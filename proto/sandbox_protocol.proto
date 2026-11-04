@@ -85,6 +85,7 @@ message RequestEnvelope {
     LoopbackConnect loopback_connect = 24;
     OpenMediation open_mediation = 25;
     AcceptNetwork accept_network = 26;
+    ReadProcessEvents read_process_events = 27;
   }
 }
 message ResponseEnvelope {
@@ -106,6 +107,7 @@ message ResponseEnvelope {
     MediationReady mediation_ready = 24;
     NetworkConnected network_connected = 25;
     Error error = 26;
+    ProcessEvents process_events = 27;
   }
 }
 // Read-only image-policy discovery, permitted before attachment.
@@ -188,6 +190,12 @@ message LoopbackConnect {
 }
 message OpenMediation {}
 message AcceptNetwork {}
+// Requires the openshell.sandbox.process-events capability. Returns the
+// retained events after after_sequence, waiting briefly for one when there
+// are none; an empty response means none arrived.
+message ReadProcessEvents {
+  uint64 after_sequence = 1;
+}
 
 // No image policy is yaml absent with invalid=false. invalid=true reports an
 // unreadable or invalid image policy; it must not be treated as missing.
@@ -225,6 +233,27 @@ message ExecStarted {
   bool pty = 2;
 }
 message Resized {}
+// lost counts events after the requested sequence that the runtime no longer
+// retains.
+message ProcessEvents {
+  repeated ProcessEvent events = 1;
+  uint64 lost = 2;
+}
+// A workload process the runtime started directly: the entrypoint or an exec
+// session. `executable` is read just after spawn, so a process that execs
+// at once can report its new program.
+message ProcessEvent {
+  uint64 sequence = 1;
+  ProcessInstance process = 2;
+  string executable = 3;
+  oneof event {
+    ProcessLaunched launched = 4;
+    ExitStatus exited = 5;
+  }
+  // When the runtime observed the launch or exit.
+  google.protobuf.Timestamp time = 6;
+}
+message ProcessLaunched {}
 message LoopbackConnected {}
 message MediationReady {}
 message NetworkConnected {

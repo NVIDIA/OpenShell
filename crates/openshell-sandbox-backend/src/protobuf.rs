@@ -272,17 +272,7 @@ impl WireMessage for w::BinaryIdentityWire {
                         .iter()
                         .map(|v| path(v))
                         .collect::<Result<_, _>>()?,
-                    process: process
-                        .map(|v| -> Result<_, FrameError> {
-                            Ok(p::ProcessInstance {
-                                pid: v.pid,
-                                parent_pid: v.parent_pid,
-                                start_time: Some(timestamp(
-                                    u64::try_from(v.start_time_ms).map_err(invalid)?,
-                                )?),
-                            })
-                        })
-                        .transpose()?,
+                    process: process.as_ref().map(process_to_proto).transpose()?,
                 }),
                 Self::Failed { message } => R::Failed(message.clone()),
             }),
@@ -299,17 +289,7 @@ impl WireMessage for w::BinaryIdentityWire {
                     .map(w::ExecutableIdentityWire::from_proto)
                     .collect::<Result<_, _>>()?,
                 cmdline_paths: v.cmdline_paths.into_iter().map(PathBuf::from).collect(),
-                process: v
-                    .process
-                    .map(|v| -> Result<_, FrameError> {
-                        Ok(c::ProcessInstance {
-                            pid: v.pid,
-                            parent_pid: v.parent_pid,
-                            start_time_ms: i64::try_from(millis(required(v.start_time)?)?)
-                                .map_err(invalid)?,
-                        })
-                    })
-                    .transpose()?,
+                process: v.process.map(process_from_proto).transpose()?,
             },
             R::Failed(message) => Self::Failed { message },
         })
@@ -453,6 +433,51 @@ impl WireMessage for w::SessionSnapshotWire {
         })
     }
 }
+fn process_to_proto(v: &c::ProcessInstance) -> Result<p::ProcessInstance, FrameError> {
+    Ok(p::ProcessInstance {
+        pid: v.pid,
+        parent_pid: v.parent_pid,
+        start_time: Some(timestamp(u64::try_from(v.start_time_ms).map_err(invalid)?)?),
+    })
+}
+fn process_from_proto(v: p::ProcessInstance) -> Result<c::ProcessInstance, FrameError> {
+    Ok(c::ProcessInstance {
+        pid: v.pid,
+        parent_pid: v.parent_pid,
+        start_time_ms: i64::try_from(millis(required(v.start_time)?)?).map_err(invalid)?,
+    })
+}
+impl WireMessage for w::ProcessEventWire {
+    type Proto = p::ProcessEvent;
+    fn to_proto(&self) -> Result<Self::Proto, FrameError> {
+        use p::process_event::Event as E;
+        Ok(p::ProcessEvent {
+            sequence: self.sequence,
+            process: Some(process_to_proto(&self.process)?),
+            executable: self.executable.clone(),
+            event: Some(match self.kind {
+                w::ProcessEventKindWire::Launched => E::Launched(p::ProcessLaunched {}),
+                w::ProcessEventKindWire::Exited(status) => E::Exited(status.to_proto()?),
+            }),
+            time: Some(timestamp(u64::try_from(self.time_ms).map_err(invalid)?)?),
+        })
+    }
+    fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
+        use p::process_event::Event as E;
+        Ok(Self {
+            sequence: v.sequence,
+            process: process_from_proto(required(v.process)?)?,
+            executable: v.executable,
+            kind: match required(v.event)? {
+                E::Launched(_) => w::ProcessEventKindWire::Launched,
+                E::Exited(status) => {
+                    w::ProcessEventKindWire::Exited(w::ExitStatusWire::from_proto(status)?)
+                }
+            },
+            time_ms: i64::try_from(millis(required(v.time)?)?).map_err(invalid)?,
+        })
+    }
+}
 fn timestamp(v: u64) -> Result<prost_types::Timestamp, FrameError> {
     let seconds = number(v / 1000)?;
     if seconds > 253_402_300_799 {
@@ -561,6 +586,9 @@ impl WireMessage for w::RequestEnvelope {
             }),
             W::OpenMediation => P::OpenMediation(p::OpenMediation {}),
             W::AcceptNetwork => P::AcceptNetwork(p::AcceptNetwork {}),
+            W::ReadProcessEvents { after_sequence } => P::ReadProcessEvents(p::ReadProcessEvents {
+                after_sequence: *after_sequence,
+            }),
         };
         Ok(p::RequestEnvelope {
             request_id: self.request_id.clone(),
@@ -629,6 +657,9 @@ impl WireMessage for w::RequestEnvelope {
             },
             P::OpenMediation(_) => W::OpenMediation,
             P::AcceptNetwork(_) => W::AcceptNetwork,
+            P::ReadProcessEvents(v) => W::ReadProcessEvents {
+                after_sequence: v.after_sequence,
+            },
         };
         // The server derives a fingerprint from decoded typed fields. Clients
         // supply only the random ID; protobuf map order never changes a replay.
@@ -714,6 +745,13 @@ impl WireMessage for w::ResponseEnvelope {
                 kind: kind.to_proto()? as i32,
                 message: message.clone(),
             }),
+            W::ProcessEvents { events, lost } => P::ProcessEvents(p::ProcessEvents {
+                events: events
+                    .iter()
+                    .map(WireMessage::to_proto)
+                    .collect::<Result<_, _>>()?,
+                lost: *lost,
+            }),
         };
         Ok(p::ResponseEnvelope {
             request_id: self.request_id.clone(),
@@ -776,6 +814,14 @@ impl WireMessage for w::ResponseEnvelope {
             P::Error(v) => W::Error {
                 kind: w::BoundaryErrorKind::from_proto(enum_value(v.kind)?)?,
                 message: v.message,
+            },
+            P::ProcessEvents(v) => W::ProcessEvents {
+                events: v
+                    .events
+                    .into_iter()
+                    .map(w::ProcessEventWire::from_proto)
+                    .collect::<Result<_, _>>()?,
+                lost: v.lost,
             },
         };
         Ok(Self {
@@ -996,6 +1042,51 @@ mod tests {
         };
         resolved.process.as_mut().unwrap().start_time = None;
         assert!(w::BinaryIdentityWire::from_proto(missing_start).is_err());
+    }
+
+    #[test]
+    fn process_events_round_trip() {
+        let process = c::ProcessInstance {
+            pid: 57,
+            parent_pid: 1,
+            start_time_ms: 1_793_750_400_123,
+        };
+        let response = w::ResponseEnvelope {
+            request_id: "r".to_string(),
+            response: w::Response::ProcessEvents {
+                events: vec![
+                    w::ProcessEventWire {
+                        sequence: 4,
+                        process,
+                        executable: "/usr/bin/sh".to_string(),
+                        kind: w::ProcessEventKindWire::Launched,
+                        time_ms: 1_793_750_400_200,
+                    },
+                    w::ProcessEventWire {
+                        sequence: 5,
+                        process,
+                        executable: "/usr/bin/sh".to_string(),
+                        kind: w::ProcessEventKindWire::Exited(w::ExitStatusWire::Signaled(9)),
+                        time_ms: 1_793_750_401_000,
+                    },
+                ],
+                lost: 3,
+            },
+        };
+        assert_eq!(
+            w::ResponseEnvelope::from_proto(response.to_proto().unwrap()).unwrap(),
+            response
+        );
+
+        let request = w::Request::ReadProcessEvents { after_sequence: 3 };
+        let envelope = w::RequestEnvelope {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            payload_digest: String::new(),
+            exec_admission_deadline_unix_ms: None,
+            request: request.clone(),
+        };
+        let decoded = w::RequestEnvelope::from_proto(envelope.to_proto().unwrap()).unwrap();
+        assert_eq!(decoded.request, request);
     }
 
     #[test]

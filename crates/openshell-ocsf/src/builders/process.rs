@@ -22,6 +22,8 @@ pub struct ProcessActivityBuilder<'a, ActorState = MissingActor> {
     launch_type: Option<LaunchTypeId>,
     exit_code: Option<i32>,
     message: Option<String>,
+    time_ms: Option<i64>,
+    uid: Option<String>,
     actor_state: std::marker::PhantomData<ActorState>,
 }
 
@@ -55,6 +57,8 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
             launch_type: None,
             exit_code: None,
             message: None,
+            time_ms: None,
+            uid: None,
             actor_state: std::marker::PhantomData,
         }
     }
@@ -74,6 +78,8 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
             launch_type: self.launch_type,
             exit_code: self.exit_code,
             message: self.message,
+            time_ms: self.time_ms,
+            uid: self.uid,
             actor_state: std::marker::PhantomData,
         }
     }
@@ -100,6 +106,19 @@ impl<ActorState> ProcessActivityBuilder<'_, ActorState> {
         self.exit_code = Some(code);
         self
     }
+    /// When the activity happened, if not when the event is built.
+    #[must_use]
+    pub fn time(mut self, time_ms: i64) -> Self {
+        self.time_ms = Some(time_ms);
+        self
+    }
+    /// Replace the random event identifier with one that repeats when the
+    /// same activity is reported again.
+    #[must_use]
+    pub fn uid(mut self, uid: impl Into<String>) -> Self {
+        self.uid = Some(uid.into());
+        self
+    }
 }
 
 impl_activity_setter!(ProcessActivityBuilder<ActorState>);
@@ -110,6 +129,12 @@ impl ProcessActivityBuilder<'_, HasActor> {
     #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity.process_label().to_string();
+        let mut metadata = self
+            .ctx
+            .metadata(&["security_control", "container", "host"]);
+        if let Some(uid) = self.uid {
+            metadata.uid = Some(uid);
+        }
         let mut base = BaseEventData::new(
             1007,
             "Process Activity",
@@ -118,9 +143,11 @@ impl ProcessActivityBuilder<'_, HasActor> {
             self.activity.as_u8(),
             &activity_name,
             self.severity,
-            self.ctx
-                .metadata(&["security_control", "container", "host"]),
+            metadata,
         );
+        if let Some(time_ms) = self.time_ms {
+            base.set_time(time_ms);
+        }
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
 
@@ -175,5 +202,21 @@ mod tests {
 
         let json = event.to_json().unwrap();
         assert_eq!(json["exit_code"], 0);
+    }
+
+    #[test]
+    fn process_activity_carries_occurrence_time_and_event_uid() {
+        let ctx = test_sandbox_context();
+        let event = ProcessActivityBuilder::new(&ctx)
+            .activity(ActivityId::Close)
+            .process(Process::new("python3", 42))
+            .actor_process(Process::new("openshell-sandbox", 1))
+            .time(1_793_750_401_000)
+            .uid("proc:42:1793750400123:exit")
+            .build();
+
+        let json = event.to_json().unwrap();
+        assert_eq!(json["time"], 1_793_750_401_000_i64);
+        assert_eq!(json["metadata"]["uid"], "proc:42:1793750400123:exit");
     }
 }

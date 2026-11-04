@@ -18,6 +18,7 @@ use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, LaunchTypeId, Process as OcsfProcess,
     ProcessActivityBuilder, SeverityId, StatusId, ocsf_emit,
 };
+use openshell_sandbox_backend::boundary_protocol::ExitStatusWire;
 
 use crate::process::{ProcessHandle, ProcessStatus, ResolvedWorkspace};
 
@@ -143,8 +144,11 @@ pub async fn spawn_workload(
             .build()
     );
 
+    let recorded_launch = crate::process_events::record_launch(handle.pid(), program);
+
     Ok(SpawnedAgent {
         handle,
+        launched: recorded_launch,
         timeout_secs,
         terminal,
         signal_lock,
@@ -158,6 +162,7 @@ pub async fn spawn_workload(
 /// Owned workload process and its live boundary capabilities.
 pub struct SpawnedAgent {
     handle: ProcessHandle,
+    launched: Option<crate::process_events::Launched>,
     timeout_secs: u64,
     terminal: Arc<AtomicBool>,
     signal_lock: Arc<std::sync::Mutex<()>>,
@@ -213,6 +218,12 @@ impl SpawnedAgent {
         };
         self.boundary_runtime
             .unregister_process_group(self.handle.pid(), &self.terminal);
+        if let Some(launched) = self.launched.take() {
+            launched.record_exit(status.signal().map_or_else(
+                || ExitStatusWire::Exited(status.code()),
+                ExitStatusWire::Signaled,
+            ));
+        }
         let _ = self.main_session.finish(status.code(), false).await;
         self.main_session.mark_terminal_reported();
         Ok(status)
