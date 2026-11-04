@@ -131,11 +131,24 @@ A direct request to an agent authorizes the requested planning or implementation
 
 Do not file suspected vulnerabilities as public issues. Follow [SECURITY.md](SECURITY.md). Use the specialized security skills for authorized review or remediation.
 
+### Accepted Work
+
+Accepted work is work the project intends to pursue. Work submitted by a maintainer listed in the merged [MAINTAINERS.md](MAINTAINERS.md), or someone with repository `WRITE`, `MAINTAIN`, or `ADMIN` access, qualifies immediately. Other issues require a maintainer's acceptance, recorded with `state:accepted`.
+
+A PR represents accepted work when either:
+
+- Its author is a maintainer or has repository write access as described above.
+- It closes at least one issue in this repository that has `state:accepted`, and the PR author is that issue's submitter or a current assignee.
+
+Use GitHub closing references such as `Closes #123` or `Fixes #123`. Merely mentioning an accepted issue does not qualify. Acceptance and the author relationship must hold on the same issue. The PR author determines eligibility, not the person triggering a workflow. Other tools and contributor skills use this shared definition; the importable `tasks/scripts/accepted_work.py` library implements the PR check.
+
+Acceptance classifies work, not implementation quality or approval to merge. Existing issue-linking rules, the separate `PR Issue Acceptance` check (which requires every linked issue to be accepted for community authors), and maintainer/code-owner approvals still apply. Acceptance does not certify that the diff implements the issue, and the existing Dependabot gate exemption does not automatically qualify a PR as accepted work.
+
 ### Labeling and Notifications
 
 Labels drive notification streams as well as classification. Contributors use the GitHub app in Slack, and other integrations, to follow issues and PRs filtered by area or topic. Applying those labels can notify subscribers immediately, before they have chosen to follow the individual item.
 
-Apply `area:` and `topic:` classification labels only after the issue or PR represents accepted work. Work submitted by a maintainer or someone with repository `WRITE`, `MAINTAIN`, or `ADMIN` access qualifies immediately. Other issues need a maintainer's acceptance; other PRs must satisfy the [accepted-work definition](#accepted-work), including the issue submitter or assignee relationship. Once accepted, apply the relevant classification labels so subscribers can find the work.
+Apply `area:` and `topic:` classification labels only after the issue or PR meets the shared [accepted-work definition](#accepted-work). Once accepted, apply the relevant classification labels so subscribers can find the work.
 
 Do not classify an issue merely because it was filed or its subject is clear. Waiting until acceptance keeps label-filtered streams focused on work the project intends to pursue and avoids sending unaccepted intake to subscribers. Workflow labels such as `state:triage-needed` still record intake status; they do not establish acceptance.
 
@@ -468,18 +481,11 @@ Automated dependency update PRs, including Dependabot PRs, are exempt from the s
 
 Authors with `WRITE`, `MAINTAIN`, or `ADMIN` access may open a PR that only fixes a broken build or flaky tests without a separate issue. Describe the failure in the PR instead. Authors without write access follow the normal issue and acceptance requirements.
 
-### Accepted Work
+### Automatic Acceptance Labeling
 
-The `Accepted Work` workflow manages `state:accepted` on open PRs, including drafts. A PR represents accepted work when either:
+The existing [review-readiness workflow](.github/workflows/review-readiness.yml) checks [accepted work](#accepted-work) when a PR is opened and adds `state:accepted` if it qualifies. This includes drafts and PRs awaiting area/topic classification. Reviewer requests still wait until a PR is ready and has an area label.
 
-- Its author is listed in the merged [MAINTAINERS.md](MAINTAINERS.md) or has `WRITE`, `MAINTAIN`, or `ADMIN` access to this repository.
-- It closes at least one issue in this repository that has `state:accepted`, and the PR author is that issue's submitter or a current assignee.
-
-Use GitHub closing references such as `Closes #123` or `Fixes #123`. Merely mentioning an accepted issue does not qualify. A contributor implementing someone else's accepted issue must be assigned to it to qualify through that issue. Acceptance and the author relationship must hold on the same issue; an accepted issue unrelated to the PR author does not qualify them.
-
-The workflow uses the PR author, not the person triggering it. It refreshes the label on PR changes, accepted-issue label and assignment changes, and changes to the merged maintainer list. A daily refresh and manual workflow dispatch reconcile all open PRs, including permission changes and closing-link changes without a dedicated event. The label is removed when a PR no longer qualifies; do not apply it manually to bypass the rule. Closed PRs retain their last label.
-
-This label classifies work, not implementation quality or approval to merge. Existing issue-linking rules, the separate `PR Issue Acceptance` check (which requires every linked issue to be accepted for community authors), and maintainer/code-owner approvals still apply. The label does not certify that the diff implements the issue, and the existing Dependabot gate exemption does not automatically qualify a PR for the label.
+This is an additive check at creation, not continuous reconciliation: later edits, permission changes, and issue-label or assignment changes do not refresh or remove the PR label. The shared library is read-only; review-readiness applies the label. The label does not replace the issue-acceptance gate or merge approvals.
 
 ### Branch Names
 
