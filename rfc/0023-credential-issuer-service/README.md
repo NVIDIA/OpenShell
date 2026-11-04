@@ -120,7 +120,7 @@ graph LR
         CLI[CLI / SDK] -->|public API| GW[Gateway]
         GW -->|snapshots| SUP[Supervisor]
         SUP -->|placeholders replaced on egress| UP[Upstream APIs]
-        GW --- GWDB[(Gateway database:<br/>no secret values)]
+        GW --- GWDB[(Gateway database:<br/>no secret values in remote mode)]
     end
     subgraph Issuer cluster
         ISS[Credential issuer]
@@ -141,8 +141,11 @@ inbound traffic, and secret values move only in response to a gateway request.
 The issuer owns the only store of secret values in both deployment modes. This
 matches the current behavior when an external credential driver is configured:
 SSH host keys and shared supervisor launch material already go to the same
-driver as provider credentials. The gateway database keeps only non-secret
-state. In remote mode, the gateway no longer needs a key-encryption key.
+driver as provider credentials. Gateway code outside the issuer works only
+with non-secret state. In embedded mode with the default encrypted store, the
+issuer keeps encrypted envelopes in the gateway database through its storage
+interface, as today. In remote mode, the gateway database holds no secret
+values and the gateway no longer needs a key-encryption key.
 Legacy provider records that hold inline credential values migrate into the
 issuer.
 
@@ -487,10 +490,10 @@ cannot diverge between modes.
 | Calls | In-process | gRPC over mTLS |
 | Refresh worker | Runs in each gateway replica, as today | Runs in the issuer |
 | Change notifications | In-process channel | `WatchSecrets` and `WatchGrants` streams |
-| Secret storage | Issuer-owned tables in the gateway database, or Vault or Kubernetes Secrets | Issuer database, or Vault or Kubernetes Secrets |
+| Secret and refresh-state storage | Gateway database through issuer storage interfaces, or Vault or Kubernetes Secrets | Issuer database, or Vault or Kubernetes Secrets |
 
-In both modes, only issuer code reads or writes secret data. The gateway
-reaches it only through the trait.
+In both modes, only issuer code decides what secret data is read or written.
+The gateway reaches it only through the trait.
 
 The **embedded** mode keeps today's behavior for local and single-cluster
 deployments and needs no new configuration.
@@ -511,11 +514,37 @@ the same `[openshell.credential_drivers.<name>]` tables the gateway uses today.
 Multi-replica issuers require Postgres, because the refresh lock relies on
 Postgres advisory locks.
 
-The refresh engine depends on `persistence::Store` in `openshell-server` for
-compare-and-swap writes and advisory locks. The issuer crate cannot depend on
-`openshell-server`, because the gateway depends on the issuer crate. Either a
-shared persistence crate moves out of `openshell-server`, or the issuer gets
-its own smaller storage layer. This choice is listed under Open questions.
+### Issuer persistence
+
+The issuer crate cannot depend on `openshell-server`, because the gateway
+depends on the issuer crate. Instead, the issuer defines two narrow storage
+interfaces, and each deployment mode supplies implementations:
+
+- **Secret object store.** Get, conditional put, and conditional delete of
+  encrypted credential envelopes. This is the existing
+  `DbCredstoreObjectStore` interface from `openshell-driver-db-credstore`.
+  Implementations never see plaintext.
+- **Refresh-state store.** Get, list, compare-and-swap put, and delete of
+  refresh-state records, plus `acquire_lock(key)`, which returns a guard that
+  serializes refresh of one credential across replicas while the minter runs.
+
+In embedded mode, small gateway adapters implement both interfaces over the
+existing `Store`, its connection pools, and its Postgres advisory locks.
+Existing secret objects and refresh-state records stay where they are, so
+embedded mode needs no data migration. The adapters translate records, write
+conditions, and errors, but never select drivers, handle encryption keys, or
+make refresh decisions. In remote mode, the issuer binary implements both
+interfaces over its own database.
+
+The two refresh-state implementations must agree on lock and
+compare-and-swap semantics, because uncertain-mint parking and refresh
+coalescing depend on them. A shared contract test suite in the issuer crate,
+starting from the cases in `persistence/refresh_lock_tests.rs`, runs against
+every implementation.
+
+Once refresh state moves behind the issuer, the gateway stops reading it
+directly. The provider environment revision uses grant versions, and
+`GetProviderRefreshStatus` reads grant status through the issuer trait.
 
 ### Compatibility
 
@@ -532,16 +561,18 @@ state into the issuer, which this RFC leaves to a dedicated tool.
 The work proceeds in phases. Phases 1 and 2 change only internal boundaries and
 ship with embedded mode, so they are useful even if remote mode is delayed.
 
-1. **Persistence and owner kinds.** Decide how the issuer crate gets
-   persistence and extract it from `openshell-server`. Replace the synthetic
-   provider identities for SSH host keys and launch material with owner kinds.
-   Route the roughly 35 non-test storage call sites in `grpc/provider.rs`,
-   `provider_refresh.rs`, `grpc/provider_credentials.rs`, `ssh_identity.rs`,
-   and `supervisor_pool.rs` through the issuer trait.
+1. **Embedded issuer and owner kinds.** Create the
+   `openshell-credential-issuer` library crate with the secret object store
+   interface and its gateway adapter. Replace the synthetic provider
+   identities for SSH host keys and launch material with owner kinds. Route
+   every storage call site in `grpc/provider.rs`, `provider_refresh.rs`,
+   `grpc/provider_credentials.rs`, `ssh_identity.rs`, and `supervisor_pool.rs`
+   through the issuer trait.
 2. **References, versions, and the refresh engine.** Introduce credential
    references with versions, include versions in the provider environment
-   revision, and migrate existing handles. Move the refresh engine into an
-   `openshell-credential-issuer` library crate behind three traits: a minter, a
+   revision, and migrate existing handles. Add the refresh-state store
+   interface, its gateway adapter, and the shared contract tests. Move the
+   refresh engine into the issuer crate behind three traits: a minter, the
    refresh-state store, and a sink notified when a new version commits.
    Replace the strategy `match` with a registry and add `strategy_name`.
 3. **Contracts and remote transport.** Add the `CredentialStore`,
@@ -551,6 +582,8 @@ ship with embedded mode, so they are useful even if remote mode is delayed.
    subject-token cache check.
 4. **Issuer service.** Ship the `openshell-credential-issuer` binary, container
    image, and Helm chart option, with identity scoping, audit, and metrics.
+   Implement both storage interfaces over the issuer's own database and run
+   the shared contract tests against them.
 5. **Documentation and validation.** Update
    `docs/how-it-works/gateways/configuration.mdx`, `docs/extensibility/`, the
    provider refresh docs, and the `debug-openshell-cluster` skill. Add e2e
@@ -568,11 +601,11 @@ ship with embedded mode, so they are useful even if remote mode is delayed.
   limits the impact to values that are new, expire, or change during the
   outage. Whether the gateway may serve a cached value past `cache_ttl` during
   an outage is an open question.
-- **Persistence extraction.** The refresh engine relies on gateway persistence
-  for compare-and-swap writes and advisory locks. Extracting a shared
-  persistence crate touches much of `openshell-server`, and a separate issuer
-  storage layer duplicates locking logic that has subtle recovery semantics.
-  Either path is a large part of the implementation cost.
+- **Two refresh-state implementations.** The gateway adapter and the issuer
+  binary each implement refresh locking and compare-and-swap writes. If they
+  diverge, refreshes can double-mint or park grants differently in the two
+  modes. Mitigation: one contract test suite runs against both, and the
+  embedded adapter reuses the existing advisory-lock code unchanged.
 - **Migration complexity.** Replacing handle swaps with versioned references
   changes durable provider and refresh state. A bug can strand credentials or
   break revocation. Mitigation: migrate in embedded mode first, keep handle
@@ -622,6 +655,24 @@ backup, and audit, and the gateway would still hold secrets at rest. A single
 issuer-owned store with a gateway-side cache keeps one security boundary and
 matches how external credential drivers behave today.
 
+### Extract a shared persistence crate
+
+The issuer could use a persistence crate pulled out of `openshell-server`, so
+the gateway and the issuer binary share one implementation of
+compare-and-swap writes and locks. Gateway persistence also covers policy
+storage, sandbox image transactions, gateway membership, private protobuf
+descriptors, metrics, and lock ordering. Extracting all of it is far larger
+than the credential work needs, and it would couple the issuer's schema to the
+gateway's.
+
+### Give the issuer its own tables in both modes
+
+The issuer could own its tables and migrations even in embedded mode, in the
+same database. That gives the issuer the same storage code in every
+deployment, but it adds a second connection pool and migration set to the
+gateway process, duplicates the locking code anyway, and requires migrating
+existing secret objects and refresh records before embedded mode can use it.
+
 ### Let supervisors fetch from the issuer
 
 Supervisors could resolve credentials from the issuer directly. That would move
@@ -670,9 +721,6 @@ keeps those guarantees in one place.
 
 ## Open questions
 
-- Should the issuer crate share a persistence crate extracted from
-  `openshell-server`, or own a separate storage layer? This changes the
-  implementation size more than any other decision in this RFC.
 - Should the issuer binary live in the library crate or in a separate crate?
 - May the gateway serve a cached value past `cache_ttl`, up to its
   `expiration_time`, when the issuer is unreachable? This trades availability
