@@ -6200,20 +6200,20 @@ fn container_resources(
                 sec[key] = serde_json::json!(value);
             }
         };
-        if let Some(cpu) = requirements.cpu.as_ref()
-            && let Some(quantity) = cpu.quantity.as_deref()
-        {
-            apply("limits", "cpu", quantity);
-            if !driver_resources.requests.contains_key("cpu") {
-                apply("requests", "cpu", quantity);
+        if let Some(cpu) = requirements.cpu.as_ref() {
+            if let Some(quantity) = cpu.quantity.as_deref() {
+                apply("limits", "cpu", quantity);
+                if !driver_resources.requests.contains_key("cpu") {
+                    apply("requests", "cpu", quantity);
+                }
             }
         }
-        if let Some(memory) = requirements.memory.as_ref()
-            && let Some(quantity) = memory.quantity.as_deref()
-        {
-            apply("limits", "memory", quantity);
-            if !driver_resources.requests.contains_key("memory") {
-                apply("requests", "memory", quantity);
+        if let Some(memory) = requirements.memory.as_ref() {
+            if let Some(quantity) = memory.quantity.as_deref() {
+                apply("limits", "memory", quantity);
+                if !driver_resources.requests.contains_key("memory") {
+                    apply("requests", "memory", quantity);
+                }
             }
         }
     }

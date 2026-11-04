@@ -137,7 +137,8 @@ CPU, memory, and GPU requests use the typed
 - `gpu` indicates a GPU request and can include an optional count.
 
 Reusable workload templates use this same message at
-`SandboxWorkloadConfig.resources`.
+`SandboxWorkloadConfig.resources`. The gateway copies those typed requirements
+into the resolved sandbox spec when a sandbox is created from a template.
 
 | Driver | CPU and memory behavior |
 |---|---|
