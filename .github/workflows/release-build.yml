@@ -116,11 +116,11 @@ jobs:
             echo "source_sha=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
 
-  build-binaries:
+  build-binaries-linux:
     needs: compute-versions
     permissions:
       contents: read
-    uses: ./.github/workflows/build-binaries.yml
+    uses: ./.github/workflows/build-binaries-linux.yml
     with:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
@@ -128,11 +128,35 @@ jobs:
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-  build-vm-driver:
-    needs: [compute-versions, build-binaries]
+  build-binaries-macos:
+    needs: compute-versions
     permissions:
       contents: read
-    uses: ./.github/workflows/build-vm-driver.yml
+    uses: ./.github/workflows/build-binaries-macos.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  build-vm-driver-linux:
+    needs: [compute-versions, build-binaries-linux]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-vm-driver-linux.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  build-vm-driver-macos:
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-vm-driver-macos.yml
     with:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
@@ -141,7 +165,7 @@ jobs:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   package-binaries:
-    needs: [compute-versions, build-binaries, build-vm-driver]
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos, build-vm-driver-linux, build-vm-driver-macos]
     permissions:
       actions: read
       contents: read
@@ -150,7 +174,7 @@ jobs:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
   build-images:
-    needs: [compute-versions, build-binaries]
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos]
     permissions:
       contents: read
       packages: write
@@ -202,7 +226,7 @@ jobs:
 
   build-deb:
     name: Build Debian Packages
-    needs: [compute-versions, build-binaries, build-vm-driver]
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos, build-vm-driver-linux, build-vm-driver-macos]
     uses: ./.github/workflows/deb-package.yml
     with:
       deb-version: ${{ needs.compute-versions.outputs.deb_version }}
@@ -210,14 +234,14 @@ jobs:
 
   build-snap:
     name: Build Snap
-    needs: [compute-versions, build-binaries]
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos]
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
   build-rpm:
     name: Build RPM Packages
-    needs: [compute-versions, build-binaries]
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos]
     uses: ./.github/workflows/rpm-package.yml
     with:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
