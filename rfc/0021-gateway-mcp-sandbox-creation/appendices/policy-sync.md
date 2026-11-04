@@ -6,9 +6,9 @@ This appendix shows how a parent's policy reaches its children and what happens 
 
 - A child's supervisor still writes its startup policy back. The gateway answers OK and stores nothing.
 - Children always fail closed, whatever failure mode the gateway uses.
-- While a `fail_closed` parent is blocked by a rejected policy, the gateway blocks its children at delivery.
-- A child that missed a copy catches up when its supervisor connects and at gateway start.
-- A provider the parent loses is detached from its children in the same sync.
+- Every configuration and credential build for a child checks the parent's live record. The child is refused while the parent is missing or blocked, or while its copy is behind the parent's loaded version, and it is served only providers the parent still has.
+- A refusal for a copy that is behind starts a sync for that child. Rebuilds happen at least every 30 s, so a failed sync is retried that often.
+- A provider the parent loses is withheld at the child's next build, and the sync removes it from the child's record.
 - A child whose parent record is gone is stopped.
 
 ## What OpenShell already had
@@ -57,10 +57,16 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A["Child supervisor asks for its config"] --> B{"Is the parent blocked?<br/>fail_closed parent rejected<br/>a newer revision"}
+    A["Child config or credentials are built"] --> M{"Parent record found?"}
+    M -- no --> C0["Not admitted: the parent no longer exists"]
+    M -- yes --> B{"Is the parent blocked?<br/>fail_closed parent rejected<br/>a newer revision"}
     B -- yes --> C["Not admitted:<br/>parent sandbox 'lead' rejected its latest policy"]
     C --> D["Child denies all new egress"]
-    B -- no --> E["Serve the child's newest revision,<br/>a copy of the parent's,<br/>plus the child's own providers,<br/>mode fail_closed"]
+    C0 --> D
+    B -- no --> K{"Child's copy older than<br/>the parent's loaded version?"}
+    K -- yes --> C2["Not admitted: waiting for a copy;<br/>a sync for this child starts"]
+    C2 --> D
+    K -- no --> E["Serve the child's newest revision,<br/>a copy of the parent's,<br/>plus providers both have,<br/>mode fail_closed"]
     E --> F{"Does the copy load on the child?"}
     F -- yes --> G["Child enforces exactly the parent's policy"]
     F -- no --> H["Child fails closed and denies all new egress"]
@@ -116,9 +122,12 @@ sequenceDiagram
     participant GW as Gateway
     Note over Child: offline while lead moved to v8
     Child->>GW: connect
-    GW->>GW: lock lead and child, detach lost providers, copy v8 if behind
-    Note over GW: capped at 2 s; on timeout the error is logged and the session goes on
-    GW-->>Child: first configuration, copy of v8
+    GW->>GW: start a sync for the child in the background
+    GW-->>Child: first configuration: not admitted, copy behind v8
+    GW->>GW: sync copies v8, removes lost providers
+    GW->>Child: re-push
+    Child->>GW: fetch snapshot
+    GW-->>Child: admitted, copy of v8
     Note over GW: at gateway start, every root's children are synced in the background
 ```
 
@@ -170,11 +179,12 @@ sequenceDiagram
 | Provider attach on a child | Allowed only if the parent has the provider, checked under the parent's lock | A child's providers are a subset of its parent's |
 | Global policy active, parent has no policy history | Child create is refused | There is no parent revision to copy |
 | Parent is deleted while it has live children | Refused: "has N child sandboxes; delete them first" | No orphaned children |
-| A child is offline during a parent change | It gets the copy when it reconnects | Delivery is asynchronous |
+| A child is offline during a parent change | Refused on reconnect until the copy lands, then admitted | Delivery checks the parent, not the sync |
+| The parent's loaded policy cannot be copied | Child refused with that reason; logged once per parent version | A copy that can never succeed must say why |
 
 ## Still open
 
-- **No periodic retry.** A failed copy waits for the parent's next load, the child's next connect or the next gateway start.
+- **Up to one rebuild of extra access.** A child keeps its old copy until its next rebuild, about 30 s, if the sync after a parent change fails. Notifying children when the parent loads would close this.
 - **Parent delete and child create across replicas.** Deleting a sandbox takes the parent's lock only within one gateway process, so on two replicas both can succeed; the child is then stopped as an orphan.
 - **Stopping an orphan by name.** The stop re-reads the child by name and checks its id, but a short window remains before the stop; closing it needs a stop by id in the compute layer.
-- **A detach on a root waits at most 10 s** for its children; the rest catch up on connect or at gateway start.
+- **A late "failed" report for a revision that already loaded** might leave the parent with no loaded revision, which delivery and create both read. Not yet tested.

@@ -308,9 +308,17 @@ behind. The write is conditional on the child's recorded parent version, so a
 child only ever moves forward: a slow or repeated run can never replace a newer
 copy with an older one, and running it twice changes nothing. The gateway runs
 it after the parent loads a new policy, at gateway start, and when a child's
-supervisor connects, so a copy missed during a crash or a disconnect is caught
-up. A copy that fails for another reason waits for the next of these; a
-periodic retry is future work.
+supervisor connects.
+
+**Delivery checks the parent itself**, so a child's safety never depends on a
+sync reaching it. Every time the gateway builds a child's configuration or
+provider credentials, it reads the parent's record. It refuses the child,
+which then denies all new network access, while the parent is missing, is
+blocked, or has loaded a version the child's copy has not reached; that
+refusal also starts a sync for the child. It serves the child only the
+providers both the child and the parent have. Every supervisor's
+configuration is rebuilt at least every 30 seconds, so a missed or failed sync
+is retried that often with no separate retry loop.
 
 ```text
 lead:      v6 ──── v7 ──────────── v8
@@ -320,8 +328,9 @@ reviewer:  v1 (from lead v6) ─ v2 (from lead v7) ─ v3 (from lead v8)
 Each child keeps its own history and its own load status, so a child that
 fails to load a version never marks the parent's version as failed, and the
 reverse. Delivery is asynchronous, as it is for every sandbox today: a child
-applies a new version within seconds of the parent, and a disconnected child
-catches up when it reconnects. A parent's policy follows the existing rules for
+normally applies a new version within seconds of the parent. After a parent
+policy change, a child may be refused, with no new network access, until the
+copy lands and its configuration is rebuilt; at most about 30 seconds. A parent's policy follows the existing rules for
 running sandboxes: Landlock and process rules cannot change after creation, and
 filesystem rules can only gain paths, which take effect on the next start.
 Because children only receive versions their parent accepted, the same limits
@@ -851,10 +860,13 @@ reused; its grants, lineage store and result files are not part of this design.
   Narrowing in v1 lets a child have less than its parent, but the parent keeps
   its access; only a policy for a whole group of sandboxes, which is future
   work, would remove it.
-- **Policy updates reach children a few seconds after the parent.** Delivery is
-  asynchronous, as it is for every sandbox, and a disconnected child catches up
-  only when it reconnects. During that window a child can still use access the
-  parent has just lost.
+- **A child can keep access its parent lost for up to one rebuild, about 30
+  seconds.** The delivery check acts when a child's configuration is built.
+  If the parent tightens its policy and the sync fails, the child keeps
+  enforcing its old copy until its next rebuild, which refuses it. A provider
+  the parent loses is withheld from the child's next build the same way.
+  Notifying children at once when the parent loads would shorten this to
+  seconds; that is future work.
 - **Background jobs depend on the sandbox runtime.** Jobs assume that a
   process started with its input and output redirected outlives the `exec`
   that started it, and that `/tmp` is writable. This was checked on Docker; if
@@ -886,9 +898,9 @@ reused; its grants, lineage store and result files are not part of this design.
   sandbox takes the parent's lock only within one gateway process, so the two
   can both succeed on different replicas. The child is then stopped as an
   orphan.
-- **A failed policy copy is not retried on a timer.** It is retried when the
-  parent loads its next policy, when the child reconnects and at gateway
-  start.
+- **A parent policy that cannot be copied refuses its children for good.**
+  The child is told why and the gateway logs it once per parent version; the
+  fix is a parent policy that can be copied.
 - **No GPU for children created by agents without a template.**
 - **Roots with driver configuration** cannot create children through MCP,
   because it can set isolation, devices and mounts that are not safe to copy;
