@@ -379,6 +379,7 @@ mod tests {
             tokio::sync::watch::channel(false).0,
             None,
             None,
+            None,
         )
         .await
         .expect("access without SSH is portable");
@@ -419,6 +420,7 @@ mod tests {
             None,
             tokio::sync::mpsc::channel(1).0,
             tokio::sync::watch::channel(false).0,
+            None,
             None,
             None,
         )
