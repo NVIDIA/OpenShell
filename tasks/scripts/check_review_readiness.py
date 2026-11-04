@@ -10,7 +10,7 @@
 """Reconcile PR reviewers from the merged REVIEWERS.md and current PR metadata.
 
 Preview with --repo OWNER/REPO --pr NUMBER; add --apply to update requests.
-Request all matching members with write access, excluding the author. Preserve
+Request all matching roster members, excluding the author. Preserve
 manual choices, unknown request provenance, and anyone who commented or reviewed.
 The parser and planning helpers are importable. No state is stored between runs.
 """
@@ -194,15 +194,6 @@ def _load_reviewers(repository: str, number: int, pr: dict) -> dict[str, set[str
     }
 
 
-def _eligible_reviewers(repository: str, logins: set[str]) -> set[str]:
-    eligible = set()
-    for login in sorted(logins):
-        value = _api(f"repos/{repository}/collaborators/{login}/permission")
-        if value.get("permission") in {"write", "maintain", "admin"}:
-            eligible.add(login)
-    return eligible
-
-
 def _routing_key(pr: dict):
     return (
         pr["state"],
@@ -228,7 +219,7 @@ def check_review_readiness(
     if pr["state"] != "open" or pr["draft"]:
         return None
     selected = select_reviewers(categories, {label["name"] for label in pr["labels"]})
-    selected = _eligible_reviewers(repository, selected - {pr["user"]["login"].lower()})
+    selected -= {pr["user"]["login"].lower()}
     plan = plan_review_requests(selected, **_load_reviewers(repository, number, pr))
     if apply:
         endpoint = f"{pull}/requested_reviewers"

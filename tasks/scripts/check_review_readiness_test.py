@@ -227,17 +227,6 @@ class GitHubTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs["pages"] for call in api.call_args_list))
         self.assertIn("/timeline?per_page=100", api.call_args.args[0])
 
-    def test_only_current_write_maintain_admin_permissions_are_eligible(self):
-        responses = [
-            {"permission": role}
-            for role in ("admin", "maintain", "read", "triage", "write")
-        ]
-        with mock.patch.object(routing, "_api", side_effect=responses):
-            self.assertEqual(
-                routing._eligible_reviewers(REPO, {"a", "b", "c", "d", "e"}),
-                {"a", "b", "e"},
-            )
-
 
 class ReconciliationTests(unittest.TestCase):
     def run_routing(self, categories, *, snapshots, responses, apply=True):
@@ -246,21 +235,17 @@ class ReconciliationTests(unittest.TestCase):
             mock.patch.object(
                 routing, "_load_reviewers", side_effect=snapshots
             ) as load,
-            mock.patch.object(
-                routing, "_eligible_reviewers", side_effect=lambda _repo, logins: logins
-            ) as eligible,
         ):
             plan = routing.check_review_readiness(categories, REPO, 42, apply=apply)
-        return plan, api, load, eligible
+        return plan, api, load
 
     def test_initial_assignment_excludes_author_without_extra_refresh(self):
-        plan, api, load, eligible = self.run_routing(
+        plan, api, load = self.run_routing(
             CATEGORIES,
             snapshots=[reviewers()],
             responses=[pr("area:runtime", "topic:policy", author="ALICE"), None],
         )
         self.assertEqual(plan, routing.ReviewPlan(("bob", "carol"), ()))
-        eligible.assert_called_once_with(REPO, {"bob", "carol"})
         load.assert_called_once()
         self.assertEqual(api.call_count, 2)
         self.assertEqual(
@@ -268,9 +253,30 @@ class ReconciliationTests(unittest.TestCase):
             {"method": "POST", "data": {"reviewers": ["bob", "carol"]}},
         )
 
+    def test_requests_roster_members_without_permission_lookups(self):
+        members = {"read-member", "triage-member", "outside-collaborator"}
+        categories = {"area:runtime": members}
+        plan, api, _ = self.run_routing(
+            categories,
+            snapshots=[reviewers()],
+            responses=[pr("area:runtime"), None],
+        )
+        self.assertEqual(plan, routing.ReviewPlan(tuple(sorted(members)), ()))
+        self.assertEqual(
+            api.call_args_list,
+            [
+                mock.call(PULL),
+                mock.call(
+                    f"{PULL}/requested_reviewers",
+                    method="POST",
+                    data={"reviewers": sorted(members)},
+                ),
+            ],
+        )
+
     def test_empty_area_does_not_block_topic_reviewers(self):
         categories = {"area:runtime": set(), "topic:policy": {"carol"}}
-        plan, _, _, _ = self.run_routing(
+        plan, _, _ = self.run_routing(
             categories,
             snapshots=[reviewers()],
             responses=[pr("area:runtime", "topic:policy")],
@@ -281,16 +287,15 @@ class ReconciliationTests(unittest.TestCase):
     def test_draft_and_closed_prs_skip_all_routing(self):
         for value in (pr(draft=True), pr(state="closed")):
             with self.subTest(value=value):
-                plan, api, load, eligible = self.run_routing(
+                plan, api, load = self.run_routing(
                     CATEGORIES, snapshots=[], responses=[value]
                 )
                 self.assertIsNone(plan)
                 api.assert_called_once_with(PULL)
                 load.assert_not_called()
-                eligible.assert_not_called()
 
     def test_preview_makes_no_changes(self):
-        plan, api, _, _ = self.run_routing(
+        plan, api, _ = self.run_routing(
             CATEGORIES,
             snapshots=[reviewers()],
             responses=[pr("area:build")],
@@ -310,7 +315,7 @@ class ReconciliationTests(unittest.TestCase):
                 manual=("carol",),
             ),
         ]
-        plan, api, _, _ = self.run_routing(
+        plan, api, _ = self.run_routing(
             CATEGORIES, snapshots=snapshots, responses=[before, None, after, None]
         )
         self.assertEqual(plan, routing.ReviewPlan(("dave",), ("alice",)))
@@ -338,9 +343,6 @@ class ReconciliationTests(unittest.TestCase):
                     "_load_reviewers",
                     return_value=reviewers(requested=("alice", "dave")),
                 ),
-                mock.patch.object(
-                    routing, "_eligible_reviewers", return_value={"dave"}
-                ),
             ):
                 with self.assertRaisesRegex(ValueError, "routing changed"):
                     routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
@@ -356,7 +358,7 @@ class ReconciliationTests(unittest.TestCase):
         after = pr("area:build", "kind:bug", requested=("alice", "dave"))
         before["head"], after["head"] = {"sha": "old"}, {"sha": "new"}
         snapshots = [reviewers(requested=("alice", "dave"))] * 2
-        plan, _, _, _ = self.run_routing(
+        plan, _, _ = self.run_routing(
             CATEGORIES, snapshots=snapshots, responses=[before, after, None]
         )
         self.assertEqual(plan.remove, ("alice",))
@@ -374,7 +376,7 @@ class ReconciliationTests(unittest.TestCase):
                 snapshots=snapshots,
                 responses=[before, None, after, subprocess.CalledProcessError(1, "gh")],
             )
-        plan, api, _, _ = self.run_routing(
+        plan, api, _ = self.run_routing(
             CATEGORIES, snapshots=[snapshots[1]] * 2, responses=[after, after, None]
         )
         self.assertEqual(plan, routing.ReviewPlan((), ("alice",)))
