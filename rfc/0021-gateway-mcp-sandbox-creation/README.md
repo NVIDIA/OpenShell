@@ -419,7 +419,9 @@ sandbox's supervisor serves that address, the same way it serves
 attaches the sandbox's existing session token and forwards the call to the
 gateway. The agent never holds a token. Only roots can create children, but
 every sandbox can reach the endpoint, so a child gets a clear refusal instead
-of a connection error.
+of a connection error. The supervisor opens one gateway connection for the
+door on first use and reuses it, with the token attached to each request, and
+allows 8 door requests at a time; another gets `503` and should retry.
 
 **From the host**, a user adds `openshell mcp serve` to their MCP client's
 configuration. The client starts it as a local process, and it forwards each
