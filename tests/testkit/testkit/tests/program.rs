@@ -44,7 +44,7 @@ async fn registered_ignored(_cx: &mut testkit::Context) -> testkit::Result {
 mod unix {
     use std::future::Future;
     use std::os::unix::process::CommandExt as _;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::process::{Child, Command, Output, Stdio};
     use std::time::{Duration, Instant};
@@ -137,23 +137,20 @@ mod unix {
         },
     ];
 
-    pub static CHECKS: [Test; 11] = [
+    pub static CHECKS: [Test; 12] = [
         check("nextest_interface", || {
             Box::pin(async { nextest_interface() })
         }),
         check("list_shows_name_and_description", || {
             Box::pin(async { list_shows_name_and_description() })
         }),
-        check("a_program_without_tests_fails", || {
-            Box::pin(async { a_program_without_tests_fails() })
-        }),
-        check("ready_fails_without_a_gateway", || {
-            Box::pin(async { ready_fails_without_a_gateway() })
-        }),
         check("run_reports_every_outcome", || {
             Box::pin(async { run_reports_every_outcome() })
         }),
         check("run_exit_codes", || Box::pin(async { run_exit_codes() })),
+        check("a_program_without_tests_fails", || {
+            Box::pin(async { a_program_without_tests_fails() })
+        }),
         check("timeout_kills_the_process_group", || {
             Box::pin(async { timeout_kills_the_process_group() })
         }),
@@ -163,11 +160,17 @@ mod unix {
         check("interrupt_stops_the_test_and_the_run", || {
             Box::pin(async { interrupt_stops_the_test_and_the_run() })
         }),
+        check("interrupt_between_tests_ends_the_run", || {
+            Box::pin(async { interrupt_between_tests_ends_the_run() })
+        }),
         check("a_passing_test_leaves_nothing_behind", || {
             Box::pin(async { a_passing_test_leaves_nothing_behind() })
         }),
         check("registered_tests_run_through_testkit", || {
             Box::pin(async { registered_tests_run_through_testkit() })
+        }),
+        check("ready_fails_without_a_gateway", || {
+            Box::pin(async { ready_fails_without_a_gateway() })
         }),
     ];
 
@@ -198,6 +201,11 @@ mod unix {
 
     fn stderr(output: &Output) -> &str {
         std::str::from_utf8(&output.stderr).expect("utf-8")
+    }
+
+    fn junit(dir: &Path) -> (PathBuf, String) {
+        let path = dir.join("results").join("junit.xml");
+        (path.clone(), path.to_str().expect("utf-8 path").to_string())
     }
 
     /// nextest lists with `--list --format terse [--ignored]` and runs each
@@ -258,6 +266,55 @@ mod unix {
         assert_eq!(stdout(&filtered), "fixture::passes  A fixture.\n");
     }
 
+    fn run_reports_every_outcome() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (path, junit_arg) = junit(dir.path());
+        let run = output(program(
+            "fixtures",
+            &["run", "passes", "fails", "ignored", "--junit", &junit_arg],
+        ));
+        assert_eq!(run.status.code(), Some(1));
+        // Test output is passed through.
+        assert!(stdout(&run).contains("passes: stdout"));
+        assert!(stderr(&run).contains("passes: stderr"));
+        assert!(stderr(&run).contains("1 passed, 1 failed, 1 skipped"));
+        assert!(stderr(&run).contains("FAIL fixture::fails: test failed"));
+
+        let xml = std::fs::read_to_string(path).expect("junit report");
+        for expected in [
+            r#"<testsuites name="program-"#,
+            r#"tests="3" skipped="1" failures="1" errors="0">"#,
+            r#"<testsuite name="fixtures" tests="3""#,
+            r#"<testcase name="fixture::fails" classname="program::fixture""#,
+            r#"<failure message="test failed" type="failure"/>"#,
+            r#"<skipped message="ignored: not today"/>"#,
+            "<system-out>",
+            "passes: stdout",
+            "fixture failure",
+        ] {
+            assert!(xml.contains(expected), "missing {expected} in\n{xml}");
+        }
+    }
+
+    fn run_exit_codes() {
+        let pass = output(program("fixtures", &["run", "passes"]));
+        assert_eq!(pass.status.code(), Some(0));
+        let ignored = output(program(
+            "fixtures",
+            &["run", "ignored", "--include-ignored"],
+        ));
+        assert_eq!(ignored.status.code(), Some(0));
+        assert!(stderr(&ignored).contains("1 passed, 0 failed"));
+        // Selecting nothing to run is not a pass.
+        for args in [&["run", "nothing-matches"][..], &["run", "ignored"]] {
+            let none = output(program("fixtures", args));
+            assert_eq!(none.status.code(), Some(2), "{args:?}");
+            assert!(stderr(&none).contains("no tests to run"));
+        }
+        let usage = output(program("fixtures", &["run", "--timeout", "0"]));
+        assert_eq!(usage.status.code(), Some(2));
+    }
+
     /// A program whose suites were not linked fails rather than passing with
     /// no tests, under every interface.
     fn a_program_without_tests_fails() {
@@ -274,32 +331,6 @@ mod unix {
                 "{args:?}"
             );
         }
-    }
-
-    /// Point the gateway lookup at a closed port, away from any registered
-    /// gateways.
-    fn without_gateway(mut command: Command, config: &Path) -> Command {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let endpoint = format!("http://{}", closed.local_addr().expect("address"));
-        drop(closed);
-        command
-            .env("XDG_CONFIG_HOME", config)
-            .env("OPENSHELL_GATEWAY_ENDPOINT", endpoint)
-            .env_remove("OPENSHELL_GATEWAY")
-            .env("OPENSHELL_BIN", config.join("no-openshell"));
-        command
-    }
-
-    fn ready_fails_without_a_gateway() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let started = Instant::now();
-        let ready = output(without_gateway(
-            program("registered", &["ready", "--timeout", "1"]),
-            dir.path(),
-        ));
-        assert_eq!(ready.status.code(), Some(2));
-        assert!(stderr(&ready).contains("not ready after 1s"));
-        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     fn is_alive(pid: libc::pid_t) -> bool {
@@ -329,41 +360,22 @@ mod unix {
         }
     }
 
-    fn run_reports_every_outcome() {
-        let run = output(program("fixtures", &["run", "passes", "fails", "ignored"]));
-        assert_eq!(run.status.code(), Some(1));
-        // Test output is passed through.
-        assert!(stdout(&run).contains("passes: stdout"));
-        assert!(stderr(&run).contains("passes: stderr"));
-        assert!(stderr(&run).contains("1 passed, 1 failed, 1 skipped"));
-        assert!(stderr(&run).contains("FAIL fixture::fails: test failed"));
-    }
-
-    fn run_exit_codes() {
-        let pass = output(program("fixtures", &["run", "passes"]));
-        assert_eq!(pass.status.code(), Some(0));
-        let ignored = output(program(
-            "fixtures",
-            &["run", "ignored", "--include-ignored"],
-        ));
-        assert_eq!(ignored.status.code(), Some(0));
-        assert!(stderr(&ignored).contains("1 passed, 0 failed"));
-        // Selecting nothing to run is not a pass.
-        for args in [&["run", "nothing-matches"][..], &["run", "ignored"]] {
-            let none = output(program("fixtures", args));
-            assert_eq!(none.status.code(), Some(2), "{args:?}");
-            assert!(stderr(&none).contains("no tests to run"));
-        }
-        let usage = output(program("fixtures", &["run", "--timeout", "0"]));
-        assert_eq!(usage.status.code(), Some(2));
-    }
-
     fn timeout_kills_the_process_group() {
         let dir = tempfile::tempdir().expect("temp dir");
         let pid_file = dir.path().join("pid");
+        let (path, junit_arg) = junit(dir.path());
         let mut command = program(
             "fixtures",
-            &["run", "hangs", "--timeout", "1", "--grace", "5"],
+            &[
+                "run",
+                "hangs",
+                "--timeout",
+                "1",
+                "--grace",
+                "5",
+                "--junit",
+                &junit_arg,
+            ],
         );
         command.env(PID_FILE_ENV, &pid_file);
         let started = Instant::now();
@@ -377,6 +389,8 @@ mod unix {
         );
         assert!(stderr(&run).contains("TIMEOUT fixture::hangs: timed out after 1s"));
         assert_gone(read_pid(&pid_file));
+        let xml = std::fs::read_to_string(path).expect("junit report");
+        assert!(xml.contains(r#"type="timeout""#), "{xml}");
     }
 
     fn sigterm_is_followed_by_sigkill() {
@@ -402,7 +416,13 @@ mod unix {
     fn interrupt_stops_the_test_and_the_run() {
         let dir = tempfile::tempdir().expect("temp dir");
         let pid_file = dir.path().join("pid");
-        let mut command = program("fixtures", &["run", "hangs", "passes", "--grace", "5"]);
+        let (path, junit_arg) = junit(dir.path());
+        let mut command = program(
+            "fixtures",
+            &[
+                "run", "hangs", "passes", "--grace", "5", "--junit", &junit_arg,
+            ],
+        );
         command
             .env(PID_FILE_ENV, &pid_file)
             .stdout(Stdio::piped())
@@ -421,6 +441,30 @@ mod unix {
         assert_eq!(run.status.code(), Some(2));
         assert!(stderr(&run).contains("ERROR fixture::hangs: interrupted"));
         assert_gone(helper);
+        let xml = std::fs::read_to_string(path).expect("junit report");
+        assert!(xml.contains(r#"type="interrupted""#), "{xml}");
+        assert!(!xml.contains("fixture::passes"), "{xml}");
+    }
+
+    fn interrupt_between_tests_ends_the_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (path, junit_arg) = junit(dir.path());
+        let run = output(program(
+            "fixtures",
+            &[
+                "run",
+                "interrupts_after_exit",
+                "passes",
+                "--junit",
+                &junit_arg,
+            ],
+        ));
+        assert_eq!(run.status.code(), Some(2));
+        assert!(stderr(&run).contains("<== PASS fixture::interrupts_after_exit"));
+        assert!(stderr(&run).contains("interrupted; 1 later test did not run"));
+        assert!(!stdout(&run).contains("passes: stdout"));
+        let xml = std::fs::read_to_string(path).expect("junit report");
+        assert!(!xml.contains("fixture::passes"), "{xml}");
     }
 
     fn a_passing_test_leaves_nothing_behind() {
@@ -433,12 +477,51 @@ mod unix {
         assert_gone(read_pid(&pid_file));
     }
 
+    /// Point the gateway lookup at a closed port, away from any registered
+    /// gateways.
+    fn without_gateway(mut command: Command, config: &Path) -> Command {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = format!("http://{}", closed.local_addr().expect("address"));
+        drop(closed);
+        command
+            .env("XDG_CONFIG_HOME", config)
+            .env("OPENSHELL_GATEWAY_ENDPOINT", endpoint)
+            .env_remove("OPENSHELL_GATEWAY")
+            .env("OPENSHELL_BIN", config.join("no-openshell"));
+        command
+    }
+
     fn registered_tests_run_through_testkit() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let run = output(without_gateway(program("registered", &["run"]), dir.path()));
+        let (path, junit_arg) = junit(dir.path());
+        let run = output(without_gateway(
+            program("registered", &["run", "--junit", &junit_arg]),
+            dir.path(),
+        ));
         assert_eq!(run.status.code(), Some(1));
         // `testkit::run` logs the description and the gateway.
         assert!(stderr(&run).contains("[registered_needs_a_gateway] Needs a gateway."));
         assert!(stderr(&run).contains("1 failed, 1 skipped"));
+        let xml = std::fs::read_to_string(path).expect("junit report");
+        assert!(
+            xml.contains(r#"<testcase name="registered_needs_a_gateway" classname="program""#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<property name="description" value="Needs a gateway."/>"#),
+            "{xml}"
+        );
+    }
+
+    fn ready_fails_without_a_gateway() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let started = Instant::now();
+        let ready = output(without_gateway(
+            program("registered", &["ready", "--timeout", "1"]),
+            dir.path(),
+        ));
+        assert_eq!(ready.status.code(), Some(2));
+        assert!(stderr(&ready).contains("not ready after 1s"));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

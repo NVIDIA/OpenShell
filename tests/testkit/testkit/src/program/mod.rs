@@ -17,7 +17,7 @@
 //! - `list [FILTER]...` prints each test's name and description.
 //! - `ready [--timeout SECS]` waits for the gateway, as `testkit-ready` does.
 //! - `run [FILTER]...` runs tests one at a time, each in its own process with
-//!   a timeout. Unix only.
+//!   a timeout, and can write a `JUnit` report. Unix only.
 //!
 //! Any other arguments are libtest's, so the program also works as a
 //! `harness = false` test target under `cargo test` and nextest: it answers
@@ -25,6 +25,10 @@
 //! In that mode tests run in the program's own process, one at a time unless
 //! `--test-threads` says otherwise.
 
+#[cfg(unix)]
+mod capture;
+#[cfg(unix)]
+mod junit;
 #[cfg(unix)]
 mod process;
 #[cfg(unix)]
@@ -127,6 +131,9 @@ enum Command {
         /// How long a stopped test has between SIGTERM and SIGKILL, in seconds.
         #[arg(long, default_value = "10", value_name = "SECS", value_parser = seconds)]
         grace: Duration,
+        /// Write a JUnit report here.
+        #[arg(long, value_name = "PATH")]
+        junit: Option<PathBuf>,
     },
 }
 
@@ -153,6 +160,7 @@ fn command(program: &str, tests: &'static [Test], command: Command) -> ExitCode 
             include_ignored,
             timeout,
             grace,
+            junit,
         } => run(
             program,
             tests,
@@ -162,6 +170,7 @@ fn command(program: &str, tests: &'static [Test], command: Command) -> ExitCode 
             },
             timeout,
             grace,
+            junit,
         ),
     }
 }
@@ -173,6 +182,7 @@ fn run(
     selection: Selection,
     timeout: Duration,
     grace: Duration,
+    junit: Option<PathBuf>,
 ) -> ExitCode {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -185,6 +195,7 @@ fn run(
         selection,
         timeout,
         grace,
+        junit,
     };
     supervisor::run(program, &exe, tests, &options)
 }
@@ -196,6 +207,7 @@ fn run(
     _selection: Selection,
     _timeout: Duration,
     _grace: Duration,
+    _junit: Option<PathBuf>,
 ) -> ExitCode {
     eprintln!(
         "{program}: `run` is only supported on Unix; run the tests with cargo test or nextest"
@@ -328,6 +340,8 @@ mod tests {
             "--include-ignored",
             "--timeout",
             "1.5",
+            "--junit",
+            "out/junit.xml",
         ])
         .unwrap();
         let Command::Run {
@@ -335,6 +349,7 @@ mod tests {
             include_ignored,
             timeout,
             grace,
+            junit,
         } = cli.command
         else {
             panic!("not run");
@@ -343,6 +358,7 @@ mod tests {
         assert!(include_ignored);
         assert_eq!(timeout, Duration::from_millis(1500));
         assert_eq!(grace, Duration::from_secs(10));
+        assert_eq!(junit.unwrap().to_str(), Some("out/junit.xml"));
 
         let Command::Ready { timeout } = Cli::try_parse_from(["p", "ready"]).unwrap().command
         else {

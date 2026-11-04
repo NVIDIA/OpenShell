@@ -6,19 +6,20 @@
 //! The program starts itself once per test as `<name> --exact --nocapture`,
 //! the same interface nextest uses, in a new process group. A test that runs
 //! past its timeout gets `SIGTERM`, a grace period, then `SIGKILL`. Output is
-//! shown as it comes.
+//! shown as it comes and kept for the `JUnit` report.
 //!
 //! A test stopped this way does not run its cleanup: testkit tests do not
 //! handle `SIGTERM` yet, so sandboxes named `test-<run id>-*` can be left
 //! behind.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use super::capture::Capture;
 use super::process::{self, Ended};
-use super::{ERROR_EXIT, FAILED_EXIT, SUPERVISED_ENV};
+use super::{ERROR_EXIT, FAILED_EXIT, SUPERVISED_ENV, junit};
 use crate::registry::{Disposition, Selection, Test};
 
 /// libtest's exit code when a test failed.
@@ -28,6 +29,7 @@ pub struct Options {
     pub selection: Selection,
     pub timeout: Duration,
     pub grace: Duration,
+    pub junit: Option<PathBuf>,
 }
 
 /// One test's result.
@@ -36,6 +38,8 @@ pub struct TestRun<'a> {
     pub outcome: Outcome,
     /// `None` for a test that did not run.
     pub duration: Option<Duration>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -110,6 +114,8 @@ pub fn run(program: &str, exe: &Path, tests: &[Test], options: &Options) -> Exit
                 test,
                 outcome: Outcome::Skipped,
                 duration: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
             });
             continue;
         }
@@ -129,7 +135,16 @@ pub fn run(program: &str, exe: &Path, tests: &[Test], options: &Options) -> Exit
     }
 
     let not_run = selected_count - runs.len();
-    let status = summarize(program, &runs, not_run, started.elapsed());
+    let mut status = summarize(program, &runs, not_run, started.elapsed());
+    if let Some(path) = &options.junit {
+        match junit::write(path, &junit::report(program, &runs)) {
+            Ok(()) => eprintln!("{program}: wrote {}", path.display()),
+            Err(error) => {
+                eprintln!("{program}: write {}: {error}", path.display());
+                status = ERROR_EXIT;
+            }
+        }
+    }
     ExitCode::from(status)
 }
 
@@ -140,8 +155,8 @@ fn run_one<'a>(exe: &Path, test: &'a Test, options: &Options) -> TestRun<'a> {
         .args([name.as_str(), "--exact", "--nocapture"])
         .env(SUPERVISED_ENV, "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if test.ignored {
         command.arg("--ignored");
     }
@@ -154,9 +169,19 @@ fn run_one<'a>(exe: &Path, test: &'a Test, options: &Options) -> TestRun<'a> {
                 test,
                 outcome: Outcome::Error(format!("start {}: {error}", exe.display())),
                 duration: Some(started.elapsed()),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
             };
         }
     };
+    let stdout = child
+        .stdout
+        .take()
+        .map(|stream| Capture::start(stream, std::io::stdout()));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stream| Capture::start(stream, std::io::stderr()));
     let ended = process::wait(&mut child, options.timeout, options.grace);
     let duration = started.elapsed();
     let outcome = match ended {
@@ -167,6 +192,8 @@ fn run_one<'a>(exe: &Path, test: &'a Test, options: &Options) -> TestRun<'a> {
         test,
         outcome,
         duration: Some(duration),
+        stdout: stdout.map(Capture::finish).unwrap_or_default(),
+        stderr: stderr.map(Capture::finish).unwrap_or_default(),
     }
 }
 
@@ -257,6 +284,8 @@ mod tests {
                 test: &TEST,
                 outcome,
                 duration: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
             })
             .collect()
     }
