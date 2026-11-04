@@ -459,6 +459,19 @@ Automated dependency update PRs, including Dependabot PRs, are exempt from the s
 
 Authors with `WRITE`, `MAINTAIN`, or `ADMIN` access may open a PR that only fixes a broken build or flaky tests without a separate issue. Describe the failure in the PR instead. Authors without write access follow the normal issue and acceptance requirements.
 
+### Accepted Work
+
+The `Accepted Work` workflow manages `state:accepted` on open PRs, including drafts. A PR represents accepted work when either:
+
+- Its author is listed in the merged [MAINTAINERS.md](MAINTAINERS.md) or has `WRITE`, `MAINTAIN`, or `ADMIN` access to this repository.
+- It closes at least one issue in this repository that has `state:accepted`, and the PR author is that issue's submitter or a current assignee.
+
+Use GitHub closing references such as `Closes #123` or `Fixes #123`. Merely mentioning an accepted issue does not qualify. A contributor implementing someone else's accepted issue must be assigned to it to qualify through that issue. Acceptance and the author relationship must hold on the same issue; an accepted issue unrelated to the PR author does not qualify them.
+
+The workflow uses the PR author, not the person triggering it. It refreshes the label on PR changes, accepted-issue label and assignment changes, and changes to the merged maintainer list. A daily refresh and manual workflow dispatch reconcile all open PRs, including permission changes and closing-link changes without a dedicated event. The label is removed when a PR no longer qualifies; do not apply it manually to bypass the rule. Closed PRs retain their last label.
+
+This label classifies work, not implementation quality or approval to merge. Existing issue-linking rules, the separate `PR Issue Acceptance` check (which requires every linked issue to be accepted for community authors), and maintainer/code-owner approvals still apply. The label does not certify that the diff implements the issue, and the existing Dependabot gate exemption does not automatically qualify a PR for the label.
+
 ### Branch Names
 
 Use `<type>/<issue-id>-<short-description>/<github-username>` for contributor branches. Choose the Conventional Commit type that describes the work, such as `feat`, `fix`, `refactor`, `chore`, `perf`, `docs`, `test`, or `ci`. The description is a short lowercase slug separated by hyphens; the final component is your GitHub login, not initials.

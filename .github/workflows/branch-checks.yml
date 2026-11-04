@@ -604,6 +604,9 @@ jobs:
 
       - name: Test release qualification summary
         run: mise run test:qualification-summary
+
+      - name: Test accepted-work labeling
+        run: mise run test:accepted-work
   sdk-go-freeze:
     # The Go SDK moved to ai-openshell/sdk-go (#5031). Its directory stays only
     # until the final deprecated sdk/go tag exists, so PRs must not add or change
