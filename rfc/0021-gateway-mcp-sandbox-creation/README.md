@@ -890,6 +890,9 @@ reused; its grants, lineage store and result files are not part of this design.
   parent loads its next policy, when the child reconnects and at gateway
   start.
 - **No GPU for children created by agents without a template.**
+- **Roots with driver configuration** cannot create children through MCP,
+  because it can set isolation, devices and mounts that are not safe to copy;
+  create their children with the CLI.
 - **Roots created by platform administrators** who are not workspace members
   cannot create children through MCP (see
   [Authorization and audit](#authorization-and-audit)).
