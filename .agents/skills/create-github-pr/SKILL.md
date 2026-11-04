@@ -258,6 +258,15 @@ automatically on issue-label events.
 Created PR [#123](https://github.com/OWNER/REPO/pull/123)
 ```
 
+### Accepted-Work Classification
+
+The `Accepted Work` workflow manages the PR's acceptance label using the definition
+in [CONTRIBUTING.md](../../../CONTRIBUTING.md#accepted-work). For an author without
+maintainer membership or target-repository write access, the same closing issue
+must be accepted and list the PR author as its submitter or a current assignee.
+The label does not replace the issue-acceptance gate or merge approvals. Do not
+manually apply it as a substitute for satisfying the automated rule.
+
 ### Monitor Workflow Run (Optional)
 
 If the user asks to wait for a green CI before posting the RFR, use this snippet to monitor the workflow run:
