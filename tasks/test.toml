@@ -27,6 +27,7 @@ depends = [
   "test:cargo-lockfile-alignment",
   "test:review-readiness",
   "test:merge-gateway-toml",
+  "test:accepted-work",
 ]
 
 ["test:merge-gateway-toml"]
@@ -106,6 +107,11 @@ hide = true
 ["test:review-readiness"]
 description = "Test PR review readiness and reviewer reconciliation"
 run = "uv run --no-project python -m unittest discover -s tasks/scripts -p check_review_readiness_test.py"
+hide = true
+
+["test:accepted-work"]
+description = "Test accepted-work PR labeling"
+run = "uv run --no-project python -m unittest discover -s tasks/scripts -p label_accepted_work_test.py"
 hide = true
 
 [e2e]

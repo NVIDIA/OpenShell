@@ -705,6 +705,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
 | `.github/workflows/required-ci-gates.yml` | Posts required PR-head and merge-group statuses for gated CI workflows. This is what branch protection and merge queue should require. |
 | `.github/workflows/e2e-label-help.yml` | When a `test:e2e*` label is applied, posts a PR comment telling the maintainer the next manual step (re-run an existing workflow run, or `/ok to test <SHA>` to refresh the mirror). |
+| `.github/workflows/accepted-work.yml` | Reconciles the informational `state:accepted` PR label from trusted maintainer membership, repository write access, or accepted closing issues submitted by or assigned to the PR author. Runs on PR and issue changes, maintainer/helper changes, daily refresh, and manual dispatch. |
 | `.github/workflows/workflow-security.yml` | Runs informational Actionlint and High-severity Zizmor reports on GitHub-hosted runners. |
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Python and TypeScript SDKs and retains SARIF artifacts. |
