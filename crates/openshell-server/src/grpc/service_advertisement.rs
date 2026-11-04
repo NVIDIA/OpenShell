@@ -23,13 +23,39 @@ pub const LEASE: Duration = Duration::from_secs(15);
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_ROUTES: usize = 1024;
 
+/// Trusted driver resolution scoped to one session and one lease exchange.
+#[derive(Clone)]
+pub struct LeaseAuthority {
+    sandbox_id: String,
+    session_id: String,
+    supervisor_instance_id: String,
+    connection_epoch: u64,
+    auth_epoch: Option<openshell_core::jwt::CredentialEpoch>,
+    endpoint: openshell_core::proto::compute::v1::SupervisorAppEndpoint,
+}
+
+impl LeaseAuthority {
+    fn matches(&self, owner: &OwnerGuard) -> bool {
+        self.sandbox_id == owner.sandbox_id
+            && self.session_id == owner.session_id
+            && self.supervisor_instance_id == owner.supervisor_instance_id
+            && self.connection_epoch == owner.connection_epoch
+            && self.auth_epoch == owner.auth_epoch
+    }
+}
+
+pub struct ClaimedLease {
+    authority: LeaseAuthority,
+    expires_at_ms: i64,
+}
+
 /// A challenge is session-local and single-use. Its monotonic deadline starts
 /// before transmission, so delayed answers never receive a fresh receipt lease.
 pub struct LeaseWindow {
     sequence: u64,
     deadline: tokio::time::Instant,
     expires_at_ms: i64,
-    answered: bool,
+    authority: Option<LeaseAuthority>,
 }
 
 impl Default for LeaseWindow {
@@ -38,18 +64,21 @@ impl Default for LeaseWindow {
             sequence: 0,
             deadline: tokio::time::Instant::now(),
             expires_at_ms: 0,
-            answered: true,
+            authority: None,
         }
     }
 }
 
 impl LeaseWindow {
-    pub fn issue(&mut self) -> Option<openshell_core::proto::ServiceRouteLease> {
+    pub fn issue(
+        &mut self,
+        authority: LeaseAuthority,
+    ) -> Option<openshell_core::proto::ServiceRouteLease> {
         self.sequence = self.sequence.checked_add(1)?;
         self.deadline = tokio::time::Instant::now() + LEASE;
         self.expires_at_ms =
             current_time_ms() + i64::try_from(LEASE.as_millis()).expect("bounded lease");
-        self.answered = false;
+        self.authority = Some(authority);
         Some(openshell_core::proto::ServiceRouteLease {
             sequence: self.sequence,
             duration: openshell_core::time::duration_from_std(LEASE).ok(),
@@ -57,15 +86,14 @@ impl LeaseWindow {
         })
     }
 
-    pub fn claim(&mut self, sequence: u64) -> Option<i64> {
-        if self.answered
-            || sequence != self.sequence
-            || tokio::time::Instant::now() >= self.deadline
-        {
+    pub fn claim(&mut self, sequence: u64) -> Option<ClaimedLease> {
+        if sequence != self.sequence || tokio::time::Instant::now() >= self.deadline {
             return None;
         }
-        self.answered = true;
-        Some(self.expires_at_ms)
+        Some(ClaimedLease {
+            authority: self.authority.take()?,
+            expires_at_ms: self.expires_at_ms,
+        })
     }
 }
 
@@ -146,48 +174,66 @@ fn sandbox_term_matches(
     }
 }
 
-async fn current_endpoint(
+async fn endpoint_authority_current(
     state: &ServerState,
     sandbox: &Sandbox,
     owner: &OwnerGuard,
-) -> Result<Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>, Status> {
-    if !sandbox_term_matches(sandbox, owner.auth_epoch) {
-        return Ok(None);
+    endpoint: &openshell_core::proto::compute::v1::SupervisorAppEndpoint,
+) -> Result<bool, Status> {
+    if !sandbox_term_matches(sandbox, owner.auth_epoch)
+        || endpoint.runtime_identity != runtime_identity(sandbox)?
+        || endpoint.port != u32::from(state.config.supervisor_app_listener.port)
+        || endpoint.host.parse::<std::net::IpAddr>().is_err()
+    {
+        return Ok(false);
     }
-    let Some(endpoint) = state.compute.supervisor_app_endpoint(sandbox).await? else {
-        return Ok(None);
-    };
     if !endpoint.pool_route.is_empty()
         && (owner
             .auth_epoch
             .map_or(0, openshell_core::jwt::CredentialEpoch::get)
             != endpoint.ownership_epoch
-            || !crate::supervisor_pool::app_endpoint_current(&state.store, sandbox, &endpoint)
+            || !crate::supervisor_pool::app_endpoint_current(&state.store, sandbox, endpoint)
                 .await
                 .map_err(|_| Status::unavailable("pool application authority unavailable"))?)
     {
-        return Ok(None);
+        return Ok(false);
     }
-    Ok(Some(endpoint))
+    Ok(true)
+}
+
+async fn current_endpoint(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    owner: &OwnerGuard,
+) -> Result<Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>, Status> {
+    let Some(endpoint) = state.compute.supervisor_app_endpoint(sandbox).await? else {
+        return Ok(None);
+    };
+    Ok(endpoint_authority_current(state, sandbox, owner, &endpoint)
+        .await?
+        .then_some(endpoint))
 }
 
 /// A serving lease is issued only while the session still has durable runtime
 /// authority. This check is repeated for every lease, independently of config.
-pub async fn may_lease(state: &ServerState, owner: &OwnerGuard) -> Result<bool, Status> {
+pub async fn prepare_lease(
+    state: &ServerState,
+    owner: &OwnerGuard,
+) -> Result<Option<LeaseAuthority>, Status> {
     let Some(sandbox) = state
         .store
         .get_message::<Sandbox>(&owner.sandbox_id)
         .await
         .map_err(|_| Status::unavailable("sandbox storage unavailable"))?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if sandbox
         .metadata
         .as_ref()
         .is_some_and(|m| m.deletion_time.is_some())
     {
-        return Ok(false);
+        return Ok(None);
     }
     let current = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
         .read(&owner.sandbox_id)
@@ -200,16 +246,61 @@ pub async fn may_lease(state: &ServerState, owner: &OwnerGuard) -> Result<bool, 
             || current.supervisor_instance_id != owner.supervisor_instance_id
             || current.connection_epoch != owner.connection_epoch
     }) {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(current_endpoint(state, &sandbox, owner).await?.is_some())
+    if !state.config.supervisor_app_listener.enabled {
+        return Ok(None);
+    }
+    Ok(current_endpoint(state, &sandbox, owner)
+        .await?
+        .map(|endpoint| LeaseAuthority {
+            sandbox_id: owner.sandbox_id.clone(),
+            session_id: owner.session_id.clone(),
+            supervisor_instance_id: owner.supervisor_instance_id.clone(),
+            connection_epoch: owner.connection_epoch,
+            auth_epoch: owner.auth_epoch,
+            endpoint,
+        }))
 }
 
+pub async fn accept_lease(
+    state: &Arc<ServerState>,
+    owner: &OwnerGuard,
+    report: &SupervisorServiceAdvertisement,
+    lease: ClaimedLease,
+) -> Result<(), Status> {
+    if !lease.authority.matches(owner) {
+        return Err(Status::failed_precondition(
+            "service lease session replaced",
+        ));
+    }
+    accept_inner(
+        state,
+        owner,
+        report,
+        lease.expires_at_ms,
+        Some(lease.authority.endpoint),
+    )
+    .await
+}
+
+// Tests can install records directly without performing a session exchange.
+#[cfg(test)]
 pub async fn accept(
     state: &Arc<ServerState>,
     owner: &OwnerGuard,
     report: &SupervisorServiceAdvertisement,
     expires_at_ms: i64,
+) -> Result<(), Status> {
+    accept_inner(state, owner, report, expires_at_ms, None).await
+}
+
+async fn accept_inner(
+    state: &Arc<ServerState>,
+    owner: &OwnerGuard,
+    report: &SupervisorServiceAdvertisement,
+    expires_at_ms: i64,
+    resolved_endpoint: Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>,
 ) -> Result<(), Status> {
     if !state.config.supervisor_app_listener.enabled {
         return Ok(());
@@ -299,19 +390,22 @@ pub async fn accept(
             ));
         }
         validate_routes(report, &config.service_routes)?;
-        let endpoint = current_endpoint(state, &sandbox, owner)
-            .await?
-            .ok_or_else(|| {
-                Status::failed_precondition("trusted supervisor app endpoint unavailable")
-            })?;
-        if endpoint.runtime_identity != record.runtime_identity
-            || endpoint.port != u32::from(state.config.supervisor_app_listener.port)
-            || endpoint.host.parse::<std::net::IpAddr>().is_err()
-        {
-            return Err(Status::failed_precondition(
-                "driver endpoint does not match current runtime",
-            ));
-        }
+        let endpoint = if let Some(endpoint) = resolved_endpoint {
+            // Reuse only the challenge's driver result. Recheck durable pool
+            // authority after configuration validation and before publication.
+            if !endpoint_authority_current(state, &sandbox, owner, &endpoint).await? {
+                return Err(Status::failed_precondition(
+                    "service lease endpoint authority replaced",
+                ));
+            }
+            endpoint
+        } else {
+            current_endpoint(state, &sandbox, owner)
+                .await?
+                .ok_or_else(|| {
+                    Status::failed_precondition("trusted supervisor app endpoint unavailable")
+                })?
+        };
         record.pool_route = endpoint.pool_route;
         record.host = endpoint.host;
         record.port = endpoint.port;
@@ -524,6 +618,212 @@ pub fn spawn_cleanup(state: Arc<ServerState>, mut shutdown: tokio::sync::watch::
 mod tests {
     use super::*;
 
+    fn test_lease_authority() -> LeaseAuthority {
+        LeaseAuthority {
+            sandbox_id: "sandbox".into(),
+            session_id: "session".into(),
+            supervisor_instance_id: "instance".into(),
+            connection_epoch: 1,
+            auth_epoch: None,
+            endpoint: openshell_core::proto::compute::v1::SupervisorAppEndpoint {
+                host: "10.0.0.7".into(),
+                port: 9443,
+                runtime_identity: "runtime-a".into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    struct CountingEndpointResolver {
+        calls: std::sync::atomic::AtomicUsize,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[tonic::async_trait]
+    impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for CountingEndpointResolver {
+        async fn resolve_supervisor_app_endpoint(
+            &self,
+            request: tonic::Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+        ) -> Result<tonic::Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>, Status> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Status::unavailable("endpoint lookup failed"));
+            }
+            Ok(tonic::Response::new(openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse {
+                sandbox_id: request.into_inner().sandbox_id,
+                supervisor_app_endpoint: Some(test_lease_authority().endpoint),
+            }))
+        }
+    }
+
+    async fn counted_fixture() -> (
+        Arc<ServerState>,
+        OwnerGuard,
+        SupervisorServiceAdvertisement,
+        Arc<CountingEndpointResolver>,
+    ) {
+        let (mut state, owner, report) = installed_fixture().await;
+        let resolver = Arc::new(CountingEndpointResolver {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.compute = inner
+            .compute
+            .clone()
+            .with_app_endpoint_resolver(Some(resolver.clone()));
+        (state, owner, report, resolver)
+    }
+
+    #[tokio::test]
+    async fn lease_exchange_resolves_once_and_withdrawals_do_not_resolve_again() {
+        use std::sync::atomic::Ordering;
+        let (state, owner, mut report, resolver) = counted_fixture().await;
+        let mut window = LeaseWindow::default();
+        for expected_calls in 1..=2 {
+            let authority = prepare_lease(&state, &owner).await.unwrap().unwrap();
+            let lease = window.issue(authority).unwrap();
+            report.lease_sequence = lease.sequence;
+            let claimed = window.claim(lease.sequence).unwrap();
+            let expiry = claimed.expires_at_ms;
+            accept_lease(&state, &owner, &report, claimed)
+                .await
+                .unwrap();
+            assert!(window.claim(lease.sequence).is_none());
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), expected_calls);
+            let row = state
+                .store
+                .get(OBJECT_TYPE, "service-installation:sandbox")
+                .await
+                .unwrap()
+                .unwrap();
+            let record: Installation = serde_json::from_slice(&row.payload).unwrap();
+            assert_eq!(record.expires_at_ms, expiry);
+        }
+        let lease = window
+            .issue(prepare_lease(&state, &owner).await.unwrap().unwrap())
+            .unwrap();
+        resolver.fail.store(true, Ordering::SeqCst);
+        report.lease_sequence = lease.sequence;
+        report.routes.clear();
+        accept_lease(
+            &state,
+            &owner,
+            &report,
+            window.claim(lease.sequence).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 3);
+        assert!(prepare_lease(&state, &owner).await.is_err());
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn resolved_lease_rejects_identity_changes_and_durable_owner_replacement() {
+        let (state, owner, mut report, _) = counted_fixture().await;
+        let authority = prepare_lease(&state, &owner).await.unwrap().unwrap();
+        // None of these mismatches may reuse another session's resolution.
+        for field in 0..5 {
+            let mut changed = owner.clone();
+            match field {
+                0 => changed.sandbox_id = "another-sandbox".into(),
+                1 => changed.session_id = "another-session".into(),
+                2 => changed.supervisor_instance_id = "another-instance".into(),
+                3 => changed.connection_epoch += 1,
+                _ => changed.auth_epoch = openshell_core::jwt::CredentialEpoch::new(1).ok(),
+            }
+            let mut window = LeaseWindow::default();
+            let lease = window.issue(authority.clone()).unwrap();
+            assert!(
+                accept_lease(
+                    &state,
+                    &changed,
+                    &report,
+                    window.claim(lease.sequence).unwrap()
+                )
+                .await
+                .is_err()
+            );
+        }
+        let mut window = LeaseWindow::default();
+        let lease = window.issue(authority).unwrap();
+        report.lease_sequence = lease.sequence;
+        SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .release_if_current(&owner)
+            .await
+            .unwrap();
+        SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .publish(
+                "sandbox",
+                "replacement-session",
+                "replacement-instance",
+                2,
+                "other-replica",
+                "local://other",
+            )
+            .await
+            .unwrap();
+        // The passed guard still matches the challenge, but storage no longer does.
+        assert!(
+            accept_lease(
+                &state,
+                &owner,
+                &report,
+                window.claim(lease.sequence).unwrap()
+            )
+            .await
+            .is_err()
+        );
+        assert!(prepare_lease(&state, &owner).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn resolved_lease_rechecks_runtime_configuration_expiry_and_pool_authority() {
+        for change in 0..4 {
+            let (state, owner, mut report, _) = counted_fixture().await;
+            let mut authority = prepare_lease(&state, &owner).await.unwrap().unwrap();
+            if change == 3 {
+                authority.endpoint.pool_route = "replaced-pool-route".into();
+            }
+            let mut window = LeaseWindow::default();
+            let lease = window.issue(authority).unwrap();
+            report.lease_sequence = lease.sequence;
+            let mut claimed = window.claim(lease.sequence).unwrap();
+            match change {
+                0 => {
+                    let mut sandbox = state
+                        .store
+                        .get_message::<Sandbox>("sandbox")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    sandbox.metadata.as_mut().unwrap().annotations.insert(
+                        COMPUTE_RUNTIME_IDENTITY_ANNOTATION.into(),
+                        "runtime-b".into(),
+                    );
+                    state.store.put_message(&sandbox).await.unwrap();
+                }
+                1 => report.config_revision += 1,
+                2 => claimed.expires_at_ms = current_time_ms() - 1,
+                _ => {}
+            }
+            assert!(
+                accept_lease(&state, &owner, &report, claimed)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                state
+                    .store
+                    .get(OBJECT_TYPE, "service-installation:sandbox")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
     fn cleanup_test_record(index: usize) -> ObjectRecord {
         ObjectRecord {
             object_type: OBJECT_TYPE.into(),
@@ -628,13 +928,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let stale = state.store.get(OBJECT_TYPE, id).await.unwrap().unwrap();
+        let expired_record = state.store.get(OBJECT_TYPE, id).await.unwrap().unwrap();
         report.lease_sequence += 1;
         accept(&state, &owner, &report, current_time_ms() + 10_000)
             .await
             .unwrap();
         let renewed = state.store.get(OBJECT_TYPE, id).await.unwrap().unwrap();
-        let _ = cleanup_record(&state, stale).await;
+        let _ = cleanup_record(&state, expired_record).await;
         assert_eq!(
             state
                 .store
@@ -665,12 +965,17 @@ mod tests {
     async fn lease_is_single_use_and_delayed_or_superseded_reports_do_not_extend_it() {
         let mut window = LeaseWindow::default();
         assert!(window.claim(0).is_none());
-        let first = window.issue().unwrap();
+        let first = window.issue(test_lease_authority()).unwrap();
         let first_expiry = window.expires_at_ms;
         tokio::time::advance(Duration::from_secs(8)).await;
-        assert_eq!(window.claim(first.sequence), Some(first_expiry));
+        assert_eq!(
+            window
+                .claim(first.sequence)
+                .map(|lease| lease.expires_at_ms),
+            Some(first_expiry)
+        );
         assert!(window.claim(first.sequence).is_none());
-        let second = window.issue().unwrap();
+        let second = window.issue(test_lease_authority()).unwrap();
         assert!(window.claim(first.sequence).is_none());
         tokio::time::advance(LEASE).await;
         assert!(window.claim(second.sequence).is_none());

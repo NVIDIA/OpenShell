@@ -244,12 +244,20 @@ trusted driver-resolved app endpoint, and gateway lease expiry. The private
 `ComputeDriverAppEndpoints.ResolveSupervisorAppEndpoint` extension RPC resolves this endpoint separately
 from `GetSandbox`: endpoint lookup failures do not affect ordinary sandbox
 observation. Unsupported drivers return `UNIMPLEMENTED`; an absent endpoint
-withholds application publication. In-process factories opt in with
+withholds application publication. The gateway resolves the endpoint once before
+issuing each challenge and binds that result to the session and lease sequence.
+Acceptance rechecks durable ownership, shared member/readiness authority, runtime,
+and configuration without another driver lookup. The next challenge resolves
+afresh; the saved result never extends the original lease expiry.
+In-process factories opt in with
 `ComputeDriverBuildContext::register_app_endpoints`; baseline factories need no
 changes. Standalone drivers register the extension on their existing endpoint.
 The generic
 store key is prefixed `service-installation:`; records are ephemeral and do not
 change durable sandbox protobufs. Reads revalidate owner, configuration,
 generation, and expiry. Cleanup scans bounded pages and uses conditional deletes
-so concurrent renewals are preserved. Discovery consumers must not treat these
+so concurrent renewals are preserved. Cursor progress survives partial sweep
+timeouts; bounded record attempts prevent a malformed or stalled record from
+starving later cleanup. Failed attempts are revisited on the next scan.
+Discovery consumers must not treat these
 records as application health or external ingress readiness.

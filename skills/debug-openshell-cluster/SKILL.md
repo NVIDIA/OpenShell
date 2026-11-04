@@ -1697,7 +1697,9 @@ gateway requests installation evidence every five seconds with a fifteen-second
 lease measured from challenge issuance. Instances report only when their serving
 freshness covers that lease. Replayed, late, stale-configuration, and replaced
 session reports cannot renew evidence. Endpoint resolution comes from the
-compute driver; ambiguous shared member ownership must not publish an address.
+compute driver once per challenge/report exchange, with fresh resolution for the
+next challenge. Acceptance still checks durable ownership and shared member
+readiness; ambiguous shared ownership must not publish an address.
 
 For shared pools, compare the discovered endpoint to the
 acknowledged owner's Pod IP and configured app port, not its runtime port or a

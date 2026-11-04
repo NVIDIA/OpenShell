@@ -2970,8 +2970,8 @@ async fn run_session_loop(
                             bootstrap_complete = true;
                         }
                         if let Some(supervisor_message::Payload::ServiceAdvertisement(report)) = &msg.payload {
-                            if let Some(app_expiry) = app_lease.claim(report.lease_sequence)
-                                && !matches!(tokio::time::timeout(Duration::from_secs(2), crate::grpc::service_advertisement::accept(state, owner_guard, report, app_expiry)).await, Ok(Ok(()))) {
+                            if let Some(lease) = app_lease.claim(report.lease_sequence)
+                                && !matches!(tokio::time::timeout(Duration::from_secs(2), crate::grpc::service_advertisement::accept_lease(state, owner_guard, report, lease)).await, Ok(Ok(()))) {
                                 debug!(sandbox_id, "service installation report rejected or unavailable");
                             }
                             continue;
@@ -3007,10 +3007,10 @@ async fn run_session_loop(
                 }
             }
             _ = app_timer.tick(), if session.advertises_services => {
-                if !matches!(tokio::time::timeout(Duration::from_secs(2),
-                    crate::grpc::service_advertisement::may_lease(state, owner_guard)).await,
-                    Ok(Ok(true))) { continue; }
-                let Some(lease) = app_lease.issue() else { break; };
+                let Ok(Ok(Some(authority))) = tokio::time::timeout(Duration::from_secs(2),
+                    crate::grpc::service_advertisement::prepare_lease(state, owner_guard)).await
+                    else { continue; };
+                let Some(lease) = app_lease.issue(authority) else { break; };
                 let message = GatewayMessage { payload: Some(gateway_message::Payload::ServiceRouteLease(lease)) };
                 if tx.try_send(message).is_err() { break; }
             }
