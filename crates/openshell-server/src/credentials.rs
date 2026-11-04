@@ -32,24 +32,35 @@ pub struct ResolvedProviderCredentials {
 #[derive(Debug, Clone)]
 pub struct CredentialRuntime {
     issuer: Arc<dyn CredentialIssuer>,
+    // The same allocation as `issuer`, not a second backend. Other issuer
+    // implementations need no embedded failure-injection or gate methods.
+    #[cfg(test)]
+    embedded_test_issuer: Option<Arc<EmbeddedCredentialIssuer>>,
 }
 
 impl CredentialRuntime {
+    fn from_embedded(issuer: EmbeddedCredentialIssuer) -> Self {
+        let issuer = Arc::new(issuer);
+        Self {
+            #[cfg(test)]
+            embedded_test_issuer: Some(Arc::clone(&issuer)),
+            issuer,
+        }
+    }
+
     pub fn from_config(config: &Config) -> CoreResult<Self> {
-        Ok(Self {
-            issuer: Arc::new(EmbeddedCredentialIssuer::from_config(&IssuerConfig::from(
-                config,
-            ))?),
-        })
+        Ok(Self::from_embedded(EmbeddedCredentialIssuer::from_config(
+            &IssuerConfig::from(config),
+        )?))
     }
 
     pub fn from_config_with_store(config: &Config, store: Arc<Store>) -> CoreResult<Self> {
-        Ok(Self {
-            issuer: Arc::new(EmbeddedCredentialIssuer::from_config_with_store(
+        Ok(Self::from_embedded(
+            EmbeddedCredentialIssuer::from_config_with_store(
                 &IssuerConfig::from(config),
                 Arc::new(ServerDbCredstoreObjectStore::new(store)),
-            )?),
-        })
+            )?,
+        ))
     }
 
     pub async fn from_config_file(
@@ -89,9 +100,9 @@ impl CredentialRuntime {
                 Arc::new(ServerDbCredstoreObjectStore::new(store));
             adapter
         });
-        Ok(Self {
-            issuer: Arc::new(EmbeddedCredentialIssuer::from_options(&options, store).await?),
-        })
+        Ok(Self::from_embedded(
+            EmbeddedCredentialIssuer::from_options(&options, store).await?,
+        ))
     }
 
     pub fn validate_provider_handles(&self, provider: &Provider) -> Result<(), Status> {
@@ -267,24 +278,31 @@ impl CredentialRuntime {
     }
 
     #[cfg(test)]
+    fn embedded_test_issuer(&self) -> &EmbeddedCredentialIssuer {
+        self.embedded_test_issuer
+            .as_deref()
+            .expect("test credential hooks require an embedded issuer")
+    }
+
+    #[cfg(test)]
     pub(crate) fn stored_credential_count(&self) -> Option<usize> {
-        self.issuer.stored_credential_count()
+        self.embedded_test_issuer().stored_credential_count()
     }
     #[cfg(test)]
     pub(crate) fn fail_next_store(&self) {
-        self.issuer.fail_next_store();
+        self.embedded_test_issuer().fail_next_store();
     }
     #[cfg(test)]
     pub(crate) fn fail_next_delete(&self) {
-        self.issuer.fail_next_delete();
+        self.embedded_test_issuer().fail_next_delete();
     }
     #[cfg(test)]
     pub(crate) fn gate_next_store(&self) -> openshell_credential_issuer::TestGate {
-        self.issuer.gate_next_store()
+        self.embedded_test_issuer().gate_next_store()
     }
     #[cfg(test)]
     pub(crate) fn gate_next_resolve(&self) -> openshell_credential_issuer::TestGate {
-        self.issuer.gate_next_resolve()
+        self.embedded_test_issuer().gate_next_resolve()
     }
 }
 
@@ -360,6 +378,42 @@ mod tests {
             )]),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn embedded_test_hooks_share_the_trait_backed_issuer_across_clones() {
+        let runtime = CredentialRuntime::from_config(
+            &Config::new(None).with_credential_drivers(["test-static"]),
+        )
+        .unwrap();
+        let cloned = runtime.clone();
+        let embedded: Arc<dyn CredentialIssuer> =
+            runtime.embedded_test_issuer.as_ref().unwrap().clone();
+        assert!(Arc::ptr_eq(&runtime.issuer, &embedded));
+        assert!(Arc::ptr_eq(&cloned.issuer, &embedded));
+        assert!(Arc::ptr_eq(
+            runtime.embedded_test_issuer.as_ref().unwrap(),
+            cloned.embedded_test_issuer.as_ref().unwrap(),
+        ));
+
+        assert_eq!(runtime.stored_credential_count(), Some(0));
+        let values = HashMap::from([("TOKEN".to_string(), "test-value".to_string())]);
+        let handles = cloned
+            .store_provider_credentials(
+                "provider",
+                "workspace",
+                "provider-id",
+                &values,
+                &Handles::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.stored_credential_count(), Some(1));
+        runtime
+            .delete_provider_credential_handles("provider", "workspace", "provider-id", &handles)
+            .await
+            .unwrap();
+        assert_eq!(cloned.stored_credential_count(), Some(0));
     }
 
     #[test]

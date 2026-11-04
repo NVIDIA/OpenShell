@@ -129,17 +129,6 @@ pub trait CredentialIssuer: std::fmt::Debug + Send + Sync {
         scope: RefreshMaterialScope<'_>,
         deletions: &[RefreshMaterialDeletion],
     ) -> Result<(), Status>;
-
-    #[cfg(feature = "test-support")]
-    fn stored_credential_count(&self) -> Option<usize>;
-    #[cfg(feature = "test-support")]
-    fn fail_next_store(&self);
-    #[cfg(feature = "test-support")]
-    fn fail_next_delete(&self);
-    #[cfg(feature = "test-support")]
-    fn gate_next_store(&self) -> TestGate;
-    #[cfg(feature = "test-support")]
-    fn gate_next_resolve(&self) -> TestGate;
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -211,25 +200,5 @@ impl CredentialIssuer for EmbeddedCredentialIssuer {
         deletions: &[RefreshMaterialDeletion],
     ) -> Result<(), Status> {
         Self::delete_refresh_material_deletions(self, scope, deletions).await
-    }
-    #[cfg(feature = "test-support")]
-    fn stored_credential_count(&self) -> Option<usize> {
-        Self::stored_credential_count(self)
-    }
-    #[cfg(feature = "test-support")]
-    fn fail_next_store(&self) {
-        Self::fail_next_store(self);
-    }
-    #[cfg(feature = "test-support")]
-    fn fail_next_delete(&self) {
-        Self::fail_next_delete(self);
-    }
-    #[cfg(feature = "test-support")]
-    fn gate_next_store(&self) -> TestGate {
-        Self::gate_next_store(self)
-    }
-    #[cfg(feature = "test-support")]
-    fn gate_next_resolve(&self) -> TestGate {
-        Self::gate_next_resolve(self)
     }
 }

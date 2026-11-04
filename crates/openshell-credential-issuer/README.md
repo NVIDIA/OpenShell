@@ -34,7 +34,7 @@ Raw resolution returns backend expiration metadata without applying provider pol
 
 Issuer tests cover registry/configuration/transport behavior, owner translation, storage batching, response correlation, and material-key compatibility. The existing server tests continue to cover provider orchestration, refresh races/recovery, credential export, SSH identity, launch material, and delivery through the extracted implementation.
 
-The `test-support` feature exposes the existing static backend and deterministic failure/concurrency hooks to server tests. It is enabled by the server's dev-dependency and explicit test-support feature, not by release defaults. A dependency does not inherit its caller's `cfg(test)`.
+The `test-support` feature exposes the existing static backend and deterministic failure/concurrency hooks on `EmbeddedCredentialIssuer` to server tests. The hooks are not part of `CredentialIssuer`, so other implementations need only implement the storage contract even when this feature is enabled. The server's test helpers retain the same concrete issuer allocation used by its trait object. The feature is enabled by the server's dev-dependency and explicit test-support feature, not by release defaults. A dependency does not inherit its caller's `cfg(test)`.
 
 ```shell
 cargo test -p openshell-credential-issuer
