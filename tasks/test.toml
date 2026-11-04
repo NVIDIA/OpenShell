@@ -307,10 +307,10 @@ env = { OPENSHELL_E2E_KUBE_TEST = "kubernetes_shared_supervisor", OPENSHELL_E2E_
 run = 'OPENSHELL_E2E_KUBE_EXTRA_VALUES="deploy/helm/openshell/ci/values-supervisor.yaml:deploy/helm/openshell/ci/values-tls-port-forward.yaml${OPENSHELL_E2E_KUBE_EXTRA_VALUES:+:$OPENSHELL_E2E_KUBE_EXTRA_VALUES}" e2e/rust/e2e-kubernetes.sh'
 
 ["e2e:kubernetes:shared-supervisor-ha"]
-description = "Run Kubernetes e2e that kills the owning member of a two-replica shared supervisor pool and checks its sandboxes are adopted, not restarted"
-env = { OPENSHELL_E2E_KUBE_TEST = "kubernetes_shared_supervisor_ha", OPENSHELL_E2E_KUBE_TLS = "1", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-shared-supervisor-ha" }
+description = "Run Kubernetes e2e for a two-replica shared supervisor pool behind two gateway replicas: a killed owning member's sandboxes are adopted, not restarted, and each pool sandbox's session stays on its supervisor's gateway through gateway and supervisor failures"
+env = { OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET = "openshell-ha-pg", OPENSHELL_E2E_KUBE_TEST = "kubernetes_shared_supervisor_ha", OPENSHELL_E2E_KUBE_TLS = "1", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-shared-supervisor-ha" }
 # The shared supervisor requires gateway TLS, which the Skaffold values turn off.
-run = 'OPENSHELL_E2E_KUBE_EXTRA_VALUES="deploy/helm/openshell/ci/values-supervisor-ha.yaml:deploy/helm/openshell/ci/values-tls-port-forward.yaml${OPENSHELL_E2E_KUBE_EXTRA_VALUES:+:$OPENSHELL_E2E_KUBE_EXTRA_VALUES}" e2e/rust/e2e-kubernetes.sh'
+run = 'OPENSHELL_E2E_KUBE_EXTRA_VALUES="deploy/helm/openshell/ci/values-high-availability.yaml:deploy/helm/openshell/ci/values-supervisor-ha.yaml:deploy/helm/openshell/ci/values-tls-port-forward.yaml${OPENSHELL_E2E_KUBE_EXTRA_VALUES:+:$OPENSHELL_E2E_KUBE_EXTRA_VALUES}" e2e/rust/e2e-kubernetes.sh'
 
 ["e2e:kubernetes:shared-supervisor-scaling"]
 description = "Run Kubernetes e2e that scales a one-member shared supervisor pool to two members and back to one with Helm, checking sandboxes are handed off, not restarted"

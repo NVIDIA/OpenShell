@@ -435,6 +435,11 @@ impl SupervisorSessionRegistry {
         self.admission_closed.store(true, Ordering::Release);
     }
 
+    /// Watch for [`Self::shutdown`] beginning.
+    pub(crate) fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
     /// Close control sessions and wait for tracked ownership cleanup. Call
     /// after compute shutdown so supervisors can finish normal stop reporting.
     pub(crate) async fn shutdown(&self, timeout: Duration) -> Result<(), String> {

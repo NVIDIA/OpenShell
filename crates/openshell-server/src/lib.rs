@@ -843,6 +843,11 @@ pub(crate) async fn run_server(
             "shared supervisor assignment stream enabled; minting supervisor tokens"
         );
         info!("shared supervisor pool enabled; reconciling pool membership and ownership");
+        // Sandbox sessions dial this endpoint with their tokens.
+        if let Some(peer_endpoint) = state.peer_endpoint.as_deref() {
+            validate_peer_endpoint_scheme(&state.config, peer_endpoint)?;
+        }
+        controller.set_peer_endpoint(state.peer_endpoint.clone().unwrap_or_default());
         supervisor_pool::SupervisorPool::new(
             state.store.clone(),
             controller.clone(),

@@ -44,6 +44,9 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// How long a shared host's session waits for the host to attach to a
+/// gateway replica before dialing another address.
+const GATEWAY_HOME_WAIT: Duration = Duration::from_secs(5);
 const CONFIG_APPLY_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// A stream-delivered configuration update awaiting application by the
@@ -129,6 +132,9 @@ pub struct SessionRuntimeContext {
     /// Publishes whether the current session pushes configuration, so the
     /// runtime stops polling while it does.
     pub config_push_updates: watch::Sender<bool>,
+    /// Peer endpoint of the gateway replica serving this supervisor's shared
+    /// host. When set, sessions dial it instead of the configured address.
+    pub gateway_home: Option<watch::Receiver<Option<String>>>,
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -423,6 +429,7 @@ pub fn spawn_with_readiness(
         session_id_updates: runtime.session_id_updates,
         config_apply_tx: runtime.config_apply_tx,
         config_push_updates: runtime.config_push_updates,
+        gateway_home: runtime.gateway_home,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
@@ -442,6 +449,7 @@ struct SessionConfig {
     /// Publishes whether the current session pushes configuration. A
     /// reconnect to a gateway that does not push resumes polling.
     config_push_updates: watch::Sender<bool>,
+    gateway_home: Option<watch::Receiver<Option<String>>>,
     ready_tx: watch::Sender<bool>,
 }
 
@@ -455,9 +463,22 @@ async fn run_session_loop(config: SessionConfig) {
     // back to the configured address, which load-balances across replicas.
     let mut target = config.gateway.clone();
     let mut redirected = false;
+    // A shared host's sessions dial the replica serving the host, as
+    // redirected so that replica serves them, unless they are following a
+    // redirect away from it.
+    let mut gateway_home = config.gateway_home.clone();
+    let mut follow_home = true;
 
     loop {
         attempt += 1;
+        if follow_home
+            && let Some(home) = gateway_home.as_mut()
+            && let Some(endpoint) = wait_for_home(home, None).await
+        {
+            target = config.gateway.with_url(endpoint);
+            redirected = true;
+        }
+        follow_home = true;
 
         let result = run_single_session(&config, &target, redirected, attempt).await;
         if let Some(updates) = &config.session_id_updates {
@@ -485,9 +506,26 @@ async fn run_session_loop(config: SessionConfig) {
                     peer_endpoint = %peer_endpoint,
                     "supervisor session: following gateway redirect"
                 );
+                // Prefer the replica the shared host moved to.
+                let home = match gateway_home.as_mut() {
+                    Some(home) => wait_for_home(home, Some(target.url())).await,
+                    None => None,
+                };
+                target = config.gateway.with_url(home.unwrap_or(peer_endpoint));
+                redirected = true;
+                follow_home = false;
+                // No backoff: this is an expected handoff, not a failure.
+            }
+            Ok(SessionOutcome::HomeMoved { peer_endpoint }) => {
+                backoff.on_redirect(config.ready_tx.send_replace(false));
+                info!(
+                    sandbox_id = %config.sandbox_id,
+                    peer_endpoint = %peer_endpoint,
+                    "supervisor session: following the shared host to another gateway"
+                );
                 target = config.gateway.with_url(peer_endpoint);
                 redirected = true;
-                // No backoff: this is an expected handoff, not a failure.
+                follow_home = false;
             }
             Err(e) => {
                 let accepted = config.ready_tx.send_replace(false);
@@ -555,6 +593,44 @@ impl ReconnectBackoff {
     }
 }
 
+/// The peer endpoint of the replica serving the shared host, once it is one
+/// other than `avoid`, waiting up to [`GATEWAY_HOME_WAIT`] while no replica
+/// serves the host. `None` at once when the serving replica has no endpoint.
+async fn wait_for_home(
+    home: &mut watch::Receiver<Option<String>>,
+    avoid: Option<&str>,
+) -> Option<String> {
+    tokio::time::timeout(
+        GATEWAY_HOME_WAIT,
+        home.wait_for(|home| home.as_deref().is_some_and(|home| Some(home) != avoid)),
+    )
+    .await
+    .ok()?
+    .ok()
+    .and_then(|home| (*home).clone())
+    .filter(|home| !home.is_empty())
+}
+
+/// The peer endpoint of the shared host, once it is one other than `current`,
+/// including a move that landed before this is first polled. Pending forever
+/// without a shared host.
+async fn home_moved(home: Option<&mut watch::Receiver<Option<String>>>, current: &str) -> String {
+    let Some(home) = home else {
+        return std::future::pending().await;
+    };
+    loop {
+        let endpoint = home.borrow_and_update().clone();
+        if let Some(endpoint) =
+            endpoint.filter(|endpoint| !endpoint.is_empty() && endpoint != current)
+        {
+            return endpoint;
+        }
+        if home.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
+}
+
 /// Keep asking not to be redirected when a redirected attempt never got a
 /// session, so a stale ring pointing at a dead replica cannot bounce us back
 /// to it. A session that was accepted and later dropped starts placement over.
@@ -579,6 +655,9 @@ enum SessionOutcome {
         peer_endpoint: String,
         owner_replica_id: String,
     },
+    /// The shared host reattached to another replica. The caller reconnects
+    /// there.
+    HomeMoved { peer_endpoint: String },
 }
 
 async fn run_single_session(
@@ -693,9 +772,13 @@ async fn run_single_session(
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat_interval.tick().await; // skip immediate tick
+    let mut home = config.gateway_home.clone();
 
     loop {
         tokio::select! {
+            peer_endpoint = home_moved(home.as_mut(), target.url()) => {
+                return Ok(SessionOutcome::HomeMoved { peer_endpoint });
+            }
             msg = inbound.message() => {
                 let msg = match map_session_stream_message(
                     msg,
@@ -1634,6 +1717,77 @@ mod ocsf_event_tests {
         assert!(!redirect_survives_failure(true, true));
         assert!(!redirect_survives_failure(false, false));
         assert!(!redirect_survives_failure(false, true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_host_sessions_wait_for_the_hosts_gateway() {
+        let (tx, mut home) = watch::channel(None);
+        assert_eq!(wait_for_home(&mut home, None).await, None);
+
+        tx.send_replace(Some("https://gw-a:8443".to_string()));
+        assert_eq!(
+            wait_for_home(&mut home, None).await.as_deref(),
+            Some("https://gw-a:8443")
+        );
+        assert_eq!(
+            wait_for_home(&mut home, Some("https://gw-a:8443")).await,
+            None
+        );
+
+        let mut moving = home.clone();
+        let moved =
+            tokio::spawn(
+                async move { wait_for_home(&mut moving, Some("https://gw-a:8443")).await },
+            );
+        tokio::task::yield_now().await;
+        tx.send_replace(Some("https://gw-b:8443".to_string()));
+        assert_eq!(moved.await.unwrap().as_deref(), Some("https://gw-b:8443"));
+    }
+
+    #[tokio::test]
+    async fn a_host_gateway_without_a_peer_endpoint_is_not_waited_for() {
+        let (_tx, mut home) = watch::channel(Some(String::new()));
+        let started = tokio::time::Instant::now();
+        assert_eq!(wait_for_home(&mut home, None).await, None);
+        assert!(started.elapsed() < GATEWAY_HOME_WAIT);
+
+        let moved = tokio::time::timeout(
+            Duration::from_millis(50),
+            home_moved(Some(&mut home), "https://gw-a:8443"),
+        )
+        .await;
+        assert!(moved.is_err(), "an endpointless gateway is not a move");
+    }
+
+    #[tokio::test]
+    async fn a_host_move_during_session_setup_is_followed() {
+        let (tx, mut home) = watch::channel(Some("https://gw-a:8443".to_string()));
+        // The session dialed A; the host moved to B before it was accepted,
+        // and the move was already observed.
+        tx.send_replace(Some("https://gw-b:8443".to_string()));
+        home.mark_unchanged();
+        assert_eq!(
+            home_moved(Some(&mut home), "https://gw-a:8443").await,
+            "https://gw-b:8443"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_established_session_follows_its_host_to_another_gateway() {
+        let (tx, mut home) = watch::channel(Some("https://gw-a:8443".to_string()));
+        let moved =
+            tokio::spawn(async move { home_moved(Some(&mut home), "https://gw-a:8443").await });
+
+        tx.send_replace(None);
+        tx.send_replace(Some("https://gw-a:8443".to_string()));
+        tokio::task::yield_now().await;
+        assert!(
+            !moved.is_finished(),
+            "a reattach to the same gateway is not a move"
+        );
+
+        tx.send_replace(Some("https://gw-b:8443".to_string()));
+        assert_eq!(moved.await.unwrap(), "https://gw-b:8443");
     }
 
     #[test]
