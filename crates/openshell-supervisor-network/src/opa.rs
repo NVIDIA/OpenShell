@@ -54,6 +54,32 @@ fn new_regorus_engine() -> Result<regorus::Engine> {
             }),
         )
         .map_err(|_| miette::miette!("failed to register endpoint path matcher"))?;
+    engine
+        .add_extension(
+            "openshell.selected_l7_protocol".into(),
+            2,
+            Box::new(|params: Vec<regorus::Value>| {
+                let configs = params[0]
+                    .as_array()?
+                    .iter()
+                    .filter_map(crate::l7::parse_l7_config)
+                    .collect::<Vec<_>>();
+                let path = params[1].as_string()?;
+                let protocol =
+                    crate::l7::relay::select_l7_config_for_path(&configs, path).map(|config| {
+                        match config.protocol {
+                            crate::l7::L7Protocol::Rest => "rest",
+                            crate::l7::L7Protocol::Websocket => "websocket",
+                            crate::l7::L7Protocol::Graphql => "graphql",
+                            crate::l7::L7Protocol::Sql => "sql",
+                            crate::l7::L7Protocol::JsonRpc => "json-rpc",
+                            crate::l7::L7Protocol::Mcp => "mcp",
+                        }
+                    });
+                Ok(protocol.map_or(regorus::Value::Undefined, regorus::Value::from))
+            }),
+        )
+        .map_err(|_| miette::miette!("failed to register L7 route protocol selector"))?;
     Ok(engine)
 }
 
@@ -6531,6 +6557,170 @@ network_policies:
             !eval_l7(&engine, &blocked_tool),
             "tools/call for a non-matching tool must be denied (params matcher must survive the proto load path)"
         );
+    }
+
+    #[test]
+    fn l7_route_protocol_confines_sibling_allows_from_proto() {
+        for protocol in ["json-rpc", "mcp"] {
+            for broad_protocol in ["rest", "json-rpc", "mcp"] {
+                if protocol == broad_protocol {
+                    continue;
+                }
+                for split_policies in [false, true] {
+                    let narrow_allow = if protocol == "mcp" {
+                        "{ method: tools/call, tool: read_status }"
+                    } else {
+                        "{ method: tools/list }"
+                    };
+                    let broad_rules = if broad_protocol == "rest" {
+                        "access: read-write"
+                    } else {
+                        "rules: [{ allow: { method: tools/call } }]"
+                    };
+                    let broad = format!(
+                        "      - host: \"*.routes.test\"\n        port: 8000\n        protocol: {broad_protocol}\n        enforcement: enforce\n        {broad_rules}\n"
+                    );
+                    let narrow = format!(
+                        "      - host: api.routes.test\n        port: 8000\n        path: /services/*\n        protocol: {protocol}\n        enforcement: enforce\n        rules: [{{ allow: {narrow_allow} }}]\n"
+                    );
+                    let binary = "    binaries: [{ path: /usr/bin/curl }]\n";
+                    let yaml = if split_policies {
+                        format!(
+                            "version: 1\nnetwork_policies:\n  broad:\n    endpoints:\n{broad}{binary}  narrow:\n    endpoints:\n{narrow}{binary}"
+                        )
+                    } else {
+                        format!(
+                            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n{broad}{narrow}{binary}"
+                        )
+                    };
+                    let mut proto = openshell_policy::parse_sandbox_policy(&yaml).unwrap();
+                    for policy in proto.network_policies.values_mut() {
+                        for endpoint in &mut policy.endpoints {
+                            endpoint.token_grant_owner = format!("owner-{}", endpoint.protocol);
+                        }
+                    }
+                    let engine = OpaEngine::from_proto(&proto).unwrap_or_else(|error| {
+                        panic!("{protocol} / {broad_protocol} split={split_policies}: {error:?}")
+                    });
+                    let request = |allowed| {
+                        if protocol == "mcp" {
+                            l7_jsonrpc_input_with_params(
+                                "api.routes.test",
+                                8000,
+                                "/services/catalog",
+                                "tools/call",
+                                serde_json::json!({"name": if allowed { "read_status" } else { "write_status" }}),
+                            )
+                        } else {
+                            l7_jsonrpc_input(
+                                "api.routes.test",
+                                8000,
+                                "/services/catalog",
+                                if allowed { "tools/list" } else { "tools/call" },
+                            )
+                        }
+                    };
+                    assert!(
+                        eval_l7(&engine, &request(true)),
+                        "configured {protocol} call must remain allowed"
+                    );
+                    assert!(
+                        !eval_l7(&engine, &request(false)),
+                        "{broad_protocol} sibling must not admit excluded {protocol} call; split_policies={split_policies}"
+                    );
+                    assert_eq!(
+                        eval_token_grant_owners(&engine, &request(true)),
+                        [format!("owner-{protocol}")],
+                        "cross-protocol siblings must not contribute credentials"
+                    );
+                    assert!(eval_token_grant_owners(&engine, &request(false)).is_empty());
+                    if broad_protocol == "rest" {
+                        assert!(
+                            eval_l7(
+                                &engine,
+                                &l7_input("api.routes.test", 8000, "POST", "/public")
+                            ),
+                            "REST requests outside the RPC route must retain broad access"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn l7_route_protocol_preserves_same_protocol_union_and_global_denies() {
+        let yaml = r#"
+version: 1
+network_policies:
+  api:
+    endpoints:
+      - host: api.routes.test
+        port: 8000
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow: { method: status.get }
+      - host: api.routes.test
+        port: 8000
+        path: /services/**
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+        deny_rules:
+          - { method: POST, path: /services/private/** }
+      - host: api.routes.test
+        port: 8000
+        path: /services/private/**
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow: { method: status.set }
+    binaries: [{ path: /usr/bin/curl }]
+"#;
+        let proto = openshell_policy::parse_sandbox_policy(yaml).unwrap();
+        let engine = OpaEngine::from_proto(&proto).unwrap();
+        // The most-specific route returns to JSON-RPC after an intermediate
+        // REST route. Both JSON-RPC endpoints still contribute allow rules,
+        // while the REST endpoint's explicit deny remains authoritative.
+        let request = l7_jsonrpc_input(
+            "api.routes.test",
+            8000,
+            "/services/private/data",
+            "status.get",
+        );
+        assert!(!eval_l7(&engine, &request));
+        let mut without_deny = proto;
+        without_deny
+            .network_policies
+            .get_mut("api")
+            .unwrap()
+            .endpoints[1]
+            .deny_rules
+            .clear();
+        let engine = OpaEngine::from_proto(&without_deny).unwrap();
+        assert!(
+            eval_l7(&engine, &request),
+            "broader same-protocol endpoint must still admit request"
+        );
+        assert!(eval_l7(
+            &engine,
+            &l7_jsonrpc_input(
+                "api.routes.test",
+                8000,
+                "/services/private/data",
+                "status.set"
+            )
+        ));
+        assert!(!eval_l7(
+            &engine,
+            &l7_jsonrpc_input(
+                "api.routes.test",
+                8000,
+                "/services/private/data",
+                "status.delete"
+            )
+        ));
     }
 
     #[test]
