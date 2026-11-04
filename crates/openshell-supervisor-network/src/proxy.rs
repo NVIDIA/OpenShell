@@ -8882,40 +8882,46 @@ process:
 
     #[tokio::test]
     async fn reserved_destination_is_served_without_policy_evaluation() {
-        let engine = reserved_test_engine();
-        let (reserved, mut served_rx, calls) = reserved_relay(true);
-        let (open, decision, mut peer) =
-            staged_open(&engine, openshell_core::sandbox_env::OTLP_RELAY_ADDR);
+        let addr = *OTLP_RELAY_ADDR;
+        for destination in [
+            addr.to_string(),
+            format!("[::ffff:{}]:{}", addr.ip(), addr.port()),
+        ] {
+            let engine = reserved_test_engine();
+            let (reserved, mut served_rx, calls) = reserved_relay(true);
+            let (open, decision, mut peer) = staged_open(&engine, &destination);
 
-        assert!(
-            preauthorize_transparent_open(
-                open,
-                None,
-                &engine,
-                &BinaryIdentityCache::new(),
-                None,
-                None,
-                false,
-                None,
-                Some(&reserved)
-            )
-            .await
-            .is_none(),
-            "a reserved open never becomes a proxy connection"
-        );
-        assert_eq!(decision.await.unwrap(), TcpOpenDecision::RelayReady);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                preauthorize_transparent_open(
+                    open,
+                    None,
+                    &engine,
+                    &BinaryIdentityCache::new(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some(&reserved)
+                )
+                .await
+                .is_none(),
+                "a reserved open never becomes a proxy connection"
+            );
+            assert_eq!(decision.await.unwrap(), TcpOpenDecision::RelayReady);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // The handler holds the workload's stream: bytes written by the
-        // workload side arrive at the handler.
-        let mut stream = tokio::time::timeout(std::time::Duration::from_secs(1), served_rx.recv())
-            .await
-            .expect("handler future ran")
-            .expect("handler received the stream");
-        peer.write_all(b"POST /v1/traces").await.unwrap();
-        let mut head = [0u8; 15];
-        stream.read_exact(&mut head).await.unwrap();
-        assert_eq!(&head, b"POST /v1/traces");
+            // The handler holds the workload's stream: bytes written by the
+            // workload side arrive at the handler.
+            let mut stream =
+                tokio::time::timeout(std::time::Duration::from_secs(1), served_rx.recv())
+                    .await
+                    .expect("handler future ran")
+                    .expect("handler received the stream");
+            peer.write_all(b"POST /v1/traces").await.unwrap();
+            let mut head = [0u8; 15];
+            stream.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head, b"POST /v1/traces");
+        }
     }
 
     #[tokio::test]
