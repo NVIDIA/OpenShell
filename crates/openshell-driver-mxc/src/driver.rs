@@ -539,6 +539,119 @@ impl MxcComputeBackend {
         Ok(())
     }
 
+    /// Restart a stopped sandbox by running its lifecycle again with the fresh
+    /// launch credentials the gateway supplies for this start.
+    ///
+    /// Stop tears the runtime down completely; for an isolation session that
+    /// includes deprovisioning the agent user. Restart therefore provisions a
+    /// new runtime generation (and, for an isolation session, a new agent user)
+    /// from the stored sandbox spec. Host paths named by the policy, such as the
+    /// workspace, are unaffected by stop and so persist across the restart.
+    pub async fn start_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        fresh_launch_authentication: Vec<u8>,
+    ) -> Result<(), tonic::Status> {
+        if fresh_launch_authentication.is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "launch authentication is required to start an MXC sandbox",
+            ));
+        }
+        let gate = {
+            let registry = self.registry.lock().await;
+            let entry = registry.get(sandbox_id).ok_or_else(|| {
+                tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
+            })?;
+            if entry.sandbox.name != sandbox_name {
+                return Err(tonic::Status::failed_precondition(
+                    "sandbox_id did not match sandbox_name",
+                ));
+            }
+            entry.lifecycle_gate.clone()
+        };
+        let startup_guard = gate.lock_owned().await;
+
+        let (mut sandbox, previous_host, previous_boundary) = {
+            let registry = self.registry.lock().await;
+            let entry = registry.get(sandbox_id).ok_or_else(|| {
+                tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
+            })?;
+            match entry.phase_state {
+                PhaseState::Stopped | PhaseState::Failed(_) => {}
+                // A retried start of a sandbox that is already up is not an error.
+                PhaseState::Running | PhaseState::Starting => return Ok(()),
+            }
+            (
+                entry.sandbox.clone(),
+                entry.host_state_dir.clone(),
+                entry.boundary_state_dir.clone(),
+            )
+        };
+        if let Some(spec) = sandbox.spec.as_mut() {
+            spec.launch_authentication = fresh_launch_authentication;
+        } else {
+            return Err(tonic::Status::failed_precondition(
+                "stored MXC sandbox has no spec to restart",
+            ));
+        }
+        let launch = launch_authentication(&sandbox)?;
+        launch
+            .validate()
+            .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
+        let sandbox_config = sandbox_config(&sandbox)?;
+        let generation = safe_component(launch.supervisor.runtime_generation.as_str())?.to_string();
+        let host_state_dir = self
+            .config
+            .state_dir
+            .join(safe_component(sandbox_id)?)
+            .join(&generation);
+        let boundary_state_dir = PathBuf::from(&sandbox_config.cwd)
+            .join(".openshell-runtime")
+            .join(&generation);
+        if previous_host != host_state_dir {
+            cleanup_runtime_directory(&previous_host);
+        }
+        if previous_boundary != boundary_state_dir {
+            cleanup_runtime_directory(&previous_boundary);
+        }
+
+        let starting = make_sandbox_with_condition(
+            &sandbox,
+            &condition("Ready", "False", "Starting", "MXC runtime restarting"),
+            false,
+        );
+        {
+            let mut registry = self.registry.lock().await;
+            let entry = registry.get_mut(sandbox_id).ok_or_else(|| {
+                tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
+            })?;
+            entry.sandbox = starting.clone();
+            entry.phase_state = PhaseState::Starting;
+            entry.shutdown_tx = None;
+            entry.terminated_rx = None;
+            entry.host_state_dir.clone_from(&host_state_dir);
+            entry.boundary_state_dir.clone_from(&boundary_state_dir);
+        }
+        let _ = self.watch_tx.send(sandbox_event(starting));
+        let context = LifecycleContext {
+            invoker: self.invoker.clone(),
+            config: self.config.clone(),
+            gateway: self.gateway.clone(),
+            registry: self.registry.clone(),
+            watch_tx: self.watch_tx.clone(),
+            attribution: self.attribution.clone(),
+            sandbox,
+            sandbox_config,
+            generation,
+            host_state_dir,
+            boundary_state_dir,
+            policy_mapper: self.policy_mapper.clone(),
+        };
+        tokio::spawn(async move { run_lifecycle(context, startup_guard).await });
+        Ok(())
+    }
+
     pub async fn delete_sandbox(
         &self,
         sandbox_id: &str,

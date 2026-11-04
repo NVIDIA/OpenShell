@@ -127,11 +127,16 @@ impl ComputeDriver for ComputeDriverService {
 
     async fn start_sandbox(
         &self,
-        _request: Request<StartSandboxRequest>,
+        request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "mxc driver does not support restarting stopped sandboxes",
-        ))
+        let req = request.into_inner();
+        if req.sandbox_id.is_empty() || req.name.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id and name are required"));
+        }
+        self.backend
+            .start_sandbox(&req.sandbox_id, &req.name, req.launch_authentication)
+            .await?;
+        Ok(Response::new(StartSandboxResponse::default()))
     }
 
     async fn delete_sandbox(
@@ -185,7 +190,7 @@ mod tests {
     use crate::driver::MxcComputeConfig;
 
     #[tokio::test]
-    async fn start_sandbox_reports_one_shot_lifecycle() {
+    async fn start_sandbox_validates_the_request() {
         let service = ComputeDriverService::new(MxcComputeBackend::new(
             openshell_core::config::DEFAULT_GATEWAY_NAME,
             MxcComputeConfig::default(),
@@ -194,10 +199,30 @@ mod tests {
         let error = service
             .start_sandbox(Request::new(StartSandboxRequest::default()))
             .await
-            .expect_err("MXC must not restart a stopped one-shot workload");
+            .expect_err("a start without a sandbox identity is rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
-        assert_eq!(error.code(), tonic::Code::Unimplemented);
-        assert!(error.message().contains("does not support restarting"));
+        let error = service
+            .start_sandbox(Request::new(StartSandboxRequest {
+                sandbox_id: "missing".to_string(),
+                name: "missing".to_string(),
+                launch_authentication: Vec::new(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a start without fresh launch credentials is rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        let error = service
+            .start_sandbox(Request::new(StartSandboxRequest {
+                sandbox_id: "missing".to_string(),
+                name: "missing".to_string(),
+                launch_authentication: b"{}".to_vec(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unknown sandbox cannot be started");
+        assert_eq!(error.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
