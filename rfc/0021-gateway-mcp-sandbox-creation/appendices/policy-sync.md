@@ -167,13 +167,15 @@ sequenceDiagram
 | Situation | What happens | Why |
 |---|---|---|
 | Child created while the parent has no loaded revision | Refused | A child copies only a policy the parent enforces |
+| Which parent revision is "enforced" | The one at the parent's `current_policy_version`, the last version it reported loaded, read by version | A newer revision marks it superseded before loading, and a failed re-apply marks it failed, so "the newest revision with status loaded" can be missing or older |
+| A "failed" report for the parent's current version | `fail_closed`: parent and children blocked. `retain_last_valid`: children keep that version, and new children copy it | The parent still enforces that version under `retain_last_valid`; an older one could allow more |
 | Two syncs finish out of order, v8 then v7 | v7 is skipped | The child's tag already says v8; a sync only moves a child forward |
 | Sync runs twice for v8 | The second run writes nothing | The tag check makes it safe to repeat |
 | One child's lock times out during a sync | Its siblings are still synced; the error is logged and reported at the end | One stuck child must not hold a revocation back from the others |
 | The child's newest revision has no parent tag | It counts as behind and gets re-copied | Nothing but the sync may decide a child's policy |
 | The parent's copy binds a provider the child lacks | Child is not admitted and fails closed | Children never keep access the parent lost |
 | Gateway set to `retain_last_valid` | The parent keeps that mode; children always use `fail_closed` | A child that kept its old copy could keep revoked access |
-| Parent uses `retain_last_valid` and has a newer pending or failed revision | Children copy the parent's loaded revision | Children get what the parent enforces |
+| Parent uses `retain_last_valid` and has a newer pending or failed revision | Children copy the parent's enforced revision | Children get what the parent enforces |
 | Child's image needs a system path its parent's image lacks | The path is not added; something in the child may get "permission denied" | Child = parent exactly; the gateway log shows the dropped write |
 | Parent is unblocked but the child's copy is already current | The re-push of every child admits it again | This is why re-push runs on every sync, not only when it writes |
 | Provider attach on a child | Allowed only if the parent has the provider, checked under the parent's lock | A child's providers are a subset of its parent's |
@@ -187,4 +189,4 @@ sequenceDiagram
 - **Up to one rebuild of extra access.** A child keeps its old copy until its next rebuild, about 30 s, if the sync after a parent change fails. Notifying children when the parent loads would close this.
 - **Parent delete and child create across replicas.** Deleting a sandbox takes the parent's lock only within one gateway process, so on two replicas both can succeed; the child is then stopped as an orphan.
 - **Stopping an orphan by name.** The stop re-reads the child by name and checks its id, but a short window remains before the stop; closing it needs a stop by id in the compute layer.
-- **A late "failed" report for a revision that already loaded** might leave the parent with no loaded revision, which delivery and create both read. Not yet tested.
+- **Failures of a loaded version cannot be told apart.** A "failed" report for the version a parent last loaded may be a re-apply that failed or a late result from a replaced polling session; both are recorded as failed. Under `fail_closed` the children are then blocked with the parent until it loads again.
