@@ -232,6 +232,7 @@ mod tests {
             profiles: vec!["container".to_string(), "host".to_string()],
             uid: Some("sandbox-abc123".to_string()),
             log_source: None,
+            correlation_uid: None,
         }
     }
 

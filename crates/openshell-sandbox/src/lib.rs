@@ -3,6 +3,7 @@
 
 //! Capability-free in-workload sandbox boundary.
 
+pub mod binary_pins;
 #[cfg(target_os = "linux")]
 pub mod boundary_exec;
 #[cfg(target_os = "linux")]
@@ -74,3 +75,6 @@ pub fn run(
     boundary_server::run_boundary(config_path, qualification)
         .map_err(|error| miette::miette!(error))
 }
+
+#[cfg(target_os = "linux")]
+mod native_api;

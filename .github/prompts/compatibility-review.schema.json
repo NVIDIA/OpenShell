@@ -15,7 +15,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["surface", "change", "impact", "evidence", "recommendation", "pull_request", "acknowledgement"],
+        "required": ["surface", "change", "impact", "evidence", "recommendation", "pull_request", "acknowledgement", "acknowledgement_url", "previous_report_url"],
         "properties": {
           "surface": {"type": "string"},
           "change": {"type": "string"},
@@ -23,6 +23,8 @@
           "evidence": {"type": "string"},
           "recommendation": {"type": "string"},
           "pull_request": {"type": "string"},
+          "acknowledgement_url": {"type": "string"},
+          "previous_report_url": {"type": "string"},
           "acknowledgement": {
             "type": "string",
             "enum": ["ACKED", "NOT ACKED", "UNKNOWN"]

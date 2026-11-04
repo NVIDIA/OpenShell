@@ -119,6 +119,7 @@ mod tests {
                     profiles: vec!["security_control".to_string()],
                     uid: Some("sandbox-abc123".to_string()),
                     log_source: None,
+                    correlation_uid: None,
                 },
             ),
             http_request: Some(HttpRequest::new(

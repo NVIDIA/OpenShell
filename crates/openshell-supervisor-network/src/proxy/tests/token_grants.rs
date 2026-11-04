@@ -44,7 +44,6 @@ fn forward_inspection_fixture() -> (
         Ok("grant-token"),
         false,
     );
-    ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
     ctx.provider_credentials = Some(fixture.provider_credentials());
     ctx.token_grant_resolver = Some(fixture.resolver());
     (config, engine, ctx, fixture)
@@ -79,6 +78,8 @@ async fn forward_inspection_selects_only_the_owner_admitting_the_request() {
                 engine: &engine,
                 request_info: &info,
             }),
+            "5c4b3a29-1807-4f6e-8d5c-4b3a29180716",
+            None,
         )
         .await
         .expect("prepare admitted forward request");
@@ -127,6 +128,8 @@ async fn forward_inspection_retains_installation_through_guarded_write() {
             engine: &engine,
             request_info: &info,
         }),
+        "5c4b3a29-1807-4f6e-8d5c-4b3a29180716",
+        None,
     )
     .await
     .expect("prepare authenticated request");

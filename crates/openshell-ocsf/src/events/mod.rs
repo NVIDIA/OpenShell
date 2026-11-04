@@ -5,6 +5,7 @@
 
 mod api_activity;
 mod app_lifecycle;
+mod authentication;
 pub(crate) mod base_event;
 mod config_state_change;
 mod detection_finding;
@@ -16,6 +17,7 @@ mod ssh_activity;
 
 pub use api_activity::ApiActivityEvent;
 pub use app_lifecycle::ApplicationLifecycleEvent;
+pub use authentication::AuthenticationEvent;
 pub use base_event::{BaseEvent, BaseEventData};
 pub use config_state_change::DeviceConfigStateChangeEvent;
 pub use detection_finding::DetectionFindingEvent;
@@ -41,6 +43,8 @@ pub enum OcsfEvent {
     SshActivity(SshActivityEvent),
     /// Process Activity [1007]
     ProcessActivity(ProcessActivityEvent),
+    /// Authentication [3002]
+    Authentication(AuthenticationEvent),
     /// Detection Finding [2004]
     DetectionFinding(DetectionFindingEvent),
     /// Application Lifecycle [6002]
@@ -60,6 +64,7 @@ impl Serialize for OcsfEvent {
             Self::HttpActivity(e) => e.serialize(serializer),
             Self::SshActivity(e) => e.serialize(serializer),
             Self::ProcessActivity(e) => e.serialize(serializer),
+            Self::Authentication(e) => e.serialize(serializer),
             Self::DetectionFinding(e) => e.serialize(serializer),
             Self::ApplicationLifecycle(e) => e.serialize(serializer),
             Self::DeviceConfigStateChange(e) => e.serialize(serializer),
@@ -92,6 +97,9 @@ impl<'de> Deserialize<'de> for OcsfEvent {
             1007 => serde_json::from_value::<ProcessActivityEvent>(value)
                 .map(Self::ProcessActivity)
                 .map_err(serde::de::Error::custom),
+            3002 => serde_json::from_value::<AuthenticationEvent>(value)
+                .map(Self::Authentication)
+                .map_err(serde::de::Error::custom),
             2004 => serde_json::from_value::<DetectionFindingEvent>(value)
                 .map(Self::DetectionFinding)
                 .map_err(serde::de::Error::custom),
@@ -123,6 +131,7 @@ impl OcsfEvent {
             Self::HttpActivity(_) => 4002,
             Self::SshActivity(_) => 4007,
             Self::ProcessActivity(_) => 1007,
+            Self::Authentication(_) => 3002,
             Self::DetectionFinding(_) => 2004,
             Self::ApplicationLifecycle(_) => 6002,
             Self::DeviceConfigStateChange(_) => 5019,
@@ -139,6 +148,7 @@ impl OcsfEvent {
             Self::HttpActivity(e) => &e.base,
             Self::SshActivity(e) => &e.base,
             Self::ProcessActivity(e) => &e.base,
+            Self::Authentication(e) => &e.base,
             Self::DetectionFinding(e) => &e.base,
             Self::ApplicationLifecycle(e) => &e.base,
             Self::DeviceConfigStateChange(e) => &e.base,
@@ -152,9 +162,9 @@ impl OcsfEvent {
 mod tests {
     use super::*;
     use crate::builders::{
-        ApiActivityBuilder, AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder,
-        DetectionFindingBuilder, HttpActivityBuilder, NetworkActivityBuilder,
-        ProcessActivityBuilder, SshActivityBuilder, test_sandbox_context,
+        ApiActivityBuilder, AppLifecycleBuilder, AuthenticationBuilder, BaseEventBuilder,
+        ConfigStateChangeBuilder, DetectionFindingBuilder, HttpActivityBuilder,
+        NetworkActivityBuilder, ProcessActivityBuilder, SshActivityBuilder, test_sandbox_context,
     };
     use crate::enums::*;
     use crate::objects::*;
@@ -316,6 +326,22 @@ mod tests {
         assert!(matches!(deserialized, OcsfEvent::ApiActivity(_)));
         assert_eq!(deserialized.class_uid(), 6003);
         assert!(deserialized.base().ai_model.is_some());
+    }
+
+    #[test]
+    fn test_roundtrip_authentication() {
+        let ctx = test_sandbox_context();
+        let event = AuthenticationBuilder::new(
+            &ctx,
+            User::unidentified(),
+            Service::new("openshell-gateway"),
+        )
+        .build();
+
+        let json = serde_json::to_value(&event).unwrap();
+        let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(deserialized, OcsfEvent::Authentication(_)));
+        assert_eq!(deserialized.class_uid(), 3002);
     }
 
     #[test]

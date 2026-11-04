@@ -3,10 +3,10 @@
 
 //! Sandbox-local [`BoundaryLoopbackConnector`] implementation.
 
+use crate::native_api::BoundaryLoopbackConnector;
+
 use async_trait::async_trait;
-use openshell_isolation_interface::contract::{
-    BackendError, BoundaryDuplexStream, BoundaryLoopbackConnector, LoopbackTarget,
-};
+use openshell_isolation_interface::contract::{BackendError, BoundaryDuplexStream, LoopbackTarget};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};

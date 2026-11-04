@@ -658,6 +658,42 @@ Token grants require the sandbox supervisor to have access to a SPIFFE Workload 
 
 The gateway only brokers an intermediate token for a sandbox principal, and only when the requested provider is attached to that sandbox. It verifies the supervisor JWT-SVID issuer, audience, signature, and SPIFFE trust domain against the gateway's own JWT-SVID, then uses the verified supervisor SVID subject as the intermediate-token audience.
 
+### Token Grant Failures
+
+A failed grant returns HTTP 502 without forwarding the protected request. Connection setup, including an upstream TLS handshake, may already have completed. The workload response hides the cause; authorized sandbox readers can [diagnose the failure](/how-it-works/sandboxes/overview#read-token-grant-failures). The request ID correlates the response, sandbox status, and supervisor/gateway logs. OpenShell never logs the token service's `error` or `error_description`, which can echo credentials.
+
+Each failure has a code, a stage identifying the failed step, and a recovery action:
+
+| Code | Meaning | Recovery action |
+|---|---|---|
+| `provider_authorization_required` | Provider authorization is required, including a missing or expired stored subject credential. | `reauthorize` |
+| `workload_identity_rejected` | The workload identity was rejected. | `fix_configuration` |
+| `configuration_error` | Provider, grant, or token-service configuration is invalid. | `fix_configuration` |
+| `timeout` | A grant step timed out. | `retry` |
+| `unavailable` | A service or connection was unavailable. | `retry` |
+| `unclassified` | No more specific cause is established. | `investigate` |
+
+Without a recognized error extension, HTTP 429, 5xx, and connection failures, including TLS verification failures, are `unavailable`; timeouts are `timeout`. Other failures are `unclassified`, including response bodies over 64 KiB and successful responses without a valid `access_token`. A generic 401 never implies reauthorization.
+
+A token service can report a specific cause using the `openshell.token-grant.v1` extension. For example, return HTTP 409 with:
+
+```json
+{
+  "error": "provider_authorization_required",
+  "openshell_error_contract": "openshell.token-grant.v1"
+}
+```
+
+OpenShell requires the exact contract marker and one of these pairs:
+
+| HTTP status | Error code |
+|---|---|
+| 409 | `provider_authorization_required` |
+| 401 or 403 | `workload_identity_rejected` |
+| 400 | `configuration_error` |
+
+The extension requires the configured endpoint over verified HTTPS; redirects are not followed. Recognized codes over plain HTTP or with a mismatched status are `unclassified`. Unknown versions or codes fall back to HTTP-status classification. Generic OAuth errors such as `invalid_client` and `invalid_grant` do not establish identity rejection.
+
 ## Provider Instances
 
 A provider instance stores concrete credentials and config for a profile type. `--type` accepts the ID of any imported profile, matched exactly. Creating a provider for a profile the gateway does not serve fails and names the import command.

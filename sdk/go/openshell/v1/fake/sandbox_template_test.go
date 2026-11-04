@@ -233,7 +233,7 @@ func TestSandboxTemplate_CreateSandboxFromTemplateResolvesWorkloadAndGovernance(
 			Providers: []string{"github"},
 			Policy:    policy,
 		},
-		map[string]string{"team": "runtime"},
+		types.WithLabels(map[string]string{"team": "runtime"}),
 	)
 
 	require.NoError(t, err)
@@ -345,7 +345,6 @@ func TestSandboxTemplate_CreateSandboxFromTemplatePreservesDefaultGPURequest(t *
 		"default",
 		"job-default-gpu",
 		"default-gpu",
-		nil,
 		nil,
 	)
 

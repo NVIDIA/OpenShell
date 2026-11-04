@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: Build Docker Image
-description: Build, push, and export a multi-platform OpenShell image
+description: Build and export a multi-platform OpenShell image, optionally pushing it
 
 inputs:
   component:
@@ -17,6 +17,9 @@ inputs:
   image-tag:
     description: Docker image tag
     required: true
+  push:
+    description: Push the image to GHCR during the build
+    default: "true"
   github-token:
     description: Token used to push the image
     required: true
@@ -29,6 +32,7 @@ runs:
         buildkitd-config: /etc/buildkit/buildkitd.toml
 
     - name: Log in to GHCR
+      if: inputs.push == 'true'
       uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
       with:
         registry: ghcr.io
@@ -60,8 +64,13 @@ runs:
       env:
         COMPONENT: ${{ inputs.component }}
         IMAGE_TAG: ${{ inputs.image-tag }}
+        PUSH_IMAGE: ${{ inputs.push }}
       run: |
         install -d artifacts/images
+        push_args=()
+        if [[ "${PUSH_IMAGE}" == "true" ]]; then
+          push_args+=(--output "type=image,push=true,oci-mediatypes=true,oci-artifact=true")
+        fi
         docker buildx build \
           --builder openshell \
           --platform linux/amd64,linux/arm64 \
@@ -72,11 +81,12 @@ runs:
           --cache-to type=gha,mode=max,scope=${COMPONENT} \
           --provenance=mode=min \
           --attest type=sbom \
-          --output type=image,push=true,oci-mediatypes=true,oci-artifact=true \
-          --output type=oci,dest=artifacts/images/${COMPONENT}.tar \
+          "${push_args[@]}" \
+          --output "type=oci,dest=artifacts/images/${COMPONENT}.tar,oci-mediatypes=true,oci-artifact=true" \
           .
 
     - name: Verify SBOM attestation
+      if: inputs.push == 'true'
       shell: bash
       env:
         IMAGE_REF: ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ inputs.image-tag }}

@@ -23,25 +23,25 @@ type sandboxClient struct {
 
 var _ SandboxInterface = (*sandboxClient)(nil)
 var _ SandboxTemplateCreateInterface = (*sandboxClient)(nil)
+var _ SandboxSuspendResumeInterface = (*sandboxClient)(nil)
 
 func newSandboxClient(conn grpc.ClientConnInterface) *sandboxClient {
 	return &sandboxClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error) {
 	protoSpec, err := converter.SandboxSpecToProtoChecked(spec)
 	if err != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
+	cfg := types.ApplyCreateOptions(opts)
 	req := &pb.CreateSandboxRequest{
-		Name:           name,
-		Spec:           protoSpec,
-		Labels:         labels,
-		WorkspaceScope: namedWorkspaceScope(workspace),
-	}
-	if len(opts) > 0 {
-		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
-		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
+		Name:             name,
+		Spec:             protoSpec,
+		Labels:           converter.CopyStringMap(cfg.Labels()),
+		Annotations:      converter.CopyStringMap(cfg.Annotations()),
+		WorkspaceScope:   namedWorkspaceScope(workspace),
+		ServiceExposures: serviceExposuresToProto(cfg.ServiceExposures()),
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
@@ -54,7 +54,7 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 	return sandbox, nil
 }
 
-func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error) {
 	if templateName == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "template name is required"}
 	}
@@ -65,16 +65,15 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 	if err != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
+	cfg := types.ApplyCreateOptions(opts)
 	req := &pb.CreateSandboxRequest{
 		Name:             name,
 		Spec:             protoSpec,
-		Labels:           labels,
+		Labels:           converter.CopyStringMap(cfg.Labels()),
+		Annotations:      converter.CopyStringMap(cfg.Annotations()),
 		WorkspaceScope:   namedWorkspaceScope(workspace),
 		WorkloadTemplate: templateName,
-	}
-	if len(opts) > 0 {
-		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
-		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
+		ServiceExposures: serviceExposuresToProto(cfg.ServiceExposures()),
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
@@ -204,6 +203,33 @@ func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*San
 	return converter.SandboxFromProto(resp.GetSandbox()), nil
 }
 
+func (s *sandboxClient) Suspend(ctx context.Context, workspace, name string) (*Sandbox, error) {
+	resp, err := s.client.SuspendSandbox(ctx, &pb.SuspendSandboxRequest{
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.SandboxFromProto(resp.GetSandbox()), nil
+}
+
+func (s *sandboxClient) Resume(ctx context.Context, workspace, name string, opts ...ResumeOptions) (*Sandbox, error) {
+	var options ResumeOptions
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	resp, err := s.client.ResumeSandbox(ctx, &pb.ResumeSandboxRequest{
+		Name:                  name,
+		WorkspaceScope:        namedWorkspaceScope(workspace),
+		RestartIfRestoreFails: options.RestartIfRestoreFails,
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.SandboxFromProto(resp.GetSandbox()), nil
+}
+
 func (s *sandboxClient) AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error) {
 	resp, err := s.client.AttachSandboxProvider(ctx, &pb.AttachSandboxProviderRequest{
 		Provider:                providerName,
@@ -279,6 +305,10 @@ func (s *sandboxClient) WaitStopped(ctx context.Context, workspace, name string,
 	return s.waitForPhase(ctx, workspace, name, SandboxStopped, opts...)
 }
 
+func (s *sandboxClient) WaitSuspended(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error) {
+	return s.waitForPhase(ctx, workspace, name, SandboxSuspended, opts...)
+}
+
 func (s *sandboxClient) waitForPhase(ctx context.Context, workspace, name string, target SandboxPhase, opts ...WaitOptions) (*Sandbox, error) {
 	interval := defaultPollInterval
 	if len(opts) > 0 && opts[0].PollInterval > 0 {
@@ -329,6 +359,11 @@ func checkTerminalPhase(sb *Sandbox, name string, target SandboxPhase) (*Sandbox
 		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is in error state", name)}
 	case SandboxDeleting:
 		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is being deleted", name)}
+	case SandboxSuspending, SandboxSuspended:
+		if target == SandboxSuspended {
+			return nil, nil
+		}
+		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is suspended; resume it before waiting for %s", name, target)}
 	default:
 		return nil, nil
 	}

@@ -22,11 +22,19 @@ require_env() {
 [[ $# -eq 1 ]] || die "usage: $0 OUTPUT"
 output=$1
 current_profile_passed=true
+proto_exception_tag=${PROTO_COMPATIBILITY_EXCEPTION_TAG:-}
+proto_exception_reason=${PROTO_COMPATIBILITY_EXCEPTION_REASON:-}
 
 require_env \
   RELEASE_TAG SOURCE_SHA IS_PRERELEASE GITHUB_RUN_ID GITHUB_RUN_ATTEMPT \
   GITHUB_SERVER_URL GITHUB_REPOSITORY SECURITY_RESULT CONFORMANCE_RESULT \
   FEATURE_INTEGRATION_RESULT DOCKER_E2E_RESULT VM_E2E_RESULT PROTO_COMPATIBILITY_RESULT
+
+if [[ -n "${proto_exception_tag}" ]]; then
+  [[ "${IS_PRERELEASE}" == true && "${proto_exception_tag}" == "${RELEASE_TAG}" ]] ||
+    die "protobuf exception must match the prerelease tag"
+  [[ -n "${proto_exception_reason//[[:space:]]/}" ]] || die "protobuf exception requires a reason"
+fi
 
 for result in \
   "${PROTO_COMPATIBILITY_RESULT}" \
@@ -53,6 +61,8 @@ jq -n \
   --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg security "${SECURITY_RESULT}" \
   --arg protobuf_compatibility "${PROTO_COMPATIBILITY_RESULT}" \
+  --arg proto_exception_tag "${proto_exception_tag}" \
+  --arg proto_exception_reason "${proto_exception_reason}" \
   --arg conformance "${CONFORMANCE_RESULT}" \
   --arg feature_integration "${FEATURE_INTEGRATION_RESULT}" \
   --arg docker_e2e "${DOCKER_E2E_RESULT}" \
@@ -72,6 +82,11 @@ jq -n \
       ]
     },
     current_profile_passed: $current_profile_passed,
+    exceptions: (if $proto_exception_tag == "" then [] else [{
+      suite: "protobuf_compatibility",
+      tag: $proto_exception_tag,
+      reason: $proto_exception_reason
+    }] end),
     run: {
       id: $run_id,
       attempt: $run_attempt,

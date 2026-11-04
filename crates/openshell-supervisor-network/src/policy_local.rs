@@ -3,7 +3,9 @@
 
 //! Sandbox-local policy advisor HTTP API.
 
+use crate::l7::token_grant_injection::TokenGrantResolver;
 use miette::{IntoDiagnostic, Result};
+use openshell_core::grpc_client::GatewayEndpoint;
 use openshell_core::proposals::AgentProposals;
 use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
@@ -75,60 +77,160 @@ const MAX_DENIALS_LIMIT: usize = 100;
 /// denials.
 const DENIAL_LOG_FILES_TO_SCAN: usize = 2;
 const LOG_DIR: &str = "/var/log";
-/// Shorthand log filenames are `openshell.YYYY-MM-DD.log`. The trailing dot in
-/// the prefix is intentional: it disambiguates from the OCSF JSONL appender's
-/// `openshell-ocsf.YYYY-MM-DD.log`, which we never want to surface here (the
-/// JSONL is opt-in via `ocsf_json_enabled` and not the source of truth for
-/// `/v1/denials`).
+/// `/v1/denials` reads `openshell.YYYY-MM-DD.log`, not the OCSF `.jsonl` files,
+/// which are opt-in via `ocsf_json_enabled`.
 const SHORTHAND_LOG_PREFIX: &str = "openshell.";
 /// Defensive cap on per-line length returned to the agent so a pathological
 /// log entry (very long URL path, etc.) cannot blow up the response.
 const MAX_DENIAL_LINE_BYTES: usize = 4096;
 
-#[derive(Debug)]
+/// Most recent denial lines retained for one hosted sandbox instance.
+const MAX_INSTANCE_DENIAL_LINES: usize = 256;
+
+/// Where `/v1/denials` reads this sandbox's recent denials.
+#[derive(Clone, Debug)]
+pub enum DenialLogSource {
+    /// Shorthand log files written by a supervisor process that serves one
+    /// sandbox.
+    ShorthandFiles(PathBuf),
+    /// Denials recorded for this sandbox instance alone. A process hosting several
+    /// sandboxes cannot expose its shared log files to any one of them.
+    SandboxInstance(SandboxInstanceDenialLog),
+}
+
+impl Default for DenialLogSource {
+    fn default() -> Self {
+        Self::ShorthandFiles(PathBuf::from(LOG_DIR))
+    }
+}
+
+/// Bounded recent OCSF denial lines recorded for one hosted sandbox instance.
+#[derive(Clone, Default)]
+pub struct SandboxInstanceDenialLog {
+    lines: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl std::fmt::Debug for SandboxInstanceDenialLog {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let retained = self
+            .lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        formatter
+            .debug_struct("SandboxInstanceDenialLog")
+            .field("retained", &retained)
+            .finish()
+    }
+}
+
+impl SandboxInstanceDenialLog {
+    /// Retain `line` when it is a rendered OCSF denial; ignore anything else.
+    pub fn record(&self, line: &str) {
+        let line = line.trim_end();
+        if !is_ocsf_denial_line(line) {
+            return;
+        }
+        let mut lines = self
+            .lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lines.len() == MAX_INSTANCE_DENIAL_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(line.to_string());
+    }
+
+    fn recent(&self, limit: usize) -> Vec<String> {
+        self.lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|line| surfaced_denial_line(line))
+            .collect()
+    }
+}
+
 pub struct PolicyLocalContext {
     current_policy: Arc<RwLock<Option<Arc<ProtoSandboxPolicy>>>>,
     agent_proposals: AgentProposals,
-    gateway_endpoint: Option<String>,
+    gateway: Option<GatewayEndpoint>,
     sandbox_name: Option<String>,
-    shorthand_log_dir: PathBuf,
+    denials: DenialLogSource,
+    token_grants: Option<Arc<dyn TokenGrantResolver>>,
     workspace_rx: tokio::sync::watch::Receiver<String>,
+}
+
+impl std::fmt::Debug for PolicyLocalContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PolicyLocalContext")
+            .field("gateway", &self.gateway)
+            .field("sandbox_name", &self.sandbox_name)
+            .field("denials", &self.denials)
+            .field("token_grants", &self.token_grants.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PolicyLocalContext {
     pub fn new(
         current_policy: Option<ProtoSandboxPolicy>,
-        gateway_endpoint: Option<String>,
+        gateway: Option<GatewayEndpoint>,
         sandbox_name: Option<String>,
         agent_proposals: AgentProposals,
-        workspace_rx: tokio::sync::watch::Receiver<String>,
-    ) -> Self {
-        Self::with_log_dir(
-            current_policy,
-            gateway_endpoint,
-            sandbox_name,
-            agent_proposals,
-            PathBuf::from(LOG_DIR),
-            workspace_rx,
-        )
-    }
-
-    fn with_log_dir(
-        current_policy: Option<ProtoSandboxPolicy>,
-        gateway_endpoint: Option<String>,
-        sandbox_name: Option<String>,
-        agent_proposals: AgentProposals,
-        shorthand_log_dir: PathBuf,
         workspace_rx: tokio::sync::watch::Receiver<String>,
     ) -> Self {
         Self {
             current_policy: Arc::new(RwLock::new(current_policy.map(Arc::new))),
             agent_proposals,
-            gateway_endpoint,
+            gateway,
             sandbox_name,
-            shorthand_log_dir,
+            denials: DenialLogSource::default(),
+            token_grants: None,
             workspace_rx,
         }
+    }
+
+    #[cfg(test)]
+    fn with_log_dir(
+        current_policy: Option<ProtoSandboxPolicy>,
+        gateway: Option<GatewayEndpoint>,
+        sandbox_name: Option<String>,
+        agent_proposals: AgentProposals,
+        shorthand_log_dir: PathBuf,
+        workspace_rx: tokio::sync::watch::Receiver<String>,
+    ) -> Self {
+        Self::new(
+            current_policy,
+            gateway,
+            sandbox_name,
+            agent_proposals,
+            workspace_rx,
+        )
+        .with_denial_log(DenialLogSource::ShorthandFiles(shorthand_log_dir))
+    }
+
+    /// Serve `/v1/denials` from `denials` instead of the process log files.
+    #[must_use]
+    pub fn with_denial_log(mut self, denials: DenialLogSource) -> Self {
+        self.denials = denials;
+        self
+    }
+
+    /// Acquire provider token grants for this sandbox's HTTP relays.
+    #[must_use]
+    pub fn with_token_grants(mut self, resolver: Arc<dyn TokenGrantResolver>) -> Self {
+        self.token_grants = Some(resolver);
+        self
+    }
+
+    /// The sandbox instance's provider token grant resolver, absent when grants are
+    /// unavailable and must fail closed.
+    pub(crate) fn token_grant_resolver(&self) -> Option<Arc<dyn TokenGrantResolver>> {
+        self.token_grants.clone()
     }
 
     pub async fn set_current_policy(&self, policy: ProtoSandboxPolicy) {
@@ -321,7 +423,18 @@ async fn recent_denials_response(
     query: &str,
 ) -> (u16, serde_json::Value) {
     let limit = parse_last_query(query).unwrap_or(DEFAULT_DENIALS_LIMIT);
-    let log_dir = ctx.shorthand_log_dir.clone();
+    let log_dir = match &ctx.denials {
+        DenialLogSource::ShorthandFiles(log_dir) => log_dir.clone(),
+        DenialLogSource::SandboxInstance(log) => {
+            return (
+                200,
+                serde_json::json!({
+                    "denials": log.recent(limit),
+                    "log_available": true,
+                }),
+            );
+        }
+    };
 
     // Distinguish "shorthand log exists and no denials happened" from "no log
     // file yet, so we have nothing to read." Without this flag the agent sees
@@ -401,15 +514,18 @@ fn read_recent_denial_lines(log_dir: &Path, limit: usize) -> Vec<String> {
             // proxy.rs FORWARD path so the on-disk shorthand log itself is
             // clean — tracked separately). Redact first so truncation cannot
             // slice mid-secret.
-            let redacted = redact_query_strings(line);
-            let surfaced = truncate_at_char_boundary(&redacted, MAX_DENIAL_LINE_BYTES);
-            lines.push(surfaced);
+            lines.push(surfaced_denial_line(line));
             if lines.len() >= limit {
                 return lines;
             }
         }
     }
     lines
+}
+
+fn surfaced_denial_line(line: &str) -> String {
+    let redacted = redact_query_strings(line);
+    truncate_at_char_boundary(&redacted, MAX_DENIAL_LINE_BYTES)
 }
 
 /// Replace any `?<query>` substring with `?[redacted]` to keep query-string
@@ -471,8 +587,7 @@ fn collect_shorthand_log_files(log_dir: &Path, max_files: usize) -> std::io::Res
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            // `openshell.YYYY-MM-DD.log` only — the trailing dot in the prefix
-            // disambiguates from `openshell-ocsf.YYYY-MM-DD.log`.
+            // `/v1/denials` reads `openshell.YYYY-MM-DD.log`, not the OCSF `.jsonl` files.
             if !name.starts_with(SHORTHAND_LOG_PREFIX) || !name.ends_with(".log") {
                 return None;
             }
@@ -490,7 +605,7 @@ fn collect_shorthand_log_files(log_dir: &Path, max_files: usize) -> std::io::Res
 }
 
 async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_json::Value) {
-    let Some(endpoint) = ctx.gateway_endpoint.as_deref() else {
+    let Some(gateway) = ctx.gateway.as_ref() else {
         return (
             503,
             serde_json::json!({
@@ -530,7 +645,7 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
         Err(error) => return (400, error_payload("invalid_proposal", error)),
     };
 
-    let client = match openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await {
+    let client = match openshell_core::grpc_client::CachedOpenShellClient::connect(gateway).await {
         Ok(client) => {
             client.set_workspace(workspace);
             client
@@ -960,7 +1075,7 @@ struct LookupSession<'a> {
 async fn open_lookup_session(
     ctx: &PolicyLocalContext,
 ) -> std::result::Result<LookupSession<'_>, (u16, serde_json::Value)> {
-    let endpoint = ctx.gateway_endpoint.as_deref().ok_or_else(|| {
+    let gateway = ctx.gateway.as_ref().ok_or_else(|| {
         (
             503,
             error_payload(
@@ -993,7 +1108,7 @@ async fn open_lookup_session(
             ),
         ));
     }
-    let client = openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint)
+    let client = openshell_core::grpc_client::CachedOpenShellClient::connect(gateway)
         .await
         .map_err(|e| (502, error_payload("gateway_connect_failed", e.to_string())))?;
     client.set_workspace(workspace);
@@ -1654,11 +1769,11 @@ mod tests {
 
     #[tokio::test]
     async fn recent_denials_skips_jsonl_log_files() {
-        // The shorthand reader must not surface `openshell-ocsf.*.log` content
+        // The shorthand reader must not surface `openshell-ocsf.*.jsonl` content
         // even if a deny-looking line is present, so the response stays
         // independent of the JSONL appender's enabled state.
         let dir = tempfile::tempdir().unwrap();
-        let jsonl = dir.path().join("openshell-ocsf.2026-05-06.log");
+        let jsonl = dir.path().join("openshell-ocsf.2026-05-06.jsonl");
         std::fs::write(
             &jsonl,
             r#"{"class_uid":4002,"action_id":2,"message":"DENIED","time":1}"#,

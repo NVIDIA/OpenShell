@@ -9,9 +9,10 @@
 //! inspects the plaintext HTTP, then re-encrypts to upstream using real root CAs.
 
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
-use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use openshell_crypto::pki::KeyPair;
+use rcgen::{CertificateParams, DnType, IsCa, KeyUsagePurpose};
+use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, ServerConfig};
 use std::collections::HashMap;
 use std::io::{BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -32,15 +33,15 @@ const SYSTEM_CA_PATHS: &[&str] = &[
 /// Ephemeral CA certificate and key for MITM TLS termination.
 #[allow(clippy::struct_field_names)]
 pub struct SandboxCa {
-    ca_cert: rcgen::Certificate,
-    ca_key: KeyPair,
+    issuer: rcgen::Issuer<'static, KeyPair>,
+    ca_der: CertificateDer<'static>,
     ca_cert_pem: String,
 }
 
 impl SandboxCa {
     /// Generate a new ephemeral CA keypair.
     pub fn generate() -> Result<Self> {
-        let ca_key = KeyPair::generate().into_diagnostic()?;
+        let ca_key = openshell_crypto::pki::generate_keypair().into_diagnostic()?;
 
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -52,12 +53,12 @@ impl SandboxCa {
             .push(DnType::OrganizationName, "OpenShell");
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
-        let ca_cert = params.self_signed(&ca_key).into_diagnostic()?;
+        let ca_cert = openshell_crypto::pki::self_signed(params, &ca_key).into_diagnostic()?;
         let ca_cert_pem = ca_cert.pem();
 
         Ok(Self {
-            ca_cert,
-            ca_key,
+            ca_der: ca_cert.der().clone(),
+            issuer: ca_cert.into_issuer(ca_key),
             ca_cert_pem,
         })
     }
@@ -68,8 +69,8 @@ impl SandboxCa {
     }
 
     /// Returns the CA private key in PKCS#8 PEM format.
-    pub fn private_key_pem(&self) -> String {
-        self.ca_key.serialize_pem()
+    pub fn private_key_pem(&self) -> Result<String> {
+        self.issuer.key().serialize_pem().into_diagnostic()
     }
 
     /// Load a durable CA certificate and matching private key from absolute paths.
@@ -100,7 +101,7 @@ impl SandboxCa {
     /// Load a durable CA while preserving the exact certificate bytes supplied
     /// by the provisioner for boundary launch replay.
     pub fn from_pem(certificate_pem: &str, private_key_pem: &str) -> Result<Self> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let ca_key = KeyPair::from_pem(private_key_pem)
             .into_diagnostic()
             .wrap_err("parse proxy CA private key")?;
@@ -117,22 +118,19 @@ impl SandboxCa {
             .into_diagnostic()
             .wrap_err("parse proxy CA private key")?
             .ok_or_else(|| miette!("proxy CA private key file contains no private key"))?;
-        ServerConfig::builder()
+        let ca_der = certificates[0].clone();
+        openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(certificates, private_key)
             .into_diagnostic()
             .wrap_err("proxy CA certificate and private key do not match")?;
 
-        let params = CertificateParams::from_ca_cert_pem(certificate_pem)
+        let issuer = openshell_crypto::pki::issuer_from_der(&ca_der, ca_key)
             .into_diagnostic()
             .wrap_err("parse proxy CA signing certificate")?;
-        let ca_cert = params
-            .self_signed(&ca_key)
-            .into_diagnostic()
-            .wrap_err("initialize proxy CA signer")?;
         Ok(Self {
-            ca_cert,
-            ca_key,
+            issuer,
+            ca_der,
             ca_cert_pem: certificate_pem.to_string(),
         })
     }
@@ -182,19 +180,18 @@ impl CertCache {
 
     /// Generate a new leaf certificate for the given hostname.
     fn generate_leaf(&self, hostname: &str) -> Result<CertifiedLeaf> {
-        let leaf_key = KeyPair::generate().into_diagnostic()?;
+        let leaf_key = openshell_crypto::pki::generate_keypair().into_diagnostic()?;
 
         let mut params = CertificateParams::new(vec![hostname.to_string()]).into_diagnostic()?;
         params.distinguished_name.push(DnType::CommonName, hostname);
         params.use_authority_key_identifier_extension = true;
 
-        let leaf_cert = params
-            .signed_by(&leaf_key, &self.ca.ca_cert, &self.ca.ca_key)
+        let leaf_cert = openshell_crypto::pki::signed_by_issuer(params, &leaf_key, &self.ca.issuer)
             .into_diagnostic()?;
 
         let leaf_der = CertificateDer::from(leaf_cert.der().to_vec());
-        let ca_der = CertificateDer::from(self.ca.ca_cert.der().to_vec());
-        let key_der = PrivateKeyDer::try_from(leaf_key.serialize_der())
+        let ca_der = self.ca.ca_der.clone();
+        let key_der = PrivateKeyDer::try_from(leaf_key.serialize_der().into_diagnostic()?)
             .map_err(|e| miette::miette!("failed to serialize leaf key: {e}"))?;
 
         Ok(CertifiedLeaf {
@@ -222,7 +219,7 @@ impl ProxyTlsState {
     /// Get or generate a leaf cert for the hostname and return a TLS acceptor.
     fn acceptor_for(&self, hostname: &str) -> Result<TlsAcceptor> {
         let leaf = self.cert_cache.get_or_generate(hostname)?;
-        let mut server_config = ServerConfig::builder()
+        let mut server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
             .into_diagnostic()?;
@@ -279,7 +276,7 @@ pub async fn tls_connect_upstream(
 /// `system_ca_bundle` is ignored because the native store already reflects all
 /// operator-installed trust anchors.
 pub fn build_upstream_client_config(system_ca_bundle: &str) -> Result<Arc<ClientConfig>> {
-    let mut config = ClientConfig::builder()
+    let mut config = openshell_crypto::tls::client_builder()
         .with_root_certificates(build_upstream_root_store(system_ca_bundle)?)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -585,9 +582,78 @@ mod tests {
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
 
+    /// Reproduces issue #3781 end to end with a real TLS handshake: an
+    /// upstream client trying to reach a destination signed by an
+    /// operator-owned private CA fails when that CA is unknown, and succeeds
+    /// once it is appended to the bundle passed to
+    /// `build_upstream_client_config` — the same mechanism the Podman driver
+    /// fix (`additional_ca_bundle`) feeds into. No fakes: a real rustls
+    /// `TlsAcceptor`/`TlsConnector` pair over a real loopback TCP connection.
+    #[tokio::test]
+    async fn additional_ca_enables_trust_of_privately_signed_upstream() {
+        let hostname = "private.example";
+
+        // A CA the system bundle has never heard of, standing in for the
+        // operator-owned private CA from #3781.
+        let private_ca = SandboxCa::generate().unwrap();
+        let private_ca_pem = private_ca.cert_pem().to_string();
+        let cert_cache = CertCache::new(private_ca);
+        let leaf = cert_cache.get_or_generate(hostname).unwrap();
+
+        let server_config = Arc::new(
+            openshell_crypto::tls::server_builder()
+                .with_no_client_auth()
+                .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
+                .unwrap(),
+        );
+        let acceptor = TlsAcceptor::from(server_config);
+
+        // --- Without the private CA: must fail. This is the literal bug in
+        // #3781 — "Upstream TLS establishment failed" against a
+        // policy-allowed, private-CA-signed destination. ---
+        let addr = serve_one(acceptor.clone()).await;
+        let client_without = build_upstream_client_config("").unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let result = tls_connect_upstream(tcp, hostname, &client_without).await;
+        assert!(
+            result.is_err(),
+            "connection to a privately-signed destination must fail when the \
+             private CA is not trusted, reproducing #3781"
+        );
+
+        // --- With the private CA appended to the bundle: must succeed. This
+        // is what additional_ca_bundle plumbs through in the Podman driver
+        // fix. ---
+        let addr = serve_one(acceptor).await;
+        let client_with = build_upstream_client_config(&private_ca_pem).unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let result = tls_connect_upstream(tcp, hostname, &client_with).await;
+        assert!(
+            result.is_ok(),
+            "connection must succeed once the private CA is trusted: {:?}",
+            result.err()
+        );
+    }
+
     /// Helper: generate a self-signed CA and return its PEM string.
     fn generate_ca_pem() -> String {
         SandboxCa::generate().unwrap().ca_cert_pem
+    }
+
+    /// Accept exactly one TLS connection on a fresh loopback listener and
+    /// return its address. Used by `additional_ca_enables_trust_of_...` to
+    /// give each connection attempt its own listener.
+    async fn serve_one(acceptor: TlsAcceptor) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Don't unwrap: when the client (correctly) rejects an untrusted
+            // certificate, the server observes a failed handshake too. Only
+            // the client's outcome matters here.
+            let _ = acceptor.accept(stream).await;
+        });
+        addr
     }
 
     #[test]
@@ -701,18 +767,47 @@ mod tests {
     fn durable_ca_round_trip_preserves_certificate_bytes() {
         let generated = SandboxCa::generate().unwrap();
         let certificate = generated.cert_pem().to_string();
-        let private_key = generated.private_key_pem();
+        let private_key = generated.private_key_pem().unwrap();
         let loaded = SandboxCa::from_pem(&certificate, &private_key).unwrap();
 
         assert_eq!(loaded.cert_pem(), certificate);
-        assert_eq!(loaded.private_key_pem(), private_key);
+        assert_eq!(loaded.private_key_pem().unwrap(), private_key);
+        let original_der = rustls_pemfile::certs(&mut certificate.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let leaf = CertCache::new(loaded).get_or_generate("localhost").unwrap();
+        assert_eq!(leaf.cert_chain[1], original_der);
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(original_der).unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            openshell_crypto::tls::configuration_provider(),
+        )
+        .build()
+        .unwrap();
+        rustls::client::danger::ServerCertVerifier::verify_server_cert(
+            verifier.as_ref(),
+            &leaf.cert_chain[0],
+            &[],
+            &ServerName::try_from("localhost").unwrap(),
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        )
+        .unwrap();
     }
 
     #[test]
     fn durable_ca_rejects_mismatched_key_and_relative_paths() {
         let certificate = SandboxCa::generate().unwrap();
         let other_key = SandboxCa::generate().unwrap();
-        assert!(SandboxCa::from_pem(certificate.cert_pem(), &other_key.private_key_pem()).is_err());
+        assert!(
+            SandboxCa::from_pem(
+                certificate.cert_pem(),
+                &other_key.private_key_pem().unwrap()
+            )
+            .is_err()
+        );
         assert!(SandboxCa::load_from_paths(Path::new("ca.pem"), Path::new("ca.key")).is_err());
     }
 }

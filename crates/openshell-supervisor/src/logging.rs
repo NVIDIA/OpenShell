@@ -36,11 +36,11 @@ where
         .thread_name("openshell-console")
         .finish(console);
     let mut guards = vec![console_guard];
-    let shorthand_file = file_writer(directory, "openshell", &mut guards);
+    let shorthand_file = file_writer(directory, "openshell", "log", &mut guards);
     let file_available = shorthand_file.is_some();
     // Preserve the existing file-sink behavior while making stderr independent.
     let json_file = if file_available {
-        file_writer(directory, "openshell-ocsf", &mut guards)
+        file_writer(directory, "openshell-ocsf", "jsonl", &mut guards)
     } else {
         None
     };
@@ -73,12 +73,13 @@ where
 fn file_writer(
     directory: &Path,
     prefix: &str,
+    suffix: &str,
     guards: &mut Vec<WorkerGuard>,
 ) -> Option<tracing_appender::non_blocking::NonBlocking> {
     let roller = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix(prefix)
-        .filename_suffix("log")
+        .filename_suffix(suffix)
         .max_log_files(3)
         .build(directory)
         .ok()?;
@@ -192,6 +193,7 @@ mod tests {
                     .starts_with("openshell-ocsf.")
             })
             .unwrap();
+        assert_eq!(path.extension().unwrap(), "jsonl");
         let file = std::fs::read_to_string(path).unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(file.trim()).unwrap(),

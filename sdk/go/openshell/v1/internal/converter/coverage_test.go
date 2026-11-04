@@ -122,6 +122,7 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"phase":                     true,
 		"conditions":                true,
 		"endpoint_statuses":         true,
+		"last_token_grant_failure":  true,
 		"current_policy_version":    true,
 		"exit_code":                 true,
 		"configuration_admission":   true,
@@ -159,9 +160,34 @@ func TestConverterCoversAllProtoFields_EndpointStatus(t *testing.T) {
 		"path":               true,
 		"last_result":        true,
 		"last_reported_time": true,
+		"last_failure":       true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.EndpointStatus{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_EndpointFailure(t *testing.T) {
+	handled := fieldSet{
+		"domain":               true,
+		"code":                 true,
+		"recovery_action":      true,
+		"provider":             true,
+		"credential_key":       true,
+		"stage":                true,
+		"upstream_http_status": true,
+		"request_id":           true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.EndpointFailure{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_TokenGrantFailureObservation(t *testing.T) {
+	handled := fieldSet{
+		"destination_host": true,
+		"destination_port": true,
+		"failure":          true,
+	}
+	assertAllFieldsCovered(t, (&pb.TokenGrantFailureObservation{}).ProtoReflect().Descriptor(), handled, nil)
 }
 
 func TestConverterCoversAllProtoFields_SandboxPolicy(t *testing.T) {

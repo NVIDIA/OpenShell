@@ -113,6 +113,15 @@ func TestValidateGatewayName_ValidNames(t *testing.T) {
 		"a",
 		"test-gateway-01",
 		"A_B_C",
+		"gw.example.com",
+		"192.0.2.1",
+		"foo.bar",
+		"config.json",
+		"gw-1.example.com",
+		"COM10",
+		"LPT10",
+		"CONSOLE",
+		"com1x.example.com",
 	}
 
 	for _, name := range validNames {
@@ -147,13 +156,10 @@ func TestValidateGatewayName_PathSeparators(t *testing.T) {
 	}
 }
 
-func TestValidateGatewayName_Dots(t *testing.T) {
+func TestValidateGatewayName_DotComponents(t *testing.T) {
 	cases := []string{
 		".",
 		"..",
-		".hidden",
-		"foo.bar",
-		"config.json",
 	}
 
 	for _, name := range cases {
@@ -220,14 +226,80 @@ func TestValidateGatewayName_SpecialCharacters(t *testing.T) {
 		{"foo#bar", "hash"},
 		{"café", "non-ASCII"},
 		{"日本語", "unicode"},
-		{"foo bar", "tab (space)"},
+		{"foo\tbar", "tab"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
 			err := validateGatewayName(tc.name)
-			require.Error(t, err)
 			assert.ErrorIs(t, err, ErrInvalidGatewayName)
 		})
 	}
+}
+
+// Windows filename rules apply regardless of the host operating system.
+func TestValidateGatewayName_WindowsFilenameRules(t *testing.T) {
+	invalid := []string{
+		"CON", "con.txt", "CON.example.com",
+		"PRN", "prn.log", "AUX", "aux.json", "NUL", "nul.config",
+		"COM0", "COM1", "com9.txt", "COM1.example.com",
+		"LPT0", "LPT1", "lpt9.log",
+		"gateway.", ".hidden", "foo..bar", "gw.example.com.",
+		"gateway ", "foo bar", "foo:stream", "C:gateway",
+		"foo|bar", "foo?bar", "foo*bar", "foo<bar", "foo>bar", "foo\"bar",
+		"gw\x01bar", "[2001:db8::1]", "2001:db8::1",
+	}
+	for _, name := range invalid {
+		t.Run(name, func(t *testing.T) {
+			err := validateGatewayName(name)
+			assert.ErrorIs(t, err, ErrInvalidGatewayName)
+		})
+	}
+}
+
+func TestHostDerivedGatewayNames(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv(systemGatewayDirEnv, filepath.Join(tmp, "system"))
+
+	names := []string{"gw.example.com", "192.0.2.1"}
+	for _, name := range names {
+		dir := filepath.Join(tmp, "openshell", "gateways", name)
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(
+			filepath.Join(dir, "metadata.json"),
+			[]byte(`{"gateway_endpoint":"https://gw.example.com:443","auth_mode":"none"}`),
+			0o600,
+		))
+
+		cfg, err := LoadConfig(name)
+		require.NoError(t, err)
+		assert.Equal(t, name, cfg.Name)
+	}
+
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tmp, "openshell", "active_gateway"),
+		[]byte("gw.example.com"), 0o600,
+	))
+
+	active, err := LoadConfig("")
+	require.NoError(t, err)
+	assert.Equal(t, "gw.example.com", active.Name)
+
+	gateways, err := ListGateways()
+	require.NoError(t, err)
+	got := make(map[string]bool)
+	for _, gw := range gateways {
+		got[gw.Name] = gw.Active
+	}
+	assert.Equal(t, map[string]bool{
+		"gw.example.com": true,
+		"192.0.2.1":      false,
+	}, got)
+}
+
+func TestValidateGatewayName_NUL(t *testing.T) {
+	err := validateGatewayName("gw\x00example")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidGatewayName)
 }

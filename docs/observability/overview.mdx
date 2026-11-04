@@ -1,0 +1,100 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Observability Overview"
+sidebar-title: "Overview"
+description: "The traces, metrics, and OCSF events that OpenShell produces, where each one goes, and how to enable it."
+keywords: "Generative AI, Cybersecurity, Observability, OpenTelemetry, OTLP, Traces, Metrics, Prometheus, OCSF, SIEM"
+position: 1
+---
+
+OpenShell produces three kinds of observability signals: traces, metrics, and OCSF security events. This page describes what each signal is for and how to turn it on, and links to the page that covers it in detail.
+
+| Signal | Produced by | Destination |
+|---|---|---|
+| Traces | Gateway, compute drivers, sandbox supervisors | OTLP collector |
+| Metrics | Gateway | Prometheus scrape |
+| OCSF events, shorthand | Gateway, sandbox supervisors | Gateway console, `openshell logs`, supervisor log file |
+| OCSF events, JSONL | Gateway, sandbox supervisors | Local file |
+| OCSF events, OTLP | Gateway, sandbox supervisors | OTLP collector |
+
+The examples on this page are `gateway.toml` tables. In the Helm chart, set each table under `gatewayConfig`, as described in [Configure Chart Values](/kubernetes/setup#configure-chart-values).
+
+All OTLP export uses OTLP over gRPC. Configure it in `gateway.toml`, and the gateway passes the settings to the sandbox supervisors it starts. Supervisors connect to the collector directly, so the collector must be reachable from sandboxes as well as from the gateway. The gateway ignores the `OTEL_*` variables that would choose which signals are exported or where they go, and honors those that tune export, such as sampling. Refer to [Tuning](/how-it-works/gateways/configuration#tuning) for the full list.
+
+## Traces
+
+Traces show how the gateway handles each request, including the compute-driver work it performs, and how each sandbox supervisor starts up. Use them to find where time goes in an operation such as sandbox creation.
+
+To export traces, set an OTLP collector endpoint in `gateway.toml`:
+
+```toml
+[openshell.gateway.otlp]
+endpoint = "https://backend:4317"
+```
+
+For span names, resource attributes, and gateway names, refer to [Traces](/observability/traces).
+
+## Metrics
+
+The gateway serves Prometheus metrics for API requests, readiness, gateway interceptors, OCSF output, and multi-replica capacity, on a listener separate from its API. Use them to alert on saturation and to choose autoscaling signals.
+
+To enable the listener, set `metrics_bind_address` in `gateway.toml`:
+
+```toml
+[openshell.gateway]
+metrics_bind_address = "0.0.0.0:9090"
+```
+
+The port is an example. Until the listener is enabled, the gateway serves no metrics. The endpoint has no authentication, so restrict who can reach it. For metric names, deployment defaults, the catalog, and scrape configuration, refer to [Gateway Metrics](/observability/gateway-metrics).
+
+## OCSF Events
+
+OCSF events record security-relevant activity, such as network and HTTP policy decisions, process lifecycle, SSH sessions, and configuration changes. They use the [Open Cybersecurity Schema Framework](https://ocsf.io). Sandbox supervisors produce most of them, and the gateway produces events for its own decisions, such as approving or rejecting draft policy rules. The same events are available in three forms.
+
+### Shorthand Logs
+
+Shorthand logs are always on. Each event appears as a one-line summary in the gateway console, in the sandbox log stream that `openshell logs` and the TUI read, and in the supervisor's log file. For example, this policy denial is the event a sandbox produces when `curl https://github.com` runs without a network policy that allows `github.com`:
+
+```text
+[1791996125.789] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(2187) -> github.com:443 [reason:transparent_tcp_policy_denied]
+```
+
+To read the format, refer to [Sandbox Logging](/observability/logging). To find logs for each compute driver, refer to [Accessing Logs](/observability/accessing-logs).
+
+### JSONL Files
+
+JSONL files hold the full OCSF record, one JSON object per line, for a log shipper to collect. The gateway and supervisors are enabled separately:
+
+```toml
+# Gateway events, in gateway.toml.
+[openshell.gateway.ocsf_log]
+path = "/var/log/openshell/gateway-ocsf.jsonl"
+```
+
+```shell
+# Supervisor events, for every sandbox.
+openshell settings set --global --key ocsf_json_enabled --value true
+```
+
+For the record structure, file locations, rotation, and schema version downgrades for older SIEMs, refer to [OCSF JSON Export](/observability/ocsf-json-export).
+
+### OTLP Log Export
+
+OTLP log export sends each OCSF event to a collector as an OTLP log record that contains the full JSON event. It is off by default, even when trace export is on. Set `enabled = true` in `[openshell.gateway.otlp.ocsf]` to turn it on for the gateway and for every sandbox supervisor the gateway starts:
+
+```toml
+[openshell.gateway.otlp]
+endpoint = "https://backend:4317"
+
+[openshell.gateway.otlp.ocsf]
+enabled = true
+```
+
+The records go to the `[openshell.gateway.otlp]` endpoint unless the table sets its own `endpoint`, such as a collector that feeds a SIEM. For the record format, collector authentication, delivery guarantees, and loss reporting, refer to [OCSF Log Export](/how-it-works/gateways/configuration#ocsf-log-export).
+
+## Next Steps
+
+- Learn how spans are named and identified in [Traces](/observability/traces).
+- Learn how to [read the shorthand format](/observability/logging).
+- Learn what anonymous usage data OpenShell collects in [Telemetry](/observability/telemetry). It is separate from the signals on this page.

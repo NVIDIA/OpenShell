@@ -7,6 +7,13 @@ REST API over a Unix socket. Each sandbox has two independent containers:
 - `openshell-supervisor` evaluates policy, holds gateway credentials, and
   proxies approved egress in a separate companion container.
 
+New containers dial the supervisor over a separate private Unix socket volume
+at `/.openshell/channel/control/control.sock`; workload networking remains
+`none`. The supervisor's bootstrap-key mount stays read-only. Restart metadata
+records the direction, with missing metadata retaining the legacy runtime
+listener. Deploy matching supervisor and sandbox runtime binaries for new
+containers.
+
 The driver provisions placement, identity, credentials, transport, and lifecycle.
 The shared isolation interface supplies exec, attach, signal, terminate, binary
 identity, DNS, TCP, and loopback-forwarding semantics.

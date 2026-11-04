@@ -16,3 +16,5 @@ Use this skill after an authorized `review-security-issue` review identifies an 
 5. Follow `create-github-pr` and use `Closes #<id>` for the reviewed issue. Every PR from this issue-backed remediation workflow must close its own issue; split multi-PR remediations into separate issues in the authorized security workflow. Keep the PR description appropriately scoped to its disclosure venue.
 
 Begin any fix comments with `> **🔧 security-fix-agent**`. Do not change human disposition or introduce `agent:*` workflow labels.
+
+For first-party security-sensitive crypto, use `openshell-crypto` and extend its facade/backend contracts when needed. Follow the [crypto architecture](../../../crates/openshell-crypto/CRYPTO.md) for compatibility, failure handling, and explicit coverage exceptions.

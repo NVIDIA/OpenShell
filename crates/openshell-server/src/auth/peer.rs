@@ -9,7 +9,10 @@
 //! the apiserver `TokenReview` API, checks the live pod UID and required labels,
 //! and only then produces a [`Principal::Peer`].
 
-use super::authenticator::{Authenticator, bearer_credential};
+use super::authenticator::{
+    AuthDecline, AuthRejection, Authentication, Authenticator, bearer_credential,
+};
+use super::authenticator::{AuthFailureReason, AuthMechanism};
 use super::principal::{PeerPrincipal, Principal};
 use async_trait::async_trait;
 use k8s_openapi::api::{
@@ -56,7 +59,10 @@ pub struct ResolvedGatewayPeerIdentity {
 
 #[async_trait]
 pub trait GatewayPeerIdentityResolver: Send + Sync + 'static {
-    async fn resolve(&self, token: &str) -> Result<Option<ResolvedGatewayPeerIdentity>, Status>;
+    async fn resolve(
+        &self,
+        token: &str,
+    ) -> Result<Option<ResolvedGatewayPeerIdentity>, AuthRejection>;
 }
 
 #[derive(Debug)]
@@ -88,18 +94,21 @@ impl Authenticator for PeerServiceAccountAuthenticator {
         &self,
         headers: &http::HeaderMap,
         path: &str,
-    ) -> Result<Option<Principal>, Status> {
+    ) -> Result<Authentication, AuthRejection> {
         if !crate::auth::method_authz::is_peer_callable(path) {
-            return Ok(None);
+            return Ok(Authentication::NotApplicable);
         }
 
         let Some(token) = bearer_credential(headers) else {
-            return Ok(None);
+            return Ok(Authentication::NotApplicable);
         };
 
         let Some(resolved) = self.resolver.resolve(token).await? else {
             debug!("K8s gateway peer token did not authenticate; falling through");
-            return Ok(None);
+            return Ok(Authentication::Declined(AuthDecline {
+                mechanism: AuthMechanism::GatewayPeer,
+                reason: AuthFailureReason::InvalidCredential,
+            }));
         };
 
         if let Some(claimed_replica) = headers
@@ -113,16 +122,21 @@ impl Authenticator for PeerServiceAccountAuthenticator {
                 pod_name = %resolved.pod_name,
                 "gateway peer replica header does not match authenticated pod"
             );
-            return Err(Status::permission_denied(
-                "gateway peer replica does not match authenticated pod",
+            return Err(reject(
+                AuthFailureReason::InvalidCredential,
+                Status::permission_denied("gateway peer replica does not match authenticated pod"),
             ));
         }
 
-        Ok(Some(Principal::Peer(PeerPrincipal {
+        Ok(Authentication::Accepted(Principal::Peer(PeerPrincipal {
             replica_id: resolved.pod_name,
             pod_uid: resolved.pod_uid,
         })))
     }
+}
+
+fn reject(reason: AuthFailureReason, status: Status) -> AuthRejection {
+    AuthRejection::new(AuthMechanism::GatewayPeer, reason, status)
 }
 
 /// Resolver backed by Kubernetes `TokenReview` and a live Pod lookup.
@@ -158,7 +172,10 @@ impl LiveGatewayPeerResolver {
 
 #[async_trait]
 impl GatewayPeerIdentityResolver for LiveGatewayPeerResolver {
-    async fn resolve(&self, token: &str) -> Result<Option<ResolvedGatewayPeerIdentity>, Status> {
+    async fn resolve(
+        &self,
+        token: &str,
+    ) -> Result<Option<ResolvedGatewayPeerIdentity>, AuthRejection> {
         let review = TokenReview {
             metadata: ObjectMeta::default(),
             spec: TokenReviewSpec {
@@ -174,11 +191,17 @@ impl GatewayPeerIdentityResolver for LiveGatewayPeerResolver {
             .await
             .map_err(|err| {
                 warn!(error = %err, "K8s TokenReview failed for gateway peer");
-                Status::internal(format!("peer tokenreview failed: {err}"))
+                reject(
+                    AuthFailureReason::IdentityProviderUnavailable,
+                    Status::internal(format!("peer tokenreview failed: {err}")),
+                )
             })?;
-        let status = review
-            .status
-            .ok_or_else(|| Status::internal("TokenReview response missing status"))?;
+        let status = review.status.ok_or_else(|| {
+            reject(
+                AuthFailureReason::IdentityProviderUnavailable,
+                Status::internal("TokenReview response missing status"),
+            )
+        })?;
         let Some(identity) = peer_token_review_identity(
             &status,
             &self.expected_audience,
@@ -199,14 +222,20 @@ impl GatewayPeerIdentityResolver for LiveGatewayPeerResolver {
                     error = %err,
                     "failed to fetch gateway peer pod"
                 );
-                Status::internal(format!("gateway peer pod GET failed: {err}"))
+                reject(
+                    AuthFailureReason::IdentityProviderUnavailable,
+                    Status::internal(format!("gateway peer pod GET failed: {err}")),
+                )
             })?;
         let Some(pod) = pod else {
             warn!(
                 pod = %identity.pod_name,
                 "gateway peer pod referenced by SA token not found"
             );
-            return Err(Status::not_found("gateway peer pod not found"));
+            return Err(reject(
+                AuthFailureReason::StaleIdentity,
+                Status::not_found("gateway peer pod not found"),
+            ));
         };
 
         let actual_uid = pod.metadata.uid.as_deref().unwrap_or_default();
@@ -217,8 +246,9 @@ impl GatewayPeerIdentityResolver for LiveGatewayPeerResolver {
                 actual_uid,
                 "gateway peer SA token pod UID does not match live pod"
             );
-            return Err(Status::permission_denied(
-                "gateway peer SA token pod UID mismatch",
+            return Err(reject(
+                AuthFailureReason::StaleIdentity,
+                Status::permission_denied("gateway peer SA token pod UID mismatch"),
             ));
         }
 
@@ -234,8 +264,9 @@ impl GatewayPeerIdentityResolver for LiveGatewayPeerResolver {
                 expected_service_account = %self.expected_service_account,
                 "gateway peer pod service account does not match TokenReview principal"
             );
-            return Err(Status::permission_denied(
-                "gateway peer pod service account mismatch",
+            return Err(reject(
+                AuthFailureReason::InvalidCredential,
+                Status::permission_denied("gateway peer pod service account mismatch"),
             ));
         }
 
@@ -322,7 +353,10 @@ impl CachingGatewayPeerResolver {
 
 #[async_trait]
 impl GatewayPeerIdentityResolver for CachingGatewayPeerResolver {
-    async fn resolve(&self, token: &str) -> Result<Option<ResolvedGatewayPeerIdentity>, Status> {
+    async fn resolve(
+        &self,
+        token: &str,
+    ) -> Result<Option<ResolvedGatewayPeerIdentity>, AuthRejection> {
         let key = token_cache_key(token);
         if let Some(identity) = self.cached(&key) {
             return Ok(Some(identity));
@@ -375,7 +409,7 @@ fn peer_token_review_identity(
     expected_audience: &str,
     namespace: &str,
     expected_service_account: &str,
-) -> Result<Option<PeerTokenReviewIdentity>, Status> {
+) -> Result<Option<PeerTokenReviewIdentity>, AuthRejection> {
     if status.authenticated != Some(true) {
         debug!(
             error = status.error.as_deref().unwrap_or_default(),
@@ -391,19 +425,24 @@ fn peer_token_review_identity(
             audiences = ?audiences,
             "K8s TokenReview authenticated gateway peer token without expected audience"
         );
-        return Err(Status::unauthenticated(
-            "gateway peer token audience not accepted",
+        return Err(reject(
+            AuthFailureReason::AudienceOrIssuerMismatch,
+            Status::unauthenticated("gateway peer token audience not accepted"),
         ));
     }
 
-    let user = status
-        .user
-        .as_ref()
-        .ok_or_else(|| Status::permission_denied("TokenReview response missing user info"))?;
-    let username = user
-        .username
-        .as_deref()
-        .ok_or_else(|| Status::permission_denied("TokenReview response missing username"))?;
+    let user = status.user.as_ref().ok_or_else(|| {
+        reject(
+            AuthFailureReason::InvalidCredential,
+            Status::permission_denied("TokenReview response missing user info"),
+        )
+    })?;
+    let username = user.username.as_deref().ok_or_else(|| {
+        reject(
+            AuthFailureReason::InvalidCredential,
+            Status::permission_denied("TokenReview response missing username"),
+        )
+    })?;
     let expected_username = format!("system:serviceaccount:{namespace}:{expected_service_account}");
     if username != expected_username {
         warn!(
@@ -412,8 +451,11 @@ fn peer_token_review_identity(
             service_account = %expected_service_account,
             "K8s TokenReview principal is not the configured gateway service account"
         );
-        return Err(Status::permission_denied(
-            "gateway peer token is not from the configured service account",
+        return Err(reject(
+            AuthFailureReason::UnknownIdentity,
+            Status::permission_denied(
+                "gateway peer token is not from the configured service account",
+            ),
         ));
     }
 
@@ -423,15 +465,17 @@ fn peer_token_review_identity(
 }
 
 #[allow(clippy::result_large_err)]
-fn user_extra_one(user: &UserInfo, key: &str) -> Result<String, Status> {
+fn user_extra_one(user: &UserInfo, key: &str) -> Result<String, AuthRejection> {
     let Some(values) = user.extra.as_ref().and_then(|extra| extra.get(key)) else {
-        return Err(Status::permission_denied(
-            "gateway peer token is not pod-bound",
+        return Err(reject(
+            AuthFailureReason::InvalidCredential,
+            Status::permission_denied("gateway peer token is not pod-bound"),
         ));
     };
     if values.len() != 1 || values[0].is_empty() {
-        return Err(Status::permission_denied(
-            "gateway peer token has invalid pod binding",
+        return Err(reject(
+            AuthFailureReason::InvalidCredential,
+            Status::permission_denied("gateway peer token has invalid pod binding"),
         ));
     }
     Ok(values[0].clone())
@@ -441,7 +485,7 @@ fn user_extra_one(user: &UserInfo, key: &str) -> Result<String, Status> {
 fn validate_required_pod_labels(
     pod: &Pod,
     required_labels: &[(String, String)],
-) -> Result<(), Status> {
+) -> Result<(), AuthRejection> {
     let labels = pod.metadata.labels.as_ref();
     for (key, expected) in required_labels {
         let actual = labels
@@ -456,8 +500,9 @@ fn validate_required_pod_labels(
                 actual,
                 "gateway peer pod missing required label"
             );
-            return Err(Status::permission_denied(
-                "gateway peer pod labels do not match",
+            return Err(reject(
+                AuthFailureReason::UnknownIdentity,
+                Status::permission_denied("gateway peer pod labels do not match"),
             ));
         }
     }
@@ -535,12 +580,14 @@ pub mod test_support {
     use std::sync::Mutex;
 
     pub struct FakeGatewayPeerResolver {
-        pub outcome: Result<Option<ResolvedGatewayPeerIdentity>, Status>,
+        pub outcome: Result<Option<ResolvedGatewayPeerIdentity>, AuthRejection>,
         pub seen_tokens: Mutex<Vec<String>>,
     }
 
     impl FakeGatewayPeerResolver {
-        pub fn returning(outcome: Result<Option<ResolvedGatewayPeerIdentity>, Status>) -> Self {
+        pub fn returning(
+            outcome: Result<Option<ResolvedGatewayPeerIdentity>, AuthRejection>,
+        ) -> Self {
             Self {
                 outcome,
                 seen_tokens: Mutex::new(Vec::new()),
@@ -553,12 +600,9 @@ pub mod test_support {
         async fn resolve(
             &self,
             token: &str,
-        ) -> Result<Option<ResolvedGatewayPeerIdentity>, Status> {
+        ) -> Result<Option<ResolvedGatewayPeerIdentity>, AuthRejection> {
             self.seen_tokens.lock().unwrap().push(token.to_string());
-            match &self.outcome {
-                Ok(opt) => Ok(opt.clone()),
-                Err(status) => Err(Status::new(status.code(), status.message())),
-            }
+            self.outcome.clone()
         }
     }
 }
@@ -644,7 +688,29 @@ mod tests {
             "openshell",
         )
         .expect_err("wrong service account must fail closed");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.mechanism, AuthMechanism::GatewayPeer);
+        assert_eq!(err.reason, AuthFailureReason::UnknownIdentity);
+    }
+
+    #[test]
+    fn peer_token_review_identity_rejects_other_audiences() {
+        let status = token_review_status(
+            true,
+            vec!["kubernetes.default.svc"],
+            "system:serviceaccount:openshell:openshell",
+            vec![(POD_NAME_EXTRA, "openshell-0"), (POD_UID_EXTRA, "uid-a")],
+        );
+
+        let err = peer_token_review_identity(
+            &status,
+            DEFAULT_PEER_TOKEN_AUDIENCE,
+            "openshell",
+            "openshell",
+        )
+        .expect_err("a token for another audience must fail closed");
+        assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(err.reason, AuthFailureReason::AudienceOrIssuerMismatch);
     }
 
     #[test]
@@ -669,7 +735,75 @@ mod tests {
             )],
         )
         .expect_err("missing required label must fail");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.reason, AuthFailureReason::UnknownIdentity);
+    }
+
+    async fn decline_for(token: &str) -> AuthDecline {
+        let resolver = Arc::new(FakeGatewayPeerResolver::returning(Ok(None)));
+        let auth = PeerServiceAccountAuthenticator::new(resolver);
+        match auth
+            .authenticate(&bearer_headers(token), PEER_RELAY_PATH)
+            .await
+            .expect("a token TokenReview rejects must fall through")
+        {
+            Authentication::Declined(decline) => decline,
+            other => panic!("expected a decline, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticator_declines_tokens_tokenreview_rejects_as_invalid() {
+        // The payload's exp is unverified, so a past exp is no evidence of expiry.
+        for token in [
+            token_expiring_in(-60),
+            token_expiring_in(3600),
+            "opaque-token".to_string(),
+        ] {
+            let decline = decline_for(&token).await;
+            assert_eq!(decline.mechanism, AuthMechanism::GatewayPeer);
+            assert_eq!(
+                decline.reason,
+                AuthFailureReason::InvalidCredential,
+                "{token}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticator_rejects_a_replica_header_naming_another_pod() {
+        let resolver = Arc::new(FakeGatewayPeerResolver::returning(Ok(Some(identity()))));
+        let auth = PeerServiceAccountAuthenticator::new(resolver);
+        let mut headers = bearer_headers("token-a");
+        headers.insert("x-openshell-peer-replica", "openshell-1".parse().unwrap());
+
+        let err = auth
+            .authenticate(&headers, PEER_RELAY_PATH)
+            .await
+            .expect_err("a mismatched replica claim must be rejected");
+        assert_eq!(err.status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.mechanism, AuthMechanism::GatewayPeer);
+        assert_eq!(err.reason, AuthFailureReason::InvalidCredential);
+    }
+
+    #[tokio::test]
+    async fn authenticator_preserves_the_resolver_rejection() {
+        let resolver = Arc::new(FakeGatewayPeerResolver::returning(Err(AuthRejection::new(
+            AuthMechanism::GatewayPeer,
+            AuthFailureReason::StaleIdentity,
+            Status::permission_denied("gateway peer SA token pod UID mismatch"),
+        ))));
+        let auth = PeerServiceAccountAuthenticator::new(resolver);
+
+        let err = auth
+            .authenticate(&bearer_headers("token-a"), PEER_RELAY_PATH)
+            .await
+            .expect_err("resolver rejection must fail closed");
+        assert_eq!(
+            err.status.message(),
+            "gateway peer SA token pod UID mismatch"
+        );
+        assert_eq!(err.reason, AuthFailureReason::StaleIdentity);
     }
 
     #[tokio::test]
@@ -686,6 +820,7 @@ mod tests {
             .authenticate(&bearer_headers("token-a"), PEER_RELAY_PATH)
             .await
             .unwrap()
+            .principal()
             .expect("principal");
 
         let Principal::Peer(peer) = principal else {
@@ -711,19 +846,21 @@ mod tests {
             "/openshell.v1.OpenShell/PeerReportProviderReadiness",
             "/openshell.v1.OpenShell/PeerReportEndpointStatus",
             "/openshell.v1.OpenShell/PeerGetSandboxProviderStatus",
+            "/openshell.v1.OpenShell/PeerNotifyConfigUpdate",
         ] {
             assert!(matches!(
                 auth.authenticate(&headers, path).await.unwrap(),
-                Some(Principal::Peer(_))
+                Authentication::Accepted(Principal::Peer(_))
             ));
         }
         assert!(
             auth.authenticate(&headers, "/openshell.v1.OpenShell/ListSandboxes")
                 .await
                 .unwrap()
+                .principal()
                 .is_none()
         );
-        assert_eq!(resolver.seen_tokens.lock().unwrap().len(), 4);
+        assert_eq!(resolver.seen_tokens.lock().unwrap().len(), 5);
     }
 
     fn identity() -> ResolvedGatewayPeerIdentity {

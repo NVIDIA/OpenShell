@@ -21,9 +21,9 @@ use openshell_core::proto::compute::v1::{
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverSandbox, EnsureWorkspaceRequest,
     EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
     GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
-    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest,
+    SuspendSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -112,6 +112,15 @@ pub enum FakeComputeDriverCall {
     StartSandbox {
         sandbox_id: String,
         sandbox_name: String,
+        isolation_backend: Option<openshell_core::proto::compute::v1::IsolationBackendRegistration>,
+        /// Fresh supervisor-facing credentials. These remain opaque in test
+        /// diagnostics just as they do in production tracing.
+        launch_authentication: Vec<u8>,
+        generation_id: String,
+        /// The optional durable provisioning snapshot supplied by newer
+        /// gateways. Keeping it in the fake makes compatibility and
+        /// reconciliation tests able to verify the start contract.
+        sandbox: Option<DriverSandbox>,
     },
     DeleteSandbox {
         sandbox_id: String,
@@ -199,6 +208,20 @@ impl FakeComputeDriver {
     #[must_use]
     pub fn with_gateway_manages_lifecycle(self) -> Self {
         self.with_state(|state| state.capabilities.gateway_manages_lifecycle = true);
+        self
+    }
+
+    #[must_use]
+    pub fn with_isolation_backend_registration(self) -> Self {
+        self.with_state(|state| {
+            state
+                .capabilities
+                .extension
+                .as_mut()
+                .unwrap()
+                .supported_capabilities
+                .push(openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND.into());
+        });
         self
     }
 
@@ -385,6 +408,15 @@ impl ComputeDriver for FakeComputeDriver {
         Ok(Response::new(CreateSandboxResponse::default()))
     }
 
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the test compute driver does not support sandbox suspend",
+        ))
+    }
+
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
@@ -410,6 +442,10 @@ impl ComputeDriver for FakeComputeDriver {
             state.calls.push(FakeComputeDriverCall::StartSandbox {
                 sandbox_id: request.sandbox_id,
                 sandbox_name: request.name,
+                isolation_backend: request.isolation_backend,
+                launch_authentication: request.launch_authentication,
+                generation_id: request.generation_id,
+                sandbox: request.sandbox,
             });
         });
         Ok(Response::new(StartSandboxResponse::default()))

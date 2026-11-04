@@ -71,8 +71,9 @@ permissions:
   security-events: write
 
 concurrency:
-  group: codex-security-release-qualification
-  cancel-in-progress: true
+  group: codex-release-review
+  cancel-in-progress: false
+  queue: max
 
 env:
   CODEX_SECURITY_MAX_CONCURRENT_THREADS: "8"
@@ -291,7 +292,7 @@ jobs:
 
       - name: Upload SARIF to Code Scanning
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.upload_sarif }}
-        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           sarif_file: ${{ runner.temp }}/codex-security.sarif
           ref: refs/heads/main

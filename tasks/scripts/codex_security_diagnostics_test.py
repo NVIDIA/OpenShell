@@ -118,13 +118,21 @@ def test_unknown_enum_values_are_not_published(tmp_path, value):
     assert SENSITIVE not in json.dumps(report)
 
 
-def test_missing_invalid_and_symlinked_reports_do_not_echo_contents(tmp_path):
+def test_missing_invalid_reports_do_not_echo_contents(tmp_path):
     assert coverage_summary(tmp_path)["coverage_document"] == "missing"
     path = tmp_path / "coverage.json"
     path.write_text(SENSITIVE)
     assert coverage_summary(tmp_path)["coverage_document"] == "invalid"
-    path.unlink()
-    path.symlink_to(tmp_path / "scan-manifest.json")
+
+
+def test_symlinked_reports_do_not_echo_contents(tmp_path):
+    path = tmp_path / "coverage.json"
+    try:
+        path.symlink_to(tmp_path / "scan-manifest.json")
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Windows symlink creation requires Developer Mode or elevation")
+        raise
     assert coverage_summary(tmp_path)["coverage_document"] == "invalid"
 
 
@@ -139,7 +147,9 @@ def test_missing_invalid_and_symlinked_reports_do_not_echo_contents(tmp_path):
 def test_fifo_report_does_not_block_diagnostics(tmp_path, filename, field):
     scan = tmp_path / "scan"
     scan.mkdir()
-    os.mkfifo(scan / filename)
+    mkfifo = getattr(os, "mkfifo", None)
+    assert mkfifo is not None
+    mkfifo(scan / filename)
     output = tmp_path / "diagnostics.json"
     result = subprocess.run(
         [

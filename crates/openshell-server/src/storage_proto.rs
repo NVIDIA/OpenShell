@@ -123,7 +123,8 @@ mod tests {
     // Unspecified (treated as Never), zero count, and absent timestamps.
     // ProviderProfileFile is reachable from stored provider profiles. Its
     // additive declaration changes the durable and public/durable overlap
-    // inventories; the provider-environment file map is public-only. The
+    // inventories; the provider-environment file map and peer configuration
+    // notification are public-only. The
     // request has no provider-file capability field: older supervisors ignore
     // the additive file map while retaining the rest of the response.
     // Preparation timing adds two optional timestamps to SandboxProvisioning.
@@ -138,7 +139,8 @@ mod tests {
     // decoding or deadline updates cannot claim an existing attempt.
     // Stable placeholders add a stored credential flag whose absent value is
     // false. Capability negotiation and delivered key lists are public-only;
-    // the set of shared message and enum types remains unchanged.
+    // the set of shared message and enum types remains unchanged. Delivered
+    // provider snapshots carry the same flag per value and are never stored.
     // SessionRedirect and SupervisorHello.redirected are supervisor control
     // traffic and are never stored.
     // Token-grant owner fields add gateway-derived metadata to endpoints and
@@ -148,13 +150,27 @@ mod tests {
     // Operator credential export adds four public messages and no durable types.
     // ListProvidersRequest field 4 adds a public-only label selector. Older
     // requests decode an empty selector; durable schemas remain unchanged.
-    // The public inventory includes the label selector alongside MXC UI fields.
+    // Endpoint failure causes add EndpointFailure and EndpointFailureDomain to
+    // both closures through EndpointStatus.last_failure. Stored statuses decode
+    // without a cause, and the next accepted report or reset replaces them.
+    // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
+    // closures and TokenGrantStatus to public reports. Older rows have no grant
+    // record; absent report extensions retain compatibility without a rewrite.
+    // Supervisor middleware binding policy and selectors are public-only. An
+    // absent policy preserves dynamic discovery; older supervisors ignore both fields.
+    // Suspend/resume adds two public request messages without durable request
+    // admission, the restart_if_restore_fails resume option, and the SUSPENDING
+    // and SUSPENDED values to the shared
+    // SandboxPhase enum. Stored rows never carried those values, so prior
+    // payloads decode unchanged.
+    // The Windows startup UI policy adds one message and enum to both closures.
+    // Omitted UI fields preserve the existing default-deny behavior.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "7871afc3d1ff603fdd15ed4211d539e435d27c3da443b8bee5a608aacc70738f";
+        "4441e3ea1526d6e22bd6beecda42dd3bc8e50dab03cbdbff41ab394033ad6aec";
     const DURABLE_SCHEMA_SHA256: &str =
-        "74dcecdc7375511bd7638d044e13f5ae85eb8d4a5c221fbfeb14f6ce622d5f6e";
+        "9c8e260678cced0c2c72399324feb002f655bd9a0529b45f9e62fbb6b4bd9470";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "5f5165548d2ec333689fc88ab652af1977760bb976007a634e3ed30f28782424";
+        "3a96bcf0e04faa9bf0bdf3d8b73624f72e7321f14b9a40dc56f60e16ff42cbe4";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -198,6 +214,9 @@ mod tests {
         "openshell.v1.OpenShell/PeerGetSandboxProviderStatus|.openshell.v1.GetSandboxProviderStatusRequest|.openshell.v1.GetSandboxProviderStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportEndpointStatus|.openshell.v1.ReportEndpointStatusRequest|.openshell.v1.ReportEndpointStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
+    ];
+    const PEER_CONFIG_RPC_SIGNATURES: [&str; 1] = [
+        "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerNotifyConfigUpdateRequest|.openshell.v1.PeerNotifyConfigUpdateResponse|false|false",
     ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
@@ -523,11 +542,40 @@ mod tests {
         let mut methods = Vec::new();
         let mut public_roots = BTreeSet::new();
         let mut compiled_method_count = 0;
+        let mut isolation_methods = BTreeSet::new();
+        let mut sandbox_protocol_methods = BTreeSet::new();
+        let mut supervisor_host_methods = BTreeSet::new();
         for file in &public.file {
             let package = file.package.as_deref().unwrap_or_default();
             for service in &file.service {
                 let service_name = service.name.as_deref().expect("service name");
                 compiled_method_count += service.method.len();
+                if package == "openshell.sandbox.backend.v1" {
+                    assert_eq!(service_name, "IsolationBackend");
+                    isolation_methods.extend(
+                        service
+                            .method
+                            .iter()
+                            .map(|method| method.name.as_deref().expect("isolation method name")),
+                    );
+                }
+                if package == "openshell.sandbox.protocol.v1" {
+                    assert_eq!(service_name, "SandboxProtocol");
+                    sandbox_protocol_methods.extend(service.method.iter().map(|method| {
+                        method
+                            .name
+                            .as_deref()
+                            .expect("sandbox protocol method name")
+                    }));
+                }
+                // Private gateway-to-shared-supervisor protocol: served by the
+                // gateway but never part of the public SDK surface.
+                if package == "openshell.supervisor.host.v1" {
+                    assert_eq!(service_name, "SupervisorHost");
+                    supervisor_host_methods.extend(service.method.iter().map(|method| {
+                        method.name.as_deref().expect("supervisor host method name")
+                    }));
+                }
                 if !matches!(
                     (package, service_name),
                     ("openshell.v1", "OpenShell") | ("openshell.inference.v1", "Inference")
@@ -551,6 +599,20 @@ mod tests {
             }
         }
         methods.sort();
+        assert_eq!(
+            isolation_methods,
+            BTreeSet::from([
+                "Describe",
+                "OpenBoundary",
+                "ResumeBoundary",
+                "SuspendBoundary"
+            ])
+        );
+        assert_eq!(
+            sandbox_protocol_methods,
+            BTreeSet::from(["Exchange", "Mediate"])
+        );
+        assert_eq!(supervisor_host_methods, BTreeSet::from(["Attach"]));
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -563,14 +625,27 @@ mod tests {
                 "peer owner RPC is missing or changed: {signature}"
             );
         }
+        for signature in PEER_CONFIG_RPC_SIGNATURES {
+            assert!(
+                methods.iter().any(|method| method == signature),
+                "peer config RPC is missing or changed: {signature}"
+            );
+        }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            106 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len()
+                + isolation_methods.len()
+                + sandbox_protocol_methods.len()
+                + supervisor_host_methods.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -578,9 +653,16 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
+        assert!(
+            methods
+                .iter()
+                .all(|method| !method.contains(".supervisor.host."))
+        );
 
         let public_closure = schema_closure(&index, public_roots);
         let durable_closure =
@@ -622,9 +704,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (312, 28),
-                (94, 22),
-                (82, 22),
+                (331, 32),
+                (96, 23),
+                (84, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -725,6 +807,7 @@ mod tests {
         assert_eq!(status.main_process_instance_id, "supervisor-id");
         assert_eq!(status.exit_code, None);
         assert_eq!(status.restart_count, 0);
+        assert!(status.last_token_grant_failure.is_none());
         assert!(status.next_restart_time.is_none());
         assert!(status.main_process_started_time.is_none());
         assert_eq!(status.conditions.len(), 1);

@@ -224,6 +224,6 @@ behavior:
 
 - `/var/log/openshell.YYYY-MM-DD.log` — shorthand log of sandbox activity.
   This is what `/v1/denials` reads from.
-- `/var/log/openshell-ocsf.YYYY-MM-DD.log` — full OCSF JSON events, only
+- `/var/log/openshell-ocsf.YYYY-MM-DD.jsonl` — full OCSF JSON events, only
   written when the `ocsf_json_enabled` setting is on. Not used by
   `/v1/denials`; useful for SIEM ingestion.

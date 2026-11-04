@@ -21,6 +21,12 @@ use openshell_core::jwt::{
     SandboxId, SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SystemJwtClock,
 };
 use openshell_isolation_interface::contract::BoundaryConfirmation;
+use openshell_sandbox_backend::backend_proto::{
+    DescribeIsolationBackendRequest, DescribeIsolationBackendResponse, OpenBoundaryRequest,
+    OpenBoundaryResponse, ResumeBoundaryRequest, SuspendBoundaryRequest, SuspendBoundaryResponse,
+    isolation_backend_server::{IsolationBackend, IsolationBackendServer},
+    open_boundary_response::LaunchOutcome,
+};
 use openshell_sandbox_backend::boundary_protocol::{
     AgentSpecWire, BoundaryConfig, BoundaryErrorKind, BoundaryListener, ExecSpecWire,
     ExitStatusWire, OutputWindowWire, ProcessKindWire, ProcessSnapshotWire, Request,
@@ -29,8 +35,8 @@ use openshell_sandbox_backend::boundary_protocol::{
     encode_frame, read_frame_async, read_stream_frame, write_stream_frame,
 };
 use openshell_sandbox_backend::proto::{
-    BoundaryChunk,
-    isolation_boundary_server::{IsolationBoundary, IsolationBoundaryServer},
+    ExchangeFrame, MediateFrame,
+    sandbox_protocol_server::{SandboxProtocol, SandboxProtocolServer},
 };
 use openshell_sandbox_backend::sandbox_auth::{
     SandboxConnectionId, SandboxConnectionRegistry, SandboxProtocolAuthenticator,
@@ -68,7 +74,7 @@ pub fn run_boundary(config_path: &Path) -> Result<(), String> {
     runtime.block_on(async move {
         let (address, tls) = match &config.runtime.listener {
             BoundaryListener::TlsTcp { address, tls } => (*address, tls.clone()),
-            BoundaryListener::Unix { .. } | BoundaryListener::Vsock { .. } => {
+            _ => {
                 return Err("MXC requires a TLS TCP boundary listener".to_string());
             }
         };
@@ -129,7 +135,7 @@ fn validate_config(launch: &crate::launch::MxcBoundaryConfig) -> Result<(), Stri
         return Err("MXC boundary identity and verification keys are required".to_string());
     }
     config
-        .outer_fence
+        .provisioning_evidence
         .validate(&config.generation)
         .map_err(|error| error.to_string())?;
     match &config.listener {
@@ -141,7 +147,7 @@ fn validate_config(launch: &crate::launch::MxcBoundaryConfig) -> Result<(), Stri
         BoundaryListener::TlsTcp { .. } => {
             return Err("MXC boundary TLS listener configuration is invalid".to_string());
         }
-        BoundaryListener::Unix { .. } | BoundaryListener::Vsock { .. } => {
+        _ => {
             return Err("MXC boundary supports only TLS TCP transport".to_string());
         }
     }
@@ -207,15 +213,19 @@ async fn serve_grpc(
         })]),
         tokio_stream::pending(),
     );
+    let service = GrpcBoundaryService {
+        runtime: runtime.clone(),
+        connection_id,
+        connection_expiry,
+        connection_closed: connection_closed.clone(),
+        negotiated: Arc::new(AtomicBool::new(false)),
+        opened: Arc::new(AtomicBool::new(false)),
+    };
     let result = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(CONTROL_KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(CONTROL_KEEPALIVE_TIMEOUT))
-        .add_service(IsolationBoundaryServer::new(GrpcBoundaryService {
-            runtime: runtime.clone(),
-            connection_id,
-            connection_expiry,
-            connection_closed: connection_closed.clone(),
-        }))
+        .add_service(IsolationBackendServer::new(service.clone()))
+        .add_service(SandboxProtocolServer::new(service))
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = connection_closed.changed().await;
         })
@@ -286,9 +296,11 @@ struct GrpcBoundaryService {
     connection_id: SandboxConnectionId,
     connection_expiry: Arc<ConnectionExpiry>,
     connection_closed: tokio::sync::watch::Receiver<()>,
+    negotiated: Arc<AtomicBool>,
+    opened: Arc<AtomicBool>,
 }
 
-type GrpcResponseStream = ReceiverStream<Result<BoundaryChunk, tonic::Status>>;
+type GrpcResponseStream<F = ExchangeFrame> = ReceiverStream<Result<F, tonic::Status>>;
 
 // Match the Linux boundary: renewed RPC credentials update the physical
 // connection deadline, and expiry cancels every open exchange on it.
@@ -344,21 +356,123 @@ impl Drop for ConnectionExpiry {
 }
 
 #[tonic::async_trait]
-impl IsolationBoundary for GrpcBoundaryService {
-    type ExchangeStream = GrpcResponseStream;
-    type MediateStream = GrpcResponseStream;
-
-    async fn exchange(
+impl IsolationBackend for GrpcBoundaryService {
+    async fn describe(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
-    ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+        request: tonic::Request<DescribeIsolationBackendRequest>,
+    ) -> Result<tonic::Response<DescribeIsolationBackendResponse>, tonic::Status> {
+        let mut backend = openshell_sandbox_backend::isolation_protocol::metadata("openshell/mxc");
+        backend.supported_capabilities.retain(|capability| {
+            capability == openshell_sandbox_backend::isolation_protocol::SANDBOX_PROTOCOL_CAPABILITY
+        });
+        openshell_sandbox_backend::isolation_protocol::negotiate(
+            &backend,
+            request.into_inner().supervisor,
+        )?;
+        self.negotiated.store(true, Ordering::Release);
+        Ok(tonic::Response::new(DescribeIsolationBackendResponse {
+            backend: Some(backend),
+        }))
+    }
+
+    async fn open_boundary(
+        &self,
+        request: tonic::Request<OpenBoundaryRequest>,
+    ) -> Result<tonic::Response<OpenBoundaryResponse>, tonic::Status> {
         let principal = self
             .runtime
             .authenticate_request(self.connection_id, request.metadata())?;
+        if !self.negotiated.load(Ordering::Acquire) {
+            return Err(tonic::Status::failed_precondition(
+                "negotiate isolation capabilities before opening a boundary",
+            ));
+        }
+        let mut launch = request.into_inner();
+        if launch.backend_name != crate::BACKEND_NAME {
+            return Err(tonic::Status::permission_denied(
+                "MXC backend name does not match provisioned runtime",
+            ));
+        }
+        // Reuse the canonical descriptor checks after verifying the native backend name.
+        launch.backend_name = openshell_sandbox_backend::BACKEND_NAME.to_string();
+        openshell_sandbox_backend::isolation_protocol::validate_open(
+            &launch,
+            &self.runtime.config,
+        )?;
         self.connection_expiry
             .update(principal.session().expires_at);
-        let (stream, response) =
-            bridge_grpc_stream(request.into_inner(), self.connection_closed.clone());
+        self.opened.store(true, Ordering::Release);
+        Ok(tonic::Response::new(OpenBoundaryResponse {
+            boundary_id: self.runtime.config.generation.clone(),
+            outcome: LaunchOutcome::Fresh as i32,
+        }))
+    }
+
+    async fn suspend_boundary(
+        &self,
+        request: tonic::Request<SuspendBoundaryRequest>,
+    ) -> Result<tonic::Response<SuspendBoundaryResponse>, tonic::Status> {
+        self.runtime
+            .authenticate_request(self.connection_id, request.metadata())?;
+        Err(tonic::Status::unimplemented(
+            "MXC does not advertise suspend/resume",
+        ))
+    }
+
+    async fn resume_boundary(
+        &self,
+        request: tonic::Request<ResumeBoundaryRequest>,
+    ) -> Result<tonic::Response<OpenBoundaryResponse>, tonic::Status> {
+        self.runtime
+            .authenticate_request(self.connection_id, request.metadata())?;
+        Err(tonic::Status::unimplemented(
+            "MXC does not advertise suspend/resume",
+        ))
+    }
+}
+
+impl GrpcBoundaryService {
+    async fn bind_stream(
+        &self,
+        request: tonic::Request<tonic::Streaming<ExchangeFrame>>,
+    ) -> Result<(tonic::Streaming<ExchangeFrame>, SandboxProtocolPrincipal), tonic::Status> {
+        let principal = self
+            .runtime
+            .authenticate_request(self.connection_id, request.metadata())?;
+        if !self.opened.load(Ordering::Acquire) {
+            return Err(tonic::Status::failed_precondition(
+                "open a boundary before opening Sandbox Protocol streams",
+            ));
+        }
+        self.connection_expiry
+            .update(principal.session().expires_at);
+        let mut inbound = request.into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(10), inbound.message())
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("boundary binding frame timed out"))??;
+        match first.and_then(|frame| frame.payload) {
+            Some(openshell_sandbox_backend::proto::exchange_frame::Payload::BoundaryId(id))
+                if id == self.runtime.config.generation => {}
+            _ => {
+                return Err(tonic::Status::permission_denied(
+                    "stream does not bind the authenticated MXC boundary",
+                ));
+            }
+        }
+        Ok((inbound, principal))
+    }
+}
+#[tonic::async_trait]
+impl SandboxProtocol for GrpcBoundaryService {
+    type ExchangeStream = GrpcResponseStream;
+    type MediateStream = GrpcResponseStream<MediateFrame>;
+
+    async fn exchange(
+        &self,
+        request: tonic::Request<tonic::Streaming<ExchangeFrame>>,
+    ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+        let (inbound, principal) = self.bind_stream(request).await?;
+        let (stream, response) = bridge_grpc_stream(inbound, self.connection_closed.clone());
         let runtime = self.runtime.clone();
         let mut connection_closed = self.connection_closed.clone();
         tokio::spawn(async move {
@@ -377,7 +491,7 @@ impl IsolationBoundary for GrpcBoundaryService {
 
     async fn mediate(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<MediateFrame>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
         let _ = self
             .runtime
@@ -388,58 +502,66 @@ impl IsolationBoundary for GrpcBoundaryService {
     }
 }
 
-fn bridge_grpc_stream(
-    mut inbound: impl tokio_stream::Stream<Item = Result<BoundaryChunk, tonic::Status>>
-    + Send
-    + Unpin
-    + 'static,
+fn bridge_grpc_stream<F: openshell_sandbox_backend::stream_adapter::ProtocolFrame>(
+    mut inbound: impl tokio_stream::Stream<Item = Result<F, tonic::Status>> + Send + Unpin + 'static,
     connection_closed: tokio::sync::watch::Receiver<()>,
-) -> (tokio::io::DuplexStream, GrpcResponseStream) {
+) -> (tokio::io::DuplexStream, GrpcResponseStream<F>) {
     let (application, bridge) = tokio::io::duplex(256 * 1024);
     let (mut reader, mut writer) = tokio::io::split(bridge);
-    let (outbound, outbound_rx) = tokio::sync::mpsc::channel(64);
+    let (outbound, outbound_rx) = tokio::sync::mpsc::channel::<Result<F, tonic::Status>>(64);
+    // Do not retain the response sender while the client request direction
+    // stays open: finite exchanges must still observe the server's EOF.
+    let invalid_frames = outbound.downgrade();
     let mut inbound_closed = connection_closed.clone();
     tokio::spawn(async move {
         tokio::select! {
-            biased;
-            _ = inbound_closed.changed() => {}
-            () = async {
-                loop {
-                    match tokio_stream::StreamExt::next(&mut inbound).await {
-                        Some(Ok(chunk)) if writer.write_all(&chunk.data).await.is_ok() => {}
-                        Some(Ok(_) | Err(_)) => return,
-                        None => {
+        _ = inbound_closed.changed() => {},
+        () = async {
+        let mut mode = openshell_sandbox_backend::stream_adapter::Mode::Request;
+        loop {
+            match tokio_stream::StreamExt::next(&mut inbound).await {
+                Some(Ok(chunk)) => {
+                    let data = match chunk.receive(&mut mode).map_err(|error|tonic::Status::invalid_argument(error.to_string())) {
+                        Ok(data) => data,
+                        Err(error) => {
+                            if let Some(outbound) = invalid_frames.upgrade() {
+                                let _ = outbound.send(Err(error)).await;
+                            }
                             let _ = writer.shutdown().await;
                             return;
                         }
+                    };
+                    if writer.write_all(&data).await.is_err() {
+                        return;
                     }
                 }
-            } => {}
+                None => {
+                    let _ = writer.shutdown().await;
+                    return;
+                }
+                Some(Err(error)) => {
+                    tracing::debug!(%error, "Boundary gRPC request stream ended");
+                    return;
+                }
+            }
+        }
+        } => {},
         }
     });
     let mut outbound_closed = connection_closed;
     tokio::spawn(async move {
         tokio::select! {
-            biased;
-            _ = outbound_closed.changed() => {}
-            () = async {
-                let mut buffer = vec![0_u8; 16 * 1024];
-                loop {
-                    let Ok(read) = reader.read(&mut buffer).await else {
-                        return;
-                    };
-                    if read == 0
-                        || outbound
-                            .send(Ok(BoundaryChunk {
-                                data: buffer[..read].to_vec(),
-                            }))
-                            .await
-                            .is_err()
-                    {
-                        return;
-                    }
-                }
-            } => {}
+        _ = outbound_closed.changed() => {},
+        () = async {
+        let mut mode = openshell_sandbox_backend::stream_adapter::Mode::Response;
+        loop {
+            match F::send(&mut reader,&mut mode).await {
+                Ok(Some(chunk)) => if outbound.send(Ok(chunk)).await.is_err() { return; },
+                Ok(None) => return,
+                Err(error) => { let _=outbound.send(Err(tonic::Status::invalid_argument(error.to_string()))).await;return; }
+            }
+        }
+        } => {},
         }
     });
     (application, ReceiverStream::new(outbound_rx))
@@ -470,6 +592,7 @@ struct BoundaryRuntime {
     active_connection: Mutex<Option<SandboxConnectionId>>,
     lifecycle: Mutex<Lifecycle>,
     attached_policy: Mutex<Option<SandboxPolicyWire>>,
+    confirmed_policy: Mutex<Option<SandboxPolicyWire>>,
     processes: Mutex<HashMap<String, Arc<ManagedProcess>>>,
     main_process: Mutex<Option<String>>,
     provider_environment: Mutex<(u64, HashMap<String, String>, u64)>,
@@ -512,7 +635,11 @@ impl BoundaryRuntime {
                 generation,
                 config.auth_epoch,
             ),
-            connections: SandboxConnectionRegistry::new(config.session_id, config.session_rotation),
+            connections: SandboxConnectionRegistry::new(
+                config.session_id,
+                config.session_rotation,
+                config.auth_epoch,
+            ),
             config,
             runtime_directory,
             proxy_url: launch.proxy_url,
@@ -520,6 +647,7 @@ impl BoundaryRuntime {
             active_connection: Mutex::new(None),
             lifecycle: Mutex::new(Lifecycle::AwaitingAttach),
             attached_policy: Mutex::new(None),
+            confirmed_policy: Mutex::new(None),
             processes: Mutex::new(HashMap::new()),
             main_process: Mutex::new(None),
             provider_environment: Mutex::new((0, HashMap::new(), 0)),
@@ -601,7 +729,7 @@ impl BoundaryRuntime {
     ) -> Result<(), String> {
         if let Some(replaced) = self
             .connections
-            .attach(principal, instance)
+            .attach(principal, instance, None)
             .map_err(|error| error.to_string())?
         {
             self.close_connection(replaced);
@@ -613,6 +741,7 @@ impl BoundaryRuntime {
         if let Some(replaced) = self
             .connections
             .confirm(principal)
+            .map(|promotion| promotion.replaced)
             .map_err(|error| error.to_string())?
         {
             self.close_connection(replaced);
@@ -636,6 +765,7 @@ impl BoundaryRuntime {
         SessionSnapshotWire {
             generation: self.config.generation.clone(),
             processes,
+            bound_policy: lock(&self.attached_policy).clone().map(Box::new),
         }
     }
 
@@ -653,18 +783,14 @@ impl BoundaryRuntime {
             generation_scoped_attribution: true,
         };
         evidence.validate().map_err(|error| error.to_string())?;
-        let properties = evidence.properties();
         let backend_audit =
             serde_json::to_value(crate::audit::MxcBoundaryAuditEvidence::WindowsMxc(evidence))
                 .map_err(|error| format!("encode MXC audit evidence: {error}"))?;
         Ok(BoundaryConfirmation {
             generation: self.config.generation.clone(),
             identity: self.config.workload_identity.clone(),
-            properties,
-            authenticated_supervisor: true,
             session_id: self.config.session_id,
-            outer_fence: self.config.outer_fence.clone(),
-            runtime_exit_terminates_workload: true,
+            provisioning_evidence_digest: self.config.provisioning_evidence.evidence_digest,
             resource_claims: self.config.resource_claims.clone(),
             backend_audit,
         })
@@ -692,16 +818,19 @@ impl BoundaryRuntime {
                 yaml: None,
                 invalid: false,
             },
-            Request::ProbeProviderFiles => guest_error(
-                BoundaryErrorKind::Invalid,
-                "MXC provider file delivery is not supported",
-            ),
             Request::Attach {
                 policy,
-                resource_claims,
+                supervisor_takeover,
+                supervisor_recovery_timeout_secs,
                 ..
             } => {
-                if resource_claims == &self.config.resource_claims {
+                if supervisor_takeover.is_some() || supervisor_recovery_timeout_secs.is_some() {
+                    return guest_error(
+                        BoundaryErrorKind::Unsupported,
+                        "MXC does not support supervisor takeover or recovery timeout overrides",
+                    );
+                }
+                {
                     let mut lifecycle = lock(&self.lifecycle);
                     let mut attached_policy = lock(&self.attached_policy);
                     if *lifecycle == Lifecycle::AwaitingAttach {
@@ -709,14 +838,15 @@ impl BoundaryRuntime {
                         *lifecycle = Lifecycle::Bound;
                     }
                     if attached_policy.as_ref() == Some(policy) {
+                        // Snapshot reads the bound policy too; release its
+                        // mutation guard before collecting the response.
+                        drop(attached_policy);
                         Response::Attached {
                             snapshot: self.snapshot(),
                         }
                     } else {
                         guest_error(BoundaryErrorKind::Denied, "MXC attach policy changed")
                     }
-                } else {
-                    guest_error(BoundaryErrorKind::Denied, "MXC resource claims mismatch")
                 }
             }
             Request::Confirm => {
@@ -726,6 +856,8 @@ impl BoundaryRuntime {
                         match self.confirmation() {
                             Ok(confirmation) => {
                                 if *lifecycle == Lifecycle::Bound {
+                                    let attached_policy = lock(&self.attached_policy);
+                                    lock(&self.confirmed_policy).clone_from(&attached_policy);
                                     *lifecycle = Lifecycle::Ready;
                                 }
                                 Response::Confirmed {
@@ -777,7 +909,6 @@ impl BoundaryRuntime {
             | Request::Terminate { .. }
             | Request::TerminateBoundary
             | Request::Exec { .. }
-            | Request::ExecSignal { .. }
             | Request::LoopbackConnect { .. } => guest_error(
                 BoundaryErrorKind::Invalid,
                 "streaming request used on the non-streaming path",
@@ -812,7 +943,7 @@ impl BoundaryRuntime {
     async fn start_agent(&self, envelope: &RequestEnvelope) -> Response {
         let Request::StartAgent {
             spec,
-            policy,
+            sandbox_id,
             ca_cert,
             ca_bundle,
             provider_env_revision,
@@ -848,8 +979,18 @@ impl BoundaryRuntime {
                     "MXC boundary must be confirmed before agent start",
                 );
             }
-            if lock(&self.attached_policy).as_ref() != Some(policy) {
+            // StartAgent carries no policy in protocol v1. Compare the policy
+            // bound at Attach with the snapshot admitted by Confirm instead.
+            let attached_policy = lock(&self.attached_policy);
+            let confirmed_policy = lock(&self.confirmed_policy);
+            if confirmed_policy.is_none() || *attached_policy != *confirmed_policy {
                 return guest_error(BoundaryErrorKind::Denied, "MXC start policy changed");
+            }
+            if sandbox_id != &self.config.boundary_id {
+                return guest_error(
+                    BoundaryErrorKind::Denied,
+                    "MXC start sandbox identity changed",
+                );
             }
         }
         if let Err(error) = validate_provider_environment(provider_env) {
@@ -1047,7 +1188,7 @@ async fn serve_one(
             };
             write_response(&mut stream, &envelope.request_id, response).await
         }
-        Request::Signal { process_id, signal } | Request::ExecSignal { process_id, signal } => {
+        Request::Signal { process_id, signal } => {
             let response = match runtime.process(&process_id) {
                 Ok(process) => process.signal(signal).await.map_or_else(
                     |error| guest_error(BoundaryErrorKind::Process, error),
@@ -1106,7 +1247,7 @@ async fn forward_loopback(
     match tokio::net::TcpStream::connect((host, port)).await {
         Ok(mut target) => {
             openshell_core::net::set_tcp_nodelay_best_effort(&target);
-            write_response(&mut stream, request_id, Response::PortConnected).await?;
+            write_response(&mut stream, request_id, Response::LoopbackConnected).await?;
             tokio::io::copy_bidirectional(&mut stream, &mut target)
                 .await
                 .map(|_| ())
@@ -1479,7 +1620,7 @@ impl OutputLog {
     }
 
     fn publish_exit(&self, status: ExitStatusWire) {
-        if let Ok(payload) = serde_json::to_vec(&status) {
+        if let Ok(payload) = openshell_sandbox_backend::protobuf::encode(&status) {
             self.publish(STREAM_EXIT, payload);
         }
     }
@@ -1691,6 +1832,174 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    fn startup_fixture() -> BoundaryRuntime {
+        use openshell_core::jwt::{CredentialEpoch, SessionRotation};
+        use openshell_isolation_interface::contract::{
+            ProvisioningEvidence, ResolvedWorkloadIdentity,
+        };
+        use openshell_sandbox_backend::boundary_protocol::{
+            GatewayVerificationKey, SandboxTlsServerConfig,
+        };
+        let key = openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519).unwrap();
+        let config = BoundaryConfig {
+            boundary_id: "sandbox-startup".into(),
+            generation: "generation-startup".into(),
+            session_id: openshell_core::SandboxSessionId::new(),
+            session_rotation: SessionRotation::new(1).unwrap(),
+            auth_epoch: CredentialEpoch::new(1).unwrap(),
+            gateway_id: "test-gateway".into(),
+            verification_keys: vec![GatewayVerificationKey {
+                key_id: "test-key".into(),
+                public_key_pem: key.public_key_pem(),
+            }],
+            listener: BoundaryListener::TlsTcp {
+                address: "127.0.0.1:12345".parse().unwrap(),
+                tls: SandboxTlsServerConfig {
+                    certificate_chain_path: "C:/test/cert.pem".into(),
+                    private_key_path: "C:/test/key.pem".into(),
+                },
+            },
+            resource_claims: std::collections::BTreeMap::default(),
+            resource_claim_files: std::collections::BTreeMap::default(),
+            workload_identity: ResolvedWorkloadIdentity::new(
+                1,
+                1,
+                Vec::new(),
+                "test".into(),
+                "test-resource".into(),
+            )
+            .unwrap(),
+            provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence(
+                "generation-startup",
+                b"test-evidence",
+            )
+            .unwrap(),
+            child_env: HashMap::default(),
+        };
+        BoundaryRuntime::new(
+            crate::launch::MxcBoundaryConfig {
+                runtime: config,
+                proxy_url: "http://test:secret@127.0.0.1:12346".into(),
+            },
+            "C:/test/runtime".into(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn attach_snapshot_preserves_bound_policy_and_rejects_changes() {
+        use openshell_sandbox_backend::boundary_protocol::{
+            LandlockCompatibilityWire, NetworkModeWire, SupervisorInstanceId,
+        };
+        let runtime = startup_fixture();
+        let policy = SandboxPolicyWire {
+            version: 1,
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+            include_workdir: false,
+            network: NetworkModeWire::Block,
+            proxy_addr: None,
+            landlock: LandlockCompatibilityWire::BestEffort,
+            run_as_user: None,
+            run_as_group: None,
+        };
+        let attach = |policy: SandboxPolicyWire| {
+            RequestEnvelope::new(Request::Attach {
+                supervisor_instance_id: SupervisorInstanceId::new(),
+                policy: Box::new(policy),
+                supervisor_takeover: None,
+                supervisor_recovery_timeout_secs: None,
+            })
+            .unwrap()
+        };
+        for _ in 0..2 {
+            let response = runtime.dispatch(&attach(policy.clone()));
+            let Response::Attached { snapshot } = response else {
+                panic!("attach must return its bound snapshot")
+            };
+            assert_eq!(snapshot.bound_policy.as_deref(), Some(&policy));
+            assert_eq!(snapshot.generation, runtime.config.generation);
+        }
+        let mut changed = policy.clone();
+        changed.read_write.push("C:/unexpected".into());
+        assert!(matches!(
+            runtime.dispatch(&attach(changed)),
+            Response::Error {
+                kind: BoundaryErrorKind::Denied,
+                ..
+            }
+        ));
+        assert_eq!(runtime.snapshot().bound_policy.as_deref(), Some(&policy));
+    }
+
+    #[tokio::test]
+    async fn start_rejects_missing_or_changed_confirmed_policy_and_wrong_identity() {
+        use openshell_sandbox_backend::boundary_protocol::{
+            LandlockCompatibilityWire, NetworkModeWire,
+        };
+        let runtime = startup_fixture();
+        let policy = SandboxPolicyWire {
+            version: 1,
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+            include_workdir: false,
+            network: NetworkModeWire::Block,
+            proxy_addr: None,
+            landlock: LandlockCompatibilityWire::BestEffort,
+            run_as_user: None,
+            run_as_group: None,
+        };
+        *lock(&runtime.lifecycle) = Lifecycle::Ready;
+        *lock(&runtime.attached_policy) = Some(policy.clone());
+        let request = |sandbox_id: &str| {
+            RequestEnvelope::new(Request::StartAgent {
+                sandbox_id: sandbox_id.into(),
+                spec: AgentSpecWire {
+                    program: "must-not-launch.exe".into(),
+                    args: Vec::new(),
+                    workdir: None,
+                    timeout_secs: 0,
+                    interactive: false,
+                },
+                ca_cert: None,
+                ca_bundle: None,
+                provider_env_revision: 0,
+                provider_env: HashMap::default(),
+                provider_files: HashMap::default(),
+            })
+            .unwrap()
+        };
+        for case in 0..3 {
+            let sandbox_id = if case == 2 {
+                "another-sandbox"
+            } else {
+                "sandbox-startup"
+            };
+            let result = runtime.start_agent(&request(sandbox_id)).await;
+            assert!(
+                matches!(
+                    result,
+                    Response::Error {
+                        kind: BoundaryErrorKind::Denied,
+                        ..
+                    }
+                ),
+                "case {case}: {result:?}"
+            );
+            assert!(lock(&runtime.processes).is_empty());
+            if case == 0 {
+                *lock(&runtime.confirmed_policy) = Some(policy.clone());
+                lock(&runtime.attached_policy)
+                    .as_mut()
+                    .unwrap()
+                    .read_write
+                    .push("C:/unexpected".into());
+            } else {
+                *lock(&runtime.attached_policy) = Some(policy.clone());
+            }
+        }
+    }
+
     #[test]
     fn exec_environment_keeps_proxy_and_ca_with_refreshed_providers() {
         let ca_paths = (
@@ -1755,7 +2064,7 @@ mod tests {
             assert!(tokio_stream::StreamExt::next(&mut response).await.is_none());
             assert!(
                 inbound
-                    .send(Ok(BoundaryChunk { data: vec![1] }))
+                    .send(Ok(ExchangeFrame { payload: None }))
                     .await
                     .is_err()
             );
@@ -1955,7 +2264,7 @@ mod tests {
                 .await
                 .expect("protocol response");
             assert_eq!(response.request_id, "forward-1");
-            assert!(matches!(response.response, Response::PortConnected));
+            assert!(matches!(response.response, Response::LoopbackConnected));
             client
                 .write_all(b"ping")
                 .await

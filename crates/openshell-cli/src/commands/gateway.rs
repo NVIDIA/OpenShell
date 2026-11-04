@@ -1473,7 +1473,7 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
             .build()
     } else if scheme.eq_ignore_ascii_case("http") || tls.is_bearer_auth() {
         HttpsConnectorBuilder::new()
-            .with_native_roots()
+            .with_provider_and_native_roots(openshell_crypto::tls::configuration_provider())
             .into_diagnostic()?
             .https_or_http()
             .enable_http1()

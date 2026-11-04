@@ -66,6 +66,8 @@ pub fn phase_name(phase: i32) -> &'static str {
         Ok(SandboxPhase::Stopped) => "Stopped",
         Ok(SandboxPhase::Starting) => "Starting",
         Ok(SandboxPhase::Completed) => "Completed",
+        Ok(SandboxPhase::Suspending) => "Suspending",
+        Ok(SandboxPhase::Suspended) => "Suspended",
         Ok(SandboxPhase::Unknown) | Err(_) => "Unknown",
     }
 }
@@ -1112,6 +1114,27 @@ pub fn scrub_git_env(command: &mut Command) -> &mut Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_key_value_pairs_keeps_slashes_spaces_and_equals() {
+        let items = vec!["source=/home/you/my policy.yaml?a=b".to_string()];
+        let map = parse_key_value_pairs(&items, "--annotation").expect("annotation should parse");
+        assert_eq!(
+            map.get("source").map(String::as_str),
+            Some("/home/you/my policy.yaml?a=b")
+        );
+    }
+
+    #[test]
+    fn parse_key_value_pairs_rejects_malformed_and_empty_keys() {
+        let err =
+            parse_key_value_pairs(&["nokey".to_string()], "--annotation").expect_err("missing '='");
+        assert!(err.to_string().contains("--annotation expects KEY=VALUE"));
+
+        let err =
+            parse_key_value_pairs(&["=value".to_string()], "--annotation").expect_err("empty key");
+        assert!(err.to_string().contains("--annotation key cannot be empty"));
+    }
 
     #[test]
     fn parse_duration_to_ms_parses_supported_units() {

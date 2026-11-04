@@ -665,27 +665,47 @@ mod tests {
     }
 
     #[test]
-    fn capability_free_baseline_drops_each_root_entry_before_opening_the_next() {
+    fn capability_free_baseline_prepares_under_low_descriptor_limit() {
+        const CHILD_MARKER: &str = "OPENSHELL_TEST_LANDLOCK_FD_LIMIT_CHILD";
+
+        if !matches!(probe_availability(), LandlockAvailability::Available { abi } if abi >= 3) {
+            return;
+        }
+
+        // Descriptor limits are process-wide. Isolate this test from the other
+        // tests' sockets and files, and lower the limit only in the child.
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::linux::landlock::tests::capability_free_baseline_prepares_under_low_descriptor_limit",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_MARKER, "1")
+                .output()
+                .expect("run isolated Landlock descriptor-limit test");
+            assert!(
+                output.status.success(),
+                "isolated Landlock descriptor-limit test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
         let root = tempfile::tempdir().unwrap();
         for index in 0..128 {
             std::fs::write(root.path().join(format!("entry-{index:03}")), b"public").unwrap();
         }
         std::fs::create_dir(root.path().join(".openshell")).unwrap();
 
-        let baseline = std::fs::read_dir("/proc/self/fd").unwrap().count();
-        let mut visited = 0;
-        let mut peak = baseline;
-        for entry in capability_free_baseline_entries(root.path()).unwrap() {
-            let _entry = entry.unwrap();
-            visited += 1;
-            peak = peak.max(std::fs::read_dir("/proc/self/fd").unwrap().count());
-        }
-
-        assert_eq!(visited, 128);
-        assert!(
-            peak <= baseline + 16,
-            "streamed baseline preparation retained too many descriptors: baseline={baseline} peak={peak}"
-        );
+        // More entries than available descriptors forces the production path
+        // to release each entry after adding its rule instead of collecting FDs.
+        nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE, 64, 64)
+            .expect("lower child descriptor limit");
+        let _prepared = prepare_capability_free_baseline_at(root.path())
+            .expect("prepare 128 baseline entries with a 64-descriptor limit");
     }
 
     #[test]

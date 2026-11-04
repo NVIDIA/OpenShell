@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-isolation-interface"
-description = "OpenShell Isolation Backend interface (RFC 0012)"
+description = "Shared types and validation for the OpenShell Isolation Backend RPCs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,6 @@ repository.workspace = true
 
 [dependencies]
 openshell-core = { path = "../openshell-core", default-features = false }
-async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

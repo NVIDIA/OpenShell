@@ -23,7 +23,10 @@ spec:
         name: openshell-data
       spec:
         accessModes: ["ReadWriteOnce"]
+        {{- with .Values.server.dataStorageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
-            storage: 1Gi
+            storage: {{ .Values.server.dataStorageSize | default "1Gi" | quote }}
 {{- end }}

@@ -8,27 +8,40 @@ use tokio_stream::StreamExt as _;
 /// workload stops reading a relayed download. Other streams echo one chunk.
 #[derive(Clone)]
 struct StallingPeer {
-    stalled: Arc<std::sync::Mutex<Vec<tonic::Streaming<BoundaryChunk>>>>,
+    stalled: Arc<std::sync::Mutex<Vec<tonic::Streaming<ExchangeFrame>>>>,
 }
 
 #[tonic::async_trait]
-impl IsolationBoundary for StallingPeer {
+impl SandboxProtocol for StallingPeer {
     type ExchangeStream = TestGrpcStream;
-    type MediateStream = TestGrpcStream;
+    type MediateStream = TestGrpcStream<MediateFrame>;
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<ExchangeFrame>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         let stall = request.metadata().get("x-stall").is_some();
         let mut inbound = request.into_inner();
+        test_bind(&mut inbound).await;
         let (outbound, receiver) = tokio::sync::mpsc::channel(1);
         if stall {
             self.stalled.lock().unwrap().push(inbound);
         } else {
             tokio::spawn(async move {
                 if let Ok(Some(chunk)) = inbound.message().await {
-                    let _ = outbound.send(Ok(chunk)).await;
+                    let request = chunk_data(chunk).unwrap();
+                    let request: RequestEnvelope = decode_frame(&request).unwrap();
+                    let response = ResponseEnvelope {
+                        request_id: request.request_id,
+                        response: Response::Exited {
+                            status: ExitStatusWire::Exited(23),
+                        },
+                    };
+                    let _ = outbound
+                        .send(Ok(
+                            crate::isolation_protocol::response_chunk(&response).unwrap()
+                        ))
+                        .await;
                 }
             });
         }
@@ -39,7 +52,7 @@ impl IsolationBoundary for StallingPeer {
 
     async fn mediate(
         &self,
-        _request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        _request: tonic::Request<tonic::Streaming<MediateFrame>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("flow-control fixture"))
     }
@@ -65,7 +78,8 @@ async fn start_boundary(peer: StallingPeer) -> tonic::transport::Channel {
             .initial_connection_window_size(
                 crate::boundary_protocol::BOUNDARY_CONNECTION_WINDOW_BYTES,
             )
-            .add_service(IsolationBoundaryServer::new(peer))
+            .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+            .add_service(SandboxProtocolServer::new(peer))
             .serve_with_incoming(incoming)
             .await
             .unwrap();
@@ -74,17 +88,25 @@ async fn start_boundary(peer: StallingPeer) -> tonic::transport::Channel {
         tls_runtime_descriptor(address, certificate.client_tls),
         test_bearer(&"a".repeat(32)),
     );
-    client.build_grpc_channel().await.unwrap().0
+    client
+        .build_grpc_channel(&BoundaryCredential::capture(&client.sandbox_bearer).unwrap())
+        .await
+        .unwrap()
+        .0
 }
 
 /// Push into one stalled stream until the peer stops granting credit.
-async fn saturate(channel: tonic::transport::Channel) -> tokio::sync::mpsc::Sender<BoundaryChunk> {
+async fn saturate(channel: tonic::transport::Channel) -> tokio::sync::mpsc::Sender<ExchangeFrame> {
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    sender
+        .send(exchange_frame(TEST_BOUNDARY_HANDLE))
+        .await
+        .unwrap();
     let mut request = tonic::Request::new(ReceiverStream::new(receiver));
     request
         .metadata_mut()
         .insert("x-stall", "1".parse().unwrap());
-    let mut client = IsolationBoundaryClient::new(channel);
+    let mut client = SandboxProtocolClient::new(channel);
     tokio::spawn(async move {
         let _response = client.exchange(request).await;
         std::future::pending::<()>().await;
@@ -92,9 +114,7 @@ async fn saturate(channel: tonic::transport::Channel) -> tokio::sync::mpsc::Send
     let chunk = vec![0_u8; 32 * 1024];
     while tokio::time::timeout(
         Duration::from_millis(300),
-        sender.send(BoundaryChunk {
-            data: chunk.clone(),
-        }),
+        sender.send(data_chunk(chunk.clone())),
     )
     .await
     .is_ok()
@@ -119,18 +139,35 @@ async fn stalled_relays_cannot_starve_other_streams() {
 
     let auth: tonic::metadata::AsciiMetadataValue = "Bearer test".parse().unwrap();
     let exchange = async {
-        let mut stream =
-            open_grpc_client_stream_with_authorization(channel, GrpcStreamKind::Exchange, auth)
-                .await
-                .unwrap();
-        stream.write_all(b"ping").await.unwrap();
-        let mut pong = [0_u8; 4];
-        stream.read_exact(&mut pong).await.unwrap();
-        pong
+        let mut stream = open_grpc_client_stream_with_authorization(
+            channel,
+            GrpcStreamKind::Exchange,
+            auth,
+            TEST_BOUNDARY_HANDLE,
+        )
+        .await
+        .unwrap();
+        let request = RequestEnvelope::new(Request::Wait {
+            process_id: "main".into(),
+        })
+        .unwrap();
+        stream
+            .write_all(&encode_frame(&request).unwrap())
+            .await
+            .unwrap();
+        crate::boundary_protocol::read_frame_async::<_, ResponseEnvelope>(&mut stream)
+            .await
+            .unwrap()
+            .response
     };
     let pong = tokio::time::timeout(Duration::from_secs(3), exchange)
         .await
         .expect("stalled relay streams must not exhaust connection-level credit");
-    assert_eq!(&pong, b"ping");
+    assert!(matches!(
+        pong,
+        Response::Exited {
+            status: ExitStatusWire::Exited(23)
+        }
+    ));
     drop(stalled);
 }

@@ -94,8 +94,24 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # Helm pushes the manifest by digest, then fetches it back to tag it.
+        # GHCR can briefly return 404 for a manifest it just accepted, so
+        # retry. Re-pushing the same archive is idempotent.
+        push_chart() {
+          local attempt
+          for attempt in 1 2 3 4; do
+            if helm push "$1" oci://ghcr.io/nvidia/openshell; then
+              return 0
+            fi
+            if [ "${attempt}" -lt 4 ]; then
+              echo "::warning::helm push of $(basename "$1") failed (attempt ${attempt}); retrying in $((attempt * 10))s."
+              sleep $((attempt * 10))
+            fi
+          done
+          return 1
+        }
         for archive in /tmp/helm-charts/*.tgz; do
-          helm push "${archive}" oci://ghcr.io/nvidia/openshell
+          push_chart "${archive}"
         done
 
     - name: Push SHA-pinned chart
@@ -107,6 +123,20 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # See "Push Helm chart to GHCR OCI" for why pushes retry.
+        push_chart() {
+          local attempt
+          for attempt in 1 2 3 4; do
+            if helm push "$1" oci://ghcr.io/nvidia/openshell; then
+              return 0
+            fi
+            if [ "${attempt}" -lt 4 ]; then
+              echo "::warning::helm push of $(basename "$1") failed (attempt ${attempt}); retrying in $((attempt * 10))s."
+              sleep $((attempt * 10))
+            fi
+          done
+          return 1
+        }
         mkdir -p /tmp/sha-pin
         for source_dir in "${GATEWAY_CHART_DIR}" "${WORKSPACE_CHART_DIR}"; do
           chart_name="$(basename "${source_dir}")"
@@ -117,5 +147,5 @@ runs:
           helm package "${sha_chart_dir}" --destination /tmp/sha-pin
         done
         for archive in /tmp/sha-pin/*.tgz; do
-          helm push "${archive}" oci://ghcr.io/nvidia/openshell
+          push_chart "${archive}"
         done

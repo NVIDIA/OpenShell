@@ -267,6 +267,50 @@ Sandbox SSH uses the gateway endpoint registered with the CLI. No separate Helm 
 
 When a Gateway terminates TLS, register its externally reachable `https://` endpoint with the CLI. OpenShell uses that registered endpoint for `sandbox connect`, `sandbox exec`, and port forwarding, even when the gateway pod reports an internal plaintext endpoint.
 
+## Route Sandbox Service Traffic
+
+The chart creates only a `Gateway` and a `GRPCRoute`. Browser and WebSocket
+traffic to exposed sandbox services — the URLs printed by
+`openshell service expose` — has no chart-managed route. Operators configure
+it themselves.
+
+Service URLs use a hostname under the gateway's service base domain, which
+comes from the wildcard SAN in `pkiInitJob.serverDnsNames` or
+`certManager.serverDnsNames` (for example `*.apps.example.com`). Create an
+`HTTPRoute` or `Ingress` that matches those hostnames and forwards to the
+OpenShell gateway Service, terminating TLS on the shared wildcard certificate.
+The route must preserve the original `Host` header: the gateway parses it to
+select the sandbox service.
+
+### Multiple gateways behind one ingress
+
+When two gateways share a cluster, one ingress, and one wildcard certificate,
+identically named workspaces, sandboxes, and services produce identical
+composite hostnames, so the ingress cannot select the correct gateway. Give
+each gateway a unique routing name:
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set server.name=gateway-a \
+  --set server.serviceHostnameFormat=hashed
+```
+
+With a routing name set, each gateway emits opaque, fixed-length hashed
+hostnames (`https://<hash>.apps.example.com/`) for its exposed services. Hash
+hostnames are deterministic and unique per gateway, so exact-host
+`HTTPRoute`/`Ingress` rules route them unambiguously with the single shared
+wildcard certificate. The hostnames exist only once services are exposed, so
+the rules must be created as services are exposed — for example by automation
+that reads `openshell service list` or the gateway API and reconciles
+exact-host routes per gateway. The chart does not create or manage these
+routes.
+
+See [Gateway configuration](/how-it-works/gateways/configuration#service-routing)
+for the routing-name field, its validation, and the effects of changing it.
+
 ## Next Steps
 
 Return to [Setup](/kubernetes/setup) to complete the installation.

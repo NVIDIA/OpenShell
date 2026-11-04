@@ -3,6 +3,8 @@
 
 //! Workload-side implementation of RFC 0012 sandbox exec.
 
+use crate::native_api::{BoundaryExec, BoundaryProcess, BoundaryTerminal, ExecSession};
+
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::io::Write as _;
@@ -21,8 +23,7 @@ use nix::unistd::Pid;
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::contract::{
-    BackendError, BoundaryExec, BoundaryExitStatus, BoundaryInput, BoundaryOutput, BoundaryProcess,
-    BoundarySignal, BoundaryTerminal, ExecSession, ExecSpec,
+    BackendError, BoundaryExitStatus, BoundaryInput, BoundaryOutput, BoundarySignal, ExecSpec,
 };
 
 /// The sandbox executor. Every spawn reuses the same admitted policy and
@@ -116,7 +117,6 @@ impl LocalBoundaryExec {
             stdout: Box::new(stdout),
             stderr: Some(Box::new(stderr)),
             terminal: None,
-            output_status: None,
         })
     }
 
@@ -289,7 +289,6 @@ impl LocalBoundaryExec {
                 stdout,
                 stderr,
                 terminal: None,
-                output_status: None,
             }),
             process,
             armed: true,
@@ -385,7 +384,6 @@ impl LocalBoundaryExec {
                 stdout: Box::new(tokio::fs::File::from_std(output)),
                 stderr: None,
                 terminal: Some(terminal),
-                output_status: None,
             }),
             process,
             armed: true,

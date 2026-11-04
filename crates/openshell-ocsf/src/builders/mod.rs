@@ -99,7 +99,7 @@ macro_rules! impl_actor_process_setter {
             /// Set the acting process.
             #[must_use]
             pub fn actor_process(mut self, process: $crate::objects::Process) -> Self {
-                self.actor = Some($crate::objects::Actor { process });
+                self.actor = Some($crate::objects::Actor::process(process));
                 self
             }
         }
@@ -135,6 +135,7 @@ macro_rules! impl_src_endpoint_addr_setter {
 }
 
 mod api_activity;
+mod authentication;
 mod base;
 mod config;
 mod finding;
@@ -145,6 +146,7 @@ mod process;
 mod ssh;
 
 pub use api_activity::ApiActivityBuilder;
+pub use authentication::AuthenticationBuilder;
 pub use base::BaseEventBuilder;
 pub use config::ConfigStateChangeBuilder;
 pub use finding::DetectionFindingBuilder;
@@ -155,6 +157,7 @@ pub use process::ProcessActivityBuilder;
 pub use ssh::SshActivityBuilder;
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use crate::OCSF_VERSION;
 use crate::enums::StatusId;
@@ -197,6 +200,46 @@ pub struct EventContext {
     pub origin: EventOrigin,
 }
 
+/// Event context borrowed from the caller or shared by a hosted sandbox
+/// instance.
+///
+/// Builders accept either form, so events attributed to a hosted sandbox
+/// instance need not leak a `'static` context for each instance.
+#[derive(Debug, Clone)]
+pub enum ContextRef<'a> {
+    Borrowed(&'a EventContext),
+    Shared(Arc<EventContext>),
+}
+
+impl std::ops::Deref for ContextRef<'_> {
+    type Target = EventContext;
+
+    fn deref(&self) -> &EventContext {
+        match self {
+            Self::Borrowed(context) => context,
+            Self::Shared(context) => context,
+        }
+    }
+}
+
+impl<'a> From<&'a EventContext> for ContextRef<'a> {
+    fn from(context: &'a EventContext) -> Self {
+        Self::Borrowed(context)
+    }
+}
+
+impl From<Arc<EventContext>> for ContextRef<'_> {
+    fn from(context: Arc<EventContext>) -> Self {
+        Self::Shared(context)
+    }
+}
+
+impl<'a> From<&'a ContextRef<'_>> for ContextRef<'a> {
+    fn from(context: &'a ContextRef<'_>) -> Self {
+        Self::Borrowed(context)
+    }
+}
+
 impl EventContext {
     /// Build the OCSF `Metadata` object for any event.
     #[must_use]
@@ -211,6 +254,7 @@ impl EventContext {
             profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
             uid: Some(uuid::Uuid::new_v4().to_string()),
             log_source: None,
+            correlation_uid: None,
         }
     }
 
@@ -277,6 +321,22 @@ pub(crate) fn test_sandbox_context() -> EventContext {
         proxy_ip: "10.42.0.1".parse().unwrap(),
         proxy_port: 3128,
         origin: EventOrigin::Supervisor,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_gateway_context() -> EventContext {
+    EventContext {
+        sandbox_id: String::new(),
+        sandbox_name: String::new(),
+        container_image: String::new(),
+        hostname: "openshell-gateway-0".to_string(),
+        product_version: "0.1.0".to_string(),
+        proxy_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        proxy_port: 0,
+        origin: EventOrigin::Gateway {
+            name: "openshell".to_string(),
+        },
     }
 }
 

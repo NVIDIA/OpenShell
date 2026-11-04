@@ -185,17 +185,19 @@ blocks. When you're done, type `/quit` in Pi to exit.
 ## Work on a Local Project
 
 To point Pi at your own code, run this from your project directory. `--upload`
-copies the directory into the sandbox before Pi starts, skipping anything
-`.gitignore` excludes.
+copies the directory into the sandbox, skipping anything `.gitignore` excludes.
+You cannot combine `--upload` with a trailing command, so start Pi from the
+shell that opens.
 
 ```shell
 openshell sandbox create \
   --name pi-project \
   --from pi-agent:local \
   --provider openrouter \
-  --upload .:/workspace \
-  -- pi
+  --upload .:/workspace
 ```
+
+In the sandbox shell, run `pi`.
 
 Pi's changes stay inside the sandbox. To copy them back, run
 `openshell sandbox download` from another terminal while Pi is still running.

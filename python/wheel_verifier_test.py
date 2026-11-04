@@ -32,7 +32,14 @@ def _wheel_files() -> set[str]:
         "openshell/py.typed",
         "openshell/_proto/__init__.py",
     }
-    for stem in ("datamodel", "openshell", "options", "sandbox"):
+    for stem in (
+        "credential_driver",
+        "datamodel",
+        "extension",
+        "openshell",
+        "options",
+        "sandbox",
+    ):
         files.add(f"openshell/_proto/{stem}_pb2.py")
         files.add(f"openshell/_proto/{stem}_pb2.pyi")
         files.add(f"openshell/_proto/{stem}_pb2_grpc.py")
@@ -79,11 +86,15 @@ def test_requires_exactly_one_wheel_in_directory(tmp_path: Path) -> None:
         verifier.verify_wheel(tmp_path)
 
 
-def test_rejects_missing_generated_proto(tmp_path: Path) -> None:
-    files = _wheel_files() - {"openshell/_proto/sandbox_pb2.py"}
+@pytest.mark.parametrize("stem", ["sandbox", "credential_driver", "extension"])
+@pytest.mark.parametrize("suffix", ["_pb2.py", "_pb2.pyi", "_pb2_grpc.py"])
+def test_rejects_missing_generated_proto(
+    tmp_path: Path, stem: str, suffix: str
+) -> None:
+    files = _wheel_files() - {f"openshell/_proto/{stem}{suffix}"}
     wheel = _write_wheel(tmp_path, files=files)
 
-    with pytest.raises(ValueError, match=r"sandbox_pb2\.py"):
+    with pytest.raises(ValueError, match="wheel is missing required files"):
         verifier.verify_wheel(wheel)
 
 

@@ -1,0 +1,77 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Traces"
+sidebar-title: "Traces"
+description: "The OpenTelemetry spans that the OpenShell gateway, compute drivers, and sandbox supervisors export, how they are named, and the resource attributes that identify where they came from."
+keywords: "Generative AI, Cybersecurity, Observability, OpenTelemetry, OTLP, Traces, Spans, Resource Attributes"
+position: 2
+---
+
+Traces show how the gateway handles each request, including the compute-driver work it performs, and how each sandbox supervisor starts up. Use them to find where time goes in an operation such as sandbox creation, or to follow one request across the gateway and its compute driver.
+
+## Enable Traces
+
+Set an OTLP collector endpoint in `gateway.toml`:
+
+```toml
+[openshell.gateway.otlp]
+endpoint = "https://backend:4317"
+```
+
+In the Helm chart, set the table under `gatewayConfig`. The gateway passes the endpoint to the compute drivers and sandbox supervisors it starts, and supervisors connect to the collector directly, so it must be reachable from sandboxes too. For a separate trace collector, TLS, sampling, and the other settings, refer to [OTLP Export](/how-it-works/gateways/configuration#otlp-export).
+
+## What Is Traced
+
+| Component | Spans |
+|---|---|
+| Gateway requests | One server span for each inbound gRPC or HTTP request. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. |
+| Gateway background work | Reconciliation, driver watches, and credential refresh. These start their own traces because no request supplies a parent. Credential refresh creates a span only when a credential is due or needs cleanup. |
+| Compute drivers | Child spans for each compute-driver operation the gateway performs, from both the gateway's side and the driver's side. |
+| Sandbox supervisors | Supervisor startup, such as loading policy. |
+
+Spans for routine or high-volume operations use DEBUG level, and the default INFO level does not export them. These include store operations, health checks, the RPCs that supervisors call on a timer (`GetSandboxConfig` and `ReportProviderReadiness`), and how supervisors handle egress connections. Set the gateway or sandbox log level to `debug` to include them.
+
+## Span Names
+
+Each component names its spans after the operation it performs:
+
+| Component | Span names | Examples |
+|---|---|---|
+| Gateway requests | The gRPC service and method, or the HTTP method for other requests | `openshell.v1.OpenShell/CreateSandbox`, `GET` |
+| Gateway background work | The task | `reconcile.sandboxes`, `refresh.provider_credentials` |
+| Compute drivers | The compute-driver RPC, with child spans prefixed by the driver name | `openshell.compute.v1.ComputeDriver/CreateSandbox`, `docker.provision` |
+| Sandbox supervisors | Prefixed with `supervisor.` | `supervisor.startup`, `supervisor.policy.load` |
+
+The gateway's client span and the driver's server span for a compute-driver call share the same name, which also appears in `rpc.method`. Their service names and span kinds tell them apart. A driver watch stream records a terminal status when it observes one. If the gateway stops consuming the stream first, the span status stays unset.
+
+## Resource Attributes
+
+Resource attributes identify which process produced a span:
+
+| Attribute | Value | Set on |
+|---|---|---|
+| `service.name` | `openshell-gateway`, `openshell-driver-<driver>`, such as `openshell-driver-docker`, or `openshell-supervisor` | Every span |
+| `service.version` | The OpenShell version | Every span |
+| `openshell.gateway.name` | The gateway name | Every span |
+| `openshell.gateway.compute_driver` | The configured compute driver, such as `kubernetes` | Gateway and compute-driver spans |
+| `openshell.sandbox.id` | The sandbox ID | Supervisor spans |
+
+To override the gateway's `service.name`, set `service_name` under `[openshell.gateway.otlp]`. Compute-driver and supervisor service names are fixed. To add your own attributes, such as `deployment.environment`, set `OTEL_RESOURCE_ATTRIBUTES` in the gateway's environment.
+
+### Gateway Names
+
+The gateway name comes from `name` under `[openshell.gateway]`, the `--name` flag, or `OPENSHELL_GATEWAY_NAME`, and defaults to `openshell`. The Helm chart sets it with `server.name`, which defaults to the chart's full name.
+
+Give each installation that reports to the same collector its own name, including each high-availability deployment, so that you can tell their spans apart. The replicas of one installation share its name.
+
+## Trace Context
+
+The gateway continues a valid W3C `traceparent` sent by the caller, so a client's trace can include the gateway's spans for its requests. Without one, the gateway starts a new trace.
+
+The gateway also passes its trace context to compute drivers, so driver spans appear in the same trace as the gateway request that caused them. Built-in drivers export their spans through the gateway's process. Managed external drivers receive the trace endpoint, gateway name, and compute driver from the gateway. Drivers that you run yourself own their telemetry configuration.
+
+## Next Steps
+
+- Configure [OTLP export](/how-it-works/gateways/configuration#otlp-export), including sampling and the `OTEL_*` variables the gateway honors.
+- See the [Observability Overview](/observability/overview) for the other signals OpenShell produces.

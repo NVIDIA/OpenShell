@@ -639,6 +639,20 @@ class SandboxSession:
         self.sandbox = self._client.start(self.sandbox.name, workspace=self._workspace)
         return self.sandbox
 
+    def suspend(self) -> SandboxRef:
+        self.sandbox = self._client.suspend(
+            self.sandbox.name, workspace=self._workspace
+        )
+        return self.sandbox
+
+    def resume(self, *, restart_if_restore_fails: bool = False) -> SandboxRef:
+        self.sandbox = self._client.resume(
+            self.sandbox.name,
+            workspace=self._workspace,
+            restart_if_restore_fails=restart_if_restore_fails,
+        )
+        return self.sandbox
+
 
 class SandboxClient:
     """gRPC client for sandbox CRUD and command execution."""
@@ -1106,6 +1120,39 @@ class SandboxClient:
         )
         return _sandbox_ref(response.sandbox)
 
+    def suspend(self, name: str, *, workspace: str) -> SandboxRef:
+        """Suspend a ready sandbox, retaining its memory state.
+
+        Requires a compute driver and isolation backend that support suspend
+        and resume.
+        """
+        response = self._stub.SuspendSandbox(
+            openshell_pb2.SuspendSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
+            ),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
+    def resume(
+        self,
+        name: str,
+        *,
+        workspace: str,
+        restart_if_restore_fails: bool = False,
+    ) -> SandboxRef:
+        """Resume a suspended sandbox in a new runtime generation."""
+        response = self._stub.ResumeSandbox(
+            openshell_pb2.ResumeSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
+                restart_if_restore_fails=restart_if_restore_fails,
+            ),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
     def wait_deleted(
         self,
         name: str,
@@ -1152,6 +1199,17 @@ class SandboxClient:
             timeout_seconds=timeout_seconds,
         )
 
+    def wait_suspended(
+        self, name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
+        return self._wait_for_phase(
+            name,
+            workspace=workspace,
+            target_phase=openshell_pb2.SANDBOX_PHASE_SUSPENDED,
+            target_name="suspended",
+            timeout_seconds=timeout_seconds,
+        )
+
     def _wait_for_phase(
         self,
         name: str,
@@ -1176,6 +1234,16 @@ class SandboxClient:
                 and sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
             ):
                 raise SandboxError(f"sandbox {name} stopped before becoming ready")
+            if target_phase == openshell_pb2.SANDBOX_PHASE_READY and (
+                sandbox.status.phase
+                in (
+                    openshell_pb2.SANDBOX_PHASE_SUSPENDING,
+                    openshell_pb2.SANDBOX_PHASE_SUSPENDED,
+                )
+            ):
+                raise SandboxError(
+                    f"sandbox {name} is suspended; resume it before waiting for ready"
+                )
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {name} entered error phase")
             time.sleep(1)

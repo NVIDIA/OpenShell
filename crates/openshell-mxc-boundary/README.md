@@ -18,12 +18,19 @@ The separate host supervisor owns policy evaluation, provider credentials, and
 upstream networking. This library does not depend on the compute driver or the
 supervisor implementation.
 
-The library also owns the host-side `MxcRuntimeBackend`, registered under the
-exact admission name `openshell-mxc`, and the MXC audit schema and its validator.
-Windows supervisor composition selects this backend; it delegates transport
-and common lifecycle validation to the shared Sandbox Protocol implementation.
-The backend keeps evidence opaque and compares validated properties with the
-confirmation; its default Linux validator rejects Windows evidence.
+The library also owns host-side MXC client composition under the exact admission
+name `openshell-mxc`, and the MXC audit schema and its validator. It composes
+the concrete Sandbox Protocol client with the reverse-TCP transport and native
+audit checker. Common validation binds session, generation, workload identity,
+resource claims, and the provisioning evidence digest; the Linux validator
+continues to reject Windows evidence.
+
+The boundary negotiates the `IsolationBackend` service, authenticates and opens
+its provisioned resource, and requires the returned boundary handle on each
+typed `SandboxProtocol` stream. Policy is bound at `Attach`, captured at
+`Confirm`, and checked for equality again before `StartAgent`. Unsupported
+suspend/resume, supervisor takeover, and recovery-timeout overrides fail
+explicitly and are not advertised.
 
 MXC initiates the control connection to the host backend's loopback listener,
 as the Windows branch relay does. The boundary remains the TLS server on that
@@ -40,7 +47,7 @@ MXC owns separate host-launch and one-use boundary-bootstrap envelopes. Host
 proxy address, authorization, and workload identity stay in the MXC launch
 payload; the authenticated workload proxy URL stays in the MXC bootstrap.
 Windows supervisor composition turns these into ordinary shared CONNECT
-listener options. Shared isolation traits and Sandbox Protocol descriptors
+listener options. Shared isolation contracts and Sandbox Protocol descriptors
 contain no MXC proxy fields, and other compute drivers need no placeholders.
 
 MXC adopts main's authenticated image-policy discovery and ordered provider
@@ -68,10 +75,10 @@ not add transparent socket interception or a non-PSEC transport. The outer fence
 still requires native ProcessContainer networking and permits all ports on
 `127.0.0.1`; it is not isolation from unrelated host-loopback services.
 
-Main requires explicit proof of no unmanaged egress path and verified
-revocation. For Windows-branch parity testing, the MXC driver temporarily
-asserts those guarantees without establishing them. Network audit assertions
-are likewise compatibility stubs, labeled as unverified in mechanism metadata.
+The provisioning evidence digest binds driver-provided facts to one generation;
+it is not independent proof of network enforcement. For Windows-branch parity
+testing, MXC retains its temporary unverified egress and revocation assertions.
+The provisioning payload explicitly labels those assertions as unverified.
 This does not restrict access to unrelated host-loopback services or establish
 live revocation. TODOs in provisioning and confirmation track removing the
 stubs; shared backend validation and native AppContainer checks remain intact.

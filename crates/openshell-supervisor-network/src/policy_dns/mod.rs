@@ -484,6 +484,7 @@ fn dns_query_endpoint(name: &NormalizedName) -> Endpoint {
         domain: Some(name.as_str().to_string()),
         ip: None,
         port: None,
+        name: None,
     }
 }
 

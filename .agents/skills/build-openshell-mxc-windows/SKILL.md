@@ -8,9 +8,16 @@ metadata:
 # Build OpenShell-MXC for Windows
 
 This skill maintains the existing native Windows MSVC build lane in the
-OpenShell repository. The Windows lane is already present in `main`; do not
-treat this skill as a first-time porting recipe unless the user explicitly asks
-for a new fork or a from-scratch bring-up.
+OpenShell repository's [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+That branch owns native Windows implementation and releases. Shared docs may
+also appear on `main`; always direct Windows work to `windows` and use explicit
+Windows branch links for implementation details. See
+[Native Windows support](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md).
+
+Before running the tasks below, use a `windows`-based checkout and read the
+[skill from that branch](https://github.com/NVIDIA/OpenShell/blob/windows/.agents/skills/build-openshell-mxc-windows/SKILL.md).
+The task and runtime descriptions refer to that checkout, not to any older
+Windows source snapshot retained on `main`.
 
 The lane validates that OpenShell can compile and test on Windows MSVC for the
 supported deliverables:
@@ -51,8 +58,12 @@ process. Include boundary-library regression tests in native workspace tests;
 their real process/socket checks are not qualification of MXC enforcement.
 
 Keep MXC audit schemas and their validators in the Windows boundary library.
-Register its `MxcRuntimeBackend` under `openshell-mxc` at supervisor composition.
-Use the private `BackendSetup` / `PreparedBackend` extension for launch decoding,
+Select `openshell-mxc` at supervisor composition, using the concrete RPC client
+with its reverse-TCP transport and native audit checker. Keep typed protocol
+negotiation, authenticated boundary opening, per-stream handle binding, and the
+Attach/Confirm policy equality check before StartAgent. Do not advertise MXC
+suspend/resume or supervisor takeover until implemented.
+Use `BackendSetup` / `PreparedBackend` for launch decoding,
 policy discovery, and client construction. Shared startup must not decode the
 MXC descriptor or allocate its connector. Retain the same reverse-TCP connector
 in prepared launch state through discovery, attachment, and reconnects.
@@ -80,7 +91,7 @@ provider-publication generations. Do not order opaque credential revisions
 numerically. MXC rejects unsupported provider file delivery before launch or
 environment replacement; it must not acknowledge files it did not install.
 
-Preserve main's shared outer-fence evidence contract. At the user's explicit
+Preserve main's generation-bound provisioning evidence contract. At the user's explicit
 request, MXC temporarily asserts the required guarantees for Windows-branch
 parity testing. These MXC-only assertions are stubs, not verified enforcement:
 broad host loopback and unverified live revocation remain known gaps. Keep the
@@ -107,7 +118,7 @@ did not request.
 
 In scope:
 
-- Refreshing a local checkout to the latest upstream GitHub `main`.
+- Refreshing a Windows checkout to the latest upstream GitHub `windows`.
 - Maintaining `tasks/windows.toml` and `tasks/scripts/windows-msvc.ps1`.
 - Running x64 and ARM64 MSVC checks.
 - Building x64 and ARM64 release binaries for `openshell-gateway`, `openshell`,
@@ -153,10 +164,10 @@ From a fork checkout where `upstream` points to the official
 `NVIDIA/OpenShell` GitHub repository, use:
 
 ```powershell
-git fetch upstream main
-git switch main
-git merge --ff-only upstream/main
-git branch --set-upstream-to=upstream/main main
+git fetch upstream windows
+git switch windows
+git merge --ff-only upstream/windows
+git branch --set-upstream-to=upstream/windows windows
 git status --short --branch
 ```
 
@@ -237,21 +248,36 @@ $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 switch ($arch.ToString()) {
     "X64" {
         mise run --skip-tools windows:ci
+        if ($LASTEXITCODE -ne 0) { throw "windows:ci failed." }
         mise run --skip-tools windows:test:mxc-real:x64
+        if ($LASTEXITCODE -ne 0) { throw "windows:test:mxc-real:x64 failed." }
+        mise run --skip-tools windows:e2e:mxc
+        if ($LASTEXITCODE -ne 0) { throw "MXC E2E validation failed or was incomplete." }
     }
     "Arm64" {
         mise run --skip-tools windows:check:arm64
+        if ($LASTEXITCODE -ne 0) { throw "windows:check:arm64 failed." }
         mise run --skip-tools windows:build:arm64
+        if ($LASTEXITCODE -ne 0) { throw "windows:build:arm64 failed." }
         mise run --skip-tools windows:test:arm64
+        if ($LASTEXITCODE -ne 0) { throw "windows:test:arm64 failed." }
         mise run --skip-tools windows:test:unsupported:arm64
+        if ($LASTEXITCODE -ne 0) { throw "windows:test:unsupported:arm64 failed." }
         mise run --skip-tools windows:test:mxc-real:arm64
+        if ($LASTEXITCODE -ne 0) { throw "windows:test:mxc-real:arm64 failed." }
         mise run --skip-tools windows:artifacts
+        if ($LASTEXITCODE -ne 0) { throw "windows:artifacts failed." }
+        mise run --skip-tools windows:e2e:mxc
+        if ($LASTEXITCODE -ne 0) { throw "MXC E2E validation failed or was incomplete." }
     }
     default {
         throw "Unsupported Windows host architecture for OpenShell MSVC validation: $arch"
     }
 }
 ```
+
+Full validation requires an MXC-capable host. E2E exits nonzero when any
+required runtime scenario fails or skips.
 
 On x64 hosts, `windows:ci` is the full current CI contract and runs in this
 order:
@@ -318,8 +344,8 @@ crypto dependency builds.
 | `windows:check:arm64` | `cargo check --workspace` for `aarch64-pc-windows-msvc`, with the same top-level exclusions. |
 | `windows:build:x64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, and `openshell-windows-sandbox.exe` for x64. |
 | `windows:build:arm64` | Release-builds the same four binaries for ARM64. |
-| `windows:test:x64` | Runs native x64 workspace tests with `--no-fail-fast`, excluding unsupported Windows packages as top-level workspace targets. |
-| `windows:test:arm64` | Runs native ARM64 workspace tests with `--no-fail-fast` and the same package exclusions. Rejects non-ARM64 hosts. |
+| `windows:test:x64` | Runs native x64 workspace tests with the nextest CI profile and server test-support feature, excluding unsupported Windows packages as top-level workspace targets. |
+| `windows:test:arm64` | Runs native ARM64 workspace tests with the nextest CI profile, server test support, and the same package exclusions. Rejects non-ARM64 hosts. |
 | `windows:test:unsupported:x64` | Re-runs focused `openshell-gateway` tests for unsupported Windows driver behavior. |
 | `windows:test:unsupported:arm64` | Re-runs the same focused contracts natively on ARM64. Rejects non-ARM64 hosts. |
 | `windows:test:mxc-real:x64` | Runs the serial, ignored real-`wxc-exec` integration suite natively on x64 through the MSVC wrapper. Rejects non-x64 hosts. |

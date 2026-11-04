@@ -11,6 +11,10 @@ position: 2
 
 Published gateway and supervisor images carry one SPDX SBOM per platform as OCI attestations.
 
+Stable releases publish rebuilt images under version tags such as `0.4.3`.
+Promoting a prerelease preserves its commit-SHA image tags, which continue to
+identify the images used for qualification.
+
 ## Inspect an Image
 
 Read a platform's document without pulling the image:
@@ -29,7 +33,7 @@ The same commands work for `ghcr.io/nvidia/openshell/supervisor`.
 
 ## Coverage
 
-Every SBOM lists the base-image packages. Release Dev and Release Tag images also list the Rust crates compiled into their OpenShell binary.
+Every SBOM lists the base-image packages. Release Dev, Release, and Pre-release images also list the Rust crates compiled into their OpenShell binary.
 
 <Note>
 OpenShell also publishes minimal SLSA provenance. It records how BuildKit produced the image, including its source revision, build platform, and base-image materials, without the extra build parameters included by full provenance.

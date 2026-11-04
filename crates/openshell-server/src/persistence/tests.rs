@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectListQuery, ObjectType, PersistenceError, Store, generate_name, test_store};
+use super::{
+    ObjectListQuery, ObjectType, PersistenceError, PolicyRecord, Store, generate_name, test_store,
+};
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
 use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
@@ -293,12 +295,12 @@ async fn sqlite_pool_ceiling_defaults_and_honours_an_override() {
     let unset = SqliteStore::connect(&url, None)
         .await
         .expect("connect to sqlite");
-    assert_eq!(unset.max_connections_for_test(), DEFAULT_MAX_CONNECTIONS);
+    assert_eq!(unset.max_connections(), DEFAULT_MAX_CONNECTIONS);
 
     let raised = SqliteStore::connect(&url, Some(32))
         .await
         .expect("connect to sqlite");
-    assert_eq!(raised.max_connections_for_test(), 32);
+    assert_eq!(raised.max_connections(), 32);
 }
 
 /// An in-memory database lives inside its single connection: a second one
@@ -310,7 +312,7 @@ async fn in_memory_sqlite_pins_the_pool_to_one_connection() {
     let store = SqliteStore::connect("sqlite::memory:", Some(32))
         .await
         .expect("connect to in-memory sqlite");
-    assert_eq!(store.max_connections_for_test(), 1);
+    assert_eq!(store.max_connections(), 1);
 }
 
 /// The SSH identity lock keeps one data connection while it queries the
@@ -1419,6 +1421,85 @@ fn policy_test_sandbox(id: &str, name: &str) -> Sandbox {
 }
 
 #[tokio::test]
+async fn initial_policy_history_is_insert_only() {
+    assert_initial_policy_history_is_insert_only(&test_store().await).await;
+}
+
+#[tokio::test]
+#[ignore = "requires OPENSHELL_TEST_POSTGRES_URL pointing to a test database"]
+async fn postgres_initial_policy_history_is_insert_only() {
+    let url = std::env::var("OPENSHELL_TEST_POSTGRES_URL").expect("test database URL");
+    let store = Store::connect(&url).await.unwrap();
+    assert_initial_policy_history_is_insert_only(&store).await;
+}
+
+async fn assert_initial_policy_history_is_insert_only(store: &Store) {
+    let id = uuid::Uuid::new_v4().to_string();
+    let sandbox = policy_test_sandbox(&id, &id);
+    let record = PolicyRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        sandbox_id: id.clone(),
+        version: 1,
+        policy_payload: SandboxPolicy::default().encode_to_vec(),
+        policy_hash: "initial-hash".into(),
+        status: "loaded".into(),
+        load_error: None,
+        created_at_ms: 1,
+        loaded_at_ms: None,
+        provenance: StdHashMap::new(),
+    };
+
+    store
+        .put_initial_policy_revision(&record, "default")
+        .await
+        .unwrap();
+    assert!(store.get_latest_policy(&id).await.unwrap().is_none());
+
+    store.put_message(&sandbox).await.unwrap();
+    let (first, second) = tokio::join!(
+        store.put_initial_policy_revision(&record, "default"),
+        store.put_initial_policy_revision(&record, "default"),
+    );
+    first.unwrap();
+    second.unwrap();
+    let initial = store.get_latest_policy(&id).await.unwrap().unwrap();
+    assert_eq!(initial.status, "loaded");
+    assert_eq!(initial.policy_hash, record.policy_hash);
+    assert_eq!(store.list_policies(&id, 10, 0).await.unwrap().len(), 1);
+
+    store
+        .update_policy_status(&id, 1, "failed", Some("apply failed"), None)
+        .await
+        .unwrap();
+    store
+        .put_initial_policy_revision(&record, "default")
+        .await
+        .unwrap();
+    let failed = store.get_latest_policy(&id).await.unwrap().unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.load_error.as_deref(), Some("apply failed"));
+
+    store
+        .put_policy_revision(
+            &uuid::Uuid::new_v4().to_string(),
+            &id,
+            "default",
+            2,
+            &record.policy_payload,
+            "new-hash",
+        )
+        .await
+        .unwrap();
+    store
+        .put_initial_policy_revision(&record, "default")
+        .await
+        .unwrap();
+    let latest = store.get_latest_policy(&id).await.unwrap().unwrap();
+    assert_eq!(latest.version, 2);
+    assert_eq!(store.list_policies(&id, 10, 0).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn policy_atomic_write_commits_revision_provenance_and_sandbox_projection() {
     let store = test_store().await;
     store
@@ -2298,7 +2379,8 @@ async fn sqlite_concurrent_writes_return_their_own_resource_version() {
     use std::sync::Arc;
 
     const WRITERS: u64 = 8;
-    const WRITES: u64 = 25;
+    // Slow Windows fsync can starve a writer past the SQLite busy timeout.
+    const WRITES: u64 = if cfg!(windows) { 5 } else { 25 };
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let url = on_disk_store_url(&tmp.path().join("openshell.db"));
@@ -3000,4 +3082,217 @@ async fn store_operations_export_spans_with_parents() {
         Some("sandbox"),
         "the store span records what it queried"
     );
+}
+
+/// Exercises one atomic write group on `store`: results come back in input
+/// order, and any unmet condition leaves every row as it was. Writes run in
+/// `(object_type, id)` order, so each failing write below sorts after a
+/// create, an update, and a delete that already succeeded inside the group.
+async fn atomic_write_groups_apply_all_or_nothing(store: &Store) {
+    use super::AtomicWrite;
+    let create = |id: &str, name: &str| AtomicWrite::Create {
+        object_type: "atomic_test".to_string(),
+        id: id.to_string(),
+        name: name.to_string(),
+        workspace: String::new(),
+        payload: b"one".to_vec(),
+    };
+    let update = |id: &str, expected_version| AtomicWrite::Update {
+        object_type: "atomic_test".to_string(),
+        id: id.to_string(),
+        payload: b"two".to_vec(),
+        expected_version,
+    };
+    let delete = |id: &str, expected_version| AtomicWrite::Delete {
+        object_type: "atomic_test".to_string(),
+        id: id.to_string(),
+        expected_version,
+    };
+    let results = store
+        .write_atomically(&[create("x", "x"), create("b", "b"), create("a", "a")])
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(
+        results
+            .iter()
+            .all(|result| result.as_ref().unwrap().resource_version == 1)
+    );
+    let unchanged = || async {
+        for id in ["a", "b", "x"] {
+            let row = store.get("atomic_test", id).await.unwrap().unwrap();
+            assert_eq!(
+                (row.payload.as_slice(), row.resource_version),
+                (b"one".as_slice(), 1),
+                "{id} is unchanged"
+            );
+        }
+        assert!(store.get("atomic_test", "c").await.unwrap().is_none());
+    };
+
+    // Each group updates a, deletes b, and creates c before its last write
+    // fails; every one of those effects is rolled back.
+    let failing_last = [
+        // An update at a stale version.
+        update("x", 7),
+        // A create of an existing id.
+        create("x", "other"),
+        // A create of a new id under an existing name.
+        create("y", "x"),
+        // A delete at a stale version.
+        delete("x", 7),
+    ];
+    for last in failing_last {
+        let unique = matches!(last, AtomicWrite::Create { .. });
+        let outcome = store
+            .write_atomically(&[last, create("c", "c"), delete("b", 1), update("a", 1)])
+            .await;
+        if unique {
+            assert!(
+                matches!(outcome, Err(PersistenceError::UniqueViolation { .. })),
+                "{outcome:?}"
+            );
+        } else {
+            assert!(
+                matches!(outcome, Err(PersistenceError::Conflict { .. })),
+                "{outcome:?}"
+            );
+        }
+        unchanged().await;
+        assert!(store.get("atomic_test", "y").await.unwrap().is_none());
+    }
+
+    // A group whose conditions hold applies every write.
+    let applied = store
+        .write_atomically(&[delete("b", 1), update("a", 1), create("c", "c")])
+        .await
+        .unwrap();
+    assert!(applied[0].is_none());
+    assert_eq!(applied[1].as_ref().unwrap().resource_version, 2);
+    assert_eq!(applied[2].as_ref().unwrap().resource_version, 1);
+    assert!(store.get("atomic_test", "b").await.unwrap().is_none());
+    assert!(store.get("atomic_test", "c").await.unwrap().is_some());
+    let a = store.get("atomic_test", "a").await.unwrap().unwrap();
+    assert_eq!(
+        (a.payload.as_slice(), a.resource_version),
+        (b"two".as_slice(), 2)
+    );
+}
+
+/// Concurrent groups that update the same row at the same version: exactly
+/// one applies, and the rest change nothing.
+async fn concurrent_atomic_write_groups_admit_one(store: &Store) {
+    use super::AtomicWrite;
+    store
+        .write_atomically(&[AtomicWrite::Create {
+            object_type: "atomic_race".to_string(),
+            id: "slot".to_string(),
+            name: "slot".to_string(),
+            workspace: String::new(),
+            payload: b"0".to_vec(),
+        }])
+        .await
+        .unwrap();
+    let contenders = (0..8).map(|index| {
+        let store = store.clone();
+        async move {
+            store
+                .write_atomically(&[
+                    AtomicWrite::Create {
+                        object_type: "atomic_race".to_string(),
+                        id: format!("claim-{index}"),
+                        name: format!("claim-{index}"),
+                        workspace: String::new(),
+                        payload: Vec::new(),
+                    },
+                    AtomicWrite::Update {
+                        object_type: "atomic_race".to_string(),
+                        id: "slot".to_string(),
+                        payload: index.to_string().into_bytes(),
+                        expected_version: 1,
+                    },
+                ])
+                .await
+        }
+    });
+    let outcomes = futures::future::join_all(contenders).await;
+    let winners = outcomes
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| outcome.is_ok())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(winners.len(), 1, "{outcomes:?}");
+    for outcome in &outcomes {
+        if let Err(error) = outcome {
+            assert!(
+                matches!(error, PersistenceError::Conflict { .. }),
+                "{error:?}"
+            );
+        }
+    }
+    let slot = store.get("atomic_race", "slot").await.unwrap().unwrap();
+    assert_eq!(slot.payload, winners[0].to_string().into_bytes());
+    assert_eq!(slot.resource_version, 2);
+    for index in 0..8 {
+        let claim = store
+            .get("atomic_race", &format!("claim-{index}"))
+            .await
+            .unwrap();
+        assert_eq!(claim.is_some(), index == winners[0], "claim-{index}");
+    }
+}
+
+#[tokio::test]
+async fn sqlite_atomic_write_groups_apply_all_or_nothing() {
+    atomic_write_groups_apply_all_or_nothing(&test_store().await).await;
+}
+
+#[tokio::test]
+async fn sqlite_concurrent_atomic_write_groups_admit_one() {
+    concurrent_atomic_write_groups_admit_one(&test_store().await).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_atomic_write_groups_apply_all_or_nothing() {
+    let schema = super::test_postgres::TestSchema::create("atomic_write").await;
+    let store = schema.connect_store().await;
+    atomic_write_groups_apply_all_or_nothing(&store).await;
+    drop(store);
+    schema.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_concurrent_atomic_write_groups_admit_one() {
+    let schema = super::test_postgres::TestSchema::create("atomic_race").await;
+    let store = schema.connect_store().await;
+    concurrent_atomic_write_groups_admit_one(&store).await;
+    drop(store);
+    schema.drop_schema().await;
+}
+
+/// A group's queries all run on the connection its transaction holds, so a
+/// one-connection pool neither deadlocks nor loses atomicity.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_atomic_write_groups_run_on_a_one_connection_pool() {
+    let schema = super::test_postgres::TestSchema::create("atomic_one").await;
+    // Below the operator minimum on purpose: atomic groups alone must not
+    // need a second connection.
+    let backend = super::postgres::PostgresStore::connect(schema.url(), Some(1), None)
+        .await
+        .expect("connect a one-connection store");
+    backend.migrate().await.expect("migrate");
+    let store = Store::Postgres(backend);
+    assert_eq!(store.max_connections(), 1);
+    tokio::time::timeout(std::time::Duration::from_mins(1), async {
+        atomic_write_groups_apply_all_or_nothing(&store).await;
+        concurrent_atomic_write_groups_admit_one(&store).await;
+    })
+    .await
+    .expect("atomic write groups finish on one connection");
+    drop(store);
+    schema.drop_schema().await;
 }

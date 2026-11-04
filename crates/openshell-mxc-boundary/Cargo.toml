@@ -38,6 +38,8 @@ url = { workspace = true }
 windows = { workspace = true, features = ["Win32_Security_Authorization", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
+openshell-crypto = { workspace = true }
+rcgen = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"
 

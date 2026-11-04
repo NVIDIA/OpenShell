@@ -12,6 +12,9 @@ mod exec_input_tests;
 #[cfg(test)]
 mod upload_tests;
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
 use crate::main_session::{MainOutput, MainSession};
 #[cfg(unix)]
 use libc;
@@ -159,8 +162,8 @@ pub async fn run_ssh_server(
     ready_tx: tokio::sync::oneshot::Sender<Result<()>>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     shared_socket: bool,
-    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
-    boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+    port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
+    boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     host_key: PrivateKey,
 ) -> Result<()> {
@@ -337,8 +340,8 @@ fn classify_ssh_accept_error(
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     config: Arc<russh::server::Config>,
-    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
-    boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+    port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
+    boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     peer_timeout: Duration,
 ) -> Result<()> {
@@ -379,8 +382,8 @@ struct ChannelState {
     command_started: bool,
     input_sender: Option<InputSender>,
     input_task: Option<input::InputTask>,
-    process: Option<Arc<dyn openshell_isolation_interface::contract::BoundaryProcess>>,
-    terminal: Option<Arc<dyn openshell_isolation_interface::contract::BoundaryTerminal>>,
+    process: Option<Arc<openshell_sandbox_backend::BoundaryProcess>>,
+    terminal: Option<Arc<openshell_sandbox_backend::BoundaryTerminal>>,
     pty_request: Option<PtyRequest>,
     no_login_shell: bool,
     main_input_owner: Option<u64>,
@@ -419,8 +422,8 @@ struct SshHandler {
     /// Loopback port-forward, injected by the orchestrator (RFC 0012). In-pod
     /// this connects from inside the workload netns; a delegated backend
     /// tunnels into its guest. The handler does not know which.
-    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
-    boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+    port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
+    boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     channels: HashMap<ChannelId, ChannelState>,
 }
@@ -446,8 +449,8 @@ impl Drop for SshHandler {
 
 impl SshHandler {
     fn new(
-        port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
-        boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+        port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
+        boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
         main_session: Option<Arc<MainSession>>,
     ) -> Self {
         Self {
@@ -1591,8 +1594,8 @@ mod tests {
                     let config = config.clone();
                     tokio::spawn(async move {
                         let handler = SshHandler::new(
-                            Arc::new(TestLoopbackConnector),
-                            Arc::new(RejectingExec),
+                            rpc_test::loopback(Arc::new(TestLoopbackConnector)),
+                            rpc_test::exec(Arc::new(RejectingExec)),
                             None,
                         );
                         if let Ok(session) =
@@ -1658,7 +1661,7 @@ mod tests {
     pub(super) struct TestLoopbackConnector;
 
     #[async_trait::async_trait]
-    impl openshell_isolation_interface::contract::BoundaryLoopbackConnector for TestLoopbackConnector {
+    impl rpc_test::BoundaryLoopbackConnector for TestLoopbackConnector {
         async fn connect(
             &self,
             target: openshell_isolation_interface::contract::LoopbackTarget,
@@ -1680,12 +1683,12 @@ mod tests {
     pub(super) struct RejectingExec;
 
     #[async_trait::async_trait]
-    impl openshell_isolation_interface::contract::BoundaryExec for RejectingExec {
+    impl rpc_test::BoundaryExec for RejectingExec {
         async fn exec(
             &self,
             _spec: openshell_isolation_interface::contract::ExecSpec,
         ) -> std::result::Result<
-            openshell_isolation_interface::contract::ExecSession,
+            rpc_test::ExecSession,
             openshell_isolation_interface::contract::BackendError,
         > {
             Err(
@@ -1705,7 +1708,7 @@ mod tests {
     ) -> russh::client::Handle<AcceptAnyServerKey> {
         test_client(
             main_session,
-            Arc::new(RejectingExec),
+            rpc_test::exec(Arc::new(RejectingExec)),
             russh::client::Config::default(),
         )
         .await
@@ -1713,7 +1716,7 @@ mod tests {
 
     pub(super) async fn test_client(
         main_session: Option<Arc<MainSession>>,
-        boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+        boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
         client_config: russh::client::Config,
     ) -> russh::client::Handle<AcceptAnyServerKey> {
         let host_key = {
@@ -1726,7 +1729,11 @@ mod tests {
         };
         server_config.keys.push(host_key);
 
-        let handler = SshHandler::new(Arc::new(TestLoopbackConnector), boundary_exec, main_session);
+        let handler = SshHandler::new(
+            rpc_test::loopback(Arc::new(TestLoopbackConnector)),
+            boundary_exec,
+            main_session,
+        );
         let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             if let Ok(session) =

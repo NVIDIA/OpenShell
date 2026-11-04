@@ -108,6 +108,7 @@ mod tests {
                     profiles: vec!["security_control".to_string()],
                     uid: Some("sandbox-abc123".to_string()),
                     log_source: None,
+                    correlation_uid: None,
                 },
             ),
             src_endpoint: Some(Endpoint::from_ip_str("10.42.0.1", 48201)),

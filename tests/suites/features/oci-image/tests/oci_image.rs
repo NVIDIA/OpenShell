@@ -94,19 +94,63 @@ USER 2345:2346
 "
                 ),
             )?;
-            let policy_file = tempfile::NamedTempFile::new()
-                .map_err(|error| format!("create policy file: {error}"))?;
-            std::fs::write(policy_file.path(), IMAGE_IDENTITY_POLICY)
-                .map_err(|error| format!("write policy file: {error}"))?;
-            let policy = policy_file
-                .path()
-                .to_str()
-                .ok_or("policy path is not UTF-8")?;
+            let policy = PolicyFile::new(IMAGE_IDENTITY_POLICY)?;
             let checks = workspace_checks("2345:2346", "/home/app/project", true);
-            let sandbox = create_sandbox(runner, "pu", &image, Some(policy), &checks).await?;
+            let sandbox =
+                create_sandbox(runner, "pu", &image, Some(policy.path()?), &checks).await?;
             container_checks(engine, &sandbox, &image, "2345:2346")
         },
     )
+    .await;
+}
+
+/// An image without `USER`, with no policy identity, runs as the numeric
+/// default `1000:1000`. The base image has an account with UID 1000 in other
+/// groups, such as `sudo`, and the default identity does not get them.
+#[tokio::test]
+async fn userless_image_uses_default_identity() {
+    run("oci-image/userless-default", async |runner, engine| {
+        let image = engine.build_image("userless", &format!("FROM {BASE_IMAGE}\n"))?;
+        let policy = PolicyFile::new(IMAGE_IDENTITY_POLICY)?;
+        let checks = format!(
+            "{} test \"$(id -G)\" = 1000;",
+            workspace_checks("1000:1000", "/sandbox", false)
+        );
+        let sandbox = create_sandbox(runner, "ud", &image, Some(policy.path()?), &checks).await?;
+        container_checks(engine, &sandbox, &image, "1000:1000")
+    })
+    .await;
+}
+
+/// A policy `run_as_user` and `run_as_group` replace an image's `USER root`.
+/// The image has no `WORKDIR`, so the managed `/sandbox` workspace is
+/// writable by the policy identity and only identity resolution is tested.
+#[tokio::test]
+async fn policy_identity_overrides_root_image_user() {
+    run("oci-image/policy-over-root", async |runner, engine| {
+        let image = engine.build_image(
+            "root-user",
+            &format!(
+                "FROM {BASE_IMAGE}
+RUN groupadd -g 4235 appstaff && useradd -m -u 4234 -g appstaff app
+USER root
+"
+            ),
+        )?;
+        let policy = PolicyFile::new(&format!(
+            "{IMAGE_IDENTITY_POLICY}
+process:
+  run_as_user: \"4234\"
+  run_as_group: \"4235\"
+"
+        ))?;
+        let checks = format!(
+            "{} test \"$(id -G)\" = 4235;",
+            workspace_checks("4234:4235", "/sandbox", false)
+        );
+        let sandbox = create_sandbox(runner, "pr", &image, Some(policy.path()?), &checks).await?;
+        container_checks(engine, &sandbox, &image, "4234:4235")
+    })
     .await;
 }
 
@@ -505,6 +549,26 @@ async fn exec(
         ],
     )
     .await
+}
+
+/// A sandbox policy written to a temporary file for `sandbox create --policy`.
+struct PolicyFile(tempfile::NamedTempFile);
+
+impl PolicyFile {
+    fn new(contents: &str) -> Result<Self, String> {
+        let file = tempfile::NamedTempFile::new()
+            .map_err(|error| format!("create policy file: {error}"))?;
+        std::fs::write(file.path(), contents)
+            .map_err(|error| format!("write policy file: {error}"))?;
+        Ok(Self(file))
+    }
+
+    fn path(&self) -> Result<&str, String> {
+        self.0
+            .path()
+            .to_str()
+            .ok_or_else(|| "policy path is not UTF-8".to_string())
+    }
 }
 
 /// A built fixture's mutable tag and image ID captured before sandbox creation.

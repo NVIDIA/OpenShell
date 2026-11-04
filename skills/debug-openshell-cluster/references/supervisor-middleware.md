@@ -12,7 +12,7 @@ for registration settings.
 For operator-run supervisor middleware, inspect `[[openshell.supervisor.middleware]]`, service reachability, and both gateway and supervisor logs:
 
 ```shell
-rg -n 'supervisor|middleware|grpc_endpoint|tls_ca_cert_path|audience|allow_insecure_transport|max_payload_bytes|timeout|gateway_jwt' /etc/openshell/gateway.toml
+rg -n 'supervisor|middleware|grpc_endpoint|tls_ca_cert_path|audience|allow_insecure_transport|binding_policy|bindings|max_payload_bytes|timeout|gateway_jwt' /etc/openshell/gateway.toml
 journalctl -u <middleware-service> --no-pager --lines=200
 journalctl -u openshell-gateway --no-pager --lines=200
 openshell logs <sandbox-name> --tail --source sandbox
@@ -23,6 +23,12 @@ openshell logs <sandbox-name> --tail --source sandbox
 The middleware service must start before the gateway and be reachable from both the gateway and sandbox supervisors. Gateway startup fails if `Describe` is unavailable, peer metadata is missing, the protocol major is incompatible, a required capability is absent, a manifest exposes duplicate operation/phase bindings, the registration claims the reserved `openshell/` namespace, or payload and timeout limits are invalid. Current services receive `MiddlewareDescribeRequest` instead of an empty request; regenerate bindings when upgrading a legacy service. Supported V1 bindings are `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`.
 
 When gateway JWT signing is disabled, supervisors preserve the legacy unauthenticated connector and do not request extension credentials. When signing is enabled, credential acquisition and verification failures are fail closed: check HTTPS trust and hostname validation, audience and issuer agreement, the token `kid`, gateway `RefreshSandboxToken` errors, and middleware logs. Changing a registration requires a gateway restart. A policy update can also fail before persistence if the selected implementation rejects its `network_middlewares` config.
+
+## A matching request skips the middleware
+
+Compare the service's `Describe` bindings with `binding_policy` and `bindings` in its gateway registration. The gateway checks its own `Describe` response at startup; the supervisor checks again when it installs the registration. The default `dynamic` policy accepts all valid advertised bindings. An `allowlist` requires every listed binding and ignores extras; `exact` also rejects extras.
+
+For example, if the service advertises both HTTP hooks but the allowlist is `bindings = ["http_response_pre_return"]`, only the response hook is selected. Requests skip this middleware even with `on_error: fail_closed`, because that setting applies only after a stage is selected. If request inspection is required, include `http_request_pre_credentials` in the registration, restart the gateway, and confirm the supervisor accepted the change. Older supervisors ignore these fields; a running supervisor that rejects an update keeps its last accepted configuration.
 
 ## HTTP response failures
 
@@ -48,7 +54,7 @@ WebSocket message sequences are allocated session-wide; each stage receives a st
 | Policy update rejects `network_middlewares` | Unknown middleware name, implementation-owned config invalid, duplicate order, broad/invalid host selector, or fail-closed coverage of `tls: skip` | Policy error, gateway logs, middleware `ValidateConfig`, selector and order fields |
 | HTTP request returns `middleware_failed` or `middleware_denied`, or WebSocket closes with `1008` | Selected stage failed or explicitly denied admitted traffic | Sandbox OCSF logs; policy-local middleware config; service availability; binding operation; `on_error` |
 | HTTP response becomes canonical `403 middleware_denied`, `502 response_delivery_failed`, or closes mid-body | Response middleware blocked, failed before commitment, or stopped delivery after commitment | Sandbox OCSF response middleware events; `HTTP_RESPONSE/PRE_RETURN` binding; `on_error`; `whole_body_accumulation_timeout`; service stream lifecycle |
-| WebSocket upgrades but a host-matched middleware receives no preflight or message RPC | The implementation did not advertise `WEBSOCKET_MESSAGE/PRE_CREDENTIALS` | `WEBSOCKET_MIDDLEWARE_COVERAGE state=binding_not_selected`; service `Describe`; the upgrade GET may still have used its HTTP binding |
+| WebSocket upgrades but a host-matched middleware receives no preflight or message RPC | The service did not advertise `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, or its registration did not authorize that binding | `WEBSOCKET_MIDDLEWARE_COVERAGE state=binding_not_selected`; compare `Describe` with `binding_policy` and `bindings`; the upgrade GET may still have used its HTTP binding |
 | Binary WebSocket message passes without a middleware RPC | Binary is unsupported by the V1 text-message binding under both `on_error` modes | `WEBSOCKET_MIDDLEWARE_COVERAGE state=unsupported_message_type`; the next text RPC may have a valid sequence gap |
 | WebSocket messages stop reaching middleware after one failure | A fail-open stage stream was disabled for the rest of the connection | `openshell.middleware.websocket_stage_disabled`; middleware timeout/stream/protocol logs. A per-message capacity bypass alone leaves the stage active. Reconnect to create a fresh stream after a genuine stream failure |
 | Supervisor repeatedly fails to install middleware after enabling gateway JWT signing | Extension credential minting, distribution, or authenticated service connection failed; last-known-good registry remains active | Gateway `RefreshSandboxToken` logs, sandbox configuration events, service token-verification logs, registration TLS/audience settings |

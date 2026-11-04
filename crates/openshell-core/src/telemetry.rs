@@ -105,6 +105,8 @@ pub enum LifecycleOperation {
     Delete,
     Stop,
     Start,
+    Suspend,
+    Resume,
     Update,
 }
 
@@ -116,6 +118,8 @@ impl LifecycleOperation {
             Self::Delete => "delete",
             Self::Stop => "stop",
             Self::Start => "start",
+            Self::Suspend => "suspend",
+            Self::Resume => "resume",
             Self::Update => "update",
         }
     }
@@ -426,7 +430,7 @@ fn telemetry_worker(rx: mpsc::Receiver<TelemetryEvent>) {
 
 #[cfg(feature = "telemetry")]
 fn publish_payload(endpoint: &str, payload: Value) -> Result<(), reqwest::Error> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     Client::builder()
         .use_rustls_tls()
         .tls_built_in_root_certs(true)

@@ -92,14 +92,34 @@ pub struct PendingTcpOpen {
 }
 
 impl PendingTcpOpen {
+    #[cfg(test)]
     pub(crate) async fn complete(self, decision: TcpOpenDecision) -> io::Result<Option<TcpStream>> {
+        self.decide(decision)?.established().await
+    }
+
+    /// Hand the decision to the broker. Once this returns the decision has
+    /// taken effect; only the relay setup of an allowed open remains.
+    pub(crate) fn decide(self, decision: TcpOpenDecision) -> io::Result<DecidedTcpOpen> {
         self.decision
             .send(decision)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "network broker stopped"))?;
-        if matches!(decision, TcpOpenDecision::Denied(_)) {
+        Ok(DecidedTcpOpen {
+            relay: (!matches!(decision, TcpOpenDecision::Denied(_))).then_some(self.relay),
+        })
+    }
+}
+
+/// A decided TCP open: the relay of an allowed open, or nothing.
+pub struct DecidedTcpOpen {
+    relay: Option<oneshot::Receiver<io::Result<TcpStream>>>,
+}
+
+impl DecidedTcpOpen {
+    pub(crate) async fn established(self) -> io::Result<Option<TcpStream>> {
+        let Some(relay) = self.relay else {
             return Ok(None);
-        }
-        self.relay
+        };
+        relay
             .await
             .map_err(|_| {
                 io::Error::new(
@@ -126,6 +146,25 @@ impl PendingDnsQuery {
         self.response
             .send(response)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "DNS relay stopped"))
+    }
+
+    /// A UDP query as the relay queues it, and where its answer arrives.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        request: Vec<u8>,
+    ) -> (Self, std::sync::mpsc::Receiver<io::Result<Vec<u8>>>) {
+        let (response, answers) = std::sync::mpsc::sync_channel(1);
+        (
+            Self {
+                request,
+                transport: DnsTransport::Udp,
+                identity: dns_sender_identity(),
+                notification_to_queue: Duration::ZERO,
+                queued_at: Instant::now(),
+                response,
+            },
+            answers,
+        )
     }
 }
 
@@ -845,7 +884,10 @@ fn connect_socket(
                 return listener.respond_value(notification.id, 0);
             }
         }
-        if lock(&registry).resolve(notification.tid, fd).is_ok() {
+        if lock(&registry)
+            .resolve_for_native_fallback(notification.tid, fd)?
+            .is_some()
+        {
             // Every registered descriptor is an injected INET socket. Never
             // CONTINUE based on a mutable workload sockaddr for such an FD.
             return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
@@ -1262,7 +1304,10 @@ fn bind_socket(
 ) -> io::Result<()> {
     let fd = raw_fd(notification.args[0])?;
     if !socket_address_is_inet(notification.tid, notification.args[1], notification.args[2])? {
-        if lock(registry).resolve(notification.tid, fd).is_ok() {
+        if lock(registry)
+            .resolve_for_native_fallback(notification.tid, fd)?
+            .is_some()
+        {
             return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
         }
         return listener.respond_continue(notification.id);
@@ -1322,7 +1367,7 @@ fn listen_socket(
     let fd = raw_fd(notification.args[0])?;
     let backlog = i32::try_from(notification.args[1]).unwrap_or(i32::MAX);
     let mut registry = lock(registry);
-    let Ok(entry) = registry.resolve_mut(notification.tid, fd) else {
+    let Some(entry) = registry.resolve_mut_for_native_fallback(notification.tid, fd)? else {
         return listener.respond_continue(notification.id);
     };
     if matches!(entry.state(), SocketState::Listening { .. }) {
@@ -1357,7 +1402,7 @@ fn classify_send(
     }
     let (state, metadata) = {
         let registry = lock(registry);
-        let Ok(entry) = registry.resolve(notification.tid, fd) else {
+        let Some(entry) = registry.resolve_for_native_fallback(notification.tid, fd)? else {
             // Non-INET sockets are never injected into the registry. Leave
             // their native sendmsg/control-message semantics to the kernel.
             return listener.respond_continue(notification.id);
@@ -1380,9 +1425,9 @@ fn classify_send(
     };
 
     let mut registry = lock(registry);
-    let resolution = registry.resolve(notification.tid, fd);
+    let resolution = registry.resolve_for_native_fallback(notification.tid, fd)?;
     match resolution {
-        Ok(entry)
+        Some(entry)
             if entry.metadata().kind == InetKind::DnsUdp
                 && matches!(entry.state(), SocketState::Local { .. }) =>
         {
@@ -1392,7 +1437,7 @@ fn classify_send(
                 Err(io::Error::from_raw_os_error(libc::EACCES))
             }
         }
-        Ok(entry) if matches!(entry.state(), SocketState::DnsUdp { .. }) => {
+        Some(entry) if matches!(entry.state(), SocketState::DnsUdp { .. }) => {
             let SocketState::DnsUdp { relay } = entry.state() else {
                 unreachable!("guard requires DNS UDP state");
             };
@@ -1413,7 +1458,7 @@ fn classify_send(
                 Err(io::Error::from_raw_os_error(libc::EACCES))
             }
         }
-        Ok(entry)
+        Some(entry)
             if entry.metadata().kind == InetKind::DnsUdp
                 && matches!(
                     entry.state(),
@@ -1444,12 +1489,12 @@ fn classify_send(
             entry.release_preconnect();
             listener.respond_continue(notification.id)
         }
-        Ok(_) => Err(io::Error::from_raw_os_error(libc::EDESTADDRREQ)),
+        Some(_) => Err(io::Error::from_raw_os_error(libc::EDESTADDRREQ)),
         // Non-INET sockets and natively accepted sockets were never
         // registered. Accepted sockets inherit their listener's loopback
         // binding, and the mandatory outer fence remains an independent
         // backstop against an external kernel route.
-        Err(_) => listener.respond_continue(notification.id),
+        None => listener.respond_continue(notification.id),
     }
 }
 
@@ -2113,6 +2158,79 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
+    fn unreadable_workload_socket_cannot_use_native_fallback() {
+        const CHILD: &str = "OPENSHELL_UNREADABLE_WORKLOAD_TEST_CHILD";
+        const TARGET: &str = "OPENSHELL_UNREADABLE_WORKLOAD_TEST_TARGET";
+        if std::env::var_os(CHILD).is_some() {
+            let destination: SocketAddr = std::env::var(TARGET).unwrap().parse().unwrap();
+            let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let tcp =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            // SAFETY: this disposable subprocess changes only its dumpability.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            assert_eq!(
+                udp.send_to(b"test", destination)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EACCES)
+            );
+            assert_eq!(
+                tcp.listen(1).unwrap_err().raw_os_error(),
+                Some(libc::EACCES)
+            );
+            return;
+        }
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let _broker = NetworkBroker::start_for_test(listener).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut child = launcher
+            .execute(move || {
+                std::process::Command::new(executable)
+                    .arg("--exact")
+                    .arg("network_broker::tests::unreadable_workload_socket_cannot_use_native_fallback")
+                    .arg("--nocapture")
+                    .env(CHILD, "1")
+                    .env(TARGET, destination.to_string())
+                    .spawn()
+            })
+            .unwrap()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(
+            receiver.recv_from(&mut [0_u8; 4]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn closed_workload_socket_reports_bad_descriptor() {
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let _broker = NetworkBroker::start_for_test(listener).unwrap();
+        let error = launcher
+            .execute(|| {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                        .unwrap();
+                let fd = socket.as_raw_fd();
+                drop(socket);
+                // SAFETY: listen on a closed descriptor is a valid error probe.
+                assert_eq!(unsafe { libc::listen(fd, 1) }, -1);
+                io::Error::last_os_error().raw_os_error()
+            })
+            .unwrap();
+        assert_eq!(error, Some(libc::EBADF));
+    }
+
+    #[test]
     fn relay_rejects_descriptor_replaced_after_policy_decision() {
         let metadata = SocketMetadata {
             family: InetFamily::V4,
@@ -2442,6 +2560,19 @@ mod tests {
         stream.read_exact(&mut payload).expect("read Unix payload");
         assert_eq!(&payload, b"unix");
         client.join().expect("join client").expect("Unix client");
+    }
+
+    #[test]
+    fn unix_listen_remains_kernel_driven() {
+        let directory = tempfile::tempdir().expect("temporary Unix socket directory");
+        let path = directory.path().join("service.sock");
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let _broker = NetworkBroker::start_for_test(listener).unwrap();
+        let service = launcher
+            .execute(move || UnixListener::bind(path))
+            .unwrap()
+            .unwrap();
+        assert!(service.local_addr().unwrap().as_pathname().is_some());
     }
 
     #[test]

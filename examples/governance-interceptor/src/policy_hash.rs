@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use openshell_core::proto::{ProviderProfile, SandboxPolicy};
+use openshell_crypto::Digest;
 use prost::Message;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::proto_json::decode_message_to_json;
 
@@ -38,21 +38,26 @@ pub(crate) fn canonical_profile_snapshot_revision(
         .collect::<Result<Vec<_>, String>>()?;
     canonical_profiles.sort_by(|left, right| left.0.cmp(right.0));
 
-    let mut hasher = Sha256::new();
-    hasher.update(HASH_ALGORITHM.as_bytes());
-    hash_framed(&mut hasher, PROFILE_SNAPSHOT_DOMAIN.as_bytes())?;
-    hash_framed(&mut hasher, PROVIDER_PROFILE_TYPE.as_bytes())?;
+    let mut hasher = openshell_crypto::sha256_digest().map_err(|error| error.to_string())?;
+    hasher
+        .update(HASH_ALGORITHM.as_bytes())
+        .map_err(|error| error.to_string())?;
+    hash_framed(hasher.as_mut(), PROFILE_SNAPSHOT_DOMAIN.as_bytes())?;
+    hash_framed(hasher.as_mut(), PROVIDER_PROFILE_TYPE.as_bytes())?;
     hash_framed(
-        &mut hasher,
+        hasher.as_mut(),
         &u64::try_from(canonical_profiles.len())
             .map_err(|_| "provider profile count exceeds hash framing limit")?
             .to_be_bytes(),
     )?;
     for (id, canonical) in canonical_profiles {
-        hash_framed(&mut hasher, id)?;
-        hash_framed(&mut hasher, &canonical)?;
+        hash_framed(hasher.as_mut(), id)?;
+        hash_framed(hasher.as_mut(), &canonical)?;
     }
-    Ok(format!("{HASH_PREFIX}{}", hex_encode(&hasher.finalize())))
+    Ok(format!(
+        "{HASH_PREFIX}{}",
+        hex_encode(&hasher.finish().map_err(|error| error.to_string())?)
+    ))
 }
 
 pub(crate) fn is_v2_digest(value: &str) -> bool {
@@ -69,12 +74,17 @@ where
     M: Message,
 {
     let canonical = canonical_message_bytes(type_name, message)?;
-    let mut hasher = Sha256::new();
-    hasher.update(HASH_ALGORITHM.as_bytes());
-    hash_framed(&mut hasher, domain.as_bytes())?;
-    hash_framed(&mut hasher, type_name.as_bytes())?;
-    hash_framed(&mut hasher, &canonical)?;
-    Ok(format!("{HASH_PREFIX}{}", hex_encode(&hasher.finalize())))
+    let mut hasher = openshell_crypto::sha256_digest().map_err(|error| error.to_string())?;
+    hasher
+        .update(HASH_ALGORITHM.as_bytes())
+        .map_err(|error| error.to_string())?;
+    hash_framed(hasher.as_mut(), domain.as_bytes())?;
+    hash_framed(hasher.as_mut(), type_name.as_bytes())?;
+    hash_framed(hasher.as_mut(), &canonical)?;
+    Ok(format!(
+        "{HASH_PREFIX}{}",
+        hex_encode(&hasher.finish().map_err(|error| error.to_string())?)
+    ))
 }
 
 fn canonical_message_bytes<M>(type_name: &str, message: &M) -> Result<Vec<u8>, String>
@@ -120,10 +130,12 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), Strin
     Ok(())
 }
 
-fn hash_framed(hasher: &mut Sha256, bytes: &[u8]) -> Result<(), String> {
+fn hash_framed(hasher: &mut dyn Digest, bytes: &[u8]) -> Result<(), String> {
     let length = u64::try_from(bytes.len()).map_err(|_| "hash input exceeds framing limit")?;
-    hasher.update(length.to_be_bytes());
-    hasher.update(bytes);
+    hasher
+        .update(&length.to_be_bytes())
+        .map_err(|error| error.to_string())?;
+    hasher.update(bytes).map_err(|error| error.to_string())?;
     Ok(())
 }
 

@@ -291,7 +291,6 @@ openshell sandbox create \
   --provider my-github \
   --provider my-claude \
   --policy ./my-policy.yaml \
-  --upload .:/workspace \
   --label team=agents \
   -- claude
 ```
@@ -305,6 +304,7 @@ Key flags:
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
 - `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, `--env-from`, and `--driver-config-json`.
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
+- `--annotation KEY=VALUE`: Add non-secret metadata such as file paths (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
 - `--env-from KEY[=ENVVAR]`: Read a sandbox environment value from the CLI process environment without putting its value in arguments; use `--provider` to keep credentials hidden from the workload
 - `--tty`: Allocate a retained PTY for the canonical main process
@@ -535,6 +535,24 @@ sandbox, even under the same name, creates a different identity. See the
 for verification behavior and release compatibility.
 
 For an infrastructure `Error` on a backend that supports restarting stopped sandboxes, fix the reported cause, run `sandbox stop`, and wait for it to succeed before running `sandbox start`. This retains the sandbox and persistent workspace but cannot recover deleted resources or storage. For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
+
+### Suspend and resume sandboxes
+
+On a gateway whose compute driver and isolation backend support it, suspend
+freezes a `Ready` sandbox and retains its memory state:
+
+```bash
+openshell sandbox suspend [name]
+openshell sandbox resume [name]
+```
+
+Suspend waits for `Suspended`, then stops background forwards. A rejected
+suspend leaves forwards running. Resume restores the state in a new runtime
+generation and waits for `Ready`. A gateway without
+support rejects suspend with `FAILED_PRECONDITION`. Resume fails when retained
+state cannot be restored; use `sandbox start` for an explicit clean boot. `sandbox start`,
+`sandbox stop`, and `sandbox delete` on a suspended sandbox discard the
+retained memory state.
 
 ---
 

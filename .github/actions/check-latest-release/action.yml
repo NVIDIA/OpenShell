@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Check Latest Release
+description: Check current remote release tags before updating a shared latest channel
+
+inputs:
+  release-tag:
+    description: Stable or prerelease version being published
+    required: true
+
+outputs:
+  make-latest:
+    description: Whether this is still the highest release version in the repository
+    value: ${{ steps.latest.outputs.make-latest }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+      id: latest
+      env:
+        RELEASE_TAG: ${{ inputs.release-tag }}
+      with:
+        script: |
+          const tag = process.env.RELEASE_TAG;
+          const includePrereleases = tag.includes('-pre.');
+          const parse = value => {
+            const match = /^v([0-9]+)\.([0-9]+)\.([0-9]+)(?:-pre\.([1-9][0-9]*))?$/.exec(value);
+            if (!match) return null;
+            return [BigInt(match[1]), BigInt(match[2]), BigInt(match[3]), match[4] ? 0n : 1n, BigInt(match[4] || 0)];
+          };
+          const compare = (left, right) => {
+            for (let i = 0; i < left.length; i++) {
+              if (left[i] !== right[i]) return left[i] < right[i] ? -1 : 1;
+            }
+            return 0;
+          };
+          const version = parse(tag);
+          if (!version) {
+            throw new Error(`Invalid release tag: ${tag}`);
+          }
+          const tags = await github.paginate(github.rest.repos.listTags, {
+            ...context.repo,
+            per_page: 100,
+          });
+          if (!tags.some(candidate => candidate.name === tag)) {
+            throw new Error(`Release tag ${tag} is missing from the repository`);
+          }
+          const newer = tags.find(candidate => {
+            if (!includePrereleases && candidate.name.includes('-pre.')) return false;
+            const other = parse(candidate.name);
+            return other && compare(other, version) > 0;
+          });
+          core.info(newer ? `${tag} is superseded by ${newer.name}; preserving latest` : `${tag} is the latest release version`);
+          core.setOutput('make-latest', !newer);
