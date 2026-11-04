@@ -1094,7 +1094,7 @@ impl DockerComputeDriver {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/docker",
                 openshell_core::VERSION,
-                [],
+                [openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.to_string()],
             )),
         }
     }
@@ -3354,7 +3354,13 @@ impl ComputeDriver for DockerComputeDriver {
                 CdiGpuDefaultSelector::peek_device_ids,
             )
             .await?;
-        Ok(Response::new(ValidateSandboxCreateResponse {}))
+        Ok(Response::new(ValidateSandboxCreateResponse {
+            ingress_admission: Some(openshell_core::proto::SandboxIngressAdmission {
+                scope: openshell_core::proto::IngressScope::IsolatedLoopback as i32,
+                all_ports: true,
+                ports: Vec::new(),
+            }),
+        }))
     }
 
     async fn get_sandbox(

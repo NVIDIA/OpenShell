@@ -823,6 +823,9 @@ CLI forwards ignore SSH multiplexing and automatic backgrounding settings in the
 user's SSH config. Only background forwards are tracked by `forward list` and
 managed by `forward stop`; foreground forwards end when the command exits.
 
+Declare required target ports at creation with `--forward`. For shared-host
+loopback targets, choose a different local port if the target already uses it.
+
 Manage or iterate on the sandbox:
 
 ```bash

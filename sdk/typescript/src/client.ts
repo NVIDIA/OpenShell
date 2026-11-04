@@ -38,7 +38,13 @@ import {
   type TcpForwardFrameSchema,
 } from './gen/openshell_pb.js';
 import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
-import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
+import {
+  IngressScope,
+  PolicySource,
+  type SandboxPolicySchema,
+  SettingScope,
+  type SettingValueSchema,
+} from './gen/sandbox_pb.js';
 import { ProviderClient } from './providers.js';
 import { heldUntilReady, OWNER_REPLICA_HEADER, OWNER_REQUEST_HEADER, routedStream } from './routing.js';
 import { validateSshResponse } from './ssh-validate.js';
@@ -170,6 +176,8 @@ export interface SandboxSpec {
   tty?: boolean;
   /** Loopback HTTP services to expose when the sandbox is created. */
   serviceExposures?: ServiceExposure[];
+  /** Target ports to admit before provisioning; does not open listeners. */
+  forwardPorts?: number[];
   /** Restart behavior after the canonical main process exits. */
   restartPolicy?: SandboxRestartPolicyName;
   /**
@@ -191,7 +199,7 @@ export interface SandboxSpec {
 export interface ServiceExposure {
   /** Service name. Empty or omitted selects the unnamed endpoint. */
   service?: string;
-  /** Loopback TCP port inside the sandbox. */
+  /** TCP port in the compute-admitted loopback namespace. */
   targetPort: number;
   /** Handling for an incoming application Authorization header. */
   authorizationMode?: ServiceAuthorizationMode;
@@ -225,6 +233,8 @@ export interface SandboxFromTemplateSpec {
   tty?: boolean;
   /** Loopback HTTP services to expose when the sandbox is created. */
   serviceExposures?: ServiceExposure[];
+  /** Target ports to admit before provisioning; does not open listeners. */
+  forwardPorts?: number[];
   /**
    * Create-time sandbox policy (the safety boundary). The named workload
    * template supplies runtime workload fields.
@@ -232,7 +242,14 @@ export interface SandboxFromTemplateSpec {
   policy?: MessageInitShape<typeof SandboxPolicySchema>;
 }
 
+export interface SandboxIngressAdmission {
+  scope: 'unknown' | 'unsupported' | 'isolated_loopback' | 'shared_host_loopback';
+  allPorts: boolean;
+  ports: number[];
+}
+
 export interface SandboxRef {
+  ingressAdmission?: SandboxIngressAdmission;
   id: string;
   name: string;
   workspace: string;
@@ -470,9 +487,9 @@ export interface WaitDeletedOptions extends WaitOptions {
 }
 
 export interface ForwardOptions extends SandboxWorkspaceOptions {
-  /** Loopback TCP port inside the sandbox to dial. */
+  /** TCP port in the compute-admitted loopback namespace to dial. */
   targetPort: number;
-  /** Target host inside the sandbox (loopback only). Default 127.0.0.1. */
+  /** Target host in the admitted loopback namespace. Default 127.0.0.1. */
   targetHost?: string;
   /** Local port to bind. Default 0 (ephemeral). */
   localPort?: number;
@@ -630,7 +647,22 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
   if (!meta?.id || !meta.name) {
     throw new SdkError('invalid_config', 'sandbox metadata.id and metadata.name are required in gateway responses');
   }
+  const ingress = sandbox.status?.ingressAdmission;
   return {
+    ingressAdmission: ingress
+      ? {
+          scope:
+            ingress.scope === IngressScope.ISOLATED_LOOPBACK
+              ? 'isolated_loopback'
+              : ingress.scope === IngressScope.SHARED_HOST_LOOPBACK
+                ? 'shared_host_loopback'
+                : ingress.scope === IngressScope.UNSUPPORTED
+                  ? 'unsupported'
+                  : 'unknown',
+          allPorts: ingress.allPorts,
+          ports: [...ingress.ports],
+        }
+      : undefined,
     id: meta.id,
     name: meta.name,
     workspace: meta.workspace,
@@ -1234,6 +1266,7 @@ export class SandboxClient {
         name: spec.name ?? '',
         labels: spec.labels ?? {},
         spec: specInit,
+        forwardPorts: [...(spec.forwardPorts ?? [])],
         serviceExposures:
           spec.serviceExposures?.map((exposure) => ({
             service: exposure.service ?? '',
@@ -1261,6 +1294,7 @@ export class SandboxClient {
           policy: spec.policy,
         },
         workloadTemplate: spec.workloadTemplate,
+        forwardPorts: [...(spec.forwardPorts ?? [])],
         serviceExposures:
           spec.serviceExposures?.map((exposure) => ({
             service: exposure.service ?? '',
@@ -1736,6 +1770,9 @@ export class SandboxClient {
   // the `init` (TCP target + token), relay bytes both ways in ~64 KiB chunks,
   // and revoke the token on close. Process-lifetime only.
   async forward(name: string, opts: ForwardOptions): Promise<ForwardHandle> {
+    if (!Number.isInteger(opts.targetPort) || opts.targetPort < 1 || opts.targetPort > 65535) {
+      throw new SdkError('invalid_config', 'target port must be between 1 and 65535');
+    }
     const targetHost = opts.targetHost ?? '127.0.0.1';
     const targetPort = opts.targetPort;
     const localHost = opts.localHost ?? '127.0.0.1';
@@ -1751,6 +1788,17 @@ export class SandboxClient {
       const ref = found.ref;
       if (ref.phase !== 'ready') {
         throw new SdkError('connect', `sandbox '${name}' is not ready (phase: ${ref.phase})`);
+      }
+      const ingress = ref.ingressAdmission;
+      if (
+        ingress &&
+        ((ingress.scope !== 'isolated_loopback' && ingress.scope !== 'shared_host_loopback') ||
+          (ingress.allPorts && ingress.ports.length > 0) ||
+          ingress.ports.some((port) => !Number.isInteger(port) || port < 1 || port > 65535) ||
+          new Set(ingress.ports).size !== ingress.ports.length ||
+          (!ingress.allPorts && !ingress.ports.includes(targetPort)))
+      ) {
+        throw new SdkError('invalid_config', 'target port was not admitted by the compute driver');
       }
       sandboxId = ref.id;
       owner = found.owner;

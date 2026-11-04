@@ -702,6 +702,7 @@ describe('create', () => {
   it('sends create-time service exposures', async () => {
     let created: {
       serviceExposures?: Array<{ service?: string; targetPort?: number; authorizationMode?: number }>;
+      forwardPorts?: number[];
     } = {};
     const sandbox = client({
       createSandbox: (req) => {
@@ -718,6 +719,7 @@ describe('create', () => {
 
     const result = await sandbox.create({
       image: 'img',
+      forwardPorts: [8080],
       serviceExposures: [
         { targetPort: 4500 },
         {
@@ -728,6 +730,7 @@ describe('create', () => {
       ],
     });
 
+    expect(created.forwardPorts).toEqual([8080]);
     expect(
       created.serviceExposures?.map(({ service, targetPort, authorizationMode }) => ({
         service,
@@ -2167,6 +2170,18 @@ describe('ssh sessions', () => {
 });
 
 describe('forward', () => {
+  it('rejects an unadmitted target before creating a local forward handle', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb', workspace: 'default' },
+          status: { phase: SandboxPhase.READY, ingressAdmission: { scope: 3, allPorts: false, ports: [8080] } },
+        },
+      }),
+    });
+    await expect(sandbox.forward('sb', { targetPort: 9090 })).rejects.toMatchObject({ code: 'invalid_config' });
+  });
+
   it('binds a local port and relays bytes both ways, minting + revoking a token', async () => {
     let sshReq: ScopedRequest = {};
     let revokedToken: string | undefined;

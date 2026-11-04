@@ -342,6 +342,7 @@ func TestSandboxCreate(t *testing.T) {
 		"my-sandbox",
 		spec,
 		WithLabels(labels),
+		WithForwardPorts(8080, 9090),
 		WithServiceExposures(
 			ServiceExposure{TargetPort: 4500},
 			ServiceExposure{
@@ -362,6 +363,7 @@ func TestSandboxCreate(t *testing.T) {
 		"":        "https://.example.test/",
 		"metrics": "https://metrics.example.test/",
 	}, result.ServiceURLs)
+	assert.Equal(t, []uint32{8080, 9090}, mock.createRequest.GetForwardPorts())
 	require.Len(t, mock.createRequest.GetServiceExposures(), 2)
 	assert.Equal(t, uint32(4500), mock.createRequest.GetServiceExposures()[0].GetTargetPort())
 	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_STRIP, mock.createRequest.GetServiceExposures()[0].GetAuthorizationMode())

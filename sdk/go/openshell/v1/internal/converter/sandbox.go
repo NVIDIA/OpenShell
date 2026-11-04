@@ -11,6 +11,7 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
+	sandboxpb "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -131,6 +132,18 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			DestinationPort: observation.GetDestinationPort(),
 			Failure:         endpointFailureFromProto(observation.GetFailure()),
 		}
+	}
+	if admission := status.GetIngressAdmission(); admission != nil {
+		scope := types.IngressUnknown
+		switch admission.GetScope() {
+		case sandboxpb.IngressScope_INGRESS_SCOPE_UNSUPPORTED:
+			scope = types.IngressUnsupported
+		case sandboxpb.IngressScope_INGRESS_SCOPE_ISOLATED_LOOPBACK:
+			scope = types.IngressIsolatedLoopback
+		case sandboxpb.IngressScope_INGRESS_SCOPE_SHARED_HOST_LOOPBACK:
+			scope = types.IngressSharedHostLoopback
+		}
+		result.IngressAdmission = &types.SandboxIngressAdmission{Scope: scope, AllPorts: admission.GetAllPorts(), Ports: slices.Clone(admission.GetPorts())}
 	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
 	if admission := status.GetConfigurationAdmission(); admission != nil {
