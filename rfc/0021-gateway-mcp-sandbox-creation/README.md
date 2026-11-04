@@ -802,7 +802,9 @@ the calling sandbox or user as the actor and, for a sandbox, the user it acts
 for (`acting_for`, the root's `created_by`). A refusal by policy or by the
 request, such as not found or a limit, is recorded as denied with its code; an
 internal, unavailable or timed-out call is recorded as allowed but failed, not
-as a denial. The event records each tool's arguments and outcome: the target,
+as a denial. For an internal or unavailable error the agent sees only a request
+id; the error's own text goes to the gateway log and the event
+(`error_detail`), under the same id. The event records each tool's arguments and outcome: the target,
 for `create_sandbox` the template, parent, image and providers given and the
 new sandbox's id, for `list` the parent filter and the count, for `exec` the
 argument list, working directory, timeout and exit code, and for jobs the job
