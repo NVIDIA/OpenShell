@@ -101,9 +101,7 @@ impl PolicyDnsRuntime {
         config: PolicyDnsRuntimeConfig,
         mut engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
-        let resolver = SocketTrustedResolver::from_resolv_conf("/etc/resolv.conf")
-            .map_err(|error| miette::miette!(error))
-            .wrap_err("failed to configure trusted supervisor resolver")?;
+        let resolver = trusted_resolver()?;
         let store = Arc::new(ResolvedEndpointStore::new(
             StoreConfig::new(config.pools, MAX_MAPPINGS)
                 .map_err(|error| miette::miette!(error.to_string()))?,
@@ -193,9 +191,7 @@ impl PolicyDnsRuntime {
         config: PolicyDnsRuntimeConfig,
         engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
-        let resolver = SocketTrustedResolver::from_resolv_conf("/etc/resolv.conf")
-            .map_err(|error| miette::miette!(error))
-            .wrap_err("failed to configure trusted supervisor resolver")?;
+        let resolver = trusted_resolver()?;
         let store = Arc::new(ResolvedEndpointStore::new(
             StoreConfig::new(config.pools, MAX_MAPPINGS)
                 .map_err(|error| miette::miette!(error.to_string()))?,
@@ -309,6 +305,12 @@ impl Drop for PolicyDnsRuntime {
             task.abort();
         }
     }
+}
+
+fn trusted_resolver() -> Result<SocketTrustedResolver> {
+    SocketTrustedResolver::from_resolv_conf("/etc/resolv.conf")
+        .map_err(|error| miette::miette!(error))
+        .wrap_err("failed to configure trusted supervisor resolver")
 }
 
 #[cfg(test)]
