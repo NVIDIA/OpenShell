@@ -30,6 +30,7 @@ pub async fn exported(
     });
     let _lock = tracing_test_lock().await;
     LazyLock::force(&REGISTER);
+    super::reset_deny_span_limiter();
     let collector = OtlpTestServer::start().await;
     let (provider, error) = openshell_otel::provider_for(Some(openshell_otel::OtlpExportConfig {
         endpoint: collector.endpoint(),
@@ -164,7 +165,7 @@ async fn companion_emissions_reuse_an_active_decision_scope() {
         let event = http_deny("blocked.example", "denied");
         let finding =
             openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx()).build();
-        let scope = super::deny_span(&event, None);
+        let scope = super::deny_span(&event, None).unwrap();
         scope.in_scope(|| {
             super::emit(event, None);
             super::emit(finding, None);
@@ -203,7 +204,7 @@ async fn concurrent_decisions_keep_companions_and_request_contexts_separate() {
                                     )
                                     .message(&decision)
                                     .build();
-                                    let scope = super::deny_span(&event, None);
+                                    let scope = super::deny_span(&event, None).unwrap();
                                     scope.in_scope(|| {
                                         super::emit(event, None);
                                         // Both threads keep different deny scopes entered
@@ -394,4 +395,65 @@ async fn allowed_emissions_do_not_create_info_deny_spans() {
             .iter()
             .any(|span| span.name == "supervisor.egress.deny")
     );
+}
+
+#[test]
+fn deny_span_limiter_bounds_each_destination_and_refills() {
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let mut limiter = super::DenySpanLimiter::new(2, Duration::from_secs(1), 8);
+    assert!(limiter.allow("a:443", start));
+    assert!(limiter.allow("a:443", start));
+    assert!(!limiter.allow("a:443", start));
+    assert!(
+        limiter.allow("b:443", start),
+        "destinations are independent"
+    );
+    assert!(!limiter.allow("a:443", start + Duration::from_millis(999)));
+    assert!(limiter.allow("a:443", start + Duration::from_secs(1)));
+    assert!(!limiter.allow("a:443", start + Duration::from_secs(1)));
+    let later = start + Duration::from_mins(1);
+    assert!(limiter.allow("a:443", later));
+    assert!(limiter.allow("a:443", later));
+    assert!(!limiter.allow("a:443", later), "refill stops at the burst");
+}
+
+#[test]
+fn deny_span_limiter_bounds_tracked_destinations() {
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let mut limiter = super::DenySpanLimiter::new(1, Duration::from_secs(1), 2);
+    assert!(limiter.allow("a", start));
+    assert!(limiter.allow("b", start));
+    assert!(
+        !limiter.allow("c", start),
+        "untracked destinations wait for room"
+    );
+    // Full buckets are idle and can be evicted.
+    assert!(limiter.allow("c", start + Duration::from_secs(1)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_denials_to_one_destination_export_bounded_spans() {
+    let (events, received) = exported("warn", || {
+        for _ in 0..(super::DENY_SPAN_BURST + 5) {
+            super::emit(http_deny("loop.example", "denied"), None);
+        }
+        super::emit(http_deny("other.example", "denied"), None);
+    })
+    .await;
+    let denies = received
+        .spans
+        .iter()
+        .filter(|span| span.name == "supervisor.egress.deny")
+        .count();
+    assert_eq!(denies, super::DENY_SPAN_BURST as usize + 1);
+    let traced = events
+        .iter()
+        .filter(|event| event.get("trace").is_some())
+        .count();
+    assert_eq!(traced, denies, "limited records carry no trace.uid");
+    assert_eq!(events.len(), super::DENY_SPAN_BURST as usize + 6);
 }
