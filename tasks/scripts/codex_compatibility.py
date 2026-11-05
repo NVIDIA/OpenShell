@@ -128,18 +128,8 @@ async def invoke_codex(context: dict, directory: Path) -> dict:
             )
             result = await thread.run(prompt, output_schema=schema)
     except (openai_codex.CodexError, RuntimeError, ValueError) as error:
-        message = str(error)
-        for key in (
-            "NVIDIA_INFERENCE_API_KEY",
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-            "CODEX_SECURITY_API_KEY",
-        ):
-            if secret := os.environ.get(key):
-                message = message.replace(secret, "[REDACTED]")
-        message = " ".join(message.split())[:1000]
         raise ValueError(
-            f"Codex SDK review failed ({type(error).__name__}): {message}; no assessment is available."
+            f"Codex SDK review failed ({type(error).__name__}): {error}; no assessment is available."
         ) from None
     finally:
         await codex.close()
