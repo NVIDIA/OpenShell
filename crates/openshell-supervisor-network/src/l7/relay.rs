@@ -293,7 +293,6 @@ where
             build_request_authority_mismatch_finding(ctx),
         ],
         None,
-        false,
     );
     Ok(())
 }
@@ -653,7 +652,7 @@ where
     if endpoint_mismatch {
         events.push(build_credential_endpoint_mismatch_finding(ctx));
     }
-    crate::telemetry::emit_decision(events, None, false);
+    crate::telemetry::emit_decision(events, None);
     Ok(())
 }
 

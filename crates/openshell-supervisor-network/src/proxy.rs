@@ -255,7 +255,7 @@ fn emit_credential_endpoint_mismatch(method: &str, host: &str, port: u16, policy
         None,
         "Provider credential endpoint binding mismatch; request denied",
     );
-    crate::telemetry::emit_decision([event, finding], None, false);
+    crate::telemetry::emit_decision([event, finding], None);
 }
 
 /// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
@@ -2120,7 +2120,6 @@ fn emit_forward_l7_decision(
     crate::telemetry::emit_decision(
         std::iter::once(decision).chain(evaluation_error),
         Some(connect_span),
-        false,
     );
 }
 

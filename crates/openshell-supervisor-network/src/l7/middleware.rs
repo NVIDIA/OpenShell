@@ -963,6 +963,7 @@ pub(super) fn middleware_events(
                 "openshell.middleware.failure",
                 "Supervisor middleware failure",
             ))
+            .action(ActionId::Denied)
             .message("Required supervisor middleware failed closed")
             .build();
         events.push(event);
@@ -982,6 +983,7 @@ pub(super) fn middleware_events(
                 ("policy", ctx.policy_name.as_str()),
                 ("host", ctx.host.as_str()),
             ])
+            .action(ActionId::Denied)
             .message("Transformed request denied because policy evaluation failed")
             .build();
         events.push(event);
@@ -1000,7 +1002,7 @@ fn emit_middleware_events(
     req: &crate::l7::provider::L7Request,
     outcome: &openshell_supervisor_middleware::ChainOutcome,
 ) {
-    crate::telemetry::emit_decision(middleware_events(ctx, req, outcome), None, !outcome.allowed);
+    crate::telemetry::emit_decision(middleware_events(ctx, req, outcome), None);
 }
 
 #[cfg(test)]
@@ -1037,6 +1039,37 @@ mod trace_tests {
             assert_deny_resolves(events, received, true);
         } else {
             assert!(events.iter().all(|event| event.get("trace").is_none()));
+        }
+    }
+
+    #[test]
+    fn refusal_findings_record_the_denial() {
+        for reason in [
+            "middleware_failed: guard",
+            "transformed_body_policy_evaluation_failed: unavailable",
+        ] {
+            let outcome = openshell_supervisor_middleware::ChainOutcome {
+                allowed: false,
+                reason: reason.to_string(),
+                body: vec![],
+                header_mutations: vec![],
+                findings: vec![],
+                metadata: std::collections::BTreeMap::new(),
+                applied: vec![],
+                denial: None,
+            };
+            let request = crate::l7::provider::L7Request {
+                action: "POST".to_string(),
+                target: "/".to_string(),
+                query_params: std::collections::HashMap::new(),
+                raw_header: vec![],
+                body_length: crate::l7::provider::BodyLength::None,
+            };
+            let events = middleware_events(&L7EvalContext::default(), &request, &outcome);
+            assert_eq!(events.len(), 1, "{reason}");
+            let finding = events[0].to_json().unwrap();
+            assert_eq!(finding["class_uid"], 2004);
+            assert_eq!(finding["action_id"], 2, "{reason}");
         }
     }
 

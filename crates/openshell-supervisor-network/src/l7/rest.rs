@@ -1547,7 +1547,7 @@ fn emit_uninspected_body_credential_denial(
         ])
         .message("Request body credential placeholder denied")
         .build();
-    crate::telemetry::emit_decision([event, finding], None, false);
+    crate::telemetry::emit_decision([event, finding], None);
 }
 
 struct PreparedRequestBody {

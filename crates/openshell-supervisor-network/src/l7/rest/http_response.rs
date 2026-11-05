@@ -423,10 +423,11 @@ where
                 &middleware.target,
                 status_code,
                 false,
+                true,
             ));
         }
     }
-    crate::telemetry::emit_decision(preflight_events, None, !preflight.allowed);
+    crate::telemetry::emit_decision(preflight_events, None);
     if !preflight.allowed {
         if let Some(denial) = preflight.denial.as_ref() {
             send_response_middleware_denial(
@@ -891,7 +892,6 @@ fn emit_http_response_middleware_invocations(
     crate::telemetry::emit_decision(
         http_response_decision_events(policy_name, target, status_code, invocations),
         None,
-        false,
     );
 }
 
@@ -914,9 +914,10 @@ fn emit_http_response_diagnostics(
             target,
             status_code,
             committed,
+            denied,
         ));
     }
-    crate::telemetry::emit_decision(events, None, denied);
+    crate::telemetry::emit_decision(events, None);
 }
 
 pub(super) fn http_response_middleware_invocation_events(
@@ -930,8 +931,11 @@ pub(super) fn http_response_middleware_invocation_events(
         .map(|invocation| {
             let outcome = format!("{:?}", invocation.outcome).to_ascii_lowercase();
             let failed = invocation.failed;
-            let blocked = invocation.outcome
-                == openshell_supervisor_middleware::HttpResponseInvocationOutcome::BlockDelivery;
+            let blocked = matches!(
+                invocation.outcome,
+                openshell_supervisor_middleware::HttpResponseInvocationOutcome::BlockDelivery
+                    | openshell_supervisor_middleware::HttpResponseInvocationOutcome::FailClosed
+            );
             openshell_ocsf::HttpActivityBuilder::new(ocsf_ctx())
             .activity(openshell_ocsf::ActivityId::Other)
             .action(if blocked {
@@ -1084,16 +1088,13 @@ fn emit_http_response_middleware_failure(
     status_code: u16,
     committed: bool,
 ) {
-    crate::telemetry::emit_decision(
-        [http_response_middleware_failure_event(
-            policy_name,
-            target,
-            status_code,
-            committed,
-        )],
-        None,
+    crate::telemetry::egress_emit!(http_response_middleware_failure_event(
+        policy_name,
+        target,
+        status_code,
+        committed,
         true,
-    );
+    ));
 }
 
 fn http_response_middleware_failure_event(
@@ -1101,9 +1102,14 @@ fn http_response_middleware_failure_event(
     target: &HttpRequestTarget,
     status_code: u16,
     committed: bool,
+    denied: bool,
 ) -> openshell_ocsf::OcsfEvent {
     let status_code = status_code.to_string();
-    openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
+    let mut builder = openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx());
+    if denied {
+        builder = builder.action(openshell_ocsf::ActionId::Denied);
+    }
+    builder
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
             "openshell.middleware.http_response_failure",
@@ -2221,7 +2227,11 @@ mod tests {
                     invocations: vec![openshell_supervisor_middleware::HttpResponseInvocation {
                         config_name: "content-guard".to_string(),
                         implementation: "test/guard".to_string(),
-                        outcome: HttpResponseInvocationOutcome::PassThrough,
+                        outcome: if denied {
+                            HttpResponseInvocationOutcome::BlockDelivery
+                        } else {
+                            HttpResponseInvocationOutcome::PassThrough
+                        },
                         sequence: None,
                         input_size: 0,
                         output_size: None,
@@ -2253,7 +2263,8 @@ mod tests {
                 tracing::info_span!("test.export-barrier").in_scope(|| {});
             })
             .await;
-            assert_eq!(events.len(), 2);
+            // A blocking invocation adds its own block finding.
+            assert_eq!(events.len(), if denied { 3 } else { 2 });
             if denied {
                 assert_deny_resolves(&events, &received, true);
             } else {
@@ -2265,6 +2276,46 @@ mod tests {
                         .any(|span| span.name == "supervisor.egress.deny")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fail_closed_invocations_and_enforced_failures_record_the_denial() {
+        use openshell_supervisor_middleware::HttpResponseInvocationOutcome as Outcome;
+
+        let target = super::HttpRequestTarget::default();
+        for (outcome, failed, action_id) in [
+            (Outcome::BlockDelivery, false, 2),
+            (Outcome::FailClosed, true, 2),
+            (Outcome::FailOpen, true, 99),
+            (Outcome::PassThrough, false, 1),
+        ] {
+            let invocation = openshell_supervisor_middleware::HttpResponseInvocation {
+                config_name: "guard".to_string(),
+                implementation: "test/guard".to_string(),
+                outcome,
+                sequence: None,
+                input_size: 0,
+                output_size: None,
+                failed,
+                stage_disabled: false,
+                reason_code: None,
+                failure_category: None,
+            };
+            let events =
+                super::http_response_middleware_invocation_events("p", &target, 200, &[invocation]);
+            assert_eq!(
+                events[0].to_json().unwrap()["action_id"],
+                action_id,
+                "{outcome:?}"
+            );
+        }
+        for denied in [false, true] {
+            let failure =
+                super::http_response_middleware_failure_event("p", &target, 200, false, denied)
+                    .to_json()
+                    .unwrap();
+            assert_eq!(failure["action_id"] == 2, denied);
         }
     }
 

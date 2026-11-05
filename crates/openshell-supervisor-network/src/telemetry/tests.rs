@@ -348,7 +348,7 @@ async fn denials_without_an_http_record_do_not_open_deny_spans() {
         let finding = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
             .action(openshell_ocsf::ActionId::Denied)
             .build();
-        super::emit_decision([network, finding], None, true);
+        super::emit_decision([network, finding], None);
         tracing::info_span!("test.export-barrier").in_scope(|| {});
     })
     .await;

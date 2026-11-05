@@ -33,23 +33,14 @@ fn is_http(event: &OcsfEvent) -> bool {
 }
 
 pub fn emit(event: OcsfEvent, parent: Option<&tracing::Span>) {
-    if !is_http(&event) || !is_denied(&event) {
-        openshell_ocsf::ocsf_emit!(event);
-        return;
-    }
-    let span = deny_span(&event, parent);
-    span.in_scope(|| openshell_ocsf::ocsf_emit!(event));
+    emit_decision([event], parent);
 }
 
 /// Emit all records of one synchronous decision under one deny span. Different
 /// decisions remain separate, even when they concern the same connection.
-pub fn emit_decision(
-    events: impl IntoIterator<Item = OcsfEvent>,
-    parent: Option<&tracing::Span>,
-    denied: bool,
-) {
+pub fn emit_decision(events: impl IntoIterator<Item = OcsfEvent>, parent: Option<&tracing::Span>) {
     let events: Vec<_> = events.into_iter().collect();
-    let denied = denied || events.iter().any(is_denied);
+    let denied = events.iter().any(is_denied);
     let span = events
         .iter()
         .find(|event| denied && is_http(event))
