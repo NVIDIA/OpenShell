@@ -332,11 +332,19 @@ nix run .#openshell-test-runner -- run \
 ```
 
 A suite that needs setup beyond a container engine runs in a feature
-environment, named `<base>-<feature>`, such as `ubuntu-docker-rootful-keycloak`. `features` in `tests/tmachine/config.nix`
-lists each feature's setup playbooks, the inputs they read, and the bases it
-supports.
+environment, named `<base>-<feature>`, such as `ubuntu-docker-rootful-keycloak`
+or `ubuntu-docker-rootful-cdi`. `features` in `tests/tmachine/config.nix` lists
+each feature's setup playbooks, the inputs they read, and the bases it supports.
 To add one, add an entry there and use the generated environment name in the
-suite's row in `.github/workflows/e2e-suites.yml`.
+suite's row in `.github/workflows/e2e-suites.yml`. The CDI suite
+(`tests/suites/features/cdi`) runs in `ubuntu-docker-rootful-cdi`, which creates
+hardware-free CDI devices and the host files they reference. The environment
+tells the suite where its scenarios are with `OPENSHELL_TEST_CDI_SCENARIOS`, the
+path of a document that names the device kind, each scenario and the checks it
+expects. Any environment that creates matching devices and sets the variable
+can run the suite. The expectations characterize the sandbox's behavior today,
+not a specification, and the `echo-socket` check needs `perl` in the workload
+image, which the default image has.
 
 ### Python E2E (`e2e/python/`)
 
