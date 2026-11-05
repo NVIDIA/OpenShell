@@ -147,7 +147,8 @@ issuer keeps encrypted envelopes in the gateway database through its storage
 interface, as today. In remote mode, the gateway database holds no secret
 values and the gateway no longer needs a key-encryption key.
 Legacy provider records that hold inline credential values migrate into the
-issuer.
+issuer when an operator activates versioned credentials (see
+[Compatibility](#compatibility)).
 
 Gateway-internal secrets get a real owner kind instead of the synthetic
 provider identities they use today (`sandbox-ssh-<id>` in `ssh_identity.rs` and
@@ -550,11 +551,38 @@ directly. The provider environment revision uses grant versions, and
 
 Public provider and refresh RPCs keep their request and response shapes. The
 gateway forwards refresh operations to the issuer and maps grant status onto
-`GetProviderRefreshStatus`. Existing provider records that hold driver handles
-migrate to references on first gateway start in embedded mode; the reference is
-the existing handle, and its version starts at 1. Moving an existing deployment
-from embedded to remote mode requires migrating stored secrets and refresh
-state into the issuer, which this RFC leaves to a dedicated tool.
+`GetProviderRefreshStatus`.
+
+Existing deployments adopt references only when an operator opts in.
+Installing a compatible gateway does not migrate anything. The
+`enable_versioned_credentials` gateway option defaults to `false`. Until it is
+set, the gateway keeps the legacy credential representation and the legacy
+refresh commit path. Setting it during a maintenance window authorizes the
+migration in embedded mode. Each existing driver handle becomes the identity of
+its reference, at version 1. Inline credential values and refresh material are
+stored through the selected backend. Legacy refresh rows are removed only after
+their issuer grants are durable.
+
+Activation follows these rules:
+
+- **Validate before converting.** Migration validates every provider, refresh
+  state and internal secret before its first incompatible write. It reports
+  every record it can't convert, by ID. Records that would fail partway
+  through must stop activation while legacy startup still works.
+- **Mark the boundary durably.** A database marker records when the first
+  incompatible write happens. Compatible replicas use it to coordinate, and
+  legacy startup refuses to run after it. The marker doesn't fence old
+  binaries. Operators must drain incompatible writers and take a coordinated
+  database and backend backup before opting in.
+- **Allow abandoning a failed preparation.** Before the boundary, preparation
+  can be abandoned. A deployment that turns the option off after a failed
+  attempt must be able to retry activation later.
+- **Make rollback explicit.** After the boundary, turning the option off
+  doesn't undo migration. Rollback needs a compatible build or a coordinated
+  restore, and an upstream-rotated refresh token may require reauthorization.
+
+Whether an existing embedded deployment can later move to remote mode is an
+open question.
 
 ## Implementation plan
 
@@ -570,10 +598,11 @@ ship with embedded mode, so they are useful even if remote mode is delayed.
    through the issuer trait.
 2. **References, versions, and the refresh engine.** Introduce credential
    references with versions, include versions in the provider environment
-   revision, and migrate existing handles. Add the refresh-state store
-   interface, its gateway adapter, and the shared contract tests. Move the
-   refresh engine into the issuer crate behind three traits: a minter, the
-   refresh-state store, and a sink notified when a new version commits.
+   revision, and adopt existing handles through opt-in activation. Add the
+   refresh-state store interface, its gateway adapter, and the shared contract
+   tests. Move the refresh engine into the issuer crate behind three traits: a
+   minter, the refresh-state store, and a sink notified when a new version
+   commits.
    Replace the strategy `match` with a registry and add `strategy_name`.
 3. **Contracts and remote transport.** Add the `CredentialStore`,
    `CredentialRefresh`, and `TokenMinter` protos. Add mTLS client identity to
@@ -608,9 +637,10 @@ ship with embedded mode, so they are useful even if remote mode is delayed.
   embedded adapter reuses the existing advisory-lock code unchanged.
 - **Migration complexity.** Replacing handle swaps with versioned references
   changes durable provider and refresh state. A bug can strand credentials or
-  break revocation. Mitigation: migrate in embedded mode first, keep handle
-  identity as the reference identity, and test authorization-epoch revocation
-  explicitly.
+  break revocation. Mitigation: migrate in embedded mode first, behind an
+  opt-in option that defaults to off. Validate every record before the first
+  incompatible write, keep handle identity as the reference identity, and test
+  authorization-epoch revocation explicitly.
 - **Confused deputy at the issuer.** A shared issuer holds secrets for several
   gateways. A compromised gateway can read everything in its scope.
   Mitigation: per-gateway reference binding and workspace scoping. Remaining
@@ -733,8 +763,13 @@ keeps those guarantees in one place.
   contract?
 - Does remote mode need per-call JWT claims, such as purpose and sandbox ID,
   for issuer-side authorization in v1?
-- How should operators migrate an existing embedded deployment to a remote
-  issuer, and is downtime acceptable during migration?
+- Can an existing embedded deployment move to a remote issuer?
+  [#5315](https://github.com/NVIDIA/OpenShell/pull/5315) proposes choosing the
+  mode at initial deployment, with no conversion in either direction. That
+  keeps the issuer simpler, but existing deployments could then never use
+  remote mode. A conversion tool would have to transfer stored secrets, grants
+  and refresh state while holding the same versioning and revocation
+  guarantees. If conversion is supported, is downtime acceptable?
 - Should one issuer support several storage backends at once, selected per
   workspace or per grant? Today the gateway allows at most one enabled
   credential driver.
