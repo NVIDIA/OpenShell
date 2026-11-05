@@ -13115,6 +13115,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_attachment_credential_inspection_uses_latest_policy() {
+        for (creation_has_rule, updated_has_rule) in [
+            (true, Some(false)),
+            (false, Some(true)),
+            (true, None),
+            (false, None),
+        ] {
+            let state = test_server_state().await;
+            state
+                .store
+                .put_message(&test_provider("work-github", "github"))
+                .await
+                .unwrap();
+            let policy = |has_rule| {
+                if has_rule {
+                    test_policy_with_rule("uninspected", "api.github.com")
+                } else {
+                    ProtoSandboxPolicy::default()
+                }
+            };
+            let creation_policy = policy(creation_has_rule);
+            let sandbox = test_sandbox(
+                "sb-attachment-inspection",
+                "attach-inspection",
+                creation_policy.clone(),
+                Vec::new(),
+            );
+            state.store.put_message(&sandbox).await.unwrap();
+
+            if let Some(has_rule) = updated_has_rule {
+                handle_update_config(
+                    &state,
+                    with_user(Request::new(UpdateConfigRequest {
+                        sandbox: "attach-inspection".to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        policy: Some(policy(has_rule)),
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .expect("policy update without an attached provider must succeed");
+            }
+
+            let result = super::super::sandbox::handle_attach_sandbox_provider(
+                &state,
+                authed_request(openshell_core::proto::AttachSandboxProviderRequest {
+                    sandbox: "attach-inspection".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    provider: "work-github".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            let should_reject = updated_has_rule.unwrap_or(creation_has_rule);
+            if should_reject {
+                let error = result.expect_err("current uninspected rule must prevent attachment");
+                assert_eq!(error.code(), Code::FailedPrecondition);
+                assert!(error.message().contains("L4-only"));
+                assert!(error.message().contains("uninspected"));
+            } else {
+                assert!(
+                    result
+                        .expect("no current uninspected rule")
+                        .into_inner()
+                        .attached
+                );
+            }
+
+            let stored = state
+                .store
+                .get_message::<Sandbox>("sb-attachment-inspection")
+                .await
+                .unwrap()
+                .unwrap();
+            let spec = stored.spec.unwrap();
+            assert_eq!(spec.policy, Some(creation_policy));
+            assert_eq!(
+                spec.providers,
+                if should_reject {
+                    Vec::<String>::new()
+                } else {
+                    vec!["work-github".to_string()]
+                }
+            );
+            state.store.close_for_test().await;
+        }
+    }
+
+    #[tokio::test]
     async fn update_config_gates_uninspected_endpointless_credential_binding() {
         use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 

@@ -1566,11 +1566,13 @@ pub(super) async fn handle_attach_sandbox_provider(
         &candidate_spec.providers,
     )
     .await?;
+    let current_policy =
+        super::policy::current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
     super::policy::validate_candidate_sandbox_credential_policy(
         state,
         &workspace,
         &candidate_spec.providers,
-        candidate_spec.policy.as_ref(),
+        Some(&current_policy),
     )
     .await?;
 
