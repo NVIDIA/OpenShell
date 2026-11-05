@@ -13,6 +13,10 @@ use crate::objects::{AiModel, Device, Metadata};
 /// Every event class embeds this struct via `#[serde(flatten)]`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BaseEventData {
+    /// Optional trace correlation from the OCSF producer (Trace profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<crate::TraceCorrelation>,
+
     /// OCSF class UID (e.g., 4001 for Network Activity).
     pub class_uid: u32,
 
@@ -76,7 +80,6 @@ impl Serialize for BaseEventData {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
 
-        // Count fields: 9 required + severity pair (2) + up to 6 optional
         let mut map = serializer.serialize_map(None)?;
 
         map.serialize_entry("class_uid", &self.class_uid)?;
@@ -111,6 +114,9 @@ impl Serialize for BaseEventData {
         }
         if let Some(ref ai_model) = self.ai_model {
             map.serialize_entry("ai_model", ai_model)?;
+        }
+        if let Some(ref trace) = self.trace {
+            map.serialize_entry("trace", trace)?;
         }
         if let Some(ref unmapped) = self.unmapped {
             map.serialize_entry("unmapped", unmapped)?;
@@ -154,6 +160,7 @@ impl BaseEventData {
             metadata,
             device: None,
             ai_model: None,
+            trace: None,
             unmapped: None,
         }
     }
@@ -186,6 +193,19 @@ impl BaseEventData {
     /// Set AI model info (`ai_operation` profile).
     pub fn set_ai_model(&mut self, ai_model: AiModel) {
         self.ai_model = Some(ai_model);
+    }
+
+    /// Set explicit trace correlation and add the Trace profile once.
+    pub fn set_trace(&mut self, trace: crate::TraceCorrelation) {
+        self.trace = Some(trace);
+        if !self
+            .metadata
+            .profiles
+            .iter()
+            .any(|profile| profile == "trace")
+        {
+            self.metadata.profiles.push("trace".to_string());
+        }
     }
 
     /// Add an unmapped field.

@@ -12,6 +12,7 @@ use crate::objects::{Endpoint, HttpRequest, Service, User};
 /// Builder for Authentication [3002] Logon events.
 pub struct AuthenticationBuilder<'a> {
     ctx: ContextRef<'a>,
+    trace: Option<crate::TraceCorrelation>,
     user: User,
     service: Service,
     auth_protocol: Option<AuthProtocolId>,
@@ -28,10 +29,18 @@ pub struct AuthenticationBuilder<'a> {
 }
 
 impl<'a> AuthenticationBuilder<'a> {
+    /// Set trace correlation explicitly instead of using the active span.
+    #[must_use]
+    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     #[must_use]
     pub fn new(ctx: impl Into<ContextRef<'a>>, user: User, service: Service) -> Self {
         Self {
             ctx: ctx.into(),
+            trace: None,
             user,
             service,
             auth_protocol: None,
@@ -112,6 +121,9 @@ impl<'a> AuthenticationBuilder<'a> {
         // Authentication identifies the authenticating device, not a workload container.
         if let Some(device) = base.device.as_mut() {
             device.container = None;
+        }
+        if let Some(trace) = self.trace {
+            base.set_trace(trace);
         }
 
         OcsfEvent::Authentication(AuthenticationEvent {

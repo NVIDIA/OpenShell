@@ -3,6 +3,9 @@
 
 //! Shared OpenTelemetry trace and log export support for `OpenShell` services.
 
+mod correlation;
+pub use correlation::current_ocsf_trace_correlation;
+
 mod driver;
 mod grpc;
 mod headers;
@@ -53,6 +56,18 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::registry::LookupSpan;
+
+/// Export supervisor spans at INFO by default, or DEBUG and TRACE when enabled.
+/// Dependency spans remain at INFO.
+#[must_use]
+pub fn supervisor_span_filter(log_level: &str) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::filter::LevelFilter;
+    let level = log_level
+        .parse::<LevelFilter>()
+        .unwrap_or(LevelFilter::INFO)
+        .max(LevelFilter::INFO);
+    tracing_subscriber::EnvFilter::new(format!("info,openshell={level}"))
+}
 
 const SDK_UNKNOWN_SERVICE_PREFIX: &str = "unknown_service";
 
@@ -565,6 +580,15 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_span_filter_raises_only_openshell_targets() {
+        let directives = |log_level: &str| supervisor_span_filter(log_level).to_string();
+        assert_eq!(directives("warn"), "openshell=info,info");
+        assert_eq!(directives("info"), "openshell=info,info");
+        assert_eq!(directives("debug"), "openshell=debug,info");
+        assert_eq!(directives("info,h2=debug"), "openshell=info,info");
+    }
 
     #[test]
     fn error_status_guard_marks_only_unfinished_results() {

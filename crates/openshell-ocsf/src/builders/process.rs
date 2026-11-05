@@ -12,6 +12,7 @@ use crate::objects::{Actor, Process};
 /// Builder for Process Activity [1007] events.
 pub struct ProcessActivityBuilder<'a, ActorState = MissingActor> {
     ctx: ContextRef<'a>,
+    trace: Option<crate::TraceCorrelation>,
     activity: ActivityId,
     severity: SeverityId,
     status: Option<StatusId>,
@@ -45,6 +46,7 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
     pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
             ctx: ctx.into(),
+            trace: None,
             activity: ActivityId::Unknown,
             severity: SeverityId::Informational,
             status: None,
@@ -64,6 +66,7 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
     pub fn actor_process(self, process: Process) -> ProcessActivityBuilder<'a, HasActor> {
         ProcessActivityBuilder {
             ctx: self.ctx,
+            trace: self.trace,
             activity: self.activity,
             severity: self.severity,
             status: self.status,
@@ -80,6 +83,13 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
 }
 
 impl<ActorState> ProcessActivityBuilder<'_, ActorState> {
+    /// Set trace correlation explicitly instead of using the active span.
+    #[must_use]
+    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     /// Set the action taken.
     /// Set the disposition of the action.
     /// Set the event severity.
@@ -123,6 +133,10 @@ impl ProcessActivityBuilder<'_, HasActor> {
         );
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
+
+        if let Some(trace) = self.trace {
+            base.set_trace(trace);
+        }
 
         OcsfEvent::ProcessActivity(ProcessActivityEvent {
             base,
