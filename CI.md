@@ -144,6 +144,14 @@ Each run retains `report.json` and `report.md` for 90 days in
 `compatibility-review-run-<run-id>-attempt-<attempt>`. The report records both
 revisions, the train, tool/model metadata, coverage gaps, and actionable
 findings. Raw agent transcripts and PR discussions are not published.
+The report's `diagnostics` object and job log record the last execution phase,
+elapsed seconds, exception type, turn status, retry/error notification counts,
+and the last and final structured SDK error codes and upstream HTTP statuses
+when available. A merge conflict is identified separately during context
+resolution. SDK messages, additional details, stderr, and rejected review output
+are not retained because they can contain source or credentials. A successful
+review can still have retry notifications; use `final_error` and the execution
+status to distinguish recovery from failure.
 The qualification summary links this separate advisory evidence without waiting
 for it; compatibility
 review remains missing from the blocking RFC profile during this rollout.
