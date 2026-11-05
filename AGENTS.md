@@ -23,6 +23,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
+| `crates/openshell-credential-issuer/` | Embedded credential issuer | Credential backend orchestration, typed secret owners, storage dispatch, and existing driver transport |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | [`crates/openshell-mxc-boundary/`](https://github.com/NVIDIA/OpenShell/tree/windows/crates/openshell-mxc-boundary) (`windows` branch) | Windows sandbox boundary | Windows boundary library and dedicated openshell-windows-sandbox binary for MXC process operations, containment confirmation, and shared-protocol forwarding |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
