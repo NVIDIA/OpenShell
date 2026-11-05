@@ -317,6 +317,13 @@ nix run .#openshell-test-runner -- \
   --family features --package keycloak-provider-refresh
 ```
 
+A suite that needs setup beyond a container engine runs in a feature
+environment, named `<base>-<feature>`, such as `ubuntu-docker-rootful-keycloak`. `features` in `tests/tmachine/config.nix`
+lists each feature's setup playbooks, the inputs they read, and the bases it
+supports.
+To add one, add an entry there and use the generated environment name in the
+suite's row in `.github/workflows/e2e-suites.yml`.
+
 ### Python E2E (`e2e/python/`)
 
 `mise run e2e:python` builds `openshell/e2e-python:dev` from
