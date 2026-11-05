@@ -1,6 +1,6 @@
 ---
 name: getting-started-with-openshell
-description: Guide a prospective OpenShell contributor from first interest to hands-on use, and toward community involvement once they show real engagement. Use when someone asks how to get started, how to contribute, what to work on first, or how to get involved with OpenShell. Trigger keywords - getting started, get started, how do I contribute, first contribution, get involved, new contributor, onboarding.
+description: Guide a prospective OpenShell contributor from first interest to hands-on use, and toward community involvement once they show real engagement. Use when someone asks how to get started, how to contribute, what to work on first, or how to get involved with OpenShell. Trigger keywords - getting started, get started, how do I contribute, first contribution, get involved, new contributor, onboarding, vouch request.
 metadata:
   internal: true
 ---
@@ -11,20 +11,20 @@ Help a prospective contributor turn interest into hands-on experience, then poin
 
 ## Ground rules
 
-- Take no GitHub write actions. Do not comment on issues, claim or assign work, open PRs, or start discussions on the person's behalf.
-- Never draft a vouch request. [CONTRIBUTING.md](../../../CONTRIBUTING.md#first-time-contributors) denies AI-generated vouch requests; the person must write it in their own words.
+- Take no GitHub write actions. Do not comment on issues, claim or assign work, open PRs, or post a vouch request on the person's behalf.
 - Ask one or two questions at a time and listen. Adapt to what they tell you; this is a conversation, not a form.
 - Let them do the work. Explain commands and concepts, but have them run things and read the output themselves.
+- Keep track of their answers and what they actually did. Phase 4 builds on that record, and nothing else.
 
 ## 1. Learn their interest
 
-Ask:
+Use questions to choose what they should learn first, not to screen them. Ask:
 
 - What do they want to do with OpenShell? Which agent do they run, and what should it be able, or unable, to do?
 - What environment do they use: a laptop with Docker or Podman, Kubernetes, or a VM?
 - What draws them to the project: security, policy, agent tooling, infrastructure, or something else?
 
-If they only want "something to work on," say plainly that the project looks for contributors who use OpenShell first, then continue to the next phase.
+Use the answers to pick the sandbox, policy, and background reading for phase 2. If they only want "something to work on," say plainly that the project looks for contributors who use OpenShell first, then continue to phase 2.
 
 ## 2. Build and learn
 
@@ -47,15 +47,15 @@ Look for evidence in the conversation and their workspace. Strong signals:
 - Specific friction, a bug, or a missing feature they hit themselves.
 - A clear area of interest they can connect to code, docs, or an RFC.
 
-Weak signals: wanting any open issue, choosing issues by label or title alone, or being unable to describe what they did with OpenShell. With only weak signals, encourage more hands-on use from phase 2 and stop there. Do not suggest issues to claim.
+Weak signals: wanting any open issue, choosing issues by label or title alone, or being unable to describe what they did with OpenShell. With only weak signals, encourage more hands-on use from phase 2 and stop there. Do not suggest issues to claim or help with a vouch request.
 
 ## 4. Point toward involvement
 
 When the evidence is strong, explain the path in [CONTRIBUTING.md](../../../CONTRIBUTING.md#first-time-contributors):
 
-1. Join the community. Introduce themselves in [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions) or the CNCF Slack channel with what they use OpenShell for. File bugs or feature requests from their own experience with the issue templates.
-2. Request a vouch in their own words. Unvouched PRs are closed automatically.
-3. Find work. Look for open [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) issues in their area. A PR from someone without write access must link an issue labeled `state:accepted` (see Pull Requests in `CONTRIBUTING.md`). Check for an existing assignee, branch, or PR first. Comment once on the issue they choose, saying why they want it and how they would approach it, and wait for a maintainer.
-4. Earn the badge of honor. Implement the first issue with an agent running inside an OpenShell sandbox, and include OCSF log excerpts from that session in the PR as evidence. Redact anything sensitive.
+1. **Join the community.** Get an invite to CNCF Slack at <https://slack.cncf.io>, find the OpenShell channel, and introduce themselves with what they use OpenShell for and what they learned. Join the [OpenShell Community Google Group](https://groups.google.com/a/ai-openshell.org/g/openshell-community/about) to get the community call invitation and agenda, and attend a call. File bugs or feature requests from their own experience with the issue templates.
+2. **Request a vouch.** Offer to help draft a [Vouch Request](https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request). Build the draft only from their answers in phase 1 and what they did in phases 2 and 3: their use case, the sandbox and policy they ran, and the friction or interest they found. Do not add experience they did not describe or skills they did not show. Have them review the draft and rewrite it in their own voice, then post it themselves. Unvouched PRs are closed automatically.
+3. **Find work.** Look for open [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) issues in their area. A PR from someone without write access must link an issue labeled `state:accepted` (see Pull Requests in `CONTRIBUTING.md`). Check for an existing assignee, branch, or PR first. Comment once on the issue they choose, saying why they want it and how they would approach it, and wait for a maintainer.
+4. **Earn a contributor's badge.** Implement the first issue with an agent running inside an OpenShell sandbox, and include OCSF log excerpts from that session in the PR as evidence. Redact anything sensitive.
 
-If no matching `good first issue` exists, suggest staying engaged through Discussions and Slack rather than picking an unrelated issue.
+If no matching `good first issue` exists, suggest asking in Slack or on a community call where help is wanted, rather than picking an unrelated issue.

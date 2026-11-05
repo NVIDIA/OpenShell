@@ -20,13 +20,13 @@ OpenShell is agent-first, not agent-only. The distinction matters:
 
 ## First-Time Contributors
 
-Start by using OpenShell. To get guided help, fork the repository, open your agent in your local checkout, and run the `getting-started-with-openshell` skill. It asks what you want to do with OpenShell, helps you run your own agent in a sandbox, and points you toward the community and first issues once you have hands-on experience.
+Start by using OpenShell. To get guided help, fork the repository, open your agent in your local checkout, and run the `getting-started-with-openshell` skill. It asks what you want to do with OpenShell, helps you run your own agent in a sandbox, and once you have hands-on experience, points you toward [CNCF Slack](https://slack.cncf.io), the community call, and first issues.
 
 We use a vouch system. This exists because AI makes it trivial to generate plausible-looking but low-quality contributions, and we can no longer trust by default.
 
 1. Open a [Vouch Request](https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request) discussion.
 2. Describe what you want to change and why.
-3. Write in your own words. AI-generated vouch requests will be denied.
+3. Write in your own words, based on your own use of OpenShell. An agent may help you organize what you did and learned, but vouch requests that are generic or don't reflect your own experience will be denied.
 4. A maintainer will comment `/vouch` if approved, and the request discussion
    will close automatically.
 5. **Get vouched before opening a PR.** Once vouched, you can submit pull requests.
@@ -76,7 +76,7 @@ Pull requests that touch the enforcement machinery or reviewer routing — anyth
 
 Use exactly one `area:` label and any relevant `topic:` labels on your pull request. The [reviewer routing workflow](.github/workflows/review-readiness.yml) requests all matching members of [REVIEWERS.md](REVIEWERS.md), excluding the author, when a PR opens ready for review, leaves draft status, or gains or loses an area/topic label. Reviewers do not need repository write access to receive requests or review PRs. Manual reviewer choices and people who have commented or reviewed are preserved. Propose roster membership changes through a reviewed PR.
 
-If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
+If your pull request has been idle, ask for a reviewer in the pull request or in the OpenShell channel on [CNCF Slack](https://slack.cncf.io) rather than waiting.
 
 ## Agent Skills
 
