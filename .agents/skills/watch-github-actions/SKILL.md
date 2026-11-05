@@ -235,12 +235,7 @@ For `Codex Compatibility Review`, inspect its job summary and the
 candidate and baseline SHAs before interpreting findings. `complete` describes
 execution and coverage, not compatibility: also read the assessment and findings.
 An `error`, incomplete coverage, or missing artifact means no clean review is
-available. Findings are advisory. For failed execution, inspect `report.json`'s `diagnostics`
-or the execution diagnostics in the job log/summary: phase, exception type,
-last/final SDK code and upstream HTTP status, and retry counts. SDK error text
-and transcripts are deliberately omitted. Retry events alone do not imply failure
-if the review ultimately completed. Context-resolution merge conflicts are not
-transient SDK failures. The review targets breaking changes with high
+available. Findings are advisory. The review targets breaking changes with high
 reasoning effort. Risk acceptance needs a linked author or verified-maintainer
 comment or review, not a PR description, general approval, or bot report.
 The full report keeps all findings and prior-comment links. `comment.md` includes

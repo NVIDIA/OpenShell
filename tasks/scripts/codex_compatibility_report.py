@@ -179,15 +179,6 @@ def write_report(output: Path, result: dict) -> None:
         f"- Baseline: `{context.get('baseline_tag', 'unresolved')}` "
         f"(`{context.get('baseline_sha', 'unresolved')}`)",
     ]
-    if diagnostics := result.get("diagnostics"):
-        details += [
-            "",
-            "Execution diagnostics (fixed states and numeric metadata only):",
-            "",
-            "```json",
-            json.dumps(diagnostics, indent=2),
-            "```",
-        ]
     if review:
         details.append(
             f"- Reviewed: {', '.join(review['reviewed_surfaces']) or 'none'}"
