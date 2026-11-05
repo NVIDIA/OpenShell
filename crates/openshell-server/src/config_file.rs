@@ -143,6 +143,11 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub credential_storage: Option<toml::Table>,
 
+    /// Operator attestation that all incompatible credential writers have been
+    /// drained and a coordinated database/backend backup exists. Not a fence.
+    #[serde(default)]
+    pub enable_versioned_credentials: Option<bool>,
+
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
@@ -1834,6 +1839,48 @@ endpoint = { kind = "unix", socket_path = "/run/other.sock" }
             load(tmp.path()),
             Err(ConfigFileError::MissingVersion)
         ));
+    }
+
+    #[test]
+    fn versioned_credential_activation_file_preserves_boolean_presence() {
+        let omitted = write_tmp("[openshell.gateway]\n");
+        assert_eq!(
+            load(omitted.path())
+                .unwrap()
+                .openshell
+                .gateway
+                .enable_versioned_credentials,
+            None
+        );
+        for enabled in [false, true] {
+            let tmp = write_tmp(&format!(
+                "[openshell.gateway]\nenable_versioned_credentials = {enabled}\n"
+            ));
+            let file = load(tmp.path()).unwrap();
+            assert_eq!(
+                file.openshell.gateway.enable_versioned_credentials,
+                Some(enabled)
+            );
+            let encoded = toml::to_string(&file).unwrap();
+            let decoded: ConfigFile = toml::from_str(&encoded).unwrap();
+            assert_eq!(
+                decoded.openshell.gateway.enable_versioned_credentials,
+                Some(enabled)
+            );
+        }
+    }
+
+    #[test]
+    fn versioned_credential_activation_file_rejects_non_boolean_values() {
+        for value in ["\"true\"", "1", "[]"] {
+            let tmp = write_tmp(&format!(
+                "[openshell.gateway]\nenable_versioned_credentials = {value}\n"
+            ));
+            assert!(matches!(
+                load(tmp.path()),
+                Err(ConfigFileError::Parse { .. })
+            ));
+        }
     }
 
     #[test]

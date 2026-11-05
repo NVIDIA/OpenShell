@@ -7,6 +7,7 @@
 #[doc(hidden)]
 pub mod engine;
 pub mod minter;
+pub mod persistence;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,6 +32,8 @@ pub struct RefreshState {
     pub provider_name: String,
     pub credential_key: String,
     pub strategy: i32,
+    /// Canonical selected registry name. Legacy records may omit it.
+    pub strategy_name: Option<String>,
     pub material: HashMap<String, String>,
     pub secret_material_keys: Vec<String>,
     pub expires_at_ms: i64,
@@ -50,6 +53,10 @@ pub struct RefreshState {
     pub failure_code: String,
     pub provider_error_subtype: String,
     pub last_error_at_ms: i64,
+    /// Fixed issuer-owned outputs. Empty only for the pre-activation legacy
+    /// representation; never serialized through the frozen gateway V1/V2 schema.
+    pub output_references: Handles,
+    pub reference_generation: u64,
 }
 
 impl std::fmt::Debug for RefreshState {
@@ -85,6 +92,7 @@ impl From<&RefreshState> for minter::MintRequest {
     fn from(state: &RefreshState) -> Self {
         Self {
             strategy: state.strategy,
+            strategy_name: state.strategy_name.clone(),
             material: state.material.clone(),
             token_url: state.token_url.clone(),
             scopes: state.scopes.clone(),
@@ -154,6 +162,9 @@ pub struct RefreshChange {
     pub provider_name: String,
     pub credential_key: String,
     pub completed_mint: Option<String>,
+    /// Non-secret committed reference identities and versions. Empty for a
+    /// legacy refresh or deletion; never inferred from database row versions.
+    pub references: HashMap<String, (String, u64)>,
 }
 
 pub trait RefreshCommitSink {
@@ -184,11 +195,48 @@ pub trait CredentialRefresh: Send + Sync {
     async fn sweep(&self) -> Result<Vec<RefreshChange>, Status>;
 }
 
+/// Distinguish a definite pre-activation failure from a possibly committed CAS.
+#[derive(Debug)]
+pub enum ReferenceActivationError {
+    /// Activation was not attempted. Only this exact staging-journal version
+    /// can record a retryable error; its material/write evidence must survive.
+    NotActivated {
+        state: Box<RefreshState>,
+        error: Status,
+    },
+    /// Never overwrite terminal state or remint without exact reconciliation.
+    Uncertain(Status),
+}
+
+impl From<Status> for ReferenceActivationError {
+    fn from(error: Status) -> Self {
+        Self::Uncertain(error)
+    }
+}
+
+/// Issuer-owned atomic output/grant activation.
+///
+/// Implementations stage immutable candidates and activate their manifest
+/// together with the terminal grant state.
+/// This port cannot inspect provider records or invoke gateway policy callbacks.
+#[async_trait]
+pub trait ReferenceOutputStore: std::fmt::Debug + Send + Sync {
+    async fn activate(
+        &self,
+        state: RefreshState,
+        expected_version: u64,
+        values: HashMap<String, String>,
+        expiration: Option<prost_types::Timestamp>,
+    ) -> Result<RefreshState, ReferenceActivationError>;
+}
+
 #[derive(Clone, Debug)]
 pub struct RefreshRuntime {
     store: Arc<dyn RefreshStateStore>,
     credentials: Option<Arc<dyn CredentialIssuer>>,
-    gateway: Arc<dyn GatewayRefreshCommit>,
+    // Only the legacy representation can write provider handles on refresh.
+    gateway: Option<Arc<dyn GatewayRefreshCommit>>,
+    outputs: Option<Arc<dyn ReferenceOutputStore>>,
 }
 
 impl RefreshRuntime {
@@ -200,8 +248,28 @@ impl RefreshRuntime {
         Self {
             store,
             credentials,
-            gateway,
+            gateway: Some(gateway),
+            outputs: None,
         }
+    }
+
+    /// Construct an activated embedded issuer without any gateway provider
+    /// observation/commit callback. Grant bindings are its source of authority.
+    pub fn with_references(
+        store: Arc<dyn RefreshStateStore>,
+        credentials: Arc<dyn CredentialIssuer>,
+        outputs: Arc<dyn ReferenceOutputStore>,
+    ) -> Self {
+        Self {
+            store,
+            credentials: Some(credentials),
+            gateway: None,
+            outputs: Some(outputs),
+        }
+    }
+
+    pub fn uses_references(&self) -> bool {
+        self.outputs.is_some()
     }
 }
 

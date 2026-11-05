@@ -264,6 +264,12 @@ pub struct Config {
     /// Disabled by default; not a license to run mixed-version writers.
     pub enable_sandbox_updates: bool,
 
+    /// Operator attestation for activating versioned credential bindings after
+    /// draining all incompatible credential writers and taking a coordinated
+    /// database/backend backup. Disabled by default; this is not an old-writer
+    /// fence or a downgrade switch after the first incompatible binding change.
+    pub enable_versioned_credentials: bool,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -1035,6 +1041,7 @@ impl Config {
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
             enable_sandbox_updates: false,
+            enable_versioned_credentials: false,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
@@ -1471,6 +1478,11 @@ mod tests {
         let cfg = Config::new(None);
         assert!(cfg.credential_drivers.is_empty());
         assert!(cfg.default_credential_driver.is_none());
+    }
+
+    #[test]
+    fn config_disables_versioned_credentials_by_default() {
+        assert!(!Config::new(None).enable_versioned_credentials);
     }
 
     #[test]

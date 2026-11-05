@@ -68,6 +68,84 @@ struct EndpointContext {
     policy_hash: String,
     provider_env_revision: u64,
     endpoints: BTreeMap<String, ExpectedEndpoint>,
+    policy: ProtoSandboxPolicy,
+}
+
+/// Capture values before taking revocation locks. Polling has no installed
+/// receipt, so its report still needs the same version-aware capture as its
+/// configuration fetch, but a slow secret store must not block mutations.
+async fn capture_polling_report_inputs(
+    state: &Arc<ServerState>,
+    req: &ReportEndpointStatusRequest,
+) -> Result<Option<super::SandboxConfigInputs>, Status> {
+    if !state.credentials.is_versioned() {
+        return Ok(None);
+    }
+    if !state
+        .supervisor_sessions
+        .is_endpoint_status_authority(&req.sandbox_id, &req.supervisor_session_id)
+    {
+        return Err(Status::permission_denied(
+            "tool server endpoint status requires the active supervisor session",
+        ));
+    }
+    if state
+        .supervisor_sessions
+        .current_session_applies_config(&req.sandbox_id)
+        == Some(true)
+    {
+        return Ok(None);
+    }
+    tokio::time::timeout(
+        crate::config_delivery::PROVIDER_ENVIRONMENT_BUILD_TIMEOUT,
+        async {
+            let sandbox = state
+                .store
+                .get_message::<Sandbox>(&req.sandbox_id)
+                .await
+                .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            super::load_sandbox_config_inputs(state, sandbox)
+                .await
+                .map(Some)
+        },
+    )
+    .await
+    .map_err(|_| Status::deadline_exceeded("endpoint configuration capture timed out"))?
+}
+
+/// Only metadata I/O is permitted here: the caller holds the mutation guard.
+/// Reject intervening configuration changes rather than attaching a capture
+/// to a different provider, policy or settings generation.
+async fn verify_polling_report_inputs(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    captured: &super::SandboxConfigInputs,
+) -> Result<(), Status> {
+    let current = super::SandboxConfigInputs::load_metadata(state, sandbox.clone()).await?;
+    let metadata_revision = |inputs: &super::SandboxConfigInputs| {
+        let mut records = inputs.provider_records.clone();
+        for record in &mut records {
+            record.resolved_credentials = None;
+        }
+        super::compute_provider_env_revision_from_records_and_policy_bindings(
+            &inputs.catalog,
+            &records,
+            &HashMap::new(),
+            None,
+        )
+    };
+    if captured.sandbox != *sandbox
+        || captured.catalog.revision() != current.catalog.revision()
+        || captured.global_settings.record_id != current.global_settings.record_id
+        || captured.global_settings.resource_version != current.global_settings.resource_version
+        || metadata_revision(captured)? != metadata_revision(&current)?
+    {
+        return Err(Status::aborted(
+            "endpoint configuration changed during capture; retry report",
+        ));
+    }
+    super::config_inputs::verify_captured_provider_bindings(state, captured).await
 }
 
 /// Accept the last observed result for each configured tool server endpoint.
@@ -129,9 +207,15 @@ async fn handle_report_endpoint_status_inner(
         return Err(Status::invalid_argument("report_sequence is required"));
     }
 
-    // Session validation, configuration derivation, and persistence share the
-    // sandbox mutation boundary. A newly registered supervisor can therefore
-    // invalidate its predecessor before any stale report reaches the CAS.
+    // Keep the captured snapshot off the handler's async frame while it waits
+    // for mutation admission and performs metadata-only revalidation.
+    let polling_inputs = Box::pin(capture_polling_report_inputs(state, &req))
+        .await?
+        .map(Box::new);
+
+    // Session validation, metadata revalidation and persistence share the
+    // mutation boundary. Secret capture above never owns these locks; a newly
+    // registered supervisor can still invalidate a stale report before its CAS.
     let Some(_mutation_guard) = state
         .compute
         .sandbox_mutation_guard_by_id(&req.sandbox_id)
@@ -159,7 +243,42 @@ async fn handle_report_endpoint_status_inner(
         .await
         .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let context = active_endpoint_context(state.as_ref(), &sandbox).await?;
+    let mut context = active_endpoint_context(state.as_ref(), &sandbox).await?;
+    if state.credentials.is_versioned() {
+        context.provider_env_revision = if state
+            .supervisor_sessions
+            .current_session_applies_config(&req.sandbox_id)
+            == Some(true)
+        {
+            let (policy_hash, revision) = state
+                .supervisor_sessions
+                .installed_endpoint_configuration(&req.sandbox_id, &req.supervisor_session_id)
+                .ok_or_else(|| {
+                    Status::failed_precondition("no installed supervisor configuration")
+                })?;
+            if policy_hash != context.policy_hash {
+                return Err(Status::failed_precondition(
+                    "installed supervisor policy does not match the active policy",
+                ));
+            }
+            revision
+        } else {
+            // Polling has no streamed install receipt. Use the same coherent
+            // capture/revision contract as its configuration fetch, including
+            // versions advanced by refresh without a provider-row write.
+            let inputs = polling_inputs.as_ref().ok_or_else(|| {
+                Status::aborted("endpoint reporting session changed during capture; retry report")
+            })?;
+            Box::pin(verify_polling_report_inputs(state, &sandbox, inputs)).await?;
+            let bindings = policy_static_credential_endpoint_bindings(Some(&context.policy))?;
+            let global_policy = decode_policy_from_global_settings(&inputs.global_settings)?;
+            super::compute_provider_env_revision_from_inputs(
+                inputs,
+                &bindings,
+                global_policy.as_ref().map(|_| &context.policy),
+            )?
+        };
+    }
     if req.policy_hash != context.policy_hash
         || req.provider_env_revision != context.provider_env_revision
     {
@@ -386,6 +505,7 @@ async fn derive_endpoint_context(
         policy_hash: deterministic_policy_hash(&policy),
         provider_env_revision,
         endpoints: expected_endpoint_statuses(&policy),
+        policy,
     })
 }
 
@@ -1104,6 +1224,9 @@ pub(super) fn reconcile_endpoint_statuses(
         .collect();
 }
 
+#[cfg(test)]
+#[path = "endpoint_capture_tests.rs"]
+mod capture_tests;
 #[cfg(test)]
 #[path = "endpoint_status_tests.rs"]
 mod tests;

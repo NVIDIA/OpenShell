@@ -15,6 +15,8 @@ mod endpoint_status;
 mod provisioning_clock;
 #[cfg(test)]
 mod token_grant_owners_tests;
+#[cfg(test)]
+mod versioned_delivery_tests;
 pub use config_inputs::{SandboxConfigInputs, load_sandbox_config_inputs};
 pub use provisioning_clock::configuration_change;
 
@@ -2914,7 +2916,14 @@ pub async fn build_sandbox_config_snapshot(
     state: &ServerState,
     sandbox: &Sandbox,
 ) -> Result<SandboxConfigSnapshot, Status> {
-    let inputs = load_sandbox_config_inputs(state, sandbox.clone()).await?;
+    let mut inputs = SandboxConfigInputs::load_metadata(state, sandbox.clone()).await?;
+    let mut credential_budget = crate::config_delivery::PROVIDER_ENVIRONMENT_BUILD_TIMEOUT;
+    crate::config_delivery::capture_credentials_for_delivery(
+        state,
+        &mut inputs,
+        &mut credential_budget,
+    )
+    .await;
     build_sandbox_config_snapshot_from_inputs(state, &inputs).await
 }
 
@@ -3075,9 +3084,8 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
             &policy_credential_bindings,
         )?;
     }
-    let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
-        provider_profile_catalog,
-        provider_records,
+    let provider_env_revision = compute_provider_env_revision_from_inputs(
+        inputs,
         &policy_credential_bindings,
         policy
             .as_ref()
@@ -3098,6 +3106,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
             .map_err(|_| Status::internal("service configuration fingerprint failed"))?;
         config_revision = u64::from_le_bytes(hash[..8].try_into().expect("hash prefix"));
     }
+    config_inputs::verify_captured_provider_bindings(state, inputs).await?;
     Ok(SandboxConfigSnapshot {
         service_routes,
         configuration_instance_id: sandbox
@@ -3433,9 +3442,101 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
     }
 
     let digest = hasher.finalize();
-    Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
-        |_| Status::internal("provider env revision digest too short"),
-    )?))
+    let legacy_revision = u64::from_le_bytes(
+        digest[..8]
+            .try_into()
+            .map_err(|_| Status::internal("provider env revision digest too short"))?,
+    );
+    extend_provider_env_revision_with_captured_versions(legacy_revision, records)
+}
+
+/// The shared revision contract for sandbox, environment, and report builds.
+/// Unresolved captures have their own identity, never a legacy/partial capture
+/// identity that could name a previously cached environment.
+fn compute_provider_env_revision_from_inputs(
+    inputs: &SandboxConfigInputs,
+    policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    global_policy: Option<&ProtoSandboxPolicy>,
+) -> Result<u64, Status> {
+    let revision = compute_provider_env_revision_from_records_and_policy_bindings(
+        &inputs.catalog,
+        &inputs.provider_records,
+        policy_bindings,
+        global_policy,
+    )?;
+    if inputs.credential_capture_error.is_none() {
+        return Ok(revision);
+    }
+    let mut bytes = b"openshell-provider-env-unresolved-capture-v1".to_vec();
+    bytes.extend_from_slice(&revision.to_le_bytes());
+    let digest = openshell_crypto::sha256(&bytes)
+        .map_err(|_| Status::internal("unresolved provider environment fingerprint failed"))?;
+    Ok(u64::from_le_bytes(
+        digest[..8].try_into().expect("hash prefix"),
+    ))
+}
+
+/// Version metadata comes exclusively from the capture that supplies values.
+/// Keep legacy identity byte-for-byte unchanged when no capture is present.
+/// The extension is canonical, length-delimited and uses the crypto facade;
+/// secret bytes and backend candidate handles are never revision inputs.
+fn extend_provider_env_revision_with_captured_versions(
+    legacy_revision: u64,
+    records: &[super::provider::ProviderEnvironmentRecord],
+) -> Result<u64, Status> {
+    if records
+        .iter()
+        .all(|record| record.resolved_credentials.is_none())
+    {
+        return Ok(legacy_revision);
+    }
+    let mut bytes = b"openshell-provider-env-reference-versions-v1".to_vec();
+    bytes.extend_from_slice(&legacy_revision.to_le_bytes());
+    let mut append = |value: &[u8]| {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value);
+    };
+    for record in records {
+        append(b"provider");
+        append(record.object_id.as_bytes());
+        let captured = record.resolved_credentials.as_ref().ok_or_else(|| {
+            Status::failed_precondition("provider credential capture is incomplete")
+        })?;
+        if captured
+            .values
+            .keys()
+            .any(|key| !captured.versions.contains_key(key))
+        {
+            return Err(Status::failed_precondition(
+                "resolved provider credential has no committed version",
+            ));
+        }
+        let mut keys = captured.versions.keys().collect::<Vec<_>>();
+        keys.sort();
+        append(&(keys.len() as u64).to_le_bytes());
+        for key in keys {
+            let version = &captured.versions[key];
+            if version.reference.is_empty()
+                || version.version == 0
+                || version.authorization_epoch.is_empty()
+            {
+                return Err(Status::failed_precondition(
+                    "resolved provider credential version is invalid",
+                ));
+            }
+            append(key.as_bytes());
+            append(version.reference.as_bytes());
+            append(&version.version.to_le_bytes());
+            append(version.authorization_epoch.as_bytes());
+            // Presence is omission/readiness evidence from this same capture.
+            append(&[u8::from(captured.values.contains_key(key))]);
+        }
+    }
+    let digest = openshell_crypto::sha256(&bytes)
+        .map_err(|_| Status::internal("provider credential version fingerprint failed"))?;
+    Ok(u64::from_le_bytes(
+        digest[..8].try_into().expect("hash prefix"),
+    ))
 }
 
 fn hash_provider_refresh_states(
@@ -3929,9 +4030,8 @@ fn provider_environment_target(
         &effective_policy,
         &policy_credential_bindings,
     )?;
-    let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
-        provider_profile_catalog,
-        provider_records,
+    let provider_env_revision = compute_provider_env_revision_from_inputs(
+        inputs,
         &policy_credential_bindings,
         matches!(policy_source, PolicySource::Global).then_some(&effective_policy),
     )?;
@@ -3944,14 +4044,17 @@ fn provider_environment_target(
     })
 }
 
-/// Build the provider environment from captured inputs. This is the only
-/// configuration build step that resolves credential values.
+/// Build the provider environment from captured inputs. Versioned builds reuse
+/// their value/version capture; legacy builds resolve credential values here.
 pub async fn build_provider_environment_snapshot_from_inputs(
     state: &ServerState,
     inputs: &SandboxConfigInputs,
     supports_static_credential_bindings: bool,
     supports_stable_placeholder_environment_keys: bool,
 ) -> Result<ProviderEnvironmentSnapshot, Status> {
+    if let Some(error) = inputs.credential_capture_error() {
+        return Err(error.clone());
+    }
     let sandbox_id = inputs.sandbox.object_id().to_string();
     let ProviderEnvironmentTarget {
         spec,
@@ -3964,6 +4067,7 @@ pub async fn build_provider_environment_snapshot_from_inputs(
     let provider_names = &spec.providers;
     let provider_profile_catalog = &inputs.catalog;
     let provider_records = &inputs.provider_records;
+    config_inputs::verify_captured_provider_bindings(state, inputs).await?;
     let mut provider_environment =
         super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
             provider_profile_catalog,
@@ -3973,6 +4077,8 @@ pub async fn build_provider_environment_snapshot_from_inputs(
             Some(&sandbox_id),
         )
         .await?;
+
+    config_inputs::verify_captured_provider_bindings(state, inputs).await?;
 
     if matches!(policy_source, PolicySource::Global) {
         // A global policy replaces provider ACLs. Grants retain their profile

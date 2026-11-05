@@ -177,15 +177,25 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // Refresh strategy_name is additive: profile field 106 enters the durable
+    // closure through StoredProviderProfile -> ProviderProfile.credentials ->
+    // ProviderProfileCredential.refresh. Configure field 107 and status field
+    // 114 are public-only. Old stored profiles retain an absent name and their
+    // enum selection; frozen storage.v1 refresh V1/V2 messages are unchanged.
+    // No message/enum or public RPC was added, so overlap membership is stable.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3b4c2af6cf22e7ed1d84279ff865acb0db7199717bee9bc041caef791334104d";
+        "e55b0e84d084f4572f40032b1ea82a62b4248e35a10e50bbde59f1c153b48740";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "d6121fd14efa2bcdc0d41565d648d2c0afc43b41461154cdc36f08b4b37a5e30";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
+    // Emitted with protoc using 22349a7b3's unchanged StoredProviderProfile
+    // wrapper and enum-only ProviderCredentialRefresh (before field 106).
+    // Fractional durations and material declarations are deliberately present.
+    const PRE_STRATEGY_NAME_REFRESH_PROFILE: &str = "0a380a1373747261746567792d70726f66696c652d696412166c65676163792d726566726573682d70726f66696c6528073a0764656661756c7412b9010a166c65676163792d726566726573682d70726f66696c65120e4c656761637920726566726573682a8e010a0c6163636573735f746f6b656e1a0c4143434553535f544f4b454e20012a06626561726572320d417574686f72697a6174696f6e42570804121f68747470733a2f2f617574682e6578616d706c652e746573742f746f6b656e1a0773636f70652d6132130a0d636c69656e745f73656372657418012001c20607081e10959aef3aca060908901c10b1d1f9d603";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -808,6 +818,134 @@ mod tests {
         assert!(credential.required);
         assert_eq!(credential.auth_style, "bearer");
         assert!(!credential.stable_placeholder);
+    }
+
+    #[test]
+    fn pre_strategy_name_stored_profile_retains_enum_and_exact_payload() {
+        use openshell_core::proto::ProviderCredentialRefreshStrategy;
+
+        let bytes = legacy_bytes(PRE_STRATEGY_NAME_REFRESH_PROFILE);
+        let stored = StoredProviderProfile::decode(bytes.as_slice())
+            .expect("enum-only stored refresh profile must decode");
+        assert_eq!(stored.encode_to_vec(), bytes);
+        let metadata = stored.metadata.as_ref().unwrap();
+        assert_eq!(metadata.id, "strategy-profile-id");
+        assert_eq!(metadata.resource_version, 7);
+        assert_eq!(metadata.workspace, "default");
+        let profile = stored.profile.as_ref().unwrap();
+        let refresh = profile.credentials[0].refresh.as_ref().unwrap();
+        assert_eq!(refresh.strategy_name, None);
+        assert_eq!(
+            refresh.strategy,
+            ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32
+        );
+        assert_eq!(refresh.token_url, "https://auth.example.test/token");
+        assert_eq!(refresh.scopes, ["scope-a"]);
+        assert_eq!(
+            refresh.refresh_before,
+            Some(prost_types::Duration {
+                seconds: 30,
+                nanos: 123_456_789
+            })
+        );
+        assert_eq!(
+            refresh.max_lifetime,
+            Some(prost_types::Duration {
+                seconds: 3600,
+                nanos: 987_654_321
+            })
+        );
+        assert_eq!(refresh.material[0].name, "client_secret");
+        assert!(refresh.material[0].required);
+        assert!(refresh.material[0].secret);
+        let authored = openshell_providers::ProviderTypeProfile::from_proto(profile);
+        assert_eq!(authored.to_proto(), *profile);
+        assert_eq!(
+            authored.credentials[0]
+                .refresh
+                .as_ref()
+                .unwrap()
+                .effective_strategy()
+                .unwrap(),
+            ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_profile_strategy_name_presence_survives_database_restart() {
+        use crate::persistence::Store;
+        use openshell_core::proto::ProviderCredentialRefreshStrategy;
+
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}",
+            directory.path().join("profiles.db").display()
+        );
+        let store = Store::connect(&url).await.unwrap();
+        let mut expected = Vec::new();
+        for (index, (strategy, name)) in [
+            (
+                ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+                None,
+            ),
+            (ProviderCredentialRefreshStrategy::Unspecified, Some("")),
+            (
+                ProviderCredentialRefreshStrategy::Unspecified,
+                Some("oauth2_client_credentials"),
+            ),
+            (
+                ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+                Some("oauth2_client_credentials"),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut stored = StoredProviderProfile::decode(
+                legacy_bytes(PRE_STRATEGY_NAME_REFRESH_PROFILE).as_slice(),
+            )
+            .unwrap();
+            let id = format!("strategy-profile-{index}");
+            let metadata = stored.metadata.as_mut().unwrap();
+            metadata.id.clone_from(&id);
+            metadata.name.clone_from(&id);
+            let profile = stored.profile.as_mut().unwrap();
+            profile.id.clone_from(&id);
+            let refresh = profile.credentials[0].refresh.as_mut().unwrap();
+            refresh.strategy = strategy as i32;
+            refresh.strategy_name = name.map(str::to_string);
+            let expected_profile = profile.clone();
+            let bytes = stored.encode_to_vec();
+            assert_eq!(
+                StoredProviderProfile::decode(bytes.as_slice()).unwrap(),
+                stored
+            );
+            store.put_message(&stored).await.unwrap();
+            expected.push((id, expected_profile));
+        }
+        store.close().await;
+        let reopened = Store::connect(&url).await.unwrap();
+        for (id, expected_profile) in expected {
+            let stored = reopened
+                .get_message::<StoredProviderProfile>(&id)
+                .await
+                .unwrap()
+                .expect("stored profile survives restart");
+            let profile = stored.profile.unwrap();
+            assert_eq!(profile, expected_profile);
+            let authored = openshell_providers::ProviderTypeProfile::from_proto(&profile);
+            assert_eq!(authored.to_proto(), profile);
+            let refresh = authored.credentials[0].refresh.as_ref().unwrap();
+            if refresh.strategy_name.as_deref() == Some("") {
+                assert!(refresh.effective_strategy().is_err());
+            } else {
+                assert_eq!(
+                    refresh.effective_strategy().unwrap(),
+                    ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+                );
+            }
+        }
+        reopened.close().await;
     }
 
     #[test]

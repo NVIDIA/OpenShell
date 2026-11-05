@@ -507,9 +507,13 @@ impl FingerprintKey {
     }
 
     fn fingerprint<M: Mutation>(&self, request: &M) -> Result<String, Status> {
+        self.protect_fingerprint(&fingerprint(request)?)
+    }
+
+    fn protect_fingerprint(&self, fingerprint: &str) -> Result<String, Status> {
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.0)
             .map_err(|_| Status::internal("initialize mutation fingerprint"))?;
-        mac.update(fingerprint(request)?.as_bytes());
+        mac.update(fingerprint.as_bytes());
         Ok(format!("{:x}", mac.finalize().into_bytes()))
     }
 }
@@ -531,9 +535,17 @@ async fn fingerprint_key(state: &ServerState) -> Result<FingerprintKey, Status> 
             "request_id on this method requires readable, stable gateway JWT or TLS private key material; no work was started by this call",
         )
     };
-    let bytes = tokio::fs::read(path.ok_or_else(unavailable)?)
-        .await
-        .map_err(|_| unavailable())?;
+    load_fingerprint_key(path.ok_or_else(unavailable)?).await
+}
+
+async fn load_fingerprint_key(path: &std::path::Path) -> Result<FingerprintKey, Status> {
+    let unavailable = || {
+        rpc_error::failed_precondition(
+            "REQUEST_REPLAY_UNAVAILABLE",
+            "protected credential writes require readable, stable gateway JWT or TLS private key material",
+        )
+    };
+    let bytes = tokio::fs::read(path).await.map_err(|_| unavailable())?;
     if bytes.is_empty() {
         return Err(unavailable());
     }
@@ -541,6 +553,24 @@ async fn fingerprint_key(state: &ServerState) -> Result<FingerprintKey, Status> 
     hash.update(b"openshell/mutation-fingerprint/v1\0");
     hash.update(bytes);
     Ok(FingerprintKey(hash.finalize().into()))
+}
+
+/// Check the same stable key prerequisite as protected credential writes before
+/// credential activation creates any durable migration state.
+pub async fn validate_credential_write_key(path: &std::path::Path) -> Result<(), Status> {
+    load_fingerprint_key(path).await.map(|_| ())
+}
+
+/// Reuse the existing protected mutation-intent format for issuer static-write
+/// journals. Only the protected digest is durable; neither values nor an
+/// unkeyed low-entropy fingerprint may enter issuer records.
+pub async fn protect_credential_write(
+    path: &std::path::Path,
+    intent: &serde_json::Value,
+) -> Result<Vec<u8>, Status> {
+    let key = load_fingerprint_key(path).await?;
+    let protected = key.protect_fingerprint(&hash_json(intent)?)?;
+    Ok(format!("{}:{protected}", key.id()).into_bytes())
 }
 
 // Sort every map explicitly; do not depend on serde_json's preserve_order feature.

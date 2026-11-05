@@ -20,6 +20,7 @@ mod compute;
 mod config_delivery;
 pub mod config_file;
 mod config_update_operation;
+mod credential_activation;
 mod credential_store;
 mod credentials;
 mod defaults;
@@ -61,6 +62,7 @@ mod tls;
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
 mod tracing_setup;
+mod versioned_credentials;
 mod watch_cursor;
 mod ws_tunnel;
 

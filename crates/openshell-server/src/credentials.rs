@@ -21,17 +21,41 @@ use crate::credential_store::ServerDbCredstoreObjectStore;
 use crate::persistence::Store;
 use crate::storage_proto::StoredRefreshMaterialDeletion;
 
+/// Non-secret identity of the exact committed value used by one build.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedCredentialVersion {
+    pub reference: String,
+    pub version: u64,
+    pub authorization_epoch: String,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ResolvedProviderCredentials {
+    pub versions: HashMap<String, ResolvedCredentialVersion>,
     pub values: HashMap<String, String>,
     pub expires_at_ms: HashMap<String, i64>,
     /// Expired keys remain visible as omission evidence, never as secret values.
     pub expired_keys: HashSet<String>,
 }
 
+impl std::fmt::Debug for ResolvedProviderCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedProviderCredentials")
+            .field("versions", &self.versions)
+            .field("credential_keys", &self.values.keys())
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("expired_keys", &self.expired_keys)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CredentialRuntime {
     issuer: Arc<dyn CredentialIssuer>,
+    storage_driver: String,
+    versioned: Option<Arc<crate::versioned_credentials::VersionedCredentials>>,
+    intent_key_path: Option<std::path::PathBuf>,
     // The same allocation as `issuer`, not a second backend. Other issuer
     // implementations need no embedded failure-injection or gate methods.
     #[cfg(test)]
@@ -40,8 +64,12 @@ pub struct CredentialRuntime {
 
 impl CredentialRuntime {
     fn from_embedded(issuer: EmbeddedCredentialIssuer) -> Self {
+        let storage_driver = issuer.storage_driver_name();
         let issuer = Arc::new(issuer);
         Self {
+            storage_driver,
+            versioned: None,
+            intent_key_path: None,
             #[cfg(test)]
             embedded_test_issuer: Some(Arc::clone(&issuer)),
             issuer,
@@ -49,12 +77,22 @@ impl CredentialRuntime {
     }
 
     pub fn from_config(config: &Config) -> CoreResult<Self> {
+        if config.enable_versioned_credentials {
+            return Err(openshell_core::Error::config(
+                "versioned credentials require asynchronous activation with a durable store",
+            ));
+        }
         Ok(Self::from_embedded(EmbeddedCredentialIssuer::from_config(
             &IssuerConfig::from(config),
         )?))
     }
 
     pub fn from_config_with_store(config: &Config, store: Arc<Store>) -> CoreResult<Self> {
+        if config.enable_versioned_credentials {
+            return Err(openshell_core::Error::config(
+                "versioned credentials require asynchronous activation before serving",
+            ));
+        }
         Ok(Self::from_embedded(
             EmbeddedCredentialIssuer::from_config_with_store(
                 &IssuerConfig::from(config),
@@ -95,18 +133,127 @@ impl CredentialRuntime {
                 .driver_configs
                 .clone_from(&file.openshell.credential_drivers);
         }
-        let store = store.map(|store| {
+        let adapter = store.as_ref().map(|store| {
             let adapter: Arc<dyn openshell_credential_issuer::persistence::DbCredstoreObjectStore> =
-                Arc::new(ServerDbCredstoreObjectStore::new(store));
+                Arc::new(ServerDbCredstoreObjectStore::new(Arc::clone(store)));
             adapter
         });
-        Ok(Self::from_embedded(
-            EmbeddedCredentialIssuer::from_options(&options, store).await?,
-        ))
+        let mut runtime =
+            Self::from_embedded(EmbeddedCredentialIssuer::from_options(&options, adapter).await?);
+        runtime.intent_key_path = config
+            .gateway_jwt
+            .as_ref()
+            .map(|jwt| jwt.signing_key_path.clone())
+            .or_else(|| config.tls.as_ref().map(|tls| tls.key_path.clone()));
+        if config.enable_versioned_credentials {
+            // Validate before begin() can create a marker or migrate any binding.
+            // Use exactly the same key selection/loading as future static writes;
+            // do not fall back to another key when the selected one is unusable.
+            let path = runtime.intent_key_path.as_deref().ok_or_else(|| {
+                openshell_core::Error::config(
+                    "versioned credential activation requires readable, stable gateway JWT or TLS private key material",
+                )
+            })?;
+            crate::grpc::mutation_replay::validate_credential_write_key(path)
+                .await
+                .map_err(|error| openshell_core::Error::config(error.message()))?;
+            openshell_credential_issuer::references::backend_recovery::validate_activation(
+                &options,
+                runtime.negotiated_extensions(),
+            )
+            .map_err(|error| openshell_core::Error::config(error.message()))?;
+        }
+        if let Some(store) = store {
+            let mut activation = crate::credential_activation::begin(
+                Arc::clone(&store),
+                config.enable_versioned_credentials,
+            )
+            .await
+            .map_err(|error| openshell_core::Error::config(error.message()))?;
+            if let Some(activation) = activation.as_mut() {
+                let versioned = crate::versioned_credentials::VersionedCredentials::new(
+                    store,
+                    runtime.issuer(),
+                )
+                .map_err(|error| openshell_core::Error::config(error.message()))?;
+                crate::versioned_credentials::migrate(&runtime, &versioned, activation)
+                    .await
+                    .map_err(|error| openshell_core::Error::config(error.message()))?;
+                activation
+                    .finish()
+                    .await
+                    .map_err(|error| openshell_core::Error::config(error.message()))?;
+                runtime.versioned = Some(versioned);
+            }
+        } else if config.enable_versioned_credentials {
+            return Err(openshell_core::Error::config(
+                "versioned credentials require durable issuer persistence",
+            ));
+        }
+        Ok(runtime)
+    }
+
+    pub fn is_versioned(&self) -> bool {
+        self.versioned.is_some()
+    }
+
+    pub(crate) fn versioned(
+        &self,
+    ) -> Option<&Arc<crate::versioned_credentials::VersionedCredentials>> {
+        self.versioned.as_ref()
+    }
+
+    pub(crate) fn storage_driver_name(&self) -> &str {
+        &self.storage_driver
     }
 
     pub(crate) fn issuer(&self) -> Arc<dyn CredentialIssuer> {
         Arc::clone(&self.issuer)
+    }
+
+    /// Revalidate authorization only, not value generations. The capture keeps
+    /// its old coherent values/versions across an ordinary later refresh.
+    pub(crate) async fn validate_provider_capture(
+        &self,
+        provider: &Provider,
+        capture: &ResolvedProviderCredentials,
+    ) -> Result<(), Status> {
+        let Some(versioned) = &self.versioned else {
+            return Ok(());
+        };
+        let metadata = provider
+            .metadata
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("provider identity is required"))?;
+        let owner = SecretOwner::provider(&metadata.workspace, &metadata.id, &metadata.name);
+        let mut handles = Handles::new();
+        for (key, version) in &capture.versions {
+            let handle = provider
+                .credential_handles
+                .get(key)
+                .ok_or_else(|| Status::aborted("captured credential binding changed"))?;
+            let projection =
+                openshell_credential_issuer::references::ReferenceProjection::from_handle(handle)?
+                    .ok_or_else(|| {
+                        Status::aborted("captured credential binding is not versioned")
+                    })?;
+            if projection.reference_id != version.reference
+                || projection.epoch != version.authorization_epoch
+            {
+                return Err(Status::aborted("captured credential authorization changed"));
+            }
+            handles.insert(key.clone(), handle.clone());
+        }
+        if !versioned
+            .references
+            .validate_bindings(owner, &handles)
+            .await?
+        {
+            return Err(Status::aborted(
+                "captured credential authorization was revoked",
+            ));
+        }
+        Ok(())
     }
 
     pub fn validate_provider_handles(&self, provider: &Provider) -> Result<(), Status> {
@@ -167,6 +314,31 @@ impl CredentialRuntime {
         values: &HashMap<String, String>,
         existing_handles: &Handles,
     ) -> Result<Handles, Status> {
+        if let Some(versioned) = &self.versioned {
+            let path = self.intent_key_path.as_deref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "versioned credential writes require stable gateway JWT or TLS key material",
+                )
+            })?;
+            let intent = serde_json::json!({
+                "domain": "openshell/issuer-static-write/v1", "owner": openshell_credential_issuer::references::OwnerIdentity::of(owner),
+                "write_id": object_id, "values": values,
+            });
+            let protected =
+                crate::grpc::mutation_replay::protect_credential_write(path, &intent).await?;
+            return Box::pin(versioned.references.store(
+                openshell_credential_issuer::references::StoreReferenceSecrets {
+                    owner,
+                    epoch: "static",
+                    write_id: object_id,
+                    protected_intent: &protected,
+                    values,
+                    existing_handles,
+                    expiration_time: None,
+                },
+            ))
+            .await;
+        }
         self.issuer
             .store(StoreSecrets {
                 owner,
@@ -196,6 +368,13 @@ impl CredentialRuntime {
         owner: SecretOwner<'_>,
         handles: &Handles,
     ) -> Result<(), Status> {
+        if let Some(versioned) = &self.versioned {
+            versioned.references.delete(owner, handles).await?;
+            if let Err(error) = versioned.references.reclaim(owner, 16).await {
+                tracing::warn!(code = ?error.code(), "issuer credential cleanup deferred");
+            }
+            return Ok(());
+        }
         self.issuer.delete(owner, handles).await
     }
 
@@ -210,6 +389,17 @@ impl CredentialRuntime {
             metadata.map_or("", |meta| meta.id.as_str()),
             metadata.map_or("", |meta| meta.name.as_str()),
         );
+        if let Some(versioned) = &self.versioned {
+            Box::pin(versioned.validate_provider_grants(provider)).await?;
+            return Box::pin(resolve_versioned(
+                versioned,
+                owner,
+                &provider.credential_handles,
+                &provider.credential_expiration_times,
+                now_ms,
+            ))
+            .await;
+        }
         let secrets = self
             .issuer
             .resolve(owner, &provider.credential_handles)
@@ -230,6 +420,9 @@ impl CredentialRuntime {
         handles: &Handles,
         now_ms: i64,
     ) -> Result<ResolvedProviderCredentials, Status> {
+        if let Some(versioned) = &self.versioned {
+            return resolve_versioned(versioned, owner, handles, &HashMap::new(), now_ms).await;
+        }
         let secrets = self.issuer.resolve(owner, handles).await?;
         apply_expiration(owner, secrets, &HashMap::new(), now_ms)
     }
@@ -310,6 +503,65 @@ impl CredentialRuntime {
     }
 }
 
+async fn resolve_versioned(
+    versioned: &crate::versioned_credentials::VersionedCredentials,
+    owner: SecretOwner<'_>,
+    handles: &Handles,
+    provider_expirations: &HashMap<String, prost_types::Timestamp>,
+    now_ms: i64,
+) -> Result<ResolvedProviderCredentials, Status> {
+    use openshell_credential_issuer::references::ReferenceProjection;
+    let mut bundles: std::collections::BTreeMap<String, Handles> =
+        std::collections::BTreeMap::new();
+    for (key, handle) in handles {
+        let projection = ReferenceProjection::from_handle(handle)?.ok_or_else(|| {
+            Status::failed_precondition("legacy credential binding remains after issuer activation")
+        })?;
+        bundles
+            .entry(projection.manifest_id)
+            .or_default()
+            .insert(key.clone(), handle.clone());
+    }
+    let now = openshell_core::time::timestamp_from_millis(now_ms)
+        .map_err(|_| Status::internal("invalid credential resolution time"))?;
+    let mut result = ResolvedProviderCredentials::default();
+    for bundle in bundles.into_values() {
+        let secrets = match versioned.references.resolve_at(owner, &bundle, now).await {
+            Ok(secrets) => secrets,
+            Err(error)
+                if error.code() == tonic::Code::FailedPrecondition
+                    && (error.message() == "issuer reference is expired"
+                        || error.message() == "issuer reference is pending or revoked") =>
+            {
+                result.expired_keys.extend(bundle.into_keys());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let mut raw = Vec::with_capacity(secrets.len());
+        for secret in secrets {
+            result.versions.insert(
+                secret.credential_key.clone(),
+                ResolvedCredentialVersion {
+                    reference: secret.reference.reference_id,
+                    version: secret.version,
+                    authorization_epoch: secret.reference.epoch,
+                },
+            );
+            raw.push(ResolvedSecret {
+                credential_key: secret.credential_key,
+                value: secret.value,
+                expiration_time: secret.expiration_time,
+            });
+        }
+        let applied = apply_expiration(owner, raw, provider_expirations, now_ms)?;
+        result.values.extend(applied.values);
+        result.expires_at_ms.extend(applied.expires_at_ms);
+        result.expired_keys.extend(applied.expired_keys);
+    }
+    Ok(result)
+}
+
 fn apply_expiration(
     owner: SecretOwner<'_>,
     secrets: Vec<ResolvedSecret>,
@@ -365,6 +617,167 @@ mod tests {
     use openshell_core::extension_protocol::ExtensionFamily;
     use std::path::Path;
     use tonic::Code;
+
+    #[tokio::test]
+    async fn activation_preflights_stable_key_before_marker_or_binding_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = config_file(&format!(
+            "[openshell.gateway.credential_storage]\nkey_encryption_key_path = {}\n",
+            toml_path(&directory.path().join("kek")),
+        ));
+        let store = Arc::new(crate::persistence::test_store().await);
+        let original = Provider {
+            metadata: Some(openshell_core::proto::ObjectMeta {
+                id: "preflight-provider".into(),
+                name: "preflight-provider".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            credentials: HashMap::from([("TOKEN".into(), "legacy-test-secret".into())]),
+            ..Default::default()
+        };
+        store.put_message(&original).await.unwrap();
+        let before = store
+            .get("provider", "preflight-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        let key = directory.path().join("intent-key");
+        let mut config = Config::new(None);
+        config.enable_versioned_credentials = true;
+        for scenario in [
+            "missing-config",
+            "missing-file",
+            "empty-file",
+            "unreadable-file",
+        ] {
+            config.gateway_jwt = if scenario == "missing-config" {
+                None
+            } else {
+                Some(openshell_core::config::GatewayJwtConfig {
+                    signing_key_path: if scenario == "unreadable-file" {
+                        directory.path().to_owned() // read on a directory fails even as root
+                    } else {
+                        key.clone()
+                    },
+                    public_key_path: directory.path().join("public"),
+                    kid_path: directory.path().join("kid"),
+                    gateway_id: "test".into(),
+                    ttl_secs: None,
+                })
+            };
+            if scenario == "empty-file" {
+                std::fs::write(&key, []).unwrap();
+            }
+            let error = CredentialRuntime::from_config_file_with_store(
+                &config,
+                Some(&file),
+                Arc::clone(&store),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("stable gateway JWT or TLS"),
+                "{scenario}: {error}"
+            );
+            assert!(
+                store
+                    .get(
+                        "credential_issuer_activation",
+                        "embedded-credential-references-v1"
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{scenario} must not create a marker"
+            );
+            let after = store
+                .get("provider", "preflight-provider")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.payload, before.payload, "{scenario}");
+            assert_eq!(
+                after.resource_version, before.resource_version,
+                "{scenario}"
+            );
+            assert!(
+                !crate::credential_activation::uses_reference_records(&store)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                crate::credential_activation::begin(Arc::clone(&store), false)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        // Once the selected key is usable, the same database can activate and
+        // accept a new protected static write, not merely read migrated values.
+        std::fs::write(&key, b"stable test-only private material").unwrap();
+        config.tls = Some(openshell_core::config::TlsConfig {
+            cert_path: directory.path().join("cert"),
+            key_path: key,
+            client_ca_path: None,
+            require_client_auth: false,
+            external_cert_path: None,
+            external_key_path: None,
+            external_server_names: Vec::new(),
+        });
+        // A usable TLS key must not mask an unusable preferred JWT key.
+        assert!(
+            CredentialRuntime::from_config_file_with_store(
+                &config,
+                Some(&file),
+                Arc::clone(&store),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            store
+                .get(
+                    "credential_issuer_activation",
+                    "embedded-credential-references-v1"
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        config.gateway_jwt = None;
+        let runtime = CredentialRuntime::from_config_file_with_store(
+            &config,
+            Some(&file),
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap();
+        assert!(runtime.is_versioned());
+        let handles = runtime
+            .store_provider_credentials(
+                "new-provider",
+                "default",
+                "new-provider-id",
+                &HashMap::from([("TOKEN".into(), "new-test-value".into())]),
+                &Handles::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!handles.is_empty());
+    }
+
+    #[test]
+    fn resolved_credential_diagnostics_never_print_values() {
+        let resolved = ResolvedProviderCredentials {
+            values: HashMap::from([("TOKEN".into(), "private-captured-value".into())]),
+            ..Default::default()
+        };
+        let diagnostic = format!("{resolved:?}");
+        assert!(diagnostic.contains("TOKEN"));
+        assert!(!diagnostic.contains("private-captured-value"));
+    }
 
     fn provider_with_handle(driver: &str, handle: &str) -> Provider {
         Provider {

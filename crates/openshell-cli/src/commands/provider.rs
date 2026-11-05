@@ -1282,6 +1282,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                 provider: provider_name.clone(),
                 credential_key: adc_credential_key.clone(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                strategy_name: Some("oauth2_refresh_token".to_string()),
                 material,
                 secret_material_keys: vec![
                     "client_secret".to_string(),
@@ -1996,6 +1997,7 @@ pub async fn provider_refresh_config(
             provider: input.name.to_string(),
             credential_key: input.credential_key.to_string(),
             strategy: strategy as i32,
+            strategy_name: Some(strategy.canonical_name().to_string()),
             material,
             secret_material_keys,
             expiration_time: input
@@ -2124,7 +2126,10 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
         "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
         status.provider,
         status.credential_key,
-        provider_refresh_strategy_name(strategy),
+        status
+            .strategy_name
+            .as_deref()
+            .unwrap_or_else(|| provider_refresh_strategy_name(strategy)),
         status.status,
         provider_refresh_recovery_action_name(recovery_action),
         format_optional_epoch_ms(proto_timestamp_ms(status.expiration_time.as_ref())),
@@ -3454,6 +3459,15 @@ binaries: [/usr/bin/curl]
     }
 
     #[test]
+    fn refresh_status_row_uses_canonical_name_when_enum_is_unspecified() {
+        let row = refresh_status_row(&ProviderCredentialRefreshStatus {
+            strategy_name: Some("oauth2_refresh_token".into()),
+            ..Default::default()
+        });
+        assert!(row.contains("oauth2_refresh_token"));
+    }
+
+    #[test]
     fn refresh_status_table_includes_operational_fields() {
         let header = refresh_status_header();
         assert!(header.contains("NEXT_REFRESH"));
@@ -3463,6 +3477,7 @@ binaries: [/usr/bin/curl]
         assert!(header.contains("LAST_ERROR"));
 
         let row = refresh_status_row(&ProviderCredentialRefreshStatus {
+            strategy_name: None,
             provider: "my-graph".to_string(),
             provider_id: "provider-id".to_string(),
             credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),

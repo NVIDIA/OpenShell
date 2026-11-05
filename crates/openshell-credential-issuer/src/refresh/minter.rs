@@ -25,6 +25,7 @@ const MAX_OAUTH_ERROR_RESPONSE_BYTES: usize = 8 * 1024;
 #[derive(Clone, Default)]
 pub struct MintRequest {
     pub strategy: i32,
+    pub strategy_name: Option<String>,
     pub material: HashMap<String, String>,
     pub token_url: String,
     pub scopes: Vec<String>,
@@ -316,6 +317,13 @@ impl BuiltInMinterRegistry {
         self.lookup(refresh_strategy_name(strategy)).is_some()
     }
 
+    /// Check selectors and execution availability, without making an unknown
+    /// legacy enum executable merely because a known name accompanies it.
+    pub fn can_mint_input(&self, strategy: i32, name: Option<&str>) -> bool {
+        ProviderCredentialRefreshStrategy::resolve_input(strategy, name)
+            .is_ok_and(|selected| self.lookup(selected.canonical_name()).is_some())
+    }
+
     pub fn strategy_names(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.entries.iter().map(|(name, _)| *name)
     }
@@ -330,11 +338,14 @@ pub fn can_mint(strategy: i32) -> bool {
 }
 
 pub async fn mint_credential(request: &MintRequest) -> Result<MintedCredential, RefreshFailure> {
-    if let Some(minter) = built_in_minters().lookup(refresh_strategy_name(request.strategy)) {
+    let strategy = ProviderCredentialRefreshStrategy::resolve_input(
+        request.strategy,
+        request.strategy_name.as_deref(),
+    )
+    .map_err(|error| RefreshFailure::from(Status::failed_precondition(error)))?;
+    if let Some(minter) = built_in_minters().lookup(strategy.canonical_name()) {
         return minter.mint(request).await;
     }
-    let strategy = ProviderCredentialRefreshStrategy::try_from(request.strategy)
-        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
     Err(Status::failed_precondition(format!(
         "refresh strategy '{strategy:?}' cannot be minted by the gateway"
     ))
@@ -949,7 +960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_and_unknown_strategies_preserve_configuration_errors() {
+    async fn non_minting_strategies_preserve_configuration_errors() {
         for (strategy, name) in [
             (ProviderCredentialRefreshStrategy::Static as i32, "Static"),
             (
@@ -960,8 +971,6 @@ mod tests {
                 ProviderCredentialRefreshStrategy::Unspecified as i32,
                 "Unspecified",
             ),
-            (i32::MAX, "Unspecified"),
-            (-1, "Unspecified"),
         ] {
             assert!(!built_in_minters().can_mint(strategy));
             let failure = mint_credential(&MintRequest {
@@ -982,6 +991,78 @@ mod tests {
                 ProviderCredentialRefreshRecoveryAction::FixConfiguration
             );
             assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Configuration);
+        }
+    }
+
+    #[test]
+    fn registry_selection_supports_names_without_enum_fallback() {
+        let registry = built_in_minters();
+        for name in registry.strategy_names() {
+            assert!(registry.can_mint_input(0, Some(name)));
+            assert!(!registry.can_mint_input(i32::MAX, Some(name)));
+            assert!(!registry.can_mint_input(-1, Some(name)));
+        }
+        for name in [
+            "static",
+            "external",
+            "custom:example",
+            "",
+            "OAUTH2_REFRESH_TOKEN",
+        ] {
+            assert!(!registry.can_mint_input(0, Some(name)));
+        }
+        assert!(!registry.can_mint_input(
+            ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+            Some("oauth2_client_credentials"),
+        ));
+    }
+
+    #[tokio::test]
+    async fn name_only_refresh_token_selection_uses_the_registered_minter() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "named-token", "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let output = mint_credential(&MintRequest {
+            strategy_name: Some("oauth2_refresh_token".into()),
+            token_url: server.uri(),
+            material: HashMap::from([
+                ("client_id".into(), "client".into()),
+                ("refresh_token".into(), "refresh".into()),
+            ]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(output.access_token, "named-token");
+    }
+
+    #[tokio::test]
+    async fn unknown_enum_and_names_fail_before_upstream_io() {
+        for (strategy, strategy_name) in [
+            (i32::MAX, None),
+            (-1, Some("oauth2_refresh_token")),
+            (0, Some("custom:example")),
+            (
+                ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                Some("oauth2_client_credentials"),
+            ),
+        ] {
+            let error = mint_credential(&MintRequest {
+                strategy,
+                strategy_name: strategy_name.map(str::to_string),
+                ..Default::default()
+            })
+            .await
+            .err()
+            .expect("invalid selection must not mint");
+            assert_eq!(error.status.code(), Code::FailedPrecondition);
+            assert_eq!(error.failure_code, "refresh_configuration_invalid");
         }
     }
 
@@ -1290,6 +1371,7 @@ mod tests {
             .await;
 
         let state = MintRequest {
+            strategy_name: None,
             additional_output_keys: HashMap::from([
                 ("secret_access_key".to_string(), "CUSTOM_SECRET".to_string()),
                 ("session_token".to_string(), "CUSTOM_SESSION".to_string()),
@@ -1339,6 +1421,7 @@ mod tests {
     #[tokio::test]
     async fn aws_sts_mint_rejects_partial_source_credentials() {
         let state = MintRequest {
+            strategy_name: None,
             additional_output_keys: HashMap::from([
                 (
                     "secret_access_key".to_string(),
@@ -1393,6 +1476,7 @@ mod tests {
             .await;
 
         let state = MintRequest {
+            strategy_name: None,
             additional_output_keys: HashMap::from([
                 (
                     "secret_access_key".to_string(),
@@ -1428,6 +1512,7 @@ mod tests {
     #[tokio::test]
     async fn aws_sts_mint_rejects_session_token_without_source_pair() {
         let state = MintRequest {
+            strategy_name: None,
             additional_output_keys: HashMap::from([
                 (
                     "secret_access_key".to_string(),

@@ -199,6 +199,53 @@ impl DbCredstoreCredentialDriver {
             return self.crypto.credential_handle(&id);
         }
 
+        // An explicit per-write identity is an immutable staging attempt, not
+        // the legacy owner-default allocation. Its opaque ID is recoverable
+        // after a lost backend response or journal update, without a plaintext
+        // digest or another durable copy of the value. Existing V1 handles,
+        // envelopes/AAD, and owner-default random allocation remain unchanged.
+        if !request.object_id.is_empty() && request.object_id != request.provider_id {
+            let id = staged_handle_id(&request)?;
+            match self
+                .write_envelope(
+                    &id,
+                    &provider_name,
+                    &credential_key,
+                    &request.value,
+                    DbCredstoreWriteCondition::MustCreate,
+                )
+                .await
+            {
+                Ok(()) => return self.crypto.credential_handle(&id),
+                Err(error) if error.code() == tonic::Code::AlreadyExists => {
+                    let record = self
+                        .store
+                        .get_credential_object(OBJECT_TYPE, &id, "recover staged credential")
+                        .await?
+                        .ok_or_else(|| {
+                            Status::aborted("staged credential disappeared during recovery")
+                        })?;
+                    let envelope = deserialize_credential_envelope(&record)?;
+                    EncryptedGatewayCredentialStoreCrypto::ensure_envelope_owner(
+                        &envelope,
+                        &id,
+                        &provider_name,
+                        &credential_key,
+                    )?;
+                    // Compare the authenticated decrypted value in memory.
+                    // Reusing an attempt ID for different intent must never
+                    // overwrite an already-created (possibly live) candidate.
+                    if self.crypto.decrypt_envelope(&envelope)? != request.value {
+                        return Err(Status::already_exists(
+                            "staged credential identity was reused for different intent",
+                        ));
+                    }
+                    return self.crypto.credential_handle(&id);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
         for _ in 0..16 {
             let id = EncryptedGatewayCredentialStoreCrypto::new_handle_id()?;
             match self
@@ -622,6 +669,31 @@ fn new_handle_id() -> Result<String, Status> {
     Ok(hex_encode(&random_bytes_status::<KEY_LEN>()?))
 }
 
+fn staged_handle_id(request: &StoreCredentialRequest) -> Result<String, Status> {
+    let derive = || {
+        let mut digest = openshell_crypto::sha256_digest()?;
+        digest.update(b"openshell-db-credstore-immutable-write-v1")?;
+        for field in [
+            request.workspace.as_str(),
+            request.provider_id.as_str(),
+            request.provider.as_str(),
+            request.credential_key.as_str(),
+            request.object_id.as_str(),
+        ] {
+            let length =
+                u64::try_from(field.len()).map_err(|_| openshell_crypto::CryptoError::Operation)?;
+            digest.update(&length.to_be_bytes())?;
+            digest.update(field.as_bytes())?;
+        }
+        digest.finish()
+    };
+    derive()
+        .map(|digest| hex_encode(&digest))
+        .map_err(|_: openshell_crypto::CryptoError| {
+            Status::internal("failed to derive immutable credential write identity")
+        })
+}
+
 fn credential_handle(state: &EncryptedGatewayCredentialState, id: &str) -> CredentialHandle {
     CredentialHandle {
         driver: DRIVER_NAME.to_string(),
@@ -911,6 +983,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tonic::Code;
 
@@ -978,6 +1051,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct MemoryObjectStore {
         objects: Mutex<HashMap<String, StoredCredentialObject>>,
+        lose_write_reply: AtomicBool,
     }
 
     #[async_trait]
@@ -1024,6 +1098,9 @@ mod tests {
                     resource_version,
                 },
             );
+            if self.lose_write_reply.swap(false, Ordering::SeqCst) {
+                return Err(Status::unavailable("lost committed credential response"));
+            }
             Ok(())
         }
 
@@ -1262,5 +1339,100 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(key_encryption_key_mode, 0o600);
+    }
+    #[tokio::test]
+    async fn immutable_write_recovers_lost_reply_without_new_rows_or_ciphertext_rewrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = driver_config_for_key_encryption_key_path(
+            &directory.path().join(DEFAULT_KEY_ENCRYPTION_KEY_FILE),
+        );
+        let store = Arc::new(MemoryObjectStore::default());
+        let driver = DbCredstoreCredentialDriver::from_config(store.clone(), &config).unwrap();
+        let mut write = request("provider", "API_KEY", "secret-value", None);
+        write.object_id = "durably-journalled-attempt".to_owned();
+        store.lose_write_reply.store(true, Ordering::SeqCst);
+        assert_eq!(
+            driver
+                .store_credential(write.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        let original = store
+            .objects
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(store.objects.lock().unwrap().len(), 1);
+        let restarted = DbCredstoreCredentialDriver::from_config(store.clone(), &config).unwrap();
+        let recovered = restarted.store_credential(write.clone()).await.unwrap();
+        let repeated = restarted.store_credential(write.clone()).await.unwrap();
+        assert_eq!(recovered, repeated);
+        assert_eq!(recovered.handle, format!("v1:{}", original.id));
+        {
+            let objects = store.objects.lock().unwrap();
+            assert_eq!(objects.len(), 1);
+            assert_eq!(objects[&original.id].payload, original.payload);
+            assert_eq!(
+                objects[&original.id].resource_version,
+                original.resource_version
+            );
+        }
+        write.value = "different-intent".to_owned();
+        assert_eq!(
+            restarted.store_credential(write).await.unwrap_err().code(),
+            Code::AlreadyExists
+        );
+        let resolved = restarted
+            .resolve_credentials(vec![resolve_request(
+                "read", "provider", "API_KEY", recovered,
+            )])
+            .await
+            .unwrap();
+        assert!(resolved[0].value == "secret-value");
+        assert!(!String::from_utf8_lossy(&original.payload).contains("secret-value"));
+    }
+
+    #[tokio::test]
+    async fn immutable_write_identity_is_owner_key_and_attempt_qualified_but_legacy_allocation_stays_random()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let config = driver_config_for_key_encryption_key_path(
+            &directory.path().join(DEFAULT_KEY_ENCRYPTION_KEY_FILE),
+        );
+        let store = Arc::new(MemoryObjectStore::default());
+        let driver = DbCredstoreCredentialDriver::from_config(store.clone(), &config).unwrap();
+        let mut base = request("provider", "API_KEY", "secret-value", None);
+        base.object_id = "attempt-one".to_owned();
+        let first = driver.store_credential(base.clone()).await.unwrap();
+        let mut variants = Vec::new();
+        let mut other = base.clone();
+        other.workspace = "other-workspace".to_owned();
+        variants.push(other);
+        let mut other = base.clone();
+        other.provider_id = "other-provider-id".to_owned();
+        variants.push(other);
+        let mut other = base.clone();
+        other.provider = "other-provider".to_owned();
+        variants.push(other);
+        let mut other = base.clone();
+        other.credential_key = "OTHER_KEY".to_owned();
+        variants.push(other);
+        let mut other = base;
+        other.object_id = "attempt-two".to_owned();
+        variants.push(other);
+        let mut ids = std::collections::HashSet::from([first.handle]);
+        for write in variants {
+            assert!(ids.insert(driver.store_credential(write).await.unwrap().handle));
+        }
+        assert_eq!(ids.len(), 6);
+        let legacy = request("provider", "API_KEY", "secret-value", None);
+        let one = driver.store_credential(legacy.clone()).await.unwrap();
+        let two = driver.store_credential(legacy).await.unwrap();
+        assert_ne!(one.handle, two.handle);
     }
 }

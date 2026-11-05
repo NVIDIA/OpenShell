@@ -261,6 +261,10 @@ log_level             = "info"
 # Activate only after retiring incompatible gateways and outstanding driver work.
 enable_sandbox_updates = false
 
+# Activate only in a maintenance window after draining all incompatible credential
+# writers and taking a coordinated database/backend backup. Not a downgrade switch.
+enable_versioned_credentials = false
+
 # Connection ceiling for the gateway's database pool. Omit to use the backend
 # default: 10 for Postgres, 5 for on-disk SQLite.
 database_max_connections = 10
@@ -607,6 +611,58 @@ This is not an automatic mixed-version migration switch. Do not downgrade while
 an image update is pending or retained sandboxes require the private image
 revision protocol. SQLite supports one gateway process only; activation attests
 that the previous process has stopped, not that sharing a SQLite file enables HA.
+
+## Versioned Credential Activation
+
+`[openshell.gateway] enable_versioned_credentials` defaults to `false`. Set it
+only to authorize the embedded issuer's versioned credential migration during a
+maintenance window. The equivalent gateway process option is
+`--enable-versioned-credentials true`, and the environment variable is
+`OPENSHELL_ENABLE_VERSIONED_CREDENTIALS=true`. The flag requires an explicit
+`true` or `false` value. CLI values override environment values, which override
+the file. This option does not select another credential backend, start a
+separate service, or enable a remote issuer.
+
+The in-tree encrypted database, Kubernetes Secrets, and Vault adapters support
+activation. A UDS credential driver must advertise
+`openshell.credentials.recoverable-immutable-write`; otherwise startup rejects
+activation before conversion. The current Vault UDS service does not advertise
+this capability. Leave versioned credentials disabled for unsupported drivers
+rather than bypassing this check.
+
+Activation also requires readable, nonempty, stable gateway JWT signing-key or
+listener TLS private-key material to protect credential-write intents. The JWT
+signing key takes precedence when both are configured; an unusable JWT key does
+not fall back to TLS. Startup checks the selected key before creating migration
+state or converting bindings. Keep the selected key material consistent across
+replicas and restarts; do not rotate it independently of credential recovery.
+
+Before first activation:
+
+1. Stop credential mutations and drain every incompatible gateway, refresh
+   worker, administrative job, and other credential writer, including processes
+   absent from gateway membership. Settle their outstanding backend operations
+   and prevent old binaries from returning through restart or rollback policies.
+2. Take a coordinated backup of the database, credential backends, and encryption
+   keys. Preserve replacement refresh material needed for uncertain rotations.
+3. Start only compatible gateway replicas with explicit activation enabled.
+   SQLite supports one gateway process, not shared-file HA. Keep the maintenance
+   window open until migration completes and readiness succeeds.
+
+Setting the option attests that you completed these prerequisites. It does not
+fence old writers; a database activation marker or expiring gateway membership
+cannot exclude an old binary that does not understand it. Do not activate during
+a mixed-version rolling upgrade.
+
+<Warning>
+Old-binary rollback becomes unsafe at the first incompatible binding change or
+removal of an inline credential field, even if no credential has been minted.
+Preparation alone retains the old active representation, but turning this option
+off after that boundary does not undo migration or permit a downgrade. Use a
+compatible rollback build or a reviewed, coordinated database/backend restore.
+An upstream-rotated refresh grant may no longer accept the token in a backup;
+restoring that backup may still require reauthorization to recover access.
+</Warning>
 
 ## Database Pool
 

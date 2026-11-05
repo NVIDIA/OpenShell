@@ -1477,6 +1477,51 @@ network supervisor logs for CONNECT and upstream-proxy decisions:
 kubectl -n <sandbox-namespace> logs pod/<supervisor-pod> --tail=200 | grep -Ei 'upstream|connect|proxy'
 ```
 
+#### Versioned credential activation and rollback
+
+A UDS credential driver must advertise
+`openshell.credentials.recoverable-immutable-write` before versioned activation;
+otherwise startup rejects it before conversion. The current Vault UDS service
+does not advertise this capability. Check the selected transport and negotiated
+capabilities rather than bypassing the recovery gate.
+
+Activation also checks readable, nonempty, stable gateway JWT signing-key or
+listener TLS private-key material before creating migration state or converting
+bindings. JWT takes precedence; an unusable JWT key does not fall back to TLS.
+Verify the selected key mount and replica consistency without printing its
+contents. Preserve the key with coordinated recovery backups; do not rotate it
+independently of credential recovery.
+
+Check `[openshell.gateway] enable_versioned_credentials` and its overrides,
+`--enable-versioned-credentials true` and
+`OPENSHELL_ENABLE_VERSIONED_CREDENTIALS=true`, against the installed gateway's
+help. The option defaults to false and requires an explicit boolean. Do not
+activate it to work around a credential or readiness error. It attests that the
+operator drained all incompatible credential writers, including unregistered
+gateways, refresh/configuration jobs, and outstanding backend operations, and
+took a coordinated database/backend/encryption-key backup in a maintenance
+window. Only compatible replicas may start afterward; SQLite supports one gateway
+process. A database marker and expiring membership do not fence old writers.
+
+Keep old binaries excluded from restart and rollback policies. Old-binary
+rollback becomes unsafe at the first incompatible binding change or inline-field
+removal, even without a mint. Turning the option off is not a downgrade path.
+Use a compatible rollback build or a reviewed coordinated restore; a backup may
+contain a refresh token invalidated by upstream rotation and require
+reauthorization. Preserve recovery material and never print secrets to diagnose
+migration. Follow the published
+[activation guidance](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#versioned-credential-activation).
+This remains an embedded issuer using the selected backend, not a remote issuer
+or another Helm service.
+
+A versioned backend read failure revokes static material on a connected
+supervisor. Backend recovery triggers redelivery even without a version change.
+A rejected configuration can retain the previous policy and dynamic grants;
+check provider readiness rather than treating delivery as policy activation.
+If refresh status shows `deleting` after backend cleanup fails, restore backend
+access and repeat the same keyed refresh-delete command. Do not remove issuer
+journals or treat the cleanup debt as a missing configuration.
+
 #### Sandbox image-update activation and recovery
 
 `openshell.v1.SandboxUpdates/UpdateSandbox` uses the existing authenticated

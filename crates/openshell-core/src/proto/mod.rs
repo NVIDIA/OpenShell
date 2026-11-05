@@ -94,6 +94,52 @@ pub use openshell::*;
 pub use sandbox::v1::*;
 pub use test::ObjectForTest;
 
+impl ProviderCredentialRefreshStrategy {
+    /// Canonical registration name, distinct from permissive YAML enum aliases.
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Static => "static",
+            Self::External => "external",
+            Self::Oauth2RefreshToken => "oauth2_refresh_token",
+            Self::Oauth2ClientCredentials => "oauth2_client_credentials",
+            Self::GoogleServiceAccountJwt => "google_service_account_jwt",
+            Self::AwsStsAssumeRole => "aws_sts_assume_role",
+        }
+    }
+
+    /// Resolve new authored/configure inputs without accepting unknown enum
+    /// integers, aliases, or unregistered custom names. Legacy decoders must
+    /// retain their raw integer instead of calling this validation helper.
+    pub fn resolve_input(strategy: i32, name: Option<&str>) -> Result<Self, String> {
+        let strategy = Self::try_from(strategy)
+            .map_err(|_| format!("unsupported provider refresh strategy enum: {strategy}"))?;
+        let Some(name) = name else {
+            return Ok(strategy);
+        };
+        let named = match name {
+            "static" => Self::Static,
+            "external" => Self::External,
+            "oauth2_refresh_token" => Self::Oauth2RefreshToken,
+            "oauth2_client_credentials" => Self::Oauth2ClientCredentials,
+            "google_service_account_jwt" => Self::GoogleServiceAccountJwt,
+            "aws_sts_assume_role" => Self::AwsStsAssumeRole,
+            _ => {
+                return Err(format!(
+                    "unsupported provider refresh strategy name: {name}"
+                ));
+            }
+        };
+        if strategy != Self::Unspecified && strategy != named {
+            return Err(format!(
+                "refresh strategy '{}' conflicts with strategy_name '{name}'",
+                strategy.canonical_name()
+            ));
+        }
+        Ok(named)
+    }
+}
+
 /// Build a selector for one explicitly named workspace.
 pub fn workspace_selector(workspace: impl Into<String>) -> WorkspaceSelector {
     WorkspaceSelector {
@@ -117,6 +163,55 @@ mod tests {
     use prost::Message;
 
     use super::SandboxPolicy;
+
+    #[test]
+    fn refresh_strategy_name_compatibility_is_exact_and_fail_closed() {
+        use super::ProviderCredentialRefreshStrategy as Strategy;
+        assert_eq!(
+            Strategy::resolve_input(0, None).unwrap(),
+            Strategy::Unspecified
+        );
+        for strategy in [
+            Strategy::Static,
+            Strategy::External,
+            Strategy::Oauth2RefreshToken,
+            Strategy::Oauth2ClientCredentials,
+            Strategy::GoogleServiceAccountJwt,
+            Strategy::AwsStsAssumeRole,
+        ] {
+            let name = strategy.canonical_name();
+            assert_eq!(
+                Strategy::resolve_input(strategy as i32, None).unwrap(),
+                strategy
+            );
+            assert_eq!(Strategy::resolve_input(0, Some(name)).unwrap(), strategy);
+            assert_eq!(
+                Strategy::resolve_input(strategy as i32, Some(name)).unwrap(),
+                strategy
+            );
+            for unknown in [-1, i32::MAX] {
+                assert!(Strategy::resolve_input(unknown, Some(name)).is_err());
+                assert!(Strategy::resolve_input(unknown, None).is_err());
+            }
+        }
+        assert!(
+            Strategy::resolve_input(
+                Strategy::Oauth2RefreshToken as i32,
+                Some("oauth2_client_credentials")
+            )
+            .is_err()
+        );
+        for name in [
+            "",
+            "unspecified",
+            "custom:example",
+            "OAUTH2_REFRESH_TOKEN",
+            "oauth2-refresh-token",
+            " oauth2_refresh_token",
+        ] {
+            assert!(Strategy::resolve_input(0, Some(name)).is_err(), "{name}");
+        }
+    }
 
     // SandboxPolicy payload encoded by the pre-0.1.0 schema with
     // NetworkBinary.harness=true. Keep this fixed fixture to prove that the

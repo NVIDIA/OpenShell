@@ -14,6 +14,7 @@ use openshell_credential_issuer::refresh::{
     RefreshLease, RefreshState, RefreshStateStore, refresh_state_name,
 };
 use prost::Message;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::Status;
 
@@ -141,6 +142,14 @@ impl From<&StoredProviderCredentialRefreshState> for RefreshState {
             provider_name: state.provider_name.clone(),
             credential_key: state.credential_key.clone(),
             strategy: state.strategy,
+            strategy_name: openshell_core::proto::ProviderCredentialRefreshStrategy::try_from(
+                state.strategy,
+            )
+            .ok()
+            .filter(|strategy| {
+                *strategy != openshell_core::proto::ProviderCredentialRefreshStrategy::Unspecified
+            })
+            .map(|strategy| strategy.canonical_name().to_string()),
             material: state.material.clone(),
             secret_material_keys: state.secret_material_keys.clone(),
             expires_at_ms: state.expires_at_ms,
@@ -167,6 +176,8 @@ impl From<&StoredProviderCredentialRefreshState> for RefreshState {
             failure_code: state.failure_code.clone(),
             provider_error_subtype: state.provider_error_subtype.clone(),
             last_error_at_ms: state.last_error_at_ms,
+            output_references: HashMap::new(),
+            reference_generation: 0,
         }
     }
 }

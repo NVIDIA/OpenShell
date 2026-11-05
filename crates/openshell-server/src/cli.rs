@@ -341,6 +341,17 @@ struct RunArgs {
     /// and settling its outstanding driver operations. See HA upgrade guidance.
     #[arg(long, env = "OPENSHELL_ENABLE_SANDBOX_UPDATES", default_value_t = false, action = ArgAction::Set)]
     enable_sandbox_updates: bool,
+
+    /// Activate versioned credentials in a maintenance window after draining ALL incompatible
+    /// credential writers and taking a coordinated database/backend backup. This attests operator
+    /// exclusion; it does not fence old writers or allow an old-binary downgrade after bindings change.
+    #[arg(
+        long,
+        env = "OPENSHELL_ENABLE_VERSIONED_CREDENTIALS",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    enable_versioned_credentials: bool,
 }
 
 pub fn command() -> Command {
@@ -636,6 +647,7 @@ fn prepare_server_config_with_drivers(
         .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
 
     config.enable_sandbox_updates = args.enable_sandbox_updates;
+    config.enable_versioned_credentials = args.enable_versioned_credentials;
 
     config.supervisor_app_listener = file
         .as_ref()
@@ -1518,6 +1530,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "enable_sandbox_updates")
     {
         args.enable_sandbox_updates = enabled;
+    }
+    if let Some(enabled) = file.enable_versioned_credentials
+        && arg_defaulted(matches, "enable_versioned_credentials")
+    {
+        args.enable_versioned_credentials = enabled;
     }
     if let Some(mtls_auth) = &file.mtls_auth
         && arg_defaulted(matches, "enable_mtls_auth")
@@ -3281,6 +3298,149 @@ mod tests {
                 let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
                 assert!(!args.enable_sandbox_updates);
+            });
+    }
+
+    #[test]
+    fn versioned_credential_activation_defaults_off_and_file_is_explicit() {
+        Environment::new()
+            .remove("OPENSHELL_ENABLE_VERSIONED_CREDENTIALS")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                assert!(!args.enable_versioned_credentials);
+                let omitted = config_file_from_toml("[openshell]\nversion = 2\n");
+                merge_file_into_args(&mut args, &omitted.openshell.gateway, &matches);
+                assert!(!args.enable_versioned_credentials);
+                for enabled in [false, true] {
+                    let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                    let file = config_file_from_toml(&format!(
+                        "[openshell]\nversion = 2\n[openshell.gateway]\nenable_versioned_credentials = {enabled}\n"
+                    ));
+                    merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                    assert_eq!(args.enable_versioned_credentials, enabled);
+                }
+            });
+    }
+
+    #[test]
+    fn versioned_credential_activation_cli_requires_explicit_boolean() {
+        Environment::new()
+            .remove("OPENSHELL_ENABLE_VERSIONED_CREDENTIALS")
+            .run(|| {
+                for argv in [
+                    vec!["openshell-gateway", "--enable-versioned-credentials"],
+                    vec!["openshell-gateway", "--enable-versioned-credentials", "yes"],
+                ] {
+                    assert!(command().try_get_matches_from(argv).is_err());
+                }
+                for enabled in [false, true] {
+                    let value = enabled.to_string();
+                    let (args, _) = parse_with_args(&[
+                        "openshell-gateway",
+                        "--enable-versioned-credentials",
+                        &value,
+                    ]);
+                    assert_eq!(args.enable_versioned_credentials, enabled);
+                }
+            });
+    }
+
+    #[test]
+    fn versioned_credential_activation_environment_rejects_invalid_boolean() {
+        Environment::new()
+            .set("OPENSHELL_ENABLE_VERSIONED_CREDENTIALS", "yes")
+            .run(|| {
+                assert!(
+                    command()
+                        .try_get_matches_from(["openshell-gateway"])
+                        .is_err()
+                );
+            });
+    }
+
+    #[test]
+    fn versioned_credential_activation_environment_overrides_file() {
+        for enabled in [false, true] {
+            Environment::new()
+                .set("OPENSHELL_ENABLE_VERSIONED_CREDENTIALS", enabled.to_string())
+                .run(|| {
+                    let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                    assert_eq!(args.enable_versioned_credentials, enabled);
+                    let file = config_file_from_toml(&format!(
+                        "[openshell]\nversion = 2\n[openshell.gateway]\nenable_versioned_credentials = {}\n",
+                        !enabled
+                    ));
+                    merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                    assert_eq!(args.enable_versioned_credentials, enabled);
+                });
+        }
+    }
+
+    #[test]
+    fn versioned_credential_activation_cli_overrides_environment_and_file() {
+        for enabled in [false, true] {
+            Environment::new()
+                .set("OPENSHELL_ENABLE_VERSIONED_CREDENTIALS", (!enabled).to_string())
+                .run(|| {
+                    let value = enabled.to_string();
+                    let (mut args, matches) = parse_with_args(&[
+                        "openshell-gateway",
+                        "--enable-versioned-credentials",
+                        &value,
+                    ]);
+                    let file = config_file_from_toml(&format!(
+                        "[openshell]\nversion = 2\n[openshell.gateway]\nenable_versioned_credentials = {}\n",
+                        !enabled
+                    ));
+                    merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                    assert_eq!(args.enable_versioned_credentials, enabled);
+                });
+        }
+    }
+
+    #[test]
+    fn versioned_credential_activation_reaches_runtime_config_with_file_precedence() {
+        let state = tempfile::tempdir().unwrap();
+        let local_tls = tempfile::tempdir().unwrap();
+        let config_path = state.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            "[openshell]\nversion = 2\n[openshell.gateway]\nenable_versioned_credentials = true\n",
+        )
+        .unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path())
+            .set("OPENSHELL_LOCAL_TLS_DIR", local_tls.path())
+            .remove("OPENSHELL_ENABLE_VERSIONED_CREDENTIALS")
+            .remove("OPENSHELL_DRIVERS")
+            .run(|| {
+                // Environment assertions re-enter this test in a subprocess;
+                // use the paths supplied to that process, not rebuilt fixtures.
+                let config_path =
+                    std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap())
+                        .join("gateway.toml");
+                for explicit_disable in [false, true] {
+                    let mut argv = vec![
+                        "openshell-gateway",
+                        "--config",
+                        config_path.to_str().unwrap(),
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--compute-driver",
+                        "local",
+                        "--disable-tls",
+                    ];
+                    if explicit_disable {
+                        argv.extend(["--enable-versioned-credentials", "false"]);
+                    }
+                    let (mut parsed, matches) = parse_with_args(&argv);
+                    let prepared = super::prepare_server_config(&mut parsed, &matches)
+                        .expect("server config is prepared without activating storage");
+                    assert_eq!(
+                        prepared.config.enable_versioned_credentials,
+                        !explicit_disable
+                    );
+                }
             });
     }
 

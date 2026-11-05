@@ -968,6 +968,14 @@ async fn configure_and_rotate_capture_actual_grant_without_repeating_token_excha
         .unwrap()
         .into_inner();
     assert_eq!(replay(&state, configure.clone()).await, configured);
+    let mut changed_name = configure.clone();
+    changed_name.strategy_name = Some(strategy.canonical_name().to_string());
+    assert_ne!(
+        fingerprint(&configure).unwrap(),
+        fingerprint(&changed_name).unwrap()
+    );
+    let error = run(&state, authed_request(changed_name)).await.unwrap_err();
+    assert_eq!(reason(&error), "REQUEST_ID_PAYLOAD_MISMATCH");
     let rotate = RotateProviderCredentialRequest {
         provider: "refresh-provider".into(),
         credential_key: "ACCESS_TOKEN".into(),
