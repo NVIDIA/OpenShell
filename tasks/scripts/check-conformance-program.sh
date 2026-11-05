@@ -19,6 +19,10 @@ cargo run --quiet --locked --manifest-path "${manifest}" --bin openshell-conform
 cargo nextest list --locked --color never --manifest-path "${manifest}" --message-format oneline \
     | awk '{print $2}' | sort > "${work}/nextest"
 
+if [[ ! -s "${work}/nextest" ]]; then
+    echo "error: could not read test names from nextest's list; has its oneline format changed?" >&2
+    exit 1
+fi
 if ! diff -u "${work}/nextest" "${work}/program"; then
     echo "error: openshell-conformance list differs from nextest's list (-nextest +program)" >&2
     exit 1

@@ -37,14 +37,21 @@ e2e_openshell_conformance_bin() {
     return
   fi
 
-  cargo build \
+  # Cargo reports where it put the binary, which depends on the target
+  # directory and on CARGO_BUILD_TARGET. Diagnostics still go to stderr.
+  local messages program
+  messages="$(cargo build \
     --locked \
+    --message-format=json-render-diagnostics \
     --manifest-path "${root}/tests/suites/conformance/Cargo.toml" \
-    --bin openshell-conformance >&2 || return
-  # Cargo resolves a relative CARGO_TARGET_DIR against the working directory.
-  local target_dir
-  target_dir="$(cd "${CARGO_TARGET_DIR:-${root}/tests/suites/conformance/target}" && pwd)" || return
-  echo "${target_dir}/debug/openshell-conformance"
+    --bin openshell-conformance)" || return
+  program="$(printf '%s\n' "${messages}" \
+    | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+  if [ -z "${program}" ] || [ ! -x "${program}" ]; then
+    echo "ERROR: cargo did not report the openshell-conformance binary" >&2
+    return 2
+  fi
+  echo "${program}"
 }
 
 # Run the conformance suite with openshell-conformance. The JUnit report goes
