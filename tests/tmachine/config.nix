@@ -36,6 +36,7 @@ let
   };
   fedoraPodman = podman: {
     machine = "fedora";
+    driver = "podman";
     use_galaxy = false;
     playbooks = [
       "ansible/playbooks/nextest.yaml"
@@ -49,6 +50,7 @@ let
   bases = {
     ubuntu-docker-rootful = {
       machine = "ubuntu";
+      driver = "docker";
       use_galaxy = true;
       playbooks = [
         "ansible/playbooks/nextest.yaml"
@@ -74,7 +76,9 @@ let
     "fedora-podman-rootless"
   ];
   # An environment named <base>-<suffix>: a base with more setup playbooks and
-  # the inputs they read, run after the base's own.
+  # the inputs they read, run after the base's own. A base with a compute driver
+  # also passes it as `environment_driver`, for setup that configures the
+  # gateway's driver table.
   withSetup =
     base: suffix: setup:
     let
@@ -86,7 +90,9 @@ let
       setup = {
         inherit (parent) use_galaxy;
         playbooks = parent.playbooks ++ setup.playbooks;
-        inputs = setup.inputs or { };
+        inputs =
+          (if parent ? driver then { environment_driver = parent.driver; } else { })
+          // (setup.inputs or { });
       };
     };
   # Feature environments, <base>-<feature>, one per base the feature supports.
@@ -100,6 +106,11 @@ let
         playbooks = [ "ansible/playbooks/keycloak.yaml" ];
         inputs.keycloak_realm_file = "../../scripts/keycloak-realm.json";
       };
+    };
+    # Hardware-free CDI fixtures, for the cdi suite.
+    cdi = {
+      bases = dockerBases ++ podmanBases;
+      setup.playbooks = [ "ansible/playbooks/cdi.yaml" ];
     };
   };
   featureEnvironments = pkgs.lib.concatMap (
