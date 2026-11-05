@@ -46,7 +46,9 @@ re-implementing the control contracts.
   stream attaches, ends, or announces leaving, so the gateway refreshes
   membership records at once. The gateway closes a member's stream after
   `pool_timing::GATEWAY_SILENCE_TIMEOUT` of silence, and drops a member that
-  stops reading as soon.
+  stops reading as soon. `HostAccepted` carries this replica's peer endpoint
+  (`set_peer_endpoint`); the host dials its instances' sandbox sessions
+  there, so each session runs on the replica serving its supervisor.
 - `pool_timing`: the timing contract between pool hosts and the gateway: the
   15 s membership TTL, the 2 s record refresh, 1 s heartbeats, host silence
   detection and bounded reconnect attempts, and `reconnect_budget`, the worst
@@ -66,8 +68,8 @@ re-implementing the control contracts.
   only then assigns the instance; a host at capacity is refused before the
   workload runs. For a pool, the gateway's installed `InstancePlacement`
   durably records the instance and its launch term's owner before the
-  assignment, and a launch no member can take is refused like a full host
-  (`LaunchError::Refused`). A pool's withdrawals are removed from the durable
+  assignment, and a launch no member can take fails with the pool's reason
+  (`LaunchError::Unplaced`). A pool's withdrawals are removed from the durable
   records by the gateway, and a recovery reconciles those records with the
   driver's listing instead of replacing the desired set. `begin_recovery` captures
   the revision before the driver lists its durable records and

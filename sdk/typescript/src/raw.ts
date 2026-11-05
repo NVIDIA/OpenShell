@@ -4,7 +4,7 @@
 export * from './gen/datamodel_pb.js';
 export * from './gen/google/rpc/error_details_pb.js';
 // Advanced surface: the full generated protobuf types (messages, enums, and the
-// OpenShell service descriptor) for callers using the raw escape hatch on
+// OpenShell and SandboxUpdates service descriptors) for callers using the raw escape hatch on
 // OpenShellClient / SandboxClient (`.raw` and `.transport`). These are the
 // uncurated wire types; import them from '@nvidia/openshell-sdk/raw'. The
 // curated entry point stays free of generated types so its surface does not

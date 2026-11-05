@@ -21,8 +21,10 @@
 //	}
 //
 // After successful authentication, tokens are persisted to disk in the
-// gateway directory as oidc_token.json, compatible with
-// [gateway.NewClient] and the existing [gateway.diskTokenSource].
+// gateway directory as oidc_token.json, in the same format as
+// `openshell gateway login`, so both [gateway.NewClient] and the CLI can
+// use them. A later Login reuses the stored token only when it is valid
+// and was issued for the gateway's issuer and client ID.
 //
 // # Standalone Login
 //

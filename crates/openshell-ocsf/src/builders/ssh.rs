@@ -10,7 +10,7 @@ use crate::events::{OcsfEvent, SshActivityEvent};
 use crate::objects::{Actor, Endpoint};
 
 /// Builder for SSH Activity [4007] events.
-pub struct SshActivityBuilder<'a> {
+pub struct SshActivityBuilder<'a, EndpointState = MissingSshEndpoint> {
     ctx: ContextRef<'a>,
     activity: ActivityId,
     action: Option<ActionId>,
@@ -24,9 +24,26 @@ pub struct SshActivityBuilder<'a> {
     auth_type_label: Option<String>,
     protocol_ver: Option<String>,
     message: Option<String>,
+    endpoint_state: std::marker::PhantomData<EndpointState>,
 }
 
-impl<'a> SshActivityBuilder<'a> {
+/// Marker for an SSH Activity builder without a source or destination endpoint.
+pub struct MissingSshEndpoint;
+
+/// Marker for an SSH Activity builder with a source or destination endpoint.
+pub struct HasSshEndpoint;
+
+impl<'a> SshActivityBuilder<'a, MissingSshEndpoint> {
+    /// Start building an SSH Activity event.
+    ///
+    /// An SSH Activity must identify a source or destination endpoint before it
+    /// can be built.
+    ///
+    /// ```compile_fail
+    /// use openshell_ocsf::SshActivityBuilder;
+    ///
+    /// SshActivityBuilder::new(openshell_ocsf::ctx::ctx()).build();
+    /// ```
     #[must_use]
     pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
@@ -43,6 +60,46 @@ impl<'a> SshActivityBuilder<'a> {
             auth_type_label: None,
             protocol_ver: None,
             message: None,
+            endpoint_state: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, EndpointState> SshActivityBuilder<'a, EndpointState> {
+    /// Set the source endpoint from an address.
+    #[must_use]
+    pub fn src_endpoint_addr(
+        mut self,
+        ip: std::net::IpAddr,
+        port: u16,
+    ) -> SshActivityBuilder<'a, HasSshEndpoint> {
+        self.src_endpoint = Some(Endpoint::from_ip(ip, port));
+        self.with_endpoint()
+    }
+
+    /// Set the destination endpoint.
+    #[must_use]
+    pub fn dst_endpoint(mut self, endpoint: Endpoint) -> SshActivityBuilder<'a, HasSshEndpoint> {
+        self.dst_endpoint = Some(endpoint);
+        self.with_endpoint()
+    }
+
+    fn with_endpoint(self) -> SshActivityBuilder<'a, HasSshEndpoint> {
+        SshActivityBuilder {
+            ctx: self.ctx,
+            activity: self.activity,
+            action: self.action,
+            disposition: self.disposition,
+            severity: self.severity,
+            status: self.status,
+            src_endpoint: self.src_endpoint,
+            dst_endpoint: self.dst_endpoint,
+            actor: self.actor,
+            auth_type_id: self.auth_type_id,
+            auth_type_label: self.auth_type_label,
+            protocol_ver: self.protocol_ver,
+            message: self.message,
+            endpoint_state: std::marker::PhantomData,
         }
     }
 
@@ -60,6 +117,19 @@ impl<'a> SshActivityBuilder<'a> {
         self
     }
 
+    /// Set the acting process.
+    #[must_use]
+    pub fn actor_process(mut self, process: crate::objects::Process) -> Self {
+        self.actor = Some(Actor::process(process));
+        self
+    }
+}
+
+impl_activity_setter!(SshActivityBuilder<EndpointState>);
+impl_action_disposition_setters!(SshActivityBuilder<EndpointState>);
+impl_builder_setters!(SshActivityBuilder<EndpointState>);
+
+impl SshActivityBuilder<'_, HasSshEndpoint> {
     #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity.network_label().to_string();
@@ -90,13 +160,6 @@ impl<'a> SshActivityBuilder<'a> {
         })
     }
 }
-
-impl_activity_setter!(SshActivityBuilder);
-impl_action_disposition_setters!(SshActivityBuilder);
-impl_actor_process_setter!(SshActivityBuilder);
-impl_dst_endpoint_setter!(SshActivityBuilder);
-impl_src_endpoint_addr_setter!(SshActivityBuilder);
-impl_builder_setters!(SshActivityBuilder);
 
 #[cfg(test)]
 mod tests {

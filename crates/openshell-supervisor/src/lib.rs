@@ -18,14 +18,19 @@ compile_error!(
 );
 
 mod activity_aggregator;
+pub mod app_listener;
 pub mod backend_setup;
 mod config_runtime;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+mod otlp_relay;
 mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;
 
 use config_runtime::{agent_proposals_enabled_from_settings, run_policy_poll_loop};
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -685,6 +690,7 @@ pub async fn run_network_proxy(
         sandbox_id: String::new(),
         sandbox_name: "network-proxy".to_string(),
         container_image: String::new(),
+        container_image_uid: None,
         hostname,
         product_version: openshell_core::VERSION.to_string(),
         proxy_ip: listen.ip(),
@@ -744,6 +750,7 @@ pub async fn run_network_proxy(
         additional_ca_bundle.as_deref(),
         None,
         #[cfg(target_os = "linux")]
+        None,
         None,
         None,
         None,
@@ -857,6 +864,7 @@ pub fn sandbox_instance_event_context(
         sandbox_id: sandbox_id.unwrap_or_default().to_string(),
         sandbox_name: sandbox.unwrap_or_default().to_string(),
         container_image,
+        container_image_uid: None,
         hostname,
         product_version: openshell_core::VERSION.to_string(),
         proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
@@ -888,6 +896,7 @@ pub fn trace_context_from_environment() -> Option<RegistrationTraceContext> {
 /// from its [`SandboxInstanceBindings`], so one process can host several
 /// instances.
 pub struct SandboxInstanceConfig {
+    pub app_router: Option<app_listener::Router>,
     pub command: Vec<String>,
     pub workdir: Option<String>,
     pub timeout_secs: u64,
@@ -897,7 +906,13 @@ pub struct SandboxInstanceConfig {
     pub sandbox: Option<String>,
     /// Workload image recorded in this instance's OCSF events.
     pub container_image: String,
+    /// Immutable workload image ID resolved by the driver, when available.
+    pub container_image_uid: Option<String>,
     pub openshell_endpoint: Option<String>,
+    /// Peer endpoint of the gateway replica serving the shared host, which
+    /// the session dials instead of `openshell_endpoint` when set and
+    /// nonempty.
+    pub gateway_home: Option<tokio::sync::watch::Receiver<Option<String>>>,
     pub policy_rules: Option<String>,
     pub policy_data: Option<String>,
     pub ssh_socket_path: Option<String>,
@@ -921,17 +936,26 @@ pub struct SandboxInstanceConfig {
     /// attach: how long it keeps the workload frozen after losing this
     /// supervisor. `None` leaves the runtime default.
     pub supervisor_recovery_timeout_secs: Option<u32>,
+    /// OTLP collector for relayed agent traces; `None` keeps the relay
+    /// inactive.
+    pub otlp_agent_endpoint: Option<String>,
+    /// Transport to the relayed agent trace collector.
+    pub otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol,
 }
 
 impl SandboxInstanceConfig {
     /// OCSF identity of this sandbox instance.
     #[must_use]
     pub fn event_context(&self) -> EventContext {
-        sandbox_instance_event_context(
+        let mut context = sandbox_instance_event_context(
             self.sandbox_id.as_deref(),
             self.sandbox.as_deref(),
             self.container_image.clone(),
-        )
+        );
+        context
+            .container_image_uid
+            .clone_from(&self.container_image_uid);
+        context
     }
 }
 
@@ -1050,6 +1074,7 @@ pub async fn run_sandbox_instance(
     controls: SandboxInstanceControls,
 ) -> Result<i32> {
     let SandboxInstanceConfig {
+        app_router,
         command,
         workdir,
         timeout_secs,
@@ -1058,7 +1083,9 @@ pub async fn run_sandbox_instance(
         sandbox_id,
         sandbox,
         container_image: _,
+        container_image_uid: _,
         openshell_endpoint,
+        gateway_home,
         policy_rules,
         policy_data,
         ssh_socket_path,
@@ -1074,6 +1101,8 @@ pub async fn run_sandbox_instance(
         proxy_tls,
         takeover,
         supervisor_recovery_timeout_secs,
+        otlp_agent_endpoint,
+        otlp_agent_protocol,
     } = config;
     // The owner binds the event context and log sink to the instance's
     // threads; the instance itself uses the rest.
@@ -1290,6 +1319,18 @@ pub async fn run_sandbox_instance(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
+    // The agent trace relay must exist before networking starts so the
+    // handler is installed when the first staged connection arrives, and
+    // before attach so the agent spec can tell the boundary whether to point
+    // workload SDKs at it.
+    let (mut otlp_relay, otlp_reserved_destination) = otlp_relay::activate(
+        otlp_agent_endpoint,
+        otlp_agent_protocol,
+        auth_bundle.agent_otlp().headers.cloned(),
+        auth_bundle.agent_otlp().tls.cloned(),
+        sandbox_id.clone(),
+    );
+
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
     // supervisor-owned handles shared with the backend.
@@ -1311,6 +1352,7 @@ pub async fn run_sandbox_instance(
                 workdir: workspace,
                 timeout_secs,
                 interactive,
+                otlp_relay_active: otlp_relay.is_some(),
             },
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
@@ -1434,6 +1476,7 @@ pub async fn run_sandbox_instance(
             None,
             remote_network_source,
             proxy_listener,
+            otlp_reserved_destination,
         )
         .await
     });
@@ -1568,6 +1611,26 @@ pub async fn run_sandbox_instance(
         });
     }
 
+    let app_instance =
+        match app_router {
+            Some(router) => {
+                if !loaded_policy_origin.allows_gateway_policy_reload() {
+                    return Err(miette::miette!(
+                        "app ingress requires gateway-managed configuration"
+                    ));
+                }
+                Some(
+                    router.instance(sandbox.as_deref().ok_or_else(|| {
+                        miette::miette!("app ingress requires sandbox identity")
+                    })?)?,
+                )
+            }
+            None => None,
+        };
+    let app_routes = app_instance
+        .as_ref()
+        .map(|instance| instance.routes.clone());
+
     // Spawn background policy poll task (gRPC mode only).
     if let (Some(id), Some(sandbox), Some(gateway), Some(engine)) = (
         sandbox_id.as_deref(),
@@ -1580,7 +1643,7 @@ pub async fn run_sandbox_instance(
         let poll_gateway = gateway.clone();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_json.enabled.clone();
-        let poll_ocsf_schema_version = ocsf_json.target_version.clone();
+        let poll_ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
@@ -1593,6 +1656,7 @@ pub async fn run_sandbox_instance(
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
         let poll_ctx = PolicyPollLoopContext {
+            app_routes: app_routes.clone(),
             gateway: poll_gateway,
             sandbox_id: poll_id,
             sandbox: poll_sandbox,
@@ -1678,6 +1742,8 @@ pub async fn run_sandbox_instance(
         } else {
             info!(backend = %backend_name, "Isolation boundary agent started");
         }
+        let _app_listener =
+            app_instance.map(|instance| instance.start(running.loopback_connector()));
         let agent = running.agent();
         let boundary_access = openshell_supervisor_process::delegated::start_boundary_access(
             sandbox_id.as_deref(),
@@ -1694,6 +1760,10 @@ pub async fn run_sandbox_instance(
             config_apply_tx,
             config_push_updates,
             ssh_host_key,
+            gateway_home,
+            app_routes
+                .as_ref()
+                .map(app_listener::Routes::installation_source),
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
         .await?;
@@ -1775,6 +1845,12 @@ pub async fn run_sandbox_instance(
             instance_readiness.release();
             drop(running);
             drop(boundary_access);
+            // The workload is frozen, so no new spans arrive. Export what the
+            // relay already acknowledged; the agent will not resend it after
+            // resume. Bounded; never fails.
+            if let Some(relay) = otlp_relay.take() {
+                relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+            }
             drop(networking);
             info!(backend = %backend_name, "Isolation boundary suspended; supervisor instance exiting");
             return Ok(0);
@@ -1785,6 +1861,17 @@ pub async fn run_sandbox_instance(
         boundary_access
             .publish_main_exit(exit_code, await_main_process_attachment)
             .await;
+        // Flush relayed agent traces before the exit is reported so the last
+        // spans of a short run are not lost. Bounded; never fails. When the
+        // access plane is retained for exec sessions, the relay keeps serving
+        // them and shuts down at final teardown instead.
+        if retain_access {
+            if let Some(relay) = otlp_relay.as_ref() {
+                relay.flush(otlp_relay::FLUSH_TIMEOUT).await;
+            }
+        } else if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+        }
         // `shutdown_requested` has already completed when shutdown won the
         // lifecycle select above and must not be polled again.
         let mut completion_cancelled = !retain_access;
@@ -1828,6 +1915,11 @@ pub async fn run_sandbox_instance(
         if retain_access {
             info!(backend = %backend_name, "Canonical process exited; retaining control-mode access plane");
             retain_remote_access_plane(&mut proxy_exited, &mut shutdown_requested).await?;
+        }
+        // Exec sessions served after the main exit may have exported traces;
+        // flush those too before the relay goes away.
+        if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
         }
         drop(instance_readiness);
         drop(running);
@@ -4163,6 +4255,7 @@ async fn report_initial_policy_failure(
 /// When the entrypoint PID is available, policy reloads include symlink
 /// resolution for binary paths via the container filesystem.
 struct PolicyPollLoopContext {
+    app_routes: Option<app_listener::Routes>,
     gateway: openshell_core::grpc_client::GatewayEndpoint,
     sandbox_id: String,
     /// Canonical sandbox reference used by name-scoped configuration APIs.
@@ -4177,6 +4270,7 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
+    /// Last value of the deprecated `ocsf_schema_version` setting.
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     provider_credentials: ProviderCredentialState,
     provider_readiness: ProviderReadinessTracker,
@@ -4585,9 +4679,16 @@ mod tests {
                 .expect("token"),
             sandbox_expires_at: 0,
             ssh_host_private_key: None,
+            traces_otlp_headers: None,
             ocsf_otlp_headers: None,
+            agent_otlp_headers: None,
+            otlp_tls: Vec::new(),
+            traces_otlp_tls: None,
+            ocsf_otlp_tls: None,
+            agent_otlp_tls: None,
         };
         let config = SandboxInstanceConfig {
+            app_router: None,
             command: vec!["true".to_string()],
             workdir: None,
             timeout_secs: 0,
@@ -4595,8 +4696,10 @@ mod tests {
             await_main_process_attachment: false,
             sandbox_id: Some("sandbox-1".to_string()),
             sandbox: None,
-            container_image: String::new(),
+            container_image: "registry.example/agent:latest".into(),
+            container_image_uid: Some("sha256:workload".into()),
             openshell_endpoint: None,
+            gateway_home: None,
             policy_rules: None,
             policy_data: None,
             ssh_socket_path: None,
@@ -4616,6 +4719,8 @@ mod tests {
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
             takeover: None,
             supervisor_recovery_timeout_secs: None,
+            otlp_agent_endpoint: None,
+            otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
         };
         let bindings = SandboxInstanceBindings::dedicated(
             &config,
@@ -4623,6 +4728,9 @@ mod tests {
                 .expect("credentials"),
             openshell_ocsf::OcsfJsonSettings::default(),
         );
+        let image = bindings.event_context.container().unwrap().image.unwrap();
+        assert_eq!(image.uid, "sha256:workload");
+        assert_eq!(image.name.as_deref(), Some("registry.example/agent:latest"));
         let error = run_sandbox_with_backend(
             &backend_setup::OpenShellBackendSetup,
             config,
@@ -5070,6 +5178,7 @@ network_policies:
         source: openshell_core::proto::PolicySource,
     ) -> openshell_core::grpc_client::SettingsPollResult {
         openshell_core::grpc_client::SettingsPollResult {
+            service_routes: Vec::new(),
             policy,
             version,
             policy_hash: format!("hash-v{version}"),
@@ -7156,6 +7265,7 @@ network_policies:
         let canonical =
             settings_poll_result(Some(newer), 1, openshell_core::proto::PolicySource::Sandbox);
         let canonical = openshell_core::grpc_client::SettingsPollResult {
+            service_routes: Vec::new(),
             policy_hash: "hash-provider-change".to_string(),
             config_revision: loaded.config_revision + 1,
             ..canonical
@@ -7210,6 +7320,7 @@ network_policies:
     #[test]
     fn unchanged_sandbox_policy_revision_candidate_is_strictly_scoped() {
         let sandbox_result = openshell_core::grpc_client::SettingsPollResult {
+            service_routes: Vec::new(),
             policy_hash: "same-policy".to_string(),
             ..settings_poll_result(
                 Some(proto_policy_fixture()),
@@ -7250,6 +7361,7 @@ network_policies:
         );
 
         let global_result = openshell_core::grpc_client::SettingsPollResult {
+            service_routes: Vec::new(),
             policy_hash: "same-policy".to_string(),
             ..settings_poll_result(
                 Some(proto_policy_fixture()),

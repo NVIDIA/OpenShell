@@ -265,7 +265,7 @@ const IMAGE_PREP_INIT_MODE: &str = "image-prep";
 const IMAGE_PREP_CONSOLE_LOG: &str = "image-prep-console.log";
 /// Directory the guest image-prep init writes at the root of the prepared disk
 /// once preparation succeeds (`image_root` in `openshell-vm-sandbox-init.sh`).
-const PREPARED_IMAGE_ROOTFS_DIR: &str = "/image-rootfs";
+pub(crate) const PREPARED_IMAGE_ROOTFS_DIR: &str = "/image-rootfs";
 static IMAGE_CACHE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static OWNER_STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static NETWORK_TRUST_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -348,14 +348,10 @@ pub struct VmDriverConfig {
     #[serde(default)]
     pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     pub grpc_endpoint: String,
-    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
-    /// supplies its own export endpoint; driver TOML cannot set it.
+    /// OTLP exports passed to supervisors. The gateway supplies them from
+    /// `[otlp]`; driver TOML cannot set them.
     #[serde(skip)]
-    pub supervisor_otlp_endpoint: Option<String>,
-    /// OCSF event export passed to supervisors. The gateway supplies its own
-    /// export; driver TOML cannot set it.
-    #[serde(skip)]
-    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
     /// Gateway name passed to supervisors for their telemetry.
     pub supervisor_gateway_name: Option<String>,
     pub state_dir: PathBuf,
@@ -429,8 +425,7 @@ impl std::fmt::Debug for VmDriverConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VmDriverConfig")
             .field("grpc_endpoint", &self.grpc_endpoint)
-            .field("supervisor_otlp_endpoint", &self.supervisor_otlp_endpoint)
-            .field("supervisor_ocsf_export", &self.supervisor_ocsf_export)
+            .field("supervisor_otlp", &self.supervisor_otlp)
             .field("supervisor_gateway_name", &self.supervisor_gateway_name)
             .field("state_dir", &self.state_dir)
             .field("launcher_bin", &self.launcher_bin)
@@ -500,8 +495,7 @@ impl Default for VmDriverConfig {
     fn default() -> Self {
         Self {
             grpc_endpoint: String::new(),
-            supervisor_otlp_endpoint: None,
-            supervisor_ocsf_export: None,
+            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
             supervisor_gateway_name: None,
             allow_driver_config: false,
             resource_admission:
@@ -1486,17 +1480,7 @@ impl VmDriver {
                 openshell_core::sandbox_env::TELEMETRY_ENABLED,
                 openshell_core::telemetry::enabled_env_value(),
             );
-        if let Some(endpoint) = &self.config.supervisor_otlp_endpoint {
-            command
-                .env(openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint)
-                .envs(openshell_otel::current_trace_context_environment());
-        }
-        if let Some(export) = &self.config.supervisor_ocsf_export {
-            command.envs(export.environment());
-        }
-        if let Some(name) = &self.config.supervisor_gateway_name {
-            command.env(openshell_core::sandbox_env::GATEWAY_NAME, name);
-        }
+        command.envs(supervisor_otlp_environment(&self.config));
         if let Some(server_name) = gateway_tls_server_name {
             command.env(
                 openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
@@ -5312,6 +5296,9 @@ fn configure_main_exit_marker(command: &mut Command, state_dir: &Path) {
 }
 
 #[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for VmDriver {}
+
+#[tonic::async_trait]
 impl ComputeDriver for VmDriver {
     async fn authenticate_sandbox(
         &self,
@@ -8087,6 +8074,20 @@ fn isolate_host_control_environment(command: &mut Command) {
     command.env_clear();
 }
 
+/// Environment that lets the supervisor export spans, joining the current
+/// trace, OCSF events, and relayed workload traces, identifying the gateway
+/// that launched it.
+fn supervisor_otlp_environment(config: &VmDriverConfig) -> Vec<(&'static str, String)> {
+    let mut environment = config.supervisor_otlp.environment();
+    if config.supervisor_otlp.traces.is_some() {
+        environment.extend(openshell_otel::current_trace_context_environment());
+    }
+    if let Some(name) = &config.supervisor_gateway_name {
+        environment.push((openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
+    }
+    environment
+}
+
 #[tracing::instrument(
     name = "vm.launch",
     skip(command),
@@ -10697,6 +10698,20 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_state_dirs_stay_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = unique_temp_dir();
+        let dir = base.join("sandboxes").join("sandbox-123");
+        create_private_dir_all(&dir).await.unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[tokio::test]
     async fn sandbox_request_metadata_round_trips_for_start() {
         let base = unique_temp_dir();
@@ -11241,7 +11256,13 @@ mod tests {
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
                 sandbox_expires_at: 1,
                 ssh_host_private_key: None,
+                traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
+                agent_otlp_headers: None,
+                otlp_tls: Vec::new(),
+                traces_otlp_tls: None,
+                ocsf_otlp_tls: None,
+                agent_otlp_tls: None,
             },
             gateway_id: "gateway-a".to_string(),
             verification_keys: vec![SessionVerificationKey {
@@ -12332,6 +12353,28 @@ mod tests {
     }
 
     #[test]
+    fn extracts_zstd_compressed_oci_layer() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = tar_bytes_with_file("bin/tool", b"tool contents");
+        let compressed = zstd::encode_all(archive.as_slice(), 0).unwrap();
+        let blob = temp.path().join("layer.tar.zst");
+        let extracted = temp.path().join("extracted");
+        fs::write(&blob, compressed).unwrap();
+
+        extract_layer_blob_to_dir(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            &extracted,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(extracted.join("bin/tool")).unwrap(),
+            b"tool contents"
+        );
+    }
+
+    #[test]
     fn layer_compression_from_media_type_supports_common_formats() {
         assert_eq!(
             layer_compression_from_media_type("application/vnd.oci.image.layer.v1.tar").unwrap(),
@@ -12665,6 +12708,75 @@ mod tests {
         assert_eq!(
             absolute_state_dir(&absolute).expect("preserve absolute state dir"),
             absolute
+        );
+    }
+
+    #[test]
+    fn supervisor_otlp_environment_carries_only_configured_signals() {
+        use openshell_core::sandbox_env::{
+            GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT,
+            OTLP_OCSF_ENDPOINT, OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol,
+        };
+        let export = |endpoint: &str, protocol| {
+            Some(OtlpExport {
+                endpoint: endpoint.to_string(),
+                protocol,
+            })
+        };
+
+        let mut config = VmDriverConfig::default();
+        assert!(supervisor_otlp_environment(&config).is_empty());
+
+        config.supervisor_otlp.traces = export("http://127.0.0.1:4317", OtlpProtocol::Grpc);
+        let environment = supervisor_otlp_environment(&config);
+        assert_eq!(
+            environment[0],
+            (OTLP_ENDPOINT, "http://127.0.0.1:4317".to_string())
+        );
+        assert!(environment.iter().all(|(name, _)| *name != OTLP_PROTOCOL));
+
+        config.supervisor_otlp.traces = export("http://127.0.0.1:4318", OtlpProtocol::HttpProtobuf);
+        assert_eq!(
+            supervisor_otlp_environment(&config)[1],
+            (OTLP_PROTOCOL, "http/protobuf".to_string())
+        );
+
+        config.supervisor_otlp.traces = None;
+        config.supervisor_otlp.ocsf = export("http://siem:4317", OtlpProtocol::Grpc);
+        assert_eq!(
+            supervisor_otlp_environment(&config),
+            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),]
+        );
+
+        config.supervisor_otlp.ocsf = export("http://siem:4318", OtlpProtocol::HttpProtobuf);
+        assert_eq!(
+            supervisor_otlp_environment(&config),
+            [
+                (OTLP_OCSF_ENDPOINT, "http://siem:4318".to_string()),
+                (OTLP_OCSF_PROTOCOL, "http/protobuf".to_string()),
+            ]
+        );
+
+        config.supervisor_otlp.ocsf = None;
+        config.supervisor_otlp.agent = export("http://agents:4317", OtlpProtocol::Grpc);
+        assert_eq!(
+            supervisor_otlp_environment(&config),
+            [(OTLP_AGENT_ENDPOINT, "http://agents:4317".to_string())]
+        );
+
+        config.supervisor_otlp.agent = export("http://agents:4318", OtlpProtocol::HttpProtobuf);
+        assert_eq!(
+            supervisor_otlp_environment(&config),
+            [
+                (OTLP_AGENT_ENDPOINT, "http://agents:4318".to_string()),
+                (OTLP_AGENT_PROTOCOL, "http/protobuf".to_string()),
+            ]
+        );
+
+        config.supervisor_gateway_name = Some("prod-west".to_string());
+        assert_eq!(
+            supervisor_otlp_environment(&config).last(),
+            Some(&(GATEWAY_NAME, "prod-west".to_string()))
         );
     }
 

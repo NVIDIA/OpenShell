@@ -42,6 +42,7 @@ use openshell_sandbox_backend::sandbox_auth::{
     SandboxConnectionId, SandboxConnectionRegistry, SandboxProtocolAuthenticator,
     SandboxProtocolPrincipal,
 };
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::{Child, Command};
 use tokio_stream::wrappers::ReceiverStream;
@@ -169,22 +170,25 @@ fn validate_config(launch: &crate::launch::MxcBoundaryConfig) -> Result<(), Stri
 fn load_tls_server_config(
     tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsServerConfig,
 ) -> Result<rustls::ServerConfig, String> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let certificate_bytes = std::fs::read(&tls.certificate_chain_path)
         .map_err(|error| format!("read MXC boundary TLS certificate: {error}"))?;
-    let certificates = rustls_pemfile::certs(&mut certificate_bytes.as_slice())
+    let certificates = CertificateDer::pem_reader_iter(&mut certificate_bytes.as_slice())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("parse MXC boundary TLS certificate: {error}"))?;
     let private_key_bytes = std::fs::read(&tls.private_key_path)
         .map_err(|error| format!("read MXC boundary TLS private key: {error}"))?;
-    let private_key = rustls_pemfile::private_key(&mut private_key_bytes.as_slice())
+    let private_key = PrivateKeyDer::pem_reader_iter(&mut private_key_bytes.as_slice())
+        .next()
+        .transpose()
         .map_err(|error| format!("parse MXC boundary TLS private key: {error}"))?
         .ok_or_else(|| "MXC boundary TLS private key is empty".to_string())?;
-    let mut server =
-        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(certificates, private_key)
-            .map_err(|error| format!("configure MXC boundary TLS: {error}"))?;
+    let mut server = openshell_crypto::tls::try_server_builder_with_protocol_versions(&[
+        &rustls::version::TLS13,
+    ])
+    .map_err(|error| format!("configure MXC boundary TLS provider: {error}"))?
+    .with_no_client_auth()
+    .with_single_cert(certificates, private_key)
+    .map_err(|error| format!("configure MXC boundary TLS: {error}"))?;
     server.alpn_protocols = vec![b"h2".to_vec()];
     for path in [&tls.certificate_chain_path, &tls.private_key_path] {
         std::fs::remove_file(path).map_err(|error| {
@@ -993,6 +997,12 @@ impl BoundaryRuntime {
                 );
             }
         }
+        if spec.otlp_relay_active {
+            return guest_error(
+                BoundaryErrorKind::Unsupported,
+                "MXC does not support the sandbox agent OTLP relay",
+            );
+        }
         if let Err(error) = validate_provider_environment(provider_env) {
             return guest_error(BoundaryErrorKind::Invalid, error);
         }
@@ -1442,6 +1452,12 @@ impl ManagedProcess {
                     .disposition(openshell_ocsf::DispositionId::Allowed)
                     .severity(openshell_ocsf::SeverityId::Informational)
                     .status(openshell_ocsf::StatusId::Success)
+                    .actor_process(openshell_ocsf::Process::new(
+                        &std::env::current_exe()
+                            .unwrap_or_else(|_| PathBuf::from("openshell-windows-sandbox.exe"))
+                            .to_string_lossy(),
+                        i64::from(std::process::id()),
+                    ))
                     .launch_type(openshell_ocsf::LaunchTypeId::Spawn)
                     .process(openshell_ocsf::Process::new(
                         &program,
@@ -1933,7 +1949,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_rejects_missing_or_changed_confirmed_policy_and_wrong_identity() {
+    async fn start_rejects_unconfirmed_policy_wrong_identity_and_unsupported_relay() {
         use openshell_sandbox_backend::boundary_protocol::{
             LandlockCompatibilityWire, NetworkModeWire,
         };
@@ -1951,7 +1967,7 @@ mod tests {
         };
         *lock(&runtime.lifecycle) = Lifecycle::Ready;
         *lock(&runtime.attached_policy) = Some(policy.clone());
-        let request = |sandbox_id: &str| {
+        let request = |sandbox_id: &str, otlp_relay_active: bool| {
             RequestEnvelope::new(Request::StartAgent {
                 sandbox_id: sandbox_id.into(),
                 spec: AgentSpecWire {
@@ -1960,6 +1976,7 @@ mod tests {
                     workdir: None,
                     timeout_secs: 0,
                     interactive: false,
+                    otlp_relay_active,
                 },
                 ca_cert: None,
                 ca_bundle: None,
@@ -1969,20 +1986,25 @@ mod tests {
             })
             .unwrap()
         };
-        for case in 0..3 {
+        for case in 0..4 {
             let sandbox_id = if case == 2 {
                 "another-sandbox"
             } else {
                 "sandbox-startup"
             };
-            let result = runtime.start_agent(&request(sandbox_id)).await;
+            let result = runtime.start_agent(&request(sandbox_id, case == 3)).await;
+            let expected = if case == 3 {
+                BoundaryErrorKind::Unsupported
+            } else {
+                BoundaryErrorKind::Denied
+            };
             assert!(
                 matches!(
                     result,
                     Response::Error {
-                        kind: BoundaryErrorKind::Denied,
+                        kind,
                         ..
-                    }
+                    } if kind == expected
                 ),
                 "case {case}: {result:?}"
             );

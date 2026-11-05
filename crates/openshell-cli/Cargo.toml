@@ -53,7 +53,6 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging"] }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 reqwest = { workspace = true }
 
 # Error handling

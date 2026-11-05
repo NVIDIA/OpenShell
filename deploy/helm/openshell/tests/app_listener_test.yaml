@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: supervisor app listener
+templates:
+  - templates/supervisor.yaml
+release:
+  name: openshell
+  namespace: gateway
+tests:
+  - it: disabled configuration adds no socket port TLS mount or app Service
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.supervisor.app_listener:
+          enabled: false
+          port: 9443
+          domain: services.example.com
+        openshell.drivers.kubernetes.sandbox_runtime.app_listener:
+          tls_secret_name: app-tls
+    asserts:
+      - hasDocuments:
+          count: 1
+      - lengthEqual:
+          path: spec.template.spec.containers[0].ports
+          count: 2
+        documentIndex: 0
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: app-tls
+          any: true
+        documentIndex: 0
+  - it: enables the common nondefault app port without creating a shared app Service
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.supervisor.app_listener:
+          enabled: true
+          port: 9443
+          domain: services.example.com
+        openshell.drivers.kubernetes.sandbox_runtime.app_listener:
+          tls_secret_name: app-tls
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_APP_LISTEN_ADDRESS
+            value: 0.0.0.0:9443
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: app-tls
+            secret:
+              secretName: app-tls
+        documentIndex: 0
+  - it: refuses app ports that collide with the runtime listener
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.supervisor.app_listener:
+          enabled: true
+          port: 5500
+          domain: services.example.com
+        openshell.drivers.kubernetes.sandbox_runtime.app_listener:
+          tls_secret_name: app-tls
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor app listener port must be in 1024..65535 and distinct from runtime and health ports

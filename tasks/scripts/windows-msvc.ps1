@@ -599,8 +599,17 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     }
 }
 
+function Invoke-MxcFixtureBuild([string] $RustTarget) {
+    Invoke-VsCargo -RustTarget $RustTarget `
+        -CargoArgs "cargo build --release -p openshell-driver-mxc --example mxc-forwarding-agent --target $RustTarget" `
+        -LogName "build-$RustTarget-mxc-fixtures.log"
+}
+
 function Invoke-MxcRealTests([string] $RustTarget) {
     Assert-NativeTestTarget $RustTarget
+    # Network qualification invokes the E2E harness directly, outside its mise
+    # dependency graph, and needs the native forwarding fixture on a clean build.
+    Invoke-MxcFixtureBuild $RustTarget
     Invoke-VsCargo `
         -RustTarget $RustTarget `
         -CargoArgs "cargo test -p openshell-driver-mxc --test wxc_exec_real --target $RustTarget -- --ignored --test-threads=1 --nocapture" `
@@ -687,9 +696,7 @@ switch ($Action) {
     }
     "build-mxc-fixtures" {
         foreach ($rustTarget in $targets) {
-            Invoke-VsCargo -RustTarget $rustTarget `
-                -CargoArgs "cargo build --release -p openshell-driver-mxc --example mxc-forwarding-agent --target $rustTarget" `
-                -LogName "build-$rustTarget-mxc-fixtures.log"
+            Invoke-MxcFixtureBuild $rustTarget
         }
     }
     "test" {

@@ -10,7 +10,9 @@
 //! - Build version metadata
 
 pub mod activity;
+pub mod app_listener;
 pub mod auth;
+pub mod compute;
 pub mod config;
 pub mod container_paths;
 pub mod denial;
@@ -58,6 +60,7 @@ pub mod rpc_error;
 pub mod sandbox_env;
 pub mod sandbox_generation;
 pub mod sandbox_session;
+pub mod sandbox_update;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
@@ -72,8 +75,8 @@ pub use config::{
     AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuthConfig,
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
     GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig, GatewayJwtConfig,
-    GatewayProviderProfileSourceConfig, ImagePullPolicy, MtlsAuthConfig, OidcConfig,
-    PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
+    GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig, MtlsAuthConfig,
+    OidcConfig, PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};

@@ -271,13 +271,20 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         sandbox_token: openshell_core::jwt::SecretJwt::parse("test-sandbox-token").unwrap(),
         sandbox_expires_at: 0,
         ssh_host_private_key: None,
+        traces_otlp_headers: None,
         ocsf_otlp_headers: None,
+        agent_otlp_headers: None,
+        otlp_tls: Vec::new(),
+        traces_otlp_tls: None,
+        ocsf_otlp_tls: None,
+        agent_otlp_tls: None,
     };
     let setup = HeldBackendSetup {
         session_id,
         probe: probe.clone(),
     };
     let config = SandboxInstanceConfig {
+        app_router: None,
         command: vec!["true".into()],
         workdir: None,
         timeout_secs: 0,
@@ -286,7 +293,9 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         sandbox_id: Some("sb-legacy-restart".into()),
         sandbox: Some("legacy-restart".into()),
         container_image: String::new(),
+        container_image_uid: None,
         openshell_endpoint: Some(endpoint),
+        gateway_home: None,
         policy_rules: None,
         policy_data: None,
         ssh_socket_path: None,
@@ -306,6 +315,8 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
         takeover: None,
         supervisor_recovery_timeout_secs: None,
+        otlp_agent_endpoint: None,
+        otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
     };
     let bindings = SandboxInstanceBindings::dedicated(
         &config,

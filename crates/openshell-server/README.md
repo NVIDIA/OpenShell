@@ -71,9 +71,9 @@ replica, independent of which replica runs the compute driver's watch:
   the owner record, charges the member's capacity, and publishes the
   `Admitting` record, conditioned on that record's version, so an owner always
   has its published instance and a removed record never gains one. A member at
-  its 256-instance capacity is skipped. With no live member with room the
-  launch is refused as a capacity refusal: it removes the admitting record it
-  created, only at the version it created (a concurrent launch of the same
+  its 256-instance capacity is skipped. With no live member, or none with
+  room, the launch is refused with that reason: it removes the admitting
+  record it created, only at the version it created (a concurrent launch of the same
   generation that admitted it first wins), and then that record's candidate
   and material; a removal that fails is left to fencing. One
   `supervisor_instance_owner` record per instance names the member, its
@@ -122,6 +122,50 @@ Owner records of withdrawn instances are removed once their generation ended,
 or two minutes after the withdrawal, after their owner was told to stop them.
 Pool members still authenticate with the one shared supervisor token, so a
 member identity is asserted by its hello rather than bound to its Pod.
+
+## Optional in-process sandbox updates
+
+`SharedComputeDriver` retains the generated baseline compute-driver trait, and
+`ComputeDriverInstance` retains its existing variants. Existing compiled drivers
+and factories need no new trait implementation or registration method.
+
+A supporting factory overrides `ComputeDriverFactory::build_with_configuration_updates`
+to return its ordinary instance plus a separately registered updater. The default
+calls `build` and returns no updater. External drivers serve
+`ComputeDriverConfigurationUpdates` on their existing endpoint. Workload updates
+require `openshell.compute.update-sandbox-configuration` for image, command, or
+environment changes. Metadata-only replacements use one database CAS and update
+the label index without invoking a driver.
+
+New updates require operator activation and compatible gateway membership.
+Accepted updates recover from private durable intent at startup and in periodic
+reconciliation, including when activation is subsequently disabled. Recovery
+pages through a partial database index of pending private update records instead
+of scanning sandboxes or completed receipts. Acceptance and completion maintain
+the indexed status in the same transaction as the intent and lifecycle interlock.
+Each gateway keeps automatic recovery backoff in memory. Failed attempts wait
+1, 2, 4, 8, then 15 minutes; each failure log includes the attempt and retry delay.
+Replicas retry independently, and a gateway restart resets its backoff. A new
+operation starts without delay. Completed or deleted updates are removed from
+the backoff map as recovery observes them.
+An authorized `UpdateSandbox` with no selected fields and the current resource
+version resumes immediately, bypassing backoff without reconstructing its selections. Completion retains the
+exact operation receipt for idempotent completion across replicas; a newer update
+invalidates it. Ambiguous results retain the baseline provisioning interlock.
+Explicit deletion can supersede a pending update: the driver only patches the
+original immutable resource and never creates a replacement. The Deleting CAS
+prevents delayed completion. Cleanup bypasses the pending-driver guard only when
+the pending operation ID matches the persisted update intent. Final removal
+deletes the sandbox and private intent atomically, retaining that evidence if
+cleanup fails or loses a resource-version race.
+
+Metadata replacement preserves gateway-owned keys, including retention, while
+other user keys under OpenShell domains remain editable. Completion preserves
+later annotation merges accepted through `UpdateConfig`.
+
+A provisioning timeout can be repaired by Stop after its original driver work
+settles and cleanup completes. Stop exposes Stopped without discarding the timeout
+diagnosis or storage. This lifecycle behavior also applies when updates are disabled.
 
 ## Operator credential export
 
@@ -189,3 +233,31 @@ runs under `mise run test:rust:postgres` (see `TESTING.md`) and still accepts
 `OPENSHELL_REFRESH_TEST_DATABASE_URL` pointing to a disposable PostgreSQL database.
 It exercises independent sessions without the local mutex. Do not point this
 fixture at an existing deployment database.
+
+## Application route installation records
+
+Supervisor installation reports arrive only through the authenticated sandbox
+session. The gateway issues bounded, single-use lease challenges and validates
+reports under the sandbox mutation guard. Accepted records contain current
+service declarations, configuration/runtime identity, session fencing, a
+trusted driver-resolved app endpoint, and gateway lease expiry. The private
+`ComputeDriverAppEndpoints.ResolveSupervisorAppEndpoint` extension RPC resolves this endpoint separately
+from `GetSandbox`: endpoint lookup failures do not affect ordinary sandbox
+observation. Unsupported drivers return `UNIMPLEMENTED`; an absent endpoint
+withholds application publication. The gateway resolves the endpoint once before
+issuing each challenge and binds that result to the session and lease sequence.
+Acceptance rechecks durable ownership, shared member/readiness authority, runtime,
+and configuration without another driver lookup. The next challenge resolves
+afresh; the saved result never extends the original lease expiry.
+In-process factories opt in with
+`ComputeDriverBuildContext::register_app_endpoints`; baseline factories need no
+changes. Standalone drivers register the extension on their existing endpoint.
+The generic
+store key is prefixed `service-installation:`; records are ephemeral and do not
+change durable sandbox protobufs. Reads revalidate owner, configuration,
+generation, and expiry. Cleanup scans bounded pages and uses conditional deletes
+so concurrent renewals are preserved. Cursor progress survives partial sweep
+timeouts; bounded record attempts prevent a malformed or stalled record from
+starving later cleanup. Failed attempts are revisited on the next scan.
+Discovery consumers must not treat these
+records as application health or external ingress readiness.

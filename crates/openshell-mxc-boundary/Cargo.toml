@@ -23,22 +23,21 @@ openshell-core = { path = "../openshell-core", default-features = false }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 openshell-ocsf = { path = "../openshell-ocsf" }
+openshell-crypto = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-sha2 = { workspace = true }
+hex = "0.4"
 tracing = { workspace = true }
 url = { workspace = true }
 windows = { workspace = true, features = ["Win32_Security_Authorization", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
-openshell-crypto = { workspace = true }
 rcgen = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"

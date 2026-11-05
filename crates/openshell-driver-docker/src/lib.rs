@@ -201,20 +201,16 @@ pub struct DockerComputeConfig {
     /// Gateway gRPC endpoint the sandbox connects back to.
     pub grpc_endpoint: String,
 
-    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
-    /// supplies its own export endpoint; driver TOML cannot set it.
-    #[serde(skip)]
-    pub supervisor_otlp_endpoint: Option<String>,
     /// Networking mode for the supervisor only. Workloads always use network=none.
     pub supervisor_network_mode: DockerSupervisorNetworkMode,
 
     /// Override the trusted host address. Bridge mode otherwise resolves Docker's host-gateway.
     pub host_gateway_ip: Option<IpAddr>,
 
-    /// OCSF event export passed to supervisors. The gateway supplies its own
-    /// export; driver TOML cannot set it.
+    /// OTLP exports passed to supervisors. The gateway supplies them from
+    /// `[otlp]`; driver TOML cannot set them.
     #[serde(skip)]
-    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
 
     /// Gateway name passed to supervisors for their telemetry. The gateway
     /// supplies its own name; driver TOML cannot set it.
@@ -319,10 +315,9 @@ impl Default for DockerComputeConfig {
             image_pull_policy: ImagePullPolicy::default(),
             sandbox_label: "default".to_string(),
             grpc_endpoint: String::new(),
-            supervisor_otlp_endpoint: None,
             supervisor_network_mode: DockerSupervisorNetworkMode::Host,
             host_gateway_ip: None,
-            supervisor_ocsf_export: None,
+            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
             supervisor_gateway_name: None,
             sandbox_runtime_image: None,
             supervisor_bin: None,
@@ -358,12 +353,11 @@ struct DockerDriverRuntimeConfig {
     sandbox_binary: Arc<Vec<u8>>,
     supervisor_image_id: String,
     supervisor_grpc_endpoint: String,
-    supervisor_otlp_endpoint: Option<String>,
     supervisor_network_mode: DockerSupervisorNetworkMode,
     supervisor_endpoint_explicit: bool,
     bridge_default_endpoint: Option<String>,
     host_gateway_ip: Option<IpAddr>,
-    supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
     supervisor_gateway_name: Option<String>,
     ssh_socket_path: String,
     guest_tls: Option<DockerGuestTlsPaths>,
@@ -1020,12 +1014,11 @@ impl DockerComputeDriver {
                 sandbox_binary,
                 supervisor_image_id,
                 supervisor_grpc_endpoint,
-                supervisor_otlp_endpoint: docker_config.supervisor_otlp_endpoint.clone(),
+                supervisor_otlp: docker_config.supervisor_otlp.clone(),
                 supervisor_network_mode: docker_config.supervisor_network_mode,
                 supervisor_endpoint_explicit,
                 bridge_default_endpoint,
                 host_gateway_ip,
-                supervisor_ocsf_export: docker_config.supervisor_ocsf_export.clone(),
                 supervisor_gateway_name: docker_config.supervisor_gateway_name.clone(),
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
@@ -3147,6 +3140,9 @@ fn validate_docker_outer_fence(
     Ok(())
 }
 #[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for ComputeDriverService {}
+
+#[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
     type WatchSandboxesStream = WatchStream;
 
@@ -3307,6 +3303,9 @@ impl ComputeDriver for ComputeDriverService {
             .await
     }
 }
+
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for DockerComputeDriver {}
 
 #[tonic::async_trait]
 impl ComputeDriver for DockerComputeDriver {
@@ -5329,6 +5328,37 @@ fn docker_network_trust_supervisor_mount(
     })
 }
 
+/// Read the image identity pinned at provisioning, including after a restart.
+/// Re-resolving the template's tag here could identify a different image.
+async fn docker_workload_image_environment(
+    sandbox: &DriverSandbox,
+    directory: &Path,
+) -> Result<Vec<String>, Status> {
+    let bytes = tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
+        .await
+        .map_err(|error| Status::internal(format!("read Docker image launch identity: {error}")))?;
+    let bootstrap: BoundaryConfig = serde_json::from_slice(&bytes)
+        .map_err(|_| Status::internal("decode Docker image launch identity"))?;
+    let mut environment = Vec::new();
+    if let Some(image) = sandbox_image(sandbox) {
+        environment.push(format!(
+            "{}={image}",
+            openshell_core::sandbox_env::CONTAINER_IMAGE
+        ));
+    }
+    if let Some(uid) = bootstrap
+        .resource_claims
+        .get("docker.image_identity")
+        .filter(|uid| !uid.trim().is_empty())
+    {
+        environment.push(format!(
+            "{}={uid}",
+            openshell_core::sandbox_env::CONTAINER_IMAGE_UID
+        ));
+    }
+    Ok(environment)
+}
+
 async fn spawn_docker_control_process(
     docker: &Docker,
     sandbox: &DriverSandbox,
@@ -5355,6 +5385,7 @@ async fn spawn_docker_control_process(
     let workspace_root = tokio::fs::read_to_string(directory.join(WORKSPACE_ROOT_FILE))
         .await
         .map_err(|error| Status::internal(format!("read Docker workspace root: {error}")))?;
+    let image_environment = docker_workload_image_environment(sandbox, &directory).await?;
     let supervisor_name = format!("{}-supervisor", container_name_for_sandbox(sandbox));
     let _ = docker
         .remove_container(
@@ -5405,6 +5436,7 @@ async fn spawn_docker_control_process(
             openshell_core::telemetry::enabled_env_value()
         ),
     ];
+    environment.extend(image_environment);
     environment.extend(supervisor_otlp_environment(config));
     if config.guest_tls.is_some() {
         environment.push(format!(
@@ -5951,22 +5983,22 @@ fn docker_child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> 
 }
 
 /// Environment that lets the supervisor export spans, joining the current
-/// trace, and OCSF events, identifying the gateway that launched it.
+/// trace, OCSF events, and relayed workload traces, identifying the gateway
+/// that launched it.
 fn supervisor_otlp_environment(config: &DockerDriverRuntimeConfig) -> Vec<String> {
-    let traces = config.supervisor_otlp_endpoint.iter().flat_map(|endpoint| {
-        std::iter::once((openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint.clone()))
-            .chain(openshell_otel::current_trace_context_environment())
-    });
-    let ocsf = config
-        .supervisor_ocsf_export
+    let exports = config.supervisor_otlp.environment();
+    let trace_context = config
+        .supervisor_otlp
+        .traces
         .iter()
-        .flat_map(openshell_core::sandbox_env::OcsfOtlpExport::environment);
+        .flat_map(|_| openshell_otel::current_trace_context_environment());
     let gateway_name = config
         .supervisor_gateway_name
         .iter()
         .map(|name| (openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
-    traces
-        .chain(ocsf)
+    exports
+        .into_iter()
+        .chain(trace_context)
         .chain(gateway_name)
         .map(|(name, value)| format!("{name}={value}"))
         .collect()

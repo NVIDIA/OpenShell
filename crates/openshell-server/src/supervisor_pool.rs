@@ -48,14 +48,14 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use openshell_core::ObjectWorkspace as _;
 use openshell_core::jwt::{SandboxId, SupervisorTakeover};
 use openshell_core::proto::datamodel::v1::{CredentialHandle, ObjectMeta, Provider};
 use openshell_core::proto::{Sandbox, SandboxPhase};
 use openshell_core::time::now_ms;
+use openshell_core::{ObjectId as _, ObjectWorkspace as _};
 use openshell_supervisor_control::pool_timing::RECORD_WRITE_BOUND;
 use openshell_supervisor_control::proto::{
-    SandboxInstanceAssignment, SandboxInstanceStatus, SandboxInstanceTakeover,
+    SandboxInstanceAssignment, SandboxInstancePhase, SandboxInstanceStatus, SandboxInstanceTakeover,
 };
 use openshell_supervisor_control::{
     ConnectedMember, InstanceOwner, InstancePlacement, MAX_ASSIGNED_INSTANCES, MAX_POOL_INSTANCES,
@@ -398,6 +398,8 @@ pub struct SupervisorPool {
     takeovers_from: tokio::time::Instant,
     /// When each desired route without an owner record was first seen.
     unowned_since: Mutex<HashMap<String, tokio::time::Instant>>,
+    /// When each route's owner term was first seen with its process gone.
+    owner_gone_since: Mutex<HashMap<String, (u64, tokio::time::Instant)>>,
     /// Takeover credentials minted for terms of members this replica serves.
     minted: Mutex<HashMap<(String, u64), (SandboxInstanceTakeover, tokio::time::Instant)>>,
     /// Launch material loaded for instances owned by members this replica
@@ -485,6 +487,96 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Revalidate an application endpoint against durable pool authority, rather
+/// than a replica's eventually refreshed placement cache. Never treats the
+/// member's runtime port as an application port.
+pub async fn app_endpoint_current(
+    store: &Store,
+    sandbox: &Sandbox,
+    endpoint: &openshell_core::proto::compute::v1::SupervisorAppEndpoint,
+) -> Result<bool, PersistenceError> {
+    let Some(metadata) = &sandbox.metadata else {
+        return Ok(false);
+    };
+    let identity = PersistedSandboxIdentity::read(&metadata.annotations)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    let Some(assignment_row) = store
+        .get_by_name(ASSIGNMENT_OBJECT_TYPE, "", &endpoint.pool_route)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let assignment: AssignmentPayload = serde_json::from_slice(&assignment_row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    if assignment.route != endpoint.pool_route
+        || assignment.sandbox_id != sandbox.object_id()
+        || assignment.generation != identity.runtime_generation.as_str()
+        || assignment.phase != RecordPhase::Published
+    {
+        return Ok(false);
+    }
+    let Some(row) = store
+        .get(OWNER_OBJECT_TYPE, &owner_object_id(&endpoint.pool_route))
+        .await?
+    else {
+        return Ok(false);
+    };
+    let owner: OwnerPayload = serde_json::from_slice(&row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    if owner.route != endpoint.pool_route
+        || owner.sandbox_id != sandbox.object_id()
+        || owner.generation != identity.runtime_generation.as_str()
+        || owner.phase != OwnerPhase::Granted
+        || owner.auth_epoch != endpoint.ownership_epoch
+        || owner.auth_epoch != identity.auth_epoch.get()
+    {
+        return Ok(false);
+    }
+    let Some(member_row) = store
+        .get(MEMBER_OBJECT_TYPE, &member_object_id(&owner.member_id))
+        .await?
+    else {
+        return Ok(false);
+    };
+    if now_ms().saturating_sub(member_row.updated_at_ms)
+        >= i64::try_from(MEMBER_TTL.as_millis()).expect("bounded member TTL")
+    {
+        return Ok(false);
+    }
+    let member: MemberPayload = serde_json::from_slice(&member_row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    if member.member_id != owner.member_id
+        || member.process_id != owner.process_id
+        || member.leaving
+        || member
+            .runtime_address
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|a| a.ip())
+            != endpoint.host.parse::<std::net::IpAddr>().ok()
+    {
+        return Ok(false);
+    }
+    let Some(report_row) = store
+        .get(
+            REPORT_OBJECT_TYPE,
+            &report_object_id(&owner.route, owner.auth_epoch),
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let report: ReportPayload = serde_json::from_slice(&report_row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    Ok(report.route == owner.route
+        && report.sandbox_id == owner.sandbox_id
+        && report.member_id == owner.member_id
+        && report.process_id == owner.process_id
+        && report.auth_epoch == owner.auth_epoch
+        && report.ready
+        && report.phase == SandboxInstancePhase::Supervising as i32)
 }
 
 /// The ring over live members that are not leaving.
@@ -693,6 +785,7 @@ impl SupervisorPool {
             unowned_grace: UNOWNED_GRACE,
             takeovers_from: tokio::time::Instant::now() + TAKEOVER_STARTUP_GRACE,
             unowned_since: Mutex::new(HashMap::new()),
+            owner_gone_since: Mutex::new(HashMap::new()),
             minted: Mutex::new(HashMap::new()),
             materials: Mutex::new(HashMap::new()),
             withdrawn_since: Mutex::new(HashMap::new()),
@@ -1865,6 +1958,9 @@ impl SupervisorPool {
                 .await
                 .map_err(|error| format!("read supervisor pool capacity: {error}"))?,
         );
+        if members.is_empty() {
+            return Err("no shared supervisor replica is attached to the gateway".to_string());
+        }
         let ring = ring_of(&members);
         let targets = candidates(
             &ring,
@@ -2085,6 +2181,8 @@ impl SupervisorPool {
         // report describes a process that may be gone, so it renders no
         // verdict until a new term is granted.
         let mut unconfirmed = BTreeSet::new();
+        // Routes whose granted owner's process is gone, not just leaving.
+        let mut gone = BTreeSet::new();
         for (route, instance) in &desired {
             if stopping.contains(route) {
                 continue;
@@ -2105,6 +2203,9 @@ impl SupervisorPool {
                     if !matches!(failure, Ok(None)) {
                         unconfirmed.insert(route.clone());
                     }
+                    if matches!(failure, Ok(Some("expired" | "restarted"))) {
+                        gone.insert(route.clone());
+                    }
                     match failure {
                         Ok(Some(cause)) if takeovers_allowed => {
                             self.take_over(record, cause, &ring, &members, &charges)
@@ -2121,6 +2222,7 @@ impl SupervisorPool {
             match outcome {
                 Ok(Reconciled::Changed(record)) => {
                     unconfirmed.remove(route);
+                    gone.remove(route);
                     recharge(
                         &mut charges,
                         route,
@@ -2132,6 +2234,7 @@ impl SupervisorPool {
                     owners.insert(route.clone(), *record);
                 }
                 Ok(Reconciled::Removed) => {
+                    gone.remove(route);
                     let previous = owners.remove(route);
                     recharge(
                         &mut charges,
@@ -2154,15 +2257,43 @@ impl SupervisorPool {
         self.remove_stale_reports(&owners, &report_rows).await;
         let reports = reports_of_owners(&owners, &report_rows, &unconfirmed);
         let materials = self.load_materials(&owners, &desired).await;
+        let expired = self.expired_routes(&owners, &gone);
         // Only granted terms are served; pending intents stay recorded for
         // the next pass.
         if let Some(view) = self
-            .view(&members, &owners, &desired, materials, reports)
+            .view(&members, &owners, &desired, materials, reports, expired)
             .await
         {
             self.controller.update_pool(view, listed_at);
         }
         Ok(())
+    }
+
+    /// Routes whose owner term's process has been gone longer than the
+    /// runtime's recovery deadline plus [`MEMBER_TTL`], so the runtime has
+    /// ended the workload. A takeover starts a new term and clears this.
+    fn expired_routes(
+        &self,
+        owners: &BTreeMap<String, OwnerRecord>,
+        gone: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let now = tokio::time::Instant::now();
+        let limit = Duration::from_secs(u64::from(self.controller.pool_recovery_timeout_secs()))
+            + MEMBER_TTL;
+        let mut since = lock(&self.owner_gone_since);
+        since.retain(|route, (auth_epoch, _)| {
+            gone.contains(route)
+                && owners
+                    .get(route)
+                    .is_some_and(|record| record.payload.auth_epoch == *auth_epoch)
+        });
+        gone.iter()
+            .filter_map(|route| {
+                let auth_epoch = owners.get(route)?.payload.auth_epoch;
+                let (_, first_seen) = since.entry(route.clone()).or_insert((auth_epoch, now));
+                (now.duration_since(*first_seen) >= limit).then(|| route.clone())
+            })
+            .collect()
     }
 
     /// Remove the owner records of instances that are no longer desired: at
@@ -2695,6 +2826,7 @@ impl SupervisorPool {
         desired: &BTreeMap<String, AssignmentRecord>,
         assignments: BTreeMap<String, SandboxInstanceAssignment>,
         reports: BTreeMap<String, SandboxInstanceStatus>,
+        expired: BTreeSet<String>,
     ) -> Option<PoolView> {
         let served = self
             .controller
@@ -2716,6 +2848,7 @@ impl SupervisorPool {
             desired: desired.keys().cloned().collect(),
             assignments,
             reports,
+            expired,
         };
         let mut current_terms = std::collections::HashSet::new();
         for record in owners.values() {
@@ -3267,12 +3400,14 @@ mod tests {
         assert_eq!(view.members.len(), 3);
         // With no live member a launch is refused before its workload runs.
         let empty = Fixture::new().await;
+        let refused = empty
+            .replica("gw-b")
+            .place_launch(launch("rt-route-none", "sandbox-x", "generation-1"))
+            .await
+            .unwrap_err();
         assert!(
-            empty
-                .replica("gw-b")
-                .place_launch(launch("rt-route-none", "sandbox-x", "generation-1"))
-                .await
-                .is_err()
+            refused.contains("no shared supervisor replica is attached"),
+            "{refused}"
         );
     }
 
@@ -4098,6 +4233,47 @@ mod tests {
         }
     }
 
+    /// An instance whose owner's process is gone reads as absent once the
+    /// runtime's recovery deadline has passed without a takeover; a leaving
+    /// owner's instance never does, and a takeover clears the deadline.
+    #[tokio::test]
+    async fn an_instance_whose_owner_is_gone_past_the_recovery_deadline_is_absent() {
+        use openshell_supervisor_control::ObservedInstance;
+        let fixture = Fixture::new().await;
+        fixture.member("m1", "p1", false).await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let pool = fixture.replica("gw-a");
+        pool.reconcile_once().await.unwrap();
+        let limit = Duration::from_secs(u64::from(pool.controller.pool_recovery_timeout_secs()))
+            + MEMBER_TTL;
+        let backdate = || {
+            for (_, first_seen) in lock(&pool.owner_gone_since).values_mut() {
+                *first_seen = first_seen.checked_sub(limit).unwrap();
+            }
+        };
+
+        // A leaving owner still runs its instance.
+        fixture.member("m1", "p1", true).await;
+        pool.reconcile_once().await.unwrap();
+        backdate();
+        pool.reconcile_once().await.unwrap();
+        assert_eq!(pool.controller.observed(&route), ObservedInstance::NoHost);
+
+        // Its process is gone: no verdict until the deadline has passed.
+        fixture.remove_member("m1").await;
+        pool.reconcile_once().await.unwrap();
+        assert_eq!(pool.controller.observed(&route), ObservedInstance::NoHost);
+        backdate();
+        pool.reconcile_once().await.unwrap();
+        assert_eq!(pool.controller.observed(&route), ObservedInstance::Absent);
+
+        // A takeover grants a new term, which is not expired.
+        fixture.member("m2", "p2", false).await;
+        pool.reconcile_once().await.unwrap();
+        assert_eq!(fixture.owner(&route).await.unwrap().member_id, "m2");
+        assert_eq!(pool.controller.observed(&route), ObservedInstance::NoHost);
+    }
+
     /// One more instance than a listing page, the live one listed last and
     /// owned by `m1`; returns the routes and a replica that places nothing,
     /// whose first pass has loaded the view.
@@ -4805,7 +4981,11 @@ mod tests {
         let launching = fixture.replica("gw-b");
         let (pass, launched) = tokio::join!(
             pool.reconcile_once(),
-            launching.place_launch(launch("rt-route-new0", "sandbox-new", "generation-1")),
+            Box::pin(launching.place_launch(launch(
+                "rt-route-new0",
+                "sandbox-new",
+                "generation-1"
+            ))),
         );
         pass.unwrap();
         // Every route is re-adopted by the new process at the next term,
@@ -5122,6 +5302,104 @@ mod tests {
         stale.reconcile_once().await.unwrap();
         let row = fixture.report_rows(&route).await.remove(&1).unwrap();
         assert_eq!((row.ready, row.connected_at_ms), (true, 2_000));
+    }
+
+    #[tokio::test]
+    async fn application_endpoints_require_current_acknowledged_owner_and_live_member() {
+        let fixture = Fixture::new().await;
+        fixture.member("m1", "p1", false).await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let sandbox_id = fixture.owner(&route).await.unwrap().sandbox_id;
+        let mut sandbox = fixture
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut endpoint = openshell_core::proto::compute::v1::SupervisorAppEndpoint {
+            host: "10.0.0.1".into(),
+            port: 9443,
+            pool_route: route.clone(),
+            ownership_epoch: 1,
+            ..Default::default()
+        };
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        let report = ReportPayload {
+            route: route.clone(),
+            member_id: "m1".into(),
+            process_id: "p1".into(),
+            auth_epoch: 1,
+            sandbox_id: sandbox_id.clone(),
+            phase: SandboxInstancePhase::Supervising as i32,
+            ready: true,
+            exit_code: 0,
+            connected_at_ms: now_ms(),
+        };
+        fixture.write_report(report.clone()).await;
+        assert!(
+            app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        endpoint.host = "10.0.0.2".into();
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        endpoint.host = "10.0.0.1".into();
+        fixture.member("m1", "p1", true).await;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        fixture.member("m1", "p1", false).await;
+        // Returning to the same host process is still a new ownership term.
+        grant_next_term(&fixture, &route, "m1", "p1").await;
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            crate::auth::sandbox_session::AUTH_EPOCH_ANNOTATION.into(),
+            "2".into(),
+        );
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        endpoint.ownership_epoch = 2;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap(),
+            "old acknowledged report cannot authorize the new term"
+        );
+        fixture
+            .write_report(ReportPayload {
+                auth_epoch: 2,
+                ..report
+            })
+            .await;
+        assert!(
+            app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        fixture.member("m1", "p2", false).await;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        fixture.remove_owner_record(&route).await;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

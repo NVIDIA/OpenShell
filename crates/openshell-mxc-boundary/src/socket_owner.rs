@@ -404,7 +404,7 @@ mod tests {
     fn resolves_child_that_owns_ipv4_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let proxy = listener.local_addr().unwrap();
-        let current_exe = std::env::current_exe().unwrap();
+        let current_exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
         let mut child = spawn_socket_owner_child(proxy.port(), 1, false);
 
         let (accepted, workload) = listener.accept().unwrap();
@@ -415,7 +415,7 @@ mod tests {
 
         let (path, pid) = result.unwrap();
         assert_eq!(pid, child.id());
-        assert_eq!(path, current_exe);
+        assert_eq!(std::fs::canonicalize(path).unwrap(), current_exe);
     }
 
     /// Stress check: every connection a child holds open resolves to that
@@ -426,7 +426,7 @@ mod tests {
         const CONNECTIONS: usize = 64;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let proxy = listener.local_addr().unwrap();
-        let current_exe = std::env::current_exe().unwrap();
+        let current_exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
         let mut child = spawn_socket_owner_child(proxy.port(), CONNECTIONS, false);
 
         let accepted = (0..CONNECTIONS)
@@ -436,7 +436,14 @@ mod tests {
             .iter()
             .filter_map(|(_, workload)| {
                 match resolve_tcp_peer_identity(WorkloadProxyTcpConnection::new(*workload, proxy)) {
-                    Ok((path, pid)) if pid == child.id() && path == current_exe => None,
+                    Ok((path, pid))
+                        if pid == child.id()
+                            && path
+                                .canonicalize()
+                                .is_ok_and(|resolved| resolved == current_exe) =>
+                    {
+                        None
+                    }
                     Ok((path, pid)) => Some(format!("{workload}: PID {pid} {}", path.display())),
                     Err(error) => Some(error),
                 }
@@ -459,7 +466,7 @@ mod tests {
     fn resolves_half_closed_connection_to_its_owner() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let proxy = listener.local_addr().unwrap();
-        let current_exe = std::env::current_exe().unwrap();
+        let current_exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
         let mut child = spawn_socket_owner_child(proxy.port(), 1, true);
 
         let (mut accepted, workload) = listener.accept().unwrap();
@@ -475,7 +482,7 @@ mod tests {
 
         let (path, pid) = result.unwrap();
         assert_eq!(pid, child.id());
-        assert_eq!(path, current_exe);
+        assert_eq!(std::fs::canonicalize(path).unwrap(), current_exe);
     }
 
     /// Once both sides close, the workload-side row has no owning process

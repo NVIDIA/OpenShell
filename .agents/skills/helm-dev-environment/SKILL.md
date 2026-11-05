@@ -195,6 +195,17 @@ every member one at a time. The PID must survive each case, while an open
 replacement confirmed within the recovery timeout, so the runtime terminated
 the workload.
 
+For RFC 0017 app-listener validation, enable the listener and supply the app TLS
+Secret on the shared Deployment, plus a separate NetworkPolicy allowing the test
+client/proxy to reach its app port. Runtime-port access does not grant app access.
+Discovery returns the acknowledged owner's Pod IP and app port; no headless app
+Service is needed. Exercise HTTP/WebSocket reconnection through graceful downscale
+and abrupt loss, preserving workload generation/PID/in-memory state and the public
+hostname. Verify stale-owner rejection independently of the replacement's success.
+Shared serving leases expire within fifteen seconds of issuance and do not renew
+from configuration alone. Do not claim seamless socket migration or infer external
+ingress readiness from an advertisement.
+
 ### 2. Deploy OpenShell
 
 **Iterative dev** (rebuilds on file changes, recommended during active development):
@@ -269,7 +280,10 @@ trace-context annotation. The same command exposes OTLP/gRPC on
 `http://127.0.0.1:4317` and, when deployed, the Kubernetes gateway on
 `http://127.0.0.1:8090`. The local `gateway:docker`, `gateway:podman`, and
 `gateway:vm` tasks detect the collector listener at startup and enable trace
-export only while it is reachable.
+export, OCSF log export, and the agent trace relay only while it is reachable.
+Spans an agent exports from inside a sandbox arrive through the supervisor's
+relay with `openshell.telemetry.source=agent` and share `openshell.sandbox.id`
+with that sandbox's supervisor spans.
 
 The Skaffold profile for HA reverse-proxy development is available from
 `deploy/helm/openshell/`:
@@ -418,6 +432,40 @@ above) instead of relying only on `OPENSHELL_GATEWAY_ENDPOINT`; some tests call
 ### Kubernetes E2E Notes
 
 Use `mise run e2e:kubernetes` for the standard Helm-backed Kubernetes suite.
+Set `OPENSHELL_E2E_KUBE_TEST=kubernetes_image_update` to scope the Rust suite to
+combined image, command, environment, and metadata updates with retained sandbox,
+SSH, and PVC identities. The next start verifies the new argv and environment. This target is
+included in both existing Agent Sandbox API-version lanes; unlike the Python
+Docker suite, it exercises the driver that supports image updates.
+
+Image updates default to disabled outside test fixtures. The e2e wrapper opts
+in only for a fresh gateway fixture that it owns; set
+`OPENSHELL_E2E_KUBE_IMAGE_UPDATES=0` to prevent that opt-in. Do not propagate
+activation to an existing shared gateway or enable it during a mixed-version
+rollout. For manual testing, follow the retirement and activation checklist in
+`docs/kubernetes/high-availability.mdx` before setting
+`gatewayConfig: {"openshell.gateway": {enable_sandbox_updates: true}}`.
+The gateway process equivalents are `--enable-sandbox-updates true` and
+`OPENSHELL_ENABLE_SANDBOX_UPDATES=true`. Retire every old process and Job,
+settle outstanding driver work, prevent old binaries returning, and do not
+treat PostgreSQL connection markers or membership TTL expiry as retirement
+proof. SQLite testing supports one gateway process only. Image-update clients
+must call the separate `SandboxUpdates` service on the existing gateway
+listener, not add a method to the baseline `OpenShell` service or inspect new
+public `SandboxStatus` image fields. Resume a pending operation with
+`SandboxUpdates.UpdateSandbox`, the current resource version, and no selected
+fields, following the documented request-ID semantics.
+
+
+For the opt-in application listener, build/import matching branch images and run
+`mise run e2e:kubernetes:app-listener`; see `e2e/kubernetes/app-listener/README.md`
+for image, topology, delivery-mode and takeover inputs. The task owns an isolated
+Helm release/namespace, temporary TLS material, in-cluster clients, teardown and
+evidence under `results/app-listener/`. It checks policy denial, Pod-IP ingress without app Services, shared-owner takeover, gateway-outage expiry and disabled-listener
+gateway compatibility, without discovery or a proxy. CI runs four cases under
+`test:e2e` and includes them in `Core E2E result`. Its reusable kind setup installs
+pinned Calico only for this lane; other jobs retain kindnet. Local k3s already
+enforces policy. The lower-level `verify.py` can target a predeployed release.
 The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
 target. `/readyz` remains covered by server unit/integration tests.
@@ -608,3 +656,24 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass and BackendTrafficPolicy for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
 | `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy, realm import, and development TLS trust anchor |
+
+## Sandbox update regression lane
+
+Run `mise run e2e:kubernetes:updates` for the testkit update suite against both
+supported Agent Sandbox APIs with the combined Helm chart and its bundled
+workspace resources. It verifies stopped-only updates, retained CR/PVC
+identity and contents, command/environment changes, and request replay.
+`OPENSHELL_E2E_UPDATE_ORIGINAL_IMAGE` and `OPENSHELL_E2E_UPDATE_TARGET_IMAGE` can
+select mirrored Alpine 3.21 and 3.22 manifests. Defaults use the public registry
+cache; keep immutable digests when overriding them.
+
+## App listener fixture
+
+The opt-in `deploy/helm/openshell/ci/values-app-listener.yaml` enables the
+supervisor listener at port 9443 without discovery or a proxy. Provision the
+operator TLS Secret and an ingress-client NetworkPolicy first. Follow
+`e2e/kubernetes/app-listener/README.md` for direct in-cluster verification,
+shared-member selection, and the HA follow-up checks. Keep the fixture disabled
+in default profiles. Dedicated and shared supervisors expose app ports on their
+Pod IPs without app Services. Select the member owning the sandbox; automatic
+owner selection belongs to the later discovery API.

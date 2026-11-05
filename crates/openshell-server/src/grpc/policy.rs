@@ -3069,7 +3069,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
     let settings = merge_effective_settings(global_settings, &sandbox_settings)?;
     let supervisor_middleware_services =
         state.middleware_registry.required_services(policy.as_ref());
-    let config_revision = compute_config_revision_with_validation_mode(
+    let mut config_revision = compute_config_revision_with_validation_mode(
         policy.as_ref(),
         &settings,
         policy_source,
@@ -3094,7 +3094,22 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
             .filter(|_| matches!(policy_source, PolicySource::Global)),
     )?;
 
+    let service_routes = super::service::configured_app_routes(state, sandbox).await?;
+    // Include the allowlist in delivery identity so a service edit is not
+    // coalesced away as a duplicate policy/settings snapshot.
+    if !service_routes.is_empty() {
+        let mut bytes = config_revision.to_le_bytes().to_vec();
+        for route in &service_routes {
+            route
+                .encode_length_delimited(&mut bytes)
+                .expect("encode service route");
+        }
+        let hash = openshell_crypto::sha256(&bytes)
+            .map_err(|_| Status::internal("service configuration fingerprint failed"))?;
+        config_revision = u64::from_le_bytes(hash[..8].try_into().expect("hash prefix"));
+    }
     Ok(SandboxConfigSnapshot {
+        service_routes,
         configuration_instance_id: sandbox
             .status
             .as_ref()
@@ -3129,6 +3144,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
 
 fn sandbox_config_response(snapshot: SandboxConfigSnapshot) -> GetSandboxConfigResponse {
     GetSandboxConfigResponse {
+        service_routes: snapshot.service_routes,
         policy: snapshot.policy,
         version: snapshot.version,
         policy_hash: snapshot.policy_hash,
@@ -5433,6 +5449,8 @@ pub(super) async fn handle_push_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
 ) -> Result<Response<PushSandboxLogsResponse>, Status> {
+    const MAX_BATCH_LINES: usize = 100;
+
     let principal = request
         .extensions()
         .get::<Principal>()
@@ -5458,8 +5476,19 @@ pub(super) async fn handle_push_sandbox_logs(
         )
         .await?;
 
-        let logs: Vec<_> = batch.logs.into_iter().take(100).collect();
+        let received_lines = batch.logs.len();
+        let logs: Vec<_> = batch.logs.into_iter().take(MAX_BATCH_LINES).collect();
         validate_sandbox_log_timestamps(&logs)?;
+
+        if received_lines > logs.len() {
+            warn!(
+                sandbox_id = %batch.sandbox_id,
+                received_lines,
+                accepted_lines = logs.len(),
+                dropped_lines = received_lines - logs.len(),
+                "Truncated sandbox log batch"
+            );
+        }
 
         for log in logs {
             let mut log = log;
@@ -8284,6 +8313,148 @@ mod tests {
                 },
             }));
         request
+    }
+
+    #[tokio::test]
+    async fn push_sandbox_logs_accepts_batched_replay_and_warns_on_truncation() {
+        use openshell_core::proto::open_shell_client::OpenShellClient;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-log-replay";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "log-replay",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = crate::auth::principal::test_support::sandbox(sandbox_id);
+        let service = OpenShellServer::with_interceptor(
+            crate::grpc::OpenShellService::new(state.clone()),
+            move |mut request: Request<()>| {
+                request.extensions_mut().insert(principal.clone());
+                Ok(request)
+            },
+        );
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+
+        let diagnostics = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter("off,openshell_server::grpc::policy=warn")
+            .with_writer(std::sync::Mutex::new(diagnostics.reopen().unwrap()))
+            .finish();
+        // This test uses a current-thread runtime, including the gateway tasks.
+        let _capture = tracing::subscriber::set_default(subscriber);
+        let mut seen_warnings = 0;
+
+        for (batch_size, count, accepted_count) in [
+            (200, 200, 100),
+            (1, 0, 0),
+            (1, 1, 1),
+            (50, 50, 50),
+            (100, 100, 100),
+            (101, 101, 100),
+            (199, 199, 100),
+            (201, 201, 100),
+            (50, 200, 200),
+            (50, 201, 201),
+        ] {
+            state.tracing_log_bus.remove(sandbox_id);
+            let logs: Vec<_> = (0..count)
+                .map(|index| SandboxLogLine {
+                    sandbox_id: "untrusted-id".to_string(),
+                    event_time: openshell_core::time::timestamp_from_millis(index).ok(),
+                    level: "INFO".to_string(),
+                    target: "reconnect-test".to_string(),
+                    message: format!("line {index}"),
+                    source: "gateway".to_string(),
+                    fields: HashMap::from([("index".to_string(), index.to_string())]),
+                })
+                .collect();
+            let expected: Vec<_> = logs
+                .iter()
+                .take(accepted_count)
+                .cloned()
+                .map(|mut log| {
+                    log.sandbox_id = sandbox_id.to_string();
+                    log.source = "sandbox".to_string();
+                    log
+                })
+                .collect();
+            let received_lines = logs.len();
+            let requests: Vec<_> = logs
+                .chunks(batch_size)
+                .map(|chunk| PushSandboxLogsRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    logs: chunk.to_vec(),
+                })
+                .collect();
+            client
+                .push_sandbox_logs(tokio_stream::iter(requests))
+                .await
+                .unwrap();
+
+            let received: Vec<_> = state
+                .tracing_log_bus
+                .tail(sandbox_id, 201)
+                .into_iter()
+                .map(|entry| {
+                    let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
+                        entry.event.payload
+                    else {
+                        panic!("expected a log event");
+                    };
+                    log
+                })
+                .collect();
+            assert_eq!(
+                received.len(),
+                expected.len(),
+                "gateway ingestion of {count} log lines in batches of {batch_size}"
+            );
+            assert_eq!(
+                received, expected,
+                "{count} log lines, batches of {batch_size}"
+            );
+
+            let warnings: Vec<serde_json::Value> = std::fs::read_to_string(diagnostics.path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let emitted = &warnings[seen_warnings..];
+            assert_eq!(emitted.len(), usize::from(received_lines > accepted_count));
+            if let Some(warning) = emitted.first() {
+                assert_eq!(warning["level"], "WARN");
+                assert_eq!(
+                    warning["fields"],
+                    serde_json::json!({
+                        "message": "Truncated sandbox log batch",
+                        "sandbox_id": sandbox_id,
+                        "received_lines": received_lines,
+                        "accepted_lines": accepted_count,
+                        "dropped_lines": received_lines - accepted_count,
+                    })
+                );
+            }
+            seen_warnings = warnings.len();
+        }
+        server.abort();
     }
 
     #[test]
@@ -21586,8 +21757,10 @@ mod tests {
         assert_eq!(events.len(), 2);
         for event in &events {
             assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
-            assert_eq!(event["container"]["uid"], "sb-123");
-            assert!(event["container"].get("image").is_none());
+            assert_eq!(event["unmapped"]["sandbox_id"], "sb-123");
+            assert!(event.get("container").is_none());
+            assert!(event["device"].get("container").is_none());
+            assert_eq!(event["unmapped"]["sandbox_name"], "demo-sandbox");
         }
         assert_eq!(events[0]["unmapped"]["policy_hash"], "sha256:manual");
         assert!(events[0]["unmapped"].get("auto").is_none());
@@ -21698,7 +21871,7 @@ mod tests {
         let rejected = rejected_events(&events);
         assert_eq!(rejected.len(), 1, "events: {events:?}");
         let event = rejected[0];
-        assert_eq!(event["container"]["uid"], "sb-reject-audit");
+        assert_eq!(event["unmapped"]["sandbox_id"], "sb-reject-audit");
         assert_eq!(event["unmapped"]["chunk_id"], chunk_id);
         assert_eq!(
             event["unmapped"]["rejection_reason"],

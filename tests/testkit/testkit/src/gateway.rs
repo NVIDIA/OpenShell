@@ -85,7 +85,7 @@ impl Gateway {
         )
     }
 
-    fn from_endpoint(endpoint: String, workspace: String) -> Self {
+    pub(crate) fn from_endpoint(endpoint: String, workspace: String) -> Self {
         Self {
             name: None,
             endpoint,

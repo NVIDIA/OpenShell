@@ -172,6 +172,7 @@ impl WireMessage for w::AgentSpecWire {
                 nanos: 0,
             }),
             interactive: self.interactive,
+            otlp_relay_active: self.otlp_relay_active,
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
@@ -185,6 +186,7 @@ impl WireMessage for w::AgentSpecWire {
             workdir: v.workdir,
             timeout_secs: u64::try_from(timeout.seconds).map_err(invalid)?,
             interactive: v.interactive,
+            otlp_relay_active: v.otlp_relay_active,
         })
     }
 }
@@ -921,6 +923,24 @@ mod tests {
         let changed = w::RequestEnvelope::from_proto(value).unwrap();
         assert_eq!(changed.request_id, request.request_id);
         assert_ne!(changed.payload_digest, request.payload_digest);
+    }
+
+    #[test]
+    fn agent_spec_carries_the_otlp_relay_flag() {
+        let mut spec = w::AgentSpecWire {
+            program: "/bin/true".into(),
+            args: vec![],
+            workdir: None,
+            timeout_secs: 0,
+            interactive: false,
+            otlp_relay_active: false,
+        };
+        let inactive = spec.to_proto().unwrap();
+        assert_eq!(w::AgentSpecWire::from_proto(inactive).unwrap(), spec);
+
+        spec.otlp_relay_active = true;
+        let decoded = w::AgentSpecWire::from_proto(spec.to_proto().unwrap()).unwrap();
+        assert!(decoded.otlp_relay_active);
     }
 
     #[test]

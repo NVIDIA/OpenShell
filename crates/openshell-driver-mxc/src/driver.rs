@@ -684,8 +684,10 @@ async fn run_lifecycle_inner(
         .map_err(|error| format!("write MXC boundary TLS certificate: {error}"))?;
     std::fs::write(&tls_key_path, tls.private_key_pem.as_bytes())
         .map_err(|error| format!("write MXC boundary TLS private key: {error}"))?;
-    let proxy_password =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let proxy_password = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        openshell_crypto::random_bytes::<32>()
+            .map_err(|error| format!("generate MXC proxy credential: {error}"))?,
+    );
     let authorization = format!(
         "Basic {}",
         base64::engine::general_purpose::STANDARD

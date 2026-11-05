@@ -21,6 +21,7 @@ use openshell_isolation_interface::contract::{
     ProviderEnvironmentInstallation, ProvisioningEvidence, ResolvedWorkloadIdentity,
     SandboxContext, TcpOpenDecision,
 };
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -688,10 +689,12 @@ impl super::BoundaryTransportConnector for Connector {
 fn client(peer: Peer) -> Arc<BoundaryClient> {
     let session_id = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
     let material = w::generate_sandbox_tls_material(session_id).unwrap();
-    let certs = rustls_pemfile::certs(&mut material.certificate_chain_pem.as_bytes())
+    let certs = CertificateDer::pem_reader_iter(&mut material.certificate_chain_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let key = rustls_pemfile::private_key(&mut material.private_key_pem.as_bytes())
+    let key = PrivateKeyDer::pem_reader_iter(&mut material.private_key_pem.as_bytes())
+        .next()
+        .transpose()
         .unwrap()
         .unwrap();
     let mut config = openshell_crypto::tls::server_builder()

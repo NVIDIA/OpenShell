@@ -63,6 +63,8 @@ with its reverse-TCP transport and native audit checker. Keep typed protocol
 negotiation, authenticated boundary opening, per-stream handle binding, and the
 Attach/Confirm policy equality check before StartAgent. Do not advertise MXC
 suspend/resume or supervisor takeover until implemented.
+MXC also rejects an active sandbox agent OTLP relay until its workload routing
+is implemented; keep agent relay export disabled for native MXC.
 Use `BackendSetup` / `PreparedBackend` for launch decoding,
 policy discovery, and client construction. Shared startup must not decode the
 MXC descriptor or allocate its connector. Retain the same reverse-TCP connector
@@ -118,11 +120,7 @@ did not request.
 
 In scope:
 
-<<<<<<< HEAD
-- Refreshing a Windows checkout to the latest upstream GitHub `windows`.
-=======
 - Refreshing a local checkout to the latest upstream GitHub `windows` branch.
->>>>>>> github-live/windows
 - Maintaining `tasks/windows.toml` and `tasks/scripts/windows-msvc.ps1`.
 - Running x64 and ARM64 MSVC checks.
 - Building x64 and ARM64 release binaries for `openshell-gateway`, `openshell`,
@@ -240,10 +238,9 @@ exclusive on a single host (each rejects the other architecture -- see the
 table below): run `windows:test:mxc-real:x64` on an x64 host, or
 `windows:test:mxc-real:arm64` on an ARM64 host, as part of validating this
 subsystem -- run the one matching your host architecture, not both, and not
-neither. Both are skip-safe (they print a SKIP reason and exit 0 when
-`wxc-exec` or the matching backend isn't available), so running the
-arch-appropriate task is always safe even without real MXC hardware. Neither
-is part of `windows:ci`'s ordered contract, so invoke it explicitly.
+neither. Contract and fence checks can report `SKIP` when the executor or backend is unavailable; strict network qualification fails when prerequisites are missing. Report skips separately from passed tests. Neither task is part of `windows:ci`'s ordered contract, so invoke it explicitly.
+The task builds the native forwarding fixture first because network qualification
+calls the E2E harness directly, outside its mise dependencies.
 
 For full validation, detect the Windows host architecture first and choose the
 native lane dynamically:
@@ -350,13 +347,8 @@ crypto dependency builds.
 | `windows:check:arm64` | `cargo check --workspace` for `aarch64-pc-windows-msvc`, with the same top-level exclusions. |
 | `windows:build:x64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, and `openshell-windows-sandbox.exe` for x64. |
 | `windows:build:arm64` | Release-builds the same four binaries for ARM64. |
-<<<<<<< HEAD
-| `windows:test:x64` | Runs native x64 workspace tests with the nextest CI profile and server test-support feature, excluding unsupported Windows packages as top-level workspace targets. |
-| `windows:test:arm64` | Runs native ARM64 workspace tests with the nextest CI profile, server test support, and the same package exclusions. Rejects non-ARM64 hosts. |
-=======
 | `windows:test:x64` | Runs `cargo nextest run --profile ci --workspace` natively on x64 with `openshell-server/test-support` and the selected Z3 features; excludes unsupported Windows packages as top-level workspace targets. The profile disables fail-fast. |
 | `windows:test:arm64` | Runs the same Nextest CI profile and test-support features natively on ARM64, with the same package exclusions. Rejects non-ARM64 hosts. |
->>>>>>> github-live/windows
 | `windows:test:unsupported:x64` | Re-runs focused `openshell-gateway` tests for unsupported Windows driver behavior. |
 | `windows:test:unsupported:arm64` | Re-runs the same focused contracts natively on ARM64. Rejects non-ARM64 hosts. |
 | `windows:test:mxc-real:x64` | Runs the serial, ignored real-`wxc-exec` integration suite natively on x64 through the MSVC wrapper. Rejects non-x64 hosts. |
