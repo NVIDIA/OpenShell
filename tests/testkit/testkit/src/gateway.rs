@@ -21,9 +21,9 @@ use openshell_sdk::{ClientConfig, ClientIdentity, Health, OpenShellClient, Servi
 
 use crate::error::{Error, Result, ResultExt};
 
-pub const ENDPOINT_ENV: &str = "OPENSHELL_GATEWAY_ENDPOINT";
-pub const GATEWAY_ENV: &str = "OPENSHELL_GATEWAY";
-pub const WORKSPACE_ENV: &str = "OPENSHELL_WORKSPACE";
+pub(crate) const ENDPOINT_ENV: &str = "OPENSHELL_GATEWAY_ENDPOINT";
+pub(crate) const GATEWAY_ENV: &str = "OPENSHELL_GATEWAY";
+pub(crate) const WORKSPACE_ENV: &str = "OPENSHELL_WORKSPACE";
 const DEFAULT_WORKSPACE: &str = "default";
 
 // Mirrors the SDK's endpoint settings for channels testkit builds itself.

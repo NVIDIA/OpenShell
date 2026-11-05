@@ -4,10 +4,10 @@
 //! The images tests create sandboxes from or build their images on.
 
 /// Overrides [`DEFAULT_BASE_IMAGE`], e.g. with a mirror.
-pub const BASE_IMAGE_ENV: &str = "OPENSHELL_TEST_BASE_IMAGE";
+const BASE_IMAGE_ENV: &str = "OPENSHELL_TEST_BASE_IMAGE";
 /// OpenShell's built-in default sandbox image. Pulling it needs access to
 /// nvcr.io.
-pub const DEFAULT_BASE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
+const DEFAULT_BASE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 
 /// Overrides [`DEFAULT_PYTHON_IMAGE`].
 const PYTHON_IMAGE_ENV: &str = "OPENSHELL_TEST_PYTHON_IMAGE";
