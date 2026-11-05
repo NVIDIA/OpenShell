@@ -89,10 +89,6 @@ OpenShell checks network traffic in two stages:
    For example, with `protocol: rest`, a rule can allow `GET` requests to an API
    while blocking `POST` and `DELETE` requests.
 
-Transparent TCP connections to IPv4-mapped IPv6 addresses, such as
-`::ffff:203.0.113.7`, use the same destination rules as the equivalent IPv4
-address, `203.0.113.7`.
-
 The second stage is called request inspection, and an endpoint that uses it is
 an inspected endpoint. The `protocol` field selects what OpenShell inspects:
 
@@ -105,6 +101,9 @@ an inspected endpoint. The `protocol` field selects what OpenShell inspects:
 | `json-rpc` | JSON-RPC method name. | [JSON-RPC rules](/how-it-works/policies/schema#json-rpc-rules) |
 | `tcp` | No request rules. Use it for clients that speak a protocol other than HTTP, such as databases. | [Native TCP](#allow-native-tcp) |
 | Omitted | No request rules. | -- |
+
+Connections to IPv4-mapped IPv6 addresses, such as `::ffff:203.0.113.7`, use the
+same destination rules as the equivalent IPv4 address, `203.0.113.7`.
 
 When `protocol` is omitted, OpenShell allows any method and path. Unless the
 endpoint sets `tls: skip`, it still terminates TLS and rejects HTTP requests

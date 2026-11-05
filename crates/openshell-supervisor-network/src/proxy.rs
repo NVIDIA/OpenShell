@@ -7901,18 +7901,22 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
     #[tokio::test]
     async fn metadata_staging_requires_verified_identity_without_egress_rules() {
+        for destination in [
+            openshell_core::google_cloud::METADATA_LOOPBACK_ADDR,
+            "[::ffff:127.0.0.1]:8174",
+        ] {
+            assert_metadata_staging(destination.parse().unwrap()).await;
+        }
+    }
+
+    async fn assert_metadata_staging(destination: SocketAddr) {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
             "network_policies: {}",
         )
         .unwrap();
         for valid_identity in [true, false] {
-            let (mut open, completion) = staged_curl_open(
-                openshell_core::google_cloud::METADATA_LOOPBACK_ADDR
-                    .parse()
-                    .unwrap(),
-                engine.current_generation(),
-            );
+            let (mut open, completion) = staged_curl_open(destination, engine.current_generation());
             if !valid_identity {
                 open.binary_identity = Err(ResolveError::Failed("unavailable".into()));
             }
@@ -8347,6 +8351,13 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
 
     #[tokio::test]
     async fn staged_policy_local_open_reaches_the_sandbox_scoped_api() {
+        let addr = crate::policy_dns::POLICY_LOCAL_ADDRESS;
+        for ip in [IpAddr::V4(addr), IpAddr::V6(addr.to_ipv6_mapped())] {
+            assert_policy_local_open_served(SocketAddr::new(ip, 80)).await;
+        }
+    }
+
+    async fn assert_policy_local_open_served(destination: SocketAddr) {
         let engine = Arc::new(
             native_identity_engine(
                 include_str!("../data/sandbox-policy.rego"),
@@ -8368,7 +8379,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         let pending = PendingTcpOpen {
             stream: Box::new(stream),
             binary_identity: Ok(identity.clone()),
-            destination: SocketAddr::from((crate::policy_dns::POLICY_LOCAL_ADDRESS, 80)),
+            destination,
             socket: Some(
                 openshell_isolation_interface::contract::NetworkSocketMetadata {
                     socket_cookie: 7,
