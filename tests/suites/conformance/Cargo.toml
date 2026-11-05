@@ -21,9 +21,12 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+base64 = "0.22"
+openshell-policy = { path = "../../../crates/openshell-policy" }
 openshell-testkit = { path = "../../testkit/testkit" }
 serde_json = "1"
+sha1 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "time"] }
 
 [workspace]

@@ -14,6 +14,7 @@ nextest run the tests as the library's unit tests. The crate also builds the
 | `persistent-workspace` | Files in `/sandbox` survive stop and start |
 | `policy-advisor` | `policy.local` accepts a proposed rule; a denied address or hostname yields one draft rule |
 | `file-transfer` | `sandbox upload` and `download`: round trips, `.gitignore` filtering, workspace-escape and option-looking names |
+| `credential-gating` | Provider credentials: admission of credentialed endpoints, REST body placeholders and rewriting, WebSocket binary frames, live policy binding |
 
 `smoke` is the smallest end-to-end check that the runner can run a real test in a
 tmachine environment on CI. The other suites are ports of the old
@@ -21,7 +22,11 @@ tmachine environment on CI. The other suites are ports of the old
 (credited in each file). `file-transfer` runs `git` on the machine that runs the
 tests, so a test environment needs it installed
 (`tests/tmachine/ansible/playbooks/test-tools.yaml` does that for the tmachine
-environments).
+environments). `credential-gating`, ported from NVIDIA/OpenShell#5264, starts
+servers on the machine that runs the tests and reaches them from sandboxes
+created from `testkit::python_image()` through `host.openshell.internal`, so
+it fails against a gateway whose sandboxes can't reach that machine, such as
+a remote Kubernetes cluster.
 
 ## Running it
 
