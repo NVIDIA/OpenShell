@@ -522,7 +522,11 @@ openshell sandbox start [name]
 Both commands default to the last-used sandbox. Stop stops background
 forwards and waits for `Stopped`; start waits for `Ready`. Connect, exec,
 file transfer, forwarding, and exposed services are unavailable while
-stopped or completed. Starting a retained `Completed` or
+stopped. After the main process of a retained sandbox exits (`Completed`, or
+`Error` with `MainProcessFailed`), exec, file transfer, forwarding, and
+exposed services keep working while the supervisor stays connected. `connect`
+fails because the main process has exited; use `sandbox exec --tty` for a shell. `--no-keep` sandboxes are
+deleted once the main process exits. Starting a retained `Completed` or
 `Error/MainProcessFailed` sandbox launches a fresh canonical-main instance and
 invalidates SSH sessions from the previous runtime generation. Delete remains
 the operation that removes retained state.

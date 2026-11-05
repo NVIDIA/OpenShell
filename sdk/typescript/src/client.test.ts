@@ -2236,16 +2236,32 @@ describe('forward', () => {
     expect(revokedToken).toBe('fwd-tok');
   });
 
-  it('rejects when the sandbox is not ready', async () => {
+  it('rejects when the sandbox is stopped', async () => {
     const sandbox = client({
       getSandbox: () => ({
         sandbox: {
           metadata: { id: 'sb-id', name: 'sb' },
-          status: { phase: SandboxPhase.PROVISIONING },
+          status: { phase: SandboxPhase.STOPPED },
         },
       }),
     });
     await expect(sandbox.forward('sb', { targetPort: 9000 })).rejects.toMatchObject({ code: 'connect' });
+  });
+
+  it('leaves a completed sandbox to the gateway', async () => {
+    // A retained sandbox keeps its access plane after the main process exits;
+    // the gateway checks each forwarded connection.
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb' },
+          status: { phase: SandboxPhase.COMPLETED, exitCode: 0 },
+        },
+      }),
+    });
+    const handle = await sandbox.forward('sb', { targetPort: 9000 });
+    await handle.close();
+    await handle.closed;
   });
 
   // Backpressure (fix #6): the sandbox->local relay must stop pulling gRPC
