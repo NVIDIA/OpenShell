@@ -4643,6 +4643,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "windows",
 ]
 
 [[package]]
@@ -5011,6 +5012,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows",
  "wiremock",
  "x509-parser",
 ]

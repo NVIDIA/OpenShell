@@ -89,7 +89,7 @@ pub(crate) fn install_jsonwebtoken_crypto_provider() {
 }
 
 use compute::ComputeRuntime;
-use gateway_listener::{BoundGatewayListener, bind_gateway_listener};
+use gateway_listener::{BoundGatewayListener, bind_gateway_listener, disable_handle_inheritance};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 
@@ -854,6 +854,7 @@ pub(crate) async fn run_server(
                 "failed to bind health port {health_bind_address}: {e}"
             ))
         })?;
+        disable_handle_inheritance(&health_listener, "health");
         info!(address = %health_bind_address, "Health server listening");
         // `health_router` returns immediately; the listener serves
         // `Initializing → 503` until the background monitor publishes the
@@ -880,6 +881,7 @@ pub(crate) async fn run_server(
                 "failed to bind metrics port {metrics_bind_address}: {e}",
             ))
         })?;
+        disable_handle_inheritance(&metrics_listener, "metrics");
         info!(address = %metrics_bind_address, "Metrics server listening");
         tokio::spawn(async move {
             if let Err(e) = axum::serve(
