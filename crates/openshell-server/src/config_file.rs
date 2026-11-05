@@ -1309,7 +1309,12 @@ pub enum ConfigFileError {
     /// Names the location and the parser's message but never quotes the
     /// file, which can hold credentials such as collector headers.
     #[error("failed to parse gateway config file '{}': {detail}", path.display())]
-    Parse { path: PathBuf, detail: String },
+    Parse {
+        path: PathBuf,
+        detail: String,
+        /// Safe key/location suffix for preflight, which omits parser messages.
+        unknown_field: String,
+    },
     #[error(
         "gateway config schema version is required; add `[openshell]` and `version = {SCHEMA_VERSION}`"
     )]
@@ -1358,18 +1363,21 @@ pub enum ConfigFileError {
 
 const CONFIG_MIGRATION_URL: &str = "https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#migrate-to-schema-version-2";
 
-/// Stable package-preflight failure with no configuration contents attached.
+/// Stable package-preflight failure that never echoes configuration values.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "gateway config preflight failed: path='{}' category={} detected_version={}; the file was preserved unchanged; migrate it before restarting the gateway: {CONFIG_MIGRATION_URL}",
+    "gateway config preflight failed: path='{}' category={} detected_version={}{}; the file was preserved unchanged; migrate it before restarting the gateway: {CONFIG_MIGRATION_URL}",
     path.display(),
     category,
-    detected_version
+    detected_version,
+    unknown_field
 )]
 pub struct ConfigPreflightError {
     path: PathBuf,
     category: &'static str,
     detected_version: String,
+    /// Location of an unknown key, never its value.
+    unknown_field: String,
 }
 
 impl ConfigPreflightError {
@@ -1378,6 +1386,7 @@ impl ConfigPreflightError {
             path: path.to_path_buf(),
             category: "malformed",
             detected_version: SCHEMA_VERSION.to_string(),
+            unknown_field: String::new(),
         }
     }
 
@@ -1494,6 +1503,7 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
     let file: ConfigFile = toml::from_str(contents).map_err(|error| ConfigFileError::Parse {
         path: path.to_path_buf(),
         detail: parse_error_detail(contents, &error),
+        unknown_field: unknown_field(contents, &error),
     })?;
 
     match file.openshell.version {
@@ -1688,6 +1698,36 @@ fn preflight_error(
         path: path.to_path_buf(),
         category,
         detected_version,
+        unknown_field: match source {
+            ConfigFileError::Parse { unknown_field, .. } => unknown_field,
+            _ => String::new(),
+        },
+    }
+}
+
+/// Names an unknown key and its line. Quoted keys can hold arbitrary text, so
+/// only a bare key is echoed.
+fn unknown_field(contents: &str, error: &toml::de::Error) -> String {
+    let Some(span) = error.span() else {
+        return String::new();
+    };
+    let Some(before) = contents.get(..span.start) else {
+        return String::new();
+    };
+    if !error.message().starts_with("unknown field `") {
+        return String::new();
+    }
+    let line = before.matches('\n').count() + 1;
+    match contents.get(span) {
+        Some(key)
+            if !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) =>
+        {
+            format!(" unknown_field={key} line={line}")
+        }
+        _ => format!(" unknown_field line={line}"),
     }
 }
 
@@ -3527,6 +3567,48 @@ ssh_gateway_port = 8080
             assert!(!diagnostic.contains("secret-value"));
             assert!(!format!("{error:?}").contains("secret-value"));
             assert!(std::error::Error::source(&error).is_none());
+        }
+    }
+
+    #[test]
+    fn preflight_names_unknown_bare_key_without_disclosing_values() {
+        for contents in [
+            "[openshell]\nversion = 2\n\n[openshell.gateway]\nguest_tls_cert = 'secret-value'\n",
+            "[openshell]\r\nversion = 2\r\n# π\r\n[openshell.gateway]\r\nguest_tls_cert = 'secret-value'\r\n",
+        ] {
+            let tmp = write_raw_tmp(contents);
+            let error = preflight(tmp.path()).expect_err("removed key must fail preflight");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("category=malformed"), "{diagnostic}");
+            assert!(
+                diagnostic.contains("unknown_field=guest_tls_cert line=5"),
+                "{diagnostic}"
+            );
+            assert!(!diagnostic.contains("secret-value"), "{diagnostic}");
+            assert!(!format!("{error:?}").contains("secret-value"));
+            assert!(std::error::Error::source(&error).is_none());
+            assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), contents);
+        }
+
+        // A quoted key can hold arbitrary text, so only its line is reported.
+        for key in [
+            "'secret'",
+            r#""secret""#,
+            "'secret key'",
+            r#""secret\nkey""#,
+            r#""secret\u001bkey""#,
+        ] {
+            let contents =
+                format!("[openshell]\nversion = 2\n[openshell.gateway]\n{key} = 'secret-value'\n");
+            let tmp = write_raw_tmp(&contents);
+            let error = preflight(tmp.path()).expect_err("unknown quoted key must fail preflight");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("unknown_field line=4"), "{diagnostic}");
+            assert!(!diagnostic.contains("secret"), "{diagnostic}");
+            assert!(!diagnostic.contains('\u{1b}'), "{diagnostic}");
+            assert!(!format!("{error:?}").contains("secret"));
+            assert!(std::error::Error::source(&error).is_none());
+            assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), contents);
         }
     }
 
