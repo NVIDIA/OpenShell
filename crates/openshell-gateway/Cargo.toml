@@ -38,6 +38,7 @@ tracing = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 openshell-driver-mxc = { path = "../openshell-driver-mxc", optional = true }
+windows = { workspace = true, features = ["Win32_System_JobObjects"] }
 
 [features]
 default = ["telemetry", "in-tree-compute-drivers"]

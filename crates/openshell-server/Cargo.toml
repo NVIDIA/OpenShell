@@ -116,6 +116,10 @@ x509-parser = "0.16"
 arc-swap = "1"
 notify = "8"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Clears the handle-inherit flag on the gateway's listening sockets (see gateway_listener.rs).
+windows = { workspace = true }
+
 [features]
 default = ["telemetry"]
 ## Compile in anonymous telemetry emission (forwards to openshell-core/telemetry).
