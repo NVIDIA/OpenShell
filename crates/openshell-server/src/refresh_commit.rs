@@ -10,6 +10,7 @@ use openshell_core::proto::Provider;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_credential_issuer::refresh::{
     GatewayRefreshCommit, RefreshAttempt, RefreshChange, RefreshCommitSink, RefreshOutputs,
+    RefreshStateStore,
 };
 use openshell_credential_issuer::{Handles, SecretOwner};
 use tonic::Status;
@@ -21,6 +22,7 @@ use crate::persistence::Store;
 pub struct ServerRefreshCommit {
     pub store: Arc<Store>,
     pub compute: Option<ComputeRuntime>,
+    pub refresh_store: Arc<dyn RefreshStateStore>,
 }
 
 struct ProviderAttempt {
@@ -90,6 +92,9 @@ impl RefreshAttempt for ProviderAttempt {
         };
         crate::grpc::provider::validate_provider_update_against_attached_sandboxes(
             &self.integration.store,
+            crate::provider_refresh::RefreshStateReader::CommitStore(
+                self.integration.refresh_store.as_ref(),
+            ),
             workspace,
             &updated,
         )
@@ -168,6 +173,7 @@ mod tests {
         let adapter = ServerRefreshCommit {
             store: Arc::clone(&store),
             compute: None,
+            refresh_store: Arc::new(crate::refresh_store::ServerRefreshStore(Arc::clone(&store))),
         };
         let attempt = adapter.observe("default", "provider").await.unwrap();
         store

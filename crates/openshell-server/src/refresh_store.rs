@@ -101,18 +101,6 @@ async fn persist_refresh_state_if_current(
     }
 }
 
-pub async fn replace_refresh_state_if_current(
-    store: &Store,
-    state: &StoredProviderCredentialRefreshState,
-    expected_version: u64,
-) -> Result<bool, Status> {
-    Ok(
-        persist_refresh_state_if_current(store, state, expected_version)
-            .await?
-            .is_some(),
-    )
-}
-
 pub async fn list_refresh_states_for_provider(
     store: &Store,
     provider_id: &str,

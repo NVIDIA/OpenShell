@@ -5,10 +5,8 @@
 #![allow(clippy::result_large_err)]
 use crate::credentials::{CredentialRuntime, RefreshMaterialScope};
 use crate::persistence::{Store, current_time_ms};
-pub use crate::refresh_store::{
-    create_refresh_state, get_refresh_state, list_refresh_states_for_provider,
-    replace_refresh_state_if_current,
-};
+#[cfg(test)]
+pub use crate::refresh_store::{get_refresh_state, list_refresh_states_for_provider};
 #[cfg(test)]
 pub use crate::refresh_store::{list_all_refresh_states, put_refresh_state};
 use crate::storage_proto::{
@@ -25,7 +23,7 @@ pub use openshell_credential_issuer::refresh::minter::{
     strategy_secret_material_keys,
 };
 use openshell_credential_issuer::refresh::{
-    CredentialRefresh, RefreshCommitSink, RefreshRuntime, RefreshState,
+    CredentialRefresh, RefreshCommitSink, RefreshRuntime, RefreshState, RefreshStateStore,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,12 +39,15 @@ pub fn runtime(
     credentials: Option<&CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
 ) -> RefreshRuntime {
+    let refresh_store: Arc<dyn RefreshStateStore> =
+        Arc::new(crate::refresh_store::ServerRefreshStore(Arc::clone(store)));
     RefreshRuntime::new(
-        Arc::new(crate::refresh_store::ServerRefreshStore(Arc::clone(store))),
+        Arc::clone(&refresh_store),
         credentials.map(CredentialRuntime::issuer),
         Arc::new(crate::refresh_commit::ServerRefreshCommit {
             store: Arc::clone(store),
             compute: compute.cloned(),
+            refresh_store,
         }),
     )
 }
@@ -244,33 +245,53 @@ pub fn enqueue_pending_secret_deletion(
             handle: Some(handle),
         });
 }
+/// Read-only adaptation for gateway validation. Ordinary callers use the shared
+/// refresh service; the temporary provider-commit adapter borrows its injected
+/// store port, avoiding an ownership cycle back into the refresh runtime.
+#[derive(Clone, Copy)]
+pub enum RefreshStateReader<'a> {
+    Runtime(&'a dyn CredentialRefresh),
+    CommitStore(&'a dyn RefreshStateStore),
+}
+impl RefreshStateReader<'_> {
+    pub async fn list(
+        self,
+        provider_id: &str,
+    ) -> Result<Vec<StoredProviderCredentialRefreshState>, Status> {
+        let states = match self {
+            Self::Runtime(refresh) => refresh.list(Some(provider_id)).await?,
+            Self::CommitStore(store) => store.list(Some(provider_id)).await?,
+        };
+        Ok(states.iter().map(Into::into).collect())
+    }
+}
+
 pub async fn delete_observed_refresh_state_with_credentials(
-    store: &Store,
-    credentials: &CredentialRuntime,
+    refresh: &dyn CredentialRefresh,
     state: StoredProviderCredentialRefreshState,
 ) -> Result<(), Status> {
-    runtime(&Arc::new(store.clone()), Some(credentials), None)
-        .delete((&state).into())
-        .await
+    refresh.delete((&state).into()).await
 }
 pub async fn delete_refresh_states_for_provider_with_credentials(
-    store: &Store,
-    credentials: &CredentialRuntime,
+    refresh: &dyn CredentialRefresh,
     provider_id: &str,
 ) -> Result<u64, Status> {
-    let runtime = runtime(&Arc::new(store.clone()), Some(credentials), None);
-    let states = runtime.list(Some(provider_id)).await?;
+    let states = refresh.list(Some(provider_id)).await?;
     let mut deleted = 0;
     for state in states {
-        if let Some(latest) = runtime
+        if let Some(latest) = refresh
             .get(state.object_workspace(), provider_id, &state.credential_key)
             .await?
         {
-            runtime.delete(latest).await?;
+            refresh.delete(latest).await?;
             deleted += 1;
         }
     }
     Ok(deleted)
+}
+#[cfg(test)]
+pub fn test_runtime(store: &Store) -> RefreshRuntime {
+    runtime(&Arc::new(store.clone()), None, None)
 }
 pub fn publish_change(state: &Arc<crate::ServerState>, refresh: &RefreshState) {
     crate::refresh_commit::ServerRefreshCommitSink(state).notify(
@@ -388,6 +409,9 @@ async fn apply_minted_credential(
     let integration = crate::refresh_commit::ServerRefreshCommit {
         store: Arc::new(store.clone()),
         compute: compute.cloned(),
+        refresh_store: Arc::new(crate::refresh_store::ServerRefreshStore(Arc::new(
+            store.clone(),
+        ))),
     };
     let attempt = integration
         .observe(workspace, provider.object_name())
@@ -2787,9 +2811,16 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        delete_observed_refresh_state_with_credentials(&store, &test_credentials(), observed)
-            .await
-            .unwrap();
+        delete_observed_refresh_state_with_credentials(
+            &super::runtime(
+                &std::sync::Arc::new(store.clone()),
+                Some(&test_credentials()),
+                None,
+            ),
+            observed,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             store
                 .get_message::<StoredProviderCredentialRefreshState>("replacement-id")

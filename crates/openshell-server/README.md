@@ -203,6 +203,12 @@ export-triggered refresh does not publish. The issuer is still embedded: stable
 reference/version migration must remove the temporary provider commit port before
 remote refresh.
 
+Gateway configuration, status, deletion, export revalidation, and snapshot reads
+use the shared `CredentialRefresh` interface. Deletion does not construct a local
+runtime. The temporary provider-commit adapter uses the same injected
+`RefreshStateStore` for attachment-validation reads, avoiding a runtime ownership
+cycle; neither path calls gateway refresh-persistence helpers directly.
+
 The shared runtime preserves these guarantees:
 
 - A process-local weak keyed mutex coalesces waiters without retaining deleted
