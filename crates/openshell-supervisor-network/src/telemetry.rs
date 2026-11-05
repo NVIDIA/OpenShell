@@ -38,6 +38,7 @@ pub fn emit(event: OcsfEvent, parent: Option<&tracing::Span>) {
 
 /// Emit all records of one synchronous decision under one deny span. Different
 /// decisions remain separate, even when they concern the same connection.
+#[allow(clippy::disallowed_macros)]
 pub fn emit_decision(events: impl IntoIterator<Item = OcsfEvent>, parent: Option<&tracing::Span>) {
     let events: Vec<_> = events.into_iter().collect();
     let denied = events.iter().any(is_denied);
