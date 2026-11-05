@@ -6563,12 +6563,32 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.remove(sandbox_id);
     }
 
+    /// Lifecycle gate for a sweep that observes a `Starting` sandbox.
+    ///
+    /// `StartSandbox` holds the gate for the whole driver call, during which
+    /// the workload can still show its previous exit. The sweep skips the
+    /// sandbox (`Err`) instead of waiting, and the next tick or watch event
+    /// reports the settled state. The sweep holds the gate while it polls.
+    fn sweep_start_gate(
+        &self,
+        record: &ObjectRecord,
+    ) -> Result<Option<SandboxLifecycleGuard>, String> {
+        let sandbox = decode_sandbox_record(record)?;
+        if sandbox.phase() != SandboxPhase::Starting as i32 {
+            return Ok(None);
+        }
+        self.lifecycle_gates
+            .try_lock_for(sandbox.object_id())
+            .map(Some)
+            .ok_or_else(|| "start in progress".to_string())
+    }
+
     async fn reconcile_snapshot_sandbox(
         &self,
         snapshot: DriverSandbox,
         sweep_started_at_ms: i64,
     ) -> Result<(), String> {
-        let expected_resource_version = {
+        let (expected_resource_version, _start_gate) = {
             let _guard = self.lock_sandbox_local(&snapshot.id).await;
             let Some(existing) = self
                 .store
@@ -6582,7 +6602,10 @@ impl ComputeRuntime {
             if existing.updated_at_ms > sweep_started_at_ms {
                 return Ok(());
             }
-            existing.resource_version
+            let Ok(start_gate) = self.sweep_start_gate(&existing) else {
+                return Ok(());
+            };
+            (existing.resource_version, start_gate)
         };
 
         let Some(current) = self
@@ -6617,7 +6640,7 @@ impl ComputeRuntime {
         sweep_started_at_ms: i64,
         grace_ms: i64,
     ) -> Result<(), String> {
-        let (sandbox_id, sandbox_name, expected_resource_version, age_ms) = {
+        let (sandbox_id, sandbox_name, expected_resource_version, age_ms, _start_gate) = {
             let _guard = self.lock_sandbox_local(&record.id).await;
             let Some(current_record) = self
                 .store
@@ -6645,12 +6668,16 @@ impl ComputeRuntime {
             if age_ms < grace_ms {
                 return Ok(());
             }
+            let Ok(start_gate) = self.sweep_start_gate(&current_record) else {
+                return Ok(());
+            };
 
             (
                 sandbox.object_id().to_string(),
                 sandbox.object_name().to_string(),
                 current_record.resource_version,
                 age_ms,
+                start_gate,
             )
         };
 
@@ -14068,16 +14095,12 @@ mod tests {
         );
     }
 
-    // Gateway side of the Podman start contract. The reconcile sweep applies
-    // polled snapshots without waiting for an in-progress start. While a start
-    // is in progress, the Podman driver reports a stopped workload that still
-    // shows its previous exit as ContainerStarting. Such a snapshot keeps the
-    // sandbox Starting, and the start completes. This passes without the
-    // #5258 fix; the driver test
-    // polled_snapshot_during_restart_does_not_report_the_previous_exit covers
-    // the regression.
+    // Regression for #5258. The reconcile sweep polls the driver without
+    // waiting for a start, and a restarting workload still shows its previous
+    // exit until the driver starts it. The sweep skips a sandbox whose start
+    // holds the lifecycle gate; the settled state is reported afterwards.
     #[tokio::test]
-    async fn reconcile_snapshot_during_start_keeps_the_sandbox_starting() {
+    async fn reconcile_sweep_skips_a_sandbox_while_its_start_is_in_progress() {
         let driver = ControlledDriver::new();
         driver.block_start();
         let sandbox = sandbox_record(
@@ -14087,8 +14110,8 @@ mod tests {
         );
         let mut polled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
         polled.status = Some(make_driver_status(make_driver_condition(
-            "ContainerStarting",
-            "Container start in progress",
+            "ContainerExited",
+            "Container exited with code 0",
         )));
         driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(polled.clone())));
         let runtime = test_runtime(driver.clone()).await;
@@ -14122,13 +14145,6 @@ mod tests {
 
         driver.release_start();
         start.await.unwrap().unwrap();
-        let stored = runtime
-            .store
-            .get_message::<Sandbox>(sandbox.object_id())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
     }
 
     #[tokio::test]

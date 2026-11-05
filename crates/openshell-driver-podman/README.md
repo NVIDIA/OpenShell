@@ -131,17 +131,12 @@ the consumed sandbox bootstrap from a copy in the supervisor's private
 filesystem, verifies the fence, and starts the same pair. A failed supervisor
 start stops the workload. Delete removes the companion first, then the workload,
 channel, workspace, and driver-owned secrets. User-owned volumes are retained.
-The previous run's exit must not fail a restart. Watch ignores stop events that
-still show the exit recorded before the start. Until the start returns, polled
-snapshots report such a workload as starting. A new exit is still reported.
 
 Only workload containers appear in sandbox list/watch results. Readiness uses
 the supervisor's private health socket; there is no shell, legacy marker, or
 TCP-listener shortcut. Watch reconciliation and supervisor exit/removal events
-stop a running workload whose companion is unavailable. A restart starts the
-workload before its exited companion, so the companion exit that the start
-recorded is not contained until the start returns. The gateway also requires
-the authenticated supervisor session before publishing Ready.
+stop a running workload whose companion is unavailable. The gateway also
+requires the authenticated supervisor session before publishing Ready.
 
 ## Mounts, GPUs, and configuration
 

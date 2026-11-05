@@ -18,7 +18,7 @@ use openshell_core::proto::compute::v1::{
 };
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
@@ -43,103 +43,30 @@ pub type WatchStream =
 /// the sandbox from `Starting` to `Error`.
 #[derive(Clone, Debug, Default)]
 pub struct LifecycleEventFences {
-    state: Arc<Mutex<LifecycleFenceState>>,
-}
-
-#[derive(Debug, Default)]
-struct LifecycleFenceState {
-    previous_finished_at: HashMap<String, String>,
-    starts_in_progress: HashMap<String, InProgressStart>,
-}
-
-#[derive(Debug, Default)]
-struct InProgressStart {
-    /// The supervisor exit that the start observed before restarting it.
-    supervisor_finished_at: Option<String>,
-}
-
-/// Marks a sandbox start as in progress until it is dropped.
-#[must_use = "the start is only in progress while this guard is held"]
-pub struct StartInProgress {
-    fences: LifecycleEventFences,
-    sandbox_id: String,
-}
-
-impl Drop for StartInProgress {
-    fn drop(&mut self) {
-        self.fences
-            .lock()
-            .starts_in_progress
-            .remove(&self.sandbox_id);
-    }
+    previous_finished_at: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl LifecycleEventFences {
-    fn lock(&self) -> MutexGuard<'_, LifecycleFenceState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    pub fn begin_start(&self, sandbox_id: &str) -> StartInProgress {
-        self.lock()
-            .starts_in_progress
-            .insert(sandbox_id.to_string(), InProgressStart::default());
-        StartInProgress {
-            fences: self.clone(),
-            sandbox_id: sandbox_id.to_string(),
-        }
-    }
-
-    pub fn start_in_progress(&self, sandbox_id: &str) -> bool {
-        self.lock().starts_in_progress.contains_key(sandbox_id)
-    }
-
-    /// Record the supervisor exit that an in-progress start is about to
-    /// restart. See [`Self::supervisor_restart_in_progress`].
-    pub fn record_supervisor_restart(&self, sandbox_id: &str, finished_at: Option<&str>) {
-        if let Some(start) = self.lock().starts_in_progress.get_mut(sandbox_id) {
-            start.supervisor_finished_at = finished_at
-                .filter(|finished_at| !finished_at.is_empty())
-                .map(str::to_string);
-        }
-    }
-
-    /// Whether an exited supervisor is the one that the in-progress start is
-    /// restarting. A restart starts the workload before its supervisor, so the
-    /// workload must not be contained for that exit. Any other exit is.
-    pub fn supervisor_restart_in_progress(&self, sandbox_id: &str, state: &ContainerState) -> bool {
-        if !matches!(state.status.as_str(), "exited" | "stopped") {
-            return false;
-        }
-        let Some(finished_at) = state.finished_at.as_deref() else {
-            return false;
-        };
-        self.lock()
-            .starts_in_progress
-            .get(sandbox_id)
-            .and_then(|start| start.supervisor_finished_at.as_deref())
-            .is_some_and(|recorded| recorded == finished_at)
-    }
-
     pub fn record_previous_exit(&self, sandbox_id: &str, finished_at: Option<&str>) {
-        let mut state = self.lock();
+        let mut fences = self
+            .previous_finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match finished_at.filter(|finished_at| !finished_at.is_empty()) {
             Some(finished_at) => {
-                state
-                    .previous_finished_at
-                    .insert(sandbox_id.to_string(), finished_at.to_string());
+                fences.insert(sandbox_id.to_string(), finished_at.to_string());
             }
             None => {
-                state.previous_finished_at.remove(sandbox_id);
+                fences.remove(sandbox_id);
             }
         }
     }
 
     pub fn remove(&self, sandbox_id: &str) {
-        let mut state = self.lock();
-        state.previous_finished_at.remove(sandbox_id);
-        state.starts_in_progress.remove(sandbox_id);
+        self.previous_finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(sandbox_id);
     }
 
     fn matches_previous_exit(
@@ -157,36 +84,11 @@ impl LifecycleEventFences {
         let Some(finished_at) = state.finished_at.as_deref() else {
             return false;
         };
-        self.lock()
-            .previous_finished_at
+        self.previous_finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(sandbox_id)
             .is_some_and(|previous| previous == finished_at)
-    }
-
-    /// Whether a polled workload that the container list reported as not
-    /// running is still starting rather than failed.
-    ///
-    /// The gateway's reconcile sweep polls sandboxes without waiting for an
-    /// in-progress start. Until the start runs the workload again, inspect
-    /// still shows the exit recorded before the start, and the workload can
-    /// also be running again by the time it is inspected. Neither is a failure
-    /// of the new run. An exit with a different `FinishedAt` is, and once the
-    /// start has returned every exit is reported.
-    pub fn polled_workload_still_starting(&self, sandbox_id: &str, state: &ContainerState) -> bool {
-        let fences = self.lock();
-        if !fences.starts_in_progress.contains_key(sandbox_id) {
-            return false;
-        }
-        match state.status.as_str() {
-            "running" => true,
-            "exited" | "stopped" => state.finished_at.as_deref().is_some_and(|finished_at| {
-                fences
-                    .previous_finished_at
-                    .get(sandbox_id)
-                    .is_some_and(|previous| previous == finished_at)
-            }),
-            _ => false,
-        }
     }
 }
 
@@ -247,7 +149,7 @@ pub async fn start_watch(
         // health check status — matching the same condition derivation used
         // for live events.
         if entry.state == "running" {
-            match inspect_workload(&client, &lifecycle_event_fences, &entry.id).await {
+            match inspect_workload(&client, &entry.id).await {
                 Ok(inspect) => {
                     if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
                         if tx.send(Ok(sandbox_event(sandbox))).await.is_err() {
@@ -363,7 +265,7 @@ async fn map_podman_event(
             .await
             .ok()?;
         let workload = workloads.first()?;
-        return inspect_workload(client, lifecycle_event_fences, &workload.id)
+        return inspect_workload(client, &workload.id)
             .await
             .ok()
             .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
@@ -374,7 +276,7 @@ async fn map_podman_event(
         "remove" => Some(deleted_event(sandbox_id.clone())),
         "create" | "start" | "stop" | "die" | "health_status" => {
             // Inspect the container to get current state.
-            match inspect_workload(client, lifecycle_event_fences, container_id).await {
+            match inspect_workload(client, container_id).await {
                 Ok(inspect) => {
                     if lifecycle_event_fences.matches_previous_exit(
                         event,
@@ -454,13 +356,8 @@ async fn map_podman_event(
 /// A workload is ready only when its independent supervisor is healthy. This
 /// check runs both on watch reconciliation and on events, and contains a lost
 /// supervisor even when the gateway missed the original exit event.
-///
-/// A restart starts the workload before its exited companion. The exit that
-/// the start recorded is not contained: the companion is about to start, and
-/// the start stops the workload itself if the companion fails to start.
 pub async fn inspect_workload(
     client: &PodmanClient,
-    lifecycle_event_fences: &LifecycleEventFences,
     id: &str,
 ) -> Result<ContainerInspect, PodmanApiError> {
     let mut workload = client.inspect_container(id).await?;
@@ -491,19 +388,6 @@ pub async fn inspect_workload(
                 if supervisor.state.status == "configured"
                     || supervisor.state.status == "created" =>
             {
-                workload.state.health = Some(HealthState {
-                    status: "starting".into(),
-                });
-            }
-            Ok(supervisor)
-                if lifecycle_event_fences
-                    .supervisor_restart_in_progress(sandbox_id, &supervisor.state) =>
-            {
-                debug!(
-                    sandbox_id = %sandbox_id,
-                    workload = %workload.id,
-                    "Not containing workload while its start restarts the supervisor"
-                );
                 workload.state.health = Some(HealthState {
                     status: "starting".into(),
                 });
@@ -609,6 +493,14 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
 
 /// Build a `DriverSandbox` from a container list entry (no inspect needed).
 pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<DriverSandbox> {
+    let sandbox_id = entry.labels.get(LABEL_SANDBOX_ID)?.clone();
+    let sandbox_name = entry
+        .labels
+        .get(LABEL_SANDBOX_NAME)
+        .cloned()
+        .unwrap_or_default();
+    let workspace = entry.labels.get(LABEL_SANDBOX_WORKSPACE).cloned()?;
+
     let (reason, status_str, message) = match entry.state.as_str() {
         "running" => (
             CONDITION_RUNNING,
@@ -621,46 +513,6 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
         "removing" => ("ContainerRemoving", "False", String::new()),
         _ => ("Unknown", "Unknown", String::new()),
     };
-    driver_sandbox_from_list_entry_with_condition(
-        entry,
-        DriverCondition {
-            r#type: "Ready".to_string(),
-            status: status_str.to_string(),
-            reason: reason.to_string(),
-            message,
-            transition_time: None,
-        },
-    )
-}
-
-/// Build a `DriverSandbox` that reports a start in progress for a container
-/// list entry. See [`LifecycleEventFences::polled_workload_still_starting`].
-pub fn starting_driver_sandbox_from_list_entry(
-    entry: &ContainerListEntry,
-) -> Option<DriverSandbox> {
-    driver_sandbox_from_list_entry_with_condition(
-        entry,
-        DriverCondition {
-            r#type: "Ready".to_string(),
-            status: "False".to_string(),
-            reason: CONDITION_STARTING.to_string(),
-            message: "Container start in progress".to_string(),
-            transition_time: None,
-        },
-    )
-}
-
-fn driver_sandbox_from_list_entry_with_condition(
-    entry: &ContainerListEntry,
-    condition: DriverCondition,
-) -> Option<DriverSandbox> {
-    let sandbox_id = entry.labels.get(LABEL_SANDBOX_ID)?.clone();
-    let sandbox_name = entry
-        .labels
-        .get(LABEL_SANDBOX_NAME)
-        .cloned()
-        .unwrap_or_default();
-    let workspace = entry.labels.get(LABEL_SANDBOX_WORKSPACE).cloned()?;
 
     Some(build_driver_sandbox(
         sandbox_id,
@@ -668,7 +520,13 @@ fn driver_sandbox_from_list_entry_with_condition(
         workspace,
         entry.names.first().cloned().unwrap_or_default(),
         short_id(&entry.id),
-        condition,
+        DriverCondition {
+            r#type: "Ready".to_string(),
+            status: status_str.to_string(),
+            reason: reason.to_string(),
+            message,
+            transition_time: None,
+        },
         entry.state == "removing",
     ))
 }
@@ -783,9 +641,7 @@ mod tests {
             ],
         );
         let client = PodmanClient::new(path.clone());
-        let inspected = inspect_workload(&client, &LifecycleEventFences::default(), "workload")
-            .await
-            .unwrap();
+        let inspected = inspect_workload(&client, "workload").await.unwrap();
         assert!(!inspected.state.running);
         handle.await.unwrap();
         assert!(
@@ -816,92 +672,11 @@ mod tests {
             ],
         );
         let client = PodmanClient::new(path.clone());
-        let inspected = inspect_workload(&client, &LifecycleEventFences::default(), "workload")
-            .await
-            .unwrap();
+        let inspected = inspect_workload(&client, "workload").await.unwrap();
         assert!(inspected.state.running);
         assert_eq!(inspected.state.health.unwrap().status, "starting");
         handle.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn supervisor_exit_recorded_by_a_restart_does_not_contain_the_workload() {
-        use crate::test_utils::{StubResponse, spawn_podman_stub};
-        use hyper::StatusCode;
-        const RECORDED_EXIT: &str = "2026-08-12T16:39:13.123456789Z";
-        const RUNNING_WORKLOAD: &str = r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#;
-        const STOPPED_WORKLOAD: &str = r#"{"Id":"workload","Name":"workload","State":{"Status":"exited","Running":false},"Config":{}}"#;
-        let exited_supervisor = |finished_at: &str| {
-            StubResponse::new(
-                StatusCode::OK,
-                format!(
-                    r#"{{"Id":"supervisor","Name":"supervisor","State":{{"Status":"exited","Running":false,"ExitCode":0,"FinishedAt":"{finished_at}"}},"Config":{{}}}}"#
-                ),
-            )
-        };
-        let contained = |finished_at: &str| {
-            vec![
-                StubResponse::new(StatusCode::OK, RUNNING_WORKLOAD),
-                exited_supervisor(finished_at),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
-                StubResponse::new(StatusCode::OK, STOPPED_WORKLOAD),
-            ]
-        };
-        let mut responses = contained(RECORDED_EXIT);
-        responses.extend([
-            StubResponse::new(StatusCode::OK, RUNNING_WORKLOAD),
-            exited_supervisor(RECORDED_EXIT),
-        ]);
-        responses.extend(contained("2026-08-12T16:39:14Z"));
-        responses.extend(contained(RECORDED_EXIT));
-        let (path, requests, handle) = spawn_podman_stub("restarting-supervisor", responses);
-        let client = PodmanClient::new(path.clone());
-        let fences = LifecycleEventFences::default();
-        let stops = || {
-            requests
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|request| request.ends_with("/libpod/containers/workload/stop?timeout=0"))
-                .count()
-        };
-
-        // Before the start has stopped and recorded the supervisor, its exit
-        // is contained.
-        let start = fences.begin_start("test");
-        let inspected = inspect_workload(&client, &fences, "workload")
-            .await
-            .unwrap();
-        assert!(!inspected.state.running);
-        assert_eq!(stops(), 1);
-
-        // A restart starts the workload before the supervisor it recorded.
-        fences.record_supervisor_restart("test", Some(RECORDED_EXIT));
-        let inspected = inspect_workload(&client, &fences, "workload")
-            .await
-            .unwrap();
-        assert!(inspected.state.running);
-        assert_eq!(inspected.state.health.unwrap().status, "starting");
-        assert_eq!(stops(), 1);
-
-        // A new supervisor exit is contained during the start.
-        let inspected = inspect_workload(&client, &fences, "workload")
-            .await
-            .unwrap();
-        assert!(!inspected.state.running);
-        assert_eq!(stops(), 2);
-
-        // Once the start has returned, the recorded exit is contained.
-        drop(start);
-        let inspected = inspect_workload(&client, &fences, "workload")
-            .await
-            .unwrap();
-        assert!(!inspected.state.running);
-        assert_eq!(stops(), 3);
-
-        handle.await.unwrap();
         let _ = std::fs::remove_file(path);
     }
 
@@ -992,46 +767,6 @@ mod tests {
             "sandbox-1",
             &previous_exit,
         ));
-    }
-
-    #[test]
-    fn lifecycle_fence_reports_polled_previous_exit_as_starting_only_during_start() {
-        let fences = LifecycleEventFences::default();
-        fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13.123456789Z"));
-        let previous_exit = ContainerState {
-            status: "exited".to_string(),
-            running: false,
-            exit_code: 0,
-            oom_killed: false,
-            health: None,
-            started_at: Some("2026-08-12T16:38:58Z".to_string()),
-            finished_at: Some("2026-08-12T16:39:13.123456789Z".to_string()),
-            supervisor_exit_code: None,
-            startup_diagnostic: None,
-        };
-        let mut new_exit = previous_exit.clone();
-        new_exit.finished_at = Some("2026-08-12T16:39:13.5Z".to_string());
-        let mut running = previous_exit.clone();
-        running.status = "running".to_string();
-        running.running = true;
-
-        // A stopped sandbox, or one whose start has already failed, reports
-        // the exit.
-        assert!(!fences.polled_workload_still_starting("sandbox-1", &previous_exit));
-
-        let start = fences.begin_start("sandbox-1");
-        assert!(fences.polled_workload_still_starting("sandbox-1", &previous_exit));
-        assert!(fences.polled_workload_still_starting("sandbox-1", &running));
-        assert!(!fences.polled_workload_still_starting("sandbox-1", &new_exit));
-        assert!(!fences.polled_workload_still_starting("sandbox-2", &previous_exit));
-        drop(start);
-        assert!(!fences.start_in_progress("sandbox-1"));
-        assert!(!fences.polled_workload_still_starting("sandbox-1", &previous_exit));
-
-        let _start = fences.begin_start("sandbox-1");
-        fences.remove("sandbox-1");
-        assert!(!fences.start_in_progress("sandbox-1"));
-        assert!(!fences.polled_workload_still_starting("sandbox-1", &previous_exit));
     }
 
     #[test]
