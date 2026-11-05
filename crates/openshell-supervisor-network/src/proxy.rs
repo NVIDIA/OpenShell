@@ -638,12 +638,14 @@ async fn preauthorize_transparent_open(
     let PendingTcpOpen {
         stream,
         binary_identity,
-        destination,
+        mut destination,
         socket: _,
         policy_generation: _,
         timing,
         decision: completion,
     } = connection;
+    // Use the IPv4 identity for mapped destinations throughout routing and policy.
+    destination.set_ip(destination.ip().to_canonical());
     let _timing = NetworkOpenTimingGuard {
         timing,
         operation: "tcp",
@@ -7200,6 +7202,8 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
     reason = "Test code: test fixtures and explicit control-flow markers are idiomatic in tests."
 )]
 mod tests {
+    mod ipv4_mapped;
+
     #[test]
     fn proxy_authorization_rejects_missing_wrong_cross_and_duplicate_credentials() {
         let expected = "Basic sandbox-a-generation";
@@ -7897,18 +7901,22 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
     #[tokio::test]
     async fn metadata_staging_requires_verified_identity_without_egress_rules() {
+        for destination in [
+            openshell_core::google_cloud::METADATA_LOOPBACK_ADDR,
+            "[::ffff:127.0.0.1]:8174",
+        ] {
+            assert_metadata_staging(destination.parse().unwrap()).await;
+        }
+    }
+
+    async fn assert_metadata_staging(destination: SocketAddr) {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
             "network_policies: {}",
         )
         .unwrap();
         for valid_identity in [true, false] {
-            let (mut open, completion) = staged_curl_open(
-                openshell_core::google_cloud::METADATA_LOOPBACK_ADDR
-                    .parse()
-                    .unwrap(),
-                engine.current_generation(),
-            );
+            let (mut open, completion) = staged_curl_open(destination, engine.current_generation());
             if !valid_identity {
                 open.binary_identity = Err(ResolveError::Failed("unavailable".into()));
             }
@@ -8343,6 +8351,13 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
 
     #[tokio::test]
     async fn staged_policy_local_open_reaches_the_sandbox_scoped_api() {
+        let addr = crate::policy_dns::POLICY_LOCAL_ADDRESS;
+        for ip in [IpAddr::V4(addr), IpAddr::V6(addr.to_ipv6_mapped())] {
+            assert_policy_local_open_served(SocketAddr::new(ip, 80)).await;
+        }
+    }
+
+    async fn assert_policy_local_open_served(destination: SocketAddr) {
         let engine = Arc::new(
             native_identity_engine(
                 include_str!("../data/sandbox-policy.rego"),
@@ -8364,7 +8379,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         let pending = PendingTcpOpen {
             stream: Box::new(stream),
             binary_identity: Ok(identity.clone()),
-            destination: SocketAddr::from((crate::policy_dns::POLICY_LOCAL_ADDRESS, 80)),
+            destination,
             socket: Some(
                 openshell_isolation_interface::contract::NetworkSocketMetadata {
                     socket_cookie: 7,
@@ -8878,40 +8893,46 @@ process:
 
     #[tokio::test]
     async fn reserved_destination_is_served_without_policy_evaluation() {
-        let engine = reserved_test_engine();
-        let (reserved, mut served_rx, calls) = reserved_relay(true);
-        let (open, decision, mut peer) =
-            staged_open(&engine, openshell_core::sandbox_env::OTLP_RELAY_ADDR);
+        let addr = *OTLP_RELAY_ADDR;
+        for destination in [
+            addr.to_string(),
+            format!("[::ffff:{}]:{}", addr.ip(), addr.port()),
+        ] {
+            let engine = reserved_test_engine();
+            let (reserved, mut served_rx, calls) = reserved_relay(true);
+            let (open, decision, mut peer) = staged_open(&engine, &destination);
 
-        assert!(
-            preauthorize_transparent_open(
-                open,
-                None,
-                &engine,
-                &BinaryIdentityCache::new(),
-                None,
-                None,
-                false,
-                None,
-                Some(&reserved)
-            )
-            .await
-            .is_none(),
-            "a reserved open never becomes a proxy connection"
-        );
-        assert_eq!(decision.await.unwrap(), TcpOpenDecision::RelayReady);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                preauthorize_transparent_open(
+                    open,
+                    None,
+                    &engine,
+                    &BinaryIdentityCache::new(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some(&reserved)
+                )
+                .await
+                .is_none(),
+                "a reserved open never becomes a proxy connection"
+            );
+            assert_eq!(decision.await.unwrap(), TcpOpenDecision::RelayReady);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // The handler holds the workload's stream: bytes written by the
-        // workload side arrive at the handler.
-        let mut stream = tokio::time::timeout(std::time::Duration::from_secs(1), served_rx.recv())
-            .await
-            .expect("handler future ran")
-            .expect("handler received the stream");
-        peer.write_all(b"POST /v1/traces").await.unwrap();
-        let mut head = [0u8; 15];
-        stream.read_exact(&mut head).await.unwrap();
-        assert_eq!(&head, b"POST /v1/traces");
+            // The handler holds the workload's stream: bytes written by the
+            // workload side arrive at the handler.
+            let mut stream =
+                tokio::time::timeout(std::time::Duration::from_secs(1), served_rx.recv())
+                    .await
+                    .expect("handler future ran")
+                    .expect("handler received the stream");
+            peer.write_all(b"POST /v1/traces").await.unwrap();
+            let mut head = [0u8; 15];
+            stream.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head, b"POST /v1/traces");
+        }
     }
 
     #[tokio::test]

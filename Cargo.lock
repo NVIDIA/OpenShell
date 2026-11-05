@@ -4460,6 +4460,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-credential-issuer"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-sts",
+ "futures",
+ "hyper-util",
+ "jsonwebtoken",
+ "openshell-core",
+ "openshell-crypto",
+ "openshell-driver-db-credstore",
+ "openshell-driver-kubernetes-secrets",
+ "openshell-driver-vault",
+ "prost-types",
+ "reqwest 0.12.28",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tonic",
+ "tower",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "openshell-crypto"
 version = "0.0.0"
 dependencies = [
@@ -5081,8 +5111,6 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
- "aws-config",
- "aws-sdk-sts",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -5111,10 +5139,8 @@ dependencies = [
  "notify",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-credential-issuer",
  "openshell-crypto",
- "openshell-driver-db-credstore",
- "openshell-driver-kubernetes-secrets",
- "openshell-driver-vault",
  "openshell-extension-core",
  "openshell-gateway-interceptors",
  "openshell-ocsf",

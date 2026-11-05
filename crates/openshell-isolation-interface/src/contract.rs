@@ -583,6 +583,7 @@ pub struct PendingTcpOpen {
     /// Executable identity, resolved by the backend for this connection.
     pub binary_identity: Result<BinaryIdentity, ResolveError>,
     /// Original external destination captured by the backend before mediation.
+    /// The supervisor may canonicalize IPv4-mapped IPv6 addresses before routing.
     pub destination: SocketAddr,
     /// Native socket evidence, when the backend mediates a kernel socket.
     /// Guests without native sockets supply authoritative executable identity

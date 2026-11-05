@@ -67,6 +67,11 @@ on:
         required: false
         type: string
         default: ""
+      prebuilt-conformance:
+        description: "Run conformance with the openshell-conformance artifact instead of building it"
+        required: false
+        type: boolean
+        default: false
       external-driver-binary:
         description: "Optional standalone compute driver binary used to compose a local test image"
         required: false
@@ -124,6 +129,8 @@ jobs:
 
       - name: Use prebuilt OpenShell CLI
         uses: ./.github/actions/setup-e2e-cli
+        with:
+          conformance: ${{ inputs.prebuilt-conformance }}
 
       - name: Use prebuilt OpenShell gateway
         if: inputs.gateway-artifact != ''

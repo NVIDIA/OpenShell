@@ -409,6 +409,12 @@ and `openshell sandbox provider detach`. See
 
 </Info>
 
+Provider attachment checks credential inspection against the latest saved sandbox
+policy, falling back to the creation policy only when no revision exists. If a
+current rule permits uninspected traffic to a credentialed endpoint, configure
+L7 inspection or remove the rule before attaching the provider. Use
+`allow_uninspected_credentials: true` only for an intentional exception.
+
 ### Auto-Discovery Shortcut
 
 Name a provider with `--provider`. If no provider by that name exists and the

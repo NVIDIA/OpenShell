@@ -194,7 +194,22 @@ closed without falling back to inline values.
 ## Refresh coordination
 
 Explicit rotation, background refresh, and operator refresh-on-read share the
-same refresh coordination:
+same refresh coordination in `openshell-credential-issuer::refresh`. The server's
+`provider_refresh` facade retains public status/configuration adaptation and
+worker startup. `refresh_store` translates the unchanged private durable record
+and leases; `refresh_commit` retains workspace/attachment/provider CAS integration.
+The gateway publishes worker/manual changes at the existing orchestration points;
+export-triggered refresh does not publish. The issuer is still embedded: stable
+reference/version migration must remove the temporary provider commit port before
+remote refresh.
+
+Gateway configuration, status, deletion, export revalidation, and snapshot reads
+use the shared `CredentialRefresh` interface. Deletion does not construct a local
+runtime. The temporary provider-commit adapter uses the same injected
+`RefreshStateStore` for attachment-validation reads, avoiding a runtime ownership
+cycle; neither path calls gateway refresh-persistence helpers directly.
+
+The shared runtime preserves these guarantees:
 
 - A process-local weak keyed mutex coalesces waiters without retaining deleted
   providers indefinitely.
@@ -233,3 +248,31 @@ runs under `mise run test:rust:postgres` (see `TESTING.md`) and still accepts
 `OPENSHELL_REFRESH_TEST_DATABASE_URL` pointing to a disposable PostgreSQL database.
 It exercises independent sessions without the local mutex. Do not point this
 fixture at an existing deployment database.
+
+## Application route installation records
+
+Supervisor installation reports arrive only through the authenticated sandbox
+session. The gateway issues bounded, single-use lease challenges and validates
+reports under the sandbox mutation guard. Accepted records contain current
+service declarations, configuration/runtime identity, session fencing, a
+trusted driver-resolved app endpoint, and gateway lease expiry. The private
+`ComputeDriverAppEndpoints.ResolveSupervisorAppEndpoint` extension RPC resolves this endpoint separately
+from `GetSandbox`: endpoint lookup failures do not affect ordinary sandbox
+observation. Unsupported drivers return `UNIMPLEMENTED`; an absent endpoint
+withholds application publication. The gateway resolves the endpoint once before
+issuing each challenge and binds that result to the session and lease sequence.
+Acceptance rechecks durable ownership, shared member/readiness authority, runtime,
+and configuration without another driver lookup. The next challenge resolves
+afresh; the saved result never extends the original lease expiry.
+In-process factories opt in with
+`ComputeDriverBuildContext::register_app_endpoints`; baseline factories need no
+changes. Standalone drivers register the extension on their existing endpoint.
+The generic
+store key is prefixed `service-installation:`; records are ephemeral and do not
+change durable sandbox protobufs. Reads revalidate owner, configuration,
+generation, and expiry. Cleanup scans bounded pages and uses conditional deletes
+so concurrent renewals are preserved. Cursor progress survives partial sweep
+timeouts; bounded record attempts prevent a malformed or stalled record from
+starving later cleanup. Failed attempts are revisited on the next scan.
+Discovery consumers must not treat these
+records as application health or external ingress readiness.

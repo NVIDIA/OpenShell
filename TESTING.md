@@ -181,6 +181,12 @@ by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
+The conformance crate also builds `openshell-conformance`, a program that
+runs the conformance suite against a gateway without cargo or nextest
+(`openshell-conformance list`, `ready`, `run`). It covers only the
+conformance suite. See
+[tests/suites/conformance/README.md](tests/suites/conformance/README.md).
+
 Suites live under `tests/suites/`, in Cargo workspaces with their own
 lockfiles: `conformance`, `features`, and one workspace per driver suite under
 `drivers/<driver>`. Run the `conformance` suites against a local Docker
@@ -232,14 +238,14 @@ nix run .#openshell-test-runner -- \
   --family conformance --package conformance
 ```
 
-It needs KVM, and tmachine only boots guests of the host's architecture. The
-runner points the tests at the installed CLI and the gateway the installer
-registered (`--gateway`, default `openshell`). A run passes if nextest
-succeeds; nextest fails a run with no tests. The runner exits with 1 when a
-test failed and 2 when the run could not complete, for example because the
-environment didn't come up. It writes `junit.xml`, `nextest.log` and, after a
-failure, the guest's diagnostics to `artifacts/test-results/` (`--results`),
-even when the run timed out.
+It needs KVM on Linux or the Hypervisor framework on macOS, and tmachine only
+boots guests of the host's architecture. The runner points the tests at the
+installed CLI and the gateway the installer registered (`--gateway`, default
+`openshell`). A run passes if nextest succeeds; nextest fails a run with no
+tests. The runner exits with 1 when a test failed and 2 when the run could not
+complete, for example because the environment didn't come up. It writes
+`junit.xml`, `nextest.log` and, after a failure, the guest's diagnostics to
+`artifacts/test-results/` (`--results`), even when the run timed out.
 
 `--filter <filterset>` narrows the tests with a nextest filterset, and
 `--keep` leaves the VM running until you press Enter. Two runs on one host
@@ -419,7 +425,10 @@ Suites:
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
 - Conformance (`tests/suites/conformance`) - the testkit `conformance` crate:
   lifecycle, the CLI, persistent workspaces, file transfer, and the policy
-  advisor. Driver E2E runs it with nextest against the lane's gateway. The
+  advisor. Driver E2E runs it with `openshell-conformance` against the lane's
+  gateway and writes a JUnit report under `results/`; set
+  `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program, as Branch E2E does
+  with the static build it makes once per architecture. The
   installed-artifact conformance lanes run the same crate through
   `openshell-test-runner` (see above).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or

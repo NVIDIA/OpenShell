@@ -102,6 +102,9 @@ an inspected endpoint. The `protocol` field selects what OpenShell inspects:
 | `tcp` | No request rules. Use it for clients that speak a protocol other than HTTP, such as databases. | [Native TCP](#allow-native-tcp) |
 | Omitted | No request rules. | -- |
 
+Connections to IPv4-mapped IPv6 addresses, such as `::ffff:203.0.113.7`, use the
+same destination rules as the equivalent IPv4 address, `203.0.113.7`.
+
 When `protocol` is omitted, OpenShell allows any method and path. Unless the
 endpoint sets `tls: skip`, it still terminates TLS and rejects HTTP requests
 that are addressed to another host or have malformed paths, such as paths that

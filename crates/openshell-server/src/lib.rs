@@ -20,6 +20,7 @@ mod compute;
 mod config_delivery;
 pub mod config_file;
 mod config_update_operation;
+mod credential_store;
 mod credentials;
 mod defaults;
 mod gateway_listener;
@@ -41,6 +42,8 @@ mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
 mod reflection;
+mod refresh_commit;
+mod refresh_store;
 mod sandbox_access;
 mod sandbox_index;
 mod sandbox_watch;
@@ -331,6 +334,9 @@ pub struct ServerState {
 
     /// Credential-driver selection and resolution runtime.
     pub credentials: credentials::CredentialRuntime,
+
+    /// Shared embedded refresh runtime (separate from storage-only consumers).
+    pub(crate) refresh: openshell_credential_issuer::refresh::RefreshRuntime,
 
     /// In-memory sandbox correlation index.
     pub sandbox_index: SandboxIndex,
@@ -638,11 +644,13 @@ impl ServerState {
             .map_or_else(String::new, |oidc| oidc.admin_role.clone());
         let config_delivery =
             config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
+        let refresh = provider_refresh::runtime(&store, Some(&credentials), Some(&compute));
         Self {
             config,
             store,
             compute,
             credentials,
+            refresh,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
@@ -1300,6 +1308,7 @@ pub(crate) async fn run_server(
     );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    grpc::service_advertisement::spawn_cleanup(state.clone(), shutdown_rx.clone());
     provider_profile_sources::spawn_refresh(state.clone());
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
@@ -1634,7 +1643,7 @@ async fn terminate_signal() {
 
 pub use compute::{
     AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess, SharedComputeDriver,
-    SharedComputeDriverConfigurationUpdates,
+    SharedComputeDriverAppEndpoints, SharedComputeDriverConfigurationUpdates,
 };
 
 /// Driver instance returned by a compiled compute-driver factory.
@@ -2012,12 +2021,21 @@ pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
     shared_supervision: &'a OnceLock<openshell_supervisor_control::SharedSupervision>,
+    app_endpoint_resolver: &'a OnceLock<SharedComputeDriverAppEndpoints>,
     /// Recovery deadline from `[openshell.gateway.supervisor_pool]`, when
     /// configured.
     supervisor_recovery_timeout_secs: Option<u32>,
 }
 
 impl ComputeDriverBuildContext<'_> {
+    /// Register an optional in-process application endpoint resolver during build.
+    /// Existing factories need not provide this extension.
+    pub fn register_app_endpoints(&self, resolver: SharedComputeDriverAppEndpoints) -> Result<()> {
+        self.app_endpoint_resolver
+            .set(resolver)
+            .map_err(|_| Error::config("application endpoint resolver already registered"))
+    }
+
     /// The gateway's coordination of the shared supervisor pool, for an
     /// in-process driver whose configuration places new generations on it.
     /// The gateway owns the desired set and ownership durably, serves each
@@ -2172,6 +2190,7 @@ async fn build_compute_runtime(
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let shared_supervision = OnceLock::new();
+            let app_endpoint_resolver = OnceLock::new();
             let build_context = ComputeDriverBuildContext {
                 config: ComputeDriverConfigContext {
                     driver_name: &registration.name,
@@ -2182,6 +2201,7 @@ async fn build_compute_runtime(
                 },
                 shutdown_rx,
                 shared_supervision: &shared_supervision,
+                app_endpoint_resolver: &app_endpoint_resolver,
                 supervisor_recovery_timeout_secs: supervisor_pool
                     .and_then(|pool| pool.recovery_timeout_secs),
             };
@@ -2211,7 +2231,8 @@ async fn build_compute_runtime(
                     Error::execution(format!("failed to create compute runtime: {error}"))
                 })?
                 .with_supervisor_host(supervisor_host)
-                .with_image_update_driver(image_updates),
+                .with_image_update_driver(image_updates)
+                .with_app_endpoint_resolver(app_endpoint_resolver.into_inner()),
                 ComputeDriverInstance::ManagedRemote(_) if supervisor_host.is_some() => {
                     return Err(Error::config(
                         "only an in-process compute driver can use the gateway's shared supervision",
@@ -2849,6 +2870,7 @@ mod tests {
                 },
                 shutdown_rx: shutdown_rx.clone(),
                 shared_supervision: &shared,
+                app_endpoint_resolver: &std::sync::OnceLock::new(),
                 supervisor_recovery_timeout_secs: configured,
             };
             // The driver asks for shared supervision as before; it is the

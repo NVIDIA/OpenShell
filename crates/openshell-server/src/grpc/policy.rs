@@ -86,6 +86,7 @@ use openshell_core::{
     host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
 };
+use openshell_credential_issuer::refresh::CredentialRefresh;
 use openshell_ocsf::{
     ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId, sanitize_reason_for_audit,
 };
@@ -1971,6 +1972,7 @@ async fn current_effective_policy_for_sandbox(
         .unwrap_or_default();
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         &provider_names,
     )
@@ -2084,6 +2086,7 @@ async fn apply_effective_policy_context(
 ) -> Result<ProtoSandboxPolicy, Status> {
     let provider_context = provider_policy_context_with_catalog(
         state.store.as_ref(),
+        &state.refresh,
         catalog,
         workspace,
         provider_names,
@@ -2403,6 +2406,7 @@ async fn validate_policy_credential_bindings_for_sandbox(
     }
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -2427,6 +2431,7 @@ async fn provider_policy_layers_for_sandbox(
         .await?;
     let layers = provider_policy_context_with_catalog(
         state.store.as_ref(),
+        &state.refresh,
         &catalog,
         workspace,
         provider_names,
@@ -2545,6 +2550,7 @@ async fn validate_provider_composition_for_existing_sandboxes(
             // sandbox already fails closed, so warn and validate the rest.
             let (records, missing) = super::provider::load_existing_provider_environment_records(
                 state.store.as_ref(),
+                &state.refresh,
                 &workspace,
                 provider_names,
             )
@@ -3284,8 +3290,10 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<u64, Status> {
+    let refresh = crate::provider_refresh::runtime(&Arc::new(store.clone()), None, None);
     compute_provider_env_revision_with_catalog_and_policy_bindings(
         store,
+        &refresh,
         catalog,
         workspace,
         provider_names,
@@ -3296,6 +3304,7 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
 
 async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
@@ -3319,9 +3328,12 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
                 let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
-                let refresh_states =
-                    crate::provider_refresh::list_refresh_states_for_provider(store, &record.id)
-                        .await?;
+                let refresh_states: Vec<StoredProviderCredentialRefreshState> = refresh
+                    .list(Some(&record.id))
+                    .await?
+                    .iter()
+                    .map(Into::into)
+                    .collect();
                 hash_provider_refresh_states(&refresh_states, &mut hasher)?;
                 hasher.update(provider.r#type.as_bytes());
                 hash_provider_profile_revision(
@@ -3508,8 +3520,9 @@ async fn profile_provider_policy_layers_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    let refresh = crate::provider_refresh::runtime(&Arc::new(store.clone()), None, None);
     Ok(
-        provider_policy_context_with_catalog(store, catalog, workspace, provider_names)
+        provider_policy_context_with_catalog(store, &refresh, catalog, workspace, provider_names)
             .await?
             .layers,
     )
@@ -3531,13 +3544,18 @@ struct ProviderPolicyContext {
 
 async fn provider_policy_context_with_catalog(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<ProviderPolicyContext, Status> {
-    let records =
-        super::provider::load_provider_environment_records(store, workspace, provider_names)
-            .await?;
+    let records = super::provider::load_provider_environment_records(
+        store,
+        refresh,
+        workspace,
+        provider_names,
+    )
+    .await?;
     Ok(provider_policy_context_from_records(catalog, &records))
 }
 
@@ -3790,6 +3808,7 @@ pub(super) async fn resolve_sandbox_create_runtime_inputs(
         .await?;
     let provider_records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -7561,6 +7580,7 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
     let composition_enabled = provider_policy_composition_enabled_in(&global_settings)?;
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -13095,6 +13115,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_attachment_credential_inspection_uses_latest_policy() {
+        for (creation_has_rule, updated_has_rule) in [
+            (true, Some(false)),
+            (false, Some(true)),
+            (true, None),
+            (false, None),
+        ] {
+            let state = test_server_state().await;
+            state
+                .store
+                .put_message(&test_provider("work-github", "github"))
+                .await
+                .unwrap();
+            let policy = |has_rule| {
+                if has_rule {
+                    test_policy_with_rule("uninspected", "api.github.com")
+                } else {
+                    ProtoSandboxPolicy::default()
+                }
+            };
+            let creation_policy = policy(creation_has_rule);
+            let sandbox = test_sandbox(
+                "sb-attachment-inspection",
+                "attach-inspection",
+                creation_policy.clone(),
+                Vec::new(),
+            );
+            state.store.put_message(&sandbox).await.unwrap();
+
+            if let Some(has_rule) = updated_has_rule {
+                handle_update_config(
+                    &state,
+                    with_user(Request::new(UpdateConfigRequest {
+                        sandbox: "attach-inspection".to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        policy: Some(policy(has_rule)),
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .expect("policy update without an attached provider must succeed");
+            }
+
+            let result = super::super::sandbox::handle_attach_sandbox_provider(
+                &state,
+                authed_request(openshell_core::proto::AttachSandboxProviderRequest {
+                    sandbox: "attach-inspection".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    provider: "work-github".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            let should_reject = updated_has_rule.unwrap_or(creation_has_rule);
+            if should_reject {
+                let error = result.expect_err("current uninspected rule must prevent attachment");
+                assert_eq!(error.code(), Code::FailedPrecondition);
+                assert!(error.message().contains("L4-only"));
+                assert!(error.message().contains("uninspected"));
+            } else {
+                assert!(
+                    result
+                        .expect("no current uninspected rule")
+                        .into_inner()
+                        .attached
+                );
+            }
+
+            let stored = state
+                .store
+                .get_message::<Sandbox>("sb-attachment-inspection")
+                .await
+                .unwrap()
+                .unwrap();
+            let spec = stored.spec.unwrap();
+            assert_eq!(spec.policy, Some(creation_policy));
+            assert_eq!(
+                spec.providers,
+                if should_reject {
+                    Vec::<String>::new()
+                } else {
+                    vec!["work-github".to_string()]
+                }
+            );
+            state.store.close_for_test().await;
+        }
+    }
+
+    #[tokio::test]
     async fn update_config_gates_uninspected_endpointless_credential_binding() {
         use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
@@ -15322,6 +15431,7 @@ mod tests {
         let provider_names = vec!["replaceable".to_string()];
         let first_records = crate::grpc::provider::load_provider_environment_records(
             state.store.as_ref(),
+            &state.refresh,
             "default",
             &provider_names,
         )
@@ -15380,6 +15490,7 @@ mod tests {
 
         let replacement_records = crate::grpc::provider::load_provider_environment_records(
             state.store.as_ref(),
+            &state.refresh,
             "default",
             &provider_names,
         )
