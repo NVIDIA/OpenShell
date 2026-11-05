@@ -1374,7 +1374,7 @@ impl fmt::Display for PolicyViolation {
 /// - UI clipboard access must use a recognized enum value
 /// - Filesystem paths must be absolute (start with `/`)
 /// - Filesystem paths must not contain `..` components
-/// - Read-write paths must not be overly broad (just `/`)
+/// - Read-write paths must not be overly broad (a filesystem root)
 /// - Individual path lengths must not exceed [`MAX_PATH_LENGTH`]
 /// - Total path count must not exceed [`MAX_FILESYSTEM_PATHS`]
 /// - Network endpoint hosts must not use TLD wildcards (e.g. `*.com`)
@@ -1431,8 +1431,7 @@ pub fn validate_filesystem_paths(
     }
 
     for path_str in read_write {
-        // Repeated separators still designate the filesystem root.
-        if path_str.trim_end_matches('/').is_empty() {
+        if is_filesystem_root(path_str) {
             violations.push(PolicyViolation::OverlyBroadPath {
                 path: path_str.clone(),
             });
@@ -1442,6 +1441,46 @@ pub fn validate_filesystem_paths(
         Ok(())
     } else {
         Err(violations)
+    }
+}
+
+/// Return whether `path` designates a filesystem root, such as `/`, `C:\`, `\`,
+/// `\\?\C:\` or `\\server\share`. The check is lexical rather than host-OS based
+/// because the sandbox platform, not the gateway, decides what a path means.
+fn is_filesystem_root(path: &str) -> bool {
+    fn only_root_components(rest: &str) -> bool {
+        rest.split('/').all(|c| c.is_empty() || c == ".")
+    }
+    // Skip up to `count` leading names (volume, server or share).
+    fn skip_names(mut rest: &str, count: usize) -> &str {
+        for _ in 0..count {
+            rest = rest.trim_start_matches('/');
+            rest = rest.split_once('/').map_or("", |(_, tail)| tail);
+        }
+        rest
+    }
+
+    let normalized = path.replace('\\', "/");
+    if path.starts_with(r"\\") {
+        let rest = &normalized[2..];
+        return match rest.split_once('/') {
+            Some(("?" | ".", tail)) => {
+                let (volume, tail) = tail.split_once('/').unwrap_or((tail, ""));
+                if volume.eq_ignore_ascii_case("UNC") {
+                    only_root_components(skip_names(tail, 2))
+                } else {
+                    only_root_components(tail)
+                }
+            }
+            _ => only_root_components(skip_names(rest, 2)),
+        };
+    }
+    match normalized.as_bytes() {
+        [drive, b':', b'/', ..] if drive.is_ascii_alphabetic() => {
+            only_root_components(&normalized[2..])
+        }
+        [b'/', ..] => only_root_components(&normalized),
+        _ => false,
     }
 }
 
@@ -3643,6 +3682,58 @@ network_policies:
                 .iter()
                 .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. }))
         );
+    }
+
+    #[test]
+    fn validate_rejects_every_root_spelling_as_read_write_path() {
+        for root in [
+            "/",
+            "//",
+            "/.",
+            "C:/",
+            r"C:\",
+            "c:/",
+            "D:/",
+            "C:/.",
+            "C://",
+            r"\",
+            r"\\?\C:\",
+            r"\\?\C:",
+            r"\\.\C:\",
+            r"\\localhost\C$",
+            r"\\server\share\",
+            r"\\?\UNC\server\share",
+        ] {
+            let violations = validate_filesystem_paths(&[], &[root.to_string()])
+                .expect_err("root read_write path must be rejected");
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+                "{root} should be overly broad, got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_root_detection_keeps_narrower_paths() {
+        for path in [
+            "/tmp",
+            "/work/demo",
+            "C:",
+            "C:/work/demo",
+            r"C:\work\demo",
+            r"\\?\C:\work",
+            r"\\localhost\C$\work",
+            r"\\?\UNC\server\share\work",
+        ] {
+            assert!(!is_filesystem_root(path), "{path} is not a filesystem root");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_read_only_filesystem_root() {
+        assert!(validate_filesystem_paths(&["/".to_string()], &[]).is_ok());
     }
 
     #[test]
