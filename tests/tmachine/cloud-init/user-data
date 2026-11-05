@@ -8,10 +8,5 @@ users:
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
 ssh_pwauth: true
-runcmd:
-  # Newer systemd (Fedora) installs a profile script that makes shells emit
-  # OSC 3008 context markers on stdout. Ansible reports them as "Module
-  # invocation had junk after the JSON data". Nothing in a test VM needs them.
-  - rm -f /etc/profile.d/80-systemd-osc-context.sh
 power_state:
   mode: poweroff
