@@ -18,16 +18,42 @@ impl std::io::Write for Writer {
     }
 }
 
-/// Capture the actual OCSF dispatch and receive spans over OTLP/gRPC.
+/// Capture the actual OCSF dispatch and the spans an in-memory exporter
+/// receives through the supervisor's span filter.
 pub async fn exported(
     log_level: &str,
     emit: impl FnOnce(),
 ) -> (Vec<serde_json::Value>, ReceivedTraces) {
-    static REGISTER: LazyLock<()> = LazyLock::new(|| {
-        assert!(openshell_ocsf::register_trace_correlation_extractor(
-            openshell_otel::current_ocsf_trace_correlation
-        ));
-    });
+    let _lock = tracing_test_lock().await;
+    LazyLock::force(&REGISTER);
+    super::reset_deny_span_limiter();
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let events = capture(log_level, &provider, emit);
+    provider.force_flush().unwrap();
+    let spans = exporter
+        .get_finished_spans()
+        .unwrap()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    provider.shutdown().unwrap();
+    (
+        events,
+        ReceivedTraces {
+            spans,
+            ..ReceivedTraces::default()
+        },
+    )
+}
+
+/// Capture the actual OCSF dispatch and receive spans over OTLP/gRPC.
+pub async fn exported_over_otlp(
+    log_level: &str,
+    emit: impl FnOnce(),
+) -> (Vec<serde_json::Value>, ReceivedTraces) {
     let _lock = tracing_test_lock().await;
     LazyLock::force(&REGISTER);
     super::reset_deny_span_limiter();
@@ -40,6 +66,24 @@ pub async fn exported(
     }));
     assert!(error.is_none());
     let provider = provider.unwrap();
+    let events = capture(log_level, &provider, emit);
+    provider.force_flush().unwrap();
+    collector.wait_for_export().await;
+    provider.shutdown().unwrap();
+    (events, collector.shutdown().await)
+}
+
+static REGISTER: LazyLock<()> = LazyLock::new(|| {
+    assert!(openshell_ocsf::register_trace_correlation_extractor(
+        openshell_otel::current_ocsf_trace_correlation
+    ));
+});
+
+fn capture(
+    log_level: &str,
+    provider: &opentelemetry_sdk::trace::SdkTracerProvider,
+    emit: impl FnOnce(),
+) -> Vec<serde_json::Value> {
     let bytes = Arc::new(Mutex::new(vec![]));
     let subscriber = tracing_subscriber::registry()
         .with(
@@ -47,7 +91,7 @@ pub async fn exported(
                 .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
         )
         .with(
-            openshell_otel::layer(&provider, "openshell-supervisor")
+            openshell_otel::layer(provider, "openshell-supervisor")
                 .with_filter(openshell_otel::supervisor_span_filter(log_level)),
         )
         // The shared test registry keeps callsites enabled process-wide.
@@ -55,16 +99,11 @@ pub async fn exported(
         // DEBUG connect handle, as well as absence from the OTLP export.
         .with(openshell_otel::supervisor_span_filter(log_level));
     tracing::subscriber::with_default(subscriber, emit);
-    provider.force_flush().unwrap();
-    collector.wait_for_export().await;
-    provider.shutdown().unwrap();
-    let received = collector.shutdown().await;
-    let events = String::from_utf8(bytes.lock().unwrap().clone())
+    String::from_utf8(bytes.lock().unwrap().clone())
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    (events, received)
+        .collect()
 }
 
 pub fn assert_deny_resolves(events: &[serde_json::Value], received: &ReceivedTraces, root: bool) {

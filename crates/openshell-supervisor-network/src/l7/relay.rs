@@ -3804,11 +3804,14 @@ mod trace_tests {
                 ..Default::default()
             };
             let mut response = Vec::new();
-            futures::executor::block_on(reject_request_authority_mismatch(
-                &mut response,
-                &ctx,
-                "POST",
-            ))
+            // The in-memory span processor exports with a futures executor.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(reject_request_authority_mismatch(
+                    &mut response,
+                    &ctx,
+                    "POST",
+                ))
+            })
             .unwrap();
             assert!(response.starts_with(b"HTTP/1.1 403 Forbidden"));
         })
@@ -3820,7 +3823,7 @@ mod trace_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn default_level_l7_relay_deny_uid_resolves_to_one_span_root_trace() {
-        let (events, received) = exported("warn", || {
+        let (events, received) = crate::telemetry::tests::exported_over_otlp("warn", || {
             let ctx = L7EvalContext {
                 host: "blocked.example".to_string(),
                 port: 443,

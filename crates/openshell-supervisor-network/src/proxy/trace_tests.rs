@@ -98,7 +98,7 @@ async fn network_class_forward_rejections_have_no_deny_trace() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forward_denials_use_the_saved_connect_parent() {
     for level in ["warn", "debug"] {
-        let (events, received) = exported(level, || {
+        let (events, received) = crate::telemetry::tests::exported_over_otlp(level, || {
             let intent = EgressIntent::connect("blocked.example".to_string(), 443);
             let connect = egress::connect_span(&intent);
             let decision = EgressDecision {
