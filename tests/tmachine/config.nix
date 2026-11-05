@@ -101,6 +101,11 @@ let
         inputs.keycloak_realm_file = "../../scripts/keycloak-realm.json";
       };
     };
+    # Hardware-free CDI fixtures, for the cdi suite.
+    cdi = {
+      bases = dockerBases ++ podmanBases;
+      setup.playbooks = [ "ansible/playbooks/cdi.yaml" ];
+    };
   };
   featureEnvironments = pkgs.lib.concatMap (
     feature: map (base: withSetup base feature features.${feature}.setup) features.${feature}.bases

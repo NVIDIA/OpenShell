@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Check the CDI spec path before creating the spec
+  become: true
+  ansible.builtin.stat:
+    path: "{{ cdi_spec_path }}"
+    follow: false
+  register: cdi_spec_stat
+
+- name: Require a guest without an existing CDI spec
+  ansible.builtin.assert:
+    that: [not cdi_spec_stat.stat.exists]
+    fail_msg: "Refusing to replace existing CDI spec {{ cdi_spec_path }}"
+
+- name: Create CDI fixture and spec directories
+  become: true
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ cdi_fixture_root }}"
+    - "{{ cdi_fixture_files_root }}"
+    - "{{ cdi_spec_path | dirname }}"
+
+- name: Prepare named CDI scenarios
+  ansible.builtin.include_tasks: scenarios.yaml
+
+# The tests select the scenario device per sandbox through driver config, which
+# the gateway rejects unless an administrator allows it. The installers add
+# this to the active driver's settings.
+- name: Create the test settings directory
+  become: true
+  ansible.builtin.file:
+    path: /etc/openshell-test
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Allow caller driver config for the CDI tests
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/openshell-test/driver.toml
+    content: |
+      allow_driver_config = true
+    owner: root
+    group: root
+    mode: "0644"

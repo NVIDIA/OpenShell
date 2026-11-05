@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Each case is one device of the tmachine.example/cdi-scenario class, selected as
+# `tmachine.example/cdi-scenario=<name>`. A case declares the host fixtures it
+# needs and the CDI edits that reference them; tasks/scenarios.yaml creates the
+# fixtures and templates/scenarios.yaml.j2 renders the spec.
+#
+# Fixture `path` is relative to {{ cdi_scenario_dir }}. Types:
+#   dir     directory (parents must be declared first)
+#   file    regular file with `content`
+# Both accept `mode`, `owner` and `group`.
+#
+# `expect` records the behavior the CDI feature tests assert for the scenario,
+# and is rendered to {{ cdi_fixture_root }}/scenarios.json for them. It states
+# what the sandbox does today; a change that alters that behavior updates the
+# values here. Either:
+#   rejected: <text>   sandbox creation fails; <text> must appear in the
+#                      diagnostic (empty matches any failure). No workload
+#                      runs, so no checks apply.
+#   checks: [...]      sandbox creation succeeds and each check holds, where a
+#                      check is one of
+#     {type: exists, path, expect}    whether the path exists (true)
+#     {type: contents, path, expect}  the file's contents
+#     {type: filetype, path, expect}  `file`, `directory`, `character-device`,
+#                                     `block-device`, `socket` or `fifo`
+#     {type: read, path, expect}      `ok` or `denied`
+#     {type: write, path, expect}     `ok` or `denied` (nothing is written)
+#     {type: env, name, expect}       value, null when unset
+#     {type: non-root, expect}        whether the workload is not uid 0 (true)
+#     {type: in-group-of, path, expect}
+#                                     whether the workload's groups include
+#                                     the group that owns path (true)
+# `non-root` and `in-group-of` describe the workload process, not a file's
+# owner.
+cdi_scenario_dir: "{{ cdi_fixture_files_root }}/scenarios"
+
+# Edits applied by every case, to check that spec and device edits merge. The
+# marker is mounted under /usr/share, which the sandbox already allows reading,
+# so these checks do not depend on grants derived from the CDI spec.
+cdi_scenario_spec_edits:
+  env:
+    - TMACHINE_CDI_SCENARIO_SPEC=fixture
+  mounts:
+    - hostPath: "{{ cdi_scenario_dir }}/spec-marker"
+      containerPath: /usr/share/tmachine-cdi/common/spec-marker
+      options: [bind, ro]
+
+# Checked in every scenario that is created, to show that spec and device edits
+# merge.
+cdi_scenario_common_checks:
+  - {type: env, name: TMACHINE_CDI_SCENARIO_SPEC, expect: fixture}
+  - {type: contents, path: /usr/share/tmachine-cdi/common/spec-marker, expect: tmachine-cdi-spec-marker}
+  - {type: write, path: /usr/share/tmachine-cdi/common/spec-marker, expect: denied}
+
+cdi_scenario_common_fixtures:
+  - {path: spec-marker, type: file, content: "tmachine-cdi-spec-marker\n", mode: "0644"}
+
+cdi_scenarios:
+  # The mount point is under a directory the sandbox baseline already makes
+  # read-only, so nothing needs to be derived for the mount to be readable.
+  - name: mount-under-read-only-baseline
+    fixtures:
+      - {path: baseline-read-only-file, type: file, content: "tmachine-cdi-baseline-read-only-file\n", mode: "0644"}
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/baseline-read-only-file"
+          containerPath: /usr/share/tmachine-cdi/baseline-read-only-file
+          options: [bind, ro]
+    expect:
+      checks:
+        - {type: contents, path: /usr/share/tmachine-cdi/baseline-read-only-file, expect: tmachine-cdi-baseline-read-only-file}
+        - {type: write, path: /usr/share/tmachine-cdi/baseline-read-only-file, expect: denied}

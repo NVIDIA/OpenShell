@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Load named CDI scenarios
+  ansible.builtin.include_vars:
+    file: scenarios.yaml
+
+- name: Collect scenario fixtures
+  ansible.builtin.set_fact:
+    cdi_scenario_fixtures: >-
+      {{ cdi_scenario_common_fixtures
+         + (cdi_scenarios | map(attribute='fixtures', default=[]) | flatten) }}
+
+- name: Create the scenario fixture root
+  become: true
+  ansible.builtin.file:
+    path: "{{ cdi_scenario_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create scenario fixture directories
+  become: true
+  ansible.builtin.file:
+    path: "{{ cdi_scenario_dir }}/{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'dir') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Write scenario fixture files
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ cdi_scenario_dir }}/{{ item.path }}"
+    content: "{{ item.content }}"
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'file') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Generate named CDI scenario devices
+  become: true
+  ansible.builtin.template:
+    src: scenarios.yaml.j2
+    dest: "{{ cdi_spec_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Publish scenario expectations for the CDI feature tests
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ cdi_fixture_root }}/scenarios.json"
+    content: >-
+      {{ {'common_checks': cdi_scenario_common_checks,
+          'scenarios': cdi_scenarios | items2dict(key_name='name', value_name='expect')}
+         | to_nice_json }}
+    owner: root
+    group: root
+    mode: "0644"
