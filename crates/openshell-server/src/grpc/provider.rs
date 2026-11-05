@@ -1566,6 +1566,78 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     })
 }
 
+/// Copy authored request metadata for static values that survived snapshot
+/// filtering. The reserved namespace keeps it separate from endpoint token grants;
+/// older supervisors ignore entries without `token_grant` before parsing selectors.
+pub(super) fn static_credential_request_metadata(
+    sandbox_id: &str,
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[ProviderEnvironmentRecord],
+    environment: &ProviderEnvironment,
+) -> Result<HashMap<String, ProviderProfileCredential>, Status> {
+    use openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX;
+    let mut metadata = HashMap::new();
+    for record in records {
+        let provider = &record.provider;
+        let Some(profile) = get_provider_type_profile_for_scope(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        ) else {
+            continue;
+        };
+        let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
+        for credential in &profile.credentials {
+            // Keep malformed explicit metadata distinguishable from a wholly
+            // absent declaration. The supervisor validates authored fields and
+            // fails closed; absence selects its default request placement.
+            if credential.auth_style.is_empty()
+                && credential.header_name.is_empty()
+                && credential.query_param.is_empty()
+                && credential.path_template.is_empty()
+            {
+                continue;
+            }
+            for key in credential.accepted_stored_keys() {
+                if !environment.environment.contains_key(key)
+                    || !environment.static_credential_keys.contains(key)
+                {
+                    continue;
+                }
+                let Some(baseline) = environment.static_credential_bindings.get(key) else {
+                    continue;
+                };
+                // A later optional declaration with the same environment key
+                // must not override metadata belonging to the actual owner.
+                let expected = static_credential_binding(
+                    Some(sandbox_id),
+                    record,
+                    key,
+                    &baseline.endpoints,
+                    refresh_epochs.get(key).map(String::as_str),
+                    credential.stable_placeholder,
+                );
+                if expected != *baseline {
+                    continue;
+                }
+                metadata.insert(
+                    format!("{STATIC_CREDENTIAL_METADATA_PREFIX}{key}"),
+                    ProviderProfileCredential {
+                        name: credential.name.clone(),
+                        env_vars: vec![key.to_string()],
+                        auth_style: credential.auth_style.clone(),
+                        header_name: credential.header_name.clone(),
+                        query_param: credential.query_param.clone(),
+                        path_template: credential.path_template.clone(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+    Ok(metadata)
+}
+
 fn refresh_authorization_epochs_by_key(
     record: &ProviderEnvironmentRecord,
 ) -> Result<HashMap<String, String>, Status> {
@@ -12223,6 +12295,142 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn static_request_metadata_is_minimal_owner_bound_and_tracks_delivered_values() {
+        use openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX;
+        let store = test_store().await;
+        let mut owned = custom_profile("metadata-owner");
+        owned.credentials = vec![static_credential("token", "TOKEN", true)];
+        owned.endpoints = vec![NetworkEndpoint {
+            host: "api.example.com".into(),
+            port: 443,
+            protocol: "rest".into(),
+            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+            ..Default::default()
+        }];
+        let mut optional = owned.clone();
+        optional.id = "metadata-optional".into();
+        optional.credentials[0].required = false;
+        optional.credentials[0].header_name = "x-wrong-owner".into();
+        let sources = ProviderProfileSources::from_test_profiles(vec![owned.clone(), optional]);
+        let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+        let record = |name: &str, id: &str, profile: &str| ProviderEnvironmentRecord {
+            name: name.into(),
+            object_id: id.into(),
+            resource_version: 1,
+            provider: Provider {
+                r#type: profile.into(),
+                profile_workspace: "default".into(),
+                ..Default::default()
+            },
+            refresh_states: Vec::new(),
+        };
+        let mut records = [
+            record("owner", "owner-id", "metadata-owner"),
+            record("optional", "optional-id", "metadata-optional"),
+        ];
+        records[0]
+            .provider
+            .credentials
+            .insert("TOKEN".into(), "synthetic-sensitive-token".into());
+        let endpoints = vec![StaticCredentialEndpointBinding {
+            host: "api.example.com".into(),
+            port: 443,
+            path: "/**".into(),
+        }];
+        let baseline = static_credential_binding(
+            Some("sandbox"),
+            &records[0],
+            "TOKEN",
+            &endpoints,
+            None,
+            false,
+        );
+        let mut environment = ProviderEnvironment {
+            environment: HashMap::from([("TOKEN".into(), "synthetic-sensitive-token".into())]),
+            static_credential_keys: HashSet::from(["TOKEN".into()]),
+            static_credential_bindings: HashMap::from([("TOKEN".into(), baseline.clone())]),
+            ..Default::default()
+        };
+        let metadata =
+            static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                .unwrap();
+        let key = format!("{STATIC_CREDENTIAL_METADATA_PREFIX}TOKEN");
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(
+            metadata[&key],
+            ProviderProfileCredential {
+                name: "token".into(),
+                env_vars: vec!["TOKEN".into()],
+                auth_style: "bearer".into(),
+                header_name: "authorization".into(),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            environment.static_credential_bindings["TOKEN"], baseline,
+            "legacy handles and identities must not change"
+        );
+        let encoded = metadata[&key].encode_to_vec();
+        assert!(
+            !encoded
+                .windows(b"synthetic-sensitive-token".len())
+                .any(|window| window == b"synthetic-sensitive-token")
+        );
+        // Preserve malformed authored fields for the supervisor to reject;
+        // silently dropping them would incorrectly select its default location.
+        for (style, header, query, path, explicit, valid) in [
+            ("", "", "", "", false, true),
+            (" ", "", "", "", true, false),
+            ("", "x-api-key", "", "", true, false),
+            ("header", "Bad Header", "", "", true, false),
+            ("bearer", "authorization", "api_key", "", true, true),
+            (
+                "bearer",
+                "authorization",
+                "api_key",
+                "/v1/{credential}/resources",
+                true,
+                true,
+            ),
+            ("query", "", "api?key", "", true, false),
+            ("basic", "x-custom", "", "", true, true),
+            ("basic", "Authorization", "", "", true, true),
+        ] {
+            let mut declared = owned.clone();
+            declared.credentials[0].auth_style = style.into();
+            declared.credentials[0].header_name = header.into();
+            declared.credentials[0].query_param = query.into();
+            declared.credentials[0].path_template = path.into();
+            let sources = ProviderProfileSources::from_test_profiles(vec![declared]);
+            let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+            let metadata =
+                static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                    .unwrap();
+            assert_eq!(
+                metadata.contains_key(&key),
+                explicit,
+                "style {style:?}, header {header:?}"
+            );
+            let installed = openshell_core::provider_credentials::ProviderCredentialState::from_bound_environment(
+                1, environment.environment.clone(), HashMap::new(), metadata,
+                environment.static_credential_bindings.clone(), vec![],
+            );
+            assert_eq!(
+                installed.is_ok(),
+                valid,
+                "style {style:?}, header {header:?}, query {query:?}"
+            );
+        }
+        environment.environment.remove("TOKEN");
+        assert!(
+            static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                .unwrap()
+                .is_empty(),
+            "expired or withheld material must not leave request metadata behind"
+        );
+    }
+
     #[test]
     fn external_stable_placeholder_binding_preserves_only_value_changes() {
         let mut record = ProviderEnvironmentRecord {
@@ -12548,6 +12756,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-1")
         );
@@ -12608,6 +12819,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-2")
         );
@@ -12625,6 +12839,9 @@ mod tests {
             reconstructed
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-2")
         );
@@ -12676,6 +12893,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             None
         );
