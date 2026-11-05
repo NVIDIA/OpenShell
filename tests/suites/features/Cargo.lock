@@ -396,6 +396,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdi"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "serde_json",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
