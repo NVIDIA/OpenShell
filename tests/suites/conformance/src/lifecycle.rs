@@ -7,6 +7,8 @@
 //! NVIDIA/OpenShell#4629 by Evan Lezar. Tests that need a driver with a
 //! persistent workspace live in `persistent_workspace.rs`.
 
+use std::time::Duration;
+
 use testkit::Context;
 use testkit::sdk::{SandboxPhase, SandboxRestartPolicy};
 
@@ -38,6 +40,62 @@ async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
 
     sandbox.delete().await?;
     cx.expect_absent(&sandbox).await
+}
+
+/// Deleting a running workload that delays TERM handling by one second finishes
+/// within ten seconds, including disappearance from get and list.
+#[testkit::test]
+async fn running_delete_with_delayed_term_completes_within_ten_seconds(
+    cx: &mut Context,
+) -> testkit::Result {
+    let sandbox = cx
+        .sandbox("dt")
+        .command([
+            "sh",
+            "-c",
+            "trap 'sleep 1; exit 0' TERM; \
+             touch /tmp/delayed-term-ready; \
+             while :; do sleep 3600 & wait $!; done",
+        ])
+        .create()
+        .await?;
+    sandbox.wait_ready().await?;
+
+    // Ready alone does not prove that the workload has installed its trap.
+    testkit::poll_until(
+        "workload TERM handler readiness",
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        async || {
+            let output = sandbox
+                .exec(["sh", "-c", "test -f /tmp/delayed-term-ready"])
+                .await?;
+            Ok(if output.exit_code == 0 {
+                testkit::Poll::Ready(())
+            } else {
+                testkit::Poll::Pending(format!(
+                    "readiness check exited {}; stderr: {}",
+                    output.exit_code, output.stderr
+                ))
+            })
+        },
+    )
+    .await?;
+
+    // Use one deadline starting before delete, not a fresh timeout per step.
+    // Boundary containment may kill the workload before its handler finishes;
+    // this asserts bounded deletion, not a graceful workload exit.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        sandbox.delete().await?;
+        cx.expect_absent(&sandbox).await
+    })
+    .await
+    .map_err(|_| {
+        testkit::Error::msg(format!(
+            "sandbox {} was not fully deleted within 10 seconds",
+            sandbox.name()
+        ))
+    })?
 }
 
 /// A sandbox whose main command exits 0, with restart policy Never, reaches
