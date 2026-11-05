@@ -187,6 +187,5 @@ sequenceDiagram
 ## Still open
 
 - **Up to one rebuild of extra access.** A child keeps its old copy until its next rebuild, about 30 s, if the sync after a parent change fails. Notifying children when the parent loads would close this.
-- **Parent delete and child create across replicas.** Deleting a sandbox takes the parent's lock only within one gateway process, so on two replicas both can succeed; the child is then stopped as an orphan.
 - **Stopping an orphan by name.** The stop re-reads the child by name and checks its id, but a short window remains before the stop; closing it needs a stop by id in the compute layer.
 - **Failures of a loaded version cannot be told apart.** A "failed" report for the version a parent last loaded may be a re-apply that failed or a late result from a replaced polling session; both are recorded as failed. Under `fail_closed` the children are then blocked with the parent until it loads again.

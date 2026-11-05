@@ -11,27 +11,33 @@ links:
 
 ## Summary
 
-This RFC lets a sandbox create child sandboxes, so an agent can hand work to a
-sub-agent or a tool that runs in its own isolated sandbox. A user creates a
-child from the CLI with
-`openshell sandbox create --name worker1 --parent <sandbox>`. An agent inside a
+This RFC lets a sandbox have child sandboxes, so an agent can hand work to a
+sub-agent or a tool that runs in its own isolated sandbox. Today a lead
+agent's workers run inside the lead's sandbox and share its files,
+credentials and network access. With child sandboxes, each worker gets its own
+filesystem and processes, while the gateway keeps every child within what its
+parent is allowed to do.
+
+A user creates a child from the CLI with
+`openshell sandbox create --name worker1 --parent lead`. An agent inside a
 root sandbox creates one through a small set of MCP tools at
-`http://openshell.local/mcp`. Users can use the same MCP tools from the host
-through `openshell mcp serve`, a local bridge that reuses their CLI login.
+`http://openshell.local/mcp`, with no token: the sandbox's supervisor
+identifies it. The tools let the agent create, list and delete its children,
+run commands in them, wait for long-running jobs and read their logs. Users
+can call the same tools from the host through `openshell mcp serve`, a local
+bridge that reuses their CLI login.
 
-The design is deliberately small. A sandbox gains a read-only `parent` field,
-and a create request can name a parent. Only a sandbox without a parent can create children, so trees are
-one level deep. A child always uses its parent's policy: the gateway copies the
-parent's policy into the child at creation and keeps it in sync when the parent
-changes. Agents create, run commands in, wait for and delete their children
-through the existing sandbox RPCs, which the MCP tools call through the
-gateway's normal authorization and interceptor path. The feature is
-experimental and off unless the gateway operator enables it.
-
-This version replaces the earlier draft of this RFC, which proposed grants,
-deeper trees, agent and tool sandbox kinds, and a policy prover. The review
-discussion narrowed the scope; the Decision record section lists each choice
-and where it came from.
+The design is deliberately small. Trees are one level deep: only a root, a
+sandbox without a parent, can be a parent. A child always uses its parent's
+policy, which the gateway copies at creation and keeps in sync, and gets a
+subset of its parent's providers, so taking access away from the parent takes
+it away from its children too. An agent cannot pick an image, but it can pick
+a template that a user has marked for agents. Each root may have a limited
+number of children, and a parent cannot be deleted while it has children. The
+MCP tools are built on the existing sandbox RPCs and go through the gateway's
+normal authorization path. The feature is experimental and off unless the
+operator enables it. A child cannot yet have a narrower policy than its
+parent; that is the planned next step.
 
 ## Motivation
 
@@ -43,76 +49,66 @@ credentials and network access.
 We want each sub-agent to run in its own sandbox. That needs three things
 OpenShell does not have today:
 
-- **A relationship between sandboxes.** A sandbox can record a parent. For now
-  a parent's children cannot have children of their own, so trees are one
-  level deep.
 - **A way for an agent to create a child.** Only users can create sandboxes
   today. An agent inside a root sandbox gets a small set of MCP tools to create
   children, run work in them and collect the results.
+- **A relationship between sandboxes.** A sandbox can record a parent. For now
+  a parent's children cannot have children of their own, so trees are one
+  level deep.
 - **The same workflow for users.**
   `openshell sandbox create --name worker1 --parent <name>` works like creating
-  any other sandbox, with the same options. Users who work
-  through an MCP client can do the same with the MCP tools.
+  any other sandbox, with the same options. Users who work through an MCP
+  client can do the same with the MCP tools.
 
 Starting with one level keeps the design small, so we can learn how sandboxed
 sub-agents are used before adding deeper trees or finer-grained permissions.
 
 ## Non-goals
 
-- **Deeper trees.** A child cannot create children; deeper trees are future
-  work.
-- **Separate agent and tool sandbox kinds.** Every child is an ordinary
-  sandbox; what runs in it does not change the rules.
+- **Deeper trees.** A child cannot create children, and every child is an
+  ordinary sandbox, whatever runs in it. Deeper trees are future work.
 - **A child policy different from its parent's.** Children cannot narrow or
-  widen the parent's policy in this version; narrowing is planned for v1.
+  widen the parent's policy, or propose changes to it, in this version; a
+  change to the parent's policy reaches every child. Narrowing is planned for
+  v1.
 - **Choosing any image from inside a sandbox.** An agent's children copy its
   image and resources, or come from a template an administrator has approved
   for agents.
+- **Copying the parent's files into a child.** A child starts from an image,
+  not from a copy of its parent's workspace. Files move between them only
+  through commands run with `exec`, for example a tar archive sent on stdin.
 - **Storing results in the gateway.** A child's output stays in the child until
   its parent reads it.
+- **Deciding when to use sub-agents.** OpenShell does not change how a harness
+  splits work or turn off its built-in sub-agents. The agent decides when to
+  create a child.
 - **Messaging between agents.** How running agents talk to each other is a
   separate proposal.
-- **Other control-plane tools on the MCP endpoint.** Each later set of tools
-  gets its own proposal.
 
-## Decision record
-
-The review of the earlier draft on this pull request and in the design
-document led to the following choices. "Proposed by" names where the idea came
-from; all were accepted by the author.
-
-| Topic | Decision | Proposed by |
-|---|---|---|
-| Depth | Only roots create children; one level | drew |
-| Sandbox kinds | No agent and tool kinds | review thread |
-| Parent link | Read-only `parent` field on the sandbox | drew |
-| RPCs | Reuse existing sandbox RPCs; no child-sandbox API | drew, Piotr |
-| MCP path | Tools call RPCs through the normal router, so interceptors run | author |
-| Callers | Agents in root sandboxes and users on the host (`openshell mcp serve`) | author |
-| Enabling | Gateway setting, off by default, also gating `/mcp`; no grants | Piotr |
-| Limit | `max_concurrent_children` per parent, default 10; a slot frees when a delete finishes | author, team call |
-| Policy | Child uses the parent's policy, copied and kept in sync | author |
-| Child policy changes | Refused, including proposals; narrowing planned for v1 | drew (narrowing) |
-| Image and resources | Users: all create options, a deliberate departure from drew's "inherited from the parent"; agents: copy the parent or use a template approved for agents | Piotr (copy), author (templates) |
-| Providers | Subset of the parent's, for users and agents; removals reach children | author |
-| Results | Idle children, `exec`, background jobs and `wait` | Piotr |
-| Retries | Over MCP, the same name returns the existing sandbox with `already_existed` | Piotr |
-| User check | The root's user must still be a workspace member | Piotr |
-| Deleting a parent | Refused while it has children; `--with-children` is future work | author |
-| Protocol | 2025 MCP revisions, no sessions, calls under the door's 60 s | Piotr |
-| Credential | Existing sandbox session token, attached by the supervisor | Piotr |
-| Host access | `openshell mcp serve` bridge using the CLI login; `/mcp` refuses browser requests | author |
+The review on this pull request and in the design document shaped these
+choices; the [decision record](appendices/decision-record.md) lists each one
+and who proposed it.
 
 ## Proposal
 
 ### Overview
 
-A sandbox can have a parent. A sandbox without a parent is a root; a sandbox
-with one is a child. Only a root can be a parent, so trees are one level deep.
-Children are ordinary sandboxes: the same lifecycle, the same commands and the
-same policy enforcement. Three rules set them apart. A child always uses its
-parent's policy, a child cannot create children, and a parent with children
-cannot be deleted unless the caller asks to delete its children too.
+A sandbox without a parent is a root; a sandbox with one is a child. Children
+are ordinary sandboxes, with the same lifecycle, commands and policy
+enforcement, except for these rules:
+
+- **Parent link:** a sandbox gains a read-only `parent` field, and a create
+  request can name a parent.
+- **One level deep:** only a root can be a parent.
+- **Policy:** a child always uses its parent's policy. The gateway copies it
+  into the child at creation and keeps it in sync.
+- **Providers:** a child gets a subset of its parent's providers.
+- **Image:** an agent cannot choose an image. It can choose a template that a
+  user has marked for agents; otherwise the child copies its parent's image.
+- **Limits:** each root may have a limited number of children, and a parent
+  cannot be deleted while it has children.
+- **Off by default:** the feature is experimental and off unless the operator
+  sets `experimental_enable_child_sandboxes`.
 
 Three kinds of caller create and manage children, and all of them end up in
 the existing sandbox RPCs:
@@ -163,10 +159,6 @@ authentication, authorization and operator interceptors apply to every
 caller. A user can do through MCP exactly what the CLI allows. A sandbox can
 act only on its own children.
 
-The rest of this section covers parentage, policy, the MCP tools, running work
-and collecting results, gateway configuration and limits, lifecycle, and
-authorization.
-
 ### Parentage
 
 A child records its parent in one gateway-owned, read-only field on the
@@ -192,14 +184,14 @@ message SandboxParent {
 message CreateSandboxRequest {
   // ... existing fields ...
   // Name of the root sandbox to create this sandbox under.
-  optional string parent = 10;
+  string parent = 10;
 }
 ```
 
 The gateway stores the parent's id so that deleting a parent and creating a
 new sandbox with the same name never re-attaches the old children. Older
 records have no `parent` field and are read as roots, so no migration is
-needed. Field numbers are illustrative until implementation.
+needed.
 
 When a request names a parent, the gateway checks, in order:
 
@@ -209,8 +201,13 @@ When a request names a parent, the gateway checks, in order:
    "only one level of child sandboxes is supported".
 4. The request carries no policy (see [Policy](#policy)).
 5. Any providers named are attached to the parent (see [Providers](#providers)).
-6. The parent has fewer children than `max_concurrent_children` (see
+6. The parent is not being deleted.
+7. The parent has fewer children than `max_concurrent_children` (see
    [Gateway configuration and limits](#gateway-configuration-and-limits)).
+
+Under the lock on the parent, the gateway checks the parent and the providers
+again, so a parent deleted or changed meanwhile is refused with "parent
+sandbox '<name>' is no longer available".
 
 **Who sets the parent.** For a user, `parent` is optional: without it the
 request creates a root, as today. For a sandbox calling through MCP, the
@@ -268,12 +265,16 @@ with driver configuration are refused, because driver
 configuration can change how the runtime isolates the sandbox. Templates are
 created by workspace administrators, so an agent can only pick from images a
 person approved. Operator interceptors still see the resulting create request,
-so rules such as allowed images apply as they do to any create. Agents name a
-template they have been told about; a tool that lists them is future work.
+so rules such as allowed images apply as they do to any create. An agent
+does not need to be told the names: `tools/list` offers the templates it may
+use on `create_sandbox`, as the allowed values of `template` and one line per
+template, with its image, in the tool's description.
 
 **No GPU without a template.** A child created without a template copies the
 parent's image, CPU and memory, but not a GPU. A child that needs a GPU comes
-from an approved template that asks for one.
+from an approved template that asks for one. With or without a template, a
+child created by an agent keeps its root's runtime class and user namespaces,
+so a template cannot weaken how the child is isolated.
 
 **Agents can narrow their children's providers.** A child created by an agent
 gets all of its parent's providers unless the agent names a subset, so each
@@ -295,8 +296,9 @@ diagrams the flow and its edge cases.
 **At creation** the gateway copies the parent's current policy into the
 child's policy history and records which parent version it came from, for
 example "copied from `lead` version 7". A request that carries a policy for a
-child is refused with "child sandboxes use their parent's policy; omit
---policy". This applies to the CLI, the SDKs and MCP alike. The CLI also
+child is refused with "a child sandbox uses its parent's policy; omit the
+policy". This applies to the SDKs and MCP alike; the CLI refuses
+`--policy` with `--parent` before sending. The CLI also
 ignores the `OPENSHELL_SANDBOX_POLICY` environment variable when `--parent` is
 set and prints a one-line note, so a policy left in the user's shell does not
 cause a confusing error.
@@ -355,7 +357,7 @@ policy instead keeps its children on their last copy.
 
 **Children cannot request more access.** A child's policy proposals through
 `policy.local` are refused with "child sandboxes use their parent's policy;
-ask the parent or a user". Denials are still logged on the child, so the lead
+change the parent's policy instead". Denials are still logged on the child, so the lead
 or a user can see what it needed. The lead can propose a change to its own
 policy; once approved, it reaches every child. A global policy, when active,
 applies to parents and children as it does to every sandbox today.
@@ -439,9 +441,10 @@ already have run.
 {"mcpServers": {"openshell": {"command": "openshell", "args": ["mcp", "serve"]}}}
 ```
 
-**Tools.** Every caller sees the same tool list; whether a call is allowed is
+**Tools.** Every caller sees the same six tools; whether a call is allowed is
 decided when it is made. Arguments only users may send are described as
-"(users only)", and a sandbox that sends one gets a clear refusal.
+"(users only)", and `template` as "(sandboxes only)"; a caller that sends the
+other kind gets a clear refusal. A sandbox's list also names its templates.
 
 | Tool | What it does | RPC |
 |---|---|---|
@@ -458,7 +461,9 @@ What a caller can do depends on who it is:
   `name` and, optionally, a `template` and `providers`. Without a template the
   child copies the caller's image, CPU and memory; without `providers` it gets
   all of the caller's. Its parent is always the caller. `list` shows only its
-  children.
+  children. Its `tools/list` names the templates it may use on
+  `create_sandbox`; a client that keeps its first tool list sees a template
+  added later only after it reconnects.
 - **A user** acts on any sandbox the CLI would let them act on, in the
   bridge's workspace. `create_sandbox` accepts `name`, `parent`, `image` and
   `providers`; without `parent` it creates a root. `list` accepts a `parent`
@@ -487,8 +492,9 @@ workspace. From the CLI the existing "already exists" error applies.
 2025-11-25) that most harnesses use today, without MCP sessions, so any
 gateway replica can answer any call. Replies are plain JSON. Every call ends
 before the 60-second limit of the sandbox door and of common MCP clients: a
-foreground `exec` waits at most 45 seconds and `wait` polls at most 40, which
-leaves room for reading a finished job's output. A job still running at the
+foreground `exec` stops waiting after at most 45 seconds plus a 5-second
+grace, and `wait` polls at most 40, which leaves room for reading a finished
+job's output. A job still running at the
 end of a `wait` is reported as `running`, and the caller calls `wait` again. Streamed
 progress and the 2026-07-28 revision are planned for v1.
 
@@ -545,87 +551,37 @@ The result is the harness's stdout. One-shot modes such as `pi -p`,
 `codex exec` and `claude -p` print the final answer there, so the parent needs
 no result file.
 
-**Follow-up turns.** A harness saves its conversation to a file inside the
-child, and a later process can resume it. Each turn is a new background job
-in the same working directory. The parent asks for structured output, keeps
-the harness's conversation id from the result, and passes it to the next
-turn. OpenShell never reads or stores conversation ids.
+**Follow-up turns.** Each turn is a new background job in the same working
+directory. The parent asks for structured output, keeps the harness's
+conversation id and passes it to the next turn; OpenShell never stores
+conversation ids. A child cannot ask its parent anything while a job runs: it
+ends its turn with the question, and the parent answers in the next turn.
 
-```text
-exec {name: "worker", background: true, workdir: "/sandbox/work",
-      command: ["claude", "-p", "--output-format", "json", "Plan the change"]}
-→ job: 1-0c4e9a12
-wait {name: "worker", job: "1-0c4e9a12"}
-→ completed · exit 0 · stdout: {"session_id": "...", "result": "the plan", ...}
-exec {name: "worker", background: true, workdir: "/sandbox/work",
-      command: ["claude", "-p", "--resume", "<session_id>",
-                "--output-format", "json", "Make it work offline"]}
-```
+**How jobs work.** Every step is a short `exec` of a fixed script built into
+the gateway. The caller's command reaches it as separate arguments and runs as
+`"$@"`; it is never pasted into the script. A start claims the next job number
+by creating `/tmp/openshell/jobs/<n>/`, starts the command detached with its
+output in files, and returns at once. `wait` reads the job's state every two
+seconds: **completed** when its exit file exists, **running** while its
+recorded process is alive, and **lost** otherwise, for example after the child
+restarted. The [background jobs appendix](appendices/background-jobs.md) gives
+the details.
 
-The parent uses the id rather than "continue the last conversation", which
-would pick the wrong one if a child ever held two. A child cannot ask its
-parent anything while a job runs: a child that needs input ends its turn with
-the question, and the parent answers in the next turn. An exit code of 0 does
-not prove the task succeeded, so the parent also checks the harness's own
-error fields. If structured output is truncated, it cannot be parsed and the
-conversation id may be lost; this is a known limit of this version.
+**One background job at a time.** Starting another while one is running is
+refused with an error that names the running job; parallel work uses more
+children. Foreground `exec` stays available while a job runs, for example to
+`tail` its output, which `wait` does not return until the job completes. A
+single job cannot be cancelled in this version; deleting or stopping the child
+ends all of its work. `wait` only reads a job's state, so calling it again is
+always safe.
 
-**How jobs work.** Every step is a short `exec` that runs a fixed script
-built into the gateway. The caller's command reaches the script as separate
-arguments, quoted like any `exec` argument, and runs as `"$@"`; it is never
-pasted into the script's text. To start a job, the script claims the next
-job number by creating `/tmp/openshell/jobs/<n>/`, which succeeds for exactly
-one of two starts racing each other. It starts the command detached (in its
-own session where `setsid` exists), with stdin read from a file and stdout
-and stderr written to files, so the starting `exec` returns at once while the
-job keeps running. It records the job's process id and start time, and the
-job writes its exit code to a temporary file that is then renamed, so an exit
-file always holds a complete code.
-
-`wait` reads the job's state with short `exec` calls, every two seconds and
-within its own limit:
-
-- **completed:** the exit file exists. `wait` returns the exit code and the
-  first and last 16 KiB of each output stream, as `exec` does.
-- **running:** the recorded process is alive and has the recorded start time,
-  so a reused process id is not mistaken for the job. A job folder whose
-  process id has not been written yet counts as running for 10 seconds.
-- **lost:** neither, for example because the job was killed or the child
-  restarted. `wait` says so instead of waiting forever.
-
-**No output while a job runs.** `wait` reports only the state until the job
-completes. To watch progress, the parent can run `tail` on the job's output
-file with a foreground `exec`. Empty output does not mean the job is stuck: a
-harness in one-shot JSON mode may print nothing until its turn ends.
-
-The gateway checks a job id's form before using it, so an id cannot point
-outside the jobs folder. Output files can grow inside the child, and a job
-that writes a lot can fill the child's disk. The child writes these files, so
-the parent receives their contents as data from the child, not as facts the
-gateway has checked. The gateway stores no output: results live in the child until it is
-deleted, which is one reason deleting a parent with children needs an explicit
-flag (see [Lifecycle](#lifecycle)).
-
-**One background job at a time.** A child runs at most one background job.
-Starting another while one is running is refused with an error that names the
-running job, so the parent waits for it first. A job that has completed or is
-`lost` no longer counts. A job's result can be read until the next job starts
-in that child; starting one removes the folders of earlier jobs. Foreground `exec` stays available while a job runs,
-so the parent can still inspect the child. Parallel work uses more children,
-which keeps tasks from overwriting each other's files and keeps two turns of
-one harness conversation from running at once. Processes that a job starts
-itself are part of that job.
-
-A single job cannot be cancelled in this version. Deleting the child, or a
-user stopping it, ends all of its work. `wait` only reads a job's state, so
-calling it again is always safe.
-
-This needs `sh`, `/proc` and `stat` in the child and a writable `/tmp`. A
-child takes its filesystem rules from its parent's policy, so a parent whose
-policy does not let `/tmp` be written has children that cannot run jobs;
-starting one is refused with that reason before anything is claimed. The
-default policy allows it. A native detach option on `ExecSandbox`, handled by
-the sandbox runtime, can replace the script later.
+Job output is written by the child, so the parent receives it as data from the
+child, not as facts the gateway has checked. The gateway stores no output:
+results live in the child until it is deleted, which is one reason deleting a
+parent with children is refused (see [Lifecycle](#lifecycle)). Jobs need `sh`,
+`/proc`, `stat` and a writable `/tmp` in the child; a parent whose policy does
+not let `/tmp` be written has children that cannot run jobs, and a start says
+so.
 
 ### Gateway configuration and limits
 
@@ -688,7 +644,9 @@ restarting a child works as for any sandbox; on reconnect the child receives
 the parent's latest policy.
 
 **Deleting a parent that has children is refused**, in the same way a
-workspace cannot be deleted while it still holds sandboxes. The caller
+workspace cannot be deleted while it still holds sandboxes. Children whose
+delete has started do not block it, although they still count toward the
+limit until their delete finishes. The caller
 deletes the children first, from the CLI or with the MCP `delete` tool:
 
 ```shell
@@ -715,52 +673,28 @@ with a parent, and it never receives a default policy.
 
 ### Authorization and audit
 
-**Authenticating `/mcp`.** Plain HTTP routes on the gateway are not
-authenticated today; only the gRPC service is. The `/mcp` handler runs the
-gateway's existing authenticator chain. A sandbox session token yields a
-sandbox caller. An OIDC bearer token or an mTLS client certificate, which is
-what `openshell mcp serve` sends, yields a user. Anonymous callers are refused.
-The handler then dispatches the RPC to the gRPC router inside the gateway
-process, with that caller and an in-memory marker saying the request came from
-`/mcp`. The marker is a typed value in the request's extensions, not a header,
-so nothing that arrives over the network can carry it. The caller's
-authentication context is preserved, so interceptors see the real caller.
+**Authenticating `/mcp`.** The `/mcp` handler runs the gateway's existing
+authenticator chain: a sandbox session token yields a sandbox caller, and an
+OIDC bearer token or a user's mTLS client certificate yields a user. An
+operator certificate and anonymous callers are refused. Each tool call then goes through the gRPC router with the real
+caller, plus an in-memory marker that says it came from `/mcp`, so
+interceptors see the real caller and nothing from the network can carry the
+marker.
 
 **Browsers are refused.** Any request to `/mcp` that carries an `Origin`
 header is refused. Browsers always send one on a cross-site request, while
 the bridge and the supervisor door never do, so a web page cannot drive
 `/mcp` with a user's session.
 
-The router allows a sandbox caller with the marker on exactly five methods:
-`CreateSandbox`, `ListSandboxes`, `ExecSandbox`, `DeleteSandbox` and
-`GetSandboxLogs`. Every other method keeps its current rule. The parent,
-workspace and child-only checks below run in the handlers, on the request as
-it arrives after interceptors have run, so an interceptor that rewrites a
-request cannot move a child to another parent or workspace.
-
-**Sandbox callers.** A sandbox may call `CreateSandbox`, `ListSandboxes`,
-`ExecSandbox`, `DeleteSandbox` and `GetSandboxLogs` only through `/mcp`, and
-only on its own children:
-
-- `CreateSandbox`: the caller must be a root. The gateway sets the parent to
-  the caller and creates the child in the caller's workspace. The request may
-  carry only a name, a workload template and a list of providers. A named
-  template must be in the caller's workspace, carry the
-  `openshell.ai/agent-usable: "true"` label and have no driver configuration;
-  without one, the gateway fills in the image, CPU and memory from the caller.
-  Named providers must be attached to the caller; without any, the gateway
-  fills in all of the caller's. Any other fields in the request are refused.
-- `ListSandboxes`: returns only the caller's children.
-- `ExecSandbox`, `DeleteSandbox`, `GetSandboxLogs`: the target's parent must be
-  the caller. Any other name, including the caller's own, a sibling and a
-  sandbox that does not exist, reads as "not found", so names cannot be
-  probed.
+**Sandbox callers** reach exactly six methods, and only through `/mcp`:
+`CreateSandbox`, `ListSandboxes`, `ListSandboxTemplates`, `ExecSandbox`,
+`DeleteSandbox` and `GetSandboxLogs`. Every other method keeps its current
+rule. A sandbox acts only on its own children and on templates approved for
+agents; any other sandbox name, including its own and a sibling's, reads as
+"not found", so names cannot be probed.
 
 **User callers** keep exactly the permissions they have today, whether they use
 the CLI, an SDK or MCP. Nothing in this RFC lets a user do more than before.
-A user's tool call goes through the same per-method role check and the same
-workspace checks in the handlers as a direct gRPC call; the sandbox-only
-rules above apply only to sandbox callers.
 
 | Action | User (CLI, SDK or MCP) | Root sandbox (MCP) | Child sandbox (MCP) |
 |---|---|---|---|
@@ -769,55 +703,25 @@ rules above apply only to sandbox callers.
 | List, exec, wait, logs, delete | sandboxes they can access | its own children | nothing |
 | Change a child's policy | no (change the parent's) | no | no |
 
-**The user who started the root must still have access.** When a user creates
-a sandbox, the gateway records that user in its read-only `created_by` field.
-When a root creates a child through MCP, the child records the root instead,
-as `sandbox:<id>`, the same form the audit log uses: `created_by` names whoever
-decided to create the sandbox, and the user a root acts for is the root's own
-`created_by`.
-Every time a root creates a child through MCP, the gateway checks that this
-user is still a member of the workspace with at least the user role. If not,
-the create is refused with "the user who started this sandbox no longer has
-access". Existing children keep running and can still be listed, waited on and
-deleted. An agent therefore cannot create children after its user loses access
-to the workspace.
-
-The check fails closed. A root created before `created_by` existed, or by an
-identity that has no workspace membership to recheck, such as an operator's
-client certificate, cannot create children through MCP; the error says so.
-The check knows only the creator's subject, not their roles, so a root
-created by a platform administrator who is not a member of the workspace
-cannot create children through MCP either. Users can still create children
-under such a root from the CLI or through MCP, where the user is the caller
-and is checked directly.
+**The user who started the root must still have access.** Each sandbox
+records who created it in a read-only `created_by` field: a user, or
+`sandbox:<id>` for a child an agent created. Every time a root creates a child
+through MCP, the gateway checks that the root's user is still a member of the
+workspace with at least the user role; if not, the create is refused with
+"the user who started this sandbox no longer has access". Existing children
+keep running. The check fails closed for roots without a recheckable user.
 
 **Credentials.** The supervisor attaches the sandbox's existing session token
 to MCP calls. The agent never receives it, and it is not a new credential. A
 token that can be used only for `/mcp` is planned for v1.
 
 **Audit.** Every MCP tool call is logged as one OCSF API Activity event with
-the calling sandbox or user as the actor and, for a sandbox, the user it acts
-for (`acting_for`, the root's `created_by`). A refusal by policy or by the
-request, such as not found or a limit, is recorded as denied with its code; an
-internal, unavailable or timed-out call is recorded as allowed but failed, not
-as a denial. For an internal or unavailable error the agent sees only a request
-id; the error's own text goes to the gateway log and the event
-(`error_detail`), under the same id. The event records each tool's arguments and outcome: the target,
-for `create_sandbox` the template, parent, image and providers given and the
-new sandbox's id, for `list` the parent filter and the count, for `exec` the
-argument list, working directory, timeout and exit code, and for jobs the job
-id, state and exit code. Every field is capped (the argument list at 1 KiB,
-the working directory at 512 bytes, others at 256 bytes) and marks a cut, so
-an event stays under 4 KiB. It never records stdin, environment values,
-output, log lines or any reply body. A child that calls `/mcp` records its own
-`created_by` as `acting_for`, which for a child made over MCP is its root,
-`sandbox:<id>`; the user is one step up, in the root's `created_by`.
-The argument list is kept because "what did it run" is the question operators
-ask, and the gateway's own exec log records the command anyway. Secrets
-belong in providers, not in command lines. Refusals at the supervisor door are logged
-as HTTP denials, like other egress denials. An operator can answer "which
-sandbox created this one, for which user, and what did it run" from the logs
-they already collect.
+the caller, the user it acts for, the outcome and the main arguments, so an
+operator can answer "which sandbox created this one, for which user, and what
+did it run". Output, stdin and environment values are never recorded.
+
+The [authorization appendix](appendices/authorization.md) gives the checks per
+method, the recorded creator and the audit fields in full.
 
 ### Compatibility
 
@@ -858,7 +762,8 @@ feature is never reachable on a default gateway.
    the `/mcp` endpoint to the gateway. Tools call the existing RPCs through the
    router; sandbox callers act only on their own children, and the root's user
    is rechecked on every create. Include the `template` and `providers`
-   arguments for sandbox callers and the `openshell.ai/agent-usable` check.
+   arguments for sandbox callers, the `openshell.ai/agent-usable` check and
+   the approved templates in a sandbox's tool list.
 5. **Results.** Foreground `exec` with the output cap, background jobs and
    `wait`.
 6. **MCP for users.** Accept user callers on `/mcp` and add
@@ -867,7 +772,7 @@ feature is never reachable on a default gateway.
    CLI, the MCP tools and the gateway settings, and add end-to-end tests that
    create, use and delete children from the CLI and from an agent in a sandbox.
 
-Phases 1 to 6 are built on the
+All seven phases are built on the
 [`feat/child-sandboxes/patkraw`](https://github.com/patkraw/OpenShell/tree/feat/child-sandboxes/patkraw)
 branch. The proof of concept on the
 [`gateway-mcp-poc`](https://github.com/patkraw/OpenShell/tree/gateway-mcp-poc)
@@ -875,7 +780,7 @@ branch implements the door, the `/mcp` endpoint and child creation for the
 earlier draft of this RFC. Its MCP protocol handling and supervisor door can be
 reused; its grants, lineage store and result files are not part of this design.
 
-## Risks
+## Risks and known limits
 
 - **Parents hold their children's permissions.** A child can use only what its
   parent has, so a lead that delegates email to a child must itself be allowed
@@ -883,69 +788,43 @@ reused; its grants, lineage store and result files are not part of this design.
   Narrowing in v1 lets a child have less than its parent, but the parent keeps
   its access; only a policy for a whole group of sandboxes, which is future
   work, would remove it.
-- **A child can keep access its parent lost for up to one rebuild, about 30
-  seconds.** The delivery check acts when a child's configuration is built.
-  If the parent tightens its policy and the sync fails, the child keeps
-  enforcing its old copy until its next rebuild, which refuses it. A provider
-  the parent loses is withheld from the child's next build the same way.
-  Notifying children at once when the parent loads would shorten this to
-  seconds; that is future work.
-- **Background jobs depend on the sandbox runtime.** Jobs assume that a
-  process started with its input and output redirected outlives the `exec`
-  that started it, and that `/tmp` is writable. This was checked on Docker; if
-  it fails on another driver, background jobs fail there until a native
-  detach option exists.
-- **The MCP door uses the sandbox's session token.** That token can do more
-  than call `/mcp`. The agent never sees it, but the agent must also be unable
-  to read the token file inside the sandbox. A token limited to `/mcp` is
-  planned for v1.
+- **A child's policy is written for its parent's image.** A child that runs a
+  different image, from a template or a user's `--image`, keeps the parent's
+  binary paths, filesystem paths and process user. Programs at other paths
+  are denied network access and paths the parent's image lacks are
+  inaccessible. If none of the listed filesystem paths exist in the child's
+  image, the default `best_effort` Landlock mode runs it without filesystem
+  rules and logs a high-severity finding. Narrowing a child's policy is the
+  planned fix.
+- **An approved template is approved for every agent in the workspace.** The
+  `openshell.ai/agent-usable` label is per template, not per parent.
+  Administrators should label only templates whose image they would let any
+  agent there run, and whose paths and users match the policies of the roots
+  that will use them.
 - **Agents start sandboxes on their own.** Within the limit, a prompt-injected
   agent can start children and run commands in them. Children cannot exceed
   the parent's policy, the limit caps how many run at once, and every call is
   audited.
-- **An approved template is approved for every agent in the workspace.** The
-  `openshell.ai/agent-usable` label is per template, not per parent, so any
-  root in the workspace can start children from it. Administrators should
-  label only templates whose image they would let any agent there run, and
-  whose binary paths and users match the policies of the roots that will use
-  them.
-- **Downgrading the gateway turns children into roots.** An older gateway does
-  not know the `parent` field and drops it the next time it saves a child's
-  record. The child becomes a root that keeps its copied policy and providers
-  but no longer follows its parent. Before downgrading, delete all children, or
-  turn off `experimental_enable_child_sandboxes` and then delete them.
-
-## Known limits of this version
-
-- **A timed-out command keeps running.** Foreground `exec` reports a timeout
-  but does not stop the command; deleting the child does.
-- **A parent policy that cannot be copied refuses its children for good.**
-  The child is told why and the gateway logs it once per parent version; the
-  fix is a parent policy that can be copied.
-- **No GPU for children created by agents without a template.**
-- **A child's policy is written for its parent's image.** A child that runs a
-  different image, from a template or a user's `--image`, keeps the parent's
-  binary paths, filesystem paths and process user. Programs at other paths
-  are denied network access, paths the parent's image lacks are inaccessible,
-  and the child's own baseline paths are dropped with its startup write-back.
-  If none of the listed filesystem paths exist in the child's image, the
-  default `best_effort` Landlock mode runs it without filesystem rules and
-  logs a high-severity finding. Narrowing a child's policy is the planned fix.
-- **`created_by` holds two forms**, a user's subject or `sandbox:<id>`, so an
-  identity provider subject that starts with `sandbox:` would read like a
-  sandbox. Nothing decides access from a child's `created_by`, so the worst
-  case is a misleading record.
-- **Roots with driver configuration** cannot create children through MCP,
-  because it can set isolation, devices and mounts that are not safe to copy;
-  create their children with the CLI.
-- **Roots created by platform administrators** who are not workspace members
-  cannot create children through MCP (see
-  [Authorization and audit](#authorization-and-audit)).
-- **The edge tunnel is not yet verified** for `openshell mcp serve`. It uses
-  the same connection as the CLI's gRPC calls, but an edge proxy might pass
-  only gRPC or buffer replies.
-- **Background jobs were checked on Docker only**; Kubernetes, Podman and VM
-  drivers are still to be checked.
+- **Revocation is not instant.** If the parent loses access and the sync
+  fails, the child keeps its old copy until its next configuration rebuild,
+  about 30 seconds. A provider the parent loses reaches a running child the
+  same way; testing measured about 15 seconds.
+- **The MCP door uses the sandbox's session token.** That token can do more
+  than call `/mcp`. The agent never sees it and must be unable to read the
+  token file. A token limited to `/mcp` is planned for v1.
+- **Background jobs were checked on Docker only.** They assume a process
+  started with redirected input and output outlives the `exec` that started
+  it, and that `/tmp` is writable. An end-to-end task exists for Podman but
+  does not run in CI yet; Kubernetes and VM drivers are still to be checked.
+- **Downgrading the gateway turns children into roots.** An older gateway drops
+  the `parent` field the next time it saves a child's record. Before
+  downgrading, delete all children.
+- **Smaller limits.** A foreground `exec` that times out keeps running until
+  the child is deleted. A parent policy that cannot be copied refuses its
+  children until it is fixed. Children created by agents get no GPU without a
+  template. Roots with driver configuration cannot create children through
+  MCP; use the CLI. `openshell mcp serve` through the edge tunnel
+  has only a manual test, not run in CI.
 
 ## Future work
 
@@ -953,13 +832,13 @@ reused; its grants, lineage store and result files are not part of this design.
   the parent's workspace, after every root policy load and for each child
   that delivery refuses as behind. A lookup indexed by parent id would remove
   that cost on gateways with many sandboxes.
-- **Listing templates over MCP.** A `list_templates` tool, built on the
-  existing `ListSandboxTemplates` RPC, that shows a sandbox only templates
-  approved for agents, without their environment values.
+- **Telling clients when templates change.** A sandbox's tool list is built
+  when the client asks for it. MCP's `notifications/tools/list_changed` needs
+  a session, which this version does not keep, so a client sees a new
+  template only when it lists the tools again.
 - **More create options over MCP for users**, such as `template`, resources,
   environment, labels and a policy for roots.
 - **Stopping a timed-out command**, and output while a job runs.
-- **A periodic retry of failed policy copies.**
 - **Deleting a parent with its children in one step.** `--with-children` on
   `sandbox delete` and `with_children: true` on the MCP `delete` tool would
   delete the children first and the parent last. It needs its own design for
@@ -991,90 +870,34 @@ reused; its grants, lineage store and result files are not part of this design.
 
 ## Alternatives
 
-### A child points at its parent's policy
-
-Instead of copying, a child would have no policy history and the gateway would
-read the parent's policy whenever it builds the child's configuration.
-
-This was rejected because the gateway delivers, records and reports policy per
-sandbox. A shared policy record would make a child's load status overwrite the
-parent's, would need every policy change to find and notify children anyway,
-and would let a supervisor's startup write-back create a child policy. Copying
-keeps per-sandbox delivery, history and load status as they are. The new work
-is the sync function and dropping a child's startup write-back.
-
-### A one-time copy at creation
-
-The child would get the parent's policy at creation and be managed separately
-afterwards, with its own proposals going to a user.
-
-This was rejected because revoking access on the parent would not reach its
-children, and a child could become wider than its parent.
-
-### A lifetime budget
-
-The root would carry a budget of children ever created, never refunded, so a
-tree could not create and delete children forever.
-
-This was not chosen because a long-running lead that cleans up after itself
-would still run out. The per-parent concurrent limit caps resources in use; a
-lifetime budget can be added later if runaway loops appear in practice.
-
-### Any sandbox in a tree may create children
-
-Children could create children as long as the root's budget allows.
-
-This was not chosen for this version, to keep one simple rule and learn how
-one level is used first.
-
-### MCP calls the handlers directly
-
-The `/mcp` endpoint would build requests and call the sandbox handlers without
-going through the gRPC router.
-
-This was rejected because operator interceptors would never see sandboxes
-created through MCP. Users can choose any create option over MCP, and
-operators may restrict even an image an agent copies from its parent, so
-skipping the interceptors would bypass operator rules such as allowed images.
-
-### Sandboxes call the gRPC API directly
-
-`CreateSandbox` and the other RPCs would accept sandbox callers over gRPC.
-
-This was rejected because it would expose the whole public create surface to
-sandboxes, including every option added in future. The MCP path accepts a
-narrow request and fills in the rest from the parent.
-
-### MCP server in the supervisor
-
-Each supervisor would serve the MCP tools itself, like `policy.local`.
-
-This was rejected because host users have no supervisor and would need a
-second path, the MCP layer would need upgrading in every running sandbox when
-MCP changes, and the checks would still have to live in the gateway.
-
-### Agent holds its own gateway credential
-
-The agent would call the gateway directly with a token in its environment.
-
-This was rejected because a prompt-injected agent could copy the token and use
-it from anywhere. The supervisor door keeps credentials out of the agent's
-reach.
-
-### Skills and a CLI instead of MCP
-
-Harnesses would create children by running a command-line tool described in a
-skill.
-
-MCP was chosen first because most harnesses already speak it and need only a
-configuration entry. A CLI over the same door is future work.
-
-### Grants
-
-The earlier draft of this RFC gave each tree a grant with depth, breadth,
-total, expiry and program limits, and checked each child's policy with the
-policy prover. Reviewers found it more than a first version needs. Its pieces
-remain available as future extensions.
+- **A child points at its parent's policy** instead of holding a copy.
+  Rejected: the gateway delivers, records and reports policy per sandbox, so a
+  shared record would mix the child's load status with the parent's and still
+  need every change to notify children.
+- **A one-time copy at creation**, managed separately afterwards. Rejected:
+  revoking access on the parent would not reach its children, and a child
+  could become wider than its parent.
+- **A lifetime budget** of children ever created. Not chosen: a long-running
+  lead that cleans up after itself would still run out. It can be added later
+  if runaway loops appear.
+- **Any sandbox in a tree may create children.** Not chosen for this version,
+  to keep one simple rule and learn how one level is used first.
+- **MCP calls the handlers directly**, skipping the gRPC router. Rejected:
+  operator interceptors, such as rules on allowed images, would never see
+  sandboxes created through MCP.
+- **Sandboxes call the gRPC API directly.** Rejected: it would expose the whole
+  create surface to sandboxes, including every future option. The MCP path
+  accepts a narrow request and fills in the rest from the parent.
+- **An MCP server in the supervisor**, like `policy.local`. Rejected: host users
+  have no supervisor, every running sandbox would need upgrading when MCP
+  changes, and the checks would still live in the gateway.
+- **The agent holds its own gateway credential.** Rejected: a prompt-injected
+  agent could copy the token and use it from anywhere.
+- **Skills and a CLI instead of MCP.** MCP came first because most harnesses
+  already speak it; a CLI over the same door is future work.
+- **Grants**, from the earlier draft: per-tree limits on depth, breadth, total,
+  expiry and programs, with each child's policy checked by the prover.
+  Reviewers found it more than a first version needs.
 
 ## Prior art
 
@@ -1112,40 +935,10 @@ remain available as future extensions.
   inside a sandbox should later reach the same RPCs, for example over gRPC-Web
   or Connect, is open.
 
-## Appendix: End-to-end walkthrough
+## Appendices
 
-1. **The operator enables the feature.**
-
-   ```toml
-   [openshell.gateway]
-   experimental_enable_child_sandboxes = true
-   max_concurrent_children = 10
-   ```
-
-2. **A user starts a lead.**
-
-   ```shell
-   openshell sandbox create --name lead --from pi-agent:local \
-     --provider nvidia --policy team.yaml -- pi
-   ```
-
-3. **The agent creates a worker.** Pi calls `create_sandbox {name: "worker"}` at
-   `http://openshell.local/mcp`. The supervisor attaches `lead`'s token. The
-   gateway checks that children are enabled, that `lead` is a root under its
-   limit, and that the user who created `lead` is still a member of the
-   workspace. It creates `worker` with `lead`'s image, CPU, memory and providers
-   and a copy of `lead`'s policy, and returns once `worker` is ready.
-
-4. **The agent hands it a task.**
-   `exec {name: "worker", command: ["pi", "-p", "Write the tests"], background: true}`
-   returns job `1-9f2c41ab`. The agent calls
-   `wait {name: "worker", job: "1-9f2c41ab"}` until it returns the exit code
-   and the worker's answer on stdout.
-
-5. **The user changes the lead's policy.** `openshell policy set lead ...`
-   creates `lead` version 8. The gateway copies it into `worker` and delivers
-   it; `worker` applies it within seconds.
-
-6. **The agent cleans up.** `delete {name: "worker"}` frees the slot. Later the
-   user runs `openshell sandbox delete lead`, which succeeds because `lead` has
-   no children left.
+- [Policy sync between parents and children](appendices/policy-sync.md)
+- [Background jobs](appendices/background-jobs.md)
+- [End-to-end walkthrough](appendices/walkthrough.md)
+- [Authorization and audit details](appendices/authorization.md)
+- [Decision record](appendices/decision-record.md)
