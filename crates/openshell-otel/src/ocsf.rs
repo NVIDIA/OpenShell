@@ -481,11 +481,14 @@ mod tests {
 
     #[test]
     fn trace_body_preserves_native_correlation_without_mutating_the_source() {
-        let event = ConfigStateChangeBuilder::new(&event_context("sandbox-1"))
-            .trace(openshell_ocsf::TraceCorrelation {
-                uid: "0af7651916cd43dd8448eb211c80319c".to_string(),
-            })
-            .build();
+        let mut correlated =
+            native(&ConfigStateChangeBuilder::new(&event_context("sandbox-1")).build());
+        correlated["trace"] = serde_json::json!({"uid": "0af7651916cd43dd8448eb211c80319c"});
+        correlated["metadata"]["profiles"]
+            .as_array_mut()
+            .unwrap()
+            .push("trace".into());
+        let event: OcsfEvent = serde_json::from_value(correlated).unwrap();
         let before = native(&event);
         let native_body = body(&record(&event));
         assert_eq!(native_body, native(&event));

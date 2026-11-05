@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, LazyLock, Mutex};
 
-use openshell_ocsf::{BaseEventBuilder, OcsfJsonlLayer, TraceCorrelation, ocsf_emit};
+use openshell_ocsf::{BaseEventBuilder, OcsfJsonlLayer, ocsf_emit};
 use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, Sampler, SdkTracerProvider};
 use tracing_subscriber::prelude::*;
 
@@ -29,24 +29,21 @@ impl std::io::Write for Writer {
 fn capture(
     sampler: Sampler,
     active: bool,
-    explicit: Option<TraceCorrelation>,
 ) -> (serde_json::Value, Vec<opentelemetry_sdk::trace::SpanData>) {
-    capture_route(sampler, active, explicit, false)
+    capture_route(sampler, active, false)
 }
 
 fn capture_route(
     sampler: Sampler,
     active: bool,
-    explicit: Option<TraceCorrelation>,
     routed: bool,
 ) -> (serde_json::Value, Vec<opentelemetry_sdk::trace::SpanData>) {
-    capture_context(sampler, active, explicit, routed, None)
+    capture_context(sampler, active, routed, None)
 }
 
 fn capture_context(
     sampler: Sampler,
     active: bool,
-    explicit: Option<TraceCorrelation>,
     routed: bool,
     remote_parent: Option<opentelemetry::trace::SpanContext>,
 ) -> (serde_json::Value, Vec<opentelemetry_sdk::trace::SpanData>) {
@@ -76,10 +73,7 @@ fn capture_context(
                 );
                 return;
             }
-            let mut builder = BaseEventBuilder::new(ctx);
-            if let Some(trace) = explicit {
-                builder = builder.trace(trace);
-            }
+            let builder = BaseEventBuilder::new(ctx);
             if routed {
                 openshell_ocsf::emit_ocsf_event_routed("test-sandbox", builder.build());
             } else {
@@ -125,7 +119,6 @@ fn authentication_failure_correlation_can_inherit_sampled_or_unsampled_caller_co
         let (event, spans) = capture_context(
             Sampler::ParentBased(Box::new(Sampler::AlwaysOn)),
             true,
-            None,
             false,
             Some(parent),
         );
@@ -155,7 +148,7 @@ fn assert_no_trace(value: &serde_json::Value) {
 
 #[test]
 fn sampled_active_span_correlates_to_exported_w3c_trace() {
-    let (value, spans) = capture(Sampler::AlwaysOn, true, None);
+    let (value, spans) = capture(Sampler::AlwaysOn, true);
     let uid = value["trace"]["uid"].as_str().unwrap();
     assert_eq!(uid.len(), 32);
     assert!(
@@ -177,14 +170,14 @@ fn sampled_active_span_correlates_to_exported_w3c_trace() {
 
 #[test]
 fn no_active_context_omits_trace_and_profile() {
-    let (value, spans) = capture(Sampler::AlwaysOn, false, None);
+    let (value, spans) = capture(Sampler::AlwaysOn, false);
     assert_no_trace(&value);
     assert!(spans.is_empty());
 }
 
 #[test]
 fn routed_emission_also_enriches_from_sampled_context() {
-    let (value, spans) = capture_route(Sampler::AlwaysOn, true, None, true);
+    let (value, spans) = capture_route(Sampler::AlwaysOn, true, true);
     assert_eq!(
         value["trace"]["uid"],
         spans[0].span_context.trace_id().to_string()
@@ -200,32 +193,9 @@ fn routed_emission_also_enriches_from_sampled_context() {
 
 #[test]
 fn unsampled_active_context_omits_trace_and_profile() {
-    let (value, spans) = capture(Sampler::AlwaysOff, true, None);
+    let (value, spans) = capture(Sampler::AlwaysOff, true);
     assert_no_trace(&value);
     assert!(spans.is_empty());
-}
-
-#[test]
-fn explicit_trace_overrides_automatic_enrichment() {
-    let explicit = "0af7651916cd43dd8448eb211c80319c";
-    let (value, spans) = capture(
-        Sampler::AlwaysOn,
-        true,
-        Some(TraceCorrelation {
-            uid: explicit.to_string(),
-        }),
-    );
-    assert_eq!(value["trace"]["uid"], explicit);
-    assert_ne!(explicit, spans[0].span_context.trace_id().to_string());
-    assert_eq!(
-        value["metadata"]["profiles"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|p| *p == "trace")
-            .count(),
-        1
-    );
 }
 
 #[test]

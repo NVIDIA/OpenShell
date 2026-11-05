@@ -12,7 +12,6 @@ use crate::objects::{Actor, Endpoint};
 /// Builder for SSH Activity [4007] events.
 pub struct SshActivityBuilder<'a, EndpointState = MissingSshEndpoint> {
     ctx: ContextRef<'a>,
-    trace: Option<crate::TraceCorrelation>,
     activity: ActivityId,
     action: Option<ActionId>,
     disposition: Option<DispositionId>,
@@ -49,7 +48,6 @@ impl<'a> SshActivityBuilder<'a, MissingSshEndpoint> {
     pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
             ctx: ctx.into(),
-            trace: None,
             activity: ActivityId::Unknown,
             action: None,
             disposition: None,
@@ -68,13 +66,6 @@ impl<'a> SshActivityBuilder<'a, MissingSshEndpoint> {
 }
 
 impl<'a, EndpointState> SshActivityBuilder<'a, EndpointState> {
-    /// Set trace correlation explicitly instead of using the active span.
-    #[must_use]
-    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
-        self.trace = Some(trace);
-        self
-    }
-
     /// Set the source endpoint from an address.
     #[must_use]
     pub fn src_endpoint_addr(
@@ -96,7 +87,6 @@ impl<'a, EndpointState> SshActivityBuilder<'a, EndpointState> {
     fn with_endpoint(self) -> SshActivityBuilder<'a, HasSshEndpoint> {
         SshActivityBuilder {
             ctx: self.ctx,
-            trace: self.trace,
             activity: self.activity,
             action: self.action,
             disposition: self.disposition,
@@ -156,10 +146,6 @@ impl SshActivityBuilder<'_, HasSshEndpoint> {
         );
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
-
-        if let Some(trace) = self.trace {
-            base.set_trace(trace);
-        }
 
         OcsfEvent::SshActivity(SshActivityEvent {
             base,

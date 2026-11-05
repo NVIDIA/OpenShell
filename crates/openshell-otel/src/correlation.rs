@@ -18,9 +18,8 @@ pub fn current_ocsf_trace_correlation() -> Option<openshell_ocsf::TraceCorrelati
     let context = tracing::Span::current().context();
     let span = context.span();
     let span_context = span.span_context();
-    (span_context.is_valid() && span_context.is_sampled()).then(|| {
-        openshell_ocsf::TraceCorrelation {
-            uid: span_context.trace_id().to_string(),
-        }
-    })
+    if !span_context.is_sampled() {
+        return None;
+    }
+    openshell_ocsf::TraceCorrelation::from_trace_id(span_context.trace_id().to_bytes())
 }

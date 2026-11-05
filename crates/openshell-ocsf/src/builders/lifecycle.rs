@@ -12,7 +12,6 @@ use crate::objects::Product;
 /// Builder for Application Lifecycle [6002] events.
 pub struct AppLifecycleBuilder<'a> {
     ctx: ContextRef<'a>,
-    trace: Option<crate::TraceCorrelation>,
     activity: ActivityId,
     severity: SeverityId,
     status: Option<StatusId>,
@@ -20,18 +19,10 @@ pub struct AppLifecycleBuilder<'a> {
 }
 
 impl<'a> AppLifecycleBuilder<'a> {
-    /// Set trace correlation explicitly instead of using the active span.
-    #[must_use]
-    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
-        self.trace = Some(trace);
-        self
-    }
-
     #[must_use]
     pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
             ctx: ctx.into(),
-            trace: None,
             activity: ActivityId::Unknown,
             severity: SeverityId::Informational,
             status: None,
@@ -54,10 +45,6 @@ impl<'a> AppLifecycleBuilder<'a> {
         );
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
-
-        if let Some(trace) = self.trace {
-            base.set_trace(trace);
-        }
 
         OcsfEvent::ApplicationLifecycle(ApplicationLifecycleEvent {
             base,

@@ -195,7 +195,7 @@ impl BaseEventData {
         self.ai_model = Some(ai_model);
     }
 
-    /// Set explicit trace correlation and add the Trace profile once.
+    /// Set trace correlation and add the Trace profile once.
     pub fn set_trace(&mut self, trace: crate::TraceCorrelation) {
         self.trace = Some(trace);
         if !self
