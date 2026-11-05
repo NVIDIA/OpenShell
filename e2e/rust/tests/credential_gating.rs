@@ -6,12 +6,14 @@
 //! E2E coverage for credentialed endpoint admission and REST body backstops.
 
 use std::io::Write;
+use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
+use futures_util::FutureExt;
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use sha1::{Digest, Sha1};
@@ -254,7 +256,7 @@ fn write_policy(
         }
     };
     let policy = format!(
-        r#"version: 1
+        r"version: 1
 filesystem_policy:
   include_workdir: true
   read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
@@ -274,7 +276,7 @@ network_policies:
       - path: /usr/bin/python*
       - path: /usr/local/bin/python*
       - path: /sandbox/.uv/python/*/bin/python*
-"#,
+",
     );
     file.write_all(policy.as_bytes())
         .map_err(|error| format!("write policy: {error}"))?;
@@ -895,46 +897,62 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         .await
         .expect("install credentialed provider");
 
-    let result = async {
-        assert_rest_body_preserves_placeholder(&server).await?;
-        assert_websocket_binary_denied(&websocket_server).await
-    }
-    .await;
+    eprintln!("credential gating: profile REST and WebSocket scenarios");
+    let (rest_result, websocket_result) = tokio::join!(
+        AssertUnwindSafe(assert_rest_body_preserves_placeholder(&server)).catch_unwind(),
+        AssertUnwindSafe(assert_websocket_binary_denied(&websocket_server)).catch_unwind(),
+    );
 
+    eprintln!("credential gating: profile provider cleanup");
     cleanup_provider_resources().await;
-    result.expect("credential gating E2E");
+    rest_result
+        .unwrap_or_else(|panic| resume_unwind(panic))
+        .and_then(|()| websocket_result.unwrap_or_else(|panic| resume_unwind(panic)))
+        .expect("credential gating E2E");
 
     install_endpointless_provider()
         .await
         .expect("install endpointless provider");
-    let endpointless_result = async {
-        assert_gateway_admission(server.port, CredentialSource::PolicyBinding).await?;
-        let literal = run_body_sandbox(
+    eprintln!("credential gating: endpointless admission, REST bodies and live environment");
+    let (admission_result, body_result, environment_result) = tokio::join!(
+        AssertUnwindSafe(assert_gateway_admission(
             server.port,
-            EndpointMode::RestBody { rewrite: false },
             CredentialSource::PolicyBinding,
-        )
-        .await?;
-        assert!(literal.contains("BODY_TEXT"));
-        let rewritten = run_body_sandbox(
-            server.port,
-            EndpointMode::RestBody { rewrite: true },
-            CredentialSource::PolicyBinding,
-        )
-        .await?;
-        assert!(rewritten.contains("BODY_REWRITTEN"));
-        assert!(!rewritten.contains(TEST_SECRET));
-        assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
-        let observations = server.wait_for_observations(3).await;
-        assert_eq!(observations.len(), 3, "observations: {observations:?}");
-        assert!(observations[1].saw_placeholder);
-        assert!(!observations[1].saw_secret);
-        assert!(!observations[2].saw_placeholder);
-        assert!(observations[2].saw_secret);
-        assert_endpointless_provider_env_live_update(server.port).await?;
-        Ok::<(), String>(())
-    }
-    .await;
+        ))
+        .catch_unwind(),
+        AssertUnwindSafe(async {
+            let literal = run_body_sandbox(
+                server.port,
+                EndpointMode::RestBody { rewrite: false },
+                CredentialSource::PolicyBinding,
+            )
+            .await?;
+            assert!(literal.contains("BODY_TEXT"));
+            let rewritten = run_body_sandbox(
+                server.port,
+                EndpointMode::RestBody { rewrite: true },
+                CredentialSource::PolicyBinding,
+            )
+            .await?;
+            assert!(rewritten.contains("BODY_REWRITTEN"));
+            assert!(!rewritten.contains(TEST_SECRET));
+            assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
+            let observations = server.wait_for_observations(3).await;
+            assert_eq!(observations.len(), 3, "observations: {observations:?}");
+            assert!(observations[1].saw_placeholder);
+            assert!(!observations[1].saw_secret);
+            assert!(!observations[2].saw_placeholder);
+            assert!(observations[2].saw_secret);
+            Ok::<(), String>(())
+        })
+        .catch_unwind(),
+        AssertUnwindSafe(assert_endpointless_provider_env_live_update(server.port)).catch_unwind(),
+    );
+    eprintln!("credential gating: endpointless provider cleanup");
     cleanup_provider_resources().await;
-    endpointless_result.expect("endpointless provider credential gating E2E");
+    admission_result
+        .unwrap_or_else(|panic| resume_unwind(panic))
+        .and_then(|()| body_result.unwrap_or_else(|panic| resume_unwind(panic)))
+        .and_then(|()| environment_result.unwrap_or_else(|panic| resume_unwind(panic)))
+        .expect("endpointless provider credential gating E2E");
 }
