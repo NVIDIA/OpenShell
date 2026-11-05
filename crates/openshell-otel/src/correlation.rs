@@ -3,8 +3,7 @@
 
 //! Sampled trace correlation for OCSF producers.
 
-use opentelemetry::trace::TraceContextExt as _;
-use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use opentelemetry::trace::{SpanContext, TraceContextExt as _};
 
 /// Extract the active span's W3C trace ID for an OCSF event.
 ///
@@ -15,11 +14,14 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 /// origin. A sampled ID does not guarantee export or retention.
 #[must_use]
 pub fn current_ocsf_trace_correlation() -> Option<openshell_ocsf::TraceCorrelation> {
-    let context = tracing::Span::current().context();
-    let span = context.span();
-    let span_context = span.span_context();
-    if !span_context.is_sampled() {
-        return None;
-    }
+    let span_context = sampled_span_context()?;
     openshell_ocsf::TraceCorrelation::from_trace_id(span_context.trace_id().to_bytes())
+}
+
+/// The OpenTelemetry tracing layer activates a span's context on entry, so this
+/// also works inside a layer, where the tracing dispatcher is busy.
+pub fn sampled_span_context() -> Option<SpanContext> {
+    let context = opentelemetry::Context::current();
+    let span_context = context.span().span_context().clone();
+    (span_context.is_valid() && span_context.is_sampled()).then_some(span_context)
 }

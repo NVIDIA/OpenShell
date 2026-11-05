@@ -290,6 +290,8 @@ The JSON examples above are formatted for readability. The actual JSONL file con
 
 HTTP Activity and API Activity records emitted inside a sampled OpenTelemetry span carry `trace.uid` and list `trace` in `metadata.profiles`. These are the classes OCSF 1.8.0 declares the Trace profile for. The UID is the W3C trace ID, 32 lowercase hexadecimal characters. Search for it in your Jaeger or Tempo backend. A sampled ID does not guarantee export or retention in the trace backend.
 
+OTLP log export links every OCSF record, whatever its class, to the active sampled span through the log record's own trace and span ID fields. Use those fields for log-to-trace links in your backend.
+
 ```json
 {
   "metadata": { "profiles": ["container", "host", "network_proxy", "security_control", "trace"] },
