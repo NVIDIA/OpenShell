@@ -10,12 +10,12 @@ pub const BASE_IMAGE_ENV: &str = "OPENSHELL_TEST_BASE_IMAGE";
 pub const DEFAULT_BASE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 
 /// Overrides [`DEFAULT_PYTHON_IMAGE`].
-pub const PYTHON_IMAGE_ENV: &str = "OPENSHELL_TEST_PYTHON_IMAGE";
+const PYTHON_IMAGE_ENV: &str = "OPENSHELL_TEST_PYTHON_IMAGE";
 /// The workload image for tests that run `python3`, curl, git or openssl in a
 /// sandbox, built from `e2e/python/Dockerfile.workload`. It isn't published:
 /// the tmachine installers load it into every environment, and
 /// `mise run e2e:workload:build` builds it locally.
-pub const DEFAULT_PYTHON_IMAGE: &str = "openshell/e2e-python:dev";
+const DEFAULT_PYTHON_IMAGE: &str = "openshell/e2e-python:dev";
 
 /// The image named by [`BASE_IMAGE_ENV`], or [`DEFAULT_BASE_IMAGE`].
 pub fn base_image() -> String {

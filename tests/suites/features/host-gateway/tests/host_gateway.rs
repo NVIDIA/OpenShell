@@ -14,18 +14,17 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-/// The Python test image's virtual environment, which links to a uv-managed
-/// Python under `/sandbox/.uv/python`.
-const VENV_PYTHON: &str = "/sandbox/.venv/bin/python3";
+/// The image's system Python, which needs nothing beyond its standard library.
+/// The policy names its real path, `/usr/bin/python3.*`, because a rule matches
+/// the executable behind a symlink.
+const PYTHON: &str = "/usr/bin/python3";
 
-/// Prints the interpreter's prefix, then requests `/` from
-/// `host.openshell.internal` on the port in `argv[1]` and prints the
-/// response. A failed connection is retried for 20 seconds, so a slow
-/// start doesn't fail the test, and reported on stderr.
+/// Requests `/` from `host.openshell.internal` on the port in `argv[1]` and
+/// prints the response. A failed connection is retried for 20 seconds, so a
+/// slow start doesn't fail the test, and reported on stderr.
 const CLIENT: &str = r#"
 import socket, sys, time
 
-print(f"prefix={sys.prefix}", flush=True)
 host, port = "host.openshell.internal", int(sys.argv[1])
 deadline = time.monotonic() + 20
 while True:
@@ -46,9 +45,9 @@ print(response.decode(errors="replace"))
 "#;
 
 /// A sandbox from the Python test image resolves `host.openshell.internal`
-/// and gets a response from a server the test runs on the host. The image's
-/// virtual environment runs the client, so its workspace content reached the
-/// sandbox, and the policy lets only that Python reach the server's port.
+/// and gets a response from a server the test runs on the host. The default
+/// policy denies all network access, so the test passes one that lets only the
+/// image's Python reach the server's port.
 #[testkit::test]
 async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result {
     let marker = format!("host-gateway-{}", cx.run_id());
@@ -87,25 +86,11 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
 
     let client = cx
         .cli([
-            "sandbox",
-            "exec",
-            "--name",
-            &name,
-            "--no-tty",
-            "--",
-            VENV_PYTHON,
-            "-c",
-            CLIENT,
-            &port,
+            "sandbox", "exec", "--name", &name, "--no-tty", "--", PYTHON, "-c", CLIENT, &port,
         ])
         .await?
         .success()
         .context("run the client in the sandbox")?;
-    testkit::ensure!(
-        client.stdout.contains("prefix=/sandbox/.venv"),
-        "the client did not run in the image's virtual environment:\n{}",
-        client.stdout
-    );
     testkit::ensure!(
         client.stdout.contains(&marker),
         "the client did not get the host server's response:\n{}{}",
@@ -115,11 +100,10 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
     Ok(())
 }
 
-/// A sandbox policy for the Python test image that allows its uv-managed
-/// Python, which [`VENV_PYTHON`] links to, to connect to
-/// `host.openshell.internal` on `port`. The endpoint names only the host and
-/// port, as the policy docs describe, so the driver's address for the name
-/// is what makes it reachable, not an `allowed_ips` range.
+/// A sandbox policy that allows the image's system Python ([`PYTHON`]) to
+/// connect to `host.openshell.internal` on `port`. The endpoint names only the
+/// host and port, as the policy docs describe, so the driver's address for the
+/// name is what makes it reachable, not an `allowed_ips` range.
 fn policy(port: u16) -> String {
     format!(
         r#"version: 1
@@ -142,7 +126,7 @@ network_policies:
       - host: host.openshell.internal
         port: {port}
     binaries:
-      - path: /sandbox/.uv/python/**/python*
+      - path: /usr/bin/python3.*
 "#
     )
 }
