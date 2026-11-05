@@ -50,6 +50,12 @@ impl AppListenerConfig {
     }
 }
 
+/// A synchronous view of installed ingress, evaluated on the sandbox instance
+/// runtime. The requested lease must fit entirely within serving freshness.
+pub type InstallationSource = std::sync::Arc<
+    dyn Fn(std::time::Duration) -> crate::proto::SupervisorServiceAdvertisement + Send + Sync,
+>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -66,6 +66,37 @@ pub(crate) fn build_credential_endpoint_mismatch_finding(
         .build()
 }
 
+pub(crate) fn build_credential_placement_mismatch_finding(
+    policy_name: &str,
+    host: &str,
+    protocol: Option<&str>,
+) -> openshell_ocsf::OcsfEvent {
+    use openshell_ocsf::{
+        ActionId, ActivityId, DetectionFindingBuilder, DispositionId, FindingInfo, SeverityId,
+    };
+    let mut evidence = vec![
+        ("policy", policy_name),
+        ("host", host),
+        ("disposition", "denied"),
+    ];
+    if let Some(protocol) = protocol {
+        evidence.push(("protocol", protocol));
+    }
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(FindingInfo::new(
+            "openshell.provider_credential.placement_mismatch",
+            "Provider credential used at an unauthorized request location",
+        ))
+        .evidence_pairs(&evidence)
+        .message("Provider credential placement mismatch; request denied")
+        .build()
+}
+
 /// TLS handling mode for proxy connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsMode {
