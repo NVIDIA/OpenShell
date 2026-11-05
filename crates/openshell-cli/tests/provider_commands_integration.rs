@@ -2291,6 +2291,126 @@ async fn provider_readiness_update_with_no_targets_preserves_saved_success() {
 }
 
 #[tokio::test]
+async fn provider_update_explains_static_rotation_without_profile_read_permission() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    server
+        .state
+        .deny_provider_reads
+        .store(true, Ordering::SeqCst);
+    server
+        .state
+        .profile_read_errors
+        .lock()
+        .await
+        .insert("openai".to_string(), Code::PermissionDenied);
+    for sandbox in ["sandbox-a", "sandbox-b"] {
+        server
+            .state
+            .sandbox_providers
+            .lock()
+            .await
+            .insert(sandbox.to_string(), vec![READINESS_PROVIDER.to_string()]);
+        script_readiness(
+            &server,
+            sandbox,
+            vec![Ok(readiness_status(
+                ProviderReadinessState::Ready,
+                ProviderReadinessReason::Unspecified,
+                true,
+            ))],
+        )
+        .await;
+    }
+    let credential = format!("OPENAI_API_KEY={SYNTHETIC_READINESS_CREDENTIAL}");
+    for wait in [false, true] {
+        let mut args = vec![
+            "provider",
+            "update",
+            READINESS_PROVIDER,
+            "--credential",
+            &credential,
+        ];
+        if wait {
+            args.extend(["--wait", "--timeout", "2"]);
+        }
+        let output = run_readiness_cli(&server, &args).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_readiness_output_redacted(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.matches("Ordinary static credentials:").count(), 1);
+        assert!(stdout.contains("existing processes keep their old references, even with --wait"));
+        assert!(stdout.contains("openshell sandbox exec"));
+        assert!(stdout.contains("recreate the sandbox"));
+        assert!(stdout.contains("stable_placeholder: true"));
+        assert!(stdout.contains("gateway-managed refresh"));
+        assert!(stdout.contains(if wait { "ready" } else { "persisted" }));
+        assert!(server.state.profile_read_requests.lock().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn provider_update_rotation_guidance_preserves_structured_output() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    server.state.sandbox_providers.lock().await.insert(
+        "sandbox-a".to_string(),
+        vec![READINESS_PROVIDER.to_string()],
+    );
+    for format in ["json", "yaml"] {
+        let output = run_readiness_cli(
+            &server,
+            &[
+                "provider",
+                "update",
+                READINESS_PROVIDER,
+                "--credential",
+                "OPENAI_API_KEY=updated-fixture",
+                "--output",
+                format,
+            ],
+        )
+        .await;
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        let value: serde_json::Value = if format == "json" {
+            serde_json::from_slice(&output.stdout).expect("update JSON")
+        } else {
+            serde_yml::from_slice(&output.stdout).expect("update YAML")
+        };
+        assert_eq!(value["targets"].as_array().unwrap().len(), 1);
+        assert_eq!(value["targets"][0]["state"], "persisted");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Ordinary static credentials:"));
+        assert_readiness_output_redacted(&output);
+    }
+}
+
+#[tokio::test]
+async fn provider_update_omits_rotation_guidance_without_affected_processes() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    for (attached, flag, value) in [
+        (false, "--credential", "OPENAI_API_KEY=updated-fixture"),
+        (true, "--config", "OPENAI_BASE_URL=https://example.com/v1"),
+    ] {
+        if attached {
+            server.state.sandbox_providers.lock().await.insert(
+                "sandbox-a".to_string(),
+                vec![READINESS_PROVIDER.to_string()],
+            );
+        }
+        let output = run_readiness_cli(
+            &server,
+            &["provider", "update", READINESS_PROVIDER, flag, value],
+        )
+        .await;
+        assert!(output.status.success(), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Ordinary static credentials:"));
+        assert_readiness_output_redacted(&output);
+    }
+}
+
+#[tokio::test]
 async fn provider_profile_permission_denial_preserves_safe_workspace_guidance() {
     let server = run_server().await;
     seed_readiness_provider(&server).await;
