@@ -7,7 +7,7 @@ This is a separate Cargo workspace with its own lockfile:
 
 | Crate | Purpose |
 |---|---|
-| `testkit` | Finds and connects to the gateway, creates and cleans up sandboxes, runs the CLI. Also builds `testkit-ready`. |
+| `testkit` | Finds and connects to the gateway, creates and cleans up sandboxes, runs the CLI, and runs test programs. Also builds `testkit-ready`. |
 | `testkit-macros` | The `#[testkit::test]` attribute. |
 
 ## Writing a test
@@ -122,6 +122,67 @@ In a tmachine VM, the test runner (`tests/runner/`) does the same: it sets
 `OPENSHELL_GATEWAY` to the gateway the installer registered and
 `OPENSHELL_BIN` to the installed CLI, then runs the suites with nextest. See
 [TESTING.md](../../TESTING.md).
+
+## Test programs
+
+`#[testkit::test]` also registers the test with testkit. A binary whose
+`main` calls `testkit::main()` runs every registered test it links, without
+cargo or nextest:
+
+```rust
+use conformance as _;
+
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+```
+
+The program must name each suite crate it runs, as `use conformance as _;` does
+above: Rust doesn't link a dependency that is never named, and its tests would
+be missing. A program that links no tests exits 2 with an error under every
+command. `openshell-conformance`, a binary in the conformance crate, is the
+program for the conformance suite; see
+[its README](../suites/conformance/README.md).
+
+| Command | What it does |
+|---|---|
+| `list [FILTER]...` | Prints each test's name and description. Ignored tests are included and marked. |
+| `ready [--timeout SECS]` | Waits for the gateway, like `testkit-ready` (default 60 seconds). Exits 2 if it is not ready in time. |
+| `run [FILTER]...` | Runs the tests one at a time, each in its own process. Unix only. |
+
+A filter selects tests whose name contains it. `run` also takes:
+
+- `--include-ignored`: runs ignored tests too, instead of reporting them as
+  skipped.
+- `--timeout SECS` (default 900): a test that runs longer gets SIGTERM, then
+  SIGKILL after `--grace SECS` (default 10).
+- `--junit PATH`: writes a JUnit report with one test suite per family.
+
+Each test runs in its own process group. When the test's process exits, `run`
+kills anything left in the group, such as CLI processes the test started.
+Interrupting `run` stops the current test the same way and runs no more
+tests; a second interrupt skips the grace period. If `run` itself is killed
+with SIGKILL, the current test's process group keeps running. In a container
+where `run` is PID 1, start it under an init, for example with
+`docker run --init`.
+
+`run` exits 0 when every test passed, 1 when a test failed, timed out, or
+crashed, and 2 when tests could not run: no tests matched, a test process
+could not start or run its test, or the run was interrupted.
+
+A test that is stopped does not clean up: sandboxes it created stay on the
+gateway. Run against a gateway you can throw away, or delete them by hand.
+
+Without a subcommand, the program takes libtest's arguments instead. A
+`[[test]]` target with `harness = false` therefore also runs under `cargo test`
+and nextest. In that mode tests run in one process, one at a time unless
+`--test-threads` says otherwise.
+
+A test's name is its module path without the crate name, then its function
+name, as in nextest. Its family, which groups tests in the JUnit report, is
+the first directory under the last `suites` directory in the crate's path:
+`conformance` for `tests/suites/conformance`, `features` for
+`tests/suites/features/<name>`.
 
 ## Checks
 

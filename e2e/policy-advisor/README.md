@@ -69,7 +69,7 @@ test runner:
 nix run .#openshell-test-runner -- \
   --environment ubuntu-docker-rootful --installer deb \
   --family conformance --package conformance \
-  --filter 'binary_id(=conformance::policy_advisor)'
+  --filter 'test(/^policy_advisor::/)'
 ```
 
 The GitHub write test above and the regressions below still exercise distinct

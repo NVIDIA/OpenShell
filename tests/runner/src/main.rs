@@ -38,7 +38,7 @@ struct Cli {
     #[arg(long = "package", short = 'p', value_name = "PACKAGE")]
     packages: Vec<String>,
     /// A nextest filterset narrowing the tests that run, e.g.
-    /// `binary(smoke)`.
+    /// `test(/^smoke::/)`.
     #[arg(long, value_name = "FILTERSET")]
     filter: Option<String>,
     /// The gateway name the installer registers with the CLI. The packaged
