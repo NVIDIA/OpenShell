@@ -424,11 +424,14 @@ Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
 - Conformance (`tests/suites/conformance`) - the testkit `conformance` crate:
-  lifecycle, the CLI, persistent workspaces, file transfer, and the policy
-  advisor. Driver E2E runs it with `openshell-conformance` against the lane's
-  gateway and writes a JUnit report under `results/`; set
-  `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program, as Branch E2E does
-  with the static build it makes once per architecture. The
+  lifecycle, the CLI, persistent workspaces, file transfer, the policy
+  advisor, and credential gating. Driver E2E runs it with
+  `openshell-conformance` against the lane's gateway and writes a JUnit report
+  under `results/`; set `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program,
+  as Branch E2E does with the static build it makes once per architecture.
+  The Docker and Podman runners build `openshell/e2e-python:dev` for it; the
+  Kubernetes and VM runners set `OPENSHELL_TEST_PYTHON_IMAGE` to a pullable
+  Python image unless it is already set. The
   installed-artifact conformance lanes run the same crate through
   `openshell-test-runner` (see above).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
@@ -656,6 +659,8 @@ explains the isolation backend separation behind the capability-free runtime.
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
 on the sandbox-side `host.openshell.internal` alias reaching the machine running
 the tests, which is unreachable from pods on a remote cluster, so they fail.
+The conformance suite's `credential_gating` tests rely on the alias too and
+fail on a remote cluster; the feature selection doesn't skip them.
 Left enabled, the `host_gateway_alias` suite fails because
 `host.openshell.internal` does not resolve inside the pod, so the gateway
 SSRF-denies the request (`DNS resolution failed` / `ssrf_denied`) — a networking

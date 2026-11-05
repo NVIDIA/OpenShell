@@ -177,6 +177,7 @@ run = "OPENSHELL_TEST_CONTAINER_ENGINE=podman e2e/with-podman-gateway.sh cargo t
 
 ["e2e:testkit"]
 description = "Run the testkit suites in tests/suites/conformance against a Docker-backed gateway"
+depends = ["e2e:workload:build"]
 run = "e2e/with-docker-gateway.sh cargo nextest run --locked --manifest-path tests/suites/conformance/Cargo.toml --workspace --test-threads 1 --no-fail-fast"
 
 ["e2e:rust:push"]

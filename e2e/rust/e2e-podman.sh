@@ -117,9 +117,9 @@ if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ] && [ -z "${OPENSHELL_BIN:-}" ]; then
   export OPENSHELL_BIN="${ROOT}/target/debug/openshell"
 fi
 
-if [ "${E2E_FEATURES}" != "e2e-conformance-only" ]; then
-  CONTAINER_ENGINE=podman bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
-fi
+# The conformance suite runs on every lane, including e2e-conformance-only,
+# and creates sandboxes from this image (testkit::python_image()).
+CONTAINER_ENGINE=podman bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
 
 exec "${ROOT}/e2e/with-podman-gateway.sh" \
   bash "${BASH_SOURCE[0]}" "${RUN_WITH_GATEWAY_COMMAND}"
