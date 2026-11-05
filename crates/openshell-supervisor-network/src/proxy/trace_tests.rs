@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::telemetry::tests::{assert_deny_resolves, exported};
+use crate::telemetry::tests::{
+    assert_deny_resolves, assert_no_deny, deny_spans, exported, span_attribute,
+};
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -36,18 +38,14 @@ async fn repeated_credential_denials_keep_decision_spans_separate() {
                 .action(ActionId::Allowed)
                 .dst_endpoint(Endpoint::from_domain("allowed.example", 443))
                 .build();
-            crate::telemetry::emit(allowed, None);
+            egress_emit!(allowed);
         })
         .await;
 
         assert_eq!(events.len(), 5);
         assert_deny_resolves(&events[..4], &received, level == "warn");
         assert!(events[4].get("trace").is_none(), "deny context must exit");
-        let denies = received
-            .spans
-            .iter()
-            .filter(|span| span.name == "supervisor.egress.deny")
-            .collect::<Vec<_>>();
+        let denies = deny_spans(&received);
         assert_eq!(denies.len(), 2);
         assert_ne!(denies[0].span_id, denies[1].span_id);
         assert_eq!(received.spans.len(), if level == "debug" { 3 } else { 2 });
@@ -81,18 +79,11 @@ async fn network_class_forward_rejections_have_no_deny_trace() {
             443,
             format!("FORWARD rejecting non-canonical request-target: {error}")
         ));
-        tracing::info_span!("test.export-barrier").in_scope(|| {});
     })
     .await;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["action_id"], 2);
-    assert!(events[0].get("trace").is_none());
-    assert!(
-        received
-            .spans
-            .iter()
-            .all(|span| span.name != "supervisor.egress.deny")
-    );
+    assert_no_deny(&events, &received);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -143,25 +134,15 @@ async fn forward_denials_use_the_saved_connect_parent() {
         .await;
         assert_eq!(events.len(), 1);
         assert_deny_resolves(&events, &received, level == "warn");
-        assert_eq!(
-            received
-                .spans
-                .iter()
-                .filter(|span| span.name == "supervisor.egress.deny")
-                .count(),
-            1
-        );
+        let denies = deny_spans(&received);
+        assert_eq!(denies.len(), 1);
         if level == "debug" {
             let connect = received
                 .spans
                 .iter()
                 .find(|span| span.name == "supervisor.egress.connect")
                 .unwrap();
-            let deny = received
-                .spans
-                .iter()
-                .find(|span| span.name == "supervisor.egress.deny")
-                .unwrap();
+            let deny = denies[0];
             assert_eq!(deny.parent_span_id, connect.span_id);
             assert_eq!(events[0]["trace"]["uid"], hex::encode(&connect.trace_id));
         }
@@ -208,9 +189,6 @@ async fn forward_evaluation_error_keeps_the_http_decision_policy_context() {
                 );
                 // Use the same grouping as the forward-proxy production path.
                 emit_forward_l7_decision(decision, Some(error), &connect);
-                if !enforced {
-                    tracing::info_span!("test.export-barrier").in_scope(|| {});
-                }
             })
             .await;
 
@@ -223,24 +201,14 @@ async fn forward_evaluation_error_keeps_the_http_decision_policy_context() {
                 .iter()
                 .find(|event| event["class_uid"] == 4001)
                 .unwrap();
-            let denies = received
-                .spans
-                .iter()
-                .filter(|span| span.name == "supervisor.egress.deny")
-                .collect::<Vec<_>>();
+            let denies = deny_spans(&received);
             if enforced {
                 assert_eq!(denies.len(), 1);
                 assert_eq!(received.spans.len(), if level == "debug" { 2 } else { 1 });
                 assert_eq!(http_decision["action_id"], 2);
                 assert_eq!(evaluation_error["action_id"], 2);
                 assert_deny_resolves(&events, &received, level == "warn");
-                let attribute = |key: &str| {
-                    denies[0]
-                        .attributes
-                        .iter()
-                        .find(|attribute| attribute.key == key)
-                        .and_then(|attribute| attribute.value.as_ref()?.value.as_ref())
-                };
+                let attribute = |key: &str| span_attribute(denies[0], key);
                 assert_eq!(
                     attribute("openshell.policy.name"),
                     Some(&Value::StringValue("forward-policy".to_string())),
@@ -263,12 +231,9 @@ async fn forward_evaluation_error_keeps_the_http_decision_policy_context() {
                     assert_eq!(denies[0].trace_id, connect.trace_id);
                 }
             } else {
-                assert!(denies.is_empty());
                 assert_eq!(http_decision["action_id"], 1);
                 assert_eq!(evaluation_error["action_id"], 99);
-                for event in events {
-                    assert!(event.get("trace").is_none());
-                }
+                assert_no_deny(&events, &received);
             }
         }
     }

@@ -1534,6 +1534,7 @@ fn emit_uninspected_body_credential_denial(
             req.action, options.host, options.port
         ))
         .build();
+    crate::telemetry::egress_emit!(event);
     let finding = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
@@ -1547,7 +1548,7 @@ fn emit_uninspected_body_credential_denial(
         ])
         .message("Request body credential placeholder denied")
         .build();
-    crate::telemetry::emit_decision([event, finding], None);
+    crate::telemetry::egress_emit!(finding);
 }
 
 struct PreparedRequestBody {
@@ -6917,7 +6918,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn response_trace_failure_records_share_the_terminal_decision() {
-        use crate::telemetry::tests::{assert_deny_resolves, exported};
+        use crate::telemetry::tests::{assert_deny_resolves, deny_spans, exported};
 
         // This relay fixture has no CONNECT span, so denies are roots at both
         // levels. The thread-local export harness observes the relay task;
@@ -6966,11 +6967,7 @@ mod tests {
                     .collect();
                 assert!(companions.len() >= 2, "failure includes diagnostic records");
                 assert_eq!(
-                    received
-                        .spans
-                        .iter()
-                        .filter(|span| span.name == "supervisor.egress.deny")
-                        .count(),
+                    deny_spans(&received).len(),
                     1,
                     "one response stop is one exported decision"
                 );
@@ -7025,18 +7022,11 @@ mod tests {
                         }
                     });
                 });
-                tracing::info_span!("test.export-barrier").in_scope(|| {});
             })
             .await;
             assert!(events.iter().any(|event| event["finding_info"]["uid"]
                 == "openshell.middleware.http_response_failure"));
-            assert!(events.iter().all(|event| event.get("trace").is_none()));
-            assert!(
-                !received
-                    .spans
-                    .iter()
-                    .any(|span| span.name == "supervisor.egress.deny")
-            );
+            crate::telemetry::tests::assert_no_deny(&events, &received);
         }
     }
 
@@ -7093,20 +7083,13 @@ mod tests {
                     assert!(!String::from_utf8_lossy(&delivered.0).contains("502 Bad Gateway"));
                 });
             });
-            tracing::info_span!("test.export-barrier").in_scope(|| {});
         })
         .await;
         assert!(
             events.iter().any(|event| event["finding_info"]["uid"]
                 == "openshell.middleware.http_response_failure")
         );
-        assert!(events.iter().all(|event| event.get("trace").is_none()));
-        assert!(
-            !received
-                .spans
-                .iter()
-                .any(|span| span.name == "supervisor.egress.deny")
-        );
+        crate::telemetry::tests::assert_no_deny(&events, &received);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7129,17 +7112,10 @@ mod tests {
                 });
                 assert!(outcome.is_ok());
                 assert!(delivered.starts_with(b"HTTP/1.1 200 OK\r\n"));
-                tracing::info_span!("test.export-barrier").in_scope(|| {});
             })
             .await;
             assert!(!events.is_empty());
-            assert!(events.iter().all(|event| event.get("trace").is_none()));
-            assert!(
-                !received
-                    .spans
-                    .iter()
-                    .any(|span| span.name == "supervisor.egress.deny")
-            );
+            crate::telemetry::tests::assert_no_deny(&events, &received);
         }
     }
 

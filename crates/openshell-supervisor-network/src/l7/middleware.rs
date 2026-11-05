@@ -1008,10 +1008,11 @@ fn emit_middleware_events(
 #[cfg(test)]
 mod trace_tests {
     use super::*;
-    use crate::telemetry::tests::{assert_deny_resolves, exported};
+    use crate::telemetry::tests::{assert_deny_resolves, assert_no_deny, deny_spans, exported};
+    use openshell_supervisor_middleware::{ChainOutcome, MiddlewareInvocation, NamespacedFinding};
 
-    fn finding() -> openshell_supervisor_middleware::NamespacedFinding {
-        openshell_supervisor_middleware::NamespacedFinding {
+    fn finding() -> NamespacedFinding {
+        NamespacedFinding {
             middleware: "guard".to_string(),
             finding: openshell_core::proto::Finding {
                 r#type: "test.finding".to_string(),
@@ -1023,22 +1024,31 @@ mod trace_tests {
         }
     }
 
-    fn assert_decision(
-        events: &[serde_json::Value],
-        received: &openshell_otel_test_support::ReceivedTraces,
-        denied: bool,
-    ) {
-        assert!(!events.is_empty());
-        let deny_count = received
-            .spans
-            .iter()
-            .filter(|span| span.name == "supervisor.egress.deny")
-            .count();
-        assert_eq!(deny_count, usize::from(denied));
-        if denied {
-            assert_deny_resolves(events, received, true);
-        } else {
-            assert!(events.iter().all(|event| event.get("trace").is_none()));
+    fn outcome(
+        allowed: bool,
+        reason: &str,
+        applied: Vec<MiddlewareInvocation>,
+        findings: Vec<NamespacedFinding>,
+    ) -> ChainOutcome {
+        ChainOutcome {
+            allowed,
+            reason: reason.to_string(),
+            body: vec![],
+            header_mutations: vec![],
+            findings,
+            metadata: std::collections::BTreeMap::new(),
+            applied,
+            denial: None,
+        }
+    }
+
+    fn request() -> crate::l7::provider::L7Request {
+        crate::l7::provider::L7Request {
+            action: "POST".to_string(),
+            target: "/".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: vec![],
+            body_length: crate::l7::provider::BodyLength::None,
         }
     }
 
@@ -1048,24 +1058,11 @@ mod trace_tests {
             "middleware_failed: guard",
             "transformed_body_policy_evaluation_failed: unavailable",
         ] {
-            let outcome = openshell_supervisor_middleware::ChainOutcome {
-                allowed: false,
-                reason: reason.to_string(),
-                body: vec![],
-                header_mutations: vec![],
-                findings: vec![],
-                metadata: std::collections::BTreeMap::new(),
-                applied: vec![],
-                denial: None,
-            };
-            let request = crate::l7::provider::L7Request {
-                action: "POST".to_string(),
-                target: "/".to_string(),
-                query_params: std::collections::HashMap::new(),
-                raw_header: vec![],
-                body_length: crate::l7::provider::BodyLength::None,
-            };
-            let events = middleware_events(&L7EvalContext::default(), &request, &outcome);
+            let events = middleware_events(
+                &L7EvalContext::default(),
+                &request(),
+                &outcome(false, reason, vec![], vec![]),
+            );
             assert_eq!(events.len(), 1, "{reason}");
             let finding = events[0].to_json().unwrap();
             assert_eq!(finding["class_uid"], 2004);
@@ -1077,44 +1074,36 @@ mod trace_tests {
     async fn http_chain_outcomes_group_findings_and_preserve_allowed_controls() {
         for allowed in [true, false] {
             let (events, received) = exported("warn", || {
-                let outcome = openshell_supervisor_middleware::ChainOutcome {
-                    allowed,
-                    reason: if allowed {
-                        "allowed"
+                let invocation = MiddlewareInvocation {
+                    name: "guard".to_string(),
+                    implementation: "test/guard".to_string(),
+                    decision: if allowed {
+                        openshell_core::proto::Decision::Allow
                     } else {
-                        "middleware_failed: guard"
-                    }
-                    .to_string(),
-                    body: vec![],
-                    header_mutations: vec![],
-                    findings: vec![finding()],
-                    metadata: std::collections::BTreeMap::new(),
-                    applied: vec![openshell_supervisor_middleware::MiddlewareInvocation {
-                        name: "guard".to_string(),
-                        implementation: "test/guard".to_string(),
-                        decision: if allowed {
-                            openshell_core::proto::Decision::Allow
-                        } else {
-                            openshell_core::proto::Decision::Deny
-                        },
-                        transformed: false,
-                        failed: false,
-                    }],
-                    denial: None,
+                        openshell_core::proto::Decision::Deny
+                    },
+                    transformed: false,
+                    failed: false,
                 };
-                let request = crate::l7::provider::L7Request {
-                    action: "POST".to_string(),
-                    target: "/".to_string(),
-                    query_params: std::collections::HashMap::new(),
-                    raw_header: vec![],
-                    body_length: crate::l7::provider::BodyLength::None,
+                let reason = if allowed {
+                    "allowed"
+                } else {
+                    "middleware_failed: guard"
                 };
-                emit_middleware_events(&L7EvalContext::default(), &request, &outcome);
-                tracing::info_span!("test.export-barrier").in_scope(|| {});
+                emit_middleware_events(
+                    &L7EvalContext::default(),
+                    &request(),
+                    &outcome(allowed, reason, vec![invocation], vec![finding()]),
+                );
             })
             .await;
             assert!(events.len() >= 2);
-            assert_decision(&events, &received, !allowed);
+            if allowed {
+                assert_no_deny(&events, &received);
+            } else {
+                assert_eq!(deny_spans(&received).len(), 1);
+                assert_deny_resolves(&events, &received, true);
+            }
         }
     }
 }

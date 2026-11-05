@@ -2436,9 +2436,12 @@ where
     C: TokioAsyncWrite + Unpin,
 {
     let detail = destination_denial_detail(denial.kind);
-    egress_emit!(deny_parent: connect_span, build_forward_destination_deny_ocsf_event(
-        denial, peer_addr, method, host, port, path, binary, pid, ancestors, cmdline, policy,
-    ));
+    crate::telemetry::emit_decision(
+        [build_forward_destination_deny_ocsf_event(
+            denial, peer_addr, method, host, port, path, binary, pid, ancestors, cmdline, policy,
+        )],
+        Some(connect_span),
+    );
 
     emit_denial_simple(
         denial_tx,
@@ -3098,13 +3101,12 @@ async fn handle_mediated_connection(
             ))
             .status_detail(DETAIL)
             .build();
-        let finding = crate::l7::build_uninspected_credential_finding(
+        egress_emit!(event);
+        crate::l7::emit_uninspected_credential_finding(
             &host_lc,
             policy_str,
             if effective_tls_skip { "tls-skip" } else { "l4" },
         );
-        egress_emit!(event);
-        egress_emit!(finding);
         emit_activity_simple(activity_tx.as_ref(), true, "uninspected_credentials");
         emit_denial(
             &denial_tx,
@@ -5704,18 +5706,21 @@ async fn handle_forward_proxy(
     let matched_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
-            egress_emit!(deny_parent: &connect_span, build_forward_policy_deny_ocsf_event(
-                workload_addr,
-                method,
-                &host_lc,
-                port,
-                &telemetry_path,
-                &binary_str,
-                &pid_str,
-                &ancestors_str,
-                &cmdline_str,
-                reason,
-            ));
+            crate::telemetry::emit_decision(
+                [build_forward_policy_deny_ocsf_event(
+                    workload_addr,
+                    method,
+                    &host_lc,
+                    port,
+                    &telemetry_path,
+                    &binary_str,
+                    &pid_str,
+                    &ancestors_str,
+                    &cmdline_str,
+                    reason,
+                )],
+                Some(&connect_span),
+            );
             emit_denial_simple(
                 denial_tx,
                 &host_lc,
@@ -5973,19 +5978,22 @@ async fn handle_forward_proxy(
         if !l7_config.config.allow_encoded_slash
             && crate::l7::path::canonical_path_has_encoded_slash(&path)
         {
-            egress_emit!(deny_parent: &connect_span, build_forward_l7_parse_rejection_ocsf_event(
-                workload_addr,
-                method,
-                &host_lc,
-                port,
-                &telemetry_path,
-                &binary_str,
-                &pid_str,
-                &ancestors_str,
-                &cmdline_str,
-                policy_str,
-                FORWARD_ENCODED_SLASH_REJECTION_DETAIL,
-            ));
+            crate::telemetry::emit_decision(
+                [build_forward_l7_parse_rejection_ocsf_event(
+                    workload_addr,
+                    method,
+                    &host_lc,
+                    port,
+                    &telemetry_path,
+                    &binary_str,
+                    &pid_str,
+                    &ancestors_str,
+                    &cmdline_str,
+                    policy_str,
+                    FORWARD_ENCODED_SLASH_REJECTION_DETAIL,
+                )],
+                Some(&connect_span),
+            );
             emit_activity_simple(activity_tx, true, "forward_parse_rejection");
             respond(
                 client,
@@ -6030,7 +6038,7 @@ async fn handle_forward_proxy(
                 ))
                 .status_detail(upgrade_detail)
                 .build();
-            egress_emit!(deny_parent: &connect_span, event);
+            crate::telemetry::emit_decision([event], Some(&connect_span));
             emit_activity_simple(activity_tx, true, "l7_parse_rejection");
             emit_denial_simple(
                 denial_tx,

@@ -460,12 +460,8 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     })
 }
 
-pub(crate) fn build_uninspected_credential_finding(
-    host: &str,
-    policy_name: &str,
-    surface: &str,
-) -> openshell_ocsf::OcsfEvent {
-    openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str, surface: &str) {
+    let event = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
             "openshell.credentials.traffic_uninspectable",
@@ -478,7 +474,8 @@ pub(crate) fn build_uninspected_credential_finding(
             ("disposition", "denied"),
         ])
         .message("Uninspected credential-bearing traffic denied")
-        .build()
+        .build();
+    crate::telemetry::egress_emit!(event);
 }
 
 impl L7EndpointConfig {

@@ -641,27 +641,27 @@ async fn write_policy_violation_close<W: AsyncWrite + Unpin>(writer: &mut W) -> 
 }
 
 fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
-    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Fail)
-        .action(ActionId::Denied)
-        .disposition(DispositionId::Blocked)
-        .severity(SeverityId::High)
-        .status(StatusId::Failure)
-        .dst_endpoint(Endpoint::from_domain(host, port))
-        .firewall_rule(policy_name, "credential-binding")
-        .message(format!(
-            "WebSocket credential use denied: credential is not authorized for {host}:{port}"
-        ))
-        .status_detail("credential_endpoint_mismatch")
-        .build();
-    let finding = crate::l7::build_credential_endpoint_mismatch_finding(
+    egress_emit!(
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Fail)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(host, port))
+            .firewall_rule(policy_name, "credential-binding")
+            .message(format!(
+                "WebSocket credential use denied: credential is not authorized for {host}:{port}"
+            ))
+            .status_detail("credential_endpoint_mismatch")
+            .build()
+    );
+    egress_emit!(crate::l7::build_credential_endpoint_mismatch_finding(
         policy_name,
         host,
         Some("websocket"),
         "Provider credential endpoint binding mismatch; WebSocket closed",
-    );
-    egress_emit!(event);
-    egress_emit!(finding);
+    ));
 }
 
 async fn relay_client_to_server<R, W>(
@@ -1412,9 +1412,8 @@ fn emit_uninspected_credential_denial(host: &str, port: u16, policy_name: &str, 
             "WebSocket credential traffic denied for {host}:{port}"
         ))
         .build();
-    let finding = crate::l7::build_uninspected_credential_finding(host, policy_name, surface);
     egress_emit!(event);
-    egress_emit!(finding);
+    crate::l7::emit_uninspected_credential_finding(host, policy_name, surface);
 }
 
 fn inspect_websocket_text_message(

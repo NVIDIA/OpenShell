@@ -4,6 +4,8 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use openshell_otel_test_support::{OtlpTestServer, ReceivedTraces, tracing_test_lock};
+use opentelemetry_proto::tonic::common::v1::any_value::Value;
+use opentelemetry_proto::tonic::trace::v1::Span;
 use tracing_subscriber::prelude::*;
 
 #[derive(Clone)]
@@ -107,8 +109,6 @@ fn capture(
 }
 
 pub fn assert_deny_resolves(events: &[serde_json::Value], received: &ReceivedTraces, root: bool) {
-    use opentelemetry_proto::tonic::common::v1::any_value::Value;
-
     assert!(events.iter().any(|event| event["class_uid"] == 4002));
     for event in events {
         if event["class_uid"] != 4002 {
@@ -129,12 +129,9 @@ pub fn assert_deny_resolves(events: &[serde_json::Value], received: &ReceivedTra
                 .iter()
                 .any(|p| p == "trace")
         );
-        let span = received
-            .spans
-            .iter()
-            .find(|span| {
-                span.name == "supervisor.egress.deny" && hex::encode(&span.trace_id) == uid
-            })
+        let span = deny_spans(received)
+            .into_iter()
+            .find(|span| hex::encode(&span.trace_id) == uid)
             .expect("OCSF trace.uid resolves to exported deny span");
         if root {
             assert!(span.parent_span_id.is_empty());
@@ -155,11 +152,7 @@ pub fn assert_deny_resolves(events: &[serde_json::Value], received: &ReceivedTra
         for key in ["openshell.policy.decision", "ocsf.class_uid"] {
             assert!(attributes.contains(&key), "deny span carries {key}");
         }
-        let class_uid = span
-            .attributes
-            .iter()
-            .find(|attribute| attribute.key == "ocsf.class_uid")
-            .and_then(|attribute| attribute.value.as_ref()?.value.as_ref());
+        let class_uid = span_attribute(span, "ocsf.class_uid");
         assert!(
             matches!(class_uid, Some(Value::IntValue(_))),
             "deny span exports ocsf.class_uid as an integer: {class_uid:?}"
@@ -180,35 +173,43 @@ pub fn http_deny(host: &str, decision: &str) -> openshell_ocsf::OcsfEvent {
         .build()
 }
 
-pub fn assert_deny_attribute(received: &ReceivedTraces, key: &str, expected: &str) {
-    use opentelemetry_proto::tonic::common::v1::any_value::Value;
-    let deny = received
+pub fn deny_spans(received: &ReceivedTraces) -> Vec<&Span> {
+    received
         .spans
         .iter()
-        .find(|span| span.name == "supervisor.egress.deny")
-        .unwrap();
-    let attribute = deny
-        .attributes
+        .filter(|span| span.name == "supervisor.egress.deny")
+        .collect()
+}
+
+/// Assert that no record carries `trace` and no deny span was exported.
+pub fn assert_no_deny(events: &[serde_json::Value], received: &ReceivedTraces) {
+    for event in events {
+        assert!(event.get("trace").is_none(), "{event}");
+    }
+    assert!(deny_spans(received).is_empty());
+}
+
+pub fn span_attribute<'a>(span: &'a Span, key: &str) -> Option<&'a Value> {
+    span.attributes
         .iter()
         .find(|attribute| attribute.key == key)
-        .unwrap();
+        .and_then(|attribute| attribute.value.as_ref()?.value.as_ref())
+}
+
+pub fn assert_deny_attribute(received: &ReceivedTraces, key: &str, expected: &str) {
     assert_eq!(
-        attribute.value.as_ref().unwrap().value.as_ref().unwrap(),
-        &Value::StringValue(expected.to_string())
+        span_attribute(deny_spans(received)[0], key),
+        Some(&Value::StringValue(expected.to_string()))
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn companion_emissions_reuse_an_active_decision_scope() {
+async fn companion_records_share_one_deny_span() {
     let (events, received) = exported("warn", || {
         let event = http_deny("blocked.example", "denied");
         let finding =
             openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx()).build();
-        let scope = super::deny_span(&event, None).unwrap();
-        scope.in_scope(|| {
-            super::emit(event, None);
-            super::emit(finding, None);
-        });
+        super::emit_decision([event, finding], None);
     })
     .await;
     assert_eq!(events.len(), 2);
@@ -243,15 +244,10 @@ async fn concurrent_decisions_keep_companions_and_request_contexts_separate() {
                                     )
                                     .message(&decision)
                                     .build();
-                                    let scope = super::deny_span(&event, None).unwrap();
-                                    scope.in_scope(|| {
-                                        super::emit(event, None);
-                                        // Both threads keep different deny scopes entered
-                                        // while their companion records interleave.
-                                        barrier.wait();
-                                        super::emit(finding, None);
-                                        barrier.wait();
-                                    });
+                                    super::emit_decision([event, finding], None);
+                                    // Both threads finish each decision before either
+                                    // starts the next.
+                                    barrier.wait();
                                 }
                             });
                             openshell_ocsf::ctx::bind_thread_ctx(None);
@@ -265,25 +261,12 @@ async fn concurrent_decisions_keep_companions_and_request_contexts_separate() {
 
         assert_eq!(events.len(), 8);
         assert_deny_resolves(&events, &received, level == "warn");
-        let denies = received
-            .spans
-            .iter()
-            .filter(|span| span.name == "supervisor.egress.deny")
-            .collect::<Vec<_>>();
+        let denies = deny_spans(&received);
         assert_eq!(denies.len(), 4);
         assert_eq!(received.spans.len(), if level == "debug" { 6 } else { 4 });
-        let attribute = |span: &opentelemetry_proto::tonic::trace::v1::Span, key: &str| {
-            use opentelemetry_proto::tonic::common::v1::any_value::Value;
-            match span
-                .attributes
-                .iter()
-                .find(|attribute| attribute.key == key)
-                .and_then(|attribute| attribute.value.as_ref())
-                .and_then(|value| value.value.as_ref())
-            {
-                Some(Value::StringValue(value)) => value.clone(),
-                other => panic!("expected string attribute {key}, got {other:?}"),
-            }
+        let attribute = |span: &Span, key: &str| match span_attribute(span, key) {
+            Some(Value::StringValue(value)) => value.clone(),
+            other => panic!("expected string attribute {key}, got {other:?}"),
         };
         let mut traces_by_host = Vec::new();
         for host in ["alpha.example", "beta.example"] {
@@ -344,6 +327,28 @@ async fn concurrent_decisions_keep_companions_and_request_contexts_separate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deny_span_describes_the_denied_http_record() {
+    let (events, received) = exported("warn", || {
+        let allowed = openshell_ocsf::HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .action(openshell_ocsf::ActionId::Allowed)
+            .http_request(openshell_ocsf::HttpRequest::new(
+                "GET",
+                openshell_ocsf::Url::new("https", "allowed.example", "/", 443),
+            ))
+            .dst_endpoint(openshell_ocsf::Endpoint::from_domain(
+                "allowed.example",
+                443,
+            ))
+            .build();
+        super::emit_decision([allowed, http_deny("blocked.example", "denied")], None);
+    })
+    .await;
+    assert_deny_resolves(&events, &received, true);
+    assert_deny_attribute(&received, "server.address", "blocked.example");
+    assert_deny_attribute(&received, "openshell.policy.reason", "denied");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_deny_context_leaves_optional_attributes_unset() {
     let (events, received) = exported("warn", || {
         let http = openshell_ocsf::HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -354,7 +359,7 @@ async fn missing_deny_context_leaves_optional_attributes_unset() {
             })
             .message("diagnostic text is not a policy reason")
             .build();
-        super::emit(http, None);
+        super::egress_emit!(http);
     })
     .await;
     assert_deny_resolves(&events, &received, true);
@@ -389,19 +394,10 @@ async fn denials_without_an_http_record_do_not_open_deny_spans() {
             .action(openshell_ocsf::ActionId::Denied)
             .build();
         super::emit_decision([network, finding], None);
-        tracing::info_span!("test.export-barrier").in_scope(|| {});
     })
     .await;
     assert_eq!(events.len(), 2);
-    for event in events {
-        assert!(event.get("trace").is_none());
-    }
-    assert!(
-        received
-            .spans
-            .iter()
-            .all(|span| span.name != "supervisor.egress.deny")
-    );
+    assert_no_deny(&events, &received);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -414,26 +410,16 @@ async fn allowed_emissions_do_not_create_info_deny_spans() {
                 443,
             ))
             .build();
-        super::emit(allowed, None);
+        super::egress_emit!(allowed);
         crate::l7::middleware::emit_middleware_uninspectable(
             &crate::l7::relay::L7EvalContext::default(),
             "unknown protocol",
             false,
         );
-        // Flush an unrelated INFO span so the collector wait is bounded by an export.
-        tracing::info_span!("test.export-barrier").in_scope(|| {});
     })
     .await;
     assert_eq!(events.len(), 2);
-    for event in events {
-        assert!(event.get("trace").is_none());
-    }
-    assert!(
-        !received
-            .spans
-            .iter()
-            .any(|span| span.name == "supervisor.egress.deny")
-    );
+    assert_no_deny(&events, &received);
 }
 
 #[test]
@@ -478,16 +464,12 @@ fn deny_span_limiter_bounds_tracked_destinations() {
 async fn repeated_denials_to_one_destination_export_bounded_spans() {
     let (events, received) = exported("warn", || {
         for _ in 0..(super::DENY_SPAN_BURST + 5) {
-            super::emit(http_deny("loop.example", "denied"), None);
+            super::egress_emit!(http_deny("loop.example", "denied"));
         }
-        super::emit(http_deny("other.example", "denied"), None);
+        super::egress_emit!(http_deny("other.example", "denied"));
     })
     .await;
-    let denies = received
-        .spans
-        .iter()
-        .filter(|span| span.name == "supervisor.egress.deny")
-        .count();
+    let denies = deny_spans(&received).len();
     assert_eq!(denies, super::DENY_SPAN_BURST as usize + 1);
     let traced = events
         .iter()
