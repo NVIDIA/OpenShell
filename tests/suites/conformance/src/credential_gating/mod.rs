@@ -5,7 +5,7 @@
 //! what the supervisor does with the credential in REST bodies and WebSocket
 //! frames.
 //!
-//! Ported from `e2e/rust/tests/credential_gating.rs` (NVIDIA/OpenShell#5264).
+//! Ported from the e2e tests added in NVIDIA/OpenShell#5264.
 //! Each test imports its own provider profile and creates a provider under a
 //! name unique to the run; cleanup deletes them after the test's sandboxes.
 //! The probe servers run where the tests run, which is the host the gateway
