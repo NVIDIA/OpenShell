@@ -358,26 +358,10 @@ impl SandboxBuilder {
             // The SDK's spec has no policy field, so create through gRPC.
             Some(policy) => {
                 crate::ensure!(
-                    self.spec.image.is_none()
-                        && self.spec.environment.is_empty()
-                        && self.spec.providers.is_empty()
-                        && !self.spec.gpu
-                        && self.spec.service_exposures.is_empty(),
-                    "testkit creates a sandbox with a policy from its name, labels, command, restart policy, and policy only"
+                    !self.spec.gpu && self.spec.service_exposures.is_empty(),
+                    "testkit doesn't create a sandbox with a policy and a GPU or service exposures"
                 );
-                let request = proto::CreateSandboxRequest {
-                    name: name.clone(),
-                    labels: self.spec.labels,
-                    workspace_scope: self.grpc.scope(),
-                    spec: Some(proto::SandboxSpec {
-                        command: self.spec.command,
-                        tty: self.spec.tty,
-                        policy: Some(policy),
-                        restart_policy: restart_policy(self.spec.restart_policy) as i32,
-                        ..proto::SandboxSpec::default()
-                    }),
-                    ..proto::CreateSandboxRequest::default()
-                };
+                let request = policy_create_request(self.spec, policy, self.grpc.scope());
                 self.grpc
                     .client()
                     .await?
@@ -399,6 +383,34 @@ impl SandboxBuilder {
             name,
             id,
         })
+    }
+}
+
+/// The gRPC request for a sandbox created from `spec` with `policy`, built
+/// as the SDK builds one from `spec` alone.
+fn policy_create_request(
+    spec: SandboxSpec,
+    policy: proto::SandboxPolicy,
+    workspace_scope: Option<proto::datamodel::v1::WorkspaceSelector>,
+) -> proto::CreateSandboxRequest {
+    proto::CreateSandboxRequest {
+        name: spec.name.unwrap_or_default(),
+        labels: spec.labels,
+        workspace_scope,
+        spec: Some(proto::SandboxSpec {
+            environment: spec.environment,
+            template: spec.image.map(|image| proto::SandboxTemplate {
+                image,
+                ..proto::SandboxTemplate::default()
+            }),
+            providers: spec.providers,
+            command: spec.command,
+            tty: spec.tty,
+            policy: Some(policy),
+            restart_policy: restart_policy(spec.restart_policy) as i32,
+            ..proto::SandboxSpec::default()
+        }),
+        ..proto::CreateSandboxRequest::default()
     }
 }
 
@@ -630,4 +642,44 @@ fn generate_run_id() -> String {
     (0..8)
         .map(|_| char::from(ALPHABET[rng.random_range(0..ALPHABET.len())]))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_create_request_keeps_the_spec_and_adds_the_policy() {
+        let spec = SandboxSpec {
+            name: Some("test-sb".to_string()),
+            image: Some("python:3".to_string()),
+            labels: [("k".to_string(), "v".to_string())].into(),
+            environment: [("E".to_string(), "1".to_string())].into(),
+            providers: vec!["provider".to_string()],
+            command: vec!["sleep".to_string(), "infinity".to_string()],
+            restart_policy: SandboxRestartPolicy::Never,
+            ..SandboxSpec::default()
+        };
+        let policy = proto::SandboxPolicy {
+            version: 1,
+            ..proto::SandboxPolicy::default()
+        };
+        let scope = Some(proto::workspace_selector("ws"));
+
+        let request = policy_create_request(spec, policy.clone(), scope.clone());
+
+        assert_eq!(request.name, "test-sb");
+        assert_eq!(request.labels.get("k").map(String::as_str), Some("v"));
+        assert_eq!(request.workspace_scope, scope);
+        let spec = request.spec.expect("spec");
+        assert_eq!(spec.template.expect("template").image, "python:3");
+        assert_eq!(spec.environment.get("E").map(String::as_str), Some("1"));
+        assert_eq!(spec.providers, ["provider"]);
+        assert_eq!(spec.command, ["sleep", "infinity"]);
+        assert_eq!(spec.policy, Some(policy));
+        assert_eq!(
+            spec.restart_policy,
+            proto::SandboxRestartPolicy::Never as i32
+        );
+    }
 }
