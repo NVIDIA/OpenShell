@@ -247,24 +247,6 @@ need different `TMACHINE_SSH_PORT` values (default 2222). The installer
 inputs, such as the Debian package and the images, come from `artifacts/`,
 built by `nix run .#build-artifacts` or downloaded by CI.
 
-The runner's nextest profile, `openshell`, runs tests one at a time and
-fails a test that runs longer than two minutes (`slow-timeout` 30 s × 4). A
-family that needs other settings puts them in
-`tests/suites/<family>/.config/nextest.toml`, which takes priority over the
-runner's profile:
-
-- `[[profile.default.overrides]]` for some tests, such as a longer
-  `slow-timeout` or a `test-group` from `[test-groups]` that keeps tests from
-  running at the same time. These also apply when you run the suite with
-  `cargo nextest run`.
-- `[profile.openshell]` for every test of the family in the runner, such as
-  its `slow-timeout`.
-
-`--test-threads <N>` runs N tests at once. Tests share the gateway and the
-guest, so it defaults to 1; raise it only for tests that tolerate that, and
-put the ones that don't in a test group. A serial run streams test output into
-`nextest.log`; a parallel run shows a test's output only when it fails.
-
 A flaky or broken test is marked `#[ignore = "<issue link>"]`, which takes it
 out of every environment until it's fixed.
 

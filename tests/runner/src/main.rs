@@ -7,7 +7,6 @@
 //! provides the guest cross-compilation toolchain, QEMU, Ansible, and the
 //! tmachine configuration.
 
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -42,11 +41,6 @@ struct Cli {
     /// `binary(smoke)`.
     #[arg(long, value_name = "FILTERSET")]
     filter: Option<String>,
-    /// How many tests run at once. Tests share the gateway and the guest, so
-    /// raise it only for tests that tolerate that; nextest then captures each
-    /// test's output and shows it when the test fails.
-    #[arg(long, default_value = "1", value_name = "N")]
-    test_threads: NonZeroUsize,
     /// The gateway name the installer registers with the CLI. The packaged
     /// installers register `openshell`.
     #[arg(long, default_value = "openshell")]
@@ -108,7 +102,6 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             gateway: &cli.gateway,
             bundle: &bundle,
             filter: cli.filter.as_deref(),
-            test_threads: cli.test_threads,
             results: &results,
             keep: cli.keep,
         },
