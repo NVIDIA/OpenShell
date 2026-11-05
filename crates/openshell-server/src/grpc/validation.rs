@@ -2166,6 +2166,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_policy_safety_rejects_windows_drive_root() {
+        use openshell_core::proto::FilesystemPolicy;
+
+        let policy = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(FilesystemPolicy {
+                include_workdir: false,
+                read_only: vec![],
+                read_write: vec!["C:/".into()],
+            }),
+            ..Default::default()
+        };
+        let err = validate_policy_safety(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("broad"));
+    }
+
+    #[test]
     fn validate_policy_safety_accepts_valid_policy() {
         let policy = openshell_policy::restrictive_default_policy();
         assert!(validate_policy_safety(&policy).is_ok());
