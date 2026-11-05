@@ -144,6 +144,7 @@ Each run retains `report.json` and `report.md` for 90 days in
 `compatibility-review-run-<run-id>-attempt-<attempt>`. The report records both
 revisions, the train, tool/model metadata, coverage gaps, and actionable
 findings. Raw agent transcripts and PR discussions are not published.
+SDK failures retain the exception message in the report.
 The qualification summary links this separate advisory evidence without waiting
 for it; compatibility
 review remains missing from the blocking RFC profile during this rollout.
