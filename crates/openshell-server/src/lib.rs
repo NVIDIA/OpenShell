@@ -42,6 +42,8 @@ mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
 mod reflection;
+mod refresh_commit;
+mod refresh_store;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
@@ -331,6 +333,9 @@ pub struct ServerState {
 
     /// Credential-driver selection and resolution runtime.
     pub credentials: credentials::CredentialRuntime,
+
+    /// Shared embedded refresh runtime (separate from storage-only consumers).
+    pub(crate) refresh: openshell_credential_issuer::refresh::RefreshRuntime,
 
     /// In-memory sandbox correlation index.
     pub sandbox_index: SandboxIndex,
@@ -638,11 +643,13 @@ impl ServerState {
             .map_or_else(String::new, |oidc| oidc.admin_role.clone());
         let config_delivery =
             config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
+        let refresh = provider_refresh::runtime(&store, Some(&credentials), Some(&compute));
         Self {
             config,
             store,
             compute,
             credentials,
+            refresh,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,

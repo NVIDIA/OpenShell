@@ -194,7 +194,22 @@ closed without falling back to inline values.
 ## Refresh coordination
 
 Explicit rotation, background refresh, and operator refresh-on-read share the
-same refresh coordination:
+same refresh coordination in `openshell-credential-issuer::refresh`. The server's
+`provider_refresh` facade retains public status/configuration adaptation and
+worker startup. `refresh_store` translates the unchanged private durable record
+and leases; `refresh_commit` retains workspace/attachment/provider CAS integration.
+The gateway publishes worker/manual changes at the existing orchestration points;
+export-triggered refresh does not publish. The issuer is still embedded: stable
+reference/version migration must remove the temporary provider commit port before
+remote refresh.
+
+Gateway configuration, status, deletion, export revalidation, and snapshot reads
+use the shared `CredentialRefresh` interface. Deletion does not construct a local
+runtime. The temporary provider-commit adapter uses the same injected
+`RefreshStateStore` for attachment-validation reads, avoiding a runtime ownership
+cycle; neither path calls gateway refresh-persistence helpers directly.
+
+The shared runtime preserves these guarantees:
 
 - A process-local weak keyed mutex coalesces waiters without retaining deleted
   providers indefinitely.

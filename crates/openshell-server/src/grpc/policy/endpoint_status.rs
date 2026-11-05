@@ -374,6 +374,7 @@ async fn derive_endpoint_context(
     let bindings = policy_static_credential_endpoint_bindings(Some(&policy))?;
     let provider_env_revision = compute_provider_env_revision_with_catalog_and_policy_bindings(
         state.store.as_ref(),
+        &state.refresh,
         catalog,
         workspace,
         &provider_names,

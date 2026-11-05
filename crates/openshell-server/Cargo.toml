@@ -93,8 +93,6 @@ tokio-stream = { workspace = true }
 sqlx = { workspace = true }
 sqlx-core = { workspace = true }
 reqwest = { workspace = true }
-aws-config = { workspace = true }
-aws-sdk-sts = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }

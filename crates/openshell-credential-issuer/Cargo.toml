@@ -17,6 +17,13 @@ openshell-driver-db-credstore = { path = "../openshell-driver-db-credstore" }
 openshell-driver-kubernetes-secrets = { path = "../openshell-driver-kubernetes-secrets" }
 openshell-driver-vault = { path = "../openshell-driver-vault" }
 async-trait = "0.1"
+aws-config = { workspace = true }
+aws-sdk-sts = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
 futures = { workspace = true }
 hyper-util = { workspace = true }
 prost-types = { workspace = true }
@@ -32,6 +39,7 @@ test-support = []
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
 
 [lints]
 workspace = true

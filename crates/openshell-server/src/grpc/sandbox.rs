@@ -665,6 +665,7 @@ async fn handle_create_sandbox_inner(
     .await?;
     validate_provider_environment_keys_unique_with_catalog(
         state.store.as_ref(),
+        crate::provider_refresh::RefreshStateReader::Runtime(&state.refresh),
         &provider_profile_catalog,
         &workspace,
         &spec.providers,
@@ -1552,6 +1553,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     .await?;
     validate_provider_environment_keys_unique_with_catalog(
         state.store.as_ref(),
+        crate::provider_refresh::RefreshStateReader::Runtime(&state.refresh),
         &provider_profile_catalog,
         &workspace,
         &candidate_spec.providers,
