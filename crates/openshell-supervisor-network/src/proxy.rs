@@ -727,7 +727,6 @@ async fn preauthorize_transparent_open(
     if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS) {
         if destination.port() != 80 || !has_policy_local {
             emit_staged_transparent_denial(
-                None,
                 destination,
                 None,
                 &binary_identity,
@@ -752,7 +751,6 @@ async fn preauthorize_transparent_open(
             });
         if let Err(denial) = identity_check {
             emit_staged_transparent_denial(
-                None,
                 destination,
                 None,
                 &binary_identity,
@@ -782,7 +780,6 @@ async fn preauthorize_transparent_open(
             Err(error) => {
                 warn!(%destination, %error, "Denied staged transparent connection");
                 emit_staged_transparent_denial(
-                    None,
                     destination,
                     None,
                     &binary_identity,
@@ -821,7 +818,6 @@ async fn preauthorize_transparent_open(
         );
         warn!(%destination, %reason, "Denied staged transparent connection");
         emit_staged_transparent_denial(
-            Some(&connect_span),
             destination,
             mapped_host,
             &binary_identity,
@@ -850,7 +846,6 @@ async fn preauthorize_transparent_open(
     {
         warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
         emit_staged_transparent_denial(
-            Some(&connect_span),
             destination,
             mapped_host,
             &binary_identity,
@@ -889,7 +884,6 @@ async fn preauthorize_transparent_open(
                 };
                 warn!(%destination, %reason, "Denied staged transparent connection");
                 emit_staged_transparent_denial(
-                    Some(&connect_span),
                     destination,
                     mapped_host,
                     &binary_identity,
@@ -922,7 +916,6 @@ async fn preauthorize_transparent_open(
         Err(denial) => {
             warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
             emit_staged_transparent_denial(
-                Some(&connect_span),
                 destination,
                 mapped_host,
                 &binary_identity,
@@ -949,14 +942,13 @@ async fn preauthorize_transparent_open(
 }
 
 fn emit_staged_transparent_denial(
-    parent: Option<&tracing::Span>,
     destination: SocketAddr,
     mapped_host: Option<&str>,
     identity: &Result<ContractBinaryIdentity, ResolveError>,
     reason: &str,
     status_detail: &'static str,
 ) {
-    egress_emit!(optional_deny_parent: parent, build_staged_transparent_denial_event(
+    egress_emit!(build_staged_transparent_denial_event(
         destination,
         mapped_host,
         identity,
@@ -1236,7 +1228,7 @@ async fn handle_transparent_tcp_connection(
     ) {
         Ok(mapping) => mapping,
         Err(error) => {
-            emit_transparent_mapping_denial(None, workload_addr, original, None, error);
+            emit_transparent_mapping_denial(workload_addr, original, None, error);
             emit_activity(&activity_tx, true, "transparent_tcp_mapping");
             return Ok(());
         }
@@ -1257,7 +1249,7 @@ async fn handle_transparent_tcp_connection(
     .map_err(|error| miette::miette!("identity resolution task panicked: {error}"))?;
 
     if let NetworkAction::Deny { reason } = &decision.action {
-        emit_transparent_policy_denial(&connect_span, &decision, workload_addr, &host, port);
+        emit_transparent_policy_denial(&decision, workload_addr, &host, port);
         emit_denial(
             &denial_tx,
             &host,
@@ -1276,7 +1268,6 @@ async fn handle_transparent_tcp_connection(
 
     if mapping.record.is_observation() {
         emit_transparent_mapping_denial(
-            Some(&connect_span),
             workload_addr,
             original,
             Some(&host),
@@ -1295,7 +1286,6 @@ async fn handle_transparent_tcp_connection(
         relay::pin_policy_generation(&opa_engine, decision.policy_generation)
     else {
         emit_transparent_mapping_denial(
-            Some(&connect_span),
             workload_addr,
             original,
             Some(&host),
@@ -1312,13 +1302,7 @@ async fn handle_transparent_tcp_connection(
     ) {
         Ok(mapping) => mapping,
         Err(error) => {
-            emit_transparent_mapping_denial(
-                Some(&connect_span),
-                workload_addr,
-                original,
-                Some(&host),
-                error,
-            );
+            emit_transparent_mapping_denial(workload_addr, original, Some(&host), error);
             emit_activity(&activity_tx, true, "transparent_tcp_mapping");
             return Ok(());
         }
@@ -1335,7 +1319,7 @@ async fn handle_transparent_tcp_connection(
         .find(|candidate| mapping.endpoint_ids().any(|mapped| mapped == candidate));
     let Some(endpoint_id) = endpoint_id else {
         let reason = "authorized endpoint did not match DNS correlation";
-        emit_transparent_policy_denial(&connect_span, &decision, workload_addr, &host, port);
+        emit_transparent_policy_denial(&decision, workload_addr, &host, port);
         emit_denial(
             &denial_tx,
             &host,
@@ -1375,9 +1359,7 @@ async fn handle_transparent_tcp_connection(
     );
     let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
-        connect_span.in_scope(|| {
-            crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", true);
-        });
+        crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", true);
         return Ok(());
     }
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding {
@@ -1393,6 +1375,7 @@ async fn handle_transparent_tcp_connection(
             .inspect_err(|_| egress::mark_error(&dial_span))
             .into_diagnostic()?;
     drop(dial_span);
+    drop(connect_span);
     let upstream_socket_peer = upstream.peer_addr().into_diagnostic()?;
     let (connected_real_destination, dial_mode) = match upstream.connect_target() {
         Some(upstream_proxy::ConnectTarget::Ip(ip)) => (
@@ -1404,7 +1387,7 @@ async fn handle_transparent_tcp_connection(
             // validated address set. A hostname-mode CONNECT would make the
             // corporate proxy resolve again and break that binding. Treat a
             // future invariant regression as an audited denial, not a panic.
-            emit_transparent_policy_denial(&connect_span, &decision, workload_addr, &host, port);
+            emit_transparent_policy_denial(&decision, workload_addr, &host, port);
             emit_denial(
                 &denial_tx,
                 &host,
@@ -1435,7 +1418,6 @@ async fn handle_transparent_tcp_connection(
     let pid = decision
         .binary_pid
         .map_or_else(|| "-".to_string(), |pid| pid.to_string());
-    drop(connect_span);
     egress_emit!(build_transparent_tcp_allow_ocsf_event(
         TransparentTcpAllowAudit {
             workload: workload_addr,
@@ -1566,7 +1548,6 @@ fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
 
 #[cfg(target_os = "linux")]
 fn emit_transparent_mapping_denial(
-    parent: Option<&tracing::Span>,
     workload: SocketAddr,
     original: SocketAddr,
     mapped_host: Option<&str>,
@@ -1581,7 +1562,7 @@ fn emit_transparent_mapping_denial(
         | MappingLookupError::InvalidMapping
         | MappingLookupError::LockPoisoned => "transparent_tcp_destination_denied",
     };
-    egress_emit!(optional_deny_parent: parent,
+    egress_emit!(
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -1598,7 +1579,6 @@ fn emit_transparent_mapping_denial(
 
 #[cfg(target_os = "linux")]
 fn emit_transparent_policy_denial(
-    parent: &tracing::Span,
     decision: &EgressDecision,
     workload: SocketAddr,
     host: &str,
@@ -1616,7 +1596,7 @@ fn emit_transparent_policy_denial(
     let pid = decision
         .binary_pid
         .map_or_else(|| "-".to_string(), |pid| pid.to_string());
-    egress_emit!(deny_parent: parent,
+    egress_emit!(
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -1841,52 +1821,6 @@ fn unsupported_l7_tunnel_protocol_detail(
             Some("Unsupported tunnel protocol cannot be inspected by required middleware")
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_unsupported_connect_protocol_event(
-    peer_addr: SocketAddr,
-    host: &str,
-    port: u16,
-    binary: &str,
-    pid: &str,
-    ancestors: &str,
-    cmdline: &str,
-    policy: &str,
-    detail: &str,
-) -> openshell_ocsf::OcsfEvent {
-    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Open)
-        .action(ActionId::Denied)
-        .disposition(DispositionId::Blocked)
-        .severity(SeverityId::Medium)
-        .status(StatusId::Failure)
-        .dst_endpoint(Endpoint::from_domain(host, port))
-        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
-        .firewall_rule(policy, "l7")
-        .message(format!(
-            "CONNECT_L7 blocked unsupported tunnel protocol for {host}:{port}"
-        ))
-        .status_detail(detail)
-        .build()
-}
-
-fn emit_unsupported_connect_protocol(
-    ctx: &crate::l7::relay::L7EvalContext,
-    requirement: InspectionRequirement,
-    detail: &str,
-    event: openshell_ocsf::OcsfEvent,
-) {
-    // Both records describe one refusal. Use the domain event's decision
-    // fields for their shared scope, which exits before the response await.
-    let scope = crate::telemetry::deny_span(&event, None);
-    scope.in_scope(|| {
-        if requirement == InspectionRequirement::RequiredMiddleware {
-            crate::l7::middleware::emit_middleware_uninspectable(ctx, detail, true);
-        }
-        egress_emit!(event);
-    });
 }
 
 /// Gate for traffic that would bypass L7 inspection entirely: query the
@@ -2434,7 +2368,6 @@ fn build_forward_destination_deny_ocsf_event(
 #[allow(clippy::too_many_arguments)]
 async fn deny_connect_destination<C>(
     client: &mut C,
-    connect_span: &tracing::Span,
     denial: &DestinationDenial,
     peer_addr: SocketAddr,
     host: &str,
@@ -2451,7 +2384,7 @@ where
     C: TokioAsyncWrite + Unpin,
 {
     let detail = destination_denial_detail(denial.kind);
-    egress_emit!(deny_parent: connect_span, build_connect_destination_deny_ocsf_event(
+    egress_emit!(build_connect_destination_deny_ocsf_event(
         denial, peer_addr, host, port, binary, pid, ancestors, cmdline,
     ));
 
@@ -2963,7 +2896,7 @@ async fn handle_mediated_connection(
             .message(format!("CONNECT denied {host_lc}:{port}"))
             .status_detail(&deny_reason)
             .build();
-        egress_emit!(deny_parent: &connect_span, event);
+        egress_emit!(event);
         emit_denial(
             &denial_tx,
             &host_lc,
@@ -3036,7 +2969,6 @@ async fn handle_mediated_connection(
                 }
                 deny_connect_destination(
                     &mut client,
-                    &connect_span,
                     &denial,
                     workload_addr,
                     &host_lc,
@@ -3080,7 +3012,6 @@ async fn handle_mediated_connection(
                 }
                 deny_connect_destination(
                     &mut client,
-                    &connect_span,
                     &denial,
                     workload_addr,
                     &host_lc,
@@ -3130,7 +3061,7 @@ async fn handle_mediated_connection(
             ))
             .status_detail(TLS_TERMINATION_UNAVAILABLE_DETAIL)
             .build();
-        egress_emit!(deny_parent: &connect_span, event);
+        egress_emit!(event);
         emit_activity_simple(activity_tx.as_ref(), true, "tls_termination_unavailable");
         emit_denial(
             &denial_tx,
@@ -3173,7 +3104,8 @@ async fn handle_mediated_connection(
             policy_str,
             if effective_tls_skip { "tls-skip" } else { "l4" },
         );
-        crate::telemetry::emit_decision([event, finding], Some(&connect_span), false);
+        egress_emit!(event);
+        egress_emit!(finding);
         emit_activity_simple(activity_tx.as_ref(), true, "uninspected_credentials");
         emit_denial(
             &denial_tx,
@@ -3474,18 +3406,28 @@ async fn handle_mediated_connection(
         if let Some(protocol_detail) =
             unsupported_l7_tunnel_protocol_detail(tunnel_protocol, requirement)
         {
-            let event = build_unsupported_connect_protocol_event(
-                workload_addr,
-                &host_lc,
-                port,
-                &binary_str,
-                &pid_str,
-                &ancestors_str,
-                &cmdline_str,
-                policy_str,
-                protocol_detail,
-            );
-            emit_unsupported_connect_protocol(&ctx, requirement, protocol_detail, event);
+            if requirement == InspectionRequirement::RequiredMiddleware {
+                crate::l7::middleware::emit_middleware_uninspectable(&ctx, protocol_detail, true);
+            }
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .firewall_rule(policy_str, "l7")
+                .message(format!(
+                    "CONNECT_L7 blocked unsupported tunnel protocol for {host_lc}:{port}"
+                ))
+                .status_detail(protocol_detail)
+                .build();
+            egress_emit!(event);
             emit_activity_simple(activity_tx.as_ref(), true, "l7_parse_rejection");
             emit_denial(
                 &denial_tx,
@@ -5879,7 +5821,7 @@ async fn handle_forward_proxy(
                 port,
                 format!("FORWARD rejecting non-canonical request-target: {error}"),
             );
-            egress_emit!(deny_parent: &connect_span, event);
+            egress_emit!(event);
             emit_activity_simple(activity_tx, true, "forward_parse_rejection");
             respond(
                 client,
@@ -6152,7 +6094,7 @@ async fn handle_forward_proxy(
                         port,
                         format!("FORWARD_GRAPHQL_L7 request rejected: {e}"),
                     );
-                    egress_emit!(deny_parent: &connect_span, event);
+                    egress_emit!(event);
                     emit_activity_simple(activity_tx, true, "l7_parse_rejection");
                     respond(
                         client,
@@ -6204,7 +6146,7 @@ async fn handle_forward_proxy(
                             port,
                             format!("FORWARD_JSONRPC_L7 request rejected: {e}"),
                         );
-                        egress_emit!(deny_parent: &connect_span, event);
+                        egress_emit!(event);
                         emit_activity_simple(activity_tx, true, "l7_parse_rejection");
                         respond(
                             client,
@@ -6855,7 +6797,7 @@ async fn handle_forward_proxy(
                     "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
                 ))
                 .build();
-            egress_emit!(deny_parent: &connect_span, event);
+            egress_emit!(event);
             if let Some(session) = middleware_session.take() {
                 session
                     .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)

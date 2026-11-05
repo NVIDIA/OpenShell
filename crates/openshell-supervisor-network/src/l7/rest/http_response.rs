@@ -2172,20 +2172,15 @@ mod tests {
         .await;
         assert!(events.len() >= 2);
         assert_eq!(received.spans.len(), 1);
-        assert!(
-            events
-                .iter()
-                .all(|event| event["trace"]["uid"] == events[0]["trace"]["uid"])
-        );
         assert_deny_resolves(&events, &received, true);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn response_terminal_failure_without_diagnostics_still_exports_a_deny_trace() {
-        use crate::telemetry::tests::{assert_deny_resolves, exported};
+    async fn response_terminal_failure_without_diagnostics_has_no_deny_trace() {
+        use crate::telemetry::tests::exported;
 
-        // Exercise the emission boundary directly: platform refusals can lack
-        // invocation diagnostics, but must retain their terminal failure record.
+        // Platform refusals can lack invocation diagnostics, but must retain
+        // their terminal failure record. Without an HTTP record, no deny span.
         for committed in [false, true] {
             let (events, received) = exported("warn", || {
                 super::emit_http_response_diagnostics(
@@ -2196,6 +2191,7 @@ mod tests {
                     true,
                     Some(committed),
                 );
+                tracing::info_span!("test.export-barrier").in_scope(|| {});
             })
             .await;
 
@@ -2204,18 +2200,36 @@ mod tests {
                 events[0]["finding_info"]["uid"],
                 "openshell.middleware.http_response_failure"
             );
-            assert_eq!(received.spans.len(), 1);
-            assert_deny_resolves(&events, &received, true);
+            assert!(events[0].get("trace").is_none());
+            assert!(
+                received
+                    .spans
+                    .iter()
+                    .all(|span| span.name != "supervisor.egress.deny")
+            );
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn response_diagnostic_findings_create_deny_spans_only_when_delivery_is_denied() {
         use crate::telemetry::tests::{assert_deny_resolves, exported};
+        use openshell_supervisor_middleware::HttpResponseInvocationOutcome;
 
         for denied in [false, true] {
             let (events, received) = exported("warn", || {
                 let diagnostics = openshell_supervisor_middleware::HttpResponseDiagnostics {
+                    invocations: vec![openshell_supervisor_middleware::HttpResponseInvocation {
+                        config_name: "content-guard".to_string(),
+                        implementation: "test/guard".to_string(),
+                        outcome: HttpResponseInvocationOutcome::PassThrough,
+                        sequence: None,
+                        input_size: 0,
+                        output_size: None,
+                        failed: false,
+                        stage_disabled: false,
+                        reason_code: None,
+                        failure_category: None,
+                    }],
                     findings: vec![openshell_supervisor_middleware::NamespacedFinding {
                         middleware: "content-guard".into(),
                         finding: openshell_core::proto::Finding {
@@ -2239,11 +2253,11 @@ mod tests {
                 tracing::info_span!("test.export-barrier").in_scope(|| {});
             })
             .await;
-            assert_eq!(events.len(), 1);
+            assert_eq!(events.len(), 2);
             if denied {
                 assert_deny_resolves(&events, &received, true);
             } else {
-                assert!(events[0].get("trace").is_none());
+                assert!(events.iter().all(|event| event.get("trace").is_none()));
                 assert!(
                     !received
                         .spans

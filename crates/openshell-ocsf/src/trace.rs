@@ -64,8 +64,15 @@ pub fn register_trace_correlation_extractor(extractor: fn() -> Option<TraceCorre
     EXTRACTOR.set(extractor).is_ok()
 }
 
+/// HTTP Activity and API Activity: the classes OCSF 1.8.0 declares the Trace
+/// profile for.
+pub const fn accepts_trace(class_uid: u32) -> bool {
+    matches!(class_uid, 4002 | 6003)
+}
+
 pub fn enrich(event: &mut crate::OcsfEvent) {
-    if event.base().trace.is_none()
+    if accepts_trace(event.class_uid())
+        && event.base().trace.is_none()
         && let Some(trace) = EXTRACTOR.get().and_then(|extract| extract())
     {
         event.base_mut().set_trace(trace);
@@ -123,16 +130,56 @@ mod tests {
             event.base_mut().set_trace(trace());
             let correlated = event.to_json().unwrap();
             validate_event(&correlated).unwrap_or_else(|e| panic!("{class} with trace: {e}"));
-            assert_eq!(correlated["trace"]["uid"], trace().uid());
+            if matches!(class, "http_activity" | "api_activity") {
+                assert_eq!(correlated["trace"]["uid"], trace().uid(), "{class}");
+            } else {
+                assert_eq!(correlated, plain, "{class}");
+            }
             let decoded: OcsfEvent = serde_json::from_value(correlated.clone()).unwrap();
             assert_eq!(decoded.to_json().unwrap(), correlated);
         }
     }
 
     #[test]
+    fn deserialized_trace_is_dropped_from_classes_without_the_profile() {
+        let ctx = builders::test_sandbox_context();
+        let (_, event) = builders::sample_events(&ctx)
+            .into_iter()
+            .find(|(class, _)| *class == "network_activity")
+            .unwrap();
+        let mut value = event.to_json().unwrap();
+        value["trace"] = serde_json::json!({"uid": trace().uid()});
+        let decoded: OcsfEvent = serde_json::from_value(value).unwrap();
+        assert!(decoded.to_json().unwrap().get("trace").is_none());
+    }
+
+    #[test]
+    fn gateway_api_activity_shapes_validate_with_trace() {
+        let ctx = builders::test_gateway_context();
+        let events = [
+            ApiActivityBuilder::new(&ctx, "CreateSandbox").build(),
+            ApiActivityBuilder::new(&ctx, "CreateSandbox")
+                .action(ActionId::Denied)
+                .build(),
+            ApiActivityBuilder::new(&ctx, "chat.completions")
+                .ai_model(AiModel::new("model", "provider"))
+                .build(),
+        ];
+        for mut event in events {
+            event.base_mut().set_trace(trace());
+            let correlated = event.to_json().unwrap();
+            validate_event(&correlated).unwrap_or_else(|e| panic!("{correlated}: {e}"));
+            assert_eq!(correlated["trace"]["uid"], trace().uid());
+        }
+    }
+
+    #[test]
     fn exported_schema_checks_trace_shape_and_declared_profile() {
         let ctx = builders::test_sandbox_context();
-        let mut event = BaseEventBuilder::new(&ctx).build();
+        let (_, mut event) = builders::sample_events(&ctx)
+            .into_iter()
+            .find(|(class, _)| *class == "http_activity")
+            .unwrap();
         event.base_mut().set_trace(trace());
         let mut value = event.to_json().unwrap();
         validate_event(&value).unwrap_or_else(|e| panic!("{e}"));

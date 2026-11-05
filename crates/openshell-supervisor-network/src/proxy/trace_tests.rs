@@ -5,111 +5,6 @@ use super::*;
 use crate::telemetry::tests::{assert_deny_resolves, exported};
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 
-fn emit_staged_policy_deny(debug: bool) {
-    let intent = EgressIntent::connect("blocked.example".to_string(), 443);
-    let connect = egress::connect_span(&intent);
-    assert_eq!(connect.is_disabled(), !debug);
-    connect.in_scope(|| {
-        egress::traced_authorization(
-            intent,
-            |intent| EgressDecision {
-                intent,
-                action: NetworkAction::Deny {
-                    reason: "not permitted".to_string(),
-                },
-                policy_generation: 1,
-                identity: ProcessIdentityEvidence::Unavailable(
-                    IdentityUnavailableReason::LookupFailed,
-                ),
-                endpoint: EndpointDecision::default(),
-                binary: None,
-                binary_pid: None,
-                ancestors: vec![],
-                cmdline_paths: vec![],
-            },
-            |decision| decision,
-        );
-    });
-    // Authorization has exited. The actual staged L4 emission must enter its
-    // own INFO deny span, retaining the saved DEBUG parent when it is enabled.
-    emit_staged_transparent_denial(
-        Some(&connect),
-        "192.0.2.1:443".parse().unwrap(),
-        Some("blocked.example"),
-        &Err(ResolveError::Failed("unavailable".to_string())),
-        "not permitted",
-        "transparent_tcp_policy_denied",
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn default_level_l4_deny_uid_resolves_to_one_span_root_trace() {
-    let (events, received) = exported("warn", || emit_staged_policy_deny(false)).await;
-    assert_eq!(events.len(), 1);
-    assert_deny_resolves(&events, &received, true);
-    assert_eq!(received.spans.len(), 1);
-    assert_eq!(events[0]["class_uid"], 4001);
-    let attributes = received.spans[0]
-        .attributes
-        .iter()
-        .map(|kv| {
-            (
-                kv.key.as_str(),
-                kv.value.as_ref().unwrap().value.as_ref().unwrap(),
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    assert_eq!(
-        attributes["openshell.policy.decision"],
-        &Value::StringValue("deny".to_string())
-    );
-    assert_eq!(
-        attributes["server.address"],
-        &Value::StringValue("blocked.example".to_string())
-    );
-    assert_eq!(attributes["server.port"], &Value::IntValue(443));
-    assert_eq!(
-        attributes["openshell.policy.reason"],
-        &Value::StringValue("transparent_tcp_policy_denied".to_string())
-    );
-    assert!(!attributes.contains_key("openshell.policy.name"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn debug_level_deny_retains_connect_and_authorization_trace() {
-    let (events, received) = exported("debug", || emit_staged_policy_deny(true)).await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(
-        received
-            .spans
-            .iter()
-            .filter(|span| span.name == "supervisor.egress.deny")
-            .count(),
-        1
-    );
-    assert_deny_resolves(&events, &received, false);
-    let connect = received
-        .spans
-        .iter()
-        .find(|span| span.name == "supervisor.egress.connect")
-        .unwrap();
-    let deny = received
-        .spans
-        .iter()
-        .find(|span| span.name == "supervisor.egress.deny")
-        .unwrap();
-    let authorize = received
-        .spans
-        .iter()
-        .find(|span| span.name == "supervisor.egress.authorize")
-        .unwrap();
-    assert_eq!(deny.trace_id, connect.trace_id);
-    assert_eq!(deny.parent_span_id, connect.span_id);
-    assert_eq!(authorize.parent_span_id, connect.span_id);
-    assert_eq!(authorize.trace_id, connect.trace_id);
-    assert_eq!(events[0]["trace"]["uid"], hex::encode(&connect.trace_id));
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paired_credential_denial_shares_one_deny_span() {
     let (events, received) = exported("warn", || {
@@ -118,7 +13,6 @@ async fn paired_credential_denial_shares_one_deny_span() {
     .await;
     assert_eq!(events.len(), 2);
     assert_eq!(received.spans.len(), 1);
-    assert_eq!(events[0]["trace"]["uid"], events[1]["trace"]["uid"]);
     assert_deny_resolves(&events, &received, true);
 }
 
@@ -142,15 +36,12 @@ async fn repeated_credential_denials_keep_decision_spans_separate() {
                 .action(ActionId::Allowed)
                 .dst_endpoint(Endpoint::from_domain("allowed.example", 443))
                 .build();
-            crate::telemetry::emit(allowed, None, false);
+            crate::telemetry::emit(allowed, None);
         })
         .await;
 
         assert_eq!(events.len(), 5);
         assert_deny_resolves(&events[..4], &received, level == "warn");
-        for pair in events[..4].chunks_exact(2) {
-            assert_eq!(pair[0]["trace"]["uid"], pair[1]["trace"]["uid"]);
-        }
         assert!(events[4].get("trace").is_none(), "deny context must exit");
         let denies = received
             .spans
@@ -178,7 +69,7 @@ async fn repeated_credential_denials_keep_decision_spans_separate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn noncanonical_forward_rejections_have_a_deny_trace() {
+async fn network_class_forward_rejections_have_no_deny_trace() {
     let (events, received) = exported("warn", || {
         let Err(error) =
             prepare_forward_target("/%zz", crate::l7::path::CanonicalizeOptions::default())
@@ -190,137 +81,89 @@ async fn noncanonical_forward_rejections_have_a_deny_trace() {
             443,
             format!("FORWARD rejecting non-canonical request-target: {error}")
         ));
+        tracing::info_span!("test.export-barrier").in_scope(|| {});
     })
     .await;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["action_id"], 2);
-    assert_deny_resolves(&events, &received, true);
+    assert!(events[0].get("trace").is_none());
+    assert!(
+        received
+            .spans
+            .iter()
+            .all(|span| span.name != "supervisor.egress.deny")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn connect_and_forward_denials_use_the_saved_connect_parent() {
+async fn forward_denials_use_the_saved_connect_parent() {
     for level in ["warn", "debug"] {
-        for forward in [false, true] {
-            let (events, received) = exported(level, || {
-                let intent = EgressIntent::connect("blocked.example".to_string(), 443);
-                let connect = egress::connect_span(&intent);
-                let decision = EgressDecision {
-                    intent,
-                    action: NetworkAction::Allow {
-                        matched_policy: None,
-                    },
-                    policy_generation: 1,
-                    identity: ProcessIdentityEvidence::Available,
-                    endpoint: EndpointDecision::default(),
-                    binary: None,
-                    binary_pid: None,
-                    ancestors: vec![],
-                    cmdline_paths: vec![],
-                };
-                let denial = DestinationDenial {
-                    kind: DestinationDenialKind::InternalAddress,
-                    reason: "private destination".to_string(),
-                };
-                let mut output = Vec::new();
-                if forward {
-                    futures::executor::block_on(deny_forward_destination(
-                        &mut output,
-                        &connect,
-                        &denial,
-                        "127.0.0.1:41000".parse().unwrap(),
-                        "POST",
-                        "blocked.example",
-                        443,
-                        "/",
-                        "curl",
-                        "42",
-                        "-",
-                        "curl",
-                        "forward-policy",
-                        &decision,
-                        None,
-                        None,
-                    ))
-                    .unwrap();
-                } else {
-                    futures::executor::block_on(deny_connect_destination(
-                        &mut output,
-                        &connect,
-                        &denial,
-                        "127.0.0.1:41000".parse().unwrap(),
-                        "blocked.example",
-                        443,
-                        "curl",
-                        "42",
-                        "-",
-                        "curl",
-                        &decision,
-                        &None,
-                        &None,
-                    ))
-                    .unwrap();
-                }
-                assert!(output.starts_with(b"HTTP/1.1 403 Forbidden"));
-            })
-            .await;
-            assert_eq!(events.len(), 1);
-            assert_deny_resolves(&events, &received, level == "warn");
-            assert_eq!(
-                received
-                    .spans
-                    .iter()
-                    .filter(|span| span.name == "supervisor.egress.deny")
-                    .count(),
-                1
-            );
-            if level == "debug" {
-                let connect = received
-                    .spans
-                    .iter()
-                    .find(|span| span.name == "supervisor.egress.connect")
-                    .unwrap();
-                let deny = received
-                    .spans
-                    .iter()
-                    .find(|span| span.name == "supervisor.egress.deny")
-                    .unwrap();
-                assert_eq!(deny.parent_span_id, connect.span_id);
-                assert_eq!(events[0]["trace"]["uid"], hex::encode(&connect.trace_id));
-            }
-        }
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn evaluation_errors_only_trace_enforced_denials() {
-    for mode in [
-        crate::l7::EnforcementMode::Audit,
-        crate::l7::EnforcementMode::Enforce,
-    ] {
-        let (events, received) = exported("warn", || {
-            egress_emit!(build_forward_l7_evaluation_error(
+        let (events, received) = exported(level, || {
+            let intent = EgressIntent::connect("blocked.example".to_string(), 443);
+            let connect = egress::connect_span(&intent);
+            let decision = EgressDecision {
+                intent,
+                action: NetworkAction::Allow {
+                    matched_policy: None,
+                },
+                policy_generation: 1,
+                identity: ProcessIdentityEvidence::Available,
+                endpoint: EndpointDecision::default(),
+                binary: None,
+                binary_pid: None,
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let denial = DestinationDenial {
+                kind: DestinationDenialKind::InternalAddress,
+                reason: "private destination".to_string(),
+            };
+            let mut output = Vec::new();
+            futures::executor::block_on(deny_forward_destination(
+                &mut output,
+                &connect,
+                &denial,
+                "127.0.0.1:41000".parse().unwrap(),
+                "POST",
                 "blocked.example",
                 443,
-                mode,
-                "evaluation unavailable"
-            ));
-            tracing::info_span!("test.export-barrier").in_scope(|| {});
+                "/",
+                "curl",
+                "42",
+                "-",
+                "curl",
+                "forward-policy",
+                &decision,
+                None,
+                None,
+            ))
+            .unwrap();
+            assert!(output.starts_with(b"HTTP/1.1 403 Forbidden"));
         })
         .await;
         assert_eq!(events.len(), 1);
-        if mode == crate::l7::EnforcementMode::Enforce {
-            assert_eq!(events[0]["action_id"], 2);
-            assert_deny_resolves(&events, &received, true);
-        } else {
-            assert!(events[0].get("trace").is_none());
-            assert_eq!(
-                received
-                    .spans
-                    .iter()
-                    .filter(|span| span.name == "supervisor.egress.deny")
-                    .count(),
-                0
-            );
+        assert_deny_resolves(&events, &received, level == "warn");
+        assert_eq!(
+            received
+                .spans
+                .iter()
+                .filter(|span| span.name == "supervisor.egress.deny")
+                .count(),
+            1
+        );
+        if level == "debug" {
+            let connect = received
+                .spans
+                .iter()
+                .find(|span| span.name == "supervisor.egress.connect")
+                .unwrap();
+            let deny = received
+                .spans
+                .iter()
+                .find(|span| span.name == "supervisor.egress.deny")
+                .unwrap();
+            assert_eq!(deny.parent_span_id, connect.span_id);
+            assert_eq!(events[0]["trace"]["uid"], hex::encode(&connect.trace_id));
         }
     }
 }
@@ -390,7 +233,6 @@ async fn forward_evaluation_error_keeps_the_http_decision_policy_context() {
                 assert_eq!(received.spans.len(), if level == "debug" { 2 } else { 1 });
                 assert_eq!(http_decision["action_id"], 2);
                 assert_eq!(evaluation_error["action_id"], 2);
-                assert_eq!(events[0]["trace"]["uid"], events[1]["trace"]["uid"]);
                 assert_deny_resolves(&events, &received, level == "warn");
                 let attribute = |key: &str| {
                     denies[0]
@@ -427,202 +269,6 @@ async fn forward_evaluation_error_keeps_the_http_decision_policy_context() {
                 for event in events {
                     assert!(event.get("trace").is_none());
                 }
-            }
-        }
-    }
-}
-
-fn unsupported_connect_context() -> crate::l7::relay::L7EvalContext {
-    crate::l7::relay::L7EvalContext {
-        host: "blocked.example".to_string(),
-        port: 443,
-        policy_name: "connect-policy".to_string(),
-        ..Default::default()
-    }
-}
-
-fn emit_unsupported_connect_fixture(
-    ctx: &crate::l7::relay::L7EvalContext,
-    requirement: InspectionRequirement,
-    detail: &str,
-) {
-    // The real CONNECT handler drops its connect span before sending the 200
-    // and inspecting the tunnel payload, including when DEBUG is enabled.
-    drop(egress::connect_span(&EgressIntent::connect(
-        ctx.host.clone(),
-        ctx.port,
-    )));
-    let event = build_unsupported_connect_protocol_event(
-        "127.0.0.1:41000".parse().unwrap(),
-        &ctx.host,
-        ctx.port,
-        "curl",
-        "42",
-        "-",
-        "curl",
-        &ctx.policy_name,
-        detail,
-    );
-    emit_unsupported_connect_protocol(ctx, requirement, detail, event);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unsupported_connect_required_middleware_companions_share_one_deny_scope() {
-    for level in ["warn", "debug"] {
-        for payload in [
-            crate::l7::rest::HTTP2_PRIOR_KNOWLEDGE_PREFACE,
-            b"SSH-2.0-OpenSSH\r\n".as_slice(),
-        ] {
-            let protocol = peek_tunnel_protocol(&mut tokio::io::BufReader::new(payload))
-                .await
-                .unwrap()
-                .unwrap();
-            let requirement = inspection_requirement(
-                false,
-                crate::l7::middleware::UninspectableTrafficGate::Deny,
-            );
-            assert_eq!(requirement, InspectionRequirement::RequiredMiddleware);
-            let detail = unsupported_l7_tunnel_protocol_detail(protocol, requirement).unwrap();
-            let ctx = unsupported_connect_context();
-            let (events, received) = exported(level, || {
-                emit_unsupported_connect_fixture(&ctx, requirement, detail);
-            })
-            .await;
-
-            assert_eq!(events.len(), 2, "one finding and one existing domain event");
-            let denies = received
-                .spans
-                .iter()
-                .filter(|span| span.name == "supervisor.egress.deny")
-                .collect::<Vec<_>>();
-            assert_eq!(
-                denies.len(),
-                1,
-                "one unsupported CONNECT decision must export one deny span ({level}, {protocol:?})"
-            );
-            assert_eq!(events[0]["trace"]["uid"], events[1]["trace"]["uid"]);
-            assert_deny_resolves(&events, &received, true);
-            assert_eq!(received.spans.len(), if level == "debug" { 2 } else { 1 });
-            assert_eq!(events[0]["class_uid"], 2004);
-            assert_eq!(events[1]["class_uid"], 4001);
-            assert_eq!(events[1]["action_id"], 2);
-            assert_eq!(events[1]["disposition_id"], 2);
-            assert_eq!(events[1]["status_detail"], detail);
-            assert_eq!(events[1]["firewall_rule"]["name"], ctx.policy_name);
-            let attribute = |key: &str| {
-                denies[0]
-                    .attributes
-                    .iter()
-                    .find(|attribute| attribute.key == key)
-                    .and_then(|attribute| attribute.value.as_ref()?.value.as_ref())
-            };
-            assert_eq!(
-                attribute("openshell.policy.name"),
-                Some(&Value::StringValue(ctx.policy_name.clone()))
-            );
-            assert_eq!(
-                attribute("openshell.policy.reason"),
-                Some(&Value::StringValue(detail.to_string()))
-            );
-            assert_eq!(attribute("ocsf.class_uid"), Some(&Value::IntValue(4001)));
-            assert_eq!(
-                attribute("server.address"),
-                Some(&Value::StringValue(ctx.host.clone()))
-            );
-            assert_eq!(attribute("server.port"), Some(&Value::IntValue(443)));
-        }
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unsupported_connect_l7_route_keeps_one_domain_record() {
-    for level in ["warn", "debug"] {
-        for protocol in [
-            TunnelProtocol::H2cPriorKnowledge,
-            TunnelProtocol::Unsupported,
-        ] {
-            let requirement =
-                inspection_requirement(true, crate::l7::middleware::UninspectableTrafficGate::Deny);
-            assert_eq!(requirement, InspectionRequirement::L7Route);
-            let detail = unsupported_l7_tunnel_protocol_detail(protocol, requirement).unwrap();
-            let ctx = unsupported_connect_context();
-            let (events, received) = exported(level, || {
-                emit_unsupported_connect_fixture(&ctx, requirement, detail);
-            })
-            .await;
-
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0]["class_uid"], 4001);
-            assert_eq!(events[0]["status_detail"], detail);
-            assert_deny_resolves(&events, &received, true);
-            assert_eq!(received.spans.len(), if level == "debug" { 2 } else { 1 });
-        }
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unsupported_connect_allowed_and_fail_open_controls_do_not_create_denies() {
-    use crate::l7::middleware::UninspectableTrafficGate;
-
-    for level in ["warn", "debug"] {
-        for gate in [
-            UninspectableTrafficGate::Unrestricted,
-            UninspectableTrafficGate::BypassWithFinding,
-        ] {
-            for protocol in [
-                TunnelProtocol::H2cPriorKnowledge,
-                TunnelProtocol::Unsupported,
-            ] {
-                let requirement = inspection_requirement(false, gate);
-                assert_eq!(requirement, InspectionRequirement::None);
-                assert!(unsupported_l7_tunnel_protocol_detail(protocol, requirement).is_none());
-                let ctx = unsupported_connect_context();
-                let (events, received) = exported(level, || {
-                    drop(egress::connect_span(&EgressIntent::connect(
-                        ctx.host.clone(),
-                        ctx.port,
-                    )));
-                    egress_emit!(build_connect_allow_ocsf_event(
-                        "127.0.0.1:41000".parse().unwrap(),
-                        &ctx.host,
-                        ctx.port,
-                        "curl",
-                        "42",
-                        "-",
-                        "curl",
-                        &ctx.policy_name,
-                        false,
-                    ));
-                    if gate == UninspectableTrafficGate::BypassWithFinding {
-                        crate::l7::middleware::emit_middleware_uninspectable(
-                            &ctx,
-                            "non-http tcp",
-                            false,
-                        );
-                    }
-                    tracing::info_span!("test.export-barrier").in_scope(|| {});
-                })
-                .await;
-
-                assert_eq!(
-                    events.len(),
-                    if gate == UninspectableTrafficGate::BypassWithFinding {
-                        2
-                    } else {
-                        1
-                    }
-                );
-                assert_eq!(events[0]["class_uid"], 4001);
-                assert_eq!(events[0]["action_id"], 1);
-                for event in events {
-                    assert!(event.get("trace").is_none());
-                }
-                assert!(
-                    received
-                        .spans
-                        .iter()
-                        .all(|span| span.name != "supervisor.egress.deny")
-                );
             }
         }
     }

@@ -6974,12 +6974,8 @@ mod tests {
                     1,
                     "one response stop is one exported decision"
                 );
+                assert!(terminal.get("trace").is_none());
                 assert_deny_resolves(&companions, &received, true);
-                assert!(
-                    companions
-                        .iter()
-                        .all(|event| event["trace"]["uid"] == terminal["trace"]["uid"])
-                );
             }
         }
     }

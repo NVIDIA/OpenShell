@@ -169,22 +169,23 @@ pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: 
             "Uninspectable traffic bypassed middleware (fail_open)"
         })
         .build();
-    egress_emit!(denied: denied, event);
+    egress_emit!(event);
 }
 
 pub fn emit_websocket_preflight_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
 ) {
-    let mut events = websocket_invocation_events(ctx, &outcome.invocations);
-    events.extend(websocket_coverage_events(ctx, &outcome.coverage));
-    events.extend(websocket_preflight_finding_events(outcome));
-    if outcome.session_capacity_exhausted {
-        events.push(middleware_session_capacity_exhausted_event(ctx));
+    emit_websocket_invocations(ctx, &outcome.invocations);
+    emit_websocket_coverage(ctx, &outcome.coverage);
+    for event in websocket_preflight_finding_events(outcome) {
+        egress_emit!(event);
     }
-    crate::telemetry::emit_decision(events, None, !outcome.allowed);
     if outcome.saturated {
         emit_websocket_saturation(ctx);
+    }
+    if outcome.session_capacity_exhausted {
+        emit_middleware_session_capacity_exhausted(ctx);
     }
 }
 
@@ -251,22 +252,19 @@ pub(super) fn emit_websocket_session_start_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketSessionStartOutcome,
 ) {
-    crate::telemetry::emit_decision(
-        websocket_invocation_events(ctx, &outcome.invocations),
-        None,
-        !outcome.allowed,
-    );
+    emit_websocket_invocations(ctx, &outcome.invocations);
 }
 
 pub(super) fn emit_websocket_message_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketMessageOutcome,
 ) {
-    let mut events = websocket_invocation_events(ctx, &outcome.invocations);
-    events.extend(websocket_message_finding_events(outcome));
-    crate::telemetry::emit_decision(events, None, !outcome.allowed);
+    emit_websocket_invocations(ctx, &outcome.invocations);
     if outcome.saturated {
         emit_websocket_saturation(ctx);
+    }
+    for event in websocket_message_finding_events(outcome) {
+        egress_emit!(event);
     }
 }
 
@@ -314,11 +312,10 @@ pub(super) fn middleware_finding_events(
         .collect()
 }
 
-fn websocket_invocation_events(
+fn emit_websocket_invocations(
     ctx: &L7EvalContext,
     invocations: &[openshell_supervisor_middleware::WebSocketInvocation],
-) -> Vec<openshell_ocsf::OcsfEvent> {
-    let mut events = Vec::new();
+) {
     for invocation in invocations {
         use openshell_supervisor_middleware::WebSocketInvocationOutcome as Outcome;
         let (action, disposition, severity, status, outcome_name) = match invocation.outcome {
@@ -389,7 +386,7 @@ fn websocket_invocation_events(
                 invocation.transformed,
             ))
             .build();
-        events.push(event);
+        egress_emit!(event);
         if invocation.failed {
             let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(if invocation.outcome == Outcome::FailClosed {
@@ -410,7 +407,7 @@ fn websocket_invocation_events(
                 ])
                 .message("WebSocket middleware stage failed")
                 .build();
-            events.push(event);
+            egress_emit!(event);
         }
         if invocation.stage_disabled {
             let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -430,10 +427,9 @@ fn websocket_invocation_events(
                     "WebSocket middleware stage stream became unusable and was disabled for this session",
                 )
                 .build();
-            events.push(event);
+            egress_emit!(event);
         }
     }
-    events
 }
 
 fn emit_websocket_saturation(ctx: &L7EvalContext) {
@@ -453,8 +449,8 @@ fn emit_websocket_saturation(ctx: &L7EvalContext) {
     egress_emit!(event);
 }
 
-fn middleware_session_capacity_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
-    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext) {
+    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
             "openshell.middleware.session_capacity_exhausted",
@@ -466,7 +462,8 @@ fn middleware_session_capacity_exhausted_event(ctx: &L7EvalContext) -> openshell
             ("operation", "websocket_message"),
         ])
         .message("Persistent middleware session admission was refused at process capacity")
-        .build()
+        .build();
+    egress_emit!(event);
 }
 
 fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
@@ -487,7 +484,7 @@ fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::
 }
 
 fn emit_middleware_admission_exhausted(ctx: &L7EvalContext) {
-    egress_emit!(denied: true, middleware_admission_exhausted_event(ctx));
+    egress_emit!(middleware_admission_exhausted_event(ctx));
 }
 
 /// Largest body-buffering limit across the entries that actually resolved to a
@@ -815,7 +812,7 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
             "Request body exceeded middleware inspection cap; passed through (fail_open)"
         })
         .build();
-    egress_emit!(denied: denied, event);
+    egress_emit!(event);
 }
 
 /// Parse the raw header block into middleware-visible headers, preserving
@@ -1011,33 +1008,6 @@ mod trace_tests {
     use super::*;
     use crate::telemetry::tests::{assert_deny_resolves, exported};
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn default_level_middleware_deny_finding_is_inside_exported_deny_span() {
-        let (events, received) = exported("warn", || {
-            let ctx = L7EvalContext {
-                host: "blocked.example".to_string(),
-                port: 443,
-                policy_name: "middleware-policy".to_string(),
-                ..Default::default()
-            };
-            emit_middleware_uninspectable(&ctx, "unknown protocol", true);
-        })
-        .await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["class_uid"], 2004);
-        assert_deny_resolves(&events, &received, true);
-        crate::telemetry::tests::assert_deny_attribute(
-            &received,
-            "openshell.policy.name",
-            "middleware-policy",
-        );
-        crate::telemetry::tests::assert_deny_attribute(
-            &received,
-            "server.address",
-            "blocked.example",
-        );
-    }
-
     fn finding() -> openshell_supervisor_middleware::NamespacedFinding {
         openshell_supervisor_middleware::NamespacedFinding {
             middleware: "guard".to_string(),
@@ -1065,11 +1035,6 @@ mod trace_tests {
         assert_eq!(deny_count, usize::from(denied));
         if denied {
             assert_deny_resolves(events, received, true);
-            assert!(
-                events
-                    .iter()
-                    .all(|event| event["trace"]["uid"] == events[0]["trace"]["uid"])
-            );
         } else {
             assert!(events.iter().all(|event| event.get("trace").is_none()));
         }
@@ -1116,108 +1081,6 @@ mod trace_tests {
             })
             .await;
             assert!(events.len() >= 2);
-            assert_decision(&events, &received, !allowed);
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn websocket_outcomes_group_domain_and_findings_with_fail_open_controls() {
-        use openshell_supervisor_middleware::WebSocketInvocationOutcome as Outcome;
-        for route in ["preflight", "message", "session-start"] {
-            for outcome in [
-                Outcome::Allow,
-                Outcome::Deny,
-                Outcome::FailOpen,
-                Outcome::FailClosed,
-            ] {
-                let denied = matches!(outcome, Outcome::Deny | Outcome::FailClosed);
-                let (events, received) = exported("warn", || {
-                    let ctx = L7EvalContext::default();
-                    let invocations = vec![openshell_supervisor_middleware::WebSocketInvocation {
-                        config_name: "guard".to_string(),
-                        implementation: "test/guard".to_string(),
-                        outcome,
-                        sequence: None,
-                        original_size: 0,
-                        replacement_size: None,
-                        transformed: false,
-                        failed: matches!(outcome, Outcome::FailOpen | Outcome::FailClosed),
-                        stage_disabled: outcome == Outcome::FailOpen,
-                        reason_code: None,
-                    }];
-                    match route {
-                        "preflight" => emit_websocket_preflight_events(
-                            &ctx,
-                            &openshell_supervisor_middleware::WebSocketPreflightResult {
-                                allowed: !denied,
-                                terminal_reason: None,
-                                reason: "test".to_string(),
-                                denial: None,
-                                session: None,
-                                findings: vec![finding()],
-                                metadata: std::collections::BTreeMap::new(),
-                                invocations,
-                                coverage: vec![],
-                                saturated: false,
-                                session_capacity_exhausted: false,
-                            },
-                        ),
-                        "message" => emit_websocket_message_events(
-                            &ctx,
-                            &openshell_supervisor_middleware::WebSocketMessageOutcome {
-                                allowed: !denied,
-                                reason: "test".to_string(),
-                                payload: String::new(),
-                                findings: vec![finding()],
-                                metadata: std::collections::BTreeMap::new(),
-                                invocations,
-                                denial: None,
-                                saturated: false,
-                                platform_oversize: false,
-                            },
-                        ),
-                        _ => emit_websocket_session_start_events(
-                            &ctx,
-                            &openshell_supervisor_middleware::WebSocketSessionStartOutcome {
-                                allowed: !denied,
-                                terminal_reason: None,
-                                reason: "test".to_string(),
-                                invocations,
-                            },
-                        ),
-                    }
-                    tracing::info_span!("test.export-barrier").in_scope(|| {});
-                })
-                .await;
-                assert_decision(&events, &received, denied);
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_capacity_only_traces_fail_closed_refusals() {
-        for allowed in [true, false] {
-            let (events, received) = exported("warn", || {
-                emit_websocket_preflight_events(
-                    &L7EvalContext::default(),
-                    &openshell_supervisor_middleware::WebSocketPreflightResult {
-                        allowed,
-                        terminal_reason: None,
-                        reason: "middleware_session_capacity_exhausted".to_string(),
-                        denial: None,
-                        session: None,
-                        findings: vec![],
-                        metadata: std::collections::BTreeMap::new(),
-                        invocations: vec![],
-                        coverage: vec![],
-                        saturated: false,
-                        session_capacity_exhausted: true,
-                    },
-                );
-                tracing::info_span!("test.export-barrier").in_scope(|| {});
-            })
-            .await;
-            assert_eq!(events.len(), 1);
             assert_decision(&events, &received, !allowed);
         }
     }

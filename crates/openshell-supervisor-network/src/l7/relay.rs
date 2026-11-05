@@ -3816,7 +3816,6 @@ mod trace_tests {
         .await;
         assert_eq!(events.len(), 2);
         assert_eq!(received.spans.len(), 1);
-        assert_eq!(events[0]["trace"]["uid"], events[1]["trace"]["uid"]);
         assert_deny_resolves(&events, &received, true);
     }
 
@@ -3829,7 +3828,9 @@ mod trace_tests {
                 policy_name: "rest-policy".to_string(),
                 ..Default::default()
             };
-            emit_parse_rejection(&ctx, "ambiguous framing", "l7-rest");
+            egress_emit!(build_l7_request_event(
+                &ctx, "GET", "/", "deny", "l7-rest", "denied", None
+            ));
         })
         .await;
         assert_eq!(events.len(), 1);

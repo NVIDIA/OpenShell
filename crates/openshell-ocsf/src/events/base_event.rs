@@ -13,9 +13,9 @@ use crate::objects::{AiModel, Device, Metadata};
 /// Every event class embeds this struct via `#[serde(flatten)]`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BaseEventData {
-    /// Optional trace correlation from the OCSF producer (Trace profile).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trace: Option<crate::TraceCorrelation>,
+    /// Trace correlation (Trace profile), written only through `set_trace`.
+    #[serde(default)]
+    pub(crate) trace: Option<crate::TraceCorrelation>,
 
     /// OCSF class UID (e.g., 4001 for Network Activity).
     pub class_uid: u32,
@@ -115,7 +115,9 @@ impl Serialize for BaseEventData {
         if let Some(ref ai_model) = self.ai_model {
             map.serialize_entry("ai_model", ai_model)?;
         }
-        if let Some(ref trace) = self.trace {
+        if let Some(ref trace) = self.trace
+            && crate::trace::accepts_trace(self.class_uid)
+        {
             map.serialize_entry("trace", trace)?;
         }
         if let Some(ref unmapped) = self.unmapped {
@@ -196,7 +198,13 @@ impl BaseEventData {
     }
 
     /// Set trace correlation and add the Trace profile once.
-    pub fn set_trace(&mut self, trace: crate::TraceCorrelation) {
+    ///
+    /// OCSF 1.8.0 declares the Trace profile only for HTTP Activity and API
+    /// Activity, so other classes ignore it.
+    pub(crate) fn set_trace(&mut self, trace: crate::TraceCorrelation) {
+        if !crate::trace::accepts_trace(self.class_uid) {
+            return;
+        }
         self.trace = Some(trace);
         if !self
             .metadata

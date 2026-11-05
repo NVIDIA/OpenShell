@@ -3,7 +3,10 @@
 
 use std::sync::{Arc, LazyLock, Mutex};
 
-use openshell_ocsf::{BaseEventBuilder, OcsfJsonlLayer, ocsf_emit};
+use openshell_ocsf::{
+    ApiActivityBuilder, AuthenticationBuilder, Endpoint, HttpActivityBuilder, HttpRequest,
+    NetworkActivityBuilder, OcsfEvent, OcsfJsonlLayer, Service, Url, User, ocsf_emit,
+};
 use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, Sampler, SdkTracerProvider};
 use tracing_subscriber::prelude::*;
 
@@ -33,12 +36,25 @@ fn capture(
     capture_route(sampler, active, false)
 }
 
+fn http_event() -> OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .http_request(HttpRequest::new(
+            "GET",
+            Url::new("https", "example.com", "/", 443),
+        ))
+        .build()
+}
+
+fn capture_event(build: fn() -> OcsfEvent) -> serde_json::Value {
+    capture_context(Sampler::AlwaysOn, true, false, None, build).0
+}
+
 fn capture_route(
     sampler: Sampler,
     active: bool,
     routed: bool,
 ) -> (serde_json::Value, Vec<opentelemetry_sdk::trace::SpanData>) {
-    capture_context(sampler, active, routed, None)
+    capture_context(sampler, active, routed, None, http_event)
 }
 
 fn capture_context(
@@ -46,6 +62,7 @@ fn capture_context(
     active: bool,
     routed: bool,
     remote_parent: Option<opentelemetry::trace::SpanContext>,
+    build: fn() -> OcsfEvent,
 ) -> (serde_json::Value, Vec<opentelemetry_sdk::trace::SpanData>) {
     LazyLock::force(&SETUP);
     let exporter = InMemorySpanExporterBuilder::new().build();
@@ -58,26 +75,11 @@ fn capture_context(
         .with(openshell_otel::layer(&provider, "ocsf-test"))
         .with(OcsfJsonlLayer::new(Writer(bytes.clone())));
     tracing::subscriber::with_default(subscriber, || {
-        let gateway_request = remote_parent.is_some();
         let emit = || {
-            let ctx = openshell_ocsf::ctx::ctx();
-            if gateway_request {
-                ocsf_emit!(
-                    openshell_ocsf::AuthenticationBuilder::new(
-                        ctx,
-                        openshell_ocsf::User::unidentified(),
-                        openshell_ocsf::Service::new("openshell-gateway"),
-                    )
-                    .status(openshell_ocsf::StatusId::Failure)
-                    .build()
-                );
-                return;
-            }
-            let builder = BaseEventBuilder::new(ctx);
             if routed {
-                openshell_ocsf::emit_ocsf_event_routed("test-sandbox", builder.build());
+                openshell_ocsf::emit_ocsf_event_routed("test-sandbox", build());
             } else {
-                ocsf_emit!(builder.build());
+                ocsf_emit!(build());
             }
         };
         if active {
@@ -101,7 +103,7 @@ fn capture_context(
 }
 
 #[test]
-fn authentication_failure_correlation_can_inherit_sampled_or_unsampled_caller_context() {
+fn api_activity_correlation_can_inherit_sampled_or_unsampled_caller_context() {
     use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState};
     let uid = "0af7651916cd43dd8448eb211c80319c";
     for sampled in [true, false] {
@@ -121,9 +123,9 @@ fn authentication_failure_correlation_can_inherit_sampled_or_unsampled_caller_co
             true,
             false,
             Some(parent),
+            || ApiActivityBuilder::new(openshell_ocsf::ctx::ctx(), "CreateSandbox").build(),
         );
-        assert_eq!(event["class_uid"], 3002);
-        assert_eq!(event["status_id"], 2);
+        assert_eq!(event["class_uid"], 6003);
         if sampled {
             assert_eq!(event["trace"]["uid"], uid);
             assert_eq!(spans.len(), 1);
@@ -144,6 +146,23 @@ fn assert_no_trace(value: &serde_json::Value) {
             .iter()
             .any(|p| p == "trace")
     );
+}
+
+#[test]
+fn classes_without_the_trace_profile_stay_uncorrelated() {
+    assert_no_trace(&capture_event(|| {
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .dst_endpoint(Endpoint::from_domain("example.com", 443))
+            .build()
+    }));
+    assert_no_trace(&capture_event(|| {
+        AuthenticationBuilder::new(
+            openshell_ocsf::ctx::ctx(),
+            User::unidentified(),
+            Service::new("openshell-gateway"),
+        )
+        .build()
+    }));
 }
 
 #[test]

@@ -660,7 +660,8 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
         Some("websocket"),
         "Provider credential endpoint binding mismatch; WebSocket closed",
     );
-    crate::telemetry::emit_decision([event, finding], None, false);
+    egress_emit!(event);
+    egress_emit!(finding);
 }
 
 async fn relay_client_to_server<R, W>(
@@ -1412,30 +1413,8 @@ fn emit_uninspected_credential_denial(host: &str, port: u16, policy_name: &str, 
         ))
         .build();
     let finding = crate::l7::build_uninspected_credential_finding(host, policy_name, surface);
-    crate::telemetry::emit_decision([event, finding], None, false);
-}
-
-#[cfg(test)]
-mod trace_tests {
-    use super::*;
-    use crate::telemetry::tests::{assert_deny_resolves, exported};
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn paired_websocket_credential_denial_shares_one_deny_span() {
-        let (events, received) = exported("warn", || {
-            emit_uninspected_credential_denial(
-                "blocked.example",
-                443,
-                "credential-policy",
-                "websocket",
-            );
-        })
-        .await;
-        assert_eq!(events.len(), 2);
-        assert_eq!(received.spans.len(), 1);
-        assert_eq!(events[0]["trace"]["uid"], events[1]["trace"]["uid"]);
-        assert_deny_resolves(&events, &received, true);
-    }
+    egress_emit!(event);
+    egress_emit!(finding);
 }
 
 fn inspect_websocket_text_message(

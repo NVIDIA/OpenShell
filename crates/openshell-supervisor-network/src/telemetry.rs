@@ -5,29 +5,15 @@
 
 use openshell_ocsf::{ActionId, OcsfEvent};
 
-/// Emit egress events inside an INFO deny span. `denied:` supplies the decision
-/// for findings without an action; domain events carry their own action.
+/// Emit egress events, entering an INFO deny span for denied HTTP Activity.
 /// A saved connect span parents denies after authorization exits.
 macro_rules! egress_emit {
     ($event:expr) => {
-        $crate::telemetry::emit($event, None, false)
+        $crate::telemetry::emit($event, None)
     };
     (deny_parent: $parent:expr, $event:expr) => {
-        $crate::telemetry::emit($event, Some($parent), false)
+        $crate::telemetry::emit($event, Some($parent))
     };
-    (deny_parent: $parent:expr, denied: $denied:expr, $event:expr) => {{
-        // Evaluate the decision before moving the event it may inspect.
-        let denied = $denied;
-        $crate::telemetry::emit($event, Some($parent), denied)
-    }};
-    (optional_deny_parent: $parent:expr, $event:expr) => {
-        $crate::telemetry::emit($event, $parent, false)
-    };
-    (denied: $denied:expr, $event:expr) => {{
-        // Evaluate the decision before moving the event it may inspect.
-        let denied = $denied;
-        $crate::telemetry::emit($event, None, denied)
-    }};
 }
 pub(crate) use egress_emit;
 
@@ -40,8 +26,14 @@ fn is_denied(event: &OcsfEvent) -> bool {
     }
 }
 
-pub fn emit(event: OcsfEvent, parent: Option<&tracing::Span>, denied: bool) {
-    if !denied && !is_denied(&event) {
+/// Only HTTP Activity carries `trace`, so only a decision with an HTTP record
+/// gets a deny span that an OCSF record can point to.
+fn is_http(event: &OcsfEvent) -> bool {
+    matches!(event, OcsfEvent::HttpActivity(_))
+}
+
+pub fn emit(event: OcsfEvent, parent: Option<&tracing::Span>) {
+    if !is_http(&event) || !is_denied(&event) {
         openshell_ocsf::ocsf_emit!(event);
         return;
     }
@@ -57,11 +49,11 @@ pub fn emit_decision(
     denied: bool,
 ) {
     let events: Vec<_> = events.into_iter().collect();
-    let primary = events
+    let denied = denied || events.iter().any(is_denied);
+    let span = events
         .iter()
-        .find(|event| is_denied(event))
-        .or_else(|| if denied { events.first() } else { None });
-    let span = primary.map(|event| deny_span(event, parent));
+        .find(|event| denied && is_http(event))
+        .map(|event| deny_span(event, parent));
     let emit = || {
         for event in events {
             openshell_ocsf::ocsf_emit!(event);
@@ -85,26 +77,12 @@ pub fn deny_span(event: &OcsfEvent, parent: Option<&tracing::Span>) -> tracing::
         return current;
     }
     let (endpoint, policy) = match event {
-        OcsfEvent::NetworkActivity(e) => (e.dst_endpoint.as_ref(), e.firewall_rule.as_ref()),
         OcsfEvent::HttpActivity(e) => (e.dst_endpoint.as_ref(), e.firewall_rule.as_ref()),
         _ => (None, None),
     };
-
-    // Finding evidence supplies decision fields, not a trace parent.
-    let evidence = |key: &str| match event {
-        OcsfEvent::DetectionFinding(e) => e.evidences.as_ref().and_then(|items| {
-            items
-                .iter()
-                .find_map(|item| item.data.as_ref()?.get(key)?.as_str())
-        }),
-        _ => None,
-    };
-    let policy = policy
-        .map(|rule| rule.name.as_str())
-        .or_else(|| evidence("policy"));
-    let address = endpoint
-        .and_then(|endpoint| endpoint.domain.as_deref().or(endpoint.ip.as_deref()))
-        .or_else(|| evidence("host"));
+    let policy = policy.map(|rule| rule.name.as_str());
+    let address =
+        endpoint.and_then(|endpoint| endpoint.domain.as_deref().or(endpoint.ip.as_deref()));
     let port = endpoint.and_then(|endpoint| endpoint.port);
     let reason = event.base().status_detail.as_deref();
     let parent = parent.cloned().unwrap_or_else(tracing::Span::current);
