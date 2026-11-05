@@ -390,13 +390,8 @@ fn log_record(
     if let Some(uid) = &base.metadata.uid {
         record.add_attribute("ocsf.metadata.uid", uid.clone());
     }
-    if let Some(sandbox_id) = base
-        .container
-        .as_ref()
-        .and_then(|container| container.uid.clone())
-        .filter(|id| !id.is_empty())
-    {
-        record.add_attribute("openshell.sandbox.id", sandbox_id);
+    if let Some(sandbox_id) = event.sandbox_id() {
+        record.add_attribute("openshell.sandbox.id", sandbox_id.to_string());
     }
 
     let body = serde_json::to_string(event)?;
@@ -445,6 +440,7 @@ mod tests {
             sandbox_id: sandbox_id.to_string(),
             sandbox_name: "sandbox-name".to_string(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "host".to_string(),
             product_version: "0.0.0".to_string(),
             proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -543,6 +539,43 @@ mod tests {
             attribute(&record, "openshell.sandbox.id"),
             Some(AnyValue::String("sandbox-1".into()))
         );
+    }
+
+    #[test]
+    fn gateway_context_attribution_reaches_otlp() {
+        use openshell_ocsf::{ApiActivityBuilder, DetectionFindingBuilder, EventOrigin};
+        let mut ctx = event_context("sandbox-1");
+        ctx.origin = EventOrigin::Gateway {
+            name: "gateway".into(),
+        };
+        for event in [
+            ApiActivityBuilder::new(&ctx, "GetSandbox").build(),
+            DetectionFindingBuilder::new(&ctx).build(),
+            ConfigStateChangeBuilder::new(&ctx).build(),
+        ] {
+            let record = record(&event);
+            assert_eq!(
+                attribute(&record, "openshell.sandbox.id"),
+                Some(AnyValue::String("sandbox-1".into()))
+            );
+            assert_eq!(body(&record), native(&event));
+        }
+    }
+
+    #[test]
+    fn requested_sandbox_resource_does_not_become_otlp_identity() {
+        use openshell_ocsf::{ApiActivityBuilder, EventOrigin, ResourceDetails};
+        let mut ctx = event_context("");
+        ctx.origin = EventOrigin::Gateway {
+            name: "gateway".into(),
+        };
+        let event = ApiActivityBuilder::new(&ctx, "GetSandbox")
+            .resource(ResourceDetails::new("sandbox", "requested-sandbox"))
+            .build();
+        let record = record(&event);
+        assert!(attribute(&record, "openshell.sandbox.id").is_none());
+        assert_eq!(body(&record), native(&event));
+        assert_eq!(native(&event)["resources"][0]["uid"], "requested-sandbox");
     }
 
     #[test]

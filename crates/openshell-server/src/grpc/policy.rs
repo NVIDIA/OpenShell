@@ -3053,7 +3053,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
     let settings = merge_effective_settings(global_settings, &sandbox_settings)?;
     let supervisor_middleware_services =
         state.middleware_registry.required_services(policy.as_ref());
-    let config_revision = compute_config_revision_with_validation_mode(
+    let mut config_revision = compute_config_revision_with_validation_mode(
         policy.as_ref(),
         &settings,
         policy_source,
@@ -3078,7 +3078,22 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
             .filter(|_| matches!(policy_source, PolicySource::Global)),
     )?;
 
+    let service_routes = super::service::configured_app_routes(state, sandbox).await?;
+    // Include the allowlist in delivery identity so a service edit is not
+    // coalesced away as a duplicate policy/settings snapshot.
+    if !service_routes.is_empty() {
+        let mut bytes = config_revision.to_le_bytes().to_vec();
+        for route in &service_routes {
+            route
+                .encode_length_delimited(&mut bytes)
+                .expect("encode service route");
+        }
+        let hash = openshell_crypto::sha256(&bytes)
+            .map_err(|_| Status::internal("service configuration fingerprint failed"))?;
+        config_revision = u64::from_le_bytes(hash[..8].try_into().expect("hash prefix"));
+    }
     Ok(SandboxConfigSnapshot {
+        service_routes,
         configuration_instance_id: sandbox
             .status
             .as_ref()
@@ -3113,6 +3128,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
 
 fn sandbox_config_response(snapshot: SandboxConfigSnapshot) -> GetSandboxConfigResponse {
     GetSandboxConfigResponse {
+        service_routes: snapshot.service_routes,
         policy: snapshot.policy,
         version: snapshot.version,
         policy_hash: snapshot.policy_hash,
@@ -21557,8 +21573,10 @@ mod tests {
         assert_eq!(events.len(), 2);
         for event in &events {
             assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
-            assert_eq!(event["container"]["uid"], "sb-123");
-            assert!(event["container"].get("image").is_none());
+            assert_eq!(event["unmapped"]["sandbox_id"], "sb-123");
+            assert!(event.get("container").is_none());
+            assert!(event["device"].get("container").is_none());
+            assert_eq!(event["unmapped"]["sandbox_name"], "demo-sandbox");
         }
         assert_eq!(events[0]["unmapped"]["policy_hash"], "sha256:manual");
         assert!(events[0]["unmapped"].get("auto").is_none());
@@ -21669,7 +21687,7 @@ mod tests {
         let rejected = rejected_events(&events);
         assert_eq!(rejected.len(), 1, "events: {events:?}");
         let event = rejected[0];
-        assert_eq!(event["container"]["uid"], "sb-reject-audit");
+        assert_eq!(event["unmapped"]["sandbox_id"], "sb-reject-audit");
         assert_eq!(event["unmapped"]["chunk_id"], chunk_id);
         assert_eq!(
             event["unmapped"]["rejection_reason"],

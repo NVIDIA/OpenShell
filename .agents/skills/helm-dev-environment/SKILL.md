@@ -195,6 +195,17 @@ every member one at a time. The PID must survive each case, while an open
 replacement confirmed within the recovery timeout, so the runtime terminated
 the workload.
 
+For RFC 0017 app-listener validation, enable the listener and supply the app TLS
+Secret on the shared Deployment, plus a separate NetworkPolicy allowing the test
+client/proxy to reach its app port. Runtime-port access does not grant app access.
+Discovery returns the acknowledged owner's Pod IP and app port; no headless app
+Service is needed. Exercise HTTP/WebSocket reconnection through graceful downscale
+and abrupt loss, preserving workload generation/PID/in-memory state and the public
+hostname. Verify stale-owner rejection independently of the replacement's success.
+Shared serving leases expire within fifteen seconds of issuance and do not renew
+from configuration alone. Do not claim seamless socket migration or infer external
+ingress readiness from an advertisement.
+
 ### 2. Deploy OpenShell
 
 **Iterative dev** (rebuilds on file changes, recommended during active development):
@@ -445,6 +456,16 @@ public `SandboxStatus` image fields. Resume a pending operation with
 `SandboxUpdates.UpdateSandbox`, the current resource version, and no selected
 fields, following the documented request-ID semantics.
 
+
+For the opt-in application listener, build/import matching branch images and run
+`mise run e2e:kubernetes:app-listener`; see `e2e/kubernetes/app-listener/README.md`
+for image, topology, delivery-mode and takeover inputs. The task owns an isolated
+Helm release/namespace, temporary TLS material, in-cluster clients, teardown and
+evidence under `results/app-listener/`. It checks policy denial, Pod-IP ingress without app Services, shared-owner takeover, gateway-outage expiry and disabled-listener
+gateway compatibility, without discovery or a proxy. CI runs four cases under
+`test:e2e` and includes them in `Core E2E result`. Its reusable kind setup installs
+pinned Calico only for this lane; other jobs retain kindnet. Local k3s already
+enforces policy. The lower-level `verify.py` can target a predeployed release.
 The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
 target. `/readyz` remains covered by server unit/integration tests.
@@ -645,3 +666,14 @@ identity and contents, command/environment changes, and request replay.
 `OPENSHELL_E2E_UPDATE_ORIGINAL_IMAGE` and `OPENSHELL_E2E_UPDATE_TARGET_IMAGE` can
 select mirrored Alpine 3.21 and 3.22 manifests. Defaults use the public registry
 cache; keep immutable digests when overriding them.
+
+## App listener fixture
+
+The opt-in `deploy/helm/openshell/ci/values-app-listener.yaml` enables the
+supervisor listener at port 9443 without discovery or a proxy. Provision the
+operator TLS Secret and an ingress-client NetworkPolicy first. Follow
+`e2e/kubernetes/app-listener/README.md` for direct in-cluster verification,
+shared-member selection, and the HA follow-up checks. Keep the fixture disabled
+in default profiles. Dedicated and shared supervisors expose app ports on their
+Pod IPs without app Services. Select the member owning the sandbox; automatic
+owner selection belongs to the later discovery API.

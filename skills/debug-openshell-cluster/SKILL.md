@@ -229,6 +229,13 @@ rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
 The published supervisor image uses a shell-free distroless Debian 13 base.
+For Docker and Podman, supervisor OCSF `device.container.image.uid` identifies
+the workload image fixed at launch, and `image.name` carries its requested
+reference. Compare the UID with engine inspection of the workload container;
+the supervisor companion uses a separate image. An absent image object means
+the driver did not supply an immutable image ID; Kubernetes currently omits it.
+When no image UID is available, `unmapped.container_image` preserves any known
+workload image reference, including for VM and shared-supervisor records.
 For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
 runtime libraries, CA certificates, and inherited user and working directory.
 Use container logs, engine inspection and the configured exec health probe for
@@ -936,6 +943,41 @@ kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec
 # Should show items filter for ca.crt from openshell-server-tls
 ```
 
+#### Secure metrics TLS
+
+When `metrics.tls.enabled=true`, the dedicated metrics listener uses its own
+TLS configuration and, when requested, an independent scraper client CA. Do
+not use the gateway client CA: sandbox workloads receive gateway client
+credentials, so trusting that CA here would grant them metrics access. The
+chart fails rendering when `metrics.tls.clientCaSecretName` matches
+`server.tls.clientCaSecretName` or `server.tls.clientTlsSecretName`; that
+check is by name only. Inspect
+the rendered configuration and the read-only Secret mounts before debugging the
+scraper:
+
+```bash
+kubectl -n openshell get configmap openshell-config \
+  -o jsonpath='{.data.gateway\.toml}' | grep -A6 '^\[openshell\.gateway\.metrics_tls\]'
+kubectl -n openshell get statefulset openshell \
+  -o jsonpath='{.spec.template.spec.volumes[?(@.name=="metrics-tls-cert")]}{"\n"}{.spec.template.spec.volumes[?(@.name=="metrics-tls-client-ca")]}' | jq .
+kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200 | grep -E 'metrics.*TLS|listener=metrics'
+```
+
+`metrics-tls-cert` must reference a Secret with `tls.crt` and `tls.key`; when
+mTLS is enabled, `metrics-tls-client-ca` must reference a Secret with `ca.crt`.
+An absent mount means the release was rendered without metrics TLS. A failed
+certificate reload retains the previous working listener; correct the Secret
+contents rather than disabling verification. Configure the scraper with the
+metrics server CA and, for mTLS, its dedicated client certificate and key. Do
+not use `insecureSkipVerify`.
+
+A Secret that exists with malformed contents leaves the metrics listener
+disabled while the gateway remains available; it never falls back to
+plaintext. A missing Secret, or a client CA Secret without a `ca.crt` key,
+never reaches the gateway: kubelet fails the non-optional volume mounts and
+the pod does not start (`FailedMount`). Correct the Secret and restart the
+gateway before retrying the scrape.
+
 If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
 is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
 mount the `sandbox-jwt` Secret.
@@ -1538,7 +1580,7 @@ credential failures.
 | Symptom | Likely cause | Check |
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
-| Collector receives no OCSF log records, or `openshell.ocsf.gap` records | `[openshell.gateway.otlp.ocsf]` missing or without `enabled = true`, an unreachable or non-gRPC endpoint, or export failures and queue pressure | Check `[openshell.gateway.otlp.ocsf]` for `enabled = true` and the endpoint it resolves to, the gateway's `OTLP exporting enabled` startup log for `ocsf_endpoint`, export warnings, and `openshell_ocsf_otlp_*` metrics. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
+| Collector receives no OCSF log records, or `openshell.ocsf.gap` records | `[openshell.gateway.otlp.ocsf]` missing or without `enabled = true`, an unreachable endpoint or one that does not speak the table's `protocol`, or export failures and queue pressure | Check `[openshell.gateway.otlp.ocsf]` for `enabled = true` and the endpoint it resolves to, the gateway's `OTLP exporting enabled` startup log for `ocsf_endpoint` and `ocsf_protocol`, export warnings, and `openshell_ocsf_otlp_*` metrics. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
 | Gateway OCSF JSONL stops growing, has gaps, or is rejected by a SIEM | File errors, queue pressure, or shipper falling behind retention | Inspect gateway warnings and `openshell_ocsf_log_*` metrics; check `[openshell.gateway.ocsf_log]`, directory permissions, free space, per-replica paths, and shipper rotation checkpoints. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
 | `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Sandbox log shows `OTLP agent trace relay inactive: not enabled by the gateway` at startup, then `agent OTLP export attempted but the agent trace relay is not enabled` when the agent exports | The gateway does not enable `[openshell.gateway.otlp.agent]`, so the supervisor refuses the workload's OTLP relay address | Set `enabled = true` in `[openshell.gateway.otlp.agent]` (Helm: `gatewayConfig."openshell.gateway.otlp.agent".enabled`) with an endpoint from that table or `[openshell.gateway.otlp]`, and recreate the sandbox; `openshell logs <sandbox> --source sandbox` then shows `OTLP agent trace relay enabled` |
@@ -1623,3 +1665,48 @@ probes. Arguments after `--` validate the effective daemon invocation,
 including its command-line overrides. Preflight preserves every failed file. Do
 not advise users to delete or rewrite it automatically; back it up and follow the
 manual schema-v2 migration in the Gateway Configuration reference.
+
+## Supervisor application ingress
+
+When `[openshell.supervisor.app_listener]` is explicitly enabled, check its
+`port` and `domain` separately from the gateway API and supervisor runtime ports.
+The Kubernetes TLS Secret is configured with `tls_secret_name` under
+`[openshell.drivers.kubernetes.sandbox_runtime.app_listener]`. Disabled listeners
+create no app TLS mount or app port. TLS material is mounted only in supervisors
+and reloads on supervisor restart.
+
+Inspect supervisor Pods with `kubectl`. In both dedicated and shared topologies,
+connect to the current sandbox owner's Pod IP and configured app port. The driver
+creates no app Services. Preserve service SNI and Host when using curl's
+`--connect-to`, and verify the application certificate. A port-forward bypasses
+NetworkPolicy forwarding; also test from a permitted in-cluster client. Operators
+provide ingress network rules. Running supervisors retain their startup listener
+configuration until restarted.
+
+Service changes arrive through polling or push configuration. Only admitted
+service declarations are installed. Polling and accepted live push sessions
+renew a 30-second lease; rejected configuration or expired freshness closes
+routes. When the listener is enabled, polling delays are capped at five seconds
+even if the configured interval is longer; failed polls do not renew the lease.
+App traffic uses application/edge authentication independently of gateway
+user authentication. This listener stage does not add service discovery or
+change the public URLs printed by the CLI.
+
+When enabled application routes are not published, check the authenticated
+supervisor session and installed configuration before checking ingress. The
+gateway requests installation evidence every five seconds with a fifteen-second
+lease measured from challenge issuance. Instances report only when their serving
+freshness covers that lease. Replayed, late, stale-configuration, and replaced
+session reports cannot renew evidence. Endpoint resolution comes from the
+compute driver once per challenge/report exchange, with fresh resolution for the
+next challenge. Acceptance still checks durable ownership and shared member
+readiness; ambiguous shared ownership must not publish an address.
+
+For shared pools, compare the discovered endpoint to the
+acknowledged owner's Pod IP and configured app port, not its runtime port or a
+load-balanced supervisor Service. Publication requires a current ownership term,
+live member, and acknowledged ready report. During takeover old streams may close;
+verify workload identity/memory survives and new connections reach the replacement.
+Shared serving leases last at most fifteen seconds from issuance, independently
+of configuration renewal; include membership failure detection when measuring a
+partition's stale-owner interval. Storage failures prevent renewal.

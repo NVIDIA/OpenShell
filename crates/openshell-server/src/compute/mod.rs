@@ -78,12 +78,17 @@ pub const COMPUTE_RUNTIME_IDENTITY_ANNOTATION: &str =
 /// can never turn a later start into a resume.
 const RESUME_INTENT_ANNOTATION: &str = "internal.openshell.ai/resume-intent";
 
+#[cfg(test)]
+use openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints as _;
 #[cfg(unix)]
 use tower::service_fn;
 use tracing::{Instrument as _, debug, info, warn};
 
 pub type DriverWatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
+/// Optional application endpoint resolver, independent of the baseline driver.
+pub type SharedComputeDriverAppEndpoints = Arc<dyn openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints + Send + Sync>;
+
 pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
 
@@ -684,6 +689,7 @@ impl AcquiredRemoteDriverEndpoint {
 #[derive(Debug, Clone)]
 struct RemoteComputeDriver {
     client: RemoteComputeDriverClient,
+    app_endpoints_client: openshell_core::proto::compute::v1::compute_driver_app_endpoints_client::ComputeDriverAppEndpointsClient<tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>>,
     configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient<tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>>,
     admission_acknowledgement: Arc<StdMutex<Option<String>>>,
 }
@@ -696,6 +702,7 @@ impl RemoteComputeDriver {
     fn new(channel: Channel) -> Self {
         Self {
             client: ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor),
+            app_endpoints_client: openshell_core::proto::compute::v1::compute_driver_app_endpoints_client::ComputeDriverAppEndpointsClient::with_interceptor(channel.clone(), TraceContextInterceptor),
             configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient::with_interceptor(channel, TraceContextInterceptor),
             admission_acknowledgement: Arc::new(StdMutex::new(None)),
         }
@@ -904,6 +911,19 @@ impl ComputeDriver for RemoteComputeDriver {
     }
 }
 
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for RemoteComputeDriver {
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        self.app_endpoints_client.clone().resolve_supervisor_app_endpoint(request).await
+    }
+}
+
 #[derive(Clone)]
 pub struct ComputeRuntime {
     isolation_backend: Option<openshell_core::proto::compute::v1::IsolationBackendRegistration>,
@@ -911,6 +931,7 @@ pub struct ComputeRuntime {
     admission_acknowledgement: String,
     driver: TracedDriver,
     image_update_driver: Option<SharedComputeDriverConfigurationUpdates>,
+    app_endpoint_resolver: Option<SharedComputeDriverAppEndpoints>,
     driver_info: ComputeDriverInfoSnapshot,
     telemetry_compute_driver: TelemetryComputeDriver,
     driver_process: Option<Arc<ManagedDriverProcess>>,
@@ -935,7 +956,8 @@ pub struct ComputeRuntime {
         Arc<OnceLock<Option<Arc<crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>>>>,
     restart_notify: Arc<Notify>,
     ssh_identities: Arc<OnceLock<crate::ssh_identity::SshIdentityStore>>,
-    supervisor_ocsf_headers: Arc<OnceLock<openshell_core::jwt::SecretOtlpHeaders>>,
+    supervisor_otlp_headers: Arc<OnceLock<crate::otel_tracing::SupervisorOtlpHeaders>>,
+    supervisor_otlp_tls: Arc<OnceLock<crate::otel_tracing::SupervisorOtlpTls>>,
     /// Desired assignments of the shared supervisor host, when the gateway
     /// coordinates one for the in-process driver.
     supervisor_host: Option<openshell_supervisor_control::SupervisorHostController>,
@@ -1029,6 +1051,7 @@ impl ComputeRuntime {
             isolation_backend: None,
             driver: TracedDriver::new(driver, driver_name),
             image_update_driver: None,
+            app_endpoint_resolver: None,
             admission: openshell_core::resource_admission::DriverAdmissionConfig::default(),
             admission_acknowledgement: capabilities.resource_admission_policy,
             driver_info,
@@ -1051,7 +1074,8 @@ impl ComputeRuntime {
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
-            supervisor_ocsf_headers: Arc::new(OnceLock::new()),
+            supervisor_otlp_headers: Arc::new(OnceLock::new()),
+            supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
             service_route_index: Arc::new(OnceLock::new()),
         })
@@ -1096,13 +1120,18 @@ impl ComputeRuntime {
         let _ = self.service_route_index.set(index);
     }
 
-    pub(crate) fn configure_supervisor_ocsf_headers(
+    pub(crate) fn configure_supervisor_otlp_headers(
         &self,
-        headers: Option<openshell_core::jwt::SecretOtlpHeaders>,
+        headers: crate::otel_tracing::SupervisorOtlpHeaders,
     ) {
-        if let Some(headers) = headers {
-            let _ = self.supervisor_ocsf_headers.set(headers);
-        }
+        let _ = self.supervisor_otlp_headers.set(headers);
+    }
+
+    pub(crate) fn configure_supervisor_otlp_tls(
+        &self,
+        tls: crate::otel_tracing::SupervisorOtlpTls,
+    ) {
+        let _ = self.supervisor_otlp_tls.set(tls);
     }
 
     pub(crate) async fn prepare_ssh_identity(
@@ -1131,7 +1160,12 @@ impl ComputeRuntime {
         let mut with_identity = sandbox.clone();
         self.prepare_ssh_identity(&mut with_identity, &mut authentication)
             .await?;
-        authentication.supervisor.ocsf_otlp_headers = self.supervisor_ocsf_headers.get().cloned();
+        if let Some(headers) = self.supervisor_otlp_headers.get() {
+            headers.apply(&mut authentication.supervisor);
+        }
+        if let Some(tls) = self.supervisor_otlp_tls.get() {
+            tls.apply(&mut authentication.supervisor);
+        }
         serialize_launch_authentication(authentication)
     }
 
@@ -1182,7 +1216,19 @@ impl ComputeRuntime {
             supervisor_sessions,
         )
         .await
-        .map(|runtime| runtime.with_image_update_driver(Some(driver)))
+        .map(|runtime| {
+            runtime
+                .with_image_update_driver(Some(driver.clone()))
+                .with_app_endpoint_resolver(Some(driver))
+        })
+    }
+
+    pub(crate) fn with_app_endpoint_resolver(
+        mut self,
+        resolver: Option<SharedComputeDriverAppEndpoints>,
+    ) -> Self {
+        self.app_endpoint_resolver = resolver;
+        self
     }
 
     pub(crate) fn with_image_update_driver(
@@ -6740,6 +6786,44 @@ impl ComputeRuntime {
             .await
     }
 
+    /// Resolve app endpoints independently of ordinary sandbox observation.
+    pub(crate) async fn supervisor_app_endpoint(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>, Status> {
+        let Some(resolver) = self.app_endpoint_resolver.clone() else {
+            return Ok(None);
+        };
+        let id = sandbox.object_id().to_string();
+        let request = openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest {
+            sandbox_id: id.clone(),
+            name: sandbox.object_name().to_string(),
+        };
+        let response = match self
+            .driver
+            .call(
+                openshell_otel::rpc::RESOLVE_SUPERVISOR_APP_ENDPOINT,
+                Some(&id),
+                |_driver| async move {
+                    resolver
+                        .resolve_supervisor_app_endpoint(Request::new(request))
+                        .await
+                },
+            )
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == Code::Unimplemented => return Ok(None),
+            Err(status) => return Err(status),
+        };
+        if response.sandbox_id != id {
+            return Err(Status::failed_precondition(
+                "driver returned a different sandbox",
+            ));
+        }
+        Ok(response.supervisor_app_endpoint)
+    }
+
     async fn get_driver_sandbox(
         &self,
         sandbox_id: &str,
@@ -8309,6 +8393,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct NoopTestDriver {
+    app_endpoint: Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>,
     workspace_delete_failures: std::sync::atomic::AtomicUsize,
     sandbox_authentication: Option<Result<(String, String), (Code, String)>>,
 }
@@ -8316,8 +8401,19 @@ pub struct NoopTestDriver {
 #[cfg(any(test, feature = "test-support"))]
 impl NoopTestDriver {
     #[cfg(test)]
+    pub fn with_app_endpoint(
+        endpoint: openshell_core::proto::compute::v1::SupervisorAppEndpoint,
+    ) -> Self {
+        Self {
+            app_endpoint: Some(endpoint),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
     pub fn failing_workspace_deletes(count: usize) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(count),
             sandbox_authentication: None,
         }
@@ -8326,6 +8422,7 @@ impl NoopTestDriver {
     #[cfg(test)]
     pub fn authenticating_sandbox(sandbox_id: impl Into<String>) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Ok((sandbox_id.into(), "test-runtime".to_string()))),
         }
@@ -8337,6 +8434,7 @@ impl NoopTestDriver {
         runtime_identity: impl Into<String>,
     ) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Ok((sandbox_id.into(), runtime_identity.into()))),
         }
@@ -8345,6 +8443,7 @@ impl NoopTestDriver {
     #[cfg(test)]
     pub fn failing_sandbox_authentication(code: Code, message: impl Into<String>) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Err((code, message.into()))),
         }
@@ -8355,6 +8454,7 @@ impl NoopTestDriver {
 impl Default for NoopTestDriver {
     fn default() -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: None,
         }
@@ -8548,6 +8648,25 @@ impl ComputeDriver for NoopTestDriver {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for NoopTestDriver {
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse {
+                sandbox_id: request.into_inner().sandbox_id,
+                supervisor_app_endpoint: self.app_endpoint.clone(),
+            },
+        ))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     new_test_runtime_for_driver(store, "test").await
 }
@@ -8585,6 +8704,7 @@ pub fn new_test_runtime_with_driver(
         isolation_backend: None,
         driver: TracedDriver::new(driver, "test".to_string()),
         image_update_driver: None,
+        app_endpoint_resolver: None,
         admission: openshell_core::resource_admission::DriverAdmissionConfig {
             allow_driver_config: true,
             ..Default::default()
@@ -8621,7 +8741,8 @@ pub fn new_test_runtime_with_driver(
         restart_authority: Arc::new(OnceLock::new()),
         restart_notify: Arc::new(Notify::new()),
         ssh_identities: Arc::new(OnceLock::new()),
-        supervisor_ocsf_headers: Arc::new(OnceLock::new()),
+        supervisor_otlp_headers: Arc::new(OnceLock::new()),
+        supervisor_otlp_tls: Arc::new(OnceLock::new()),
         supervisor_host: None,
         service_route_index: Arc::new(OnceLock::new()),
     }
@@ -8994,6 +9115,9 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct TestDriver {
+        endpoint_resolution: Option<
+            Result<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse, Code>,
+        >,
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
         workspace_rpcs_unimplemented: bool,
@@ -9184,6 +9308,27 @@ mod tests {
         }
     }
 
+    #[tonic::async_trait]
+    impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for TestDriver {
+        async fn resolve_supervisor_app_endpoint(
+            &self,
+            _request: Request<
+                openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest,
+            >,
+        ) -> Result<
+            tonic::Response<
+                openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse,
+            >,
+            Status,
+        > {
+            match self.endpoint_resolution.clone() {
+                Some(Ok(response)) => Ok(tonic::Response::new(response)),
+                Some(Err(code)) => Err(Status::new(code, "endpoint lookup failed")),
+                None => Err(Status::unimplemented("endpoint resolution unsupported")),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn workspace_lifecycle_allows_legacy_driver_without_workspace_rpcs() {
         let runtime = test_runtime(Arc::new(TestDriver {
@@ -9194,6 +9339,75 @@ mod tests {
 
         runtime.ensure_workspace("legacy").await.unwrap();
         runtime.delete_workspace("legacy").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_endpoint_resolution_is_independent_of_sandbox_observation() {
+        use openshell_core::proto::compute::v1::{
+            ResolveSupervisorAppEndpointResponse, SupervisorAppEndpoint,
+        };
+        let endpoint = SupervisorAppEndpoint {
+            host: "10.0.0.7".into(),
+            port: 9443,
+            runtime_identity: "runtime-a".into(),
+            ..Default::default()
+        };
+        let sandbox = sandbox_record("sandbox", "demo", SandboxPhase::Ready);
+        let cases = [
+            (None, Ok(None)),
+            (Some(Err(Code::Unimplemented)), Ok(None)),
+            (Some(Err(Code::Unavailable)), Err(Code::Unavailable)),
+            (
+                Some(Ok(ResolveSupervisorAppEndpointResponse {
+                    sandbox_id: "sandbox".into(),
+                    supervisor_app_endpoint: None,
+                })),
+                Ok(None),
+            ),
+            (
+                Some(Ok(ResolveSupervisorAppEndpointResponse {
+                    sandbox_id: "other-sandbox".into(),
+                    supervisor_app_endpoint: Some(endpoint.clone()),
+                })),
+                Err(Code::FailedPrecondition),
+            ),
+            (
+                Some(Ok(ResolveSupervisorAppEndpointResponse {
+                    sandbox_id: "sandbox".into(),
+                    supervisor_app_endpoint: Some(endpoint.clone()),
+                })),
+                Ok(Some(endpoint)),
+            ),
+        ];
+        for (resolution, expected) in cases {
+            let driver = Arc::new(TestDriver {
+                endpoint_resolution: resolution,
+                current_sandboxes: vec![DriverSandbox {
+                    id: "sandbox".into(),
+                    name: "demo".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let runtime = test_runtime(driver.clone())
+                .await
+                .with_app_endpoint_resolver(Some(driver));
+            assert_eq!(
+                runtime
+                    .supervisor_app_endpoint(&sandbox)
+                    .await
+                    .map_err(|s| s.code()),
+                expected
+            );
+            // An unsupported, failed, or invalid endpoint lookup must never fail
+            // ordinary sandbox observation.
+            let observed = runtime
+                .get_driver_sandbox("sandbox", "demo")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.id, "sandbox");
+        }
     }
 
     #[derive(Clone)]
@@ -9788,6 +10002,7 @@ mod tests {
             isolation_backend: None,
             driver: TracedDriver::new(driver, "test-driver".to_string()),
             image_update_driver: None,
+            app_endpoint_resolver: None,
             admission: openshell_core::resource_admission::DriverAdmissionConfig {
                 allow_driver_config: true,
                 ..Default::default()
@@ -9824,7 +10039,8 @@ mod tests {
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
-            supervisor_ocsf_headers: Arc::new(OnceLock::new()),
+            supervisor_otlp_headers: Arc::new(OnceLock::new()),
+            supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
             service_route_index: Arc::new(OnceLock::new()),
         }
@@ -13633,17 +13849,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_bundles_carry_supervisor_ocsf_headers() {
+    async fn launch_bundles_carry_each_supervisor_exports_headers_and_tls() {
+        use openshell_core::jwt::SecretOtlpHeaders;
+
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
-        runtime.configure_supervisor_ocsf_headers(Some(
-            openshell_core::jwt::SecretOtlpHeaders::new(
-                "authorization=Bearer%20secret".to_string(),
-            ),
-        ));
+        let secret = |value: &str| Some(SecretOtlpHeaders::new(value.to_string()));
+        runtime.configure_supervisor_otlp_headers(crate::otel_tracing::SupervisorOtlpHeaders {
+            traces: secret("authorization=traces"),
+            ocsf: secret("authorization=Bearer%20secret"),
+            agent: secret("x-mlflow-experiment-id=0"),
+        });
+        runtime.configure_supervisor_otlp_tls(crate::otel_tracing::SupervisorOtlpTls {
+            materials: vec![openshell_core::jwt::OtlpTlsMaterial {
+                ca_pem: Some("agent-ca".to_string()),
+                ..Default::default()
+            }],
+            agent: Some(0),
+            ..Default::default()
+        });
         let sandbox = sandbox_record(
-            "sb-ocsf-headers",
-            "sandbox-ocsf-headers",
+            "sb-otlp-headers",
+            "sandbox-otlp-headers",
             SandboxPhase::Stopped,
         );
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -13660,13 +13887,32 @@ mod tests {
         let authentications = driver.start_authentications();
         let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
             serde_json::from_slice(&authentications[0]).unwrap();
-        assert_eq!(
-            authentication
-                .supervisor
-                .ocsf_otlp_headers
+        let exposed = |headers: &Option<SecretOtlpHeaders>| {
+            headers
                 .as_ref()
-                .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret),
-            Some("authorization=Bearer%20secret")
+                .map(SecretOtlpHeaders::expose_secret)
+                .map(str::to_string)
+        };
+        let bundle = &authentication.supervisor;
+        assert_eq!(
+            [
+                exposed(&bundle.traces_otlp_headers),
+                exposed(&bundle.ocsf_otlp_headers),
+                exposed(&bundle.agent_otlp_headers),
+            ],
+            [
+                Some("authorization=traces".to_string()),
+                Some("authorization=Bearer%20secret".to_string()),
+                Some("x-mlflow-experiment-id=0".to_string()),
+            ]
+        );
+        assert!(bundle.traces_otlp_tls.is_none() && bundle.ocsf_otlp_tls.is_none());
+        assert_eq!(
+            bundle
+                .agent_otlp()
+                .tls
+                .and_then(|tls| tls.ca_pem.as_deref()),
+            Some("agent-ca")
         );
     }
 
@@ -14281,6 +14527,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(current.phase(), SandboxPhase::Provisioning as i32);
+    }
+
+    // Gateway side of the Kubernetes stop contract. While a stop holds its
+    // bootstrap annotations, the driver withdraws readiness and reports
+    // neither Bootstrapping nor Suspended. Such a snapshot keeps the stop in
+    // Stopping, never Provisioning or Error, and cannot revive the sandbox
+    // after the stop settles. This passes without the #5195 fix; the driver
+    // test stop_snapshot_does_not_report_a_starting_generation covers the
+    // regression.
+    #[tokio::test]
+    async fn kubernetes_stop_snapshots_settle_without_reviving_the_sandbox() {
+        for session_connected in [false, true] {
+            let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+            let sandbox = sandbox_record("sb-stopping", "sandbox-stopping", SandboxPhase::Stopping);
+            runtime.store.put_message(&sandbox).await.unwrap();
+            if session_connected {
+                register_test_supervisor_session(&runtime, sandbox.object_id());
+            }
+
+            let mut in_flight = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            in_flight.status = Some(make_driver_status(make_driver_condition(
+                "DependenciesNotReady",
+                "sandbox-runtime enforcement dependencies are not ready",
+            )));
+            let mut settled_status = make_driver_status(make_driver_condition(
+                "SandboxSuspended",
+                "Sandbox is suspended",
+            ));
+            settled_status.conditions.push(DriverCondition {
+                r#type: "Suspended".to_string(),
+                status: "True".to_string(),
+                reason: "PodTerminated".to_string(),
+                message: "Pod terminated".to_string(),
+                transition_time: None,
+            });
+            let mut settled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            settled.status = Some(settled_status);
+
+            for (step, snapshot, expected) in [
+                ("in-flight stop", &in_flight, SandboxPhase::Stopping),
+                ("completed stop", &settled, SandboxPhase::Stopped),
+                ("late in-flight stop", &in_flight, SandboxPhase::Stopped),
+            ] {
+                runtime
+                    .apply_sandbox_update(snapshot.clone())
+                    .await
+                    .unwrap();
+                let current = runtime
+                    .store
+                    .get_message::<Sandbox>(sandbox.object_id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    current.phase(),
+                    expected as i32,
+                    "{step} (session_connected={session_connected})"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -17797,6 +18103,16 @@ mod tests {
                 }))
                 .await
                 .unwrap();
+            let error = remote
+                .resolve_supervisor_app_endpoint(Request::new(
+                    openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest {
+                        sandbox_id: sandbox.id.clone(),
+                        name: sandbox.name.clone(),
+                    },
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::Unimplemented);
             remote
                 .list_sandboxes(Request::new(ListSandboxesRequest {}))
                 .await
@@ -17844,7 +18160,7 @@ mod tests {
         let traceparents = driver.traceparents();
         assert_eq!(
             traceparents.len(),
-            12,
+            13,
             "the client interceptor should cover every RPC"
         );
         assert!(

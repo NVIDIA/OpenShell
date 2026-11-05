@@ -166,10 +166,10 @@ impl<'a> ApiActivityBuilder<'a> {
 
     #[must_use]
     pub fn build(self) -> OcsfEvent {
-        // Gateway events carry a container only when they concern a sandbox.
+        // Only supervisors describe a container on the producing device.
         let mut profiles: Vec<&str> = match self.ctx.origin {
-            EventOrigin::Gateway { .. } if self.ctx.container().is_none() => vec!["host"],
-            _ => vec!["container", "host"],
+            EventOrigin::Gateway { .. } => vec!["host"],
+            EventOrigin::Supervisor => vec!["container", "host"],
         };
         if self.action.is_some() {
             profiles.push("security_control");

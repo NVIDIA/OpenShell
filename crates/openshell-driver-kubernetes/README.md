@@ -40,7 +40,8 @@ workspace namespace modes via `workspace_mode`:
   Kubernetes namespace.
 
 When the gateway configures `[openshell.gateway.otlp]`, Kubernetes
-compute-driver spans export to the same OTLP/gRPC collector with the service
+compute-driver spans export to the same OTLP collector, over its configured
+protocol, with the service
 name `openshell-driver-kubernetes`. The driver preserves the gateway trace
 context and uses the same compute-driver RPC span names in its in-process and
 standalone forms. Standalone deployments set `--gateway-name` or
@@ -93,7 +94,11 @@ When the gateway exports OTLP traces, the driver sets
 supervisor exports its spans there and parents its startup span on that
 context. When `[openshell.gateway.otlp.agent]` is enabled, the driver also
 sets `OPENSHELL_OTLP_AGENT_ENDPOINT`, which starts the supervisor's agent trace
-relay. Neither endpoint is configurable in driver TOML.
+relay. Each endpoint is accompanied by its `_PROTOCOL` variable
+(`OPENSHELL_OTLP_PROTOCOL`, `OPENSHELL_OTLP_AGENT_PROTOCOL`) when the collector
+uses `http/protobuf`. Collector headers and TLS material reach the supervisor
+in its launch credentials, not the Pod environment. None of these is
+configurable in driver TOML.
 
 The driver creates one namespace-wide `NetworkPolicy` before it releases any
 workload Pod. It selects every OpenShell workload, denies all workload egress,

@@ -41,6 +41,11 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
 - `Release` (`release.yml`) is dispatched by hand with the stable version. It
   picks the highest `-pre.N` on `main` whose whole `Pre-release` run passed,
   creates the stable tag on that commit, and publishes without requalifying.
+- Stable releases publish public schemas to `buf.build/openshell/core` with
+  the release tag as the label; prereleases skip Buf publication. The Buf
+  repository must exist and Actions must have a `BUF_TOKEN` secret with write
+  access. A failed Buf push fails the release run; follow Recovery before
+  rerunning the failed publication job.
 
 ## Setup
 
@@ -219,7 +224,7 @@ git worktree remove --force "$wt"
 | Transient infrastructure failure in a pre-release, including a registry push | After approval, `gh run rerun <run-id> --failed`. `Release` won't select the run until all of it passes. |
 | Pre-release run ends in `startup_failure` | The workflow file is invalid at that commit. Fix it in a new `-pre.N` (Monday step 3). |
 | Code defect or `Cargo Deny` advisory | Rerunning won't help. Fix it in a new `-pre.N` (Monday step 3). |
-| `Release` fails after selection | After approval, rerun only the failed jobs that haven't published. |
+| `Release` fails after selection | After approval, rerun only the failed jobs that haven't published. If the run's artifacts expired or its jobs were skipped, dispatch `Release` again with `-f tag=vX.Y.Z`; it publishes only what is missing. |
 
 ## Related
 

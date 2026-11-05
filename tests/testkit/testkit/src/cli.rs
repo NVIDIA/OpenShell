@@ -81,6 +81,23 @@ impl Cli {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.run_with_env(dir, &[], args).await
+    }
+
+    /// Like [`Cli::run_in`], with extra environment variables for the CLI,
+    /// such as a credential it reads by name. Values are not included in
+    /// [`CliOutput::command`] or in errors, so they can hold secrets. They
+    /// can't change which gateway or workspace the CLI uses.
+    pub async fn run_with_env<I, S>(
+        &self,
+        dir: Option<&Path>,
+        env: &[(&str, &str)],
+        args: I,
+    ) -> Result<CliOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<_> = args
             .into_iter()
             .map(|arg| arg.as_ref().to_os_string())
@@ -92,8 +109,11 @@ impl Cli {
             .join(" ");
 
         let mut process = tokio::process::Command::new(&self.binary);
+        // Set first, so the gateway and workspace selection below wins over
+        // anything the caller passes.
         process
             .args(&args)
+            .envs(env.iter().copied())
             .env("NO_COLOR", "1")
             .env(WORKSPACE_ENV, &self.gateway.workspace)
             .stdin(Stdio::null())

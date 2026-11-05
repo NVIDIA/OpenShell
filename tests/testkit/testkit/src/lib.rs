@@ -22,13 +22,16 @@
 //! Tests find the gateway the same way the `openshell` CLI does (see
 //! [`gateway`]).
 
+mod cleanup;
 mod cli;
 mod context;
 mod error;
 pub mod gateway;
+mod image;
 mod poll;
 mod run;
 
+pub use cleanup::CLEANUP_TIMEOUT;
 pub use cli::{BIN_ENV, CLI_TIMEOUT, Cli, CliOutput};
 pub use context::{
     Context, DELETE_TIMEOUT, EXEC_TIMEOUT, ExecOutput, READY_TIMEOUT, STOP_TIMEOUT, Sandbox,
@@ -36,6 +39,7 @@ pub use context::{
 };
 pub use error::{Error, Result, ResultExt};
 pub use gateway::Gateway;
+pub use image::{BASE_IMAGE_ENV, DEFAULT_BASE_IMAGE, base_image};
 pub use openshell_sdk as sdk;
 pub use poll::{Poll, poll_until};
 pub use run::{TestInfo, run};

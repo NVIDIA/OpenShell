@@ -43,6 +43,13 @@ render "${work_dir}/default.yaml"
 extract_toml "${work_dir}/default.yaml" "${work_dir}/default.toml"
 preflight "${work_dir}/default.toml"
 
+# Explicit app ingress must survive both template rendering and driver
+# preflight; child options cannot extend a sealed TOML inline table.
+render "${work_dir}/app-listener.yaml" \
+  --values "${chart}/ci/values-app-listener.yaml"
+extract_toml "${work_dir}/app-listener.yaml" "${work_dir}/app-listener.toml"
+preflight "${work_dir}/app-listener.toml"
+
 # Exercise all serializer shapes through a raw driver table and prove that
 # literal strings, TOML escaping, and null omission survive parsing.
 render "${work_dir}/shapes.yaml" --values "${fixture}"

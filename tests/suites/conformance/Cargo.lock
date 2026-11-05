@@ -407,6 +407,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "conformance"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1880,17 +1890,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-conformance"
-version = "0.0.0"
-dependencies = [
- "rand 0.9.4",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
@@ -1990,14 +1989,6 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
-]
-
-[[package]]
-name = "openshell-test-conformance-cli"
-version = "0.0.0"
-dependencies = [
- "openshell-conformance",
- "tokio",
 ]
 
 [[package]]
@@ -2348,9 +2339,9 @@ checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.13.5"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
 dependencies = [
  "bitflags",
  "memchr",
@@ -2661,13 +2652,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "sandbox"
-version = "0.0.0"
-dependencies = [
- "openshell-testkit",
-]
 
 [[package]]
 name = "schannel"
