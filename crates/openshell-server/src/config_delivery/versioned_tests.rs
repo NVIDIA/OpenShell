@@ -12,6 +12,8 @@ use openshell_core::proto::{ObjectMeta, Provider, SandboxPolicy, SandboxSpec};
 use openshell_credential_issuer::{Handles, SecretOwner, StoreSecrets};
 use prost::Message as _;
 
+mod idle_qualification_tests;
+
 pub async fn versioned_state() -> (tempfile::TempDir, Arc<ServerState>) {
     let directory = tempfile::tempdir().unwrap();
     let signing_key = directory.path().join("intent-key");

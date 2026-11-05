@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded, maintenance-window adoption. The old refresh rows are frozen inputs,
-//! never a second live journal. Every external write has a durable, non-secret
-//! identity before I/O; every incompatible gateway switch follows the rollback
-//! barrier and uses an exact resource-version CAS.
+//! Bounded, maintenance-window adoption. Old refresh formats remain readable,
+//! but verified source rows are retired after their issuer grants are durable.
+//! Every external write has a durable, non-secret identity before I/O; every
+//! incompatible gateway switch follows the rollback barrier and an exact CAS.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -31,9 +31,13 @@ use super::{
 };
 use crate::credential_activation::Activation;
 use crate::credentials::CredentialRuntime;
-use crate::persistence::{ObjectListQuery, ObjectRecord, WriteCondition};
+use crate::persistence::{
+    AtomicWrite, ObjectListQuery, ObjectRecord, PersistenceError, WriteCondition,
+};
 
 const JOURNAL_TYPE: &str = "credential_issuer_migration_v1";
+const RETIREMENT_TYPE: &str = "credential_issuer_legacy_retirement_v1";
+const LEGACY_REFRESH_TYPE: &str = "provider_credential_refresh_state";
 const MIGRATED: &str = "internal.openshell.ai/issuer-migrated-v1";
 const GRANT_PREFIX: &str = "internal.openshell.ai/issuer-grant-";
 
@@ -49,6 +53,18 @@ struct Journal {
     driver: String,
     keys: BTreeSet<String>,
     handles: Option<BTreeMap<String, Vec<u8>>>,
+}
+
+// This record binds retirement to one immutable source identity and its
+// authoritative version. Completion is committed in the same DB transaction
+// that removes that source row. No material or unprotected value digest enters
+// this journal; a restart cannot silently approve a changed source generation.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Retirement {
+    schema: u32,
+    source: String,
+    complete: bool,
 }
 
 fn unavailable() -> Status {
@@ -1050,11 +1066,218 @@ async fn migrate_internal(
     Ok(())
 }
 
+fn retirement_identity(source: &RefreshState) -> Result<(String, String), Status> {
+    let metadata = source.metadata.as_ref().ok_or_else(corrupt)?;
+    if source.object_id().is_empty()
+        || source.provider_id.is_empty()
+        || source.object_workspace().is_empty()
+        || source.credential_key.is_empty()
+        || metadata.resource_version == 0
+    {
+        return Err(corrupt());
+    }
+    let id = identity(&(
+        "retire-refresh-v1",
+        OwnerIdentity::of(owner(source)),
+        source.object_id(),
+    ))?;
+    let intent = serde_json::to_string(&(
+        OwnerIdentity::of(owner(source)),
+        source.object_id(),
+        source.object_name(),
+        &source.credential_key,
+        effective_authorization_epoch(source)?,
+        metadata.resource_version,
+    ))
+    .map_err(|_| corrupt())?;
+    Ok((id, intent))
+}
+
+async fn validate_retirement_grant(
+    versioned: &VersionedCredentials,
+    source: &RefreshState,
+) -> Result<(), Status> {
+    let grant = versioned
+        .references
+        .get_grant(owner(source), source.object_id())
+        .await?
+        .ok_or_else(|| {
+            Status::failed_precondition("legacy refresh source has no durable issuer grant")
+        })?;
+    let current = super::decode(
+        &grant,
+        source.object_id(),
+        source.object_workspace(),
+        &source.provider_id,
+    )?;
+    if grant.prepared
+        || grant.epoch != effective_authorization_epoch(source)?
+        || current.credential_key != source.credential_key
+    {
+        return Err(Status::failed_precondition(
+            "legacy refresh source differs from its committed issuer identity",
+        ));
+    }
+    // Validate the current recovery journal, not an old source value. Refresh
+    // may already have replaced the original token, or deletion may have
+    // revoked it. Retirement never remints, reimports, or deletes backend data.
+    persistence::encode(&current)?;
+    Ok(())
+}
+
+async fn retirement_ticket(
+    versioned: &VersionedCredentials,
+    source: &RefreshState,
+    create: bool,
+) -> Result<(String, u64, Retirement), Status> {
+    let (id, intent) = retirement_identity(source)?;
+    let journal = versioned
+        .store
+        .get(RETIREMENT_TYPE, &id)
+        .await
+        .map_err(|_| unavailable())?;
+    if let Some(journal) = journal {
+        let retirement: Retirement =
+            serde_json::from_slice(&journal.payload).map_err(|_| corrupt())?;
+        if retirement.schema != 1 || retirement.source != intent || retirement.complete {
+            return Err(Status::failed_precondition(
+                "legacy refresh retirement source changed or was recreated",
+            ));
+        }
+        return Ok((id, journal.resource_version, retirement));
+    }
+    if !create {
+        return Err(Status::failed_precondition(
+            "legacy refresh source has no pre-import retirement intent",
+        ));
+    }
+    let retirement = Retirement {
+        schema: 1,
+        source: intent,
+        complete: false,
+    };
+    let written = versioned
+        .store
+        .put_if(
+            RETIREMENT_TYPE,
+            &id,
+            &id,
+            "",
+            &serde_json::to_vec(&retirement).map_err(|_| corrupt())?,
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .map_err(super::persistence_error)?;
+    Ok((id, written.resource_version, retirement))
+}
+
+async fn retire_legacy_refresh_state(
+    versioned: &VersionedCredentials,
+    source: &RefreshState,
+    activation: &mut Activation,
+) -> Result<(), Status> {
+    // Activation serializes retirement. No per-credential lease is needed:
+    // retirement never mutates issuer state, even if an active peer refreshes
+    // or revokes it after this read. Its only writes CAS the exact legacy row
+    // and ticket together. Avoid consuming a third data-pool connection.
+    validate_retirement_grant(versioned, source).await?;
+    let (id, version, mut retirement) = retirement_ticket(versioned, source, false).await?;
+    let metadata = source.metadata.as_ref().ok_or_else(corrupt)?;
+    let Some(record) = versioned
+        .store
+        .get(LEGACY_REFRESH_TYPE, source.object_id())
+        .await
+        .map_err(|_| unavailable())?
+    else {
+        return Ok(());
+    };
+    if record.resource_version != metadata.resource_version
+        || record.workspace != source.object_workspace()
+        || record.name != source.object_name()
+    {
+        return Err(Status::aborted(
+            "legacy refresh source changed before retirement",
+        ));
+    }
+    activation.mark_irreversible().await?;
+    retirement.complete = true;
+    versioned
+        .store
+        .write_atomically(&[
+            AtomicWrite::Delete {
+                object_type: LEGACY_REFRESH_TYPE.to_owned(),
+                id: source.object_id().to_owned(),
+                expected_version: metadata.resource_version,
+            },
+            AtomicWrite::Update {
+                object_type: RETIREMENT_TYPE.to_owned(),
+                id,
+                payload: serde_json::to_vec(&retirement).map_err(|_| corrupt())?,
+                expected_version: version,
+            },
+        ])
+        .await
+        .map_err(|error| match error {
+            PersistenceError::Conflict { .. } => {
+                Status::aborted("legacy refresh source changed during retirement")
+            }
+            _ => unavailable(),
+        })?;
+    Ok(())
+}
+
+async fn retire_legacy_refresh_states(
+    versioned: &VersionedCredentials,
+    activation: &mut Activation,
+) -> Result<(), Status> {
+    let states = crate::refresh_store::list_all_refresh_states(&versioned.store).await?;
+    for source in states {
+        retire_legacy_refresh_state(versioned, &RefreshState::from(&source), activation).await?;
+    }
+    if !versioned
+        .store
+        .collect_records(LEGACY_REFRESH_TYPE, ObjectListQuery::AllWorkspaces)
+        .await
+        .map_err(|_| unavailable())?
+        .is_empty()
+    {
+        return Err(Status::aborted(
+            "legacy refresh sources remain after retirement",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn migrate(
     runtime: &CredentialRuntime,
     versioned: &Arc<VersionedCredentials>,
     activation: &mut Activation,
 ) -> Result<(), Status> {
+    // Bind every original authoritative source generation BEFORE any import or
+    // recovery work. A crash cannot turn a later inventory into new permission
+    // to discard material that was never adopted.
+    let legacy = crate::refresh_store::list_all_refresh_states(&versioned.store).await?;
+    let states: Vec<RefreshState> = legacy.iter().map(Into::into).collect();
+    for source in &states {
+        let grant = versioned
+            .references
+            .get_grant(owner(source), source.object_id())
+            .await?;
+        let create = if activation.already_active() {
+            // One-time bootstrap for compatible pre-retirement releases: those
+            // releases recorded no source-generation ticket. The operator's
+            // maintenance-window frozen-source attestation remains necessary;
+            // existing rotated/tombstoned issuer state must never be overwritten.
+            validate_retirement_grant(versioned, source).await?;
+            true
+        } else {
+            // An existing grant without a ticket is not evidence of which
+            // source generation was imported during an incomplete conversion.
+            grant.is_none()
+        };
+        retirement_ticket(versioned, source, create).await?;
+    }
     let providers: Vec<Provider> = versioned
         .store
         .collect_messages(ObjectListQuery::AllWorkspaces)
@@ -1065,10 +1288,11 @@ pub async fn migrate(
     }
     super::static_updates::recover(versioned).await?;
     if activation.already_active() {
-        return Ok(());
+        // Repair deployments activated by a compatible build that retained the
+        // old source rows. Only exact existing grants may authorize retirement;
+        // never import an old source into a revoked or replacement identity.
+        return retire_legacy_refresh_states(versioned, activation).await;
     }
-    let legacy = crate::refresh_store::list_all_refresh_states(&versioned.store).await?;
-    let states: Vec<RefreshState> = legacy.iter().map(Into::into).collect();
     for provider in providers {
         let matching: Vec<_> = states
             .iter()
@@ -1145,7 +1369,7 @@ pub async fn migrate(
         }
         versioned.validate_provider_grants(&provider).await?;
     }
-    Ok(())
+    retire_legacy_refresh_states(versioned, activation).await
 }
 
 #[cfg(test)]

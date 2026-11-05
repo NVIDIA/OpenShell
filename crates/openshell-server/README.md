@@ -232,7 +232,13 @@ use the shared `CredentialRefresh` interface. Deletion does not construct a loca
 runtime. Only legacy mode uses the temporary provider-commit adapter and its
 injected `RefreshStateStore` for attachment-validation reads. Activated grants
 pin validated output mappings and use the issuer manifest as their authority;
-frozen legacy rows are migration inputs, not live journals.
+frozen legacy formats remain migration inputs, not live journals. After verifying
+the durable issuer grant, startup retires its exact legacy source row using a
+non-secret source-version intent and atomic deletion/completion. It also repairs
+already-active deployments that retained those rows. A retirement failure blocks
+startup and remains retryable; changed or recreated source generations fail
+closed. This removes live application-row plaintext, not backups or historical
+database pages and journals.
 
 The shared runtime preserves these guarantees:
 

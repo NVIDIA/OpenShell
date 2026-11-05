@@ -6,7 +6,7 @@ Continue [RFC 0023 at the requested revision](https://github.com/mrunalp/OpenShe
 
 Move refresh execution, built-in minting, retry/recovery decisions, and refresh scheduling into the existing `openshell-credential-issuer` library. Inject narrow refresh persistence and gateway integration ports so the issuer no longer needs `openshell-server`, its private storage protobufs, `ServerState`, or `ComputeRuntime`. The gateway continues to own provider policy, authorization, mutations, public API adaptation, and delivery.
 
-This is a plan only. Implement it as a separate follow-up to phase 1, not as an unsolicited update to the open phase 1 PR.
+This document preserves the extraction design and its original gates. The extraction and subsequent embedded reference increment are now implemented; see [Phase 2 completion and staged rollout](phase-2-completion.md) for the current activation scope, compatibility bridge and qualification boundaries. The historical scope below describes this extraction increment, not a claim that default legacy mode already uses versioned references.
 
 The implementation must be transparent to users:
 
@@ -242,7 +242,7 @@ mise x -- cargo metadata --no-deps --format-version 1
 
 Use the established Z3 and disposable Postgres setup documented in `CONTRIBUTING.md`, not a new image, test harness, or packaging path. Check normal production features separately from all-target/dev-feature unification. Rerun existing driver tests if changes extend beyond caller/dependency relocation. Inspect the final diff for public/private schema, SQL migration, configuration, deployment, release, e2e, or revision-algorithm drift. Run the existing Markdown checks on implementation documentation.
 
-These are future implementation gates, not a claim that this planning-only change ran Rust tests. Validate this document with scoped Markdown lint, local-link/source-path checks, and `git diff --check`; a plan alone does not require rebuilding the workspace.
+These commands record the original implementation gates. They are not a test-execution report; use the change's validation evidence and [completion addendum](phase-2-completion.md) for current scope. Documentation-only edits still require scoped Markdown lint, local-link/source-path checks and `git diff --check`, not an unrelated workspace rebuild.
 
 ## Alternatives and deferred work
 
@@ -260,7 +260,7 @@ Before moving to remote refresh, complete a separate embedded reference/version 
 4. Includes committed reference versions in the exact snapshot whose values are delivered, without reading a version and later resolving different-generation values. Updates both push invalidation and poll revision calculation; never hashes secret values.
 5. Adds public strategy-name compatibility only with its own API/profile design and validation; preserves existing enums/requests. This is not implied by the internal registry.
 
-Remote RPCs, mTLS/SPIFFE identity, gateway/workspace binding, watches, version-keyed caches, subject-token cache reordering, standalone service packaging, operator migration tooling, and remote-service e2e coverage remain subsequent RFC work. This plan adds none of those runtime surfaces.
+Remote RPCs, mTLS/SPIFFE identity, gateway/workspace binding, watches, version-keyed caches, subject-token cache reordering, standalone service packaging, and remote-service e2e coverage remain subsequent RFC work. This plan adds none of those runtime surfaces. Select embedded or external issuer mode when creating a deployment; no conversion or data-transfer path between modes is supported or planned by this change. Legacy-record adoption upgrades only an existing embedded deployment on its selected backend.
 
 ## Definition of done
 

@@ -2,13 +2,13 @@
 
 ## Scope and baseline
 
-Complete the deferred parts of phase 2 in [RFC 0023 at the requested revision](https://github.com/mrunalp/OpenShell/blob/b416373d6ac84bd67bb3802861d343a50703accc/rfc/0023-credential-issuer-service/README.md), before starting its phase 3 transport work. This is an implementation plan supporting that RFC, not a new RFC or authorization to implement it.
+This document records the design for completing the deferred parts of phase 2 in [RFC 0023 at the requested revision](https://github.com/mrunalp/OpenShell/blob/b416373d6ac84bd67bb3802861d343a50703accc/rfc/0023-credential-issuer-service/README.md), before phase 3 transport work. The embedded implementation now exists. See [Phase 2 completion and staged rollout](phase-2-completion.md) for its explicit opt-in rollout amendment, supported backends, legacy bridge and qualification limits.
 
-Checked against `22349a7b3a52a4e6a4068c26e37cd3c6c8412f30`, the current head of [phase 2 PR #5283](https://github.com/NVIDIA/OpenShell/pull/5283). The PR is still open; reconcile this plan with its final merge revision before implementation. The [phase 2 plan](phase-2-implementation-plan.md) explicitly limited that increment to behavior-preserving internal extraction and recorded the remaining work. Its deferrals are not newly discovered regressions in the extraction.
+The design baseline was `22349a7b3a52a4e6a4068c26e37cd3c6c8412f30` in [phase 2 PR #5283](https://github.com/NVIDIA/OpenShell/pull/5283). The [phase 2 plan](phase-2-implementation-plan.md) limited that increment to behavior-preserving extraction and recorded the work below. The baseline table is historical design context, not a statement that the current implementation still lacks all six capabilities.
 
 Phase 2.1 remains embedded: one existing gateway process, existing credential backends, and no issuer listener, remote client, image, or Helm service. Unlike the extraction, it intentionally changes durable credential representation and revision calculation, and adds an optional strategy-name input. Those changes need schema, migration, and compatibility review; they must not be described as another migration-free refactor.
 
-## Remaining phase 2 gaps
+## Phase 2 gaps at the design baseline
 
 | Gap | Current evidence | Phase 2.1 outcome |
 | --- | --- | --- |
@@ -26,7 +26,7 @@ The extracted engine, narrow persistence ports, owned leases, built-in registry,
 - Gateway: provider/profile semantics, workspace authorization, attachment/output-collision validation, public mutations and their replay, policy, placeholders, operator export, and supervisor delivery.
 - Issuer: reference ownership, versions, grants, secret material, mint attempts, output activation, retry/uncertainty state, and backend cleanup. Embedded adapters may reuse the existing database pools without making gateway provider records part of refresh commit.
 - Preserve the four built-in strategies and `STATIC`/`EXTERNAL` behavior. Dynamic subject-token exchange and supervisor client-credentials grants remain gateway delivery concerns.
-- Do not add service protobufs, mTLS/SPIFFE, remote configuration, watches, a version-keyed secret cache, custom minter services, or subject-token cache reordering. These belong to phase 3. Standalone packaging, cross-cluster migration, and remote e2e coverage remain phases 4/5.
+- Do not add service protobufs, mTLS/SPIFFE, remote configuration, watches, a version-keyed secret cache, custom minter services, or subject-token cache reordering. These belong to phase 3. Standalone packaging and remote e2e coverage remain phases 4/5. Choose embedded or external issuer mode at initial deployment; there is no supported conversion path in either direction.
 - Do not change backend selection, copy secrets between Vault/Kubernetes/database backends, or redesign scheduling, process-wide limits, lock pools, crypto, or the supervisor protocol.
 - The earlier restriction against public/schema changes applied to phase 2's extraction, not this proposed increment. Make only the changes necessary for the six gaps and obtain review before implementation/activation.
 
@@ -117,11 +117,11 @@ This is a correctness gate, not incidental startup cleanup. Do not activate refe
 4. **Adopt existing handles.** Under the appropriate lease, record reference bindings/version 1 pointing at the current backend candidates without rewriting paths, ciphertext/AAD, key IDs, or handle bytes. Preserve effective legacy epoch, expiration presence, all metadata and recovery state. Adoption itself does not mint, rotate, or establish that an uncertain attempt succeeded. Missing output values remain pending/withheld, not fabricated version-1 credentials.
 5. **Prepare inline migration.** Store inline values through the same selected encrypted backend with unique, retryable staging identities, and durably prepare the corresponding issuer binding. Keep the original active inline fields intact throughout preparation. At the binding switch in step 6, remove those fields in the same conditional gateway-record update that installs the validated replacement binding; do not clear a value in one step and attach its replacement in another. Destructive inline removal is itself an irreversible old-binary compatibility boundary, even if no new mint has occurred. On uncertainty keep a recoverable candidate/intent; never delete the only valid rotated refresh token. The journal contains only protected/non-secret intent and handles, never plaintext values. No additional durable plaintext copy is introduced.
 6. **Switch bindings and activate.** Conditionally update provider/internal-secret bindings and active grants only after their adopted state is durable and validated. Resume incomplete transitions on restart without reverting newer state, resurrecting deleted epochs, or creating another reference/version for the same migration intent. Finish a scoped consistency scan before resuming that owner's refresh/delivery. Fail startup/readiness clearly if the deployment-wide activation cannot finish safely.
-7. **Retire compatibility writes.** After activation, write only the new representation and keep legacy decoding for recovery/upgrade tests. Remove the temporary `GatewayRefreshCommit`, `RefreshAttempt`, and provider-write path after every active refresh path uses manifests. Retain any server adapter still needed to read old records; its existence is not a second engine.
+7. **Retire compatibility writes and sources.** Activated refresh writes only issuer manifests/grants and has no `GatewayRefreshCommit`, `RefreshAttempt` or provider-write dependency. Default-off unactivated deployments retain those bridges until legacy-mode support is deliberately retired, as specified by the [staged rollout addendum](phase-2-completion.md#staged-rollout-decision). After verifying durable issuer recovery state, retire each exact legacy refresh source and record completion atomically; preserve source-version intent across failures and reject changed or recreated generations. Frozen decoders remain available for upgrades, not as justification for a redundant plaintext archive.
 
 Before any binding switch or destructive inline removal, rollback can use the old active records because new records are only prepared. Old-binary rollback eligibility ends at the first such incompatible mutation, not merely at the first mint or the final deployment-wide activation marker. Once legacy fields have been removed or versioned writes become authoritative, an old binary cannot safely run: values may no longer be reachable by its readers, stale legacy handles would miss rotations, and old writers could corrupt new state. Require a compatible rollback build or a reviewed coordinated database/backend restore. Do not promise a lossless downgrade by flipping a flag or dual-writing rotated handles forever. An upstream-rotated refresh token may also make a backup restore insufficient; retain replacement-material recovery and document when reauthorization is required.
 
-Backend migration to another store and embedded-to-remote data transfer remain out of scope. Do not delete legacy physical candidates merely because their former gateway fields have been removed; only unreachable candidates with a durable cleanup record are eligible.
+Embedded-to-external and external-to-embedded issuer conversion are unsupported, not deferred migration features. The adoption above only upgrades legacy records within the same embedded deployment and selected backend. Backend migration to another store also remains out of scope. Do not delete legacy physical candidates merely because their former gateway fields have been removed; only unreachable candidates with a durable cleanup record are eligible.
 
 ## Implementation sequence and gates
 
@@ -136,7 +136,7 @@ Implement as separately reviewable changes on the final phase 2 base. Keep prepa
 | 5. Activate outputs inside issuer | Adapt the existing engine to manifest commits and version-bearing results; preserve rotated-material/uncertainty handling, leases, limits, and cleanup. | Mint succeeds with no provider writes or gateway commit callback; multi-output and final-response/status failures do not repeat activation or delete live outputs. |
 | 6. Wire coherent revisions and publication | Resolve once per build, hash those versions, adapt push/poll/export and local invalidation payloads, and keep placeholder identity stable within an epoch. | A refresh with unchanged provider resource version changes delivery revision; raced resolution never pairs mismatched values/versions; existing failure and publication contracts pass. |
 | 7. Add strategy-name compatibility | Add protobuf/profile/CLI/SDK projections and compatibility/replay validation; use registry descriptors without dependency cycles. | Enum-only, name-only, matching/conflicting dual inputs, defaults, unknown values, output mapping, and YAML/API round-trips have coverage. |
-| 8. Activate, remove bridges, document | Exercise maintenance-window upgrade/restart/rollback gates, remove `GatewayRefreshCommit` and obsolete live V2 writers, document user-visible compatibility changes. | Final migration/backend/SQLite/Postgres/delivery matrix passes; no callback, duplicate engine, remote feature, or unsupported downgrade claim remains. |
+| 8. Activate, retire sources, document | Exercise maintenance-window upgrade/restart/rollback gates, retire verified legacy sources, remove gateway commit callbacks from activated refresh and document the intentionally retained unactivated bridge. | Migration/backend/SQLite/Postgres/delivery checks support the claimed path; activated refresh has no callback or duplicate engine, and unexecuted deployment qualification and unsupported downgrade paths remain explicit. |
 
 ## Source map
 
@@ -194,7 +194,7 @@ Run affected driver and schema-compatibility tests, existing relevant Python/CLI
 
 Update the issuer/server READMEs, relevant provider-refresh/profile/API docs, and upgrade/rollback guidance. Review related contributor skills with `sync-agent-infra`; update configuration docs and `debug-openshell-cluster` only if an activation option or operating procedure changes. Do not edit published remote-mode instructions before that feature exists.
 
-For this planning-only artifact, run scoped Markdown lint, source/link checks, and `git diff --check`; Rust/runtime validation above is an implementation requirement, not a claim of tests run for this document.
+Documentation-only changes require scoped Markdown lint, source/link checks and `git diff --check`. The commands above specify implementation validation; they are not an execution log or a substitute for the [completion boundaries](phase-2-completion.md#qualification-boundaries).
 
 ## Review decisions before implementation
 
@@ -203,7 +203,7 @@ For this planning-only artifact, run scoped Markdown lint, source/link checks, a
 3. **Confirm driver recovery requirements:** document which existing backends can safely stage/recover uncertain writes. A capability gap must produce an explicit unsupported activation path or reviewed adapter improvement, not unsafe emulation.
 4. **Approve the additive public field scope:** canonical built-in names now, `custom:` reserved but unavailable, and explicit conflicts with enums rejected. `ListStrategies` and custom minter transport remain phase 3.
 
-These are design/rollout approvals for future implementation, not blockers to writing this plan. They must not be silently decided by implementation convenience.
+These were the design decisions required before implementation. The [completion addendum](phase-2-completion.md) records the chosen manifest model, explicit maintenance-window opt-in, capability-gated backend support and additive built-in strategy scope. It does not declare a new remote mode or universal deployment qualification.
 
 ## Definition of done and phase 3 handoff
 

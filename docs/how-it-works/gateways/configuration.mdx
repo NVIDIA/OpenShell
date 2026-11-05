@@ -621,7 +621,27 @@ maintenance window. The equivalent gateway process option is
 `OPENSHELL_ENABLE_VERSIONED_CREDENTIALS=true`. The flag requires an explicit
 `true` or `false` value. CLI values override environment values, which override
 the file. This option does not select another credential backend, start a
-separate service, or enable a remote issuer.
+separate service, or enable a remote issuer. Unactivated deployments continue to
+use the legacy credential representation; installing a compatible binary alone
+does not migrate them.
+
+This upgrades legacy records within the same embedded issuer and selected
+backend. It does not convert the deployment to an external issuer. Choose issuer
+deployment mode at initial setup; conversion between embedded and external modes
+is unsupported in either direction. This change implements only embedded mode.
+An external credential driver over UDS is a storage backend, not an external
+issuer service.
+
+During activated startup, the gateway retires legacy refresh rows only after
+verifying durable issuer grants and recovery state. Startup records each source
+version before import. This also runs when upgrading a compatible gateway that
+previously retained those rows. Those older releases did not record the imported
+source version, so their one-time retirement bootstrap relies on your attestation
+that the retained sources stayed frozen. Retirement failures block startup for
+retry; investigate a changed-source error rather than manually
+deleting recovery journals. Removing live rows does not erase old backups or
+historical database pages and journals. Keep treating those artifacts as
+secret-bearing.
 
 The in-tree encrypted database, Kubernetes Secrets, and Vault adapters support
 activation. A UDS credential driver must advertise

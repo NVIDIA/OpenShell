@@ -5,6 +5,9 @@ use super::*;
 use crate::persistence::test_postgres::TestSchema;
 use openshell_credential_issuer::{EmbeddedCredentialIssuer, IssuerConfig};
 
+#[path = "postgres_startup_tests.rs"]
+mod startup;
+
 async fn candidates(backend: &dyn CredentialIssuer, id: &str, value: &str) -> Handles {
     let values = HashMap::from([
         ("ACCESS".into(), format!("{value}-access")),

@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct Fixture {
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
     config: Config,
     file: crate::config_file::ConfigFile,
     store: Arc<crate::persistence::Store>,
@@ -45,7 +45,7 @@ impl Fixture {
         .await
         .unwrap();
         Self {
-            _directory: directory,
+            directory,
             config,
             file,
             store,
@@ -308,6 +308,8 @@ async fn inline_values_switch_atomically_and_no_new_durable_plaintext_is_created
     );
     for object_type in [
         JOURNAL_TYPE,
+        RETIREMENT_TYPE,
+        LEGACY_REFRESH_TYPE,
         REFERENCE_OBJECT_TYPE,
         openshell_credential_issuer::persistence::OBJECT_TYPE,
         "provider",
@@ -329,16 +331,21 @@ async fn inline_values_switch_atomically_and_no_new_durable_plaintext_is_created
             );
         }
     }
-    // Frozen V2 is a recovery input only, never rewritten through a new codec.
-    assert_eq!(
-        old_row.payload,
+    assert!(
+        old_row
+            .payload
+            .windows(b"inline-refresh-secret-marker".len())
+            .any(|bytes| bytes == b"inline-refresh-secret-marker")
+    );
+    // Frozen readers remain compatible, but redundant secret-bearing source
+    // rows are retired only after the new grant and backend material are durable.
+    assert!(
         fixture
             .store
-            .get("provider_credential_refresh_state", legacy.object_id())
+            .get(LEGACY_REFRESH_TYPE, legacy.object_id())
             .await
             .unwrap()
-            .unwrap()
-            .payload
+            .is_none()
     );
 }
 
@@ -709,7 +716,7 @@ async fn completed_activation_never_reimports_frozen_grants_after_disable_or_own
             .get("provider_credential_refresh_state", state.object_id())
             .await
             .unwrap()
-            .is_some()
+            .is_none()
     );
 }
 
@@ -955,6 +962,9 @@ async fn preparation_restart_keeps_legacy_fields_until_one_provider_cas() {
         .unwrap()[0])
         .into();
     let versioned = fixture.versioned();
+    // Model the current startup ordering: source permission is durable before
+    // any inline/backend preparation, including a crash before Provider CAS.
+    retirement_ticket(&versioned, &state, true).await.unwrap();
     let candidates = inline_provider(&fixture.runtime, &versioned, &provider)
         .await
         .unwrap();
@@ -1683,3 +1693,6 @@ impl CredentialIssuer for FaultBackend {
             .await
     }
 }
+
+#[path = "retirement_tests.rs"]
+mod retirement_tests;

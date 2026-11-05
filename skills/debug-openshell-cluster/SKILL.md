@@ -1502,6 +1502,14 @@ gateways, refresh/configuration jobs, and outstanding backend operations, and
 took a coordinated database/backend/encryption-key backup in a maintenance
 window. Only compatible replicas may start afterward; SQLite supports one gateway
 process. A database marker and expiring membership do not fence old writers.
+Startup retires verified legacy refresh source rows after issuer recovery state
+is durable, including on already-activated compatible upgrades. New conversions
+bind source versions before import. Already-active older releases have no such
+ticket; their one-time bootstrap relies on your attestation that retained sources
+stayed frozen. Retry a failed retirement after restoring storage access. For a changed-source error, preserve
+the row and recovery evidence and investigate; do not manually delete journals or
+bypass activation checks. Old backups and database journals can still contain
+legacy secrets after live rows are removed.
 
 Keep old binaries excluded from restart and rollback policies. Old-binary
 rollback becomes unsafe at the first incompatible binding change or inline-field
@@ -1512,7 +1520,9 @@ reauthorization. Preserve recovery material and never print secrets to diagnose
 migration. Follow the published
 [activation guidance](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#versioned-credential-activation).
 This remains an embedded issuer using the selected backend, not a remote issuer
-or another Helm service.
+or another Helm service. Choose embedded or external issuer mode at initial
+deployment; no conversion path exists in either direction. Do not use activation
+or a credential-driver transport change to attempt such a conversion.
 
 A versioned backend read failure revokes static material on a connected
 supervisor. Backend recovery triggers redelivery even without a version change.

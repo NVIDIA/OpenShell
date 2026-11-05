@@ -26,6 +26,21 @@ Ordinary static provider updates stage separate immutable candidates, then commi
 
 Disabling refresh captures and transfers the entire output bundle in one owner-record CAS, creating independent static manifests without mixing source generations. Public provider expiration projections read committed manifest metadata without secret I/O and retain any shorter independently authored limit; a committing grant journal is not expiration authority.
 
+Before any import or recovery, startup binds each original legacy source
+identity and authoritative row version in a non-secret retirement intent. After
+matching issuer grants and their handle-backed recovery state are durable, one
+existing database transaction deletes the exact source and records completion. Failed deletion leaves both the source and pending intent intact.
+Restart resumes that intent, including upgrades from an already-active build
+that retained old rows. Such already-active releases lack an original import
+ticket; their one-time bootstrap relies on the maintenance-window attestation
+that retained sources stayed frozen. Incomplete conversions cannot bootstrap an
+existing grant without its original ticket. A changed source or a recreated
+completed source fails closed rather than being silently discarded. Retirement does not mint, reimport
+revoked grants, or delete backend objects or pending replacement material.
+Frozen V1/V2 readers remain available for upgrades; secret-bearing source rows do
+not remain as a second archive. Logical row removal does not erase backups or
+historical database pages and journals.
+
 The first incompatible binding switch or removal of inline fields ends old-binary rollback eligibility. A final migration marker is not that boundary. All old writers must be retired before switching; replica membership expiration is not an old-writer fence. A compatible rollback build or coordinated database/backend recovery is required afterward; upstream-rotated grants may require reauthorization.
 
 ## Mint and reclamation

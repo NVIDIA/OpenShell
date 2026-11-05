@@ -1265,29 +1265,75 @@ fn seconds_until_ms(now_ms: i64, target_ms: i64) -> i64 {
     }
 }
 
+/// Project an observed durable state into an embedded invalidation hint.
+///
+/// Callers retain publication ownership and must supply the committed snapshot,
+/// not an in-memory candidate prepared before activation.
 pub fn change(state: &RefreshState) -> RefreshChange {
+    let authorization_epoch = effective_authorization_epoch(state).ok();
+    let owner = crate::references::OwnerIdentity::of(SecretOwner::provider(
+        state.object_workspace(),
+        &state.provider_id,
+        &state.provider_name,
+    ));
+    // Preserve name-scoped invalidation even for corrupt state, without
+    // fabricating identity or advertising a partial/inconsistent output bundle.
+    let projections: Option<Vec<_>> = state
+        .output_references
+        .iter()
+        .map(|(key, handle)| {
+            crate::references::ReferenceProjection::from_handle(handle)
+                .ok()
+                .flatten()
+                .map(|projection| (key, projection))
+        })
+        .collect();
+    let projections = projections.filter(|projections| {
+        projections.first().is_some_and(|(_, first)| {
+            !first.namespace.is_empty()
+                && !first.manifest_id.is_empty()
+                && !state.object_id().is_empty()
+                && !state.provider_id.is_empty()
+                && projections.iter().all(|(key, projection)| {
+                    projection.namespace == first.namespace
+                        && projection.manifest_id == first.manifest_id
+                        && projection.owner == owner
+                        && projection.credential_key == **key
+                        && Some(projection.epoch.as_str()) == authorization_epoch
+                        && !projection.reference_id.is_empty()
+                })
+        })
+    });
     RefreshChange {
         workspace: state.object_workspace().to_string(),
         provider_name: state.provider_name.clone(),
+        provider_id: state.provider_id.clone(),
+        grant_id: state.object_id().to_owned(),
+        authorization_epoch: authorization_epoch.map(str::to_owned),
+        issuer_namespace: projections
+            .as_ref()
+            .and_then(|projections| projections.first())
+            .map(|(_, projection)| projection.namespace.clone()),
         credential_key: state.credential_key.clone(),
         completed_mint: completed_mint(state).map(str::to_owned),
-        references: if state.status == "refreshed" {
+        references: if state.status == "refreshed"
+            && state.reference_generation > 0
+            && state
+                .metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.deletion_time.is_none())
+        {
             // A fixed grant bundle starts all outputs at one and advances
             // every output in each atomic activation. Unlike row versions,
             // its generation therefore equals each committed secret version.
-            state
-                .output_references
-                .iter()
-                .filter_map(|(key, handle)| {
-                    crate::references::ReferenceProjection::from_handle(handle)
-                        .ok()
-                        .flatten()
-                        .map(|projection| {
-                            (
-                                key.clone(),
-                                (projection.reference_id, state.reference_generation),
-                            )
-                        })
+            projections
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(key, projection)| {
+                    (
+                        key.clone(),
+                        (projection.reference_id, state.reference_generation),
+                    )
                 })
                 .collect()
         } else {

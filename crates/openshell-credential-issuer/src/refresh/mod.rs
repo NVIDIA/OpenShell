@@ -154,16 +154,31 @@ pub trait GatewayRefreshCommit: std::fmt::Debug + Send + Sync {
     ) -> Result<Box<dyn RefreshAttempt>, Status>;
 }
 
-/// Non-secret invalidation hint. A completed-mint marker coalesces waiters; it
-/// is not a monotonically increasing secret version.
+/// Non-secret embedded invalidation hint, not authorization or remote identity.
+///
+/// Provider names remain available for existing name-scoped sinks.
+/// A completed-mint marker coalesces waiters; it is not a secret version.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefreshChange {
     pub workspace: String,
     pub provider_name: String,
+    /// Immutable provider owner ID, never resolved again from its display name.
+    pub provider_id: String,
+    /// Observed refresh object ID. Empty only for malformed state.
+    pub grant_id: String,
+    /// Effective durable epoch, including the existing legacy object-ID epoch.
+    /// None if corrupt state has neither an explicit epoch nor an object ID;
+    /// notification construction must not invent an epoch or panic.
+    pub authorization_epoch: Option<String>,
+    /// Durable embedded issuer namespace from the owner/epoch-bound output
+    /// projections. None for legacy or inconsistent/malformed bundles. This is
+    /// not an authenticated gateway or remote issuer identity.
+    pub issuer_namespace: Option<String>,
     pub credential_key: String,
     pub completed_mint: Option<String>,
     /// Non-secret committed reference identities and versions. Empty for a
-    /// legacy refresh or deletion; never inferred from database row versions.
+    /// legacy refresh, deletion, uncommitted or malformed bundle; never inferred
+    /// from database row versions. Consumers must reauthorize current state.
     pub references: HashMap<String, (String, u64)>,
 }
 

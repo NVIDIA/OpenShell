@@ -167,7 +167,25 @@ async fn versioned_refresh_commits_versions_without_gateway_callback_or_provider
     assert_eq!(values[0].version, 2);
     assert_eq!(refreshed.reference_generation, 2);
     let change = openshell_credential_issuer::refresh::engine::change(&refreshed);
+    assert_eq!(change.workspace, refreshed.object_workspace());
+    assert_eq!(change.provider_name, refreshed.provider_name);
+    assert_eq!(change.provider_id, f.provider.object_id());
+    assert_eq!(change.grant_id, refreshed.object_id());
+    assert_eq!(
+        change.authorization_epoch.as_deref(),
+        Some(refreshed.authorization_epoch.as_str())
+    );
+    assert_eq!(
+        change.issuer_namespace.as_deref(),
+        Some(values[0].reference.namespace.as_str())
+    );
+    assert_eq!(change.references.len(), values.len());
+    assert_eq!(
+        change.references["TOKEN"].0,
+        values[0].reference.reference_id
+    );
     assert_eq!(change.references["TOKEN"].1, values[0].version);
+    assert_eq!(change.references["TOKEN"].1, refreshed.reference_generation);
     // A previously captured result stays internally coherent after activation.
     assert_eq!(
         (captured[0].value.as_str(), captured[0].version),
@@ -181,6 +199,10 @@ async fn versioned_refresh_commits_versions_without_gateway_callback_or_provider
         .unwrap();
     assert_eq!(stored.status, "refreshed");
     assert_eq!(stored.reference_generation, 2);
+    assert_eq!(
+        openshell_credential_issuer::refresh::engine::change(&stored),
+        change
+    );
 }
 
 #[tokio::test]

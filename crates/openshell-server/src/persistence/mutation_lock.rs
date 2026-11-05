@@ -176,6 +176,14 @@ pub struct MutationLockSet {
 }
 
 impl MutationLockSet {
+    /// One existing advisory key, used for startup coordination without
+    /// changing its wire identity or taking a data-pool connection.
+    pub(super) fn exclusive_advisory_key(key: i64) -> Self {
+        let mut set = Self::default();
+        set.insert_raw(key, LockMode::Exclusive);
+        set
+    }
+
     /// Process-local lock set of a lifecycle, driver-watch, or reconcile path:
     /// S(global) X(sandbox).
     pub fn sandbox_lifecycle(sandbox_id: &str) -> Self {

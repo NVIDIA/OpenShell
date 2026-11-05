@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock};
 use serde::{Deserialize, Serialize};
 use tonic::Status;
 
-use crate::persistence::{RefreshMutationGuard, Store, WriteCondition};
+use crate::persistence::{DistributedMutationGuard, Store, WriteCondition};
 
 const OBJECT_TYPE: &str = "credential_issuer_activation";
 const OBJECT_ID: &str = "embedded-credential-references-v1";
@@ -37,7 +37,7 @@ pub struct Activation {
     resource_version: u64,
     phase: Phase,
     _local: tokio::sync::OwnedMutexGuard<()>,
-    _lease: RefreshMutationGuard,
+    _lease: DistributedMutationGuard,
 }
 
 impl std::fmt::Debug for Activation {
@@ -65,8 +65,11 @@ fn decode(bytes: &[u8]) -> Result<Phase, Status> {
     Ok(marker.phase)
 }
 
-/// Serialize compatible replicas using an owned data-pool lease. Existing
-/// configuration/refresh writers must already have been drained by the operator.
+/// Serialize compatible replicas using the existing advisory key on the lock pool.
+///
+/// Binding recovery may then hold a credential data-pool lease without
+/// exhausting the supported two-connection data pool. Incompatible writers
+/// must already have been drained by the operator.
 pub async fn begin(store: Arc<Store>, enabled: bool) -> Result<Option<Activation>, Status> {
     if !enabled {
         let record = store
@@ -85,7 +88,7 @@ pub async fn begin(store: Arc<Store>, enabled: bool) -> Result<Option<Activation
     }
     let local = Arc::clone(&LOCAL_MIGRATION).lock_owned().await;
     let lease = store
-        .acquire_refresh_guard(OBJECT_ID, "migration")
+        .acquire_credential_activation_guard(OBJECT_ID)
         .await
         .map_err(|_| Status::unavailable("credential migration coordination unavailable"))?;
     let record = store
