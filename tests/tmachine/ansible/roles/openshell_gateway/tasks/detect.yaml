@@ -20,3 +20,22 @@
          and not tmachine_container_runtime_is_rootless else tmachine_container_runtime_tmachine_uid.stdout }}
     openshell_gateway_bind_address: "{{ '127.0.0.1:17670' if tmachine_container_runtime_name == 'docker' else '0.0.0.0:17670' }}"
     openshell_runtime_socket: "{{ tmachine_container_runtime_socket }}"
+
+# An environment can add settings to the active driver's gateway.toml table,
+# such as `allow_driver_config`, by writing them to this file in the guest.
+- name: Check for environment driver settings
+  ansible.builtin.stat:
+    path: /etc/openshell-test/driver.toml
+  register: openshell_gateway_driver_file
+
+- name: Read environment driver settings
+  ansible.builtin.slurp:
+    src: /etc/openshell-test/driver.toml
+  register: openshell_gateway_driver_slurp
+  when: openshell_gateway_driver_file.stat.exists
+
+- name: Select environment driver settings
+  ansible.builtin.set_fact:
+    openshell_gateway_driver_settings: >-
+      {{ openshell_gateway_driver_slurp.content | b64decode | trim
+         if openshell_gateway_driver_file.stat.exists else '' }}
