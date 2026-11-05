@@ -388,8 +388,13 @@ fn emit_websocket_invocations(
             .build();
         egress_emit!(event);
         if invocation.failed {
-            let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-                .severity(if invocation.outcome == Outcome::FailClosed {
+            let fail_closed = invocation.outcome == Outcome::FailClosed;
+            let mut finding = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx());
+            if fail_closed {
+                finding = finding.action(ActionId::Denied);
+            }
+            let event = finding
+                .severity(if fail_closed {
                     SeverityId::High
                 } else {
                     SeverityId::Medium
@@ -1049,6 +1054,40 @@ mod trace_tests {
             query_params: std::collections::HashMap::new(),
             raw_header: vec![],
             body_length: crate::l7::provider::BodyLength::None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_fail_closed_findings_record_the_denial() {
+        use openshell_supervisor_middleware::{
+            WebSocketInvocation, WebSocketInvocationOutcome as Outcome,
+        };
+        for (outcome, action_id) in [(Outcome::FailClosed, Some(2)), (Outcome::FailOpen, None)] {
+            let (events, _) = exported("warn", || {
+                emit_websocket_invocations(
+                    &L7EvalContext::default(),
+                    &[WebSocketInvocation {
+                        config_name: "guard".to_string(),
+                        implementation: "test/guard".to_string(),
+                        outcome,
+                        sequence: None,
+                        original_size: 0,
+                        replacement_size: None,
+                        transformed: false,
+                        failed: true,
+                        stage_disabled: false,
+                        reason_code: None,
+                    }],
+                );
+            })
+            .await;
+            let finding = events
+                .iter()
+                .find(|event| {
+                    event["finding_info"]["uid"] == "openshell.middleware.websocket_failure"
+                })
+                .unwrap();
+            assert_eq!(finding["action_id"].as_u64(), action_id, "{outcome:?}");
         }
     }
 

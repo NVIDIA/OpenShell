@@ -478,3 +478,15 @@ async fn repeated_denials_to_one_destination_export_bounded_spans() {
     assert_eq!(traced, denies, "limited records carry no trace.uid");
     assert_eq!(events.len(), super::DENY_SPAN_BURST as usize + 6);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_deny_spans_spend_no_tokens() {
+    let _lock = tracing_test_lock().await;
+    super::reset_deny_span_limiter();
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::WARN);
+    tracing::subscriber::with_default(subscriber, || {
+        super::egress_emit!(http_deny("quiet.example", "denied"));
+    });
+    assert!(super::LIMITER.lock().unwrap().buckets.is_empty());
+}

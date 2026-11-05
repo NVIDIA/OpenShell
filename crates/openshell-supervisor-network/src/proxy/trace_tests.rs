@@ -10,7 +10,13 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paired_credential_denial_shares_one_deny_span() {
     let (events, received) = exported("warn", || {
-        emit_credential_endpoint_mismatch("POST", "blocked.example", 443, "credential-policy");
+        emit_credential_endpoint_mismatch(
+            "POST",
+            "blocked.example",
+            443,
+            "credential-policy",
+            &tracing::Span::none(),
+        );
     })
     .await;
     assert_eq!(events.len(), 2);
@@ -24,16 +30,16 @@ async fn repeated_credential_denials_keep_decision_spans_separate() {
         let (events, received) = exported(level, || {
             let connect =
                 egress::connect_span(&EgressIntent::connect("blocked.example".to_string(), 443));
-            connect.in_scope(|| {
-                for _ in 0..2 {
-                    emit_credential_endpoint_mismatch(
-                        "POST",
-                        "blocked.example",
-                        443,
-                        "credential-policy",
-                    );
-                }
-            });
+            // The FORWARD path passes its saved connect span without entering it.
+            for _ in 0..2 {
+                emit_credential_endpoint_mismatch(
+                    "POST",
+                    "blocked.example",
+                    443,
+                    "credential-policy",
+                    &connect,
+                );
+            }
             let allowed = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .action(ActionId::Allowed)
                 .dst_endpoint(Endpoint::from_domain("allowed.example", 443))

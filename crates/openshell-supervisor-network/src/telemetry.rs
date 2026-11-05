@@ -35,8 +35,9 @@ fn as_http(event: &OcsfEvent) -> Option<&HttpActivityEvent> {
 
 /// Emit all records of one synchronous decision under one deny span. Only HTTP
 /// Activity carries `trace`, so only a denied decision with an HTTP record gets
-/// a span; it is anchored on the denied HTTP record when there is one. A saved
-/// `parent` keeps the span in the connect trace after authorization exits.
+/// a span. The span describes the denied HTTP record, or the first HTTP record
+/// when only a companion finding is denied. A saved `parent` keeps the span in
+/// the connect trace after authorization exits.
 #[allow(clippy::disallowed_macros)]
 pub fn emit_decision(events: impl IntoIterator<Item = OcsfEvent>, parent: Option<&tracing::Span>) {
     let events: Vec<_> = events.into_iter().collect();
@@ -62,8 +63,12 @@ pub fn emit_decision(events: impl IntoIterator<Item = OcsfEvent>, parent: Option
     }
 }
 
-/// Returns `None` when the destination has used up its deny spans.
+/// Returns `None` when deny spans are disabled or the destination has used up
+/// its deny spans. Disabled spans spend no tokens.
 fn deny_span(event: &HttpActivityEvent, parent: Option<&tracing::Span>) -> Option<tracing::Span> {
+    if !tracing::enabled!(kind: tracing::metadata::Kind::SPAN, tracing::Level::INFO) {
+        return None;
+    }
     let endpoint = event.dst_endpoint.as_ref();
     let address =
         endpoint.and_then(|endpoint| endpoint.domain.as_deref().or(endpoint.ip.as_deref()));

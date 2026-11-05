@@ -247,7 +247,13 @@ fn build_credential_endpoint_mismatch_event(
         .build()
 }
 
-fn emit_credential_endpoint_mismatch(method: &str, host: &str, port: u16, policy_name: &str) {
+fn emit_credential_endpoint_mismatch(
+    method: &str,
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    connect_span: &tracing::Span,
+) {
     let event = build_credential_endpoint_mismatch_event(method, host, port, policy_name);
     let finding = crate::l7::build_credential_endpoint_mismatch_finding(
         policy_name,
@@ -255,7 +261,7 @@ fn emit_credential_endpoint_mismatch(method: &str, host: &str, port: u16, policy
         None,
         "Provider credential endpoint binding mismatch; request denied",
     );
-    crate::telemetry::emit_decision([event, finding], None);
+    crate::telemetry::emit_decision([event, finding], Some(connect_span));
 }
 
 /// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
@@ -6490,7 +6496,12 @@ async fn handle_forward_proxy(
             exchange: &middleware_exchange,
             l7_reevaluation,
         };
-        forward_request_bytes = match pipeline.apply(request, client).await? {
+        // Middleware denials join the connect trace, like other FORWARD denials.
+        forward_request_bytes = match pipeline
+            .apply(request, client)
+            .instrument(connect_span.clone())
+            .await?
+        {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 emit_activity_simple(activity_tx, true, "middleware");
@@ -6671,13 +6682,21 @@ async fn handle_forward_proxy(
                     .await;
             }
             if e.is_placement_mismatch() {
-                crate::l7::relay::reject_credential_resolution(client, &l7_ctx, method, &e).await?;
+                crate::l7::relay::reject_credential_resolution(client, &l7_ctx, method, &e)
+                    .instrument(connect_span.clone())
+                    .await?;
                 client.shutdown().await.into_diagnostic()?;
             } else if e.is_endpoint_mismatch() {
                 if let Some(observer) = endpoint_observer.as_ref() {
                     observer.observe_credential_failure(true);
                 }
-                emit_credential_endpoint_mismatch(method, &host_lc, port, policy_str);
+                emit_credential_endpoint_mismatch(
+                    method,
+                    &host_lc,
+                    port,
+                    policy_str,
+                    &connect_span,
+                );
                 respond(
                     client,
                     &build_json_error_response(
