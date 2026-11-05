@@ -149,6 +149,9 @@ pub struct GatewayFileSection {
     /// Absolute preparation budget for new attempts; existing deadlines persist.
     #[serde(default)]
     pub image_preparation_timeout_seconds: Option<u32>,
+    /// Window to reach Ready after the supervisor first reports.
+    #[serde(default)]
+    pub admission_repair_window_seconds: Option<u32>,
     /// Explicit activation only after the compatible deployment rollout ends.
     #[serde(default)]
     pub enable_sandbox_updates: Option<bool>,

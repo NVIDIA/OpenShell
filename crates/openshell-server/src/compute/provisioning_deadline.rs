@@ -11,8 +11,18 @@
 use openshell_core::proto::SandboxProvisioning;
 use openshell_core::time::{timestamp_from_millis, timestamp_to_millis};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicI64, Ordering};
 
-const REPAIR_WINDOW_MS: i64 = 300_000;
+static REPAIR_WINDOW_MS: AtomicI64 = AtomicI64::new(300_000);
+
+/// Set once at startup. Armed attempts keep the deadline they already persisted.
+pub(super) fn set_repair_window_seconds(seconds: u32) {
+    REPAIR_WINDOW_MS.store(i64::from(seconds) * 1_000, Ordering::Relaxed);
+}
+
+fn repair_window_ms() -> i64 {
+    REPAIR_WINDOW_MS.load(Ordering::Relaxed)
+}
 
 /// How long one scan pass waits, in total, for sandboxes' local keys. A sandbox
 /// whose keys are still busy is skipped until the next pass. Keys are taken in
@@ -144,7 +154,7 @@ impl ProvisioningDeadline {
             preparation_deadline_at_ms: None,
             admission_start_at_ms: None,
             state: DeadlineState::Armed {
-                deadline_at_ms: now_ms.saturating_add(REPAIR_WINDOW_MS),
+                deadline_at_ms: now_ms.saturating_add(repair_window_ms()),
             },
         }
     }
@@ -168,7 +178,7 @@ impl ProvisioningDeadline {
         }
         self.admission_start_at_ms = Some(now_ms);
         self.state = DeadlineState::Armed {
-            deadline_at_ms: now_ms.saturating_add(REPAIR_WINDOW_MS),
+            deadline_at_ms: now_ms.saturating_add(repair_window_ms()),
         };
         true
     }
@@ -196,7 +206,7 @@ impl ProvisioningDeadline {
         if !self.is_preparing() {
             self.state = DeadlineState::Armed {
                 deadline_at_ms: deadline_at_ms
-                    .max(change.committed_at_ms.saturating_add(REPAIR_WINDOW_MS)),
+                    .max(change.committed_at_ms.saturating_add(repair_window_ms())),
             };
         }
         self.change = change;
@@ -220,7 +230,7 @@ impl ProvisioningDeadline {
         }
         self.first_rejection_at_ms = Some(now_ms);
         self.state = DeadlineState::Armed {
-            deadline_at_ms: deadline_at_ms.max(now_ms.saturating_add(REPAIR_WINDOW_MS)),
+            deadline_at_ms: deadline_at_ms.max(now_ms.saturating_add(repair_window_ms())),
         };
         true
     }

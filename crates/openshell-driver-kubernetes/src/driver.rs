@@ -612,9 +612,6 @@ fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     }
 }
 const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
-/// Unsupervised shared sandbox instances removed at once by one reconcile pass.
-/// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
-const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
 
 fn random_sandbox_runtime_token() -> Result<String, KubernetesDriverError> {
     use std::fmt::Write as _;
@@ -1119,6 +1116,27 @@ impl KubernetesComputeDriver {
         if let Some(name) = &self.config.supervisor_gateway_name {
             environment.push((openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
         }
+        environment
+    }
+
+    /// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
+    fn bootstrap_grace(&self) -> Duration {
+        Duration::from_secs(u64::from(
+            self.config.sandbox_runtime.bootstrap_grace_seconds,
+        ))
+    }
+
+    /// Supervisor Pod environment beyond the fixed list: telemetry, and an
+    /// attach wait that matches the driver's bootstrap grace.
+    fn supervisor_environment(&self) -> Vec<(&'static str, String)> {
+        let mut environment = self.supervisor_otlp_environment();
+        environment.push((
+            openshell_core::sandbox_env::ATTACH_REQUEST_TIMEOUT_SECS,
+            self.config
+                .sandbox_runtime
+                .bootstrap_grace_seconds
+                .to_string(),
+        ));
         environment
     }
 
@@ -3582,7 +3600,7 @@ impl KubernetesComputeDriver {
                         .as_ref()
                         .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
                     owner,
-                    &self.supervisor_otlp_environment(),
+                    &self.supervisor_environment(),
                 )
                 .map_err(KubernetesDriverError::Message)?,
                 &self.config.sandbox_runtime.app_listener,
@@ -4102,6 +4120,7 @@ impl KubernetesComputeDriver {
             sandbox_api.api.clone(),
             cr_name.to_string(),
             Some(cr_uid.to_string()),
+            self.bootstrap_grace(),
         );
         Ok(())
     }
@@ -5540,11 +5559,7 @@ impl KubernetesComputeDriver {
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
     ) {
-        if !sandbox_runtime_bootstrap_is_stale(
-            object,
-            SystemTime::now(),
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
-        ) {
+        if !sandbox_runtime_bootstrap_is_stale(object, SystemTime::now(), self.bootstrap_grace()) {
             return;
         }
         if sandbox_runtime_bootstrap_operation(object) != Some("create") {
@@ -5986,9 +6001,10 @@ fn spawn_sandbox_runtime_bootstrap_completion(
     sandboxes: Api<DynamicObject>,
     sandbox_name: String,
     expected_sandbox_uid: Option<String>,
+    grace: Duration,
 ) {
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + SANDBOX_RUNTIME_BOOTSTRAP_GRACE;
+        let deadline = tokio::time::Instant::now() + grace;
         match tokio::time::timeout_at(deadline, control.wait_available()).await {
             Ok(true) => {}
             Ok(false) | Err(_) => return,
@@ -9190,6 +9206,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_environment_matches_bootstrap_grace() {
+        let mut config = KubernetesComputeConfig::default();
+        config.sandbox_runtime.bootstrap_grace_seconds = 900;
+        let driver = KubernetesComputeDriver::new_for_test(config);
+        assert_eq!(driver.bootstrap_grace(), Duration::from_mins(15));
+        assert_eq!(
+            driver.supervisor_environment(),
+            [(
+                openshell_core::sandbox_env::ATTACH_REQUEST_TIMEOUT_SECS,
+                "900".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn supervisor_otlp_environment_carries_only_configured_signals() {
         use openshell_core::sandbox_env::{
             OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
@@ -10533,15 +10564,16 @@ mod tests {
             Some("restart")
         );
         let started_at = SystemTime::UNIX_EPOCH + started;
+        let grace = Duration::from_mins(5);
         assert!(!sandbox_runtime_bootstrap_is_stale(
             &object,
-            started_at + SANDBOX_RUNTIME_BOOTSTRAP_GRACE - Duration::from_secs(1),
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            started_at + grace - Duration::from_secs(1),
+            grace
         ));
         assert!(sandbox_runtime_bootstrap_is_stale(
             &object,
-            started_at + SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            started_at + grace,
+            grace
         ));
         object
             .metadata
@@ -10550,9 +10582,7 @@ mod tests {
             .unwrap()
             .remove(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT);
         assert!(sandbox_runtime_bootstrap_is_stale(
-            &object,
-            started_at,
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            &object, started_at, grace
         ));
         object
             .metadata
