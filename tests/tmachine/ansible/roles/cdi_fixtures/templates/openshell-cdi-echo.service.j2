@@ -1,0 +1,25 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+[Unit]
+Description=OpenShell tmachine CDI Unix socket fixture
+After=local-fs.target
+
+[Service]
+# The socket is created by this process, not by PID 1, and `cat` echoes each
+# connection. `--inetd` puts the accepted connection on stdin and stdout, which
+# is where `cat` reads and writes.
+# On SELinux hosts a container may connect only to sockets of certain domains,
+# which does not include the default one for a service. Serve the socket as a
+# container, so the container that mounts it can connect. It is ignored where
+# SELinux is off.
+SELinuxContext=system_u:system_r:container_t:s0
+ExecStartPre=/bin/rm -f {{ cdi_scenario_dir }}/socket/echo.sock
+ExecStart=/usr/bin/systemd-socket-activate --inetd --listen={{ cdi_scenario_dir }}/socket/echo.sock --accept /bin/cat
+# The process creates the socket with mode 0644 whatever the unit's UMask, which
+# only root can connect to. Open it to any user once it exists. A service
+# start, including the one at every boot, creates the socket again.
+ExecStartPost=/bin/sh -c 'until [ -S "$1" ]; do sleep 0.1; done; chmod 0666 "$1"' sh {{ cdi_scenario_dir }}/socket/echo.sock
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
