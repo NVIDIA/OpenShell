@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Apply the configured gateway service model. The disabled mode provides a
-# safe intermediate state while changing between user and system gateways.
+# Apply the configured gateway service model. User gateway activation belongs
+# to each user's systemd manager; user mode only disables the conflicting
+# system gateway. The disabled mode provides a safe intermediate state while
+# changing between user and system gateways.
 
 set -eu
 
@@ -11,7 +13,6 @@ gateway_mode=$(snapctl get gateway-mode)
 case "$gateway_mode" in
 	user)
 		snapctl stop --disable "${SNAP_INSTANCE_NAME}.system-gateway"
-		snapctl start --enable "${SNAP_INSTANCE_NAME}.user-gateway"
 		;;
 	system)
 		snapctl stop --disable "${SNAP_INSTANCE_NAME}.user-gateway"

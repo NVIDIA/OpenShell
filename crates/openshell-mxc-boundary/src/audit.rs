@@ -3,8 +3,7 @@
 
 //! MXC-owned containment evidence and its host-side interpretation.
 
-use openshell_isolation_interface::contract::{BackendError, BoundaryProperties, EnforcedProperty};
-use openshell_sandbox_backend::audit::BoundaryAuditValidator;
+use openshell_isolation_interface::contract::BackendError;
 use serde::{Deserialize, Serialize};
 
 /// Windows `ProcessContainer` audit reported by the MXC boundary.
@@ -50,28 +49,6 @@ impl MxcSandboxAuditEvidence {
             ))
         }
     }
-
-    #[must_use]
-    pub fn properties(&self) -> BoundaryProperties {
-        BoundaryProperties {
-            filesystem_confinement: EnforcedProperty::new(
-                self.default_deny_filesystem,
-                "mxc-processcontainer-appcontainer",
-            ),
-            egress_interception: EnforcedProperty::new(
-                self.default_deny_egress && self.loopback_proxy_only,
-                "mxc-windows-parity-unverified-egress-stub",
-            ),
-            request_attribution: EnforcedProperty::new(
-                self.generation_scoped_attribution,
-                "mxc-generation-authenticated-proxy",
-            ),
-            privilege_floor: EnforcedProperty::new(
-                self.process_container,
-                "windows-appcontainer-token",
-            ),
-        }
-    }
 }
 
 /// MXC wire format; the generic transport does not interpret platform evidence.
@@ -85,14 +62,13 @@ pub enum MxcBoundaryAuditEvidence {
 #[derive(Debug)]
 pub struct MxcBoundaryAuditValidator;
 
-impl BoundaryAuditValidator for MxcBoundaryAuditValidator {
-    fn validate(&self, evidence: &serde_json::Value) -> Result<BoundaryProperties, BackendError> {
+impl MxcBoundaryAuditValidator {
+    pub fn validate(&self, evidence: &serde_json::Value) -> Result<(), BackendError> {
         let MxcBoundaryAuditEvidence::WindowsMxc(audit) = serde_json::from_value(evidence.clone())
             .map_err(|error| {
                 BackendError::Confirm(format!("decode MXC sandbox audit evidence: {error}"))
             })?;
-        audit.validate()?;
-        Ok(audit.properties())
+        audit.validate()
     }
 }
 
@@ -120,11 +96,7 @@ mod tests {
         let evidence = valid_evidence();
         assert_eq!(evidence["platform"], "windows_mxc");
         assert!(MxcBoundaryAuditValidator.validate(&evidence).is_ok());
-        assert!(
-            openshell_sandbox_backend::audit::LinuxBoundaryAuditValidator
-                .validate(&evidence)
-                .is_err()
-        );
+        assert!(openshell_sandbox_backend::audit::validate_native_linux_audit(&evidence).is_err());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use openshell_mxc_boundary::launch::MxcLaunchDescriptor;
 use openshell_supervisor_network::run::ProxyListenerConfig;
 use std::sync::Arc;
 
-pub(super) struct MxcBackendSetup;
+pub struct MxcBackendSetup;
 
 impl BackendSetup for MxcBackendSetup {
     fn backend_name(&self) -> &str {
@@ -52,15 +52,22 @@ impl PreparedBackend for MxcLaunch {
         &self,
         bearer: SessionBearerTokenSlot,
     ) -> Result<(Option<String>, bool), BackendError> {
-        openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy_with_connector(
+        openshell_sandbox_backend::OpenShellRuntimeBackend::discover_registered_policy_with_transport(
+            openshell_mxc_boundary::BACKEND_NAME.to_string(),
             self.descriptor.runtime.clone(),
+            self.descriptor.runtime.backend_descriptor()?.payload,
             bearer,
-            Some(self.connector.clone()),
+            openshell_sandbox_backend::BoundaryTransport::connector(self.connector.clone()),
         )
         .await
     }
 
     fn build(self: Box<Self>, services: BackendServices) -> Result<BuiltBackend, BackendError> {
+        if services.takeover.is_some() || services.supervisor_recovery_timeout_secs.is_some() {
+            return Err(BackendError::Unsupported(
+                "MXC supervisor takeover and recovery timeout overrides are unsupported".into(),
+            ));
+        }
         let payload = self.descriptor.runtime.backend_descriptor()?.payload;
         let proxy = self.descriptor.proxy;
         let identity_cache =
@@ -103,12 +110,13 @@ impl PreparedBackend for MxcLaunch {
                 authorization: proxy.authorization.into(),
                 identity_resolver,
             }),
-            backend: Arc::new(MxcRuntimeBackend::new(
+            backend: Arc::new(MxcRuntimeBackend::client(
+                self.descriptor.runtime,
                 services.ca_file_paths,
                 services.provider_credentials,
                 services.sandbox_bearer,
                 self.connector,
-            )),
+            )?),
         })
     }
 }

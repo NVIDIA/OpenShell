@@ -301,6 +301,25 @@ impl SocketRegistry {
         Ok(entry)
     }
 
+    /// Return `None` only when procfs positively identifies an unregistered
+    /// descriptor. Inspection and retained-identity failures stay errors.
+    pub fn resolve_for_native_fallback(
+        &self,
+        tid: u32,
+        fd: RawFd,
+    ) -> io::Result<Option<&SocketEntry>> {
+        let Some(inode) = proc_fd::socket_inode_if_socket(tid, fd)? else {
+            return Ok(None);
+        };
+        let Some(entry) = self.entries.get(&inode) else {
+            return Ok(None);
+        };
+        if entry.retained_preconnect.is_some() {
+            entry.validate_retained_identity()?;
+        }
+        Ok(Some(entry))
+    }
+
     /// Mutable form of [`Self::resolve`].
     pub fn resolve_mut(&mut self, tid: u32, fd: RawFd) -> io::Result<&mut SocketEntry> {
         let inode = proc_fd::socket_inode(tid, fd)?;
@@ -314,6 +333,24 @@ impl SocketRegistry {
             entry.validate_retained_identity()?;
         }
         Ok(entry)
+    }
+
+    /// Mutable form of [`Self::resolve_for_native_fallback`].
+    pub fn resolve_mut_for_native_fallback(
+        &mut self,
+        tid: u32,
+        fd: RawFd,
+    ) -> io::Result<Option<&mut SocketEntry>> {
+        let Some(inode) = proc_fd::socket_inode_if_socket(tid, fd)? else {
+            return Ok(None);
+        };
+        let Some(entry) = self.entries.get_mut(&inode) else {
+            return Ok(None);
+        };
+        if entry.retained_preconnect.is_some() {
+            entry.validate_retained_identity()?;
+        }
+        Ok(Some(entry))
     }
 
     /// Remove metadata after descendant-FD collection proves no installed
@@ -347,6 +384,9 @@ fn socket_identity(fd: BorrowedFd<'_>, listener_generation: u64) -> io::Result<S
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::process::{Command, Stdio};
+
     use rustix::net::{AddressFamily, SocketFlags, SocketType, ipproto};
 
     use super::*;
@@ -418,6 +458,109 @@ mod tests {
                 .raw_os_error(),
             Some(libc::EMFILE)
         );
+    }
+
+    #[test]
+    fn native_fallback_requires_a_verified_descriptor() {
+        let mut registry = SocketRegistry::new(7, 1).unwrap();
+        let source = tcp_socket();
+        let installed = rustix::io::fcntl_dupfd_cloexec(&source, 3).unwrap();
+        let tentative = registry.stage(source, metadata()).unwrap();
+        registry.commit(tentative).unwrap();
+        assert!(
+            registry
+                .resolve_for_native_fallback(std::process::id(), installed.as_raw_fd())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            registry
+                .resolve_mut_for_native_fallback(std::process::id(), installed.as_raw_fd())
+                .unwrap()
+                .is_some()
+        );
+
+        let unregistered = tcp_socket();
+        assert!(
+            registry
+                .resolve_for_native_fallback(std::process::id(), unregistered.as_raw_fd())
+                .unwrap()
+                .is_none()
+        );
+        let regular = std::fs::File::open("/dev/null").unwrap();
+        assert!(
+            registry
+                .resolve_for_native_fallback(std::process::id(), regular.as_raw_fd())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            registry
+                .resolve_for_native_fallback(std::process::id(), i32::MAX)
+                .expect_err("vanished descriptor must fail closed")
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            registry
+                .resolve_mut_for_native_fallback(std::process::id(), i32::MAX)
+                .expect_err("vanished descriptor must fail closed")
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn native_fallback_rejects_unreadable_task_descriptors() {
+        const CHILD: &str = "OPENSHELL_UNREADABLE_DESCRIPTOR_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let socket = tcp_socket();
+            // SAFETY: the disposable child changes only its own dumpability.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            println!("{}", socket.as_raw_fd());
+            io::stdout().flush().unwrap();
+            let mut release = [0_u8];
+            io::stdin().read_exact(&mut release).unwrap();
+            return;
+        }
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .arg("--exact")
+            .arg("linux::socket_registry::tests::native_fallback_rejects_unreadable_task_descriptors")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "child exited early"
+            );
+            if let Ok(fd) = line.trim().parse::<RawFd>() {
+                let registry = SocketRegistry::new(7, 1).unwrap();
+                assert_eq!(
+                    registry
+                        .resolve_for_native_fallback(child.id(), fd)
+                        .expect_err("unreadable descriptor must fail closed")
+                        .kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+                child.stdin.take().unwrap().write_all(&[1]).unwrap();
+                break;
+            }
+        }
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]

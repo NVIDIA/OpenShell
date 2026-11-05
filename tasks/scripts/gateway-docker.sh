@@ -30,6 +30,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/tasks/scripts/gateway-toml.sh"
 # shellcheck source=tasks/scripts/gateway-pull-policy.sh
 source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
+# shellcheck source=tasks/scripts/build-env.sh
+source "${ROOT}/tasks/scripts/build-env.sh"
+ensure_build_nofile_limit
 PORT="${OPENSHELL_SERVER_PORT:-18080}"
 GATEWAY_NAME="${OPENSHELL_DOCKER_GATEWAY_NAME:-docker-dev}"
 STATE_DIR="${OPENSHELL_DOCKER_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-docker}"
@@ -83,7 +86,7 @@ ensure_docker_runtime_image() {
 append_local_otlp_config_if_available() {
   local config_path=$1
   if ! port_is_in_use 4317; then
-    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
+    echo "OTLP collector not detected on 127.0.0.1:4317; trace export, OCSF log export, and the agent trace relay disabled."
     return
   fi
 
@@ -91,8 +94,14 @@ append_local_otlp_config_if_available() {
 
 [openshell.gateway.otlp]
 endpoint = "http://127.0.0.1:4317"
+
+[openshell.gateway.otlp.ocsf]
+enabled = true
+
+[openshell.gateway.otlp.agent]
+enabled = true
 EOF
-  echo "OTLP trace export enabled for http://127.0.0.1:4317."
+  echo "OTLP trace export, OCSF log export, and the agent trace relay enabled for http://127.0.0.1:4317."
 }
 
 register_gateway_metadata() {
@@ -146,8 +155,6 @@ ensure_docker_runtime_image \
   sandbox \
   "sandbox runtime"
 
-GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://127.0.0.1:${PORT}}"
-
 CARGO_BUILD_JOBS_ARG=()
 if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
@@ -191,11 +198,14 @@ supervisor_image = "${SUPERVISOR_IMAGE}"
 sandbox_runtime_image = "${SANDBOX_RUNTIME_IMAGE}"
 image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
 sandbox_label = "${SANDBOX_NAMESPACE}"
-grpc_endpoint = "${GRPC_ENDPOINT}"
 # Explicit supervisor-compatible default. Set RuntimeDefault or
 # Localhost/<profile> only on a Docker host with AppArmor enabled.
 app_armor_profile = "Unconfined"
 EOF
+
+if [[ -n "${OPENSHELL_GRPC_ENDPOINT:-}" ]]; then
+  printf 'grpc_endpoint = "%s"\n' "$(toml_escape "${OPENSHELL_GRPC_ENDPOINT}")" >>"${CONFIG_PATH}"
+fi
 
 # Keep the local task's proxy inputs aligned with [openshell.drivers.docker].
 # Credentials stay in the referenced root-owned file; do not echo their value.

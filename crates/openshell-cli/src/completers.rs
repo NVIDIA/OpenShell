@@ -9,14 +9,10 @@ use openshell_bootstrap::edge_token::load_edge_token;
 use openshell_bootstrap::oidc_token::{is_token_expired, load_oidc_token, store_oidc_token};
 use openshell_bootstrap::{list_gateways, load_active_gateway, load_gateway_metadata};
 use openshell_core::ObjectName;
-use openshell_core::auth::EdgeAuthInterceptor;
-use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{ListProvidersRequest, ListSandboxesRequest, ListWorkspacesRequest};
-use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 
 use crate::oidc_auth::oidc_refresh_token;
-use crate::tls::{TlsOptions, build_channel};
+use crate::tls::{GrpcClient, TlsOptions, grpc_client};
 
 /// Complete gateway names from local metadata files (no network call).
 pub fn complete_gateway_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
@@ -130,10 +126,7 @@ fn resolve_active_gateway() -> Option<(String, String)> {
     Some((metadata.gateway_endpoint, name))
 }
 
-async fn completion_grpc_client(
-    server: &str,
-    gateway_name: &str,
-) -> Option<OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>> {
+async fn completion_grpc_client(server: &str, gateway_name: &str) -> Option<GrpcClient> {
     let mut tls_opts = TlsOptions::default().with_gateway_name(gateway_name);
     tls_opts.gateway_insecure = std::env::var("OPENSHELL_GATEWAY_INSECURE")
         .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
@@ -172,13 +165,7 @@ async fn completion_grpc_client(
         }
     }
 
-    let channel = build_channel(server, &tls_opts).await.ok()?;
-    let interceptor = EdgeAuthInterceptor::new(
-        tls_opts.oidc_token.as_deref(),
-        tls_opts.edge_token.as_deref(),
-    )
-    .ok()?;
-    Some(OpenShellClient::with_interceptor(channel, interceptor))
+    grpc_client(server, &tls_opts).await.ok()
 }
 
 /// Run an async future on a dedicated thread to avoid nested tokio runtime panics.

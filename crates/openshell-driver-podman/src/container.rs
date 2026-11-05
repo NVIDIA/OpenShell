@@ -10,9 +10,12 @@ use openshell_core::driver_mounts::SelinuxLabel;
 use openshell_core::gpu::validate_cdi_device_names;
 #[cfg(test)]
 use openshell_core::gpu::{driver_gpu_requirements, validate_cdi_gpu_device_request};
+use openshell_core::network_trust::{
+    NETWORK_SUPERVISOR_TRUST_GENERATION_KEY, NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
+};
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
 use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
-use openshell_core::{driver_mounts, proto_struct};
+use openshell_core::{NetworkSupervisorTrustBundle, driver_mounts, proto_struct};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -69,6 +72,7 @@ const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
     openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const PROXY_CA_MOUNT_PATH: &str = openshell_core::driver_utils::PROXY_CA_MOUNT_PATH;
+const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 
@@ -612,6 +616,53 @@ fn upstream_proxy_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
     args
 }
 
+/// Build the destination-trust arguments for the trusted supervisor only.
+///
+/// The source path stays out of argv; the digest pairs the mounted artifact
+/// with the immutable generation recorded on the workload label.
+fn network_trust_cli_args(network_trust: Option<&NetworkSupervisorTrustBundle>) -> Vec<String> {
+    network_trust.map_or_else(Vec::new, |_bundle| {
+        vec![
+            "--additional-ca-bundle".to_string(),
+            ADDITIONAL_CA_MOUNT_PATH.to_string(),
+        ]
+    })
+}
+
+fn network_trust_mount(bundle: &NetworkSupervisorTrustBundle) -> Result<Mount, ComputeDriverError> {
+    bundle.verify_artifact().map_err(|error| {
+        ComputeDriverError::Precondition(format!(
+            "verify gateway-owned network additional CA artifact: {error}"
+        ))
+    })?;
+    let path = bundle.artifact_path();
+    let source = path.to_str().ok_or_else(|| {
+        ComputeDriverError::Precondition(format!(
+            "network additional CA artifact path is not valid UTF-8: {}",
+            path.display()
+        ))
+    })?;
+    driver_mounts::validate_absolute_mount_source(source, "network additional CA artifact")
+        .map_err(ComputeDriverError::Precondition)?;
+
+    let mut options = vec!["ro".into(), "rbind".into()];
+    if is_selinux_enabled() {
+        options.push("z".into());
+    }
+    Ok(Mount {
+        kind: "bind".into(),
+        source: source.to_string(),
+        destination: ADDITIONAL_CA_MOUNT_PATH.into(),
+        options,
+    })
+}
+
+fn network_trust_generation(network_trust: Option<&NetworkSupervisorTrustBundle>) -> &str {
+    network_trust.map_or(NETWORK_SUPERVISOR_TRUST_GENERATION_NONE, |bundle| {
+        bundle.digest()
+    })
+}
+
 fn build_env(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
@@ -673,7 +724,10 @@ fn build_env(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.into(),
         config.ssh_socket_path.clone(),
     );
-    env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
+    env.insert(
+        openshell_core::sandbox_env::CONTAINER_IMAGE.into(),
+        image.to_string(),
+    );
     let main_process = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(spec)
         .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
     env.insert(
@@ -684,15 +738,24 @@ fn build_env(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
         openshell_core::telemetry::enabled_env_value().into(),
     );
-    if let Some(endpoint) = &config.supervisor_otlp_endpoint {
-        env.insert(
-            openshell_core::sandbox_env::OTLP_ENDPOINT.into(),
-            endpoint.clone(),
-        );
+    env.extend(
+        config
+            .supervisor_otlp
+            .environment()
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value)),
+    );
+    if config.supervisor_otlp.traces.is_some() {
         env.extend(
             openshell_otel::current_trace_context_environment()
                 .into_iter()
                 .map(|(name, value)| (name.to_string(), value)),
+        );
+    }
+    if let Some(name) = &config.supervisor_gateway_name {
+        env.insert(
+            openshell_core::sandbox_env::GATEWAY_NAME.into(),
+            name.clone(),
         );
     }
     // Runtime capabilities are driver-owned. Override image/user input with
@@ -1517,6 +1580,9 @@ pub struct IsolationSpecInput<'a> {
     pub image: &'a ResolvedPodmanImage,
     pub supervisor_bin: Option<&'a Path>,
     pub tls_secrets: Option<&'a [String; 1]>,
+    /// Gateway-owned immutable destination-trust artifact. It is deliberately
+    /// mounted only into the trusted supervisor spec.
+    pub network_trust: Option<&'a NetworkSupervisorTrustBundle>,
     pub identity: &'a openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
 }
 
@@ -1630,11 +1696,29 @@ pub fn build_isolation_specs(
         options: vec!["rw".into(), "z".into()],
     });
 
+    workload.volumes.push(NamedVolume {
+        name: crate::isolation::control_volume_name(&input.sandbox.id),
+        dest: crate::isolation::CONTROL_ROOT.into(),
+        options: vec!["rw".into(), "z".into()],
+    });
+
     supervisor.name = crate::isolation::supervisor_name(&input.sandbox.id);
     supervisor
         .labels
         .insert(crate::isolation::LABEL_ROLE.into(), "supervisor".into());
+    // The workload is never replaced when the destination-trust bundle
+    // changes; only this supervisor is. Record the generation it was created
+    // with so a later start can detect a stale supervisor and recreate it
+    // without touching the workload or its data.
+    supervisor.labels.insert(
+        NETWORK_SUPERVISOR_TRUST_GENERATION_KEY.into(),
+        network_trust_generation(input.network_trust).into(),
+    );
     supervisor.image.clone_from(&input.config.supervisor_image);
+    supervisor.env.insert(
+        openshell_core::sandbox_env::CONTAINER_IMAGE_UID.into(),
+        input.image.id.clone(),
+    );
     supervisor.entrypoint = vec!["/openshell-supervisor".into()];
     supervisor.command.extend([
         format!(
@@ -1644,6 +1728,12 @@ pub fn build_isolation_specs(
         format!("--auth-bundle-file={}", crate::isolation::AUTH_BUNDLE_PATH),
         "--health-socket-path=/run/openshell/supervisor-health.sock".into(),
     ]);
+    supervisor
+        .command
+        .extend(network_trust_cli_args(input.network_trust));
+    if let Some(network_trust) = input.network_trust {
+        supervisor.mounts.push(network_trust_mount(network_trust)?);
+    }
     supervisor.env.insert(
         openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND.into(),
         openshell_sandbox_backend::BACKEND_NAME.into(),
@@ -1685,6 +1775,11 @@ pub fn build_isolation_specs(
         dest: crate::isolation::CHANNEL_ROOT.into(),
         options: vec!["ro".into(), "z".into()],
     }];
+    supervisor.volumes.push(NamedVolume {
+        name: crate::isolation::control_volume_name(&input.sandbox.id),
+        dest: crate::isolation::CONTROL_ROOT.into(),
+        options: vec!["rw".into(), "z".into()],
+    });
     supervisor.mounts.retain(|mount| {
         trusted_mount(&mount.destination)
             && mount.destination != openshell_core::container_paths::NETNS_MOUNT_ROOT
@@ -1729,7 +1824,10 @@ pub fn build_isolation_specs(
 fn trusted_mount(destination: &str) -> bool {
     matches!(
         destination,
-        TLS_CA_MOUNT_PATH | PROXY_CA_MOUNT_PATH | PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
+        TLS_CA_MOUNT_PATH
+            | PROXY_CA_MOUNT_PATH
+            | ADDITIONAL_CA_MOUNT_PATH
+            | PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
     ) || destination == openshell_core::container_paths::NETNS_MOUNT_ROOT
 }
 
@@ -1859,6 +1957,122 @@ mod tests {
     }
 
     #[test]
+    fn additional_destination_trust_is_delivered_only_to_supervisor_with_digest() {
+        let artifact = crate::test_utils::unique_socket_path("additional-ca").with_extension("crt");
+        let pem = b"normalized additional CA fixture";
+        std::fs::write(&artifact, pem).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &artifact,
+            std::os::unix::fs::PermissionsExt::from_mode(0o444),
+        )
+        .unwrap();
+        let bundle = NetworkSupervisorTrustBundle::new(
+            pem.to_vec(),
+            1,
+            "sha256:paired-digest",
+            artifact.clone(),
+        );
+        let sandbox = DriverSandbox {
+            id: "trust-pair".into(),
+            name: "trust-pair".into(),
+            ..Default::default()
+        };
+        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+            1000,
+            1001,
+            Vec::new(),
+            "image".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let image = resolved_image("image", "sha256:image", "1000:1001", "/workspace/project");
+        let specs = build_isolation_specs(IsolationSpecInput {
+            sandbox: &sandbox,
+            config: &PodmanComputeConfig::default(),
+            token_secret: None,
+            resolver_secret: "resolver",
+            gpu_devices: None,
+            image: &image,
+            supervisor_bin: None,
+            tls_secrets: None,
+            network_trust: Some(&bundle),
+            identity: &identity,
+        })
+        .unwrap();
+
+        assert_eq!(
+            specs
+                .supervisor
+                .labels
+                .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
+                .map(String::as_str),
+            Some("sha256:paired-digest")
+        );
+        assert!(
+            specs
+                .workload
+                .command
+                .iter()
+                .all(|argument| argument != "--additional-ca-bundle")
+        );
+        assert!(
+            specs
+                .workload
+                .mounts
+                .iter()
+                .all(|mount| { mount.destination != ADDITIONAL_CA_MOUNT_PATH })
+        );
+        assert!(specs.supervisor.command.windows(2).any(|arguments| {
+            arguments == ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH]
+        }));
+        assert!(specs.supervisor.mounts.iter().any(|mount| {
+            mount.destination == ADDITIONAL_CA_MOUNT_PATH
+                && mount.source == artifact.to_string_lossy()
+                && mount.options.iter().any(|option| option == "ro")
+        }));
+        let _ = std::fs::remove_file(artifact);
+    }
+
+    #[test]
+    fn tampered_destination_trust_artifact_fails_closed_without_pem_contents() {
+        let artifact =
+            crate::test_utils::unique_socket_path("tampered-additional-ca").with_extension("crt");
+        std::fs::write(&artifact, b"expected").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &artifact,
+            std::os::unix::fs::PermissionsExt::from_mode(0o444),
+        )
+        .unwrap();
+        let bundle = NetworkSupervisorTrustBundle::new(
+            b"expected".to_vec(),
+            1,
+            "sha256:expected",
+            artifact.clone(),
+        );
+        std::fs::remove_file(&artifact).unwrap();
+        std::fs::write(&artifact, b"BEGIN CERTIFICATE tampered contents").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &artifact,
+            std::os::unix::fs::PermissionsExt::from_mode(0o444),
+        )
+        .unwrap();
+
+        let Err(error) = network_trust_mount(&bundle) else {
+            panic!("tampering must fail closed");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("gateway-owned network additional CA artifact")
+        );
+        assert!(!error.to_string().contains("tampered contents"));
+        let _ = std::fs::remove_file(artifact);
+    }
+
+    #[test]
     fn isolated_pair_keeps_privileges_network_and_secrets_out_of_workload() {
         let sandbox = DriverSandbox {
             id: "pair".into(),
@@ -1892,6 +2106,7 @@ mod tests {
             image: &image,
             supervisor_bin: None,
             tls_secrets: None,
+            network_trust: None,
             identity: &identity,
         })
         .unwrap();
@@ -1910,9 +2125,39 @@ mod tests {
             vec!["--bootstrap", crate::isolation::BOOTSTRAP_PATH]
         );
         assert_eq!(specs.supervisor.user, "1000:1001");
+        assert_eq!(
+            specs
+                .supervisor
+                .env
+                .get(openshell_core::sandbox_env::CONTAINER_IMAGE_UID)
+                .map(String::as_str),
+            Some("sha256:image")
+        );
+        assert_eq!(
+            specs
+                .supervisor
+                .env
+                .get(openshell_core::sandbox_env::CONTAINER_IMAGE)
+                .map(String::as_str),
+            Some("image:latest")
+        );
+        assert!(
+            !specs
+                .workload
+                .env
+                .contains_key(openshell_core::sandbox_env::CONTAINER_IMAGE_UID)
+        );
         assert_eq!(specs.supervisor.groups, vec!["2000"]);
         assert!(specs.supervisor.cap_add.is_empty());
         assert_eq!(specs.workload.netns.nsmode, "none");
+        assert_eq!(
+            specs
+                .supervisor
+                .labels
+                .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
+                .map(String::as_str),
+            Some(NETWORK_SUPERVISOR_TRUST_GENERATION_NONE)
+        );
         assert_eq!(
             specs
                 .workload
@@ -1945,6 +2190,7 @@ mod tests {
             image: &ResolvedPodmanImage::new("sha256:image"),
             supervisor_bin: None,
             tls_secrets: None,
+            network_trust: None,
             identity: &default_identity,
         })
         .unwrap();
@@ -2011,7 +2257,7 @@ mod tests {
         assert_eq!(specs.supervisor.secrets.len(), 1);
         assert_eq!(specs.supervisor.secrets[0].source, "jwt");
         assert_eq!(specs.supervisor.secrets[0].uid, 1000);
-        assert_eq!(specs.supervisor.volumes.len(), 1);
+        assert_eq!(specs.supervisor.volumes.len(), 2);
         assert!(specs.workload.volumes[0].options.contains(&"rw".into()));
         assert!(!specs.workload.volumes[0].options.contains(&"nocopy".into()));
         assert!(specs.supervisor.volumes[0].options.contains(&"ro".into()));
@@ -2674,22 +2920,95 @@ mod tests {
 
     #[test]
     fn container_spec_passes_the_gateway_otlp_endpoint_to_the_supervisor() {
+        use openshell_core::sandbox_env::{
+            OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
+            OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol, SupervisorOtlp,
+        };
         let sandbox = test_sandbox("test-id", "legit-name");
         let spec = build_container_spec(&sandbox, &test_config());
+        assert!(spec["env"].get(OTLP_ENDPOINT).is_none());
+
+        let export = |endpoint: &str, protocol| {
+            Some(OtlpExport {
+                endpoint: endpoint.to_string(),
+                protocol,
+            })
+        };
+        let with_otlp = |supervisor_otlp| PodmanComputeConfig {
+            supervisor_otlp,
+            ..test_config()
+        };
+
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                traces: export("http://127.0.0.1:4317", OtlpProtocol::Grpc),
+                ..SupervisorOtlp::default()
+            }),
+        );
+        assert_eq!(spec["env"][OTLP_ENDPOINT], "http://127.0.0.1:4317");
+        assert!(spec["env"].get(OTLP_PROTOCOL).is_none());
+        assert!(spec["env"].get(OTLP_OCSF_ENDPOINT).is_none());
+
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                traces: export("http://127.0.0.1:4318", OtlpProtocol::HttpProtobuf),
+                ..SupervisorOtlp::default()
+            }),
+        );
+        assert_eq!(spec["env"][OTLP_PROTOCOL], "http/protobuf");
+
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                ocsf: export("http://siem:4317", OtlpProtocol::Grpc),
+                ..SupervisorOtlp::default()
+            }),
+        );
+        assert_eq!(spec["env"][OTLP_OCSF_ENDPOINT], "http://siem:4317");
+        assert!(spec["env"].get(OTLP_OCSF_PROTOCOL).is_none());
         assert!(
-            spec["env"]
-                .get(openshell_core::sandbox_env::OTLP_ENDPOINT)
-                .is_none()
+            spec["env"].get(OTLP_AGENT_ENDPOINT).is_none(),
+            "the agent trace relay stays off unless the gateway enables it"
         );
 
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                ocsf: export("http://siem:4318", OtlpProtocol::HttpProtobuf),
+                ..SupervisorOtlp::default()
+            }),
+        );
+        assert_eq!(spec["env"][OTLP_OCSF_PROTOCOL], "http/protobuf");
+
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                agent: export("http://agents:4317", OtlpProtocol::Grpc),
+                ..SupervisorOtlp::default()
+            }),
+        );
+        assert_eq!(spec["env"][OTLP_AGENT_ENDPOINT], "http://agents:4317");
+        assert!(spec["env"].get(OTLP_AGENT_PROTOCOL).is_none());
+
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                agent: export("http://agents:4318", OtlpProtocol::HttpProtobuf),
+                ..SupervisorOtlp::default()
+            }),
+        );
+        assert_eq!(spec["env"][OTLP_AGENT_PROTOCOL], "http/protobuf");
+
         let config = PodmanComputeConfig {
-            supervisor_otlp_endpoint: Some("http://127.0.0.1:4317".to_string()),
+            supervisor_gateway_name: Some("prod-west".to_string()),
             ..test_config()
         };
         let spec = build_container_spec(&sandbox, &config);
         assert_eq!(
-            spec["env"][openshell_core::sandbox_env::OTLP_ENDPOINT],
-            "http://127.0.0.1:4317"
+            spec["env"][openshell_core::sandbox_env::GATEWAY_NAME],
+            "prod-west"
         );
     }
 
@@ -2867,6 +3186,18 @@ mod tests {
                 |m| m["destination"].as_str() == Some("/etc/openshell/tls/proxy/ca-bundle.pem")
             ),
             "no CA bundle mount without operator config"
+        );
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| { m["destination"].as_str() == Some(ADDITIONAL_CA_MOUNT_PATH) }),
+            "no destination CA mount without global config"
+        );
+        assert!(
+            !spec_command(&spec)
+                .iter()
+                .any(|arg| arg == "--additional-ca-bundle"),
+            "no destination CA argument without global config"
         );
     }
 
@@ -3551,25 +3882,30 @@ mod tests {
     fn driver_config_rejects_reserved_mount_targets() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
-        let mut sandbox = test_sandbox("test-id", "test-name");
-        sandbox.spec = Some(DriverSandboxSpec {
-            template: Some(DriverSandboxTemplate {
-                driver_config: Some(json_struct(serde_json::json!({
-                    "mounts": [{
-                        "type": "volume",
-                        "source": "work-nfs",
-                        "target": "/etc/openshell/tls/client"
-                    }]
-                }))),
+        for target in ["/etc/openshell/tls/client", ADDITIONAL_CA_MOUNT_PATH] {
+            let mut sandbox = test_sandbox("test-id", "test-name");
+            sandbox.spec = Some(DriverSandboxSpec {
+                template: Some(DriverSandboxTemplate {
+                    driver_config: Some(json_struct(serde_json::json!({
+                        "mounts": [{
+                            "type": "volume",
+                            "source": "work-nfs",
+                            "target": target
+                        }]
+                    }))),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        });
-        let config = test_config();
+            });
+            let config = test_config();
 
-        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+            let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
-        assert!(err.to_string().contains("reserved OpenShell path"));
+            assert!(
+                err.to_string().contains("reserved OpenShell path"),
+                "target {target}: {err}"
+            );
+        }
     }
 
     #[test]

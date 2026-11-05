@@ -20,14 +20,256 @@ pub const ENDPOINT: &str = "OPENSHELL_ENDPOINT";
 /// Unique identifier of the sandbox being supervised.
 pub const SANDBOX_ID: &str = "OPENSHELL_SANDBOX_ID";
 
+/// Requested workload image reference, recorded in supervisor OCSF events.
+pub const CONTAINER_IMAGE: &str = "OPENSHELL_CONTAINER_IMAGE";
+
+/// Immutable workload image ID resolved by the compute driver at launch.
+pub const CONTAINER_IMAGE_UID: &str = "OPENSHELL_CONTAINER_IMAGE_UID";
+
 /// Filesystem path to the UNIX socket used for the in-sandbox SSH server.
 pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
-/// OTLP/gRPC collector endpoint for supervisor trace export.
+/// OTLP collector endpoint for supervisor trace export.
 pub const OTLP_ENDPOINT: &str = "OPENSHELL_OTLP_ENDPOINT";
+
+/// OTLP transport for supervisor trace export. Absent means gRPC.
+pub const OTLP_PROTOCOL: &str = "OPENSHELL_OTLP_PROTOCOL";
+
+/// OTLP collector endpoint for supervisor OCSF event export.
+pub const OTLP_OCSF_ENDPOINT: &str = "OPENSHELL_OTLP_OCSF_ENDPOINT";
+
+/// OTLP transport for supervisor OCSF event export. Absent means gRPC.
+pub const OTLP_OCSF_PROTOCOL: &str = "OPENSHELL_OTLP_OCSF_PROTOCOL";
+
+/// OTLP collector endpoint that supervisors relay workload traces to.
+///
+/// Set only when the gateway enables `[openshell.gateway.otlp.agent]`; absent
+/// keeps the relay inactive and leaves the workload environment unchanged.
+pub const OTLP_AGENT_ENDPOINT: &str = "OPENSHELL_OTLP_AGENT_ENDPOINT";
+
+/// OTLP transport that supervisors relay workload traces over. Absent means
+/// gRPC.
+pub const OTLP_AGENT_PROTOCOL: &str = "OPENSHELL_OTLP_AGENT_PROTOCOL";
+
+/// Name of the gateway that launched the sandbox, reported as
+/// `openshell.gateway.name` on supervisor telemetry.
+pub const GATEWAY_NAME: &str = "OPENSHELL_GATEWAY_NAME";
+
+/// OTLP transport, named with the `OTEL_EXPORTER_OTLP_PROTOCOL` values.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OtlpProtocol {
+    #[default]
+    #[serde(rename = "grpc")]
+    Grpc,
+    #[serde(rename = "http/protobuf")]
+    HttpProtobuf,
+}
+
+impl OtlpProtocol {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Grpc => "grpc",
+            Self::HttpProtobuf => "http/protobuf",
+        }
+    }
+}
+
+impl std::fmt::Display for OtlpProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for OtlpProtocol {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "grpc" => Ok(Self::Grpc),
+            "http/protobuf" => Ok(Self::HttpProtobuf),
+            other => Err(format!(
+                "unsupported OTLP protocol {other:?}: expected \"grpc\" or \"http/protobuf\""
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "otel")]
+impl From<OtlpProtocol> for openshell_otel::Protocol {
+    fn from(protocol: OtlpProtocol) -> Self {
+        match protocol {
+            OtlpProtocol::Grpc => Self::Grpc,
+            OtlpProtocol::HttpProtobuf => Self::HttpProtobuf,
+        }
+    }
+}
+
+/// One OTLP collector that a supervisor exports to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OtlpExport {
+    pub endpoint: String,
+    pub protocol: OtlpProtocol,
+}
+
+impl OtlpExport {
+    fn environment(
+        &self,
+        endpoint_var: &'static str,
+        protocol_var: &'static str,
+    ) -> impl Iterator<Item = (&'static str, String)> {
+        std::iter::once((endpoint_var, self.endpoint.clone())).chain(
+            (self.protocol != OtlpProtocol::Grpc)
+                .then(|| (protocol_var, self.protocol.to_string())),
+        )
+    }
+}
+
+/// The OTLP exports that a compute driver passes to its supervisors.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SupervisorOtlp {
+    /// The supervisor's own spans.
+    pub traces: Option<OtlpExport>,
+    /// OCSF events, as log records.
+    pub ocsf: Option<OtlpExport>,
+    /// Relayed workload traces.
+    pub agent: Option<OtlpExport>,
+}
+
+impl SupervisorOtlp {
+    /// Whether no export is configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.traces.is_none() && self.ocsf.is_none() && self.agent.is_none()
+    }
+
+    /// The supervisor environment variables for these exports.
+    pub fn environment(&self) -> Vec<(&'static str, String)> {
+        let traces = self
+            .traces
+            .iter()
+            .flat_map(|export| export.environment(OTLP_ENDPOINT, OTLP_PROTOCOL));
+        let ocsf = self
+            .ocsf
+            .iter()
+            .flat_map(|export| export.environment(OTLP_OCSF_ENDPOINT, OTLP_OCSF_PROTOCOL));
+        let agent = self
+            .agent
+            .iter()
+            .flat_map(|export| export.environment(OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL));
+        traces.chain(ocsf).chain(agent).collect()
+    }
+
+    /// Applies `rewrite` to every collector endpoint, for drivers whose
+    /// supervisors reach the gateway host under another name.
+    #[must_use]
+    pub fn map_endpoints(self, rewrite: impl Fn(String) -> String) -> Self {
+        let map = |export: Option<OtlpExport>| {
+            export.map(|export| OtlpExport {
+                endpoint: rewrite(export.endpoint),
+                ..export
+            })
+        };
+        Self {
+            traces: map(self.traces),
+            ocsf: map(self.ocsf),
+            agent: map(self.agent),
+        }
+    }
+}
+
+/// Compute-driver flags for the collectors given to supervisors, without the
+/// leading `--`. The driver flags read the same environment variables that
+/// supervisors do.
+pub const OTLP_ENDPOINT_FLAG: &str = "otlp-endpoint";
+pub const OTLP_PROTOCOL_FLAG: &str = "otlp-protocol";
+pub const OTLP_CA_FILE_FLAG: &str = "otlp-ca-file";
+pub const OTLP_CERT_FILE_FLAG: &str = "otlp-cert-file";
+pub const OTLP_KEY_FILE_FLAG: &str = "otlp-key-file";
+pub const OTLP_OCSF_ENDPOINT_FLAG: &str = "otlp-ocsf-endpoint";
+pub const OTLP_OCSF_PROTOCOL_FLAG: &str = "otlp-ocsf-protocol";
+pub const OTLP_AGENT_ENDPOINT_FLAG: &str = "otlp-agent-endpoint";
+pub const OTLP_AGENT_PROTOCOL_FLAG: &str = "otlp-agent-protocol";
+
+/// The OTLP flags every compute driver takes, flattened into its arguments.
+#[cfg(feature = "clap")]
+#[derive(Clone, Debug, Default, clap::Args)]
+pub struct SupervisorOtlpArgs {
+    /// OTLP collector endpoint for the driver's and supervisors' spans.
+    #[arg(long = OTLP_ENDPOINT_FLAG, env = OTLP_ENDPOINT)]
+    pub endpoint: Option<String>,
+
+    /// Transport to the trace collector: `grpc` or `http/protobuf`.
+    #[arg(long = OTLP_PROTOCOL_FLAG, env = OTLP_PROTOCOL, default_value_t)]
+    pub protocol: OtlpProtocol,
+
+    /// PEM certificates trusted to verify an `https://` trace collector.
+    #[arg(long = OTLP_CA_FILE_FLAG, env = "OPENSHELL_OTLP_CA_FILE")]
+    pub ca_file: Option<std::path::PathBuf>,
+
+    /// PEM client certificate presented to the trace collector.
+    #[arg(long = OTLP_CERT_FILE_FLAG, env = "OPENSHELL_OTLP_CERT_FILE", requires = "key_file")]
+    pub cert_file: Option<std::path::PathBuf>,
+
+    /// PEM private key for `--otlp-cert-file`.
+    #[arg(long = OTLP_KEY_FILE_FLAG, env = "OPENSHELL_OTLP_KEY_FILE", requires = "cert_file")]
+    pub key_file: Option<std::path::PathBuf>,
+
+    /// OTLP collector endpoint for supervisor OCSF event export.
+    #[arg(long = OTLP_OCSF_ENDPOINT_FLAG, env = OTLP_OCSF_ENDPOINT)]
+    pub ocsf_endpoint: Option<String>,
+
+    /// Transport to the OCSF collector: `grpc` or `http/protobuf`.
+    #[arg(long = OTLP_OCSF_PROTOCOL_FLAG, env = OTLP_OCSF_PROTOCOL, default_value_t)]
+    pub ocsf_protocol: OtlpProtocol,
+
+    /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
+    #[arg(
+        long = "otlp-ocsf-schema-version",
+        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
+        hide = true
+    )]
+    pub ocsf_schema_version: Option<String>,
+
+    /// OTLP collector endpoint that supervisors relay workload traces to.
+    /// Absent keeps the agent trace relay off.
+    #[arg(long = OTLP_AGENT_ENDPOINT_FLAG, env = OTLP_AGENT_ENDPOINT)]
+    pub agent_endpoint: Option<String>,
+
+    /// Transport to the agent trace relay's collector: `grpc` or `http/protobuf`.
+    #[arg(long = OTLP_AGENT_PROTOCOL_FLAG, env = OTLP_AGENT_PROTOCOL, default_value_t)]
+    pub agent_protocol: OtlpProtocol,
+}
+
+#[cfg(feature = "clap")]
+impl SupervisorOtlpArgs {
+    /// The exports these flags configure.
+    #[must_use]
+    pub fn supervisor_otlp(&self) -> SupervisorOtlp {
+        let export = |endpoint: &Option<String>, protocol| {
+            endpoint
+                .clone()
+                .map(|endpoint| OtlpExport { endpoint, protocol })
+        };
+        SupervisorOtlp {
+            traces: export(&self.endpoint, self.protocol),
+            ocsf: export(&self.ocsf_endpoint, self.ocsf_protocol),
+            agent: export(&self.agent_endpoint, self.agent_protocol),
+        }
+    }
+
+    /// Logs a warning when the deprecated schema version flag is set.
+    pub fn warn_deprecated(&self) {
+        if self.ocsf_schema_version.is_some() {
+            tracing::warn!(
+                "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION is deprecated and ignored; OpenShell emits OCSF 1.8.0"
+            );
+        }
+    }
+}
 
 /// Versioned specification for the exact canonical main process.
 ///
@@ -269,14 +511,249 @@ pub const DEFAULT_SANDBOX_GID: u32 = 1000;
 /// OCI only for the former contract.
 pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 
+/// Standard OpenTelemetry environment variable for the OTLP exporter endpoint.
+///
+/// While the supervisor serves the OTLP relay, the sandbox runtime sets it in
+/// workload processes to [`OTLP_RELAY_ENDPOINT`] as a lowest-precedence
+/// default, so agent SDKs export to the relay without configuration. It is
+/// not set when the creation request, the image, or a per-exec environment
+/// names an endpoint, generic or traces-specific, and any signal-specific
+/// endpoint the workload sets later takes precedence over it in the SDK.
+pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
+/// Standard OpenTelemetry environment variable for the OTLP exporter protocol.
+///
+/// Set to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_ENDPOINT`].
+pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+
+/// Signal-specific endpoint variable. Never injected; a layer that sets it
+/// has chosen where traces go, so the relay default is left out.
+pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+
+/// Standard OpenTelemetry environment variable for OTLP exporter compression.
+///
+/// Set to `none` alongside [`OTEL_EXPORTER_OTLP_ENDPOINT`], because the
+/// relay refuses compressed bodies.
+pub const OTEL_EXPORTER_OTLP_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_COMPRESSION";
+
+/// Signal-specific compression variable, also set to `none` with the relay
+/// default.
+///
+/// SDKs prefer it over [`OTEL_EXPORTER_OTLP_COMPRESSION`], so a `gzip` value
+/// from the image or the creation request would otherwise still compress
+/// every trace export.
+pub const OTEL_EXPORTER_OTLP_TRACES_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION";
+
+/// Reserved destination agent processes export OTLP to.
+///
+/// This address is never routed. A workload `connect()` to any non-loopback
+/// address is intercepted by the sandbox seccomp broker and staged for the
+/// supervisor, which recognises this destination and serves the OTLP
+/// receiver on the staged stream itself instead of dialing upstream. So the
+/// value is a label the supervisor switches on, and it must stay outside
+/// loopback (loopback connects complete locally without mediation) and
+/// outside `198.18.0.0/15`, which the policy DNS runtime uses for synthetic
+/// answers. `192.0.0.8` is the IPv4 dummy address (RFC 7600): reserved,
+/// unroutable, and never assigned to a real service.
+pub const OTLP_RELAY_ADDR: &str = "192.0.0.8:4318";
+
+/// [`OTLP_RELAY_ADDR`] as the URL injected through
+/// [`OTEL_EXPORTER_OTLP_ENDPOINT`].
+pub const OTLP_RELAY_ENDPOINT: &str = "http://192.0.0.8:4318";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
 // way it could bake `ENV` values.
 
 #[cfg(test)]
+mod otlp_relay_address_tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::{OTLP_RELAY_ADDR, OTLP_RELAY_ENDPOINT};
+
+    #[test]
+    fn relay_address_is_an_unroutable_non_loopback_label() {
+        let addr: SocketAddr = OTLP_RELAY_ADDR.parse().expect("relay address parses");
+        assert_eq!(addr.port(), 4318, "OTLP HTTP default port");
+        let IpAddr::V4(ip) = addr.ip() else {
+            panic!("relay address must be IPv4");
+        };
+        assert!(
+            !ip.is_loopback(),
+            "loopback would bypass seccomp mediation and never reach the supervisor"
+        );
+        assert_eq!(ip, Ipv4Addr::new(192, 0, 0, 8), "RFC 7600 dummy address");
+        let [a, b, ..] = ip.octets();
+        assert!(
+            !(a == 198 && (b == 18 || b == 19)),
+            "198.18.0.0/15 is the policy DNS synthetic answer pool"
+        );
+        assert_eq!(OTLP_RELAY_ENDPOINT, format!("http://{OTLP_RELAY_ADDR}"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "clap")]
+    #[test]
+    fn driver_flags_build_supervisor_otlp() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct Driver {
+            #[command(flatten)]
+            otlp: SupervisorOtlpArgs,
+        }
+
+        let driver = Driver::try_parse_from([
+            "driver",
+            "--otlp-endpoint",
+            "http://traces:4317",
+            "--otlp-ocsf-endpoint",
+            "http://siem:4318",
+            "--otlp-ocsf-protocol",
+            "http/protobuf",
+            "--otlp-ocsf-schema-version",
+            "2.0",
+            "--otlp-agent-endpoint",
+            "http://agents:4318",
+            "--otlp-agent-protocol",
+            "http/protobuf",
+        ])
+        .expect("OTLP flags should parse");
+
+        assert_eq!(driver.otlp.ocsf_schema_version.as_deref(), Some("2.0"));
+        assert_eq!(
+            driver.otlp.supervisor_otlp(),
+            SupervisorOtlp {
+                traces: Some(OtlpExport {
+                    endpoint: "http://traces:4317".into(),
+                    protocol: OtlpProtocol::Grpc,
+                }),
+                ocsf: Some(OtlpExport {
+                    endpoint: "http://siem:4318".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+                agent: Some(OtlpExport {
+                    endpoint: "http://agents:4318".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+            }
+        );
+        assert_eq!(
+            Driver::try_parse_from(["driver"])
+                .unwrap()
+                .otlp
+                .supervisor_otlp(),
+            SupervisorOtlp::default()
+        );
+    }
+
+    #[cfg(feature = "clap")]
+    #[test]
+    fn driver_flags_read_the_trace_collectors_tls_files() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct Driver {
+            #[command(flatten)]
+            otlp: SupervisorOtlpArgs,
+        }
+
+        let driver = Driver::try_parse_from([
+            "driver",
+            "--otlp-endpoint",
+            "https://collector:4317",
+            "--otlp-ca-file",
+            "/etc/otlp/ca.pem",
+            "--otlp-cert-file",
+            "/etc/otlp/client.pem",
+            "--otlp-key-file",
+            "/etc/otlp/client-key.pem",
+        ])
+        .expect("TLS files should parse");
+        assert_eq!(
+            [
+                driver.otlp.ca_file.as_deref(),
+                driver.otlp.cert_file.as_deref(),
+                driver.otlp.key_file.as_deref()
+            ],
+            [
+                Some(std::path::Path::new("/etc/otlp/ca.pem")),
+                Some(std::path::Path::new("/etc/otlp/client.pem")),
+                Some(std::path::Path::new("/etc/otlp/client-key.pem"))
+            ]
+        );
+        for flag in ["--otlp-cert-file", "--otlp-key-file"] {
+            assert!(
+                Driver::try_parse_from(["driver", flag, "/etc/otlp/file.pem"]).is_err(),
+                "{flag} needs its pair"
+            );
+        }
+    }
+
+    #[test]
+    fn otlp_protocol_uses_the_otel_exporter_protocol_values() {
+        for (value, protocol) in [
+            ("grpc", OtlpProtocol::Grpc),
+            ("http/protobuf", OtlpProtocol::HttpProtobuf),
+        ] {
+            assert_eq!(value.parse::<OtlpProtocol>(), Ok(protocol));
+            assert_eq!(protocol.as_str(), value);
+        }
+        assert_eq!(OtlpProtocol::default(), OtlpProtocol::Grpc);
+        assert!("http/json".parse::<OtlpProtocol>().is_err());
+        assert!("HTTP".parse::<OtlpProtocol>().is_err());
+    }
+
+    #[test]
+    fn supervisor_otlp_environment_names_each_lane() {
+        let export = |endpoint: &str, protocol| {
+            Some(OtlpExport {
+                endpoint: endpoint.into(),
+                protocol,
+            })
+        };
+        assert!(SupervisorOtlp::default().environment().is_empty());
+        let otlp = SupervisorOtlp {
+            traces: export("http://traces:4317", OtlpProtocol::Grpc),
+            ocsf: export("http://siem:4318", OtlpProtocol::HttpProtobuf),
+            agent: export("http://agents:4318", OtlpProtocol::HttpProtobuf),
+        };
+        assert_eq!(
+            otlp.environment(),
+            [
+                (OTLP_ENDPOINT, "http://traces:4317".to_string()),
+                (OTLP_OCSF_ENDPOINT, "http://siem:4318".to_string()),
+                (OTLP_OCSF_PROTOCOL, "http/protobuf".to_string()),
+                (OTLP_AGENT_ENDPOINT, "http://agents:4318".to_string()),
+                (OTLP_AGENT_PROTOCOL, "http/protobuf".to_string()),
+            ]
+        );
+        assert!(!otlp.is_empty());
+    }
+
+    #[test]
+    fn supervisor_otlp_rewrites_every_endpoint_and_keeps_protocols() {
+        let export = |endpoint: &str| {
+            Some(OtlpExport {
+                endpoint: endpoint.into(),
+                protocol: OtlpProtocol::HttpProtobuf,
+            })
+        };
+        let otlp = SupervisorOtlp {
+            traces: export("http://127.0.0.1:4317"),
+            ocsf: None,
+            agent: export("http://127.0.0.1:4318"),
+        }
+        .map_endpoints(|endpoint| endpoint.replace("127.0.0.1", "host.internal"));
+        assert_eq!(otlp.traces, export("http://host.internal:4317"));
+        assert_eq!(otlp.ocsf, None);
+        assert_eq!(otlp.agent, export("http://host.internal:4318"));
+    }
 
     #[test]
     fn main_process_transport_preserves_argument_boundaries() {

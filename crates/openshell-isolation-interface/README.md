@@ -1,8 +1,10 @@
-# Isolation backend interface
+# Isolation backend shared types
 
-This crate defines the supervisor-facing `IsolationBackend` contract, lifecycle
-states, and shared types. It forbids unsafe code, including in its tests.
+This crate contains shared data and validation for the Isolation Backend RPC
+contracts. It forbids unsafe code, including in its tests.
 
-Linux enforcement mechanisms belong to `openshell-sandbox::linux`. Backends
-implement this crate's safe contract without importing Linux mechanisms through
-the interface crate.
+The extension contracts are [`isolation_backend.proto`](../../proto/isolation_backend.proto)
+and [`sandbox_protocol.proto`](../../proto/sandbox_protocol.proto).
+The supervisor uses the concrete RPC client in `openshell-sandbox-backend`.
+Both in-tree and external backends implement the generated services.
+Linux process and enforcement helpers remain private to `openshell-sandbox`.

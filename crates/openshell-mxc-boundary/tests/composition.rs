@@ -19,10 +19,10 @@ fn shared_runtime_keeps_platform_audit_interpretation_in_backend_extension() {
     assert!(!protocol.contains("MxcSandboxAuditEvidence"));
     assert!(!protocol.contains("WindowsMxc"));
     let runtime = include_str!("../../openshell-sandbox-backend/src/runtime.rs");
-    assert!(runtime.contains("self.audit_validator.validate(&confirmation.backend_audit)?"));
-    assert!(runtime.contains("confirmation.properties != properties"));
+    assert!(runtime.contains("validate(&confirmation.backend_audit)?"));
+    assert!(runtime.contains("confirmation.provisioning_evidence_digest"));
     let composition = include_str!("../../openshell-supervisor/src/backend_setup/mxc.rs");
-    assert!(composition.contains("MxcRuntimeBackend::new"));
+    assert!(composition.contains("MxcRuntimeBackend::client"));
     assert!(composition.contains("impl BackendSetup for MxcBackendSetup"));
     assert!(composition.contains("impl PreparedBackend for MxcLaunch"));
     let supervisor = include_str!("../../openshell-supervisor/src/lib.rs");
@@ -30,9 +30,9 @@ fn shared_runtime_keeps_platform_audit_interpretation_in_backend_extension() {
     assert!(!supervisor.contains("OpenShellRuntimeBackend::discover_policy"));
     assert!(!supervisor.contains("MxcReverseTcpConnector"));
     let backend = include_str!("../src/backend.rs");
-    assert!(backend.contains("impl IsolationBackend for MxcRuntimeBackend"));
+    assert!(backend.contains("OpenShellRuntimeBackend::registered"));
     assert!(backend.contains("MxcBoundaryAuditValidator"));
-    assert!(backend.contains("self.transport.attach(descriptor, sandbox).await"));
+    assert!(backend.contains(".with_audit_validator"));
 }
 
 #[test]

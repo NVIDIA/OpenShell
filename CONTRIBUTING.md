@@ -70,9 +70,11 @@ Use agents and the repository skills as needed to understand the affected code, 
 
 Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTAINERS.md) before it can merge. This is enforced by the `OpenShell / Maintainer Approval` status check, which turns green once one of those reviewers approves. Reviews from other contributors are welcome and count toward the general approval requirement, but they do not satisfy this check.
 
-Pull requests that touch the enforcement machinery itself — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `.github/CODEOWNERS`, or the enforcement scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
+Pull requests that touch the enforcement machinery or reviewer routing — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `REVIEWERS.md`, `.github/CODEOWNERS`, or the enforcement and reviewer-routing scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
 
-Maintainers are not requested automatically. If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
+Use exactly one `area:` label and any relevant `topic:` labels on your pull request. The [reviewer routing workflow](.github/workflows/review-readiness.yml) requests all matching members of [REVIEWERS.md](REVIEWERS.md), excluding the author, when a PR opens ready for review, leaves draft status, or gains or loses an area/topic label. Reviewers do not need repository write access to receive requests or review PRs. Manual reviewer choices and people who have commented or reviewed are preserved. Propose roster membership changes through a reviewed PR.
+
+If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
 
 ## Agent Skills
 
@@ -101,20 +103,24 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Contributing    | `create-rfc`              | Create RFC proposals from the repository template                                                   |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
 | Contributing    | `create-github-issue`     | Create well-structured GitHub issues                                                                |
+| Contributing    | `create-security-advisory` | Prepare structured vulnerability reports and authorized private GitHub advisory drafts             |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
-| Reviewing       | `review-security-issue`   | Assess security issues for severity and remediation                                                 |
+| Reviewing       | `review-security-issue`   | Assess security issues and private advisories for severity and remediation                           |
 | Reviewing       | `fix-security-issue`      | Implement an approved security remediation plan                                                     |
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
 | Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Maintenance     | `release-openshell`       | Pick the latest qualified prerelease and tag its commit as stable                                   |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
+| Triage          | `review-triage-queue`     | Create a local, read-only queue report from GitHub intake                                           |
+| Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
 | Platform        | `build-openshell-mxc-windows` | Maintain and validate native x64 and ARM64 MSVC builds and MXC runtime on the `windows` branch |
 | Documentation   | `update-docs-from-commits` | Scan recent commits and draft doc updates for user-facing changes                                  |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
+| Maintenance     | `release-captain`         | Run the weekly Monday pre-flight and Tuesday stable release checklist                               |
 | Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |
 
 ### Issue Workflow
@@ -172,6 +178,29 @@ Linux/macOS development requirements:
 - Rust 1.94+
 - Python 3.11+
 - Docker (running)
+
+### Nix setup
+
+The `nix develop` shell and `nix run .#…` apps, such as tmachine and the test
+guests, need Nix with flakes. We recommend
+[Determinate Nix](https://docs.determinate.systems/), which CI also uses and
+which enables flakes by default. With another installer,
+[enable flakes](https://wiki.nixos.org/wiki/Flakes#Enabling_flakes_permanently)
+yourself.
+
+To download prebuilt dependencies instead of building them from source, add
+the OpenShell binary cache to your Nix configuration. With Determinate Nix, add
+these lines to
+[`/etc/nix/nix.custom.conf`](https://docs.determinate.systems/determinate-nix#configuration)
+and restart the Nix daemon:
+
+```text
+extra-substituters = https://openshell.cachix.org
+extra-trusted-public-keys = openshell.cachix.org-1:OAr5MunsfH5PZvUsfD08OtGx5RtcwdNZGJdU5FqLm5w=
+```
+
+With other installers, follow the setup instructions for the
+[`openshell` Cachix cache](https://app.cachix.org/cache/openshell).
 
 ### Z3 installation
 
@@ -358,6 +387,10 @@ These are the primary `mise` tasks for day-to-day development:
 | `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
+| `tests/testkit/` | Support library for SDK-driven end-to-end suites |
+| `tests/suites/` | End-to-end suites, grouped by test family |
+| `tests/tmachine/` | QEMU test machines provisioned with Ansible, and the `Session` API that drives them |
+| `tests/runner/` | `openshell-test-runner`: runs a test family in a tmachine environment and checks the results |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |
@@ -397,11 +430,15 @@ mise run docs
 
 PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch-docs.yml`, and they get a preview when `FERN_TOKEN` is available to the workflow.
 
-Release Dev publishes the `dev` docs version from `main`. Release Tag publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
+Release Dev publishes the `dev` docs version from `main`. Release publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
 
 `docs/` is the source-of-truth docs tree. `fern/` contains the site configuration, components, theme assets, and its README.
 
 See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authoring guide.
+
+## Stale Issues and Pull Requests
+
+Issues receive `state:stale` after 28 days without activity; pull requests receive it after 14 days. Issues labeled `roadmap`, `lifecycle:frozen`, or `state:frozen` are exempt from stale handling. Both frozen labels are supported while the naming convention is being decided. Issues close after another 14 days without activity; pull requests are not automatically closed. Comment on an item to reset the inactivity timer and remove its stale label.
 
 ## Pull Requests
 
@@ -410,7 +447,9 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 3. Run the checks appropriate to the affected code and behavior, as described below.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
 
-Every PR except an automated dependency update must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
+For release notes, describe the user-facing change in a few short, easy-to-read sentences in the optional **Release Notes** section of the PR description. Keep the section concise. Stable releases use it when non-empty; otherwise they summarize the PR title and description.
+
+Every PR must close an existing issue, except automated dependency updates and the build and flaky-test fixes described below. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
 Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance.
 
@@ -418,11 +457,13 @@ The `PR Issue Acceptance` workflow reports the native `OpenShell / PR Issue Acce
 
 Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not bypass `PR Issue Acceptance` for authors without repository write access or change applicable verification, review, or private vulnerability disclosure requirements.
 
+Authors with `WRITE`, `MAINTAIN`, or `ADMIN` access may open a PR that only fixes a broken build or flaky tests without a separate issue. Describe the failure in the PR instead. Authors without write access follow the normal issue and acceptance requirements.
+
 ### Branch Names
 
 Use `<type>/<issue-id>-<short-description>/<github-username>` for contributor branches. Choose the Conventional Commit type that describes the work, such as `feat`, `fix`, `refactor`, `chore`, `perf`, `docs`, `test`, or `ci`. The description is a short lowercase slug separated by hyphens; the final component is your GitHub login, not initials.
 
-For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
+For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. A PR without an issue omits the issue ID, such as `fix/flaky-sandbox-tests/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
 
 Branches created by automation, such as Dependabot and CI mirror branches, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
 

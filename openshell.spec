@@ -17,7 +17,14 @@ Version:        %{openshell_version}
 Release:        1.20260518180028805757.podman.toml.gateway.listener.11.g8c0cb7c8%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
-License:        Apache-2.0
+# OpenShell's own code is Apache-2.0. The binaries statically link third-party
+# crates; this is the minimal SPDX expression covering every crate linked into
+# openshell, openshell-gateway and openshell-prover (computed from `cargo tree`
+# license metadata, treating "X OR MIT" as satisfied by MIT or Apache-2.0).
+# The docs, man page sources, config templates and Python SDK sources carry
+# Apache-2.0 SPDX headers or fall under the repository LICENSE. The unit file is
+# generated from this spec. Re-check when Cargo.lock changes.
+License:        Apache-2.0 AND BSD-3-Clause AND CC0-1.0 AND CDLA-Permissive-2.0 AND ISC AND MIT AND Unicode-3.0 AND Zlib
 URL:            https://github.com/NVIDIA/OpenShell
 Source0: openshell-%{openshell_version}.tar.gz
 Source1: openshell-%{openshell_version}-vendor.tar.xz
@@ -69,11 +76,15 @@ within an operator-supplied maximum without connecting to a gateway.
 # --- Python SDK sub-package ---
 %package -n python3-%{name}
 Summary:        OpenShell Python SDK for agent execution and management
+# Pure Python; links none of the crates covered by the main License tag.
+License:        Apache-2.0
 # Use Recommends instead of Requires because Fedora 43+ ships older
 # versions of grpcio (1.48) and protobuf (3.19) than the SDK needs.
 # Users on distros with older packages can install these via pip/uv.
 Recommends:     python3-cloudpickle >= 3.0
+Recommends:     python3-googleapis-common-protos >= 1.63
 Recommends:     python3-grpcio >= 1.60
+Recommends:     python3-httpx >= 0.27
 Recommends:     python3-protobuf >= 4.25
 Recommends:     %{name}
 
@@ -193,7 +204,11 @@ install -d %{buildroot}%{python3_sitelib}/%{name}
 install -d %{buildroot}%{python3_sitelib}/%{name}/_proto
 
 install -pm 0644 python/%{name}/__init__.py %{buildroot}%{python3_sitelib}/%{name}/
+install -pm 0644 python/%{name}/errors.py %{buildroot}%{python3_sitelib}/%{name}/
+install -pm 0644 python/%{name}/mutations.py %{buildroot}%{python3_sitelib}/%{name}/
+install -pm 0644 python/%{name}/providers.py %{buildroot}%{python3_sitelib}/%{name}/
 install -pm 0644 python/%{name}/sandbox.py %{buildroot}%{python3_sitelib}/%{name}/
+install -pm 0644 python/%{name}/py.typed %{buildroot}%{python3_sitelib}/%{name}/
 install -pm 0644 python/%{name}/_proto/__init__.py %{buildroot}%{python3_sitelib}/%{name}/_proto/
 install -pm 0644 python/%{name}/_proto/*.py %{buildroot}%{python3_sitelib}/%{name}/_proto/
 
@@ -207,7 +222,9 @@ Summary: OpenShell Python SDK for agent execution and management
 License: Apache-2.0
 Requires-Python: >=3.12
 Requires-Dist: cloudpickle>=3.0
+Requires-Dist: googleapis-common-protos>=1.63
 Requires-Dist: grpcio>=1.60
+Requires-Dist: httpx>=0.27
 Requires-Dist: protobuf>=4.25
 EOF
 
@@ -232,6 +249,22 @@ touch %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-in
 # the full import pulls in grpcio and other runtime deps not present in the
 # build environment.
 PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata import version; v = version('openshell'); print(v); assert v == '%{openshell_python_version}', f'expected %{openshell_python_version}, got {v}'"
+
+# Verify every module the installed SDK pulls in with a relative import was
+# installed. Importing the package needs grpcio, which the build environment
+# does not have, so check the imports statically.
+%{python3} - %{buildroot}%{python3_sitelib}/%{name} <<'PY'
+import ast, pathlib, sys
+pkg = pathlib.Path(sys.argv[1])
+missing = []
+for source in pkg.glob("*.py"):
+    for node in ast.walk(ast.parse(source.read_text())):
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
+            base = pkg.joinpath(*node.module.split("."))
+            if not (base.with_suffix(".py").exists() or (base / "__init__.py").exists()):
+                missing.append(f"{source.name}: .{node.module}")
+assert not missing, f"installed SDK imports modules that were not installed: {missing}"
+PY
 
 # Verify the RPM default TOML config template was installed.
 # A missing template means first-start seeding silently falls back to the

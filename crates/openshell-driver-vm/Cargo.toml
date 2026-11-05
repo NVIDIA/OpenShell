@@ -24,7 +24,7 @@ name = "openshell-vm-init"
 path = "src/bin/openshell-vm-init.rs"
 
 [dependencies]
-openshell-core = { path = "../openshell-core", default-features = false }
+openshell-core = { path = "../openshell-core", default-features = false, features = ["clap"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 openshell-otel = { path = "../openshell-otel", optional = true }
@@ -50,7 +50,7 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 miette = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
+openshell-crypto = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -61,7 +61,7 @@ libloading = { version = "0.8", optional = true }
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 [features]
 # Portable test instrumentation, independent of the compute runtime.
@@ -80,6 +80,7 @@ compute-driver = [
     "dep:nix",
     "dep:oci-client",
     "dep:openshell-otel",
+    "openshell-core/otel",
     "dep:openshell-policy",
     "dep:openshell-driver-podman",
     "dep:openshell-vfio",
@@ -88,7 +89,7 @@ compute-driver = [
     "dep:polling",
     "dep:prost",
     "dep:prost-types",
-    "dep:rand",
+    "dep:openshell-crypto",
     "dep:sha2",
     "dep:tar",
     "dep:tokio-stream",
@@ -118,6 +119,7 @@ defaults-without-telemetry = ["compute-driver"]
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 temp-env = "0.3"
 tempfile = "3"
+rcgen = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 # smol-rs/polling drives the BSD/macOS parent-death detection in

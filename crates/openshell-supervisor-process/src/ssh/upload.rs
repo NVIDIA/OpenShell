@@ -10,7 +10,7 @@
 
 use super::input::{InputProgress, InputState};
 use openshell_core::upload::{ACK_INTERVAL_BYTES, PlanError, PlanReader, UploadPlan, WINDOW_BYTES};
-use openshell_isolation_interface::contract::BoundaryProcess;
+use openshell_sandbox_backend::BoundaryProcess;
 use russh::ChannelId;
 use russh::server::Handle;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ pub(super) struct Upload {
     plan: Option<PlanReader>,
     received: u64,
     progress: Option<watch::Receiver<InputProgress>>,
-    process: Option<Arc<dyn BoundaryProcess>>,
+    process: Option<Arc<BoundaryProcess>>,
     acks: Option<AbortHandle>,
     /// Set by whichever side reports the result: the exit task or a rejection.
     reported: Arc<AtomicBool>,
@@ -69,7 +69,7 @@ impl Upload {
         channel: ChannelId,
         handle: Handle,
         progress: watch::Receiver<InputProgress>,
-        process: Arc<dyn BoundaryProcess>,
+        process: Arc<BoundaryProcess>,
     ) -> Finisher {
         let acks = tokio::spawn(send_acks(
             handle,
@@ -168,7 +168,7 @@ async fn send_acks(
     handle: Handle,
     channel: ChannelId,
     mut progress: watch::Receiver<InputProgress>,
-    process: Arc<dyn BoundaryProcess>,
+    process: Arc<BoundaryProcess>,
 ) {
     // Zero tells the client that extraction started.
     if handle.data(channel, ack(0)).await.is_err() {

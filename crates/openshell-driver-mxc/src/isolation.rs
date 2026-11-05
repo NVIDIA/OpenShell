@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use openshell_isolation_interface::contract::{
-    BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+    BackendError, ProvisioningEvidence, ResolvedWorkloadIdentity,
 };
 use openshell_mxc_boundary::launch::{MxcBoundaryConfig, MxcLaunchDescriptor, MxcProxyConfig};
 use openshell_sandbox_backend::boundary_protocol::{
@@ -122,7 +122,7 @@ impl MxcBoundarySpec {
                     resource_claims: resource_claims.clone(),
                     resource_claim_files: BTreeMap::new(),
                     workload_identity: workload_identity.clone(),
-                    outer_fence: outer_fence.clone(),
+                    provisioning_evidence: outer_fence.clone(),
                     child_env: self.child_env,
                 },
             },
@@ -140,7 +140,7 @@ impl MxcBoundarySpec {
                     tls: self.supervisor_tls,
                     host_gateway_ip: Some(self.proxy_addr.ip()),
                     resource_claims,
-                    outer_fence,
+                    provisioning_evidence: outer_fence,
                 },
             },
         })
@@ -150,22 +150,13 @@ impl MxcBoundarySpec {
 fn windows_parity_outer_fence(
     generation: &str,
     evidence: &[u8],
-) -> Result<OuterFenceGuarantees, BackendError> {
+) -> Result<ProvisioningEvidence, BackendError> {
     // TODO(mxc-network-fence): Remove this temporary Windows-branch parity stub
     // once supervisor-only egress and live revocation are implemented. Broad
     // 127.0.0.1 access permits bypassing the proxy through other host services;
     // these assertions are NOT verified enforcement evidence. Keep this waiver
     // confined to MXC rather than weakening the shared confirmation contract.
-    OuterFenceGuarantees::from_enforcement_evidence(
-        generation,
-        [
-            OuterFenceGuarantee::DefaultDenyEgress,
-            OuterFenceGuarantee::NoUnmanagedEgressPath,
-            OuterFenceGuarantee::RevocationVerified,
-            OuterFenceGuarantee::ControllerLossFailsClosed,
-        ],
-        evidence,
-    )
+    ProvisioningEvidence::from_enforcement_evidence(generation, evidence)
 }
 
 #[cfg(test)]

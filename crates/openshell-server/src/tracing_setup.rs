@@ -13,22 +13,15 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::prelude::*;
 
-use crate::config_file::OtlpConfig;
-use crate::otel_tracing::{GatewayResourceAttributes, SetupError};
+use crate::otel_tracing::{GatewayResourceAttributes, OtlpExport, SetupError};
 use crate::tracing_bus::TracingLogBus;
 
 pub struct TracingHandle {
-    tracer_provider: Option<SdkTracerProvider>,
     driver_tracer_provider: Option<SdkTracerProvider>,
 }
 
 impl TracingHandle {
     pub fn shutdown(&self) {
-        if let Some(provider) = &self.tracer_provider
-            && let Err(err) = provider.shutdown()
-        {
-            tracing::warn!(error = %err, "OTLP tracer provider shutdown failed");
-        }
         if let Some(provider) = &self.driver_tracer_provider
             && let Err(err) = provider.shutdown()
         {
@@ -72,21 +65,21 @@ pub fn install(
     filter_directives: &str,
     tracing_log_bus: &TracingLogBus,
     ocsf_log: Option<&crate::ocsf_log::OcsfLog>,
-    otlp_config: Option<&OtlpConfig>,
+    otlp: Option<&OtlpExport>,
     driver: Option<openshell_otel::ComputeDriverTracing>,
     gateway: GatewayResourceAttributes<'_>,
 ) -> (TracingHandle, Option<SetupError>) {
-    let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config, gateway);
-    let driver_endpoint = driver
-        .is_some()
-        .then_some(otlp_config)
-        .flatten()
-        .map(|config| config.endpoint.as_str());
+    let driver_otlp = driver.is_some().then_some(otlp).flatten();
+    let driver_endpoint = driver_otlp.and_then(OtlpExport::traces_endpoint);
+    let driver_transport = driver_otlp
+        .map(OtlpExport::traces_transport)
+        .unwrap_or_default();
     let (driver_tracer_provider, driver_setup_error) = driver.map_or_else(
         || (None, None),
         |descriptor| {
             descriptor.provider_for(
                 driver_endpoint,
+                &driver_transport,
                 openshell_core::VERSION,
                 gateway.name(),
                 gateway.compute_driver(),
@@ -107,6 +100,13 @@ pub fn install(
                 })),
         )
         .with(
+            otlp.and_then(OtlpExport::ocsf)
+                .map(openshell_otel::OcsfOtlp::layer)
+                .with_filter(filter_fn(|metadata| {
+                    metadata.target() == openshell_ocsf::OCSF_TARGET
+                })),
+        )
+        .with(
             tracing_subscriber::fmt::layer()
                 .event_format(GatewayEventFormat)
                 .with_filter(filter_from(filter_directives)),
@@ -120,8 +120,7 @@ pub fn install(
         )
         .with(jsonl_layer)
         .with(
-            tracer_provider
-                .as_ref()
+            otlp.and_then(OtlpExport::tracer_provider)
                 .map(|provider| crate::otel_tracing::layer(provider, driver))
                 .with_filter(filter_from(filter_directives)),
         )
@@ -152,10 +151,9 @@ pub fn install(
 
     (
         TracingHandle {
-            tracer_provider,
             driver_tracer_provider,
         },
-        setup_error.or(driver_setup_error),
+        driver_setup_error,
     )
 }
 
@@ -265,6 +263,7 @@ mod tests {
             sandbox_id: "portable-audit".into(),
             sandbox_name: "portable-audit".into(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "gateway-host".into(),
             product_version: openshell_core::VERSION.into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),
@@ -320,6 +319,7 @@ mod tests {
             sandbox_id: "sandbox-filter-test".into(),
             sandbox_name: "filter-test".into(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "gateway-host".into(),
             product_version: openshell_core::VERSION.into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),

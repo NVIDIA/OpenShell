@@ -58,8 +58,14 @@ process. Include boundary-library regression tests in native workspace tests;
 their real process/socket checks are not qualification of MXC enforcement.
 
 Keep MXC audit schemas and their validators in the Windows boundary library.
-Register its `MxcRuntimeBackend` under `openshell-mxc` at supervisor composition.
-Use the private `BackendSetup` / `PreparedBackend` extension for launch decoding,
+Select `openshell-mxc` at supervisor composition, using the concrete RPC client
+with its reverse-TCP transport and native audit checker. Keep typed protocol
+negotiation, authenticated boundary opening, per-stream handle binding, and the
+Attach/Confirm policy equality check before StartAgent. Do not advertise MXC
+suspend/resume or supervisor takeover until implemented.
+MXC also rejects an active sandbox agent OTLP relay until its workload routing
+is implemented; keep agent relay export disabled for native MXC.
+Use `BackendSetup` / `PreparedBackend` for launch decoding,
 policy discovery, and client construction. Shared startup must not decode the
 MXC descriptor or allocate its connector. Retain the same reverse-TCP connector
 in prepared launch state through discovery, attachment, and reconnects.
@@ -87,7 +93,7 @@ provider-publication generations. Do not order opaque credential revisions
 numerically. MXC rejects unsupported provider file delivery before launch or
 environment replacement; it must not acknowledge files it did not install.
 
-Preserve main's shared outer-fence evidence contract. At the user's explicit
+Preserve main's generation-bound provisioning evidence contract. At the user's explicit
 request, MXC temporarily asserts the required guarantees for Windows-branch
 parity testing. These MXC-only assertions are stubs, not verified enforcement:
 broad host loopback and unverified live revocation remain known gaps. Keep the
@@ -232,10 +238,9 @@ exclusive on a single host (each rejects the other architecture -- see the
 table below): run `windows:test:mxc-real:x64` on an x64 host, or
 `windows:test:mxc-real:arm64` on an ARM64 host, as part of validating this
 subsystem -- run the one matching your host architecture, not both, and not
-neither. Both are skip-safe (they print a SKIP reason and exit 0 when
-`wxc-exec` or the matching backend isn't available), so running the
-arch-appropriate task is always safe even without real MXC hardware. Neither
-is part of `windows:ci`'s ordered contract, so invoke it explicitly.
+neither. Contract and fence checks can report `SKIP` when the executor or backend is unavailable; strict network qualification fails when prerequisites are missing. Report skips separately from passed tests. Neither task is part of `windows:ci`'s ordered contract, so invoke it explicitly.
+The task builds the native forwarding fixture first because network qualification
+calls the E2E harness directly, outside its mise dependencies.
 
 For full validation, detect the Windows host architecture first and choose the
 native lane dynamically:

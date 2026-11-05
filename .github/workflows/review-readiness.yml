@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Review Readiness
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: review-readiness-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  reviewers:
+    name: OpenShell / Review Readiness
+    if: >-
+      !github.event.pull_request.draft &&
+      (github.event.action == 'opened' ||
+       github.event.action == 'ready_for_review' ||
+       startsWith(github.event.label.name, 'area:') ||
+       startsWith(github.event.label.name, 'topic:'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Use the merged roster and helper, never code from the PR head.
+      - name: Check out the reviewer roster and helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            REVIEWERS.md
+            tasks/scripts/check_review_readiness.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Reconcile reviewer requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 tasks/scripts/check_review_readiness.py \
+            --repo "$GH_REPO" --pr "$PR_NUMBER" --apply

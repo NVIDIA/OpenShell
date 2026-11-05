@@ -61,7 +61,8 @@ if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
 
 `windows:ci` does not include the real MXC runtime tests or E2E. Run the matching
 `windows:test:mxc-real:*` task and `windows:e2e:mxc` explicitly.
-These tasks can report `SKIP` when the executor or backend is unavailable;
+The real-runtime task builds its native forwarding fixture before running tests.
+Contract and fence tests can report `SKIP` when the executor or backend is unavailable; strict network qualification fails when prerequisites are missing.
 full validation requires an MXC-capable host. E2E exits nonzero when any
 required runtime scenario fails or skips.
 

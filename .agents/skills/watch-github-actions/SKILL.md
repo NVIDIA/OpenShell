@@ -125,24 +125,42 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
-`Release Tag` temporarily omits Codex Security from its `Security Scan` job.
-Other scanners and qualification gates still run. Use the standalone
-`Codex Security Release Qualification` workflow for manual investigation.
+For Kubernetes app-listener E2E failures during kind setup, inspect the uploaded
+`results/app-listener/cni-setup/` evidence. It includes node and Calico pod
+descriptions, events, and current/previous container logs. A CNI rollout timeout
+occurs before the listener tests run; use these diagnostics to distinguish image
+pulls, init failures, and readiness failures.
 
-For `Codex Security`, an exit code of 2 with partial coverage is an incomplete
-scan, not a HIGH/CRITICAL threshold failure. Check the execution diagnostics in
-the job summary and the `codex-security-diagnostics-<run>-<attempt>` artifact on
+For tmachine Kubernetes conformance failures, inspect the `e2e-results-conformance-conformance-ubuntu-k3s-*` artifact. Its `diagnostics/` holds the K3s report with Agent Sandbox controller state, leader leases, events, and current and previous controller logs. The k3s installers check reconciliation after guest boot with a temporary scheduling-gated Sandbox probe, so a failed probe fails provisioning before any test runs. Distinguish a failed controller probe from a failed conformance scenario; gateway connectivity and controller Deployment availability do not prove reconciliation works.
+
+For the `e2e-suites` lane (`.github/workflows/e2e-suites.yml`), the last lines of the job log give the runner's result: PASS, FAIL (exit 1) after the end of the nextest log (which names the failed tests), or ERROR (exit 2) with the step that broke. FAIL and ERROR also appear as annotations on the run's summary page. Then inspect the `e2e-results-<family>-<package>-<environment>-<installer>` artifact, which holds `junit.xml`, `nextest.log` and, after a failure, the guest's `diagnostics/`.
+
+`Pre-release` runs Codex Security as a separate advisory qualification job.
+It scans the exact prerelease tag against the previous stable release. Findings
+and scanner execution failures do not affect qualification or publication;
+failed steps and warnings remain visible. `Release` uses the passing prerelease
+qualification result. Codex Security has no schedule or manual trigger.
+
+For Codex Security `0.8.3`, exit code 2 means an execution or required-output
+failure. Deferred investigations no longer cause that exit code. Check the
+execution diagnostics in the job summary and the
+`codex-security-diagnostics-<run>-<attempt>` artifact on
 scan failure. It contains fixed status values, aggregate coverage counts, and
 disk space before, after, and the minimum sampled every five seconds. Missing
 coverage or manifest documents indicate no readable final report was available;
-deferred items or surfaces needing follow-up can explain partial coverage.
+deferred items or surfaces needing follow-up describe coverage limitations.
+Current reports omit the legacy completeness field, so the diagnostic's
+`coverage` value is `unknown`; use `scan_status` and the exit code for execution.
 Sampling cannot rule out a disk spike between samples.
 
 Artifacts and logs in this public repository are public. Never upload the raw
 scan directory, `report.md`, `coverage.json`, findings, agent state, or scanner
 logs. Coverage reasons and notes are free text and may disclose vulnerabilities.
 The public diagnostic intentionally omits them; detailed review needs an
-approved private destination. Helpers must come from the workflow revision,
+approved private destination. Setting the repository variable
+`CODEX_SECURITY_DIAGNOSTICS_PUBLIC_KEY` enables bounded scanner logging and
+encrypted report retention. Only ciphertext is uploaded; the private key stays
+local. See `CI.md` for decryption. Helpers must come from the workflow revision,
 not from the candidate under scan.
 
 `setup-nix` retries development-shell preparation once when `prepare-shell`
@@ -159,29 +177,76 @@ not substitute the current `main` tip or the event's older PR base SHA. Merge
 groups and manual runs use their explicit baseline. Findings are reported by
 `Reject new high or critical findings`; distinguish those from scanner failures.
 
+For `Cargo Deny`, the metadata-only commands clear Rust compiler wrappers after
+entering mise; they do not require sccache. For OpenSSL backend and dynamic-linkage
+checks, use `nix develop .#crypto` from outside the default shell. The release
+toolchains in the default shell expose an unprefixed system AWS-LC that conflicts
+with OpenSSL. The crypto shell uses native OpenSSL and Cargo's symbol-prefixed
+AWS-LC build for dual-backend tests.
+
 For `Protobuf Compatibility`, check the logged train and comparison baseline.
-Branch Checks compares the prospective merge tree with its target; Release Tag
+Branch Checks compares the prospective merge tree with its target; release qualification
 compares the tagged candidate with the previous stable release. Both use
 the shared `check-protobuf-compatibility` action with `nix run .#check-protobuf-compatibility -- <ref>`.
 During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
-the `release-tag-v1` qualification profile. Both tagged pre-release and stable
-publication require this profile to pass. Failed, cancelled, or skipped suites
-block publication; build artifacts and qualification evidence remain in Actions
-storage for diagnosis. Source-SHA images are staging inputs for qualification.
-Snap builds run in parallel with qualification, but tagged stable Store uploads
-consume those built artifacts only after qualification passes.
+the `release-tag-v1` qualification profile. Pre-release calls the reusable
+`release-qualification.yml` workflow after building, in parallel with publication. Release
+selects the latest passing prerelease for the requested version and branch,
+verifies its qualification evidence, creates the stable tag at its exact commit,
+then rebuilds and publishes without rerunning qualification. The promotion job
+summary and `stable-promotion-*` artifact record the candidate and evidence.
+Both workflows accept optional tags. Tagless Pre-release creates the next
+candidate in the selected branch's seeded series; inspect Resolve Prerelease Tag
+for the actual tag and commit. Tagless Release infers the highest reachable
+prerelease version and stops if it is already stable. Explicit tags select an
+existing candidate or stable version for retries. Release Auto-Tag and manual
+candidate creation share a concurrency group; pending tag-resolution jobs can
+be waiting for that lock.
+Failed, cancelled, or skipped required suites fail
+qualification; stable publication is blocked, while published pre-release
+artifacts remain available. The Pre-release failure notification includes the
+run link. Both callers share `release-build.yml` and `release-publish.yml`.
+Qualification evidence remains in Actions; publishing a copy to OCI storage is best effort.
+Pre-release uploads snaps to `latest/beta`; stable releases upload to `latest/stable`.
+
+For a release notes preview, dispatch `release.yml` with `notes-only=true` and
+`tag=<stable-tag>`. The generator resolves the previous reachable stable tag;
+only `release-notes.yml` exposes an optional `previous-stable-tag` override.
+This runs the same
+`release-notes.yml` generator as stable publication and retains the `release-notes`
+artifact. Promotion, tag creation, builds, qualification, and publication are
+skipped. Check the `Prepare release notes` step before diagnosing model or
+GitHub API failures; it requires `LLM_INFERENCE_API_KEY`, `ANTHROPIC_BASE_URL`, and
+`ANTHROPIC_MODEL` in the repository Actions settings.
+
+Pre-release also runs `release-notes.yml` after building, alongside publication
+and qualification, and keeps the notes only in the `release-notes` artifact.
+This job is advisory: a notes failure emits a warning without failing the
+prerelease run or blocking promotion. Stable publication reuses the promoted
+prerelease's `release-notes` artifact, retagged, and generates notes only when
+that preview is unavailable. The Release workflow's `Release Notes` job summary
+says which happened, and Publish waits for that job.
 
 For `Codex Compatibility Review`, inspect its job summary and the
 `compatibility-review-run-<run-id>-attempt-<attempt>` artifact. Confirm the
 candidate and baseline SHAs before interpreting findings. `complete` describes
 execution and coverage, not compatibility: also read the assessment and findings.
 An `error`, incomplete coverage, or missing artifact means no clean review is
-available. The job is advisory and independent of publication gates; the
-qualification summary points to it without waiting for completion. Do not
-rerun Release Tag to debug this reviewer. Use its dedicated manual workflow
+available. Findings are advisory. The review targets breaking changes with high
+reasoning effort. Risk acceptance needs a linked author or verified-maintainer
+comment or review, not a PR description, general approval, or bot report.
+The full report keeps all findings and prior-comment links. `comment.md` includes
+only new or materially changed findings; unchanged reviews post no comment. Check
+the full artifact linked by qualification even when the bot is silent.
+The review is scheduled independently of Security Scan. The two Codex workflows
+share the `codex-release-review` concurrency group with `queue: max`, retaining
+up to 100 pending reviews while preventing overlapping API usage across runs.
+Either review can run first; other security scanners run in parallel.
+The qualification caller waits for both reviews to finish. Do not
+rerun Release or Pre-release to debug this reviewer. Use its dedicated manual workflow
 with an existing candidate tag; that path does not publish release artifacts.
 
 View logs for a specific run:

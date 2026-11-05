@@ -8,7 +8,6 @@ use openshell_isolation_interface::contract::{
 };
 use openshell_sandbox_backend::boundary_protocol::{BoundaryConfig, SandboxRuntimeDescriptor};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use std::{fmt, net::SocketAddr, path::PathBuf};
 
 /// Protected, generation-bound launch envelope decoded by Windows composition.
@@ -80,11 +79,13 @@ impl MxcProxyConfig {
             BackendError::Descriptor(format!("read MXC workload identity: {error}"))
         })?;
         let digest: Sha256Digest =
-            format!("{:x}", Sha256::digest(&bytes))
-                .parse()
-                .map_err(|error| {
-                    BackendError::Descriptor(format!("hash MXC workload identity: {error}"))
-                })?;
+            hex::encode(openshell_crypto::sha256(&bytes).map_err(|error| {
+                BackendError::Descriptor(format!("hash MXC workload identity: {error}"))
+            })?)
+            .parse()
+            .map_err(|error| {
+                BackendError::Descriptor(format!("hash MXC workload identity: {error}"))
+            })?;
         Ok(BinaryIdentity {
             executable: ExecutableIdentity {
                 path: self.workload_binary.clone(),
@@ -153,7 +154,7 @@ mod tests {
         assert_eq!(
             first.executable.digest,
             Some(
-                format!("{:x}", Sha256::digest(b"first workload"))
+                hex::encode(openshell_crypto::sha256(b"first workload").unwrap())
                     .parse()
                     .unwrap()
             )

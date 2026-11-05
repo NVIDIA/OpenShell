@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from codex_security_diagnostics import coverage_summary
+from codex_security_diagnostics import PRIVATE_LOG_LIMIT, coverage_summary
 
 SCRIPT = Path(__file__).with_name("codex_security_diagnostics.py")
 SENSITIVE = "PRIVATE_FINDING_secret_token_source_code"
@@ -118,13 +118,21 @@ def test_unknown_enum_values_are_not_published(tmp_path, value):
     assert SENSITIVE not in json.dumps(report)
 
 
-def test_missing_invalid_and_symlinked_reports_do_not_echo_contents(tmp_path):
+def test_missing_invalid_reports_do_not_echo_contents(tmp_path):
     assert coverage_summary(tmp_path)["coverage_document"] == "missing"
     path = tmp_path / "coverage.json"
     path.write_text(SENSITIVE)
     assert coverage_summary(tmp_path)["coverage_document"] == "invalid"
-    path.unlink()
-    path.symlink_to(tmp_path / "scan-manifest.json")
+
+
+def test_symlinked_reports_do_not_echo_contents(tmp_path):
+    path = tmp_path / "coverage.json"
+    try:
+        path.symlink_to(tmp_path / "scan-manifest.json")
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Windows symlink creation requires Developer Mode or elevation")
+        raise
     assert coverage_summary(tmp_path)["coverage_document"] == "invalid"
 
 
@@ -139,7 +147,9 @@ def test_missing_invalid_and_symlinked_reports_do_not_echo_contents(tmp_path):
 def test_fifo_report_does_not_block_diagnostics(tmp_path, filename, field):
     scan = tmp_path / "scan"
     scan.mkdir()
-    os.mkfifo(scan / filename)
+    mkfifo = getattr(os, "mkfifo", None)
+    assert mkfifo is not None
+    mkfifo(scan / filename)
     output = tmp_path / "diagnostics.json"
     result = subprocess.run(
         [
@@ -188,3 +198,35 @@ def test_scan_output_directory_stays_empty_until_scanner_writes(tmp_path):
     )
     assert result.returncode == 0
     assert json.loads(output.read_text())["coverage_document"] == "missing"
+
+
+def test_private_log_is_bounded_and_never_published(tmp_path):
+    output = tmp_path / "diagnostics.json"
+    private_log = tmp_path / "scan.log"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--scan-dir",
+            str(tmp_path / "scan"),
+            "--output",
+            str(output),
+            "--private-log",
+            str(private_log),
+            "--",
+            sys.executable,
+            "-c",
+            f"import sys; print({SENSITIVE!r}, flush=True); "
+            f"sys.stderr.write('x' * {PRIVATE_LOG_LIMIT * 2}); sys.exit(2)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 2
+    assert SENSITIVE in private_log.read_text()
+    assert private_log.stat().st_size == PRIVATE_LOG_LIMIT
+    if os.name == "posix":
+        assert private_log.stat().st_mode & 0o777 == 0o600
+    assert SENSITIVE not in result.stdout + result.stderr + output.read_text()

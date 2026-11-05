@@ -36,10 +36,6 @@ contain access that the proposal risk check would flag.
 This page covers the boundary check. To learn about the proposal risk check,
 refer to [Policy Advisor](/how-it-works/policies/advisor).
 
-For snap installations, replace `openshell-prover` in these examples with
-`openshell.prover`. The `openshell-prover` snap alias requires Store approval
-and may not be available.
-
 The prover remains independent of the gateway at runtime. If you only need the
 standalone binary, use the artifacts listed in the
 [Support Matrix](/about/support-matrix#standalone-policy-prover). These
@@ -60,10 +56,9 @@ or MCP rules, the prover reports that it cannot check the policy instead of
 ignoring those rules. [What the Boundary Check
 Covers](#what-the-boundary-check-covers) describes each part and its limits.
 
-The Homebrew, Debian, RPM, and snap packages install the prover. Homebrew,
-Debian, and RPM expose it as `openshell-prover`; use `openshell.prover` with the
-snap. The CLI reads policy files on your machine, does not need a gateway, and
-does not apply or approve policies.
+The Homebrew, Debian, RPM, and snap packages install the prover. The CLI reads
+policy files on your machine, does not need a gateway, and does not apply or
+approve policies.
 
 Create `boundary.yaml`, a boundary that allows reading `/usr` and `/etc`:
 

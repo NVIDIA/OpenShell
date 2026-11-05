@@ -9,6 +9,7 @@
 
 use std::process::Stdio;
 
+use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::cli::run_cli;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
@@ -74,6 +75,112 @@ fn bootstrap_image(resource: &serde_json::Value, index: usize) -> &serde_json::V
     &resource["spec"]["podTemplate"]["spec"]["initContainers"][index]["image"]
 }
 
+async fn service(resource: &serde_json::Value, prefix: &str) -> serde_json::Value {
+    let sandbox_id = resource["metadata"]["labels"]["openshell.ai/sandbox-id"]
+        .as_str()
+        .expect("sandbox ID");
+    serde_json::from_str(
+        &kubectl(&[
+            "-n",
+            &namespace(),
+            "get",
+            "service",
+            &format!("{prefix}-{sandbox_id}"),
+            "-o",
+            "json",
+        ])
+        .await,
+    )
+    .expect("parse Service")
+}
+
+async fn legacy_lifecycle(endpoint: &str, operation: &str, name: &str) {
+    let output = openshell_cmd()
+        .args(["--gateway-endpoint", endpoint, "sandbox", operation, name])
+        .output()
+        .await
+        .expect("legacy gateway lifecycle command");
+    assert!(
+        output.status.success(),
+        "legacy {operation} failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Run with an old gateway sharing the fixture database, signing keys and
+/// cluster, with its own matching supervisor/runtime images. The configured
+/// gateway endpoint must target the new gateway.
+#[tokio::test]
+#[ignore = "requires OPENSHELL_E2E_LEGACY_GATEWAY_ENDPOINT and a mixed-version gateway fixture"]
+async fn old_and_new_gateways_can_restart_the_same_sandbox() {
+    let legacy =
+        std::env::var("OPENSHELL_E2E_LEGACY_GATEWAY_ENDPOINT").expect("legacy gateway endpoint");
+    let mut sandbox = SandboxGuard::create_keep(
+        &["sh", "-c", "echo mixed-ready; exec sleep infinity"],
+        "mixed-ready",
+    )
+    .await
+    .expect("create sandbox through new gateway");
+    let (created, _) = sandbox_resource(&sandbox.name).await;
+    let boundary = service(&created, "os-boundary").await;
+    let supervisor = service(&created, "os-supervisor").await;
+    assert_eq!(
+        boundary["spec"]["selector"]["openshell.ai/boundary-role"],
+        "workload"
+    );
+    assert_eq!(
+        supervisor["spec"]["selector"]["openshell.ai/boundary-role"],
+        "supervisor"
+    );
+    assert_ne!(
+        boundary["spec"]["clusterIP"],
+        supervisor["spec"]["clusterIP"]
+    );
+
+    legacy_lifecycle(&legacy, "stop", &sandbox.name).await;
+    legacy_lifecycle(&legacy, "start", &sandbox.name).await;
+    let (restarted, _) = sandbox_resource(&sandbox.name).await;
+    let annotations = &restarted["metadata"]["annotations"];
+    assert_ne!(
+        annotations["openshell.ai/sandbox-runtime-generation"],
+        annotations["openshell.ai/sandbox-runtime-control-generation"]
+    );
+    assert!(
+        sandbox
+            .exec(&["printf", "old-ready"])
+            .await
+            .expect("old pair exec")
+            .contains("old-ready")
+    );
+
+    for operation in ["stop", "start"] {
+        let (output, code) = run_cli(&["sandbox", operation, &sandbox.name]).await;
+        assert_eq!(code, 0, "new gateway {operation}: {output}");
+    }
+    assert!(
+        sandbox
+            .exec(&["printf", "new-ready"])
+            .await
+            .expect("new pair exec")
+            .contains("new-ready")
+    );
+    let (restarted, _) = sandbox_resource(&sandbox.name).await;
+    let annotations = &restarted["metadata"]["annotations"];
+    assert_eq!(
+        annotations["openshell.ai/sandbox-runtime-generation"],
+        annotations["openshell.ai/sandbox-runtime-control-generation"]
+    );
+    let unchanged = service(&restarted, "os-boundary").await;
+    assert_eq!(unchanged["metadata"]["uid"], boundary["metadata"]["uid"]);
+    assert_eq!(
+        unchanged["spec"]["clusterIP"],
+        boundary["spec"]["clusterIP"]
+    );
+    assert_eq!(unchanged["spec"]["selector"], boundary["spec"]["selector"]);
+    sandbox.cleanup().await;
+}
+
 #[tokio::test]
 async fn start_refreshes_stale_bootstrap_image() {
     let mut sandbox = SandboxGuard::create_keep(
@@ -95,6 +202,20 @@ async fn start_refreshes_stale_bootstrap_image() {
 
     // An older gateway stored its own runtime image in the resource.
     let (before, index) = sandbox_resource(&sandbox.name).await;
+    let boundary = service(&before, "os-boundary").await;
+    let supervisor = service(&before, "os-supervisor").await;
+    // A legacy sandbox has no supervisor Service. Adding it on start must
+    // preserve the workload Service that old gateways use.
+    kubectl(&[
+        "-n",
+        &namespace(),
+        "delete",
+        "service",
+        supervisor["metadata"]["name"]
+            .as_str()
+            .expect("supervisor Service name"),
+    ])
+    .await;
     let patch = serde_json::json!([{
         "op": "replace",
         "path": format!("/spec/podTemplate/spec/initContainers/{index}/image"),
@@ -127,6 +248,20 @@ async fn start_refreshes_stale_bootstrap_image() {
     );
     let (after, after_index) = sandbox_resource(&sandbox.name).await;
     assert_eq!(after["metadata"]["uid"], before["metadata"]["uid"]);
+    let unchanged = service(&after, "os-boundary").await;
+    assert_eq!(unchanged["metadata"]["uid"], boundary["metadata"]["uid"]);
+    assert_eq!(
+        unchanged["spec"]["clusterIP"],
+        boundary["spec"]["clusterIP"]
+    );
+    assert_eq!(
+        unchanged["spec"]["selector"]["openshell.ai/boundary-role"],
+        "workload"
+    );
+    assert_eq!(
+        service(&after, "os-supervisor").await["spec"]["selector"]["openshell.ai/boundary-role"],
+        "supervisor"
+    );
     assert_eq!(
         bootstrap_image(&after, after_index),
         bootstrap_image(&before, index)

@@ -82,6 +82,22 @@ If this fails, run the local Codex login flow outside the gator launch. If Codex
 
 The launcher passes the non-secret host account ID as literal `CODEX_ACCOUNT_ID` for Codex's local workspace routing. The harness must not use the opaque `CODEX_AUTH_ACCOUNT_ID` credential placeholder for that comparison. Access tokens remain placeholders, and refresh material remains gateway-only.
 
+The image contains task-independent tooling and a prompt template, not the run's PR assignment or test authorization. The launcher supplies those instructions at runtime through `OPENSHELL_AGENT_TASK` in the canonical process command. The supervisor captures the assembled prompt in memory and supplies it on stdin for every cycle. Task text is non-secret and may appear in runtime command metadata; never put credentials in the task. Task-only changes reuse the same tooling build inputs, although the launcher still builds/tags an image per invocation.
+
+For Kubernetes gateways, select image delivery explicitly: `--k3d-cluster NAME`
+builds with Docker and imports into a running local cluster with the matching
+current kube context; `--publish-image REGISTRY/REPOSITORY:TAG` builds and pushes,
+then launches by resolved digest; `--image REGISTRY/REPOSITORY@sha256:DIGEST`
+reuses trusted compatible tooling without local image tools. Do not infer
+locality from a loopback endpoint. The k3d selection asserts which cluster
+serves the gateway; imported images require `if_not_present` or `never` pull
+policy. Registry builds use the builder's platform and existing registry auth;
+nodes need their own pull access. `--build-only` builds/delivers without
+gateway mutations, provider credential reads, or a sandbox launch. Reused
+images must match the local manifest's agent ID and payload version and support
+the runtime task contract; legacy baked-task images fail startup. See
+`scripts/agents/gator/README.md` for examples and option compatibility.
+
 ### Step 5: Verify Gateway Is Registered And Alive
 
 Use the target gateway from the operator request or current session context. Do not assume a gateway name. If the operator did not specify one, list registered gateways and ask before launching when the correct target is ambiguous.
@@ -109,7 +125,7 @@ gateway_name="<selected-gateway-name>"
 openshell --gateway "$gateway_name" sandbox list
 ```
 
-Look for names like `gator-pr-<number>-supervised`. If one exists, inspect its log before deleting or relaunching.
+Look for names like `gtr-pr-<number>-watch`. If one exists, inspect its log before deleting or relaunching.
 
 ## Input Normalization
 
@@ -129,11 +145,14 @@ pr_number="<digits-only>"
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 ```
 
-Use the portable Kubernetes DNS-1123 sandbox-name format even when the selected gateway currently uses another driver:
+Sandbox names must be DNS-1123 labels of at most **19 characters**, including
+any suffix. The gateway reserves room for workspace, sandbox, and service
+segments in one DNS label; this limit applies to every compute driver. Use
+short names and validate them before launching:
 
 ```bash
-sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+sandbox_name="gtr-pr-${pr_number}-watch"
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 ```
 
 For local image contexts passed to `--from`, use an agent-created path such as `mktemp -d`; do not pass raw user-supplied paths without validating that they are expected local Dockerfile contexts.
@@ -149,8 +168,8 @@ gateway_name="<selected-gateway-name>"
 pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
-sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+sandbox_name="gtr-pr-${pr_number}-watch"
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -160,7 +179,7 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
-The launcher queries the gateway's selected compute driver, builds the gator image in the matching Docker or Podman image store, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, and starts the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the canonical main process exits and its terminal result is finalized. `CONTAINER_ENGINE`, when set, must match the gateway driver.
+The launcher queries the gateway's selected compute driver and prepares the image through the selected build/import/publish or prebuilt path before importing provider profiles, configuring provider credentials and refresh, and starting the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the canonical main process exits and its terminal result is finalized. `CONTAINER_ENGINE`, when set, must match Docker/Podman gateways or Docker for k3d imports; registry builds for Kubernetes may use either local engine.
 
 The launcher streams image-build and provisioning output until the detached workload is ready, then exits. Use `openshell logs <sandbox-name>` or the TUI for runtime output.
 
@@ -171,8 +190,8 @@ gateway_name="<selected-gateway-name>"
 issue_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$issue_number" =~ ^[0-9]+$ ]] || { echo "invalid issue number" >&2; exit 1; }
-sandbox_name="gator-issue-${issue_number}-supervised"
-[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+sandbox_name="gtr-i-${issue_number}-watch"
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -191,8 +210,8 @@ issue_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 [[ "$issue_number" =~ ^[0-9]+$ ]] || { echo "invalid issue number" >&2; exit 1; }
-sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+sandbox_name="gtr-pr-${pr_number}-watch"
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -211,8 +230,8 @@ gateway_name="<selected-gateway-name>"
 pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
-sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+sandbox_name="gtr-pr-${pr_number}-watch"
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -231,8 +250,8 @@ gateway_name="<selected-gateway-name>"
 pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
-sandbox_name="gator-pr-${pr_number}-gpt56sol-supervised"
-[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+sandbox_name="gtr-pr-${pr_number}-exp"
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 CODEX_MODEL=gpt-5.6-sol \
 ./scripts/agents/run.sh \
@@ -244,6 +263,8 @@ CODEX_MODEL=gpt-5.6-sol \
 ```
 
 If the installed Codex CLI is too old for a model, create a temporary copy of `scripts/agents/gator/`, adjust only that temporary Dockerfile, and launch with that generated context. Keep the repo Dockerfile unchanged unless the version bump is the intended code change.
+The short `-exp` suffix below identifies an experimental watcher; keep its full
+name within 19 characters.
 
 Example shape:
 
@@ -252,8 +273,8 @@ gateway_name="<selected-gateway-name>"
 pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
-sandbox_name="gator-pr-${pr_number}-gpt56sol-supervised"
-[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+sandbox_name="gtr-pr-${pr_number}-exp"
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 tmp_context="$(mktemp -d "${TMPDIR:-/tmp}/gator-codex-XXXXXX")"
 cp -R scripts/agents/gator/. "$tmp_context"/
 
@@ -298,7 +319,7 @@ The launcher streams image-build and provisioning output to the terminal. Import
 gateway_name="<selected-gateway-name>"
 sandbox_name="<safe-sandbox-name>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
-[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 openshell --gateway "$gateway_name" sandbox list
 openshell --gateway "$gateway_name" sandbox get "$sandbox_name"
@@ -338,7 +359,7 @@ Before deleting, check that the sandbox is truly stale or that the operator aske
 gateway_name="<selected-gateway-name>"
 sandbox_name="<safe-sandbox-name>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
-[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 openshell --gateway "$gateway_name" sandbox delete "$sandbox_name"
 ./scripts/agents/run.sh \

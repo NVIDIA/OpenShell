@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use openshell_core::jwt::{SandboxLaunchAuthentication, SecretSshHostKey};
 use openshell_core::proto::Sandbox;
-use openshell_core::proto::datamodel::v1::{CredentialHandle, ObjectMeta, Provider};
-use openshell_core::{ObjectId as _, ObjectName as _, ObjectWorkspace as _};
+use openshell_core::proto::datamodel::v1::CredentialHandle;
+use openshell_core::{ObjectId as _, ObjectWorkspace as _};
+use openshell_credential_issuer::SecretOwner;
 use prost::Message as _;
 use russh::keys::{Algorithm, HashAlg, PrivateKey};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,7 @@ pub struct SshIdentityStore {
 mod tests {
     use super::*;
     use openshell_core::jwt::{CredentialEpoch, SecretJwt, SessionRotation, SupervisorAuthBundle};
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::{SandboxSessionId, sandbox_generation::SandboxGenerationId};
 
     async fn fixture() -> SshIdentityStore {
@@ -72,6 +74,13 @@ mod tests {
                 sandbox_token: SecretJwt::parse("sandbox-token").unwrap(),
                 sandbox_expires_at: 0,
                 ssh_host_private_key: None,
+                traces_otlp_headers: None,
+                ocsf_otlp_headers: None,
+                agent_otlp_headers: None,
+                otlp_tls: Vec::new(),
+                traces_otlp_tls: None,
+                ocsf_otlp_tls: None,
+                agent_otlp_tls: None,
             },
             gateway_id: "gateway".to_string(),
             verification_keys: Vec::new(),
@@ -354,13 +363,13 @@ impl SshIdentityStore {
         }
         let handle = CredentialHandle::decode(identity.credential_handle.as_slice())
             .map_err(|_| Status::internal("invalid SSH identity credential handle"))?;
-        let provider = Self::owner(
-            sandbox,
-            HashMap::from([(CREDENTIAL_KEY.to_string(), handle)]),
-        );
         let mut resolved = self
             .credentials
-            .resolve_provider_handles(&provider, 0)
+            .resolve_secrets(
+                Self::owner(sandbox),
+                &HashMap::from([(CREDENTIAL_KEY.to_string(), handle)]),
+                0,
+            )
             .await?;
         let private_key = resolved
             .values
@@ -390,17 +399,8 @@ impl SshIdentityStore {
         format!("sandbox-ssh:{}", sandbox.object_id())
     }
 
-    fn owner(sandbox: &Sandbox, handles: HashMap<String, CredentialHandle>) -> Provider {
-        Provider {
-            metadata: Some(ObjectMeta {
-                id: sandbox.object_id().to_string(),
-                name: format!("sandbox-ssh-{}", sandbox.object_id()),
-                workspace: sandbox.object_workspace().to_string(),
-                ..Default::default()
-            }),
-            credential_handles: handles,
-            ..Default::default()
-        }
+    fn owner(sandbox: &Sandbox) -> SecretOwner<'_> {
+        SecretOwner::sandbox(sandbox.object_workspace(), sandbox.object_id())
     }
 
     async fn load(&self, sandbox: &Sandbox) -> Result<Option<StoredIdentity>, Status> {
@@ -429,16 +429,14 @@ impl SshIdentityStore {
         let private_key = key
             .to_openssh(russh::keys::ssh_key::LineEnding::default())
             .map_err(|_| Status::internal("encode sandbox SSH host key failed"))?;
-        let owner = Self::owner(sandbox, HashMap::new());
+        let owner = Self::owner(sandbox);
         // A distinct candidate path is essential for K8s/Vault: losing a CAS
         // must never overwrite or delete the winning candidate's credential.
         let candidate_id = uuid::Uuid::new_v4().to_string();
         let handles = self
             .credentials
-            .store_provider_credentials_with_object_id(
-                owner.object_name(),
-                sandbox.object_workspace(),
-                sandbox.object_id(),
+            .store_secrets_with_object_id(
+                owner,
                 &candidate_id,
                 &HashMap::from([(CREDENTIAL_KEY.to_string(), private_key.to_string())]),
                 &HashMap::new(),
@@ -469,14 +467,7 @@ impl SshIdentityStore {
             .await
             .is_err()
         {
-            self.credentials
-                .delete_provider_credential_handles(
-                    owner.object_name(),
-                    sandbox.object_workspace(),
-                    sandbox.object_id(),
-                    &handles,
-                )
-                .await?;
+            self.credentials.delete_secrets(owner, &handles).await?;
             return Err(Status::unavailable("stage sandbox SSH identity failed"));
         }
         match self
@@ -502,14 +493,7 @@ impl SshIdentityStore {
                 Ok(identity)
             }
             Err(error) => {
-                self.credentials
-                    .delete_provider_credential_handles(
-                        owner.object_name(),
-                        sandbox.object_workspace(),
-                        sandbox.object_id(),
-                        &handles,
-                    )
-                    .await?;
+                self.credentials.delete_secrets(owner, &handles).await?;
                 self.store
                     .delete(CANDIDATE_TYPE, &candidate_id)
                     .await
@@ -585,12 +569,9 @@ impl SshIdentityStore {
     ) -> Result<(), Status> {
         let handle = CredentialHandle::decode(identity.credential_handle.as_slice())
             .map_err(|_| Status::internal("invalid SSH identity credential handle"))?;
-        let owner = Self::owner(sandbox, HashMap::new());
         self.credentials
-            .delete_provider_credential_handles(
-                owner.object_name(),
-                sandbox.object_workspace(),
-                sandbox.object_id(),
+            .delete_secrets(
+                Self::owner(sandbox),
                 &HashMap::from([(CREDENTIAL_KEY.to_string(), handle)]),
             )
             .await?;

@@ -3,8 +3,15 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="RPM/systemd gateway migration requires a Unix host"
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MIGRATOR = REPO_ROOT / "deploy/rpm/migrate-gateway-config.sh"

@@ -32,6 +32,10 @@
 # files, relative to the repository root or absolute, to layer additional chart
 # configuration on top of ci/values-skaffold.yaml.
 #
+# Set OPENSHELL_E2E_KUBE_TLS=1 with an overlay that keeps gateway TLS on (for
+# example ci/values-tls-port-forward.yaml) to reach the gateway over mTLS
+# through the port-forward with the chart-generated client certificate.
+#
 # Image source:
 #   - Ephemeral k3d mode builds local
 #     `openshell/{gateway,sandbox,supervisor}:${IMAGE_TAG}`
@@ -119,12 +123,17 @@ CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
 CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP="openshell-e2e-proxy-ca"
 CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=0
 OPENSHIFT_DETECTED=0
-OPENSHIFT_SANDBOX_SCC_GRANTED=0
 OPENSHIFT_POSTGRES_SCC_GRANTED=0
 OPENSHIFT_ROUTE_HOST=""
 # Temp dir holding the client mTLS material extracted from openshell-client-tls
 # for the OpenShift Route transport. Removed by cleanup().
 OPENSHIFT_PKI_DIR="${WORKDIR}/openshift-pki"
+ADDITIONAL_CA_MODE="${OPENSHELL_E2E_ADDITIONAL_CA:-0}"
+ADDITIONAL_CA_SOURCE_CONFIG_MAP="openshell-e2e-additional-ca"
+ADDITIONAL_CA_SERVER_PID=""
+ADDITIONAL_CA_SERVER_LOG="${WORKDIR}/additional-ca-server.log"
+ADDITIONAL_CA_DIR="${WORKDIR}/additional-ca"
+ADDITIONAL_CA_SOURCE_CREATED=0
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -336,7 +345,13 @@ start_gateway_portforward() {
       cat "${PORTFORWARD_LOG}" >&2 || true
       return 1
     fi
-    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
+    if [ "${OPENSHELL_E2E_KUBE_TLS:-0}" = "1" ]; then
+      # The TLS listener resets plaintext HTTP, so only check that the
+      # forward accepts TCP.
+      if (exec 3<>"/dev/tcp/127.0.0.1/${LOCAL_PORT}") 2>/dev/null; then
+        return 0
+      fi
+    elif curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
       return 0
     fi
     sleep 1
@@ -507,6 +522,15 @@ cleanup() {
   local exit_code=$?
 
   stop_gateway_portforward
+  e2e_stop_process "${ADDITIONAL_CA_SERVER_PID}" "additional CA HTTPS fixture"
+
+  if [ "${ADDITIONAL_CA_SOURCE_CREATED}" = "1" ] \
+     && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ] \
+     && command -v kubectl >/dev/null 2>&1; then
+    kctl -n "${NAMESPACE}" delete configmap "${ADDITIONAL_CA_SOURCE_CONFIG_MAP}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+    ADDITIONAL_CA_SOURCE_CREATED=0
+  fi
 
   if [ "${exit_code}" -ne 0 ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
     if command -v kubectl >/dev/null 2>&1 \
@@ -587,14 +611,6 @@ cleanup() {
   if [ "${CORPORATE_PROXY_CA_FIXTURE_DEPLOYED}" = "1" ]; then
     kctl -n "${NAMESPACE}" delete configmap "${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}" \
       --ignore-not-found >/dev/null 2>&1 || true
-  fi
-
-  if [ "${OPENSHIFT_SANDBOX_SCC_GRANTED}" = "1" ]; then
-    oc adm policy remove-scc-from-user privileged \
-      --context "${KUBE_CONTEXT}" \
-      -z openshell-sandbox -n "${NAMESPACE}" \
-      2>/dev/null || true
-    OPENSHIFT_SANDBOX_SCC_GRANTED=0
   fi
 
   # Remove the extracted client mTLS material (also covered by the WORKDIR sweep
@@ -762,7 +778,18 @@ run_scenario() {
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  # Tests that upgrade the release (for example to scale the shared
+  # supervisor pool) reuse its values against this exact chart, through the
+  # kubeconfig this harness uses.
+  export OPENSHELL_E2E_KUBE_CHART="${ROOT}/deploy/helm/openshell"
+  export OPENSHELL_E2E_KUBECONFIG="${KUBECONFIG:-}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_NAMESPACE="${NAMESPACE}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_RELEASE="${RELEASE_NAME}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_CHART="${ROOT}/deploy/helm/openshell"
+    export OPENSHELL_E2E_KUBE_GATEWAY_LOCAL_PORT="${LOCAL_PORT:-}"
+  fi
 
   e2e_import_example_provider_profiles \
     "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || return 1
@@ -947,6 +974,38 @@ start_health_portforward() {
   done
   echo "ERROR: health port-forward did not accept TCP within ${timeout}s" >&2
   cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+  return 1
+}
+
+# Shared supervisor pool members are TCP-ready before they attach to the
+# gateway, and the gateway refuses sandbox creates until a member attaches.
+wait_for_shared_supervisors() {
+  local selector="app.kubernetes.io/component=supervisor"
+  local elapsed=0 timeout=180 pods pod attached
+  pods="$(kctl -n "${NAMESPACE}" get pods -l "${selector}" -o name 2>/dev/null)"
+  [ -n "${pods}" ] || return 0
+
+  echo "Waiting for shared supervisor pool members to attach to the gateway..."
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    pods="$(kctl -n "${NAMESPACE}" get pods -l "${selector}" -o name 2>/dev/null)"
+    attached=1
+    for pod in ${pods}; do
+      if ! kctl -n "${NAMESPACE}" logs "${pod}" -c supervisor 2>/dev/null \
+        | grep -q "gateway accepted the supervisor host"; then
+        attached=0
+        break
+      fi
+    done
+    if [ -n "${pods}" ] && [ "${attached}" = "1" ]; then
+      # Placement reads the membership record the gateway writes after attach.
+      sleep 2
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  echo "ERROR: shared supervisor pool members did not attach within ${timeout}s" >&2
+  kctl -n "${NAMESPACE}" get pods -l "${selector}" -o wide >&2 || true
   return 1
 }
 
@@ -1224,6 +1283,29 @@ if kctl api-resources --api-group=route.openshift.io --no-headers 2>/dev/null | 
   fi
 fi
 
+start_additional_ca_fixture() {
+  [ "${ADDITIONAL_CA_MODE}" = "1" ] || return 0
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    echo "ERROR: Kubernetes additional CA e2e requires the in-process Kubernetes driver." >&2
+    return 1
+  fi
+  if [ -z "${HOST_GATEWAY_IP}" ]; then
+    echo "ERROR: Kubernetes additional CA e2e requires a host gateway IP for host.openshell.internal." >&2
+    return 1
+  fi
+
+  e2e_start_additional_ca_fixture \
+    "${ADDITIONAL_CA_DIR}" "${ADDITIONAL_CA_SERVER_LOG}" \
+    ADDITIONAL_CA_SERVER_PID ADDITIONAL_CA_PORT
+  kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+  kctl -n "${NAMESPACE}" create configmap "${ADDITIONAL_CA_SOURCE_CONFIG_MAP}" \
+    --from-file="ca.crt=${ADDITIONAL_CA_DIR}/ca.crt" \
+    --dry-run=client -o yaml | kctl apply -f -
+  ADDITIONAL_CA_SOURCE_CREATED=1
+}
+
+start_additional_ca_fixture
+
 ACTIVE_CREDENTIAL_DRIVER="${OPENSHELL_E2E_CREDENTIAL_DRIVER:-kubernetes-secrets}"
 if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
    && [ "${ACTIVE_CREDENTIAL_DRIVER}" = "vault" ]; then
@@ -1234,6 +1316,15 @@ helm_extra_args=()
 helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
 helm_extra_args+=(--set supervisor.sandboxRuntime.networkPolicyEnforced=true)
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  helm_extra_args+=(--set "supervisor.network.additionalCaConfigMapName=${ADDITIONAL_CA_SOURCE_CONFIG_MAP}")
+fi
+# This wrapper installs an isolated, uniformly built test gateway, not a
+# production rolling upgrade. Explicitly activate the image-update scenario;
+# callers can keep activation disabled for negative coverage.
+if [ "${OPENSHELL_E2E_KUBE_IMAGE_UPDATES:-1}" = "1" ]; then
+  helm_extra_args+=(--set 'gatewayConfig.openshell\.gateway.enable_sandbox_updates=true')
+fi
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
     echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2
@@ -1258,12 +1349,6 @@ if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-openshift-scc.yaml")
 
   kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
-
-  echo "Granting privileged SCC to openshell-sandbox in namespace ${NAMESPACE}..."
-  oc adm policy add-scc-to-user privileged \
-    --context "${KUBE_CONTEXT}" \
-    -z openshell-sandbox -n "${NAMESPACE}"
-  OPENSHIFT_SANDBOX_SCC_GRANTED=1
 
   # Drive the gateway through a passthrough Route with mTLS instead of
   # port-forward. The Route host is deterministic: OpenShift serves any name
@@ -1480,6 +1565,27 @@ else
     # OpenShift: reach the gateway over the passthrough Route with mTLS so the
     # SSH-relay `sandbox connect` suites work (port-forward stalls them).
     openshift_register_route_gateway || exit 1
+  elif [ "${OPENSHELL_E2E_KUBE_TLS:-0}" = "1" ]; then
+    # Topologies that require gateway TLS: reach the gateway over mTLS through
+    # the port-forward with the chart-generated client certificate. The
+    # server certificate names 127.0.0.1.
+    start_gateway_portforward || exit 1
+    kube_pki_dir="${WORKDIR}/kube-client-pki"
+    mkdir -p "${kube_pki_dir}/client"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.ca\.crt}' | base64 -d >"${kube_pki_dir}/ca.crt"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.tls\.crt}' | base64 -d >"${kube_pki_dir}/client/tls.crt"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.tls\.key}' | base64 -d >"${kube_pki_dir}/client/tls.key"
+    GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+    GATEWAY_ENDPOINT="https://127.0.0.1:${LOCAL_PORT}"
+    e2e_register_mtls_gateway \
+      "${XDG_CONFIG_HOME}" \
+      "${GATEWAY_NAME}" \
+      "${GATEWAY_ENDPOINT}" \
+      "${LOCAL_PORT}" \
+      "${kube_pki_dir}"
   else
     # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
     start_gateway_portforward || exit 1
@@ -1493,6 +1599,7 @@ else
   fi
 
   start_health_portforward || exit 1
+  wait_for_shared_supervisors || exit 1
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
@@ -1506,7 +1613,18 @@ else
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  # Tests that upgrade the release (for example to scale the shared
+  # supervisor pool) reuse its values against this exact chart, through the
+  # kubeconfig this harness uses.
+  export OPENSHELL_E2E_KUBE_CHART="${ROOT}/deploy/helm/openshell"
+  export OPENSHELL_E2E_KUBECONFIG="${KUBECONFIG:-}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_NAMESPACE="${NAMESPACE}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_RELEASE="${RELEASE_NAME}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_CHART="${ROOT}/deploy/helm/openshell"
+    export OPENSHELL_E2E_KUBE_GATEWAY_LOCAL_PORT="${LOCAL_PORT:-}"
+  fi
 
   e2e_import_example_provider_profiles \
     "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || exit 1

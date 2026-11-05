@@ -1740,7 +1740,7 @@ async fn mint_google_service_account_jwt(
         exp: now_secs.saturating_add(lifetime_secs),
         sub: subject.as_deref(),
     };
-    let assertion = jsonwebtoken::encode(
+    let assertion = openshell_crypto::jwt::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
         &claims,
         &jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes()).map_err(|_| {
@@ -1904,13 +1904,15 @@ async fn request_token(
         }
     }
 
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| Status::internal(format!("build refresh HTTP client failed: {e}")))?;
+    // GitHub returns form-encoded bodies unless JSON is requested.
     let response = client
         .post(parsed)
+        .header(reqwest::header::ACCEPT, "application/json")
         .form(form)
         .send()
         .await
@@ -2234,24 +2236,37 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = Box::pin(run_refresh_worker_tick(
+            match Box::pin(run_refresh_worker_tick(
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
             ))
             .await
             {
-                warn!(error = %err, "provider credential refresh worker tick failed");
+                Ok(providers) => {
+                    for (workspace, provider_name) in providers {
+                        crate::config_delivery::publish_provider(
+                            &state,
+                            &workspace,
+                            &provider_name,
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "provider credential refresh worker tick failed");
+                }
             }
         }
     });
 }
 
+/// Returns the `(workspace, provider)` pairs whose provider records changed.
 async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
-) -> Result<(), Status> {
+) -> Result<std::collections::HashSet<(String, String)>, Status> {
+    let changed_providers = std::collections::HashSet::new();
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await?;
     let watched_count = states.len();
@@ -2271,7 +2286,7 @@ async fn run_refresh_worker_tick(
         .iter()
         .any(|state| refresh_state_has_work(state, now_ms))
     {
-        return Ok(());
+        return Ok(changed_providers);
     }
     let span = tracing::info_span!(
         "refresh",
@@ -2279,8 +2294,10 @@ async fn run_refresh_worker_tick(
         watched_count,
         due_count,
     );
-    Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span)).await;
-    Ok(())
+    Ok(
+        Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span))
+            .await,
+    )
 }
 
 fn refresh_state_has_work(state: &StoredProviderCredentialRefreshState, now_ms: i64) -> bool {
@@ -2300,7 +2317,8 @@ async fn refresh_states(
     compute: Option<&crate::compute::ComputeRuntime>,
     states: Vec<StoredProviderCredentialRefreshState>,
     now_ms: i64,
-) {
+) -> std::collections::HashSet<(String, String)> {
+    let mut changed_providers = std::collections::HashSet::new();
     for state in states {
         if state
             .metadata
@@ -2330,6 +2348,8 @@ async fn refresh_states(
                     error = %err,
                     "failed to finalize tombstoned provider refresh; retrying on the next sweep"
                 );
+            } else {
+                changed_providers.insert(changed_provider(&state));
             }
             continue;
         }
@@ -2408,8 +2428,18 @@ async fn refresh_states(
                 error = %err,
                 "provider credential refresh failed"
             );
+        } else {
+            changed_providers.insert(changed_provider(&state));
         }
     }
+    changed_providers
+}
+
+fn changed_provider(state: &StoredProviderCredentialRefreshState) -> (String, String) {
+    (
+        state.object_workspace().to_string(),
+        state.provider_name.clone(),
+    )
 }
 
 #[cfg(test)]
@@ -2422,7 +2452,7 @@ mod tests {
         list_all_refresh_states, list_refresh_states_for_provider, max_lifetime_seconds,
         new_refresh_state, next_refresh_at_ms, put_refresh_state, read_bounded_oauth_error_body,
         refresh_has_expiration, refresh_material_scope, refresh_provider_credential,
-        refresh_state_name, refresh_status_from_state, refresh_strategy_name,
+        refresh_state_name, refresh_status_from_state, refresh_strategy_name, request_token,
         run_refresh_worker_tick, seconds_until_ms, set_refresh_expiration_presence,
         validate_secret_material_references,
     };
@@ -2461,7 +2491,7 @@ mod tests {
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn ts(milliseconds: i64) -> prost_types::Timestamp {
@@ -2868,7 +2898,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let response = reqwest::get(format!("{}/oversized", mock_server.uri()))
             .await
             .unwrap();
@@ -3016,6 +3046,30 @@ mod tests {
         assert_eq!(stored.provider_error_subtype, "invalid_rapt");
         assert!(stored.last_error_at_ms > 0);
         assert!(!stored.last_error.contains("provider-controlled detail"));
+    }
+
+    #[tokio::test]
+    async fn request_token_sends_accept_json() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(header("accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "minted-token",
+                "expires_in": 3600
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let minted = request_token(
+            &format!("{}/token", mock_server.uri()),
+            &[("grant_type".to_string(), "refresh_token".to_string())],
+            60,
+            OAuthGrantKind::UserRefreshToken,
+        )
+        .await
+        .unwrap();
+        assert_eq!(minted.access_token, "minted-token");
     }
 
     #[tokio::test]
@@ -4066,10 +4120,18 @@ mod tests {
         put_refresh_state(&store, &state).await.unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
 
-        Box::pin(run_refresh_worker_tick(&store, Some(&credentials), None))
+        let changed = Box::pin(run_refresh_worker_tick(&store, Some(&credentials), None))
             .await
             .unwrap();
 
+        assert_eq!(
+            changed,
+            std::collections::HashSet::from([(
+                "default".to_string(),
+                "tombstoned-refresh".to_string()
+            )]),
+            "only the refreshed provider's attached sandboxes need an update"
+        );
         assert!(
             get_refresh_state(
                 &store,

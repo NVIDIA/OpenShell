@@ -569,13 +569,13 @@ fn collect_descendant_pids_with_depth(root_pid: u32) -> Vec<DescendantPid> {
 /// result. Subsequent requests from the same binary path must produce the
 /// same hash, or the request is denied.
 pub fn file_sha256(path: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
+    use miette::IntoDiagnostic as _;
     use std::io::Read;
 
     let start = std::time::Instant::now();
     let mut file = std::fs::File::open(path)
         .map_err(|e| miette::miette!("Failed to open {}: {e}", path.display()))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = openshell_crypto::sha256_digest().into_diagnostic()?;
     let mut buf = vec![0u8; 65536].into_boxed_slice();
     let mut total_read = 0u64;
     loop {
@@ -586,10 +586,10 @@ pub fn file_sha256(path: &Path) -> Result<String> {
             break;
         }
         total_read += n as u64;
-        hasher.update(&buf[..n]);
+        hasher.update(&buf[..n]).into_diagnostic()?;
     }
 
-    let hash = hasher.finalize();
+    let hash = hasher.finish().into_diagnostic()?;
     debug!(
         "        file_sha256: {}ms size={} path={}",
         start.elapsed().as_millis(),

@@ -452,6 +452,11 @@ impl ComputeRuntime {
     /// Local S(global) S(workspace) X(sandbox), for provisioning-deadline
     /// reconciliation, which re-derives configuration from provider and
     /// profile records and must not interleave with their local writers.
+    ///
+    /// The wait is unbounded. When the sandbox key sorts first, the caller
+    /// holds X(sandbox) while it waits behind a workspace writer, so a
+    /// background caller should bound the wait with a timeout; dropping the
+    /// future releases the keys already taken.
     pub(super) async fn lock_sandbox_local_in_workspace(
         &self,
         workspace: &str,
