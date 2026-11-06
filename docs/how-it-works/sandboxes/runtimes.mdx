@@ -362,7 +362,7 @@ On Docker and Podman, set `process.run_as_user` and `process.run_as_group` in th
 
 | Driver | Default identity |
 |---|---|
-| Docker, Podman | The image's `USER`, otherwise `1000`. |
+| Docker, Podman | The image's `USER`, otherwise `1000`. A root `USER` is rejected unless the policy sets a non-root `run_as_user` and `run_as_group`. |
 | Kubernetes | OpenShift SCC namespace annotations, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 | MicroVM | The image's `sandbox` account, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 
