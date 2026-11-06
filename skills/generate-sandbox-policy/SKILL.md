@@ -246,6 +246,7 @@ Only needed for the **Moderate** and **Full** tiers. Translate API path paramete
 | All sub-paths under `/api/v1/` | `/api/v1/**` |
 
 In REST rule paths, `*` stops at `/`, while a whole-segment `**` crosses `/`.
+REST endpoints refuse HTTP upgrades in both enforce and audit modes. For WebSocket traffic, use a separate `protocol: websocket` endpoint with explicit upgrade and message rules; `websocket_credential_rewrite` requires that protocol.
 For example, `/api/v1/**` covers descendants but not `/api/v1` itself; add an
 explicit rule for that path when needed. `?` matches one character except `/`,
 and bracket classes such as `[0-9]` are supported.

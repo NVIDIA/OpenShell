@@ -1990,8 +1990,7 @@ pub(crate) fn upgrade_options<'a>(
     engine: Option<&'a TunnelPolicyEngine>,
 ) -> UpgradeRelayOptions<'a> {
     let websocket_credential_rewrite =
-        matches!(config.protocol, L7Protocol::Rest | L7Protocol::Websocket)
-            && config.websocket_credential_rewrite;
+        config.protocol == L7Protocol::Websocket && config.websocket_credential_rewrite;
     let deny_uninspected_credentials =
         config.provider_credentialed && !config.allow_uninspected_credentials;
     let websocket_message_policy = if config.protocol == L7Protocol::Websocket {
@@ -2035,7 +2034,6 @@ pub(crate) fn websocket_extension_mode(
 ) -> WebSocketExtensionMode {
     if inspecting_middleware_session
         || config.protocol == L7Protocol::Websocket
-        || (config.protocol == L7Protocol::Rest && config.websocket_credential_rewrite)
         || (config.provider_credentialed && !config.allow_uninspected_credentials)
     {
         WebSocketExtensionMode::PermessageDeflate
@@ -2363,6 +2361,12 @@ where
                     websocket_permessage_deflate,
                     websocket_subprotocol,
                 } => {
+                    if crate::l7::rest::upgrade_refusal_for_protocol(config.protocol).is_some() {
+                        if let Some(session) = middleware_session.take() {
+                            session.end(openshell_core::proto::MiddlewareSessionEndReason::ProtocolError).await;
+                        }
+                        return Ok(());
+                    }
                     let mut options = upgrade_options(
                         config,
                         ctx,
@@ -5463,12 +5467,15 @@ network_policies:
     endpoints:
       - host: api.example.test
         port: 8080
-        protocol: rest
+        protocol: websocket
         token_grant_owner: test-owner
         enforcement: enforce
         rules:
           - allow:
               method: GET
+              path: "/v1/**"
+          - allow:
+              method: WEBSOCKET_TEXT
               path: "/v1/**"
     binaries:
       - { path: /usr/bin/curl }
@@ -5525,7 +5532,10 @@ network_policies:
         )
         .await
         .expect("send upgrade request");
-        seen_rx.recv().await.expect("preflight reached middleware");
+        tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+            .await
+            .expect("preflight timed out")
+            .expect("preflight reached middleware");
         fixture.assert_no_requests();
         release.notify_one();
 
@@ -10068,7 +10078,7 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn rest_websocket_middleware_inspects_compressed_wss_messages() {
+    async fn websocket_middleware_inspects_compressed_wss_messages() {
         let data = r#"
 network_middlewares:
   redact:
@@ -10082,11 +10092,14 @@ network_policies:
     endpoints:
       - host: api.example.test
         port: 8080
-        protocol: rest
+        protocol: websocket
         enforcement: enforce
         rules:
           - allow:
               method: GET
+              path: "/ws"
+          - allow:
+              method: WEBSOCKET_TEXT
               path: "/ws"
     binaries:
       - { path: /usr/bin/node }
@@ -10176,7 +10189,7 @@ network_policies:
     endpoints:
       - host: gateway.example.test
         port: 443
-        protocol: rest
+        protocol: websocket
         enforcement: enforce
         rules:
           - allow:
@@ -10190,7 +10203,7 @@ network_policies:
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
         let configs = vec![L7EndpointConfig {
-            protocol: L7Protocol::Rest,
+            protocol: L7Protocol::Websocket,
             endpoint_id: String::new(),
             policy_hash: String::new(),
             path: "/ws".into(),
@@ -10995,9 +11008,140 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn route_selected_rest_websocket_upgrade_still_relays_beside_mcp() {
-        // The refusal follows the selected endpoint's protocol: a REST
-        // upgrade on the same host and port keeps its documented raw relay.
+    async fn rest_upgrade_refusal_emits_ocsf_denial() {
+        let (configs, _, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+        let config = configs
+            .iter()
+            .find(|c| c.protocol == L7Protocol::Rest)
+            .unwrap();
+        let request = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/api/ws".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /api/ws HTTP/1.1\r\nHost: mcp.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+        let (_app, mut client) = tokio::io::duplex(8192);
+        assert!(
+            deny_unsupported_upgrade_if_requested(&request, config, &ctx, None, &mut client)
+                .await
+                .unwrap()
+        );
+        let events = capture.json_events();
+        assert!(
+            events.iter().any(|event| event["action_id"] == 2
+                && event["status_detail"] == crate::l7::rest::UNSUPPORTED_REST_UPGRADE_DETAIL),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_upgrades_are_refused_in_both_modes_and_relay_paths() {
+        for enforcement in [EnforcementMode::Enforce, EnforcementMode::Audit] {
+            for route_selected in [false, true] {
+                for upgrade in ["websocket", "custom"] {
+                    let (mut configs, engine, ctx) =
+                        jsonrpc_and_rest_route_configs("mcp", "enforce");
+                    let config = configs
+                        .iter_mut()
+                        .find(|c| c.protocol == L7Protocol::Rest)
+                        .unwrap();
+                    config.enforcement = enforcement;
+                    let config = config.clone();
+                    let request = format!(
+                        "GET /api/ws HTTP/1.1\r\nHost: mcp.example.test:8000\r\nConnection: keep-alive, Upgrade\r\nUpgrade: {upgrade}\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                    );
+                    let frame = br#"{"action":"delete"}"#;
+                    let scenario = run_upgrade_scenario(
+                        request.as_bytes(),
+                        frame,
+                        move |mut client, mut upstream| {
+                            tokio::spawn(async move {
+                                if route_selected {
+                                    relay_with_route_selection(
+                                        &configs,
+                                        engine,
+                                        &mut client,
+                                        &mut upstream,
+                                        &ctx,
+                                    )
+                                    .await
+                                } else {
+                                    relay_with_inspection(
+                                        &config,
+                                        engine,
+                                        &mut client,
+                                        &mut upstream,
+                                        &ctx,
+                                    )
+                                    .await
+                                }
+                            })
+                        },
+                    )
+                    .await;
+                    assert_upgrade_refused_before_forwarding(
+                        &scenario,
+                        frame,
+                        crate::l7::rest::UNSUPPORTED_REST_UPGRADE_DETAIL,
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_upgrade_after_ordinary_request_is_refused() {
+        for route_selected in [false, true] {
+            let (configs, engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+            let config = configs
+                .iter()
+                .find(|c| c.protocol == L7Protocol::Rest)
+                .unwrap()
+                .clone();
+            let (mut app, mut client) = tokio::io::duplex(8192);
+            let (mut upstream, mut server) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                if route_selected {
+                    relay_with_route_selection(&configs, engine, &mut client, &mut upstream, &ctx)
+                        .await
+                } else {
+                    relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx).await
+                }
+            });
+            app.write_all(b"GET /api/tickets HTTP/1.1\r\nHost: mcp.example.test:8000\r\n\r\n")
+                .await
+                .unwrap();
+            let forwarded = read_http_headers(&mut server).await;
+            assert!(String::from_utf8_lossy(&forwarded).starts_with("GET /api/tickets "));
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let response = read_http_headers(&mut app).await;
+            assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+            app.write_all(b"GET /api/ws HTTP/1.1\r\nHost: mcp.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").await.unwrap();
+            let mut denied = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                app.read_to_end(&mut denied),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(String::from_utf8_lossy(&denied).starts_with("HTTP/1.1 403"));
+            relay.await.unwrap().unwrap();
+            let mut extra = Vec::new();
+            server.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty(), "upgrade must not reach the upstream");
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selected_rest_websocket_upgrade_is_refused_beside_mcp() {
+        // Both per-request protocols refuse upgrades on their selected path.
         let (configs, tunnel_engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
         let frame = br#"{"type":"ping"}"#;
         let scenario = run_upgrade_scenario(
@@ -11017,15 +11161,11 @@ network_policies:
             },
         )
         .await;
-        assert!(
-            scenario.response.starts_with("HTTP/1.1 101"),
-            "REST upgrade should still switch protocols, got: {}",
-            scenario.response
+        assert_upgrade_refused_before_forwarding(
+            &scenario,
+            frame,
+            crate::l7::rest::UNSUPPORTED_REST_UPGRADE_DETAIL,
         );
-        assert!(contains_bytes(
-            &scenario.upstream_seen,
-            &masked_text_frame(frame)
-        ));
     }
 
     #[tokio::test]
