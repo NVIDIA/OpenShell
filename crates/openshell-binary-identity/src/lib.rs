@@ -156,6 +156,19 @@ fn resolve_linux_process(
     })
 }
 
+/// The process `pid` names, as procfs reports it now. `None` when procfs does
+/// not report it.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn observe_process(pid: u32) -> Option<ProcessInstance> {
+    let (parent_pid, start_time) = process_stat(pid).ok()?;
+    Some(ProcessInstance {
+        pid: thread_group_id(pid).ok()?,
+        parent_pid,
+        start_time_ms: start_time_ms(start_time)?,
+    })
+}
+
 /// The process that owns `snapshot`'s task. A connection's task can be any
 /// thread, so the PID and start time are the thread-group leader's. Audit
 /// context only: unreadable values leave the identity without a process.
@@ -674,6 +687,18 @@ mod tests {
         // btime has one-second resolution.
         assert!(leader.start_time_ms <= now_ms + 1_000);
         assert!(now_ms - leader.start_time_ms < 600_000);
+    }
+
+    #[test]
+    fn observed_process_matches_the_resolved_identity() {
+        let pid = std::process::id();
+        let resolved = ProcfsIdentityResolver::for_process_tree(pid)
+            .resolve(pid)
+            .expect("resolve")
+            .process;
+        assert!(resolved.is_some());
+        assert_eq!(observe_process(pid), resolved);
+        assert_eq!(observe_process(u32::MAX), None);
     }
 
     #[test]

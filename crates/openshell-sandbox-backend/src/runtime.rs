@@ -909,6 +909,31 @@ impl ReadyBoundary {
     }
 }
 
+/// Reads the runtime's process events with a sequence cursor.
+#[derive(Clone)]
+pub struct ProcessEventSource {
+    client: Arc<BoundaryClient>,
+}
+
+impl ProcessEventSource {
+    /// Events after `after_sequence` and how many of those the runtime no
+    /// longer retains. Returns empty when none arrive within the runtime's
+    /// read wait.
+    pub async fn read(
+        &self,
+        after_sequence: u64,
+    ) -> Result<(Vec<crate::boundary_protocol::ProcessEventWire>, u64), BackendError> {
+        let response = self
+            .client
+            .call_wait(Request::ReadProcessEvents { after_sequence })
+            .await?;
+        let Response::ProcessEvents { events, lost } = response else {
+            return Err(unexpected_response("process_events", &response));
+        };
+        Ok((events, lost))
+    }
+}
+
 pub struct RunningBoundary {
     process: Arc<BoundaryProcess>,
     /// Exec processes a replacement supervisor adopted from the runtime.
@@ -947,6 +972,19 @@ impl RunningBoundary {
 
     pub fn loopback_connector(&self) -> Arc<BoundaryLoopbackConnector> {
         self.loopback_connector.clone()
+    }
+
+    /// Launch and exit events of the processes the runtime starts directly,
+    /// when the runtime serves them.
+    #[must_use]
+    pub fn process_events(&self) -> Option<ProcessEventSource> {
+        self.process
+            .client
+            .backend_supports_process_events
+            .load(Ordering::Acquire)
+            .then(|| ProcessEventSource {
+                client: self.process.client.clone(),
+            })
     }
 
     pub async fn terminate(&self) -> Result<(), BackendError> {
@@ -1582,6 +1620,7 @@ struct BoundaryClient {
     resume: Option<ResumeLaunch>,
     launch_outcome: std::sync::OnceLock<BoundaryLaunchOutcome>,
     backend_supports_suspend: AtomicBool,
+    backend_supports_process_events: AtomicBool,
     supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
@@ -1785,6 +1824,7 @@ impl BoundaryClient {
             resume: None,
             launch_outcome: std::sync::OnceLock::new(),
             backend_supports_suspend: AtomicBool::new(false),
+            backend_supports_process_events: AtomicBool::new(false),
             supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId::new(),
             sandbox_bearer,
             grpc_channel: tokio::sync::Mutex::new(None),
@@ -2616,6 +2656,12 @@ impl BoundaryClient {
         }
         self.backend_supports_suspend
             .store(supports_suspend, Ordering::Release);
+        self.backend_supports_process_events.store(
+            backend.supported_capabilities.iter().any(|capability| {
+                capability == crate::isolation_protocol::PROCESS_EVENTS_CAPABILITY
+            }),
+            Ordering::Release,
+        );
         Ok(())
     }
 
@@ -3405,6 +3451,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_events_are_read_only_from_a_runtime_that_serves_them() {
+        let (client, server) =
+            isolation_control_client(TestIsolationBackend::default(), None).await;
+        client.grpc_channel().await.unwrap();
+        assert!(
+            client
+                .backend_supports_process_events
+                .load(Ordering::Acquire)
+        );
+        server.abort();
+
+        let mut legacy = crate::isolation_protocol::metadata("legacy/runtime");
+        legacy.supported_capabilities.retain(|capability| {
+            capability != crate::isolation_protocol::PROCESS_EVENTS_CAPABILITY
+        });
+        let service = TestIsolationBackend {
+            metadata: Some(legacy),
+            ..TestIsolationBackend::default()
+        };
+        let (client, server) = isolation_control_client(service, None).await;
+        client.grpc_channel().await.unwrap();
+        assert!(
+            !client
+                .backend_supports_process_events
+                .load(Ordering::Acquire)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn suspend_sends_boundary_coordinates_and_returns_reference() {
         let service = TestIsolationBackend::suspendable(LaunchOutcome::Fresh);
         let suspends = service.suspends.clone();
@@ -3729,6 +3805,10 @@ mod tests {
                             Request::AcceptNetwork => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
                                 message: "no pending network request".to_string(),
+                            },
+                            Request::ReadProcessEvents { .. } => Response::ProcessEvents {
+                                events: Vec::new(),
+                                lost: 0,
                             },
                         },
                     }) {

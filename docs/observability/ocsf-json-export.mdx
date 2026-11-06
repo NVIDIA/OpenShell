@@ -156,7 +156,7 @@ Sandbox identity has moved from top-level `container` to `device.container` for 
 Some fields depend on the event class:
 
 - SSH Activity records name the supervisor's SSH server as `dst_endpoint`, with `svc_name: "ssh"` and the listen socket path in `name`, because the server listens on a Unix socket rather than a network address.
-- Process Activity records from the sandbox name the `openshell-sandbox` launcher as `actor.process`.
+- Process Activity records from the sandbox name the `openshell-sandbox` launcher as `actor.process`. The supervisor records a `Launch` and a `Terminate` for the sandbox entrypoint and for the process each exec or SSH session starts. `Terminate` carries `exit_code`, which is 128 plus the signal number when a signal ended the process. `time` is when the sandbox observed the launch or exit. A replacement supervisor can report a launch or exit again with the same `metadata.uid`, so deduplicate Process Activity on that field. `process.pid` and `process.created_time` match the network events from the same process.
 - Network and HTTP Activity records for connections the sandbox runtime mediates name the process that opened the connection as `actor.process`, with its `pid` as the sandbox sees it and its start time in `created_time`. When the parent process is identified, `parent_process` carries its `pid`. A `pid` can be reused after its process exits; `pid` and `created_time` together identify one process.
 - `connection_info` carries `direction_id` and `direction`. OpenShell reports Unknown (`0`) where it does not track the direction.
 

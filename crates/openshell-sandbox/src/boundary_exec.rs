@@ -226,6 +226,7 @@ impl LocalBoundaryExec {
     fn spawn_piped(&self, spec: &ExecSpec) -> Result<SpawnedExec, BackendError> {
         self.runtime.ensure_active()?;
         let mut command = self.command(spec)?;
+        let program = command.get_program().to_string_lossy().into_owned();
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -294,6 +295,7 @@ impl LocalBoundaryExec {
         let process = Arc::new(LocalExecProcess::new(
             child,
             pid,
+            &program,
             self.runtime.clone(),
             process_terminal,
             signal_lock,
@@ -339,6 +341,7 @@ impl LocalBoundaryExec {
             .try_clone()
             .map_err(|error| BackendError::Process(error.to_string()))?;
         let mut command = self.command(spec)?;
+        let program = command.get_program().to_string_lossy().into_owned();
         command.stdin(stdin).stdout(stdout).stderr(slave);
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
@@ -389,6 +392,7 @@ impl LocalBoundaryExec {
         let process = Arc::new(LocalExecProcess::new(
             child,
             pid,
+            &program,
             self.runtime.clone(),
             process_terminal,
             signal_lock,
@@ -572,6 +576,7 @@ impl LocalExecProcess {
     fn new(
         child: Child,
         pid: u32,
+        program: &str,
         runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
         terminal: Arc<std::sync::atomic::AtomicBool>,
         signal_lock: Arc<std::sync::Mutex<()>>,
@@ -586,6 +591,7 @@ impl LocalExecProcess {
         let registration_terminal = terminal.clone();
         #[cfg(target_os = "linux")]
         let signal_lock_for_wait = signal_lock.clone();
+        let launched = crate::process_events::record_launch(pid, program);
         tokio::spawn(async move {
             let waited = tokio::task::spawn_blocking(move || {
                 let mut child = child;
@@ -630,6 +636,13 @@ impl LocalExecProcess {
                 }
                 BoundaryExitStatus::Exited(status.code().unwrap_or(1))
             });
+            match (&launched, &waited) {
+                (Some(launched), Ok(status)) => launched.record_exit((*status).into()),
+                (Some(_), Err(error)) => {
+                    tracing::warn!(pid, %error, "exec exit status unavailable; no exit event recorded");
+                }
+                (None, _) => {}
+            }
             runtime_for_wait.unregister_process_group(pid, &registration_terminal);
             if let Ok(mut slot) = result_for_wait.lock() {
                 *slot = Some(waited);
@@ -1146,6 +1159,41 @@ mod tests {
             BoundaryExitStatus::Exited(0)
         );
         assert_eq!(runtime.registered_process_group_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn exec_records_its_launch_and_exit() {
+        use openshell_sandbox_backend::boundary_protocol::{ExitStatusWire, ProcessEventKindWire};
+
+        let session = executor()
+            .exec(ExecSpec {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 43".to_string()],
+                shell: None,
+                runtime_helper: None,
+                env: vec![],
+                workdir: None,
+                pty: false,
+            })
+            .await
+            .expect("spawn exec");
+        session.process.wait().await.unwrap();
+
+        let (events, _) =
+            crate::process_events::log().read(0, usize::MAX, std::time::Duration::ZERO);
+        let exit = events
+            .iter()
+            .find(|event| event.kind == ProcessEventKindWire::Exited(ExitStatusWire::Exited(43)))
+            .expect("exit recorded");
+        let launch = events
+            .iter()
+            .find(|event| {
+                event.kind == ProcessEventKindWire::Launched && event.process == exit.process
+            })
+            .expect("launch recorded");
+        assert!(launch.sequence < exit.sequence);
+        assert_eq!(exit.process.parent_pid, std::process::id());
+        assert!(launch.executable.ends_with("sh"), "{}", launch.executable);
     }
 
     #[tokio::test]

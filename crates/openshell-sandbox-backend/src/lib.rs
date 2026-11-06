@@ -27,7 +27,7 @@ pub use runtime::{
     BoundBoundary, BoundaryExec, BoundaryLaunchOutcome, BoundaryLoopbackConnector, BoundaryProcess,
     BoundaryTakeover, BoundaryTerminal, ConfirmedBoundary, ExecSession,
     MAX_RESTORE_REFERENCE_BYTES, NetworkMediationSource, OpenShellRuntimeBackend,
-    ProcessAttachment, ReadyBoundary, ResumeLaunch, RunningBoundary,
+    ProcessAttachment, ProcessEventSource, ReadyBoundary, ResumeLaunch, RunningBoundary,
 };
 pub use runtime::{BoundaryTransport, BoundaryTransportConnector, validate_runtime_coordinates};
 
