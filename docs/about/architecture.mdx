@@ -55,7 +55,7 @@ trusted process observations.
 ### Mediated Channel
 
 The **supervisor** and **sandbox** talk over the OpenShell Sandbox Protocol:
-one mutually authenticated HTTP/2 connection that carries many independent
+one HTTP/2 connection authenticated with TLS and a sandbox JWT that carries many independent
 streams. The compute driver picks the transport: a Unix socket for Docker and
 Podman, TCP for Kubernetes, or vsock for MicroVM. Authentication and protocol
 behavior are the same on all of them. The **supervisor** presents a
@@ -112,7 +112,7 @@ network.
 |---|---|---|---|
 | Docker | Its own container | Authenticated Unix socket on a driver-owned volume | Workload container has networking turned off |
 | Podman | Its own container | Authenticated Unix socket on a driver-owned volume | Workload container has networking turned off |
-| Kubernetes | Its own pod | Private service with mutual TLS | NetworkPolicy allows only the **supervisor** service |
+| Kubernetes | Its own pod | Private service with server-authenticated TLS and a sandbox JWT | NetworkPolicy allows only the **supervisor** service |
 | VM | A process on the host | Authenticated vsock | Guest has no network device |
 
 The runtime's job is to build the boundary and prove it's in place. It never
@@ -129,12 +129,12 @@ do.
 Three connections tie a sandbox together. The gateway is the only component
 that signs credentials, and every credential names exactly one sandbox.
 
-![OpenShell sandbox authentication showing the compute driver giving the supervisor a bootstrap credential, the gateway issuing a gateway JWT and sandbox JWT, and the supervisor presenting the sandbox JWT over mutual TLS to the sandbox, which holds only the gateway's public key.](../images/openshell-sandbox-authentication.svg)
+![OpenShell sandbox authentication showing the compute driver giving the supervisor a bootstrap credential, the gateway issuing a gateway JWT and sandbox JWT, and the supervisor presenting the sandbox JWT over server-authenticated TLS to the sandbox, which holds only the gateway's public key.](../images/openshell-sandbox-authentication.svg)
 
 | Connection | Who connects | How it's protected |
 |---|---|---|
 | **Supervisor** to gateway | The **supervisor** dials out to the gateway. | A gateway JWT, over TLS when the gateway has TLS enabled. |
-| **Supervisor** to **sandbox** | The **supervisor** dials into the workload over the driver's private channel. | Mutual TLS, plus a sandbox JWT. |
+| **Supervisor** to **sandbox** | The **supervisor** acts as the TLS and gRPC client over the driver's private channel. The runtime can initiate the underlying transport connection. | TLS authenticates the **sandbox** server; the sandbox JWT authenticates the **supervisor**. No TLS client certificate is used. |
 | Agent to **supervisor** | The agent never connects directly. The **sandbox** relays its traffic over the connection above. | Covered by the supervisor-to-sandbox channel. |
 
 The **supervisor** verifies the gateway's TLS certificate with its CA. User
