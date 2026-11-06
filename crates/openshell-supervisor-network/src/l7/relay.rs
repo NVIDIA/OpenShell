@@ -21,6 +21,7 @@ use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use crate::telemetry::egress_emit;
+use futures::FutureExt;
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::endpoint_status::{EndpointObservationSender, EndpointResult};
@@ -33,11 +34,13 @@ use openshell_ocsf::{
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 #[cfg(test)]
 mod token_grant_ownership_tests;
+#[cfg(test)]
+mod upstream_close_tests;
 
 const CONNECTION_READ_AHEAD_BYTES: usize = 8 * 1024;
 
@@ -758,6 +761,7 @@ where
         client,
         upstream,
         crate::l7::rest::RelayRequestOptions {
+            request_id: Some(request_id),
             resolver: ctx.secret_resolver.as_deref(),
             body_classifier: ctx.body_classifier.as_deref(),
             mcp_request_validation: (config.protocol == L7Protocol::Mcp).then_some(
@@ -819,6 +823,62 @@ where
     .await
 }
 
+fn build_upstream_http_failure_event(
+    ctx: &L7EvalContext,
+    method: &str,
+    request_id: Option<&str>,
+    response_code: Option<u16>,
+) -> openshell_ocsf::OcsfEvent {
+    let mut event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::for_http_method(method))
+        .http_request(method_only_request(method))
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+        .message("HTTP upstream connection closed or failed")
+        .status_detail("upstream_http_transport_failure");
+    if let Some(request_id) = request_id {
+        event = event.unmapped("request_id", request_id);
+    }
+    if let Some(code) = response_code {
+        event = event.http_response(openshell_ocsf::HttpResponse { code });
+    }
+    event.build()
+}
+
+pub(crate) async fn handle_upstream_http_error<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+    method: &str,
+    request_id: Option<&str>,
+    error: &crate::l7::rest::UpstreamHttpError,
+) -> Result<()>
+where
+    C: AsyncWrite + Unpin,
+    U: AsyncWrite + Unpin,
+{
+    debug!(error = ?error, "HTTP upstream transport failure");
+    let _ = upstream.shutdown().await;
+    // An unanswered request may already have executed. Never replay it or
+    // append a new status after the client stream accepted response bytes.
+    let delivery = if error.response_started {
+        Ok(())
+    } else {
+        write_bad_gateway_response(client, request_id).await
+    };
+    let response_code = (!error.response_started && delivery.is_ok()).then_some(502);
+    egress_emit!(build_upstream_http_failure_event(
+        ctx,
+        method,
+        request_id,
+        response_code
+    ));
+    delivery
+}
+
 async fn relay_http_request_with_credential_rejection_observed<C, U>(
     request: &crate::l7::provider::L7Request,
     client: &mut C,
@@ -846,7 +906,19 @@ where
     {
         Ok(outcome) => Ok(Some(outcome)),
         Err(report) => {
-            if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
+            if let Some(error) = report.downcast_ref::<crate::l7::rest::UpstreamHttpError>() {
+                handle_upstream_http_error(
+                    client,
+                    upstream,
+                    ctx,
+                    &request.action,
+                    options.request_id,
+                    error,
+                )
+                .await?;
+                Ok(Some(RelayOutcome::Consumed))
+            } else if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>()
+            {
                 // Body classification includes credentials for other destinations,
                 // so denial does not establish that this endpoint lacks credentials.
                 // Record the local decision before cleanup or client I/O can fail.
@@ -1216,25 +1288,26 @@ where
             .endpoint_observation_tx
             .as_ref()
             .and_then(EndpointObservationSender::capture);
-        let mut req = match provider.parse_request(client).await {
-            Ok(Some(req)) => req,
-            Ok(None) => return Ok(()),
-            Err(e) => {
-                if is_benign_connection_error(&e) {
-                    debug!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        error = %e,
-                        "L7 route-selected connection closed"
-                    );
-                } else {
-                    let detail =
-                        parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
-                    emit_parse_rejection(ctx, &detail, "l7");
+        let mut req =
+            match parse_next_http_request(provider.parse_request(client), upstream, ctx).await {
+                Ok(Some(req)) => req,
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    if is_benign_connection_error(&e) {
+                        debug!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %e,
+                            "L7 route-selected connection closed"
+                        );
+                    } else {
+                        let detail =
+                            parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                        emit_parse_rejection(ctx, &detail, "l7");
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-        };
+            };
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
@@ -2080,9 +2153,10 @@ where
             .filter(|_| ctx.token_grant_resolver.is_some())
             .and_then(EndpointObservationSender::capture);
         // Parse one HTTP request from client
-        let req = match provider.parse_request(client).await {
+        let req = match parse_next_http_request(provider.parse_request(client), upstream, ctx).await
+        {
             Ok(Some(req)) => req,
-            Ok(None) => return Ok(()), // Client closed connection
+            Ok(None) => return Ok(()), // The HTTP connection is no longer reusable.
             Err(e) => {
                 if is_benign_connection_error(&e) {
                     debug!(
@@ -2496,14 +2570,18 @@ where
             .endpoint_observation_tx
             .as_ref()
             .and_then(EndpointObservationSender::capture);
-        let parsed = match crate::l7::jsonrpc::parse_jsonrpc_http_request(
-            client,
-            config.json_rpc_max_body_bytes,
-            crate::l7::path::CanonicalizeOptions {
-                allow_encoded_slash: config.allow_encoded_slash,
-                ..Default::default()
-            },
-            crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
+        let parsed = match parse_next_http_request(
+            Box::pin(crate::l7::jsonrpc::parse_jsonrpc_http_request(
+                client,
+                config.json_rpc_max_body_bytes,
+                crate::l7::path::CanonicalizeOptions {
+                    allow_encoded_slash: config.allow_encoded_slash,
+                    ..Default::default()
+                },
+                crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
+            )),
+            upstream,
+            ctx,
         )
         .await
         {
@@ -2783,25 +2861,26 @@ where
         // Validate the head, including body framing, before deciding whether
         // this endpoint can inspect the requested protocol. Upgrade refusal
         // must not wait for a body or depend on its inspection size limit.
-        let mut req = match provider.parse_request(client).await {
-            Ok(Some(req)) => req,
-            Ok(None) => return Ok(()),
-            Err(e) => {
-                if is_benign_connection_error(&e) {
-                    debug!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        error = %e,
-                        "GraphQL L7 connection closed"
-                    );
-                } else {
-                    let detail =
-                        parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
-                    emit_parse_rejection(ctx, &detail, "l7-graphql");
+        let mut req =
+            match parse_next_http_request(provider.parse_request(client), upstream, ctx).await {
+                Ok(Some(req)) => req,
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    if is_benign_connection_error(&e) {
+                        debug!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %e,
+                            "GraphQL L7 connection closed"
+                        );
+                    } else {
+                        let detail =
+                            parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                        emit_parse_rejection(ctx, &detail, "l7-graphql");
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-        };
+            };
 
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
@@ -3537,6 +3616,78 @@ fn evaluate_l7_request_once(
     Ok((allowed, reason))
 }
 
+/// Read a request while watching the otherwise idle upstream connection.
+///
+/// A closed upstream must not leave a live socket in the client's pool. If
+/// both sides are ready, finish the request first so a forwarding failure can
+/// produce an explicit HTTP error. Unsolicited upstream bytes are not a response
+/// to a request and cannot be assigned to the next exchange.
+async fn parse_next_http_request<T, F, U>(
+    request: F,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Result<Option<T>>
+where
+    F: Future<Output = Result<Option<T>>>,
+    U: AsyncRead + Unpin,
+{
+    let mut byte = [0u8; 1];
+    let request = tokio::select! {
+        biased;
+        request = request => request,
+        result = upstream.read(&mut byte) => {
+            emit_idle_upstream_close(ctx, result);
+            return Ok(None);
+        }
+    };
+    // Parsing wins a simultaneous close so forwarding can return 502, but
+    // ready unsolicited data must never become that request's response.
+    if matches!(request, Ok(Some(_))) {
+        match upstream.read(&mut byte).now_or_never() {
+            Some(Ok(n)) if n > 0 => {
+                emit_idle_upstream_close(ctx, Ok(n));
+                return Ok(None);
+            }
+            Some(Err(error)) => {
+                debug!(host = %ctx.host, port = ctx.port, error = %error,
+                    "HTTP upstream failed as a client request became ready");
+            }
+            _ => {}
+        }
+    }
+    request
+}
+
+fn emit_idle_upstream_close(ctx: &L7EvalContext, result: std::io::Result<usize>) {
+    let (detail, status, severity) = match result {
+        Ok(0) => (
+            "HTTP upstream closed while idle",
+            StatusId::Success,
+            SeverityId::Informational,
+        ),
+        Ok(_) => (
+            "HTTP upstream sent unsolicited data while idle",
+            StatusId::Failure,
+            SeverityId::Low,
+        ),
+        Err(_) => (
+            "HTTP upstream failed while idle",
+            StatusId::Failure,
+            SeverityId::Low,
+        ),
+    };
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Close)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(severity)
+        .status(status)
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+        .message(detail)
+        .build();
+    egress_emit!(event);
+}
+
 /// Relay HTTP traffic with credential injection only (no L7 OPA evaluation).
 ///
 /// Used when TLS is auto-terminated but no L7 policy (`protocol` + `access`/`rules`)
@@ -3571,9 +3722,10 @@ where
             .filter(|_| ctx.token_grant_resolver.is_some())
             .and_then(EndpointObservationSender::capture);
         // Read next request from client.
-        let req = match provider.parse_request(client).await {
+        let req = match parse_next_http_request(provider.parse_request(client), upstream, ctx).await
+        {
             Ok(Some(req)) => req,
-            Ok(None) => break, // Client closed connection.
+            Ok(None) => break, // The HTTP connection is no longer reusable.
             Err(e) => {
                 if is_benign_connection_error(&e) {
                     break;
@@ -3731,6 +3883,7 @@ where
             client,
             upstream,
             crate::l7::rest::RelayRequestOptions {
+                request_id: Some(&request_id),
                 resolver,
                 credential_generation: credential_generation_guard(ctx),
                 generation_guard: Some(generation_guard),
