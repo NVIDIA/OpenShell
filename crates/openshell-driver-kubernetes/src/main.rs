@@ -310,6 +310,10 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
                 .unwrap_or_default(),
+            supervisor_runtime_class_name: std::env::var(
+                "OPENSHELL_K8S_SUPERVISOR_RUNTIME_CLASS_NAME",
+            )
+            .unwrap_or_default(),
             allowed_pod_annotations: args.allowed_pod_annotations,
             allowed_pod_labels: args.allowed_pod_labels,
             sa_token_ttl_secs: args.sa_token_ttl_secs,

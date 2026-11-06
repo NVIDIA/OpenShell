@@ -1338,6 +1338,9 @@ workspace_default_storage_size = "10Gi"
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.
 # default_runtime_class_name   = "kata-containers"
+# Kubernetes RuntimeClass for dedicated supervisor pods. Only the administrator
+# sets it. It never inherits the workload class. Empty (default) = omit.
+# supervisor_runtime_class_name = "kata-supervisor"
 # Pod annotation keys that sandbox templates may set. Each entry is an exact
 # key or a `<domain>/*` wildcard. Empty (default) rejects every template
 # annotation. Keys under openshell.ai (OpenShell sandbox identity) and
