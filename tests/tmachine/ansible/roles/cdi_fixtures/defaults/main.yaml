@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# The published scenario expectations live under this root.
+cdi_fixture_root: /var/lib/openshell-test-inputs/cdi
+
+# The files and the socket the specs mount into containers. Under /usr/local,
+# SELinux hosts give them a type containers can read, which /var/lib does not.
+cdi_fixture_files_root: /usr/local/share/openshell-test-inputs/cdi
+
+# The container engine reads static CDI specs from /etc/cdi, which persists
+# across the setup, installation, and test disk layers.
+cdi_spec_path: /etc/cdi/openshell-tmachine-scenarios.yaml

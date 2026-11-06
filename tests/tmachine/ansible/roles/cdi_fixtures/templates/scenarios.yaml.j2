@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Generated from vars/scenarios.yaml. Scenarios are selected individually, so
+# negative scenarios never combine with positive ones.
+cdiVersion: "0.8.0"
+kind: tmachine.example/cdi-scenario
+containerEdits:
+{{ cdi_scenario_spec_edits | to_nice_yaml(indent=2) | indent(2, true) }}
+devices:
+{% for case in cdi_scenarios %}
+  - name: {{ case.name }}
+    containerEdits:
+{{ case.edits | to_nice_yaml(indent=2) | indent(6, true) }}
+{% endfor %}

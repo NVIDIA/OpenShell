@@ -11,4 +11,7 @@ stop_timeout_secs = 15
 {% if openshell_gateway_podman_driver_settings %}
 {{ openshell_gateway_podman_driver_settings }}
 {% endif %}
+{% if openshell_gateway_driver_settings %}
+{{ openshell_gateway_driver_settings }}
+{% endif %}
 {% endblock %}

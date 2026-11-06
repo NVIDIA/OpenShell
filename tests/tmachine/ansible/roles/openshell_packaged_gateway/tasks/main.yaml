@@ -41,6 +41,24 @@
     group: "{{ openshell_gateway_user }}"
     mode: "0700"
 
+# The package's service reads this operator-owned file when it exists, so write
+# it only for an environment that adds driver settings (see detect.yaml). The
+# images and driver still come from the environment file below.
+- name: Configure environment driver settings
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ openshell_gateway_home }}/.config/openshell/gateway.toml"
+    owner: "{{ openshell_gateway_user }}"
+    group: "{{ openshell_gateway_user }}"
+    mode: "0600"
+    content: |
+      [openshell]
+      version = 2
+
+      [openshell.drivers.{{ openshell_gateway_driver }}]
+      {{ openshell_gateway_driver_settings }}
+  when: openshell_gateway_driver_settings | length > 0
+
 # Exercise the package-owned service's environment-file mechanism without
 # generating operator-owned gateway TOML. Preflight and startup must resolve
 # the same candidate runtime images.
