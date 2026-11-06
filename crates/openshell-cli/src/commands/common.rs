@@ -576,9 +576,17 @@ pub fn print_sandbox_header(
 pub fn ready_false_condition_message(
     status: Option<&openshell_core::proto::SandboxStatus>,
 ) -> Option<String> {
-    let condition = status?.conditions.iter().find(|condition| {
-        condition.r#type == "Ready" && condition.status.eq_ignore_ascii_case("false")
-    })?;
+    let conditions = &status?.conditions;
+    let condition = conditions
+        .iter()
+        .find(|condition| {
+            condition.r#type == "PodScheduled" && condition.status.eq_ignore_ascii_case("false")
+        })
+        .or_else(|| {
+            conditions.iter().find(|condition| {
+                condition.r#type == "Ready" && condition.status.eq_ignore_ascii_case("false")
+            })
+        })?;
 
     if condition.message.is_empty() {
         if condition.reason.is_empty() {
