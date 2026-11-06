@@ -23,6 +23,8 @@ pub const INTERCEPTABLE_METHODS: &[&str] = &[
     "AttachSandboxProvider",
     "DetachSandboxProvider",
     "DeleteSandbox",
+    "StopSandbox",
+    "StartSandbox",
     "CreateSshSession",
     "ExposeService",
     "DeleteService",
@@ -339,6 +341,8 @@ mod tests {
                 .input_type(SERVICE_OPEN_SHELL, "UpdateSandbox")
                 .is_none()
         );
+        assert!(index.is_interceptable("openshell.v1.OpenShell", "StopSandbox"));
+        assert!(index.is_interceptable("openshell.v1.OpenShell", "StartSandbox"));
         assert!(index.is_interceptable("openshell.v1.OpenShell", "UpdateConfig"));
         assert!(index.is_interceptable("openshell.v1.OpenShell", "SubmitPolicyAnalysis"));
         assert!(!index.is_interceptable("openshell.v1.OpenShell", "Health"));
