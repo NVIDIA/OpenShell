@@ -16,7 +16,8 @@ trap 'rm -rf "${work}"' EXIT
 
 cargo run --quiet --locked --manifest-path "${manifest}" --bin openshell-conformance -- list \
     | awk '{print $1}' | sort > "${work}/program"
-cargo nextest list --locked --color never --manifest-path "${manifest}" --message-format oneline \
+# --run-ignored all: the program lists ignored tests too, so nextest must as well.
+cargo nextest list --locked --color never --run-ignored all --manifest-path "${manifest}" --message-format oneline \
     | awk '{print $2}' | sort > "${work}/nextest"
 
 if [[ ! -s "${work}/nextest" ]]; then

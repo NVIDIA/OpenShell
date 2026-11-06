@@ -285,6 +285,37 @@ And a denied connection, produced when `curl https://github.com` runs in a sandb
 The JSON examples above are formatted for readability. The actual JSONL file contains one JSON object per line with no whitespace formatting.
 </Note>
 
+## Refusal Records
+
+Every record that describes a refusal sets `action` to `Denied`. On Network and HTTP Activity, `disposition` is `Blocked`, except for FORWARD requests with an unsupported scheme, which report `Rejected`. Besides policy denials, this includes:
+
+- FORWARD requests the proxy rejects as unparsable, non-canonical, or invalid GraphQL or JSON-RPC.
+- L7 evaluation errors under `enforcement: enforce`. Under `enforcement: audit` they report `action` Other and `disposition` Allowed, because the request proceeds.
+- Google Cloud metadata server emulation responses with status 403 or 405.
+- Fail-closed request, response, and WebSocket middleware, including the HTTP Activity record for a fail-closed response stage and the Detection Findings for a fail-closed stage or chain or a failed post-middleware policy evaluation.
+- Response delivery the supervisor refuses because middleware stopped it, its preflight failed, or the upstream response head could not be normalized for it.
+
+Count these records when you track denials, for example with `select(.action == "Denied")`.
+
+## Follow a Deny Trace
+
+HTTP Activity and API Activity records emitted inside a sampled OpenTelemetry span carry `trace.uid` and list `trace` in `metadata.profiles`. These are the classes OCSF 1.8.0 declares the Trace profile for. The UID is the W3C trace ID, 32 lowercase hexadecimal characters. Search for it in your Jaeger or Tempo backend. A sampled ID does not guarantee export or retention in the trace backend.
+
+```json
+{
+  "metadata": { "profiles": ["container", "host", "network_proxy", "security_control", "trace"] },
+  "trace": { "uid": "0af7651916cd43dd8448eb211c80319c" }
+}
+```
+
+OTLP log export links every OCSF record, whatever its class, to the active sampled span through the log record's own trace and span ID fields. Use those fields for log-to-trace links in your backend.
+
+With OTLP trace export enabled on a dedicated supervisor, denied HTTP requests can create an INFO `supervisor.egress.deny` span around the audit records for that decision. The span records the policy, reason, and destination when available. At the default log level, every deny span is a root span. At debug level, FORWARD policy, destination, credential-binding, and request middleware denials can join the available connect trace and its authorization, resolve, and dial spans. Other deny spans, including L7 denials inside CONNECT tunnels and response middleware denials, remain root spans. Shared supervisor hosts do not initialize OTLP exporters, so their records carry no trace correlation. Workload `traceparent` headers never supply supervisor correlation.
+
+To bound telemetry volume when a workload retries blocked destinations, the supervisor creates at most 10 deny spans per destination at once and one more per second after that. A process-wide budget also allows at most 100 spans at once and refills at 100 per second across destinations. Rate-limited decisions create no additional deny span, while all audit records are still emitted. Records can retain correlation to an already active sampled span, including a connect span at debug level.
+
+Gateway records and their OTLP trace context can inherit the caller's incoming `traceparent`, including before authentication succeeds. The caller also decides whether they are correlated at all, because an unsampled `traceparent` suppresses `trace.uid`. Treat gateway trace IDs as correlation hints, not evidence of the caller's identity, and do not treat a missing `trace.uid` as meaningful.
+
 ## OCSF Event Classes in JSON
 
 The `class_uid` field identifies the event type:

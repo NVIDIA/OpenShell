@@ -408,6 +408,11 @@ instead of broadening the range when an address changes.
 
 ### Allow WebSocket Messages
 
+REST endpoints refuse requests carrying an `Upgrade` header with `403 Forbidden`
+in both `enforce` and `audit` mode. To migrate a REST endpoint that previously
+relayed WebSocket traffic, configure a separate `protocol: websocket` endpoint
+on its own path or port with explicit upgrade and message rules.
+
 Use `protocol: websocket` to control WebSocket connections and the messages
 that clients send over them. This template requires `/usr/bin/node` and a
 WebSocket service you control. It permits the `/v1/realtime` upgrade and client
