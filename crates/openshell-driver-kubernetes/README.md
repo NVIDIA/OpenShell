@@ -262,8 +262,13 @@ fails closed.
   and the routing preface only selects which generation-pinned TLS identity
   the supervisor demands.
 
-The topology does not support upstream proxies or provider SPIFFE identity, and
-the shared supervisor is a single point of failure for the sandboxes it hosts.
+The topology does not support upstream proxies or provider SPIFFE identity.
+With a live replacement supervisor and a takeover-capable runtime, the gateway
+can move a paused sandbox generation to the replacement using a signed takeover
+grant. Recovery preserves workload processes and memory, but proxied connections
+and interactive sessions must reconnect. If recovery exceeds the configured
+deadline, the runtime terminates the workload. It cannot recover a lost workload
+Pod or node. See [supervisor recovery](../../docs/kubernetes/high-availability.mdx#recover-from-a-supervisor-failure).
 Shared sandbox instances export no supervisor OTLP traces or OCSF events and do
 not relay agent traces; the driver warns at startup when the gateway configures
 any of them.

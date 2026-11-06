@@ -189,9 +189,15 @@ the **sandbox** holds nothing worth stealing: no gateway signing key, no
 gateway JWT, and no provider credentials. It can verify that it's talking to
 the right **supervisor**, but it can't impersonate one.
 
-If the **supervisor** disconnects, the **sandbox** freezes the agent. Only the
-same **supervisor** process can reconnect and resume it. A new **supervisor** can't
-take over a running sandbox, even with valid credentials.
+If the **supervisor** disconnects, the **sandbox** freezes the agent. The same
+**supervisor** process can reconnect and resume it within the recovery window.
+In a [shared Kubernetes supervisor pool](/kubernetes/high-availability#recover-from-a-supervisor-failure),
+the gateway can authorize a replacement **supervisor** with a signed takeover
+grant for that sandbox generation and a higher ownership epoch. When the
+replacement confirms the boundary, a runtime that supports takeover revokes the
+previous owner's access and resumes the agent. Valid session credentials alone do not
+authorize takeover. If recovery does not complete before the deadline, the
+runtime terminates the workload.
 
 ## Working With Your Existing Infrastructure
 
