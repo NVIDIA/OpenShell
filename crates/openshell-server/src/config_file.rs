@@ -1309,12 +1309,7 @@ pub enum ConfigFileError {
     /// Names the location and the parser's message but never quotes the
     /// file, which can hold credentials such as collector headers.
     #[error("failed to parse gateway config file '{}': {detail}", path.display())]
-    Parse {
-        path: PathBuf,
-        detail: String,
-        /// Safe key/location suffix for preflight, which omits parser messages.
-        unknown_field: String,
-    },
+    Parse { path: PathBuf, detail: String },
     #[error(
         "gateway config schema version is required; add `[openshell]` and `version = {SCHEMA_VERSION}`"
     )]
@@ -1496,16 +1491,7 @@ fn without_quoted_strings(message: &str) -> String {
     result
 }
 
-fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigFileError> {
-    if contents.trim().is_empty() {
-        return Err(ConfigFileError::MissingVersion);
-    }
-    let file: ConfigFile = toml::from_str(contents).map_err(|error| ConfigFileError::Parse {
-        path: path.to_path_buf(),
-        detail: parse_error_detail(contents, &error),
-        unknown_field: unknown_field(contents, &error),
-    })?;
-
+fn validate_config(file: ConfigFile) -> Result<ConfigFile, ConfigFileError> {
     match file.openshell.version {
         Some(SCHEMA_VERSION) => {}
         Some(version) => return Err(ConfigFileError::UnsupportedVersion { version }),
@@ -1698,10 +1684,7 @@ fn preflight_error(
         path: path.to_path_buf(),
         category,
         detected_version,
-        unknown_field: match source {
-            ConfigFileError::Parse { unknown_field, .. } => unknown_field,
-            _ => String::new(),
-        },
+        unknown_field: String::new(),
     }
 }
 
@@ -1717,17 +1700,40 @@ fn unknown_field(contents: &str, error: &toml::de::Error) -> String {
     if !error.message().starts_with("unknown field `") {
         return String::new();
     }
-    let line = before.matches('\n').count() + 1;
-    match contents.get(span) {
-        Some(key)
-            if !key.is_empty()
-                && key
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) =>
+    let Some(key) = contents.get(span) else {
+        return String::new();
+    };
+    let bare = !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    // Tagged enum errors can span an enclosing table instead of its unknown key.
+    let quoted_key = if bare {
+        None
+    } else {
+        if !(key.starts_with('\'') || key.starts_with('"'))
+            || key.starts_with("'''")
+            || key.starts_with("\"\"\"")
         {
-            format!(" unknown_field={key} line={line}")
+            return String::new();
         }
-        _ => format!(" unknown_field line={line}"),
+        let Ok(name) = String::deserialize(toml::de::ValueDeserializer::new(key)) else {
+            return String::new();
+        };
+        Some(name)
+    };
+    let name = quoted_key.as_deref().unwrap_or(key);
+    if !error
+        .message()
+        .starts_with(&format!("unknown field `{name}`"))
+    {
+        return String::new();
+    }
+    let line = before.matches('\n').count() + 1;
+    if bare {
+        format!(" unknown_field={key} line={line}")
+    } else {
+        format!(" unknown_field line={line}")
     }
 }
 
@@ -1737,7 +1743,7 @@ pub fn preflight(path: &Path) -> Result<ConfigFile, ConfigPreflightError> {
     let contents = read_config_contents(path)
         .map_err(|source| preflight_error(path, "unavailable".to_string(), source))?;
     let version = detected_version(&contents);
-    if version == "missing" {
+    if contents.trim().is_empty() || version == "missing" {
         return Err(preflight_error(
             path,
             version,
@@ -1755,7 +1761,13 @@ pub fn preflight(path: &Path) -> Result<ConfigFile, ConfigPreflightError> {
             },
         ));
     }
-    parse_and_validate(path, &contents).map_err(|source| preflight_error(path, version, source))
+    let file = toml::from_str(&contents).map_err(|error| ConfigPreflightError {
+        path: path.to_path_buf(),
+        category: "malformed",
+        detected_version: version.clone(),
+        unknown_field: unknown_field(&contents, &error),
+    })?;
+    validate_config(file).map_err(|source| preflight_error(path, version, source))
 }
 
 /// Load and validate a TOML config file.
@@ -1765,7 +1777,14 @@ pub fn preflight(path: &Path) -> Result<ConfigFile, ConfigPreflightError> {
 #[cfg_attr(target_os = "windows", allow(clippy::result_large_err))]
 pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
     let contents = read_config_contents(path)?;
-    parse_and_validate(path, &contents)
+    if contents.trim().is_empty() {
+        return Err(ConfigFileError::MissingVersion);
+    }
+    let file = toml::from_str(&contents).map_err(|error| ConfigFileError::Parse {
+        path: path.to_path_buf(),
+        detail: parse_error_detail(&contents, &error),
+    })?;
+    validate_config(file)
 }
 
 /// Return a driver's table without gateway-level inheritance.
@@ -2622,6 +2641,10 @@ service_name = "openshell-gateway-dev"
                 "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\nheaders = {headers}\n"
             ));
             let error = load(tmp.path()).expect_err("an invalid headers value");
+            let ConfigFileError::Parse { path, detail } = &error else {
+                panic!("invalid headers must produce a parse error");
+            };
+            assert_eq!(path, tmp.path());
             let mut report = error.to_string();
             let mut source = std::error::Error::source(&error);
             while let Some(error) = source {
@@ -2629,7 +2652,7 @@ service_name = "openshell-gateway-dev"
                 source = error.source();
             }
             for expected in expected {
-                assert!(report.contains(expected), "{headers}: {report}");
+                assert!(detail.contains(expected), "{headers}: {report}");
             }
             assert!(!report.contains("SECRETVAL"), "{headers}: {report}");
         }
@@ -3597,6 +3620,8 @@ ssh_gateway_port = 8080
             "'secret key'",
             r#""secret\nkey""#,
             r#""secret\u001bkey""#,
+            r#""secret\"key""#,
+            r#""secret`key""#,
         ] {
             let contents =
                 format!("[openshell]\nversion = 2\n[openshell.gateway]\n{key} = 'secret-value'\n");
@@ -3607,6 +3632,24 @@ ssh_gateway_port = 8080
             assert!(!diagnostic.contains("secret"), "{diagnostic}");
             assert!(!diagnostic.contains('\u{1b}'), "{diagnostic}");
             assert!(!format!("{error:?}").contains("secret"));
+            assert!(std::error::Error::source(&error).is_none());
+            assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), contents);
+        }
+
+        // Enum deserialization can only locate the enclosing table, not its key.
+        for contents in [
+            "[openshell]\nversion = 2\n\n[[openshell.gateway.provider_profile_sources]]\ntype = 'interceptor'\nname = 'x'\n\ntypo = 'secret-value'\n",
+            "[openshell]\nversion = 2\n\n[[openshell.supervisor.isolation_backends]]\nname = 'test'\n[openshell.supervisor.isolation_backends.endpoint]\nkind = 'unix'\nsocket_path = '/tmp/x'\n\ntypo = 'secret-value'\n",
+        ] {
+            let tmp = write_raw_tmp(contents);
+            let runtime = load(tmp.path()).expect_err("unknown enum field must fail");
+            assert!(runtime.to_string().contains("unknown field `typo`"));
+            let error = preflight(tmp.path()).expect_err("unknown enum field must fail preflight");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("category=malformed"), "{diagnostic}");
+            assert!(!diagnostic.contains("unknown_field"), "{diagnostic}");
+            assert!(!diagnostic.contains("secret-value"), "{diagnostic}");
+            assert!(!format!("{error:?}").contains("secret-value"));
             assert!(std::error::Error::source(&error).is_none());
             assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), contents);
         }
