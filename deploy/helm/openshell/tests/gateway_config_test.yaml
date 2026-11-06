@@ -13,6 +13,32 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: leaves gateway application auth disabled by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_auth_enabled\s*=\s*false$'
+
+  - it: enables application auth without enabling the app listener
+    template: templates/gateway-config.yaml
+    set:
+      server.serviceAuthEnabled: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_auth_enabled\s*=\s*true$'
+
+  - it: honors canonical auth false over legacy true
+    template: templates/gateway-config.yaml
+    set:
+      server.serviceAuthEnabled: true
+      gatewayConfig.gateway.service_auth_enabled: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_auth_enabled\s*=\s*false$'
+
   - it: disables the WebSocket tunnel unless explicitly enabled for an edge proxy
     template: templates/gateway-config.yaml
     asserts:

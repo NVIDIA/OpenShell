@@ -3752,12 +3752,14 @@ mod tests {
         let client_cert = CertificateDer::from(client.der().to_vec());
         let key_pem = client_key.serialize_pem().unwrap();
         let client_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
-        for enabled in [false, true] {
+        for (enabled, auth_enabled) in [(false, false), (false, true), (true, false), (true, true)]
+        {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let mut state = test_state(addr, false).await;
             let inner = Arc::get_mut(&mut state).unwrap();
             inner.config.auth.allow_unauthenticated_users = false;
+            inner.config.service_routing.auth_enabled = auth_enabled;
             inner.config.mtls_auth.enabled = true;
             inner.config.supervisor_app_listener.enabled = enabled;
             inner.config.tls = Some(openshell_core::TlsConfig {
@@ -3821,12 +3823,12 @@ mod tests {
                     .unwrap();
                 let response = String::from_utf8_lossy(&response);
                 assert!(
-                    response.starts_with(if authenticated {
+                    response.starts_with(if authenticated || !auth_enabled {
                         "HTTP/1.1 404"
                     } else {
                         "HTTP/1.1 401"
                     }),
-                    "listener={enabled}, authenticated={authenticated}: {response}"
+                    "listener={enabled}, auth={auth_enabled}, authenticated={authenticated}: {response}"
                 );
             }
             stop_listener(shutdown, handle).await;
