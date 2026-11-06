@@ -98,7 +98,9 @@ where
             if !buf.is_empty() {
                 client.write_all(&buf).await.into_diagnostic()?;
             }
-            return Ok(RelayOutcome::Consumed);
+            return Err(miette::Report::new(UpstreamHttpError {
+                response_started: !buf.is_empty() || informational_header_bytes > 0,
+            }));
         }
         buf.extend_from_slice(&tmp[..n]);
     };

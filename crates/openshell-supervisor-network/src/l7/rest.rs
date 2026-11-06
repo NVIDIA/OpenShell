@@ -830,6 +830,21 @@ impl std::error::Error for CredentialUnavailableError {}
 
 impl miette::Diagnostic for CredentialUnavailableError {}
 
+/// An upstream transport failure, distinct from client I/O and credential refusals.
+#[derive(Debug)]
+pub(crate) struct UpstreamHttpError {
+    pub(crate) response_started: bool,
+}
+
+impl fmt::Display for UpstreamHttpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HTTP upstream connection closed or failed")
+    }
+}
+
+impl std::error::Error for UpstreamHttpError {}
+impl miette::Diagnostic for UpstreamHttpError {}
+
 impl<'a> CredentialGenerationGuard<'a> {
     pub(crate) fn new(
         state: &'a openshell_core::provider_credentials::ProviderCredentialState,
@@ -901,8 +916,43 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut observed_upstream = ObservedUpstream { upstream, observer };
-    let upstream = &mut observed_upstream;
+    let mut observed_upstream = ObservedUpstream {
+        upstream,
+        observer,
+        response_started: false,
+        transport_failed: false,
+    };
+    let result = relay_http_exchange(
+        req,
+        client,
+        &mut observed_upstream,
+        options,
+        response_middleware,
+        observer,
+    )
+    .await;
+    // IntoDiagnostic hides the concrete I/O error. Classify at the adapter's
+    // owner, where an upstream failure remains distinct from client I/O.
+    if result.is_err() && observed_upstream.transport_failed {
+        return Err(miette::Report::new(UpstreamHttpError {
+            response_started: observed_upstream.response_started,
+        }));
+    }
+    result
+}
+
+async fn relay_http_exchange<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: RelayRequestOptions<'_>,
+    response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
+    observer: Option<&EndpointObserver>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     ensure_credential_generation_current(options)?;
     let header_end = req
         .raw_header
@@ -1296,6 +1346,18 @@ fn ensure_body_generation_current(options: RelayRequestOptions<'_>) -> Result<()
 struct ObservedUpstream<'a, U> {
     upstream: &'a mut U,
     observer: Option<&'a EndpointObserver>,
+    response_started: bool,
+    transport_failed: bool,
+}
+
+impl<U> ObservedUpstream<'_, U> {
+    fn transport_error(&mut self, error: std::io::Error) -> std::io::Error {
+        self.transport_failed = true;
+        if let Some(observer) = self.observer {
+            observer.observe(EndpointResult::TransportFailed);
+        }
+        error
+    }
 }
 
 impl<U: AsyncRead + Unpin> AsyncRead for ObservedUpstream<'_, U> {
@@ -1305,13 +1367,15 @@ impl<U: AsyncRead + Unpin> AsyncRead for ObservedUpstream<'_, U> {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        let before = buf.filled().len();
         let result = std::pin::Pin::new(&mut *this.upstream).poll_read(cx, buf);
-        if matches!(result, std::task::Poll::Ready(Err(_)))
-            && let Some(observer) = this.observer
-        {
-            observer.observe(EndpointResult::TransportFailed);
+        this.response_started |= buf.filled().len() > before;
+        match result {
+            std::task::Poll::Ready(Err(error)) => {
+                std::task::Poll::Ready(Err(this.transport_error(error)))
+            }
+            result => result,
         }
-        result
     }
 }
 
@@ -1323,12 +1387,15 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         let result = std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf);
-        if matches!(result, std::task::Poll::Ready(Err(_)))
-            && let Some(observer) = this.observer
-        {
-            observer.observe(EndpointResult::TransportFailed);
+        match result {
+            std::task::Poll::Ready(Err(error)) => {
+                std::task::Poll::Ready(Err(this.transport_error(error)))
+            }
+            std::task::Poll::Ready(Ok(0)) if !buf.is_empty() => std::task::Poll::Ready(Err(
+                this.transport_error(std::io::Error::from(std::io::ErrorKind::WriteZero))
+            )),
+            result => result,
         }
-        result
     }
 
     fn poll_flush(
@@ -1337,12 +1404,12 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let result = std::pin::Pin::new(&mut *this.upstream).poll_flush(cx);
-        if matches!(result, std::task::Poll::Ready(Err(_)))
-            && let Some(observer) = this.observer
-        {
-            observer.observe(EndpointResult::TransportFailed);
+        match result {
+            std::task::Poll::Ready(Err(error)) => {
+                std::task::Poll::Ready(Err(this.transport_error(error)))
+            }
+            result => result,
         }
-        result
     }
 
     fn poll_shutdown(
@@ -6288,7 +6355,10 @@ mod tests {
         }
     }
 
-    async fn assert_observed_response_result(response: &'static [u8], expected: EndpointResult) {
+    async fn assert_observed_response_result(
+        response: &'static [u8],
+        expected: EndpointResult,
+    ) -> Result<RelayOutcome> {
         let (observer, mut receiver) = test_endpoint_observer().await;
         let (mut upstream, mut upstream_peer) = tokio::io::duplex(4096);
         let writer = tokio::spawn(async move {
@@ -6298,7 +6368,7 @@ mod tests {
                 .expect("write response");
         });
         let mut client = tokio::io::sink();
-        relay_response(
+        let result = relay_response(
             "POST",
             &mut upstream,
             &mut client,
@@ -6308,14 +6378,14 @@ mod tests {
             },
             None,
         )
-        .await
-        .expect("relay observed response");
+        .await;
         writer.await.expect("join upstream writer");
         let command = receiver.recv().await.expect("endpoint observation");
         assert!(matches!(
             command,
             EndpointStatusCommand::Observe { result, .. } if result == expected
         ));
+        result
     }
 
     #[tokio::test]
@@ -6324,7 +6394,8 @@ mod tests {
             b"HTTP/1.1 204 No Content\r\n\r\n",
             EndpointResult::HttpResponseReceived,
         )
-        .await;
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -6333,7 +6404,9 @@ mod tests {
             &b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"[..],
             &b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"[..],
         ] {
-            assert_observed_response_result(response, EndpointResult::UpstreamRejected).await;
+            assert_observed_response_result(response, EndpointResult::UpstreamRejected)
+                .await
+                .unwrap();
         }
     }
 
@@ -6412,7 +6485,15 @@ mod tests {
             &b"HTTP/1.1 100 Continue\r\n\r\n"[..],
             &b"HTTP/1.1 103 Early Hints\r\n\r\n"[..],
         ] {
-            assert_observed_response_result(response, EndpointResult::TransportFailed).await;
+            let error = assert_observed_response_result(response, EndpointResult::TransportFailed)
+                .await
+                .expect_err("interim response without a final response");
+            assert!(
+                error
+                    .downcast_ref::<UpstreamHttpError>()
+                    .unwrap()
+                    .response_started
+            );
         }
     }
 
@@ -6481,6 +6562,8 @@ mod tests {
             let mut upstream = ObservedUpstream {
                 upstream: &mut response,
                 observer: Some(&observer),
+                response_started: false,
+                transport_failed: false,
             };
             let mut client = Vec::new();
             relay_response(
@@ -6513,7 +6596,8 @@ mod tests {
             b"not-http 200 nope\r\nContent-Length: 0\r\n\r\n",
             EndpointResult::TransportFailed,
         )
-        .await;
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
