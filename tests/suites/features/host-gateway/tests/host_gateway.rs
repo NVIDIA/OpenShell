@@ -11,12 +11,13 @@
 
 use host_server_support::HttpRecorder;
 use testkit::policy;
-use testkit::{Context, Result, ResultExt as _, YamlFile};
+use testkit::{Context, PYTHON_BINARIES, Result, ResultExt as _, YamlFile};
 
-/// The image's system Python, which needs nothing beyond its standard library.
-/// The policy names its real path, `/usr/bin/python3.*`, because a rule matches
-/// the executable behind a symlink.
-const PYTHON: &str = "/usr/bin/python3";
+/// The image's Python, which needs nothing beyond its standard library. The
+/// policy allows [`PYTHON_BINARIES`], the real paths behind `python3` in
+/// `testkit::python_image()` images, because a rule matches the executable
+/// behind a symlink.
+const PYTHON: &str = "python3";
 
 /// Requests `/` from `host.openshell.internal` on the port in `argv[1]` and
 /// prints the response. A failed connection is retried for 20 seconds, so a
@@ -99,7 +100,7 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
     Ok(())
 }
 
-/// A sandbox policy that allows the image's system Python ([`PYTHON`]) to
+/// A sandbox policy that allows the image's Python ([`PYTHON`]) to
 /// connect to `host.openshell.internal` on `port`. The endpoint names only the
 /// host and port, as the policy docs describe, so the driver's address for the
 /// name is what makes it reachable, not an `allowed_ips` range.
@@ -110,7 +111,7 @@ fn policy(port: u16) -> Result<String> {
         "host_server",
         "host.openshell.internal",
         port,
-        &["/usr/bin/python3.*"],
+        PYTHON_BINARIES,
     );
     policy::to_yaml(&policy)
 }
