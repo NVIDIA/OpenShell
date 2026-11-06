@@ -214,6 +214,61 @@ Podman also supports `image` mounts, which mount a container image read-only at 
 
 The MicroVM driver runs each sandbox in its own lightweight VM. It requires host virtualization: Apple Hypervisor on macOS or KVM on Linux.
 
+### Re-sign the macOS VM driver
+
+For a managed Mac, place the matching `libkrun.dylib` and
+`libkrunfw.5.dylib` in an administrator-owned runtime directory. Use a
+`vm-runtime-darwin-aarch64` archive built with this driver revision. The
+macOS runtime build adds `krun_set_fw_path` to the pinned libkrun so the
+driver can pass a canonical absolute firmware path. Earlier archives lack
+that entry point and cannot boot a hardened driver through this override.
+
+Sign both libraries and `openshell-driver-vm` with the same Developer ID
+Application identity and the hardened runtime. Apple's
+[library validation rule](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.disable-library-validation)
+allows a hardened process to load libraries signed with its Team ID. The
+repository's [VM driver entitlement file](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/entitlements.plist)
+provides `com.apple.security.hypervisor`. A VM boot with matching Developer
+ID signatures has not yet been verified.
+
+If the libraries are ad-hoc signed or signed by a different Team ID, the
+driver also needs `com.apple.security.cs.disable-library-validation`. The
+ad-hoc hardened-runtime VM proof used both entitlements. It did not need
+`com.apple.security.cs.allow-dyld-environment-variables`.
+
+This example stages the two libraries from a newly built matching archive.
+Replace the identity, archive, and paths for your package:
+
+```shell
+mkdir -p runtime
+zstd -dc vm-runtime-darwin-aarch64.tar.zst |
+  tar -xf - -C runtime ./libkrun.dylib ./libkrunfw.5.dylib
+
+identity='Developer ID Application: Your Organization (TEAMID)'
+codesign --force --options runtime --timestamp -s "$identity" runtime/libkrunfw.5.dylib
+codesign --force --options runtime --timestamp -s "$identity" runtime/libkrun.dylib
+codesign --force --options runtime --timestamp \
+  --entitlements crates/openshell-driver-vm/entitlements.plist \
+  -s "$identity" openshell-driver-vm
+
+codesign --verify --strict runtime/libkrunfw.5.dylib
+codesign --verify --strict runtime/libkrun.dylib
+codesign --verify --strict openshell-driver-vm
+```
+
+Set `OPENSHELL_VM_RUNTIME_DIR` to the absolute path of that directory in the
+gateway's service environment, for example:
+
+```shell
+OPENSHELL_VM_RUNTIME_DIR=/opt/example/openshell/runtime \
+  openshell-gateway --config /etc/openshell/gateway.toml
+```
+
+The managed VM driver inherits the setting. It opens both dylibs by canonical
+absolute path inside the selected directory and does not depend on `DYLD_*`
+environment variables. Without the override, it uses its embedded runtime.
+Keep the runtime directory writable only by administrators.
+
 The VM driver is opt-in. Enable it in the gateway TOML file:
 
 ```toml

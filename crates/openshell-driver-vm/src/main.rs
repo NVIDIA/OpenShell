@@ -8,7 +8,7 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
 #[cfg(target_os = "macos")]
-use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
+use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, VM_RUNTIME_REEXEC_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
     VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VmMount, VsockPortMap, procguard, run_vm,
 };
@@ -275,21 +275,46 @@ struct Args {
     vm_mount: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
+    if args.internal_run_vm {
+        return run_internal_vm(&args);
+    }
+
+    // The re-exec marker belongs only to an embedded-runtime VM launcher.
+    // A gateway service must not pass it through the outer driver to a new
+    // launcher using an operator-supplied runtime.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        std::env::remove_var(VM_RUNTIME_REEXEC_ENV);
+    }
+
+    run_async_driver(args)
+}
+
+fn run_internal_vm(args: &Args) -> Result<()> {
+    ensure_vm_worker_outside_tokio()?;
+    // libkrun forks its worker before any Tokio threads exist.
+    maybe_reexec_internal_vm_with_runtime_env()?;
+    let config = build_vm_launch_config(args).map_err(|err| miette::miette!("{err}"))?;
+    run_vm(&config).map_err(|err| miette::miette!("{err}"))
+}
+
+fn ensure_vm_worker_outside_tokio() -> Result<()> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(miette::miette!(
+            "internal VM worker must start before the Tokio runtime"
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn run_async_driver(args: Args) -> Result<()> {
     if let Some(request) = args.internal_prepare_image {
         openshell_driver_vm::driver::run_image_preparation_worker(&request)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
-        return Ok(());
-    }
-    if args.internal_run_vm {
-        // The VM launcher arms procguard after resolving its runtime so its
-        // libkrun worker cannot outlive the launcher.
-        maybe_reexec_internal_vm_with_runtime_env()?;
-        let config = build_vm_launch_config(&args).map_err(|err| miette::miette!("{err}"))?;
-        run_vm(&config).map_err(|err| miette::miette!("{err}"))?;
         return Ok(());
     }
 
@@ -732,9 +757,9 @@ fn parse_vm_mount_arg(arg: &str) -> std::result::Result<VmMount, String> {
 fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
     use std::os::unix::process::CommandExt as _;
 
-    const REEXEC_ENV: &str = "__OPENSHELL_DRIVER_VM_REEXEC";
-
-    if std::env::var_os(REEXEC_ENV).is_some() {
+    if std::env::var_os(VM_RUNTIME_REEXEC_ENV).is_some()
+        || std::env::var_os(VM_RUNTIME_DIR_ENV).is_some()
+    {
         return Ok(());
     }
 
@@ -767,7 +792,7 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
         .args(&args)
         .env("DYLD_LIBRARY_PATH", &joined)
         .env(VM_RUNTIME_DIR_ENV, runtime_dir)
-        .env(REEXEC_ENV, "1")
+        .env(VM_RUNTIME_REEXEC_ENV, "1")
         .exec();
     // `exec()` only returns on failure.
     Err(miette::miette!("failed to re-exec with runtime env: {err}"))
@@ -788,6 +813,23 @@ mod tests {
     };
     use clap::Parser;
     use std::path::PathBuf;
+
+    #[test]
+    fn internal_vm_worker_rejects_tokio_context() {
+        assert!(super::ensure_vm_worker_outside_tokio().is_ok());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("Tokio runtime");
+        runtime.block_on(async {
+            let error = super::ensure_vm_worker_outside_tokio().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("must start before the Tokio runtime")
+            );
+        });
+    }
 
     #[test]
     fn corporate_proxy_flags_parse_into_driver_settings() {

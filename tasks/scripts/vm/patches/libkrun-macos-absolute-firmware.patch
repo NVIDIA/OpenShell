@@ -1,0 +1,46 @@
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index a797fd1..3c6f9eb 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -29,0 +30,2 @@ use std::ffi::{c_void, CStr};
++#[cfg(target_os = "macos")]
++use std::ffi::OsStr;
+@@ -36,0 +39,2 @@ use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
++#[cfg(target_os = "macos")]
++use std::os::unix::ffi::OsStrExt;
+@@ -40,0 +45,2 @@ use std::sync::LazyLock;
++#[cfg(target_os = "macos")]
++use std::sync::OnceLock;
+@@ -116,2 +122,30 @@ fn init_virtual_entry() -> VirtualDirEntry {
+-static KRUNFW: LazyLock<Option<libloading::Library>> =
+-    LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() });
++// Set by the VM driver before the first context is created. A full path is
++// required because hardened dyld rejects the bare firmware filename.
++#[cfg(target_os = "macos")]
++static KRUNFW_PATH: OnceLock<PathBuf> = OnceLock::new();
++
++#[cfg(target_os = "macos")]
++#[no_mangle]
++pub unsafe extern "C" fn krun_set_fw_path(path: *const c_char) -> i32 {
++    if path.is_null() {
++        return -libc::EINVAL;
++    }
++
++    let path = PathBuf::from(OsStr::from_bytes(unsafe { CStr::from_ptr(path) }.to_bytes()));
++    if !path.is_absolute() {
++        return -libc::EINVAL;
++    }
++
++    match KRUNFW_PATH.set(path) {
++        Ok(()) => KRUN_SUCCESS,
++        Err(_) => -libc::EALREADY,
++    }
++}
++
++static KRUNFW: LazyLock<Option<libloading::Library>> = LazyLock::new(|| {
++    #[cfg(target_os = "macos")]
++    if let Some(path) = KRUNFW_PATH.get() {
++        return unsafe { libloading::Library::new(path).ok() };
++    }
++    unsafe { libloading::Library::new(KRUNFW_NAME).ok() }
++});
