@@ -6237,55 +6237,12 @@ mod linux {
         #[test]
         fn sigterm_exits_while_the_supervisor_holds_an_exchange_open() {
             const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_SIGTERM_CHILD";
-            const READY: &str = "boundary-sigterm-test-ready";
             const EXIT_BUDGET: Duration = Duration::from_secs(10);
             if std::env::var_os(CHILD_MARKER).is_none() {
-                use std::io::BufRead as _;
-                let mut child = std::process::Command::new(
-                    std::env::current_exe().expect("current test executable"),
-                )
-                .args([
-                    "--exact",
+                run_isolated(
                     "boundary_server::linux::tests::sigterm_exits_while_the_supervisor_holds_an_exchange_open",
-                    "--nocapture",
-                ])
-                .env(CHILD_MARKER, "1")
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .expect("run isolated termination test");
-                let mut lines =
-                    io::BufReader::new(child.stdout.take().expect("child stdout")).lines();
-                assert!(
-                    lines.any(|line| line.is_ok_and(|line| line == READY)),
-                    "the boundary never parked an exchange"
-                );
-                std::thread::spawn(move || lines.for_each(drop));
-                nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("child PID")),
-                    nix::sys::signal::Signal::SIGTERM,
-                )
-                .expect("send SIGTERM");
-                let signalled = std::time::Instant::now();
-                let status = loop {
-                    if let Some(status) = child.try_wait().expect("poll boundary") {
-                        break Some(status);
-                    }
-                    if signalled.elapsed() > EXIT_BUDGET {
-                        break None;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                };
-                let elapsed = signalled.elapsed();
-                if status.is_none() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                let status = status.unwrap_or_else(|| {
-                    panic!("the boundary was still running {elapsed:?} after SIGTERM")
-                });
-                assert!(
-                    status.success(),
-                    "isolated termination test failed: {status}"
+                    CHILD_MARKER,
+                    Duration::from_mins(1),
                 );
                 return;
             }
@@ -6341,6 +6298,7 @@ mod linux {
                 )
             };
             let opening = test_open_request(&boundary.config);
+            let (signalled_sender, signalled) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let supervisor = std::panic::AssertUnwindSafe(|| {
                     supervisor_runtime.block_on(async move {
@@ -6444,7 +6402,14 @@ mod linux {
                                 "a parked exchange answered before termination"
                             );
                         }
-                        println!("{READY}");
+                        signalled_sender
+                            .send(std::time::Instant::now())
+                            .expect("report SIGTERM time");
+                        nix::sys::signal::kill(
+                            nix::unistd::Pid::this(),
+                            nix::sys::signal::Signal::SIGTERM,
+                        )
+                        .expect("send SIGTERM");
                         std::future::pending::<()>().await;
                         drop(parked);
                     });
@@ -6465,6 +6430,14 @@ mod linux {
             install_boundary_signal_handlers().expect("install termination handlers");
             serve_then_stop(process_runtime, &listener, boundary)
                 .expect("terminate after supervisor confirmation");
+            let elapsed = signalled
+                .recv()
+                .expect("the supervisor sent SIGTERM")
+                .elapsed();
+            assert!(
+                elapsed < EXIT_BUDGET,
+                "the boundary took {elapsed:?} to stop after SIGTERM"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
