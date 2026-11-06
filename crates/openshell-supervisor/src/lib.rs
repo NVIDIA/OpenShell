@@ -3090,6 +3090,34 @@ async fn reload_gateway_policy_runtime(
     .await
 }
 
+fn validate_live_filesystem_policy(
+    applied: Option<&openshell_core::proto::SandboxPolicy>,
+    candidate: Option<&openshell_core::proto::SandboxPolicy>,
+) -> Result<()> {
+    let (Some(applied), Some(candidate)) = (applied, candidate) else {
+        return Ok(());
+    };
+    let same_paths = |left: &[String], right: &[String]| {
+        left.iter().collect::<std::collections::HashSet<_>>() == right.iter().collect()
+    };
+    let unchanged = match (&applied.filesystem, &candidate.filesystem) {
+        (Some(applied), Some(candidate)) => {
+            applied.include_workdir == candidate.include_workdir
+                && same_paths(&applied.read_only, &candidate.read_only)
+                && same_paths(&applied.read_write, &candidate.read_write)
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if !unchanged {
+        // Reloading the network engine cannot change installed filesystem permissions.
+        return Err(miette::miette!(
+            "filesystem policy cannot be changed on a running sandbox; recreate the sandbox to apply filesystem changes"
+        ));
+    }
+    Ok(())
+}
+
 async fn reload_gateway_configuration_runtime(
     engine: &OpaEngine,
     policy: Option<&openshell_core::proto::SandboxPolicy>,
@@ -4681,28 +4709,36 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
         if policy_runtime_changed {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
-            let runtime_result = reload_gateway_configuration_runtime(
-                &ctx.opa_engine,
+            let runtime_result = match validate_live_filesystem_policy(
+                current_endpoint_policy.as_ref(),
                 result.policy.as_ref(),
-                pid,
-                MiddlewareReloadContext {
-                    desired_services: &result.supervisor_middleware_services,
-                    authentication: &MiddlewareAuthentication {
-                        credentials: middleware_credentials.clone(),
-                        enabled: result.extension_authentication_enabled,
-                    },
-                    registry_changed: middleware_registry_changed,
-                    connector: &ctx.middleware_connector,
-                },
-                ctx.transparent_tcp,
-                ctx.vm_identity,
-                || {
-                    if let Some(prepared) = prepared_provider.as_ref() {
-                        ctx.provider_credentials.install_prepared(prepared);
-                    }
-                },
-            )
-            .await;
+            ) {
+                Ok(()) => {
+                    reload_gateway_configuration_runtime(
+                        &ctx.opa_engine,
+                        result.policy.as_ref(),
+                        pid,
+                        MiddlewareReloadContext {
+                            desired_services: &result.supervisor_middleware_services,
+                            authentication: &MiddlewareAuthentication {
+                                credentials: middleware_credentials.clone(),
+                                enabled: result.extension_authentication_enabled,
+                            },
+                            registry_changed: middleware_registry_changed,
+                            connector: &ctx.middleware_connector,
+                        },
+                        ctx.transparent_tcp,
+                        ctx.vm_identity,
+                        || {
+                            if let Some(prepared) = prepared_provider.as_ref() {
+                                ctx.provider_credentials.install_prepared(prepared);
+                            }
+                        },
+                    )
+                    .await
+                }
+                Err(error) => Err(GatewayRuntimeReloadError::PolicyValidation(error)),
+            };
 
             match runtime_result {
                 Ok(generation) => {
@@ -8345,8 +8381,11 @@ network_policies:
             1,
             openshell_core::proto::PolicySource::Sandbox,
         );
+        // Keep the applied filesystem grants so only the TCP expansion differs.
+        let mut tcp_policy = proto_policy_fixture();
+        tcp_policy.network_policies = proto_tcp_policy_fixture().network_policies;
         let v2 = settings_poll_result(
-            Some(proto_tcp_policy_fixture()),
+            Some(tcp_policy),
             2,
             openshell_core::proto::PolicySource::Sandbox,
         );
@@ -8383,6 +8422,156 @@ network_policies:
         assert!(report.2.contains("previous policy remains active"));
         assert_eq!(engine.current_generation(), active_generation);
         assert!(engine.fail_closed_reason().is_none());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn live_filesystem_changes_reject_polled_policy_without_advancing_active_revision() {
+        use openshell_core::proto::{FilesystemPolicy, PolicySource};
+
+        for source in [PolicySource::Sandbox, PolicySource::Global] {
+            for change in ["read_only", "read_write", "from_none"] {
+                let mut policy = proto_policy_fixture();
+                if change == "from_none" {
+                    policy.filesystem = None;
+                } else {
+                    // Startup may already have added the proxy's filesystem prerequisites.
+                    policy
+                        .filesystem
+                        .as_mut()
+                        .unwrap()
+                        .read_only
+                        .push("/proxy-baseline".into());
+                }
+                let initial = settings_poll_result(Some(policy.clone()), 1, source);
+                let engine = Arc::new(OpaEngine::from_proto(&policy).expect("build OPA engine"));
+                let mut ctx = policy_poll_test_context(
+                    engine.clone(),
+                    LoadedPolicyOrigin::Gateway {
+                        revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                        has_last_valid_policy: true,
+                    },
+                    default_middleware_connector(),
+                );
+                ctx.endpoint_policy = Some(policy.clone());
+                let (client, polls, mut reports) = scripted_policy_gateway();
+                let observed_polls = client.polled_sandboxes.clone();
+                let wait_for_polls = |count: usize| {
+                    let observed_polls = observed_polls.clone();
+                    async move {
+                        timeout(Duration::from_secs(1), async {
+                            while observed_polls.lock().await.len() < count {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("policy poll loop stalled");
+                    }
+                };
+                polls.send(initial).unwrap();
+                let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+                if source == PolicySource::Sandbox {
+                    expect_policy_report(&mut reports, 1).await;
+                }
+                wait_for_polls(2).await;
+                let original_generation = engine.current_generation();
+
+                let filesystem = policy
+                    .filesystem
+                    .get_or_insert_with(FilesystemPolicy::default);
+                if change == "read_write" {
+                    filesystem.read_write.push("/extra-readwrite".into());
+                } else {
+                    filesystem.read_only.push("/extra-readonly".into());
+                }
+                let mut candidate = settings_poll_result(Some(policy), 2, source);
+                let fail_closed = source == PolicySource::Global && change == "read_only";
+                candidate.policy_validation_failure_mode = if fail_closed {
+                    PolicyValidationFailureMode::FailClosed
+                } else {
+                    PolicyValidationFailureMode::RetainLastValid
+                };
+                polls.send(candidate).unwrap();
+                wait_for_polls(3).await;
+
+                if source == PolicySource::Sandbox {
+                    let (version, loaded, error) = timeout(Duration::from_secs(1), reports.recv())
+                        .await
+                        .expect("filesystem rejection report timed out")
+                        .expect("policy reporter stopped");
+                    assert_eq!(version, 2, "{source:?}: {change}");
+                    assert!(!loaded, "{source:?}: {change}");
+                    assert!(
+                        error.contains("filesystem"),
+                        "{source:?}: {change}: {error}"
+                    );
+                } else {
+                    expect_no_policy_report(&mut reports).await;
+                }
+                assert_eq!(
+                    engine.fail_closed_reason().is_some(),
+                    fail_closed,
+                    "{source:?}: {change}"
+                );
+                assert_eq!(
+                    engine.current_generation(),
+                    original_generation + u64::from(fail_closed),
+                    "{source:?}: {change}"
+                );
+                handle.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_filesystem_change_poll_reports_failure_then_accepts_network_only_repair() {
+        use openshell_core::proto::PolicySource;
+
+        let policy = proto_policy_fixture();
+        let initial = settings_poll_result(Some(policy.clone()), 1, PolicySource::Sandbox);
+        let mut rejected = policy.clone();
+        rejected
+            .filesystem
+            .as_mut()
+            .unwrap()
+            .read_only
+            .push("/extra-readonly".into());
+        let mut rejected = settings_poll_result(Some(rejected), 2, PolicySource::Sandbox);
+        rejected.policy_validation_failure_mode = PolicyValidationFailureMode::RetainLastValid;
+        let mut repaired = policy.clone();
+        repaired.network_policies = proto_tcp_policy_fixture().network_policies;
+        repaired.filesystem.as_mut().unwrap().read_only.reverse();
+        let repaired = settings_poll_result(Some(repaired), 3, PolicySource::Sandbox);
+        let engine = Arc::new(OpaEngine::from_proto(&policy).expect("build OPA engine"));
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.endpoint_policy = Some(policy);
+        ctx.transparent_tcp = TransparentTcpReloadState {
+            capable: true,
+            substrate_ready: true,
+        };
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(initial).unwrap();
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(rejected).unwrap();
+        let (version, loaded, error) = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("filesystem rejection report timed out")
+            .expect("policy reporter stopped");
+        assert_eq!(version, 2);
+        assert!(!loaded);
+        assert!(error.contains("filesystem"));
+        assert_eq!(engine.current_generation(), 0);
+        polls.send(repaired).unwrap();
+        expect_policy_report(&mut reports, 3).await;
+        assert_eq!(engine.current_generation(), 1);
         handle.abort();
     }
 
