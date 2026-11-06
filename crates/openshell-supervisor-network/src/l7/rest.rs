@@ -88,6 +88,7 @@ pub(crate) const UNSUPPORTED_H2C_UPGRADE_DETAIL: &str =
 pub(crate) const UNSUPPORTED_JSONRPC_UPGRADE_DETAIL: &str =
     "HTTP upgrade is not supported for JSON-RPC or MCP endpoints";
 pub(crate) const UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL: &str = "HTTP upgrade is not supported for GraphQL endpoints; serve GraphQL over WebSocket from a separate protocol: websocket endpoint on another path or port";
+pub(crate) const UNSUPPORTED_REST_UPGRADE_DETAIL: &str = "HTTP upgrade is not supported for REST endpoints; use a separate protocol: websocket endpoint with explicit message rules";
 const MIN_HTTP2_PREFACE_DETECTION_BYTES: usize = 8;
 
 /// Idle timeout for `relay_until_eof`.  If no data arrives within this window
@@ -2441,11 +2442,11 @@ pub(crate) fn unsupported_upgrade_detail(
 /// individual HTTP requests, or `None` for a protocol that may relay an
 /// allowed upgrade.
 ///
-/// JSON-RPC, MCP and GraphQL rules inspect each HTTP request body or query.
+/// REST, JSON-RPC, MCP and GraphQL rules inspect individual HTTP requests.
 /// After an upgrade the relay would copy frames that no rule of these
 /// protocols evaluates, so they never upgrade; GraphQL over WebSocket is
 /// served by separate `protocol: websocket` endpoints with GraphQL operation
-/// rules. REST and WebSocket endpoints relay allowed upgrades, and SQL
+/// rules. WebSocket endpoints relay allowed upgrades, and SQL
 /// endpoints keep their existing upgrade behavior. The match is exhaustive so
 /// a new protocol must choose.
 pub(crate) fn upgrade_refusal_for_protocol(
@@ -2455,7 +2456,8 @@ pub(crate) fn upgrade_refusal_for_protocol(
     match protocol {
         L7Protocol::JsonRpc | L7Protocol::Mcp => Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL),
         L7Protocol::Graphql => Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL),
-        L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => None,
+        L7Protocol::Rest => Some(UNSUPPORTED_REST_UPGRADE_DETAIL),
+        L7Protocol::Websocket | L7Protocol::Sql => None,
     }
 }
 
@@ -9253,16 +9255,10 @@ mod tests {
         let websocket = format!(
             "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         );
-        for protocol in [
-            crate::l7::L7Protocol::Rest,
-            crate::l7::L7Protocol::Websocket,
-        ] {
-            assert_eq!(
-                unsupported_upgrade_detail(websocket.as_bytes(), protocol),
-                None,
-                "{protocol:?}"
-            );
-        }
+        assert_eq!(
+            unsupported_upgrade_detail(websocket.as_bytes(), crate::l7::L7Protocol::Websocket),
+            None,
+        );
 
         // Streamable HTTP requests, a look-alike header name, and a stray
         // `Connection: upgrade` without an `Upgrade` header stay allowed;
@@ -9275,6 +9271,7 @@ mod tests {
         ];
         for raw in ordinary {
             for protocol in [
+                crate::l7::L7Protocol::Rest,
                 crate::l7::L7Protocol::JsonRpc,
                 crate::l7::L7Protocol::Mcp,
                 crate::l7::L7Protocol::Graphql,
@@ -9325,7 +9322,11 @@ mod tests {
             upgrade_refusal_for_protocol(L7Protocol::Graphql),
             Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL)
         );
-        for protocol in [L7Protocol::Rest, L7Protocol::Websocket, L7Protocol::Sql] {
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::Rest),
+            Some(UNSUPPORTED_REST_UPGRADE_DETAIL)
+        );
+        for protocol in [L7Protocol::Websocket, L7Protocol::Sql] {
             assert_eq!(upgrade_refusal_for_protocol(protocol), None, "{protocol:?}");
         }
     }
@@ -9363,6 +9364,7 @@ mod tests {
                 "fixture must be an upgrade to the relay: {raw}"
             );
             for protocol in [
+                crate::l7::L7Protocol::Rest,
                 crate::l7::L7Protocol::JsonRpc,
                 crate::l7::L7Protocol::Mcp,
                 crate::l7::L7Protocol::Graphql,

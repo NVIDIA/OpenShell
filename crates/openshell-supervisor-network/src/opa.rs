@@ -4566,6 +4566,10 @@ process:
             let mut policy = valid.clone();
             policy["version"] = 1.into();
             policy["network_policies"]["admin"]["endpoints"][0][field] = control;
+            if field == "websocket_credential_rewrite" {
+                policy["network_policies"]["admin"]["endpoints"][0]["protocol"] =
+                    "websocket".into();
+            }
             openshell_policy::parse_sandbox_policy(&policy.to_string()).expect("typed valid twin");
             OpaEngine::from_strings(TEST_POLICY, &policy.to_string()).expect("raw valid twin");
             policy["network_policies"]["admin"]["endpoints"][0][field] = invalid;
@@ -8277,7 +8281,7 @@ network_policies:
                 endpoints: vec![NetworkEndpoint {
                     host: "gateway.example.com".to_string(),
                     port: 443,
-                    protocol: "rest".to_string(),
+                    protocol: "websocket".to_string(),
                     enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                     websocket_credential_rewrite: true,
