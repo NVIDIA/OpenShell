@@ -129,7 +129,7 @@ do.
 Three connections tie a sandbox session together. The gateway signs the
 session's gateway and sandbox JWTs, each bound to that sandbox and generation.
 
-![OpenShell sandbox authentication showing the compute driver giving the supervisor a bootstrap credential, the gateway issuing a gateway JWT and sandbox JWT, and the supervisor presenting the sandbox JWT over server-authenticated TLS to the sandbox, which holds only the gateway's public key.](../images/openshell-sandbox-authentication.svg)
+![OpenShell sandbox authentication showing the gateway preissuing session JWTs, delivery to dedicated supervisors through the compute driver or to shared supervisors through a host-JWT-authenticated assignment stream, and the supervisor presenting the sandbox JWT over server-authenticated TLS to the sandbox.](../images/openshell-sandbox-authentication.svg)
 
 | Connection | Who connects | How it's protected |
 |---|---|---|
@@ -143,17 +143,21 @@ workload; the gateway JWT authenticates supervisor RPCs.
 
 ### Getting the first credential
 
-The **supervisor** needs a starting credential to prove which sandbox it belongs
-to. How it gets one depends on the runtime:
+The gateway prepares session credentials for each sandbox generation and
+delivers them through trusted launch provisioning:
 
-- **Docker, Podman, and MicroVM.** The driver hands the **supervisor** its initial
-  tokens directly, in files only the **supervisor** can read.
-- **Kubernetes.** The **supervisor** presents its pod's ServiceAccount token. The
-  gateway asks the Kubernetes driver to verify the token and confirm that the
-  pod belongs to the expected sandbox before it issues any JWTs.
+- **Docker, Podman, and MicroVM.** The driver supplies the dedicated
+  **supervisor** with private credential files.
+- **Kubernetes, dedicated supervisor.** The driver mounts the preissued
+  credential bundle from a Secret into the **supervisor** pod.
+- **Kubernetes, shared supervisor.** Each sandbox's credential bundle arrives
+  in its assignment over the authenticated supervisor-host stream.
 
-Either way, the gateway checks the claim against its own record of the sandbox
-before returning credentials.
+A separate `IssueSandboxToken` exchange accepts a compute-driver bootstrap
+identity. On Kubernetes, the driver validates a projected ServiceAccount token
+and its pod and owner identity. The gateway compares the driver and runtime
+identity with its stored sandbox record before returning a gateway JWT. This
+exchange is not required for supervisors provisioned with a credential bundle.
 
 ### Gateway and Sandbox JWTs
 
