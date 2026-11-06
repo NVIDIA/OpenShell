@@ -11,6 +11,17 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: omits scheduling overrides by default on the Deployment
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: openshell-db
+    asserts:
+      - notExists:
+          path: spec.template.spec.priorityClassName
+      - notExists:
+          path: spec.template.spec.topologySpreadConstraints
+
   # priorityClassName — shared pod template, so both workload shapes
   - it: omits priorityClassName by default on the StatefulSet
     template: templates/statefulset.yaml
@@ -26,6 +37,11 @@ tests:
       - equal:
           path: spec.template.spec.priorityClassName
           value: system-cluster-critical
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gateway-state
+            emptyDir: {}
 
   - it: sets priorityClassName on the Deployment when configured
     template: templates/deployment.yaml
@@ -55,6 +71,7 @@ tests:
           labelSelector:
             matchLabels:
               app.kubernetes.io/name: openshell
+              app.kubernetes.io/instance: openshell
     asserts:
       - equal:
           path: spec.template.spec.topologySpreadConstraints[0].maxSkew
@@ -65,6 +82,11 @@ tests:
       - equal:
           path: spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable
           value: DoNotSchedule
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0].labelSelector.matchLabels
+          value:
+            app.kubernetes.io/name: openshell
+            app.kubernetes.io/instance: openshell
 
   - it: sets topologySpreadConstraints on the Deployment when configured
     template: templates/deployment.yaml
@@ -75,6 +97,10 @@ tests:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
           whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: openshell
+              app.kubernetes.io/instance: openshell
     asserts:
       - equal:
           path: spec.template.spec.topologySpreadConstraints[0].topologyKey
