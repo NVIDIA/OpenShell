@@ -708,6 +708,8 @@ describe('create', () => {
         created = req;
         return {
           ...readySandbox('sb', 'sb-id'),
+          applicationServiceUrls: { '': 'https://sb.example.test/', metrics: 'https://metrics.sb.example.test/' },
+          gatewayServiceUrls: { '': 'https://sb.gateway.test:8080/' },
           serviceUrls: {
             '': 'https://sb.example.test/',
             metrics: 'https://metrics.sb.example.test/',
@@ -742,6 +744,8 @@ describe('create', () => {
         authorizationMode: ProtoServiceAuthorizationMode.BEARER_PASSTHROUGH,
       },
     ]);
+    expect(result.applicationServiceUrls).toEqual(result.serviceUrls);
+    expect(result.gatewayServiceUrls['']).toBe('https://sb.gateway.test:8080/');
     expect(result.serviceUrls).toEqual({
       '': 'https://sb.example.test/',
       metrics: 'https://metrics.sb.example.test/',
