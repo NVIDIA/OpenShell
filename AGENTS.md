@@ -25,6 +25,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-credential-issuer/` | Embedded credential issuer | Credential storage, built-in refresh execution/recovery/scheduling, typed secret owners, and existing driver transport |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
+| `crates/openshell-sandbox-proxy/` | Optional application proxy | Discovery-driven TLS passthrough directly to supervisor app listeners |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
 | `crates/openshell-supervisor-control/` | Shared supervisor control | Gateway-owned assignment controller, launch registrations, recovery coordination, and host observations for a supervisor shared by many sandboxes |
 | `crates/openshell-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |

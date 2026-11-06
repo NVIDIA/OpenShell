@@ -40,6 +40,9 @@ prebuilt_arches() {
 
 required_prebuilt_binaries() {
 	case "$1" in
+		sandbox-proxy)
+			echo "openshell-sandbox-proxy"
+			;;
 		gateway)
 			echo "openshell-gateway"
 			;;
@@ -95,7 +98,7 @@ ensure_prebuilt_binaries() {
 	fi
 }
 
-TARGET=${1:?"Usage: docker-build-image.sh <gateway|sandbox|supervisor|supervisor-output> [extra-args...]"}
+TARGET=${1:?"Usage: docker-build-image.sh <gateway|sandbox|supervisor|sandbox-proxy|supervisor-output> [extra-args...]"}
 shift
 
 IS_FINAL_IMAGE=0
@@ -103,6 +106,12 @@ IMAGE_NAME=""
 DOCKER_TARGET=""
 DOCKERFILE=""
 case "${TARGET}" in
+  sandbox-proxy)
+    IS_FINAL_IMAGE=1
+    IMAGE_NAME="openshell/sandbox-proxy"
+    DOCKER_TARGET="sandbox-proxy"
+    DOCKERFILE="deploy/docker/Dockerfile.sandbox-proxy"
+    ;;
   gateway)
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/gateway"

@@ -114,6 +114,14 @@ jobs:
             binary: openshell-sandbox
             triple: aarch64-unknown-linux-musl
             runner: linux-arm64-cpu8
+          - package: openshell-sandbox-proxy
+            binary: openshell-sandbox-proxy
+            triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
+          - package: openshell-sandbox-proxy
+            binary: openshell-sandbox-proxy
+            triple: aarch64-unknown-linux-gnu
+            runner: linux-arm64-cpu8
           - package: openshell-supervisor
             binary: openshell-supervisor
             triple: x86_64-unknown-linux-gnu
