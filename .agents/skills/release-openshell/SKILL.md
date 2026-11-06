@@ -12,11 +12,17 @@ prerelease and changes since the previous stable release. Present the candidate
 to the maintainer. Once approved, dispatch Release from that branch:
 
 ```shell
-gh workflow run release.yml --ref main -f tag=vX.Y.Z
+gh workflow run release.yml --ref main
 ```
 
-Use the support branch instead of `main` for a previous minor version. Release
-selects the highest-numbered `vX.Y.Z-pre.N` reachable from that branch with a
+Without `tag`, Release detects the highest prerelease version reachable from the
+selected branch, then selects its highest-numbered passing candidate. It stops
+if that version has no qualified candidate or already has a stable tag. Supply
+`-f tag=vX.Y.Z` to select a version explicitly or retry a stable release.
+
+Use the support branch instead of `main` for a previous minor version. That
+branch must contain the updated release workflows. Release selects the
+highest-numbered `vX.Y.Z-pre.N` reachable from that branch with a
 successful Pre-release run triggered by that tag or dispatched on the same branch,
 and matching passing `release-tag-v1` qualification evidence. Missing or expired evidence blocks
 promotion. Inspect the selected candidate in the promotion job summary.
@@ -26,7 +32,9 @@ passed but publication failed, rerun the failed jobs before promoting the candid
 Release creates `vX.Y.Z` at that exact commit, then rebuilds and publishes all
 stable artifacts without rerunning qualification. Embedded versions change, so
 stable artifacts are not byte-identical to the qualified prerelease. An existing
-stable tag may be retried only if it already points to the selected commit.
+stable tag may be retried only if it already points to the selected commit. A retry
+publishes only missing artifacts; published images, charts, release assets, npm,
+and PyPI versions are kept, while the snap is uploaded again.
 Stable images are saved as OCI archives during the build and pushed under the
 stable version tags during publication. Their SBOMs are verified before updating
 `latest`; the qualified prerelease's commit-SHA image tags remain unchanged.
@@ -39,6 +47,31 @@ created using `GITHUB_TOKEN`, dispatch Pre-release explicitly on the intended br
 gh workflow run release-prerelease.yml --ref main -f tag=vX.Y.Z-pre.1
 ```
 
+Once the first tag seeds a series, omit `tag` to create the next candidate at
+the selected branch's dispatch commit:
+
+```shell
+gh workflow run release-prerelease.yml --ref main
+```
+
+This selects the highest release series reachable from that branch and requires
+its `-pre.1` seed there. It stops if that version is already stable. New version
+series always need an explicit seed. Manual runs create a new candidate even
+without new commits; pass an existing tag explicitly to retry that candidate.
+Candidate creation is serialized with Release Auto-Tag, which still skips
+unchanged commits and inactive series on `main`.
+
+For example, start a support patch series by tagging its intended branch commit
+as `v0.4.4-pre.1`. Subsequent candidates and promotion use the support branch:
+
+```shell
+gh workflow run release-prerelease.yml --ref release/0.4
+gh workflow run release.yml --ref release/0.4
+```
+
+Replace `release/0.4` with the actual support branch. Use explicit tag inputs if
+its history also contains a higher version series.
+
 Wait for the entire Pre-release run to pass before promoting it. Stable tag pushes do not
 start Release. Release Auto-Tag creates and dispatches prereleases on `main`.
 
@@ -50,3 +83,18 @@ updating a Snap Store support track. Docs retain an
 immutable version and advance latest only for a newer version.
 
 Watch the stable release run and report its result.
+
+## PyPI publishing
+
+Stable releases publish the Python wheel to PyPI from `wheel-publish.yml`, which the `publish-pypi` job in `release-publish.yml` calls after the GitHub Release is created. The workflow downloads the wheel from the stable GitHub Release, not a run's build artifact, and checks the stable tag's source commit and the wheel's release checksum. It uses Trusted Publishing with the `pypi` GitHub environment. PyPI matches the workflow file that contains the publishing job, so configure the `openshell` PyPI project's GitHub publisher with owner `NVIDIA`, repository `OpenShell`, workflow `wheel-publish.yml`, and environment `pypi`. No PyPI API token or GitLab trigger credentials are required.
+
+The environment must allow the branch used to dispatch Release or `wheel-publish.yml`. For a support release, explicitly allow its support branch before dispatching. Required reviewers, if configured, must approve the PyPI job. An existing wheel on PyPI is skipped; PyPI does not allow replacing a published wheel.
+
+If a stable release did not reach PyPI, publish the wheel without rerunning Release:
+
+```shell
+gh workflow run wheel-publish.yml -R NVIDIA/OpenShell --ref main \
+  -f release-tag=vX.Y.Z -f source-sha=<tag commit> -f python-version=X.Y.Z
+```
+
+Development and prerelease wheels remain GitHub Release assets and do not publish to PyPI.

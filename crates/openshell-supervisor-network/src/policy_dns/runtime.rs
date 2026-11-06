@@ -14,7 +14,7 @@ use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_isolation_interface::contract::{DnsTransport, PendingDnsQuery};
-use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
+use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
 use openshell_sandbox_backend::NetworkMediationSource;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -169,7 +169,7 @@ impl PolicyDnsRuntime {
                 let _ = expiry_store.expire(std::time::Instant::now());
             }
         });
-        ocsf_emit!(
+        crate::telemetry::egress_emit!(
             ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
@@ -284,7 +284,7 @@ impl PolicyDnsRuntime {
             }
         });
 
-        ocsf_emit!(
+        crate::telemetry::egress_emit!(
             ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)

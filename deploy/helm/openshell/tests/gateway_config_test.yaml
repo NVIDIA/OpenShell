@@ -29,6 +29,179 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?m)^enable_websocket_tunnel\s*=\s*true$'
 
+  - it: omits service_hostname_format unless a format is configured
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_hostname_format\s*='
+
+  - it: renders service_hostname_format from server.serviceHostnameFormat
+    template: templates/gateway-config.yaml
+    set:
+      server.serviceHostnameFormat: hashed
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_hostname_format\s*=\s*"hashed"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name\s*=\s*"openshell"$'
+
+  - it: renders service_hostname_format with the configured installation name
+    template: templates/gateway-config.yaml
+    set:
+      server.serviceHostnameFormat: hashed
+      server.name: gateway-west
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_hostname_format\s*=\s*"hashed"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name\s*=\s*"gateway-west"$'
+
+  - it: preserves an explicit gatewayConfig service_hostname_format over the value
+    template: templates/gateway-config.yaml
+    set:
+      server.serviceHostnameFormat: hashed
+      gatewayConfig:
+        openshell.gateway:
+          service_hostname_format: readable
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_hostname_format\s*=\s*"readable"$'
+
+  - it: leaves metrics TLS disabled by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.metrics_tls\]'
+
+  - it: renders metrics mTLS configuration from operator-provided Secret values
+    template: templates/gateway-config.yaml
+    set:
+      metrics.tls.enabled: true
+      metrics.tls.certSecretName: metrics-server-tls
+      metrics.tls.clientCaSecretName: metrics-scraper-ca
+      metrics.tls.requireClientCert: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.metrics_tls\].*?cert_path\s*=\s*"/etc/openshell-metrics/server/tls\.crt".*?client_ca_path\s*=\s*"/etc/openshell-metrics/client-ca/ca\.crt".*?key_path\s*=\s*"/etc/openshell-metrics/server/tls\.key".*?require_client_auth\s*=\s*true'
+
+  - it: mounts operator-provided metrics mTLS Secrets read-only
+    template: templates/statefulset.yaml
+    set:
+      metrics.tls.enabled: true
+      metrics.tls.certSecretName: metrics-server-tls
+      metrics.tls.clientCaSecretName: metrics-scraper-ca
+      metrics.tls.requireClientCert: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: metrics-tls-cert
+            mountPath: /etc/openshell-metrics/server
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: metrics-tls-client-ca
+            mountPath: /etc/openshell-metrics/client-ca
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: metrics-tls-cert
+            secret:
+              secretName: metrics-server-tls
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: metrics-tls-client-ca
+            secret:
+              secretName: metrics-scraper-ca
+              items:
+                - key: ca.crt
+                  path: ca.crt
+
+  - it: reuses the gateway server Secret for metrics TLS when no separate Secret is set
+    template: templates/statefulset.yaml
+    set:
+      metrics.tls.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: metrics-tls-cert
+            secret:
+              secretName: openshell-server-tls
+
+  - it: rejects metrics mTLS without a dedicated client CA
+    template: templates/statefulset.yaml
+    set:
+      metrics.tls.enabled: true
+      metrics.tls.requireClientCert: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.requireClientCert requires metrics.tls.clientCaSecretName'
+
+  - it: rejects a metrics client CA that reuses the gateway client CA Secret
+    template: templates/statefulset.yaml
+    set:
+      metrics.tls.enabled: true
+      metrics.tls.clientCaSecretName: openshell-server-tls
+      metrics.tls.requireClientCert: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret'
+
+  - it: rejects a metrics client CA that reuses a custom gateway client CA Secret
+    template: templates/statefulset.yaml
+    set:
+      pkiInitJob.enabled: false
+      server.tls.clientCaSecretName: gateway-client-ca
+      metrics.tls.enabled: true
+      metrics.tls.clientCaSecretName: gateway-client-ca
+      metrics.tls.requireClientCert: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret'
+
+  - it: rejects a metrics client CA that reuses the gateway client TLS Secret
+    template: templates/statefulset.yaml
+    set:
+      metrics.tls.enabled: true
+      metrics.tls.clientCaSecretName: openshell-client-tls
+      metrics.tls.requireClientCert: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client TLS Secret (server.tls.clientTlsSecretName)'
+
+  - it: rejects a metrics client CA that reuses a custom gateway client TLS Secret
+    template: templates/statefulset.yaml
+    set:
+      pkiInitJob.enabled: false
+      server.tls.clientTlsSecretName: sandbox-client-tls
+      metrics.tls.enabled: true
+      metrics.tls.clientCaSecretName: sandbox-client-tls
+      metrics.tls.requireClientCert: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client TLS Secret (server.tls.clientTlsSecretName)'
+
+  - it: rejects metrics TLS when the metrics port is disabled
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: 0
+      metrics.tls.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.enabled requires service.metricsPort to be non-zero'
+
   - it: defaults to label admission with caller driver config disabled
     template: templates/gateway-config.yaml
     asserts:
@@ -297,11 +470,10 @@ tests:
         openshell.gateway.otlp.ocsf:
           enabled: true
           endpoint: http://siem-collector:4317
-          schema_version: "1.3"
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.gateway\.otlp\.ocsf\]\nenabled\s*=\s*true\nendpoint\s*=\s*"http://siem-collector:4317"\nschema_version\s*=\s*"1\.3"'
+          pattern: '(?ms)\[openshell\.gateway\.otlp\.ocsf\]\nenabled\s*=\s*true\nendpoint\s*=\s*"http://siem-collector:4317"'
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.otlp\.traces\]\nendpoint\s*=\s*"http://traces:4317"'
@@ -396,7 +568,6 @@ tests:
     set:
       server.ocsfLog.enabled: true
       server.ocsfLog.path: /var/openshell/gateway-ocsf.jsonl
-      server.ocsfLog.schemaVersion: "1.3"
       server.ocsfLog.rotation: daily
       server.ocsfLog.maxFiles: 14
       server.ocsfLog.queueCapacity: 20000
@@ -404,7 +575,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.gateway\.ocsf_log\].*?max_files\s*=\s*14.*?path\s*=\s*"/var/openshell/gateway-ocsf\.jsonl".*?queue_capacity\s*=\s*20000.*?queue_max_bytes\s*=\s*33554432.*?rotation\s*=\s*"daily".*?schema_version\s*=\s*"1\.3"'
+          pattern: '(?ms)\[openshell\.gateway\.ocsf_log\].*?max_files\s*=\s*14.*?path\s*=\s*"/var/openshell/gateway-ocsf\.jsonl".*?queue_capacity\s*=\s*20000.*?queue_max_bytes\s*=\s*33554432.*?rotation\s*=\s*"daily"'
 
   - it: omits OCSF retention when rotation is disabled
     template: templates/gateway-config.yaml
@@ -469,15 +640,16 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.ocsf_log\].*?max_files\s*=\s*7.*?queue_capacity\s*=\s*10000.*?queue_max_bytes\s*=\s*16777216'
 
-  - it: rejects an unsupported OCSF schema version
-    template: templates/statefulset.yaml
+  - it: passes the deprecated OCSF schema version through for the gateway to report
+    template: templates/gateway-config.yaml
     set:
       server.ocsfLog.enabled: true
       server.ocsfLog.path: /var/openshell/gateway-ocsf.jsonl
-      server.ocsfLog.schemaVersion: "1.8"
+      server.ocsfLog.schemaVersion: "1.3"
     asserts:
-      - failedTemplate:
-          errorMessage: "server.ocsfLog.schemaVersion must be empty, 1.1, or 1.3"
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.ocsf_log\].*?schema_version\s*=\s*"1\.3"'
 
   - it: mounts extra gateway volumes for OCSF output in a Deployment
     template: templates/deployment.yaml
@@ -507,6 +679,47 @@ tests:
             name: ocsf-log
             mountPath: /var/log/openshell
             subPathExpr: $(OPENSHELL_POD_NAME)
+
+  - it: adds extra gateway environment variables in a StatefulSet
+    template: templates/statefulset.yaml
+    set:
+      server.extraEnv:
+        - name: OTEL_TRACES_SAMPLER
+          value: parentbased_traceidratio
+        - name: OTEL_EXPORTER_OTLP_HEADERS
+          valueFrom:
+            secretKeyRef:
+              name: otel-collector-auth
+              key: headers
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_TRACES_SAMPLER
+            value: parentbased_traceidratio
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_EXPORTER_OTLP_HEADERS
+            valueFrom:
+              secretKeyRef:
+                name: otel-collector-auth
+                key: headers
+
+  - it: adds extra gateway environment variables in a Deployment
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      server.extraEnv:
+        - name: OTEL_TRACES_SAMPLER
+          value: parentbased_traceidratio
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_TRACES_SAMPLER
+            value: parentbased_traceidratio
 
   - it: mounts the OIDC CA bundle when TLS is disabled
     template: templates/statefulset.yaml
@@ -1209,6 +1422,25 @@ tests:
       - failedTemplate:
           errorPattern: "replicaCount > 1 requires server.externalDbSecret"
 
+  - it: renders writable ephemeral XDG state for gateway trust artifacts
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: XDG_STATE_HOME
+            value: /var/lib/openshell-state
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-state
+            mountPath: /var/lib/openshell-state
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gateway-state
+            emptyDir: {}
+
   - it: renders a Deployment for external database-backed gateway workloads
     template: templates/deployment.yaml
     set:
@@ -1246,6 +1478,16 @@ tests:
               secretKeyRef:
                 name: my-pg-secret
                 key: uri
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-state
+            mountPath: /var/lib/openshell-state
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gateway-state
+            emptyDir: {}
 
   - it: fails when a Deployment uses the default SQLite database
     template: templates/statefulset.yaml

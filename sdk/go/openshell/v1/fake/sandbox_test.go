@@ -1007,3 +1007,33 @@ func TestSandbox_GetLogs_ClosedReturnsUnavailable(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))
 }
+
+func TestSandbox_SuspendAndResume(t *testing.T) {
+	sc := newTestSandboxClient()
+	ctx := context.Background()
+
+	_, err := sc.Create(ctx, "default", "frozen", &types.SandboxSpec{})
+	require.NoError(t, err)
+
+	_, err = sc.Suspend(ctx, "default", "frozen")
+	require.Error(t, err, "suspend requires Ready")
+	assert.True(t, types.IsConflict(err))
+
+	_, err = sc.WaitReady(ctx, "default", "frozen")
+	require.NoError(t, err)
+
+	suspended, err := sc.Suspend(ctx, "default", "frozen")
+	require.NoError(t, err)
+	assert.Equal(t, types.SandboxSuspended, suspended.Status.Phase)
+
+	waited, err := sc.WaitSuspended(ctx, "default", "frozen")
+	require.NoError(t, err)
+	assert.Equal(t, types.SandboxSuspended, waited.Status.Phase)
+
+	resumed, err := sc.Resume(ctx, "default", "frozen", types.ResumeOptions{RestartIfRestoreFails: true})
+	require.NoError(t, err)
+	assert.Equal(t, types.SandboxReady, resumed.Status.Phase)
+
+	_, err = sc.Resume(ctx, "default", "frozen")
+	require.Error(t, err, "resume requires Suspended")
+}

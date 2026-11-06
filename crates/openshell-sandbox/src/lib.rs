@@ -4,6 +4,9 @@
 //! Capability-free in-workload sandbox boundary.
 
 #[cfg(target_os = "linux")]
+mod accept_errors;
+pub mod binary_pins;
+#[cfg(target_os = "linux")]
 pub mod boundary_exec;
 #[cfg(target_os = "linux")]
 pub mod boundary_io;

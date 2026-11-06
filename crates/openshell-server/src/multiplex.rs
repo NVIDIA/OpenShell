@@ -18,6 +18,8 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use openshell_core::proto::open_shell_server::OpenShellServer;
+use openshell_core::proto::sandbox_updates_server::SandboxUpdatesServer;
+use openshell_core::proto::supervisor_host::v1::supervisor_host_server::SupervisorHostServer;
 use openshell_core::{
     Config,
     proto::{Provider, UpdateProviderRequest},
@@ -294,7 +296,23 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
+        // The private host stream carries launch secrets, so it bypasses the
+        // configurable interceptors.
+        let openshell = SupervisorHostRoute::new(
+            SupervisorHostServer::new(crate::grpc::supervisor_host::SupervisorHostService::new(
+                self.state.clone(),
+            ))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE),
+            openshell,
+        );
         let reflection = self.state.reflection_service.clone();
+        let sandbox_updates = SandboxUpdatesServer::new(OpenShellService::new(self.state.clone()))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let sandbox_updates = GatewayInterceptorGrpcService::new(
+            sandbox_updates,
+            self.state.gateway_interceptors.clone(),
+            Some(self.state.clone()),
+        );
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -302,7 +320,7 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, reflection),
+            GrpcRouter::new(openshell, reflection).with_sandbox_updates(sandbox_updates),
             authenticator_chain,
             authz_policy,
             self.state
@@ -368,6 +386,57 @@ impl MultiplexService {
             .await?;
 
         Ok(())
+    }
+}
+
+/// Routes the private supervisor host service past the gateway interceptors
+/// and every other gRPC path to the `OpenShell` service.
+#[derive(Clone)]
+struct SupervisorHostRoute<N> {
+    host: SupervisorHostServer<crate::grpc::supervisor_host::SupervisorHostService>,
+    gateway: N,
+}
+
+impl<N> SupervisorHostRoute<N> {
+    fn new(
+        host: SupervisorHostServer<crate::grpc::supervisor_host::SupervisorHostService>,
+        gateway: N,
+    ) -> Self {
+        Self { host, gateway }
+    }
+}
+
+impl<N> tower::Service<Request<BoxBody>> for SupervisorHostRoute<N>
+where
+    N: tower::Service<Request<BoxBody>, Response = Response<tonic::body::Body>, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    N::Future: Send + 'static,
+{
+    type Response = Response<tonic::body::Body>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.gateway.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
+        if req
+            .uri()
+            .path()
+            .starts_with(crate::grpc::supervisor_host::SUPERVISOR_HOST_PATH_PREFIX)
+        {
+            let mut host = self.host.clone();
+            Box::pin(async move {
+                <SupervisorHostServer<_> as tower::Service<Request<BoxBody>>>::call(&mut host, req)
+                    .await
+            })
+        } else {
+            let mut gateway = self.gateway.clone();
+            Box::pin(async move { gateway.ready().await?.call(req).await })
+        }
     }
 }
 
@@ -754,6 +823,11 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
             fields.insert("replica_id".to_string(), peer.replica_id.clone());
             fields.insert("pod_uid".to_string(), peer.pod_uid.clone());
         }
+        Principal::Supervisor(supervisor) => {
+            fields.insert("kind".to_string(), "supervisor".to_string());
+            fields.insert("subject".to_string(), supervisor.identity.subject.clone());
+            fields.insert("token_id".to_string(), supervisor.identity.token_id.clone());
+        }
         Principal::Anonymous => {
             fields.insert("kind".to_string(), "anonymous".to_string());
         }
@@ -921,11 +995,12 @@ where
     }
 }
 
-/// Combined gRPC service that routes between `OpenShell` and reflection.
+/// Combined gRPC service for public gateway services and reflection.
 #[derive(Clone)]
-pub struct GrpcRouter<N, R> {
+pub struct GrpcRouter<N, R, U = N> {
     openshell: N,
     reflection: R,
+    sandbox_updates: Option<U>,
 }
 
 impl<N, R> GrpcRouter<N, R> {
@@ -933,13 +1008,22 @@ impl<N, R> GrpcRouter<N, R> {
         Self {
             openshell,
             reflection,
+            sandbox_updates: None,
+        }
+    }
+
+    fn with_sandbox_updates<U>(self, sandbox_updates: U) -> GrpcRouter<N, R, U> {
+        GrpcRouter {
+            openshell: self.openshell,
+            reflection: self.reflection,
+            sandbox_updates: Some(sandbox_updates),
         }
     }
 }
 
 pub const REFLECTION_PATH_PREFIX: &str = "/grpc.reflection.v1.";
 
-impl<N, R, B> tower::Service<Request<B>> for GrpcRouter<N, R>
+impl<N, R, U, B> tower::Service<Request<B>> for GrpcRouter<N, R, U>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
@@ -950,6 +1034,11 @@ where
         + Send
         + 'static,
     R::Future: Send,
+    U: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    U::Future: Send,
     B: Send + 'static,
 {
     type Response = N::Response;
@@ -963,6 +1052,13 @@ where
     fn call(&mut self, req: Request<B>) -> Self::Future {
         if req.uri().path().starts_with(REFLECTION_PATH_PREFIX) {
             let mut svc = self.reflection.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if req
+            .uri()
+            .path()
+            .starts_with("/openshell.v1.SandboxUpdates/")
+            && let Some(mut svc) = self.sandbox_updates.clone()
+        {
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {
             let mut svc = self.openshell.clone();
@@ -980,10 +1076,12 @@ where
 /// 2. `ComputeDriverAuthenticator` (path-scoped to `IssueSandboxToken`)
 ///    — delegates a driver-native credential and receives a sandbox identity
 ///    so the handler can mint a gateway JWT. No-op on every other path.
-/// 3. `SandboxSessionJwtAuthenticator` — validates generation-bound gateway
+/// 3. `SupervisorTokenAuthenticator` — validates the shared supervisor's
+///    gateway-minted token (its own `typ`); applies to no other bearer.
+/// 4. `SandboxSessionJwtAuthenticator` — validates generation-bound gateway
 ///    JWTs against the durable sandbox identity. Untyped legacy sandbox JWTs
 ///    are not admitted.
-/// 4. `OidcAuthenticator` — validates user Bearer tokens against the
+/// 5. `OidcAuthenticator` — validates user Bearer tokens against the
 ///    configured OIDC issuer. Returns `Unauthenticated` for missing
 ///    Bearer headers so non-OIDC clients can't sneak through.
 ///
@@ -994,9 +1092,8 @@ where
 /// local developer user when `auth.allow_unauthenticated_users` is explicitly
 /// enabled.
 ///
-/// When neither OIDC nor sandbox credentials are configured (a barebones
-/// dev gateway), the chain is left as `None` so the router short-circuits
-/// to pass-through unless mTLS or local unauthenticated users are enabled.
+/// When no bearer authenticators are configured, the chain is left as `None`.
+/// The router still requires an mTLS principal or the explicit development opt-in.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(peer) = state.peer_authenticator.clone() {
@@ -1006,6 +1103,9 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
         authenticators.push(driver);
     }
     if let Some(authority) = state.sandbox_session_jwt_authority.clone() {
+        authenticators.push(Arc::new(
+            crate::auth::supervisor_token::SupervisorTokenAuthenticator::new(authority.clone()),
+        ));
         authenticators.push(Arc::new(
             crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
                 authority,
@@ -1029,8 +1129,8 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
 /// - Strip any external `x-openshell-auth-source` marker first (so callers
 ///   cannot spoof a sandbox identity).
 /// - Health probes / reflection bypass the chain entirely.
-/// - When no chain is configured (OIDC not configured), forward without
-///   authentication — preserves today's pass-through behavior.
+/// - When no chain is configured, require an mTLS principal or the explicit
+///   development opt-in.
 /// - Otherwise, run the chain. The first match produces a `Principal`.
 ///   `Principal::User` is gated by the RBAC `AuthzPolicy`.
 ///   `Principal::Sandbox` is gated by a supervisor-method allowlist, then
@@ -1226,10 +1326,15 @@ where
             } else if allow_unauthenticated_users {
                 unauthenticated_dev_user_principal()
             } else {
-                // No auth configured — dev / fronting-proxy deployments.
-                // Inject a local-dev principal so downstream handlers that
-                // call extract_principal() always find one.
-                unauthenticated_dev_user_principal()
+                audit::emit_authentication_failure(
+                    &path,
+                    &origin(req.headers()),
+                    None,
+                    AuthFailureReason::MissingCredential,
+                );
+                return Ok(status_response(tonic::Status::unauthenticated(
+                    "authentication required",
+                )));
             };
             let origin = origin(req.headers());
             audit::emit_logon(
@@ -1270,12 +1375,22 @@ where
                 Principal::Peer(_) if !crate::auth::method_authz::is_peer_callable(&path) => {
                     method_denied("gateway peer principals may not call this method")
                 }
+                Principal::Supervisor(_)
+                    if !crate::auth::method_authz::is_supervisor_callable(&path) =>
+                {
+                    method_denied(
+                        "supervisor tokens may call only the supervisor assignment stream",
+                    )
+                }
                 Principal::Anonymous => {
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "anonymous callers may not call authenticated methods",
                     )));
                 }
-                Principal::Operator(_) | Principal::Sandbox(_) | Principal::Peer(_) => None,
+                Principal::Operator(_)
+                | Principal::Sandbox(_)
+                | Principal::Peer(_)
+                | Principal::Supervisor(_) => None,
             };
             if let Some((denial, status)) = denial {
                 audit::emit_authorization_denial_for(&path, &origin, &principal, denial);
@@ -2751,6 +2866,13 @@ mod tests {
             otel_span_name(&http::Method::POST, "/openshell.v1.OpenShell/CreateSandbox"),
             "openshell.v1.OpenShell/CreateSandbox"
         );
+        assert_eq!(
+            otel_span_name(
+                &http::Method::POST,
+                "/openshell.v1.SandboxUpdates/UpdateSandbox"
+            ),
+            "openshell.v1.SandboxUpdates/UpdateSandbox"
+        );
     }
 
     /// Non-RPC paths use a low-cardinality method-only name because sandbox
@@ -2820,10 +2942,12 @@ mod tests {
             name,
             calls: calls.clone(),
         };
-        let mut router = GrpcRouter::new(service("openshell"), service("reflection"));
+        let mut router = GrpcRouter::new(service("openshell"), service("reflection"))
+            .with_sandbox_updates(service("sandbox_updates"));
 
         for path in [
             "/openshell.v1.OpenShell/Health",
+            "/openshell.v1.SandboxUpdates/UpdateSandbox",
             "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
         ] {
             router
@@ -2837,7 +2961,10 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(*calls.lock().unwrap(), vec!["openshell", "reflection"]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["openshell", "sandbox_updates", "reflection"]
+        );
     }
 
     #[tokio::test]
@@ -2933,7 +3060,10 @@ mod tests {
             .collect();
         names.sort();
 
-        assert_eq!(names, vec!["openshell.v1.OpenShell"]);
+        assert_eq!(
+            names,
+            vec!["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
+        );
 
         let descriptor_response = responses.message().await.unwrap().unwrap();
         let Some(MessageResponse::FileDescriptorResponse(response)) =
@@ -2952,6 +3082,11 @@ mod tests {
                 .get_service_by_name("openshell.v1.OpenShell")
                 .is_some(),
             "a fresh descriptor pool must resolve the advertised service"
+        );
+        assert!(
+            reflected_pool
+                .get_service_by_name("openshell.v1.SandboxUpdates")
+                .is_some()
         );
         assert!(
             reflected_pool
@@ -3440,6 +3575,51 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn operator_only_requires_operator_certificate() {
+            for (peer_identity, operator) in [
+                (None, None),
+                (Some(mtls_identity("ordinary-user")), None),
+                (
+                    Some(operator_principal().identity),
+                    Some(operator_principal()),
+                ),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let authenticated = operator.is_some();
+                let (recorder, seen) = PrincipalRecorder::new();
+                // Operator-only authentication has no bearer chain and disables
+                // both user mTLS authentication and the development opt-in.
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    None,
+                    None,
+                    peer_identity,
+                    false,
+                    false,
+                )
+                .with_operator(operator);
+                let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+                let response = router.call(empty_request(path)).await.unwrap();
+
+                if authenticated {
+                    assert!(grpc_status(&response).is_none());
+                    assert!(matches!(
+                        *seen.lock().unwrap(),
+                        Some(Principal::Operator(_))
+                    ));
+                } else {
+                    assert_eq!(grpc_status(&response).as_deref(), Some("16"));
+                    assert!(seen.lock().unwrap().is_none());
+                    let events = capture.json_events();
+                    assert_eq!(events.len(), 1, "{events:?}");
+                    assert_router_authentication_failure(&events[0], path, "missing_credential", 2);
+                }
+            }
+        }
+
+        #[tokio::test]
         async fn operator_is_admin_but_not_supervisor_peer_or_unknown() {
             for (method, permitted) in [
                 ("GetProviderCredentials", true),
@@ -3482,6 +3662,124 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn supervisor_tokens_reach_only_the_assignment_stream() {
+            let attach = "/openshell.supervisor.host.v1.SupervisorHost/Attach";
+            let supervisor = Principal::Supervisor(crate::auth::principal::SupervisorPrincipal {
+                identity: openshell_supervisor_control::HostIdentity {
+                    subject: "openshell-supervisor:test".to_string(),
+                    token_id: "token".to_string(),
+                    expires_at: i64::MAX,
+                },
+            });
+            let supervisor_chain = || {
+                AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                    Authentication::Accepted(supervisor.clone()),
+                )))])
+            };
+            for (method, permitted) in [
+                (attach, true),
+                ("/openshell.v1.OpenShell/ListSandboxes", false),
+                ("/openshell.v1.OpenShell/ConnectSupervisor", false),
+                ("/openshell.v1.OpenShell/GetSandboxConfig", false),
+                ("/openshell.v1.OpenShell/GetProviderCredentials", false),
+                ("/openshell.v1.OpenShell/RefreshSandboxToken", false),
+                ("/openshell.v1.OpenShell/PeerRelay", false),
+                ("/openshell.v1.OpenShell/Unknown", false),
+            ] {
+                let (recorder, seen) = PrincipalRecorder::new();
+                let response = AuthGrpcRouter::new(recorder, Some(supervisor_chain()), None)
+                    .call(empty_request(method))
+                    .await
+                    .unwrap();
+                if permitted {
+                    assert!(grpc_status(&response).is_none(), "{method}");
+                    assert!(matches!(
+                        *seen.lock().unwrap(),
+                        Some(Principal::Supervisor(_))
+                    ));
+                } else {
+                    assert_eq!(grpc_status(&response).as_deref(), Some("7"), "{method}");
+                }
+            }
+
+            // No other principal reaches the stream: an mTLS user, an
+            // operator, a sandbox, a peer, or an unauthenticated dev user,
+            // even when local unauthenticated users are allowed.
+            let (recorder, _) = PrincipalRecorder::new();
+            let response = AuthGrpcRouter::with_peer_identity(
+                recorder,
+                None,
+                None,
+                Some(mtls_identity("openshell-client")),
+                true,
+                false,
+            )
+            .call(empty_request(attach))
+            .await
+            .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            let (recorder, seen) = PrincipalRecorder::new();
+            let response = AuthGrpcRouter::with_peer_identity(
+                recorder,
+                Some(AuthenticatorChain::new(vec![Arc::new(
+                    MockAuthenticator::returning(Ok(Authentication::NotApplicable)),
+                )])),
+                None,
+                None,
+                false,
+                true,
+            )
+            .call(empty_request(attach))
+            .await
+            .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            assert!(seen.lock().unwrap().is_none());
+            let (recorder, _) = PrincipalRecorder::new();
+            let response = AuthGrpcRouter::new(recorder, None, None)
+                .with_operator(Some(operator_principal()))
+                .call(empty_request(attach))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            for principal in [
+                sandbox("sandbox-a"),
+                Principal::Peer(crate::auth::principal::PeerPrincipal {
+                    replica_id: "replica".into(),
+                    pod_uid: "pod".into(),
+                }),
+            ] {
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Authentication::Accepted(principal)),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let response = AuthGrpcRouter::new(recorder, Some(chain), None)
+                    .call(empty_request(attach))
+                    .await
+                    .unwrap();
+                assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            }
+            // Without a bearer chain, the development opt-in still grants no
+            // access to the assignment stream. Otherwise authentication fails
+            // before method authorization.
+            for (allow_unauthenticated_users, expected_status) in [(true, "7"), (false, "16")] {
+                let (recorder, seen) = PrincipalRecorder::new();
+                let response = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    None,
+                    None,
+                    None,
+                    false,
+                    allow_unauthenticated_users,
+                )
+                .call(empty_request(attach))
+                .await
+                .unwrap();
+                assert_eq!(grpc_status(&response).as_deref(), Some(expected_status));
+                assert!(seen.lock().unwrap().is_none());
+            }
+        }
+
+        #[tokio::test]
         async fn user_bearer_claims_and_local_dev_cannot_export_credentials() {
             let mut user = mtls_identity("ordinary-user");
             user.provider = IdentityProvider::Oidc;
@@ -3509,7 +3807,8 @@ mod tests {
                 assert_eq!(grpc_status(&response).as_deref(), Some("7"));
             }
             let (recorder, _) = PrincipalRecorder::new();
-            let mut router = AuthGrpcRouter::new(recorder, None, None);
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, true);
             let response = router
                 .call(empty_request(
                     "/openshell.v1.OpenShell/GetProviderCredentials",
@@ -4643,6 +4942,7 @@ mod tests {
                         sandbox_id: "sandbox-a".to_string(),
                         source: SandboxIdentitySource::BootstrapJwt {
                             issuer: "openshell-gateway:test".to_string(),
+                            auth_epoch: None,
                         },
                         trust_domain: None,
                     }),

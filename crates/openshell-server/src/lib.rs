@@ -20,6 +20,7 @@ mod compute;
 mod config_delivery;
 pub mod config_file;
 mod config_update_operation;
+mod credential_store;
 mod credentials;
 mod defaults;
 mod gateway_listener;
@@ -31,6 +32,7 @@ mod grpc;
 mod http;
 mod middleware;
 mod multiplex;
+mod network_trust;
 mod ocsf_log;
 mod otel_tracing;
 mod pagination;
@@ -40,6 +42,8 @@ mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
 mod reflection;
+mod refresh_commit;
+mod refresh_store;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
@@ -47,6 +51,7 @@ mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
 mod supervisor_owner;
+mod supervisor_pool;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -59,12 +64,19 @@ mod tracing_setup;
 mod watch_cursor;
 mod ws_tunnel;
 
+use axum::Router;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder,
+    service::TowerToHyperService,
+};
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
-use openshell_core::{Config, Error, ObjectLabels, Result};
+use openshell_core::{Config, Error, NetworkSupervisorTrustBundle, ObjectLabels, Result};
 use openshell_extension_core::{
     BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
 };
+use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
@@ -73,10 +85,10 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -241,8 +253,57 @@ fn spawn_gateway_extension_token_refresh(
         }
     });
 }
+
+/// Mint the shared supervisor's token and renew it at half its lifetime so
+/// the delivered copy is never close to expiry when the supervisor restarts
+/// or reconnects. Minting failures are logged and retried shortly.
+fn spawn_supervisor_token_refresh(
+    authority: Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+    ttl: Duration,
+    controller: openshell_supervisor_control::SupervisorHostController,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let delay = match authority.mint_supervisor_token(ttl) {
+                Ok(minted) => {
+                    let remaining = minted.expires_at.saturating_sub(
+                        i64::try_from(
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_or(0, |elapsed| elapsed.as_secs()),
+                        )
+                        .unwrap_or(i64::MAX),
+                    );
+                    controller.publish_credential(
+                        openshell_supervisor_control::SupervisorCredential {
+                            token: minted.token,
+                            expires_at: minted.expires_at,
+                        },
+                    );
+                    Duration::from_secs(u64::try_from(remaining).unwrap_or(0) / 2)
+                        .max(Duration::from_secs(1))
+                }
+                Err(error) => {
+                    warn!(%error, "failed to mint the supervisor token; retrying");
+                    Duration::from_secs(10)
+                }
+            };
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
 pub use auth::audit::ConnectionSource;
 pub use multiplex::{MultiplexService, MultiplexedService};
+pub use otel_tracing::gateway_trace_headers;
+use otel_tracing::supervisor_otlp_headers;
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
@@ -253,6 +314,7 @@ pub(crate) struct ServerStartupConfig {
     pub config: Config,
     pub config_file: Option<config_file::ConfigFile>,
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
+    pub network_trust: Option<NetworkSupervisorTrustBundle>,
     pub compute_driver: ComputeDriverSelection,
     pub legacy_compute_driver_env_seen: bool,
 }
@@ -271,6 +333,9 @@ pub struct ServerState {
 
     /// Credential-driver selection and resolution runtime.
     pub credentials: credentials::CredentialRuntime,
+
+    /// Shared embedded refresh runtime (separate from storage-only consumers).
+    pub(crate) refresh: openshell_credential_issuer::refresh::RefreshRuntime,
 
     /// In-memory sandbox correlation index.
     pub sandbox_index: SandboxIndex,
@@ -316,6 +381,9 @@ pub struct ServerState {
     /// Idle HTTP/1 upstreams to sandbox services, so routed requests reuse a
     /// relay instead of opening one per request.
     pub service_upstreams: Arc<service_routing::ServiceUpstreamPool>,
+
+    /// In-memory hostname-to-service index for opaque service routing labels.
+    pub service_route_index: Arc<service_routing::ServiceRouteIndex>,
 
     /// Latest placement ring, refreshed from live gateway membership. Decides
     /// which replica *should* own a sandbox; the owner record in the store
@@ -380,6 +448,136 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
     )
 }
 
+const METRICS_TLS_HANDSHAKE_WARNING_INTERVAL: Duration = Duration::from_mins(1);
+
+#[derive(Default)]
+struct MetricsTlsHandshakeLogState {
+    last_warning: Option<Instant>,
+    suppressed: u64,
+}
+
+struct MetricsTlsHandshakeLogLimiter {
+    interval: Duration,
+    state: Mutex<MetricsTlsHandshakeLogState>,
+    rejected: AtomicU64,
+}
+
+impl MetricsTlsHandshakeLogLimiter {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            state: Mutex::new(MetricsTlsHandshakeLogState::default()),
+            rejected: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, now: Instant) -> Option<u64> {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .last_warning
+            .is_none_or(|last_warning| now.duration_since(last_warning) >= self.interval)
+        {
+            state.last_warning = Some(now);
+            return Some(std::mem::take(&mut state.suppressed));
+        }
+        state.suppressed += 1;
+        None
+    }
+}
+
+/// Separate limiters for handshake rejections and timeouts so a burst of one
+/// kind cannot absorb the other's warnings, and each periodic WARN reports
+/// counts for a single event type.
+#[derive(Clone)]
+struct MetricsTlsHandshakeLogLimiters {
+    rejections: Arc<MetricsTlsHandshakeLogLimiter>,
+    timeouts: Arc<MetricsTlsHandshakeLogLimiter>,
+}
+
+impl MetricsTlsHandshakeLogLimiters {
+    fn new(interval: Duration) -> Self {
+        Self {
+            rejections: Arc::new(MetricsTlsHandshakeLogLimiter::new(interval)),
+            timeouts: Arc::new(MetricsTlsHandshakeLogLimiter::new(interval)),
+        }
+    }
+}
+
+fn log_metrics_tls_handshake_rejection(
+    limiter: &MetricsTlsHandshakeLogLimiter,
+    error: &std::io::Error,
+    client: SocketAddr,
+) {
+    debug!(
+        event = "metrics_tls_handshake_rejected",
+        error = %error,
+        client = %client,
+        "Rejected metrics TLS handshake"
+    );
+    if let Some(suppressed) = limiter.record(Instant::now()) {
+        warn!(
+            event = "metrics_tls_handshake_rejected",
+            suppressed,
+            total = limiter.rejected.load(Ordering::Relaxed),
+            "Rejected metrics TLS handshakes; verify that clients use HTTPS and, when client authentication is enabled, certificates trusted by the metrics client CA"
+        );
+    }
+}
+
+fn log_metrics_tls_handshake_timeout(limiter: &MetricsTlsHandshakeLogLimiter, client: SocketAddr) {
+    debug!(
+        event = "metrics_tls_handshake_timed_out",
+        client = %client,
+        "Metrics TLS handshake timed out"
+    );
+    if let Some(suppressed) = limiter.record(Instant::now()) {
+        warn!(
+            event = "metrics_tls_handshake_timed_out",
+            suppressed,
+            total = limiter.rejected.load(Ordering::Relaxed),
+            "Metrics TLS handshakes timed out"
+        );
+    }
+}
+
+fn metrics_tls_acceptor_or_disable(
+    metrics_tls: &openshell_core::MetricsTlsConfig,
+) -> Option<TlsAcceptor> {
+    match TlsAcceptor::from_files(
+        &metrics_tls.cert_path,
+        &metrics_tls.key_path,
+        metrics_tls.client_ca_path.as_deref(),
+        metrics_tls.require_client_auth,
+        None,
+        None,
+        Vec::new(),
+    ) {
+        Ok(acceptor) => Some(acceptor),
+        Err(error) => {
+            error!(
+                event = "metrics_tls_listener_disabled",
+                listener = "metrics",
+                error = %error,
+                "Metrics TLS listener disabled because its certificate material could not be loaded"
+            );
+            let event = ConfigStateChangeBuilder::new(&gateway_ocsf::context("", ""))
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .state(StateId::Disabled, "initialization_failed")
+                .message(format!(
+                    "metrics TLS listener disabled because certificate material could not be loaded: {error}"
+                ))
+                .build();
+            openshell_ocsf::ocsf_emit!(event);
+            None
+        }
+    }
+}
+
 fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool {
     openshell_core::transport_errors::is_expected_transport_close_error(error)
 }
@@ -429,7 +627,12 @@ impl ServerState {
         credentials: credentials::CredentialRuntime,
     ) -> Self {
         let replica_id = compute::lease::replica_id();
+        let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
         compute.configure_ssh_identities(credentials.clone());
+        let service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(
+            config.service_routing_discriminator().map(str::to_string),
+        ));
+        compute.configure_service_route_index(Arc::clone(&service_route_index));
         let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let reflection_service = reflection::build_gateway_reflection_service(&config)
@@ -440,11 +643,13 @@ impl ServerState {
             .map_or_else(String::new, |oidc| oidc.admin_role.clone());
         let config_delivery =
             config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
+        let refresh = provider_refresh::runtime(&store, Some(&credentials), Some(&compute));
         Self {
             config,
             store,
             compute,
             credentials,
+            refresh,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
@@ -458,6 +663,7 @@ impl ServerState {
             peer_endpoint,
             peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
             service_upstreams: Arc::new(service_routing::ServiceUpstreamPool::default()),
+            service_route_index,
             gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
             gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
@@ -543,6 +749,7 @@ pub(crate) async fn run_server(
         config,
         config_file,
         guest_tls,
+        network_trust,
         compute_driver,
         legacy_compute_driver_env_seen: _,
     } = startup;
@@ -659,6 +866,8 @@ pub(crate) async fn run_server(
     let driver_startup = compute::driver_config::DriverStartupContext {
         file: config_file.as_ref(),
         guest_tls: guest_tls.as_ref(),
+        network_trust: network_trust.as_ref(),
+        network_trust_configured: network_trust.is_some(),
         gateway_port: config.bind_address.port(),
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
@@ -676,7 +885,12 @@ pub(crate) async fn run_server(
         shutdown_rx.clone(),
     )
     .await?;
-    compute.configure_supervisor_ocsf_headers(otel_tracing::supervisor_ocsf_headers(
+    compute.configure_supervisor_otlp_headers(supervisor_otlp_headers(
+        config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.otlp.as_ref()),
+    ));
+    compute.configure_supervisor_otlp_tls(otel_tracing::supervisor_otlp_tls(
         config_file
             .as_ref()
             .and_then(|file| file.openshell.gateway.otlp.as_ref()),
@@ -743,6 +957,51 @@ pub(crate) async fn run_server(
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
     if let Some(issuer) = extension_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
+    }
+    // The shared supervisor authenticates with a token this gateway mints
+    // from its launch-signing key and carries only over TLS, so the topology
+    // needs both.
+    if let Some(controller) = state.compute.supervisor_host() {
+        let (authority, jwt) = state
+            .sandbox_session_jwt_authority
+            .clone()
+            .zip(config.gateway_jwt.as_ref())
+            .ok_or_else(|| {
+                Error::config(
+                    "the shared supervisor requires gateway_jwt signing material to mint \
+                     supervisor tokens; configure [openshell.gateway.gateway_jwt] or disable \
+                     supervisor_topology",
+                )
+            })?;
+        if config.tls.is_none() {
+            return Err(Error::config(
+                "the shared supervisor requires gateway TLS; its token travels only over TLS. \
+                 Enable TLS or disable supervisor_topology",
+            ));
+        }
+        let ttl = jwt.token_ttl().clamp(
+            openshell_core::jwt::MIN_SESSION_TOKEN_TTL,
+            openshell_core::jwt::MAX_SESSION_TOKEN_TTL,
+        );
+        info!(
+            ttl_secs = ttl.as_secs(),
+            "shared supervisor assignment stream enabled; minting supervisor tokens"
+        );
+        info!("shared supervisor pool enabled; reconciling pool membership and ownership");
+        // Sandbox sessions dial this endpoint with their tokens.
+        if let Some(peer_endpoint) = state.peer_endpoint.as_deref() {
+            validate_peer_endpoint_scheme(&state.config, peer_endpoint)?;
+        }
+        controller.set_peer_endpoint(state.peer_endpoint.clone().unwrap_or_default());
+        supervisor_pool::SupervisorPool::new(
+            state.store.clone(),
+            controller.clone(),
+            authority.clone(),
+            state.credentials.clone(),
+            state.replica_id.clone(),
+        )
+        .start(shutdown_rx.clone());
+        spawn_supervisor_token_refresh(authority, ttl, controller.clone(), shutdown_rx.clone());
     }
 
     if state.sandbox_session_jwt_authority.is_some()
@@ -867,6 +1126,11 @@ pub(crate) async fn run_server(
     // first snapshots observe the post-start backend state. Explicitly stopped
     // sandboxes remain stopped.
     ensure_default_workspace(&store).await?;
+    state
+        .service_route_index
+        .rebuild(&state.store)
+        .await
+        .map_err(|error| Error::config(format!("service routing index rebuild failed: {error}")))?;
     grpc::policy::validate_provider_composition_startup_preflight(&state)
         .await
         .map_err(|error| {
@@ -912,22 +1176,48 @@ pub(crate) async fn run_server(
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
     if let Some((metrics_bind_address, prometheus_handle)) = metrics_endpoint {
-        let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
-            Error::transport(format!(
-                "failed to bind metrics port {metrics_bind_address}: {e}",
-            ))
-        })?;
-        info!(address = %metrics_bind_address, "Metrics server listening");
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                metrics_listener,
-                metrics_router(prometheus_handle).into_make_service(),
-            )
-            .await
-            {
-                error!("Metrics server error: {e}");
+        if let Some(metrics_tls) = &config.metrics_tls {
+            if let Some(metrics_tls_acceptor) = metrics_tls_acceptor_or_disable(metrics_tls) {
+                let metrics_listener =
+                    TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+                        Error::transport(format!(
+                            "failed to bind metrics port {metrics_bind_address}: {e}",
+                        ))
+                    })?;
+                metrics_tls_acceptor
+                    .spawn_reload_worker_for_listener(shutdown_rx.clone(), "metrics");
+
+                info!(address = %metrics_bind_address, "Metrics TLS server listening");
+                tokio::spawn(serve_tls_metrics_listener(
+                    metrics_listener,
+                    metrics_router(prometheus_handle),
+                    metrics_tls_acceptor,
+                    shutdown_rx.clone(),
+                ));
+            } else {
+                warn!(
+                    listener = "metrics",
+                    "Metrics listener remains unavailable until valid TLS certificate material is provided"
+                );
             }
-        });
+        } else {
+            let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+                Error::transport(format!(
+                    "failed to bind metrics port {metrics_bind_address}: {e}",
+                ))
+            })?;
+            info!(address = %metrics_bind_address, "Metrics server listening");
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(
+                    metrics_listener,
+                    metrics_router(prometheus_handle).into_make_service(),
+                )
+                .await
+                {
+                    error!("Metrics server error: {e}");
+                }
+            });
+        }
     } else {
         info!("Metrics server disabled");
     }
@@ -1017,6 +1307,7 @@ pub(crate) async fn run_server(
     );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    grpc::service_advertisement::spawn_cleanup(state.clone(), shutdown_rx.clone());
     provider_profile_sources::spawn_refresh(state.clone());
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
@@ -1054,6 +1345,75 @@ pub(crate) async fn run_server(
     session_cleanup.map_err(Error::execution)?;
 
     Ok(())
+}
+
+/// Serve the metrics endpoint through a dedicated TLS listener.
+///
+/// This listener exists only when `metrics_tls` is configured. The default
+/// metrics listener remains plaintext for backwards compatibility.
+async fn serve_tls_metrics_listener(
+    listener: TcpListener,
+    router: Router,
+    tls_acceptor: TlsAcceptor,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let handshake_log_limiters =
+        MetricsTlsHandshakeLogLimiters::new(METRICS_TLS_HANDSHAKE_WARNING_INTERVAL);
+    loop {
+        let accepted = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+
+        let (stream, addr) = match accepted {
+            Ok(connection) => connection,
+            Err(error) => {
+                error!(error = %error, "Failed to accept metrics connection");
+                continue;
+            }
+        };
+        set_tcp_nodelay_best_effort(&stream);
+
+        let acceptor = tls_acceptor.clone();
+        let service = TowerToHyperService::new(router.clone());
+        let handshake_log_limiters = handshake_log_limiters.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(10), acceptor.acceptor().accept(stream))
+                .await
+            {
+                Ok(Ok(tls_stream)) => {
+                    if let Err(error) = Builder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(TokioIo::new(tls_stream), service)
+                        .await
+                    {
+                        if is_benign_connection_close(error.as_ref()) {
+                            debug!(error = %error, client = %addr, "Metrics connection closed");
+                        } else {
+                            error!(error = %error, client = %addr, "Metrics connection error");
+                        }
+                    }
+                }
+                Ok(Err(error)) if is_benign_tls_handshake_failure(&error) => {
+                    debug!(error = %error, client = %addr, "Metrics TLS handshake closed early");
+                }
+                Ok(Err(error)) => {
+                    log_metrics_tls_handshake_rejection(
+                        &handshake_log_limiters.rejections,
+                        &error,
+                        addr,
+                    );
+                }
+                Err(_) => {
+                    log_metrics_tls_handshake_timeout(&handshake_log_limiters.timeouts, addr);
+                }
+            }
+        });
+    }
 }
 
 async fn serve_gateway_listener(
@@ -1282,6 +1642,7 @@ async fn terminate_signal() {
 
 pub use compute::{
     AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess, SharedComputeDriver,
+    SharedComputeDriverAppEndpoints, SharedComputeDriverConfigurationUpdates,
 };
 
 /// Driver instance returned by a compiled compute-driver factory.
@@ -1340,7 +1701,40 @@ pub trait ComputeDriverFactory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Whether this factory can propagate the gateway-owned destination trust
+    /// bundle to its network supervisor.
+    ///
+    /// The default is deliberately conservative: out-of-tree, remote, and
+    /// otherwise unannotated drivers must explicitly opt in before a
+    /// configured additional CA bundle can be used with them.
+    fn supports_network_supervisor_trust(&self) -> bool {
+        false
+    }
+
+    /// Whether this configuration hosts sandboxes on the gateway's shared
+    /// supervisor pool. Same constraints as [`Self::validate_config`].
+    fn uses_shared_supervision(&self, _context: ComputeDriverConfigContext<'_>) -> Result<bool> {
+        Ok(false)
+    }
+
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
+
+    /// Build with a separately registered, optional in-process image updater.
+    ///
+    /// Existing factories only implement `build`; their baseline driver object
+    /// remains sufficient and this hook defaults to no configuration-update support.
+    /// Supporting factories return the same driver instance in both slots and
+    /// advertise the negotiated configuration-update capability. Remote drivers expose
+    /// their extension over the existing endpoint instead of using this hook.
+    async fn build_with_configuration_updates(
+        &self,
+        context: ComputeDriverBuildContext<'_>,
+    ) -> Result<(
+        ComputeDriverInstance,
+        Option<SharedComputeDriverConfigurationUpdates>,
+    )> {
+        self.build(context).await.map(|instance| (instance, None))
+    }
 }
 
 /// One named compiled-driver registration.
@@ -1576,6 +1970,14 @@ pub struct ComputeDriverConfigContext<'a> {
 
 impl ComputeDriverConfigContext<'_> {
     #[must_use]
+    pub fn app_listener_config(&self) -> openshell_core::app_listener::AppListenerConfig {
+        self.driver_startup
+            .file
+            .map(|file| file.openshell.supervisor.app_listener.clone())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
     pub fn driver_name(&self) -> &str {
         self.driver_name
     }
@@ -1617,9 +2019,41 @@ impl ComputeDriverConfigContext<'_> {
 pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
+    shared_supervision: &'a OnceLock<openshell_supervisor_control::SharedSupervision>,
+    app_endpoint_resolver: &'a OnceLock<SharedComputeDriverAppEndpoints>,
+    /// Recovery deadline from `[openshell.gateway.supervisor_pool]`, when
+    /// configured.
+    supervisor_recovery_timeout_secs: Option<u32>,
 }
 
 impl ComputeDriverBuildContext<'_> {
+    /// Register an optional in-process application endpoint resolver during build.
+    /// Existing factories need not provide this extension.
+    pub fn register_app_endpoints(&self, resolver: SharedComputeDriverAppEndpoints) -> Result<()> {
+        self.app_endpoint_resolver
+            .set(resolver)
+            .map_err(|_| Error::config("application endpoint resolver already registered"))
+    }
+
+    /// The gateway's coordination of the shared supervisor pool, for an
+    /// in-process driver whose configuration places new generations on it.
+    /// The gateway owns the desired set and ownership durably, serves each
+    /// member over the private assignment stream, mints the supervisor
+    /// token, and publishes each renewal for the driver to deliver.
+    /// `[openshell.gateway.supervisor_pool]` only tunes it. Created on first
+    /// request; every call returns the same coordination.
+    pub fn shared_supervision(&self) -> openshell_supervisor_control::SharedSupervision {
+        self.shared_supervision
+            .get_or_init(|| {
+                let supervision = openshell_supervisor_control::SharedSupervision::new();
+                if let Some(recovery_timeout_secs) = self.supervisor_recovery_timeout_secs {
+                    supervision.set_recovery_timeout_secs(recovery_timeout_secs);
+                }
+                supervision
+            })
+            .clone()
+    }
+
     #[must_use]
     pub fn config_context(&self) -> ComputeDriverConfigContext<'_> {
         self.config
@@ -1662,6 +2096,13 @@ impl ComputeDriverBuildContext<'_> {
             .driver_startup
             .guest_tls
             .map(compute::driver_config::GuestTlsPaths::as_path)
+    }
+
+    /// Gateway-normalized destination trust material for the network
+    /// supervisor. The bundle is absent when the global setting is omitted.
+    #[must_use]
+    pub fn network_trust_bundle(&self) -> Option<&NetworkSupervisorTrustBundle> {
+        self.config.driver_startup.network_trust
     }
 
     /// Deserialize the selected driver's merged TOML table.
@@ -1719,6 +2160,13 @@ async fn build_compute_runtime(
         driver_startup,
         false,
     )?;
+    validate_supervisor_pool_consumer(
+        &driver,
+        &config.name,
+        config.bind_address,
+        &config.log_level,
+        driver_startup,
+    )?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
     let admission = match &driver {
         ConfiguredComputeDriver::Registered(registration) => registration
@@ -1735,8 +2183,13 @@ async fn build_compute_runtime(
         }
     };
     info!(driver = %driver.name(), "Using compute driver");
+    let supervisor_pool = driver_startup
+        .file
+        .and_then(|file| file.openshell.gateway.supervisor_pool);
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
+            let shared_supervision = OnceLock::new();
+            let app_endpoint_resolver = OnceLock::new();
             let build_context = ComputeDriverBuildContext {
                 config: ComputeDriverConfigContext {
                     driver_name: &registration.name,
@@ -1746,8 +2199,21 @@ async fn build_compute_runtime(
                     driver_startup,
                 },
                 shutdown_rx,
+                shared_supervision: &shared_supervision,
+                app_endpoint_resolver: &app_endpoint_resolver,
+                supervisor_recovery_timeout_secs: supervisor_pool
+                    .and_then(|pool| pool.recovery_timeout_secs),
             };
-            let instance = registration.factory.build(build_context).await?;
+            let (instance, image_updates) = registration
+                .factory
+                .build_with_configuration_updates(build_context)
+                .await?;
+            let supervisor_host = shared_supervision
+                .into_inner()
+                .map(|supervision| supervision.controller().clone());
+            if supervisor_pool.is_some() && supervisor_host.is_none() {
+                return Err(Error::config(SUPERVISOR_POOL_WITHOUT_HOST));
+            }
             match instance {
                 ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
                     registration.name,
@@ -1762,7 +2228,15 @@ async fn build_compute_runtime(
                 .await
                 .map_err(|error| {
                     Error::execution(format!("failed to create compute runtime: {error}"))
-                })?,
+                })?
+                .with_supervisor_host(supervisor_host)
+                .with_image_update_driver(image_updates)
+                .with_app_endpoint_resolver(app_endpoint_resolver.into_inner()),
+                ComputeDriverInstance::ManagedRemote(_) if supervisor_host.is_some() => {
+                    return Err(Error::config(
+                        "only an in-process compute driver can use the gateway's shared supervision",
+                    ));
+                }
                 ComputeDriverInstance::ManagedRemote(mut endpoint) => {
                     endpoint.name = registration.name;
                     ComputeRuntime::new_remote_driver(
@@ -1886,6 +2360,49 @@ fn validate_compute_driver_config(
     Ok(driver)
 }
 
+const SUPERVISOR_POOL_WITHOUT_HOST: &str = "openshell.gateway.supervisor_pool tunes the shared \
+     supervisor pool, but no compute driver hosts sandboxes on it; set the Kubernetes driver's \
+     supervisor_topology = \"gateway\" or remove the table";
+
+/// Refuse `[openshell.gateway.supervisor_pool]` unless the selected driver
+/// hosts sandboxes on the shared supervisor pool.
+fn validate_supervisor_pool_consumer(
+    driver: &ConfiguredComputeDriver,
+    gateway_name: &str,
+    gateway_bind_address: SocketAddr,
+    gateway_log_level: &str,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
+) -> Result<()> {
+    if driver_startup
+        .file
+        .is_none_or(|file| file.openshell.gateway.supervisor_pool.is_none())
+    {
+        return Ok(());
+    }
+    match driver {
+        ConfiguredComputeDriver::Registered(registration) => {
+            if registration
+                .factory
+                .uses_shared_supervision(ComputeDriverConfigContext {
+                    driver_name: &registration.name,
+                    gateway_name,
+                    gateway_bind_address,
+                    gateway_log_level,
+                    driver_startup,
+                })?
+            {
+                Ok(())
+            } else {
+                Err(Error::config(SUPERVISOR_POOL_WITHOUT_HOST))
+            }
+        }
+        ConfiguredComputeDriver::Remote { .. } => Err(Error::config(
+            "openshell.gateway.supervisor_pool tunes the shared supervisor pool, which only an \
+             in-process compute driver can use; remove the table",
+        )),
+    }
+}
+
 fn resolve_configured_compute_driver(
     registry: &ComputeDriverRegistry,
     driver_name: &str,
@@ -1893,6 +2410,14 @@ fn resolve_configured_compute_driver(
 ) -> Result<ConfiguredComputeDriver> {
     let name = openshell_core::config::normalize_compute_driver_name(driver_name)
         .map_err(Error::config)?;
+    let network_trust_configured =
+        driver_startup.network_trust.is_some() || driver_startup.network_trust_configured;
+    if network_trust_configured && driver_startup.endpoint_overrides.contains_key(&name) {
+        return Err(Error::config(format!(
+            "{} is configured but compute driver '{name}' uses an unsupported remote endpoint",
+            network_trust::CONFIG_FIELD
+        )));
+    }
     // An operator-provided endpoint replaces normal construction for the
     // selected name, including a compiled registration with the same name.
     // The gateway connects to it; it does not provision the remote driver.
@@ -1901,9 +2426,21 @@ fn resolve_configured_compute_driver(
     }
 
     if let Some(registration) = registry.get(&name) {
+        if network_trust_configured && !registration.factory.supports_network_supervisor_trust() {
+            return Err(Error::config(format!(
+                "{} is configured but compute driver '{name}' does not support network trust propagation",
+                network_trust::CONFIG_FIELD
+            )));
+        }
         return Ok(ConfiguredComputeDriver::Registered(registration.clone()));
     }
 
+    if network_trust_configured {
+        return Err(Error::config(format!(
+            "{} is configured but remote compute driver '{name}' is unsupported because it cannot propagate network trust",
+            network_trust::CONFIG_FIELD
+        )));
+    }
     Ok(ConfiguredComputeDriver::Remote { name })
 }
 
@@ -1970,29 +2507,41 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 }
 
 #[cfg(test)]
+mod compute_factory_compatibility;
+
+#[cfg(test)]
 mod tests {
     use super::{
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
-        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
-        bind_gateway_listener, classify_initial_bytes, configured_compute_driver,
-        extension_token_ttl, is_benign_tls_handshake_failure, mint_gateway_extension_credential,
-        serve_gateway_listener, validate_peer_endpoint_scheme,
+        MetricsTlsHandshakeLogLimiter, MetricsTlsHandshakeLogLimiters, MultiplexService,
+        ServerState, TlsAcceptor, allow_plaintext_service_http, bind_gateway_listener,
+        classify_initial_bytes, configured_compute_driver, extension_token_ttl,
+        is_benign_tls_handshake_failure, log_metrics_tls_handshake_rejection,
+        log_metrics_tls_handshake_timeout, metrics_tls_acceptor_or_disable,
+        mint_gateway_extension_credential, serve_gateway_listener, serve_tls_metrics_listener,
+        validate_peer_endpoint_scheme,
     };
+    use axum::{Router, routing::get};
     use openshell_core::{
-        Config,
+        Config, MetricsTlsConfig, NetworkSupervisorTrustBundle,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
+    use rcgen::{CertificateParams, KeyUsagePurpose};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use std::fs;
     use std::io::{Error, ErrorKind};
     use std::net::SocketAddr;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::{TempDir, tempdir};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
+    use tokio_rustls::TlsConnector;
 
     use crate::tls_test_utils::generate_test_certs_with_ca;
     use axum::body::Body;
@@ -2009,6 +2558,75 @@ mod tests {
             external_key_path: None,
             external_server_names: Vec::new(),
         }))
+    }
+
+    fn test_tls_connector(ca_path: &Path, client_auth: Option<(&Path, &Path)>) -> TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        let certificates =
+            CertificateDer::pem_file_iter(ca_path).expect("failed to open test CA certificate");
+        for certificate in certificates {
+            roots
+                .add(certificate.expect("failed to parse test CA certificate"))
+                .expect("failed to add test CA certificate");
+        }
+
+        let config = if let Some((cert_path, key_path)) = client_auth {
+            let cert_chain = CertificateDer::pem_file_iter(cert_path)
+                .expect("failed to open test client certificate")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("failed to parse test client certificate");
+            let private_key =
+                PrivateKeyDer::from_pem_file(key_path).expect("failed to parse test client key");
+
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(cert_chain, private_key)
+                    .expect("failed to configure test client certificate"),
+            )
+        } else {
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        };
+
+        TlsConnector::from(config)
+    }
+
+    fn write_test_client_certificate(
+        directory: &Path,
+        name: &str,
+        ca_cert: &openshell_crypto::pki::Certificate,
+        ca_key: &openshell_crypto::pki::KeyPair,
+    ) -> (PathBuf, PathBuf) {
+        let client_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate test client key");
+        let mut client_params =
+            CertificateParams::new(Vec::<String>::new()).expect("failed to create client params");
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        client_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        let client_cert =
+            openshell_crypto::pki::signed_by(client_params, &client_key, ca_cert, ca_key)
+                .expect("failed to sign test client certificate");
+
+        let cert_path = directory.join(format!("{name}-cert.pem"));
+        let key_path = directory.join(format!("{name}-key.pem"));
+        fs::write(&cert_path, client_cert.pem()).expect("failed to write test client certificate");
+        fs::write(
+            &key_path,
+            client_key
+                .serialize_pem()
+                .expect("failed to encode test client key"),
+        )
+        .expect("failed to write test client key");
+        (cert_path, key_path)
     }
 
     #[test]
@@ -2167,13 +2785,32 @@ mod tests {
         config: &'a Config,
         file: Option<&'a super::config_file::ConfigFile>,
     ) -> crate::compute::driver_config::DriverStartupContext<'a> {
+        test_driver_startup_with_bundle(config, file, None)
+    }
+
+    fn test_driver_startup_with_bundle<'a>(
+        config: &'a Config,
+        file: Option<&'a super::config_file::ConfigFile>,
+        network_trust: Option<&'a NetworkSupervisorTrustBundle>,
+    ) -> crate::compute::driver_config::DriverStartupContext<'a> {
         crate::compute::driver_config::DriverStartupContext {
             file,
             guest_tls: None,
+            network_trust,
+            network_trust_configured: network_trust.is_some(),
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             gateway_tls_enabled: false,
             endpoint_overrides: &config.compute_driver_endpoints,
         }
+    }
+
+    fn test_network_trust_bundle() -> NetworkSupervisorTrustBundle {
+        NetworkSupervisorTrustBundle::new(
+            b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n".to_vec(),
+            1,
+            "sha256:fixture",
+            "/tmp/openshell-additional-ca.crt".into(),
+        )
     }
 
     fn test_compute_drivers() -> super::ComputeDriverRegistry {
@@ -2203,6 +2840,57 @@ mod tests {
     struct TestComputeDriverFactory;
 
     #[test]
+    fn shared_supervision_is_always_a_pool_tuned_by_its_table() {
+        let endpoint_overrides = std::collections::BTreeMap::new();
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        for (configured, offered) in [
+            (
+                None,
+                openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS,
+            ),
+            (Some(75), 75),
+        ] {
+            let shared = std::sync::OnceLock::new();
+            let context = super::ComputeDriverBuildContext {
+                config: super::ComputeDriverConfigContext {
+                    driver_name: "kubernetes",
+                    gateway_name: "test",
+                    gateway_bind_address: "127.0.0.1:8080".parse().unwrap(),
+                    gateway_log_level: "info",
+                    driver_startup: crate::compute::driver_config::DriverStartupContext {
+                        file: None,
+                        guest_tls: None,
+                        gateway_port: 8080,
+                        gateway_tls_enabled: true,
+                        network_trust: None,
+                        network_trust_configured: false,
+                        endpoint_overrides: &endpoint_overrides,
+                    },
+                },
+                shutdown_rx: shutdown_rx.clone(),
+                shared_supervision: &shared,
+                app_endpoint_resolver: &std::sync::OnceLock::new(),
+                supervisor_recovery_timeout_secs: configured,
+            };
+            // The driver asks for shared supervision as before; it is the
+            // pool, with the configured recovery deadline or the default.
+            let supervision = context.shared_supervision();
+            assert_eq!(
+                supervision.controller().pool_recovery_timeout_secs(),
+                offered
+            );
+            assert_eq!(
+                context
+                    .shared_supervision()
+                    .controller()
+                    .pool_recovery_timeout_secs(),
+                offered
+            );
+            assert!(shared.get().is_some());
+        }
+    }
+
+    #[test]
     fn factory_admission_defaults_remain_enabled() {
         use super::ComputeDriverFactory as _;
         let endpoint_overrides = std::collections::BTreeMap::new();
@@ -2214,6 +2902,8 @@ mod tests {
             driver_startup: crate::compute::driver_config::DriverStartupContext {
                 file: None,
                 guest_tls: None,
+                network_trust: None,
+                network_trust_configured: false,
                 gateway_port: 8080,
                 gateway_tls_enabled: false,
                 endpoint_overrides: &endpoint_overrides,
@@ -2389,7 +3079,7 @@ mod tests {
                 .iter()
                 .map(|service| service.name.as_str())
                 .collect::<Vec<_>>(),
-            ["openshell.v1.OpenShell"]
+            ["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
         );
 
         stop_listener(shutdown, handle).await;
@@ -2438,6 +3128,379 @@ mod tests {
     async fn stop_listener(shutdown: watch::Sender<bool>, handle: tokio::task::JoinHandle<()>) {
         let _ = shutdown.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[derive(Clone)]
+    struct TraceBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn metrics_tls_handshake_rejection_logs_actionable_context() {
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_mins(1));
+
+        log_metrics_tls_handshake_rejection(
+            &limiter,
+            &Error::new(ErrorKind::InvalidData, "untrusted client certificate"),
+            "192.0.2.10:443".parse().expect("valid test client address"),
+        );
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(output.contains("WARN"), "log output: {output}");
+        assert!(
+            output.contains("metrics_tls_handshake_rejected"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("untrusted client certificate"),
+            "log output: {output}"
+        );
+        assert!(output.contains("192.0.2.10:443"), "log output: {output}");
+        assert!(
+            output.contains("Rejected metrics TLS handshake"),
+            "log output: {output}"
+        );
+    }
+
+    #[test]
+    fn metrics_tls_handshake_warnings_are_rate_limited() {
+        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_mins(1));
+        let start = Instant::now();
+
+        assert_eq!(limiter.record(start), Some(0));
+        assert_eq!(limiter.record(start + Duration::from_secs(1)), None);
+        assert_eq!(limiter.record(start + Duration::from_secs(2)), None);
+        assert_eq!(
+            limiter.record(start + Duration::from_mins(1)),
+            Some(2),
+            "the next warning reports the rejected handshakes suppressed during the interval"
+        );
+    }
+
+    #[test]
+    fn metrics_tls_handshake_timeout_warns_independently_of_rejections() {
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let limiters = MetricsTlsHandshakeLogLimiters::new(Duration::from_mins(1));
+        let client = "192.0.2.10:443".parse().expect("valid test client address");
+
+        // A rejected handshake warns once and suppresses further rejections
+        // for the interval; a timeout during that window must still warn with
+        // its own message and counts instead of being absorbed by the
+        // rejection limiter.
+        log_metrics_tls_handshake_rejection(
+            &limiters.rejections,
+            &Error::new(ErrorKind::InvalidData, "untrusted client certificate"),
+            client,
+        );
+        log_metrics_tls_handshake_timeout(&limiters.timeouts, client);
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(
+            output.contains("metrics_tls_handshake_rejected"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("Metrics TLS handshakes timed out"),
+            "the timeout still warns after a rejected handshake: {output}"
+        );
+        assert!(
+            output.matches("WARN").count() >= 2,
+            "both the rejection and the timeout warn: {output}"
+        );
+    }
+
+    #[test]
+    fn invalid_metrics_tls_material_disables_only_the_metrics_listener() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let tls = MetricsTlsConfig {
+            cert_path: PathBuf::from("/tmp/openshell-missing-metrics-cert.pem"),
+            key_path: PathBuf::from("/tmp/openshell-missing-metrics-key.pem"),
+            client_ca_path: None,
+            require_client_auth: false,
+        };
+
+        assert!(
+            metrics_tls_acceptor_or_disable(&tls).is_none(),
+            "invalid metrics TLS files must not produce a plaintext listener or abort startup"
+        );
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(
+            output.contains("metrics_tls_listener_disabled"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("listener=\"metrics\""),
+            "log output: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_metrics_listener_serves_https_and_rejects_plaintext() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind metrics listener");
+        let address = listener
+            .local_addr()
+            .expect("failed to read metrics listener address");
+        let (tls_dir, tls_acceptor) = test_tls_acceptor();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener_task = tokio::spawn(serve_tls_metrics_listener(
+            listener,
+            Router::new().route("/metrics", get(|| async { "metrics" })),
+            tls_acceptor,
+            shutdown_rx,
+        ));
+
+        let connector = test_tls_connector(&tls_dir.path().join("ca.pem"), None);
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("failed to connect to metrics listener");
+        let mut tls_stream = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+            .expect("metrics TLS handshake failed");
+        tls_stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to request metrics over TLS");
+        let mut response = Vec::new();
+        tls_stream
+            .read_to_end(&mut response)
+            .await
+            .expect("failed to read metrics TLS response");
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "expected a successful HTTPS metrics response"
+        );
+
+        let mut plaintext = TcpStream::connect(address)
+            .await
+            .expect("failed to connect for plaintext request");
+        plaintext
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to write plaintext metrics request");
+        let mut plaintext_response = Vec::new();
+        let plaintext_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            plaintext.read_to_end(&mut plaintext_response),
+        )
+        .await
+        .expect("timed out waiting for plaintext metrics connection to close");
+        if let Err(error) = plaintext_result {
+            assert_eq!(error.kind(), ErrorKind::ConnectionReset);
+        }
+        assert!(
+            !String::from_utf8_lossy(&plaintext_response).starts_with("HTTP/"),
+            "TLS metrics listener must not serve plaintext HTTP"
+        );
+
+        stop_listener(shutdown_tx, listener_task).await;
+    }
+
+    #[tokio::test]
+    async fn metrics_mtls_trusts_only_the_metrics_client_ca() {
+        let directory = tempdir().expect("failed to create test directory");
+        let (_server_ca_cert, _server_ca_key) = generate_test_certs_with_ca(directory.path());
+
+        let metrics_ca_directory = directory.path().join("metrics-client-ca");
+        fs::create_dir(&metrics_ca_directory).expect("failed to create metrics CA directory");
+        let (metrics_ca_cert, metrics_ca_key) = generate_test_certs_with_ca(&metrics_ca_directory);
+
+        let gateway_ca_directory = directory.path().join("gateway-client-ca");
+        fs::create_dir(&gateway_ca_directory).expect("failed to create gateway CA directory");
+        let (gateway_ca_cert, gateway_ca_key) = generate_test_certs_with_ca(&gateway_ca_directory);
+
+        let (metrics_client_cert, metrics_client_key) = write_test_client_certificate(
+            directory.path(),
+            "metrics-client",
+            &metrics_ca_cert,
+            &metrics_ca_key,
+        );
+        let (gateway_client_cert, gateway_client_key) = write_test_client_certificate(
+            directory.path(),
+            "gateway-client",
+            &gateway_ca_cert,
+            &gateway_ca_key,
+        );
+        let metrics_tls_acceptor = TlsAcceptor::from_files(
+            &directory.path().join("server-cert.pem"),
+            &directory.path().join("server-key.pem"),
+            Some(&metrics_ca_directory.join("ca.pem")),
+            true,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("failed to configure metrics mTLS acceptor");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind metrics listener");
+        let address = listener
+            .local_addr()
+            .expect("failed to read metrics listener address");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener_task = tokio::spawn(serve_tls_metrics_listener(
+            listener,
+            Router::new().route("/metrics", get(|| async { "metrics" })),
+            metrics_tls_acceptor,
+            shutdown_rx,
+        ));
+
+        let metrics_connector = test_tls_connector(
+            &directory.path().join("ca.pem"),
+            Some((&metrics_client_cert, &metrics_client_key)),
+        );
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("failed to connect with metrics client certificate");
+        let mut metrics_client = metrics_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+            .expect("metrics client TLS handshake failed");
+        metrics_client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to request metrics with metrics client certificate");
+        let mut authorized_response = Vec::new();
+        metrics_client
+            .read_to_end(&mut authorized_response)
+            .await
+            .expect("failed to read authorized metrics response");
+        assert!(
+            String::from_utf8_lossy(&authorized_response).starts_with("HTTP/1.1 200"),
+            "metrics client certificate should be authorized"
+        );
+
+        let gateway_connector = test_tls_connector(
+            &directory.path().join("ca.pem"),
+            Some((&gateway_client_cert, &gateway_client_key)),
+        );
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("failed to connect with gateway client certificate");
+        let rejected_response = match gateway_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+        {
+            Ok(mut gateway_client) => {
+                let _ = gateway_client
+                    .write_all(
+                        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let mut response = Vec::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    gateway_client.read_to_end(&mut response),
+                )
+                .await;
+                response
+            }
+            Err(_) => Vec::new(),
+        };
+        assert!(
+            !String::from_utf8_lossy(&rejected_response).starts_with("HTTP/"),
+            "gateway client certificate must not authorize metrics scraping"
+        );
+
+        let anonymous_connector = test_tls_connector(&directory.path().join("ca.pem"), None);
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("failed to connect without a client certificate");
+        let anonymous_response = match anonymous_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+        {
+            Ok(mut anonymous_client) => {
+                let _ = anonymous_client
+                    .write_all(
+                        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let mut response = Vec::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    anonymous_client.read_to_end(&mut response),
+                )
+                .await;
+                response
+            }
+            Err(_) => Vec::new(),
+        };
+        assert!(
+            !String::from_utf8_lossy(&anonymous_response).starts_with("HTTP/"),
+            "metrics mTLS must reject clients without a certificate"
+        );
+
+        stop_listener(shutdown_tx, listener_task).await;
     }
 
     #[test]
@@ -2778,6 +3841,120 @@ mod tests {
             driver,
             ConfiguredComputeDriver::Remote { name } if name == "beta"
         ));
+    }
+
+    #[test]
+    fn network_trust_is_available_to_startup_context() {
+        let config = Config::new(None).with_compute_driver("docker");
+        let bundle = test_network_trust_bundle();
+        let startup = test_driver_startup_with_bundle(&config, None, Some(&bundle));
+
+        assert_eq!(
+            startup
+                .network_trust
+                .expect("configured trust bundle")
+                .certificate_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn configured_network_trust_rejects_endpoint_override_before_remote_connection() {
+        let config = Config::new(None)
+            .with_compute_driver("docker")
+            .with_compute_driver_endpoint("docker", "/run/openshell/docker.sock");
+        let bundle = test_network_trust_bundle();
+        let error = configured_compute_driver(
+            &test_compute_drivers(),
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect_err("destination trust must not be discarded by a remote override");
+
+        assert!(error.to_string().contains("additional_ca_bundle"));
+        assert!(error.to_string().contains("unsupported"));
+        assert!(!error.to_string().contains("docker.sock"));
+    }
+
+    #[test]
+    fn configured_network_trust_rejects_unknown_remote_driver() {
+        let config = Config::new(None).with_compute_driver("kyma");
+        let bundle = test_network_trust_bundle();
+        let error = configured_compute_driver(
+            &test_compute_drivers(),
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect_err("destination trust must not be silently ignored by a remote driver");
+
+        assert!(error.to_string().contains("additional_ca_bundle"));
+        assert!(error.to_string().contains("kyma"));
+    }
+
+    #[test]
+    fn configured_network_trust_rejects_unsupported_custom_registration() {
+        let mut registry = super::ComputeDriverRegistry::new();
+        registry
+            .install(
+                super::ComputeDriverRegistration::new("custom", 1, None, TestComputeDriverFactory)
+                    .expect("custom registration"),
+            )
+            .expect("install custom registration");
+        let config = Config::new(None).with_compute_driver("custom");
+        let bundle = test_network_trust_bundle();
+        let error = configured_compute_driver(
+            &registry,
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect_err("custom drivers cannot consume the shared trust contract yet");
+
+        assert!(error.to_string().contains("additional_ca_bundle"));
+        assert!(error.to_string().contains("custom"));
+        assert!(error.to_string().contains("network trust propagation"));
+    }
+
+    #[derive(Clone, Copy)]
+    struct TrustPropagatingTestFactory;
+
+    #[async_trait::async_trait]
+    impl super::ComputeDriverFactory for TrustPropagatingTestFactory {
+        fn supports_network_supervisor_trust(&self) -> bool {
+            true
+        }
+
+        async fn build(
+            &self,
+            _context: super::ComputeDriverBuildContext<'_>,
+        ) -> openshell_core::Result<super::ComputeDriverInstance> {
+            unreachable!("selection tests do not construct the driver")
+        }
+    }
+
+    #[test]
+    fn configured_network_trust_accepts_explicitly_capable_registration() {
+        let mut registry = super::ComputeDriverRegistry::new();
+        registry
+            .install(
+                super::ComputeDriverRegistration::new(
+                    "custom",
+                    1,
+                    None,
+                    TrustPropagatingTestFactory,
+                )
+                .expect("custom registration"),
+            )
+            .expect("install custom registration");
+        let config = Config::new(None).with_compute_driver("custom");
+        let bundle = test_network_trust_bundle();
+
+        let driver = configured_compute_driver(
+            &registry,
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect("an explicitly capable registration accepts destination trust");
+        assert!(matches!(driver, ConfiguredComputeDriver::Registered(_)));
     }
 
     #[tokio::test]

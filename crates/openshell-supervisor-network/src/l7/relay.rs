@@ -20,6 +20,7 @@ use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::telemetry::egress_emit;
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::endpoint_status::{EndpointObservationSender, EndpointResult};
@@ -27,7 +28,6 @@ use openshell_core::secrets::{self, SecretResolver};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
-    ocsf_emit,
 };
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -287,8 +287,13 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
 
-    ocsf_emit!(build_request_authority_mismatch_event(ctx, method));
-    ocsf_emit!(build_request_authority_mismatch_finding(ctx));
+    crate::telemetry::emit_decision(
+        [
+            build_request_authority_mismatch_event(ctx, method),
+            build_request_authority_mismatch_finding(ctx),
+        ],
+        None,
+    );
     Ok(())
 }
 
@@ -338,7 +343,7 @@ where
                     crate::l7::mcp::selected_revision_context(request, version)
                 );
                 let summary = l7_protocol_log_summary(None, Some(&info));
-                ocsf_emit!(build_l7_request_event(
+                egress_emit!(build_l7_request_event(
                     ctx,
                     &request.action,
                     redacted_target,
@@ -419,7 +424,7 @@ where
     }
     let reason = error.rejection_detail(request);
     let summary = l7_protocol_log_summary(None, Some(info));
-    ocsf_emit!(build_l7_request_event(
+    egress_emit!(build_l7_request_event(
         ctx,
         &request.action,
         redacted_target,
@@ -593,12 +598,15 @@ where
     W: AsyncWrite + Unpin,
 {
     let endpoint_mismatch = error.is_endpoint_mismatch();
-    let status = if endpoint_mismatch {
+    let placement_mismatch = error.is_placement_mismatch();
+    let status = if endpoint_mismatch || placement_mismatch {
         "403 Forbidden"
     } else {
         "500 Internal Server Error"
     };
-    let body = if endpoint_mismatch {
+    let body = if placement_mismatch {
+        r#"{"error":"credential_placement_mismatch","message":"Credential is not authorized for this request location"}"#
+    } else if endpoint_mismatch {
         r#"{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"}"#
     } else {
         r#"{"error":"credential_unavailable","message":"Credential placeholder could not be resolved"}"#
@@ -613,15 +621,38 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
 
-    ocsf_emit!(build_credential_resolution_event(
-        ctx,
-        method,
-        endpoint_mismatch
-    ));
-
+    let mut events = if placement_mismatch {
+        vec![
+            HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::for_http_method(method))
+                .http_request(method_only_request(method))
+                .http_response(openshell_ocsf::HttpResponse { code: 403 })
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::High)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .firewall_rule(&ctx.policy_name, "credential-binding")
+                .message("Credential use denied: unauthorized request location")
+                .status_detail("credential_placement_mismatch")
+                .build(),
+            crate::l7::build_credential_placement_mismatch_finding(
+                &ctx.policy_name,
+                &ctx.host,
+                None,
+            ),
+        ]
+    } else {
+        vec![build_credential_resolution_event(
+            ctx,
+            method,
+            endpoint_mismatch,
+        )]
+    };
     if endpoint_mismatch {
-        ocsf_emit!(build_credential_endpoint_mismatch_finding(ctx));
+        events.push(build_credential_endpoint_mismatch_finding(ctx));
     }
+    crate::telemetry::emit_decision(events, None);
     Ok(())
 }
 
@@ -1015,7 +1046,7 @@ fn emit_parse_rejection(ctx: &L7EvalContext, detail: &str, engine_type: &str) {
         ))
         .status_detail(detail)
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
     emit_activity(ctx, true, "l7_parse_rejection");
 }
 
@@ -1131,7 +1162,7 @@ where
                     .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                     .message("SQL L7 provider not yet implemented, falling back to passthrough")
                     .build();
-                ocsf_emit!(event);
+                egress_emit!(event);
             }
             tokio::io::copy_bidirectional(client, upstream)
                 .await
@@ -1664,7 +1695,7 @@ fn emit_l7_request_log(
         reason,
         protocol_summary,
     );
-    ocsf_emit!(event);
+    egress_emit!(event);
     emit_activity(ctx, decision_str == "deny", "l7_policy");
 }
 
@@ -1748,7 +1779,7 @@ pub(crate) async fn websocket_middleware_preflight(
     let requested_subprotocols =
         crate::l7::rest::websocket_requested_subprotocols(&req.raw_header[..header_end])?;
     let input = websocket_preflight_input(
-        openshell_ocsf::ctx::ctx(),
+        &openshell_ocsf::ctx::ctx(),
         ctx,
         req,
         scheme,
@@ -1830,7 +1861,7 @@ where
     } else {
         "raw bidirectional relay (L7 enforcement no longer active)"
     };
-    ocsf_emit!(
+    egress_emit!(
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Other)
             .activity_name("Upgrade")
@@ -1884,9 +1915,13 @@ where
                 assembly_budget,
                 resolver,
                 generation_guard: options.generation_guard,
-                provider_credentials: options
-                    .ctx
-                    .and_then(|ctx| ctx.provider_credentials.as_ref()),
+                provider_credentials: if options.websocket.credential_rewrite {
+                    options
+                        .ctx
+                        .and_then(|ctx| ctx.provider_credentials.as_ref())
+                } else {
+                    None
+                },
                 target: &options.target,
                 inspector,
                 compression,
@@ -1955,8 +1990,7 @@ pub(crate) fn upgrade_options<'a>(
     engine: Option<&'a TunnelPolicyEngine>,
 ) -> UpgradeRelayOptions<'a> {
     let websocket_credential_rewrite =
-        matches!(config.protocol, L7Protocol::Rest | L7Protocol::Websocket)
-            && config.websocket_credential_rewrite;
+        config.protocol == L7Protocol::Websocket && config.websocket_credential_rewrite;
     let deny_uninspected_credentials =
         config.provider_credentialed && !config.allow_uninspected_credentials;
     let websocket_message_policy = if config.protocol == L7Protocol::Websocket {
@@ -2000,7 +2034,6 @@ pub(crate) fn websocket_extension_mode(
 ) -> WebSocketExtensionMode {
     if inspecting_middleware_session
         || config.protocol == L7Protocol::Websocket
-        || (config.protocol == L7Protocol::Rest && config.websocket_credential_rewrite)
         || (config.provider_credentialed && !config.allow_uninspected_credentials)
     {
         WebSocketExtensionMode::PermessageDeflate
@@ -2169,7 +2202,7 @@ where
                     request_info.action, ctx.host, ctx.port, redacted_target, reason,
                 ))
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
 
         if allowed || config.enforcement == EnforcementMode::Audit {
@@ -2328,6 +2361,12 @@ where
                     websocket_permessage_deflate,
                     websocket_subprotocol,
                 } => {
+                    if crate::l7::rest::upgrade_refusal_for_protocol(config.protocol).is_some() {
+                        if let Some(session) = middleware_session.take() {
+                            session.end(openshell_core::proto::MiddlewareSessionEndReason::ProtocolError).await;
+                        }
+                        return Ok(());
+                    }
                     let mut options = upgrade_options(
                         config,
                         ctx,
@@ -2377,7 +2416,7 @@ pub(crate) fn emit_policy_reload(
     port: u16,
     policy_name: &str,
 ) {
-    ocsf_emit!(
+    egress_emit!(
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -2597,7 +2636,7 @@ where
                     &reason,
                 ))
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
@@ -2879,7 +2918,7 @@ where
                     request_info.action, ctx.host, ctx.port, redacted_target, reason,
                 ))
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
@@ -3350,7 +3389,7 @@ fn emit_transformed_body_decision(
             request_info.action, ctx.host, ctx.port, request_info.target, reason
         ))
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
 }
 
 fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_json::Value {
@@ -3583,7 +3622,7 @@ where
                     req.action, ctx.host, ctx.port, redacted_target,
                 ))
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
 
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -3753,6 +3792,67 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::telemetry::tests::{assert_deny_resolves, exported};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authority_mismatch_domain_and_finding_share_one_trace() {
+        let (events, received) = exported("warn", || {
+            let ctx = L7EvalContext {
+                host: "blocked.example".to_string(),
+                port: 443,
+                ..Default::default()
+            };
+            let mut response = Vec::new();
+            // The in-memory span processor exports with a futures executor.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(reject_request_authority_mismatch(
+                    &mut response,
+                    &ctx,
+                    "POST",
+                ))
+            })
+            .unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 403 Forbidden"));
+        })
+        .await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(received.spans.len(), 1);
+        assert_deny_resolves(&events, &received, true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_level_l7_relay_deny_uid_resolves_to_one_span_root_trace() {
+        let (events, received) = crate::telemetry::tests::exported_over_otlp("warn", || {
+            let ctx = L7EvalContext {
+                host: "blocked.example".to_string(),
+                port: 443,
+                policy_name: "rest-policy".to_string(),
+                ..Default::default()
+            };
+            egress_emit!(build_l7_request_event(
+                &ctx, "GET", "/", "deny", "l7-rest", "denied", None
+            ));
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        assert_deny_resolves(&events, &received, true);
+        assert_eq!(received.spans.len(), 1);
+        crate::telemetry::tests::assert_deny_attribute(
+            &received,
+            "openshell.policy.name",
+            "rest-policy",
+        );
+        crate::telemetry::tests::assert_deny_attribute(
+            &received,
+            "server.address",
+            "blocked.example",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4000,15 +4100,11 @@ mod tests {
 
     #[test]
     fn early_http_rejections_include_method_and_response() {
-        use openshell_ocsf::validation::{
-            load_class_schema, validate_enum_value, validate_required_fields,
-        };
         let ctx = L7EvalContext {
             host: "example.com".into(),
             port: 443,
             ..Default::default()
         };
-        let schema = load_class_schema("http_activity");
         for (event, method, response_code) in [
             (
                 build_request_authority_mismatch_event(&ctx, "GET"),
@@ -4033,8 +4129,7 @@ mod tests {
             assert_eq!(json["http_request"]["http_method"], method);
             assert!(json["http_request"].get("url").is_none());
             assert_eq!(json["http_response"]["code"], response_code);
-            validate_required_fields(&json, &schema);
-            validate_enum_value(&json, "activity_id", &schema);
+            openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
         }
     }
 
@@ -4044,6 +4139,7 @@ mod tests {
             sandbox_id: "sbx-123".into(),
             sandbox_name: "nightly-build".into(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "h".into(),
             product_version: "0".into(),
             proxy_ip: [127, 0, 0, 1].into(),
@@ -4113,6 +4209,9 @@ mod tests {
             scoped
                 .secret_resolver
                 .expect("endpoint resolver")
+                .with_request_location(secrets::RequestCredentialLocation::Header(
+                    "Authorization".into()
+                ))
                 .resolve_placeholder("openshell:resolve:env:v42_API_TOKEN"),
             Some("secret")
         );
@@ -4294,6 +4393,570 @@ mod tests {
         );
         assert_eq!(finding["action"], "Denied");
         assert_eq!(finding["disposition"], "Blocked");
+    }
+
+    fn placement_test_state() -> ProviderCredentialState {
+        placement_test_state_with_metadata(true)
+    }
+
+    fn placement_test_state_with_metadata(with_metadata: bool) -> ProviderCredentialState {
+        ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("API_TOKEN".into(), "synthetic-private-token".into())]),
+            TestHashMap::new(),
+            if with_metadata {
+                crate::test_support::header_placement_metadata(&["API_TOKEN"])
+            } else {
+                TestHashMap::new()
+            },
+            TestHashMap::from([("API_TOKEN".into(), endpoint_binding("provider:API_TOKEN"))]),
+            Vec::new(),
+        )
+        .expect("bound placement fixture")
+    }
+
+    #[tokio::test]
+    async fn mixed_declared_and_fallback_credentials_preserve_opt_in_body_rewriting() {
+        let fallback_binding = endpoint_binding("provider:FALLBACK_TOKEN");
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([
+                ("STRICT_TOKEN".into(), "strict-private-token".into()),
+                ("FALLBACK_TOKEN".into(), "fallback-private-token".into()),
+            ]),
+            TestHashMap::new(),
+            crate::test_support::header_placement_metadata(&["STRICT_TOKEN"]),
+            TestHashMap::from([
+                (
+                    "STRICT_TOKEN".into(),
+                    endpoint_binding("provider:STRICT_TOKEN"),
+                ),
+                ("FALLBACK_TOKEN".into(), fallback_binding),
+            ]),
+            Vec::new(),
+        )
+        .expect("mixed placement fixture");
+        let snapshot = state.snapshot();
+        let strict = &snapshot.child_env["STRICT_TOKEN"];
+        let fallback = &snapshot.child_env["FALLBACK_TOKEN"];
+        let resolver = state
+            .resolver_for_endpoint("allowed.example.test", 443, "/allowed/search")
+            .unwrap();
+        let body = format!("fallback={fallback}&strict={strict}");
+        let target = "/allowed/search?probe=literal";
+        let raw = format!(
+            "POST {target} HTTP/1.1\r\nHost: allowed.example.test\r\nAuthorization: token {strict}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let request = crate::l7::rest::request_from_buffered_http(
+            "POST",
+            "/allowed/search",
+            target,
+            raw.into_bytes(),
+        )
+        .unwrap();
+        let (mut _app, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut service) = tokio::io::duplex(8192);
+        let service_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            loop {
+                let mut byte = [0];
+                service.read_exact(&mut byte).await.unwrap();
+                bytes.push(byte[0]);
+                if bytes.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = String::from_utf8(bytes).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("Content-Length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            service.read_exact(&mut body).await.unwrap();
+            service
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            (headers, String::from_utf8(body).unwrap())
+        });
+        crate::l7::rest::relay_http_request_with_options_guarded(
+            &request,
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                resolver: Some(&resolver),
+                request_body_credential_rewrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (headers, body) = service_task.await.unwrap();
+        assert!(headers.contains("/allowed/search?probe=literal"));
+        assert!(headers.contains("Authorization: token strict-private-token"));
+        assert_eq!(
+            body,
+            "fallback=fallback-private-token&strict=strict-private-token"
+        );
+        assert!(
+            resolver
+                .rewrite_header_value_for_name("X-Legacy", strict)
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_credentials_do_not_enable_disabled_body_rewriting() {
+        let state = placement_test_state();
+        let resolver = state
+            .resolver_for_endpoint("allowed.example.test", 443, "/allowed/search")
+            .unwrap();
+        let token = state.snapshot().child_env["API_TOKEN"].clone();
+        let body = format!("token={token}");
+        let raw = format!(
+            "POST /allowed/search HTTP/1.1\r\nHost: allowed.example.test\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let request = crate::l7::rest::request_from_buffered_http(
+            "POST",
+            "/allowed/search",
+            "/allowed/search",
+            raw.into_bytes(),
+        )
+        .unwrap();
+        let (mut _app, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut service) = tokio::io::duplex(8192);
+        let error = crate::l7::rest::relay_http_request_with_options_guarded(
+            &request,
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                resolver: Some(&resolver),
+                request_body_credential_rewrite: false,
+                deny_uninspected_credentials: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("placement metadata must not enable body rewriting");
+        assert!(
+            error
+                .downcast_ref::<secrets::body::BodyCredentialError>()
+                .is_some(),
+            "{error}"
+        );
+        drop(upstream);
+        let mut sent = String::new();
+        service.read_to_string(&mut sent).await.unwrap();
+        assert!(!sent.contains("synthetic-private-token"));
+    }
+
+    #[tokio::test]
+    async fn metadata_credentials_do_not_enable_disabled_websocket_rewriting() {
+        let state = placement_test_state();
+        let token = state.snapshot().child_env["API_TOKEN"].clone();
+        let ctx = L7EvalContext {
+            host: "allowed.example.test".into(),
+            port: 443,
+            provider_credentials: Some(state.clone()),
+            ..Default::default()
+        };
+        let (mut app, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut service) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            handle_upgrade(
+                &mut client,
+                &mut upstream,
+                Vec::new(),
+                "allowed.example.test",
+                443,
+                UpgradeRelayOptions {
+                    websocket_request: true,
+                    websocket: WebSocketUpgradeBehavior {
+                        credential_rewrite: false,
+                        deny_uninspected_credentials: true,
+                        ..Default::default()
+                    },
+                    secret_resolver: state.resolver(),
+                    ctx: Some(&ctx),
+                    target: "/allowed/socket".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        app.write_all(&masked_text_frame(token.as_bytes()))
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("disabled rewriting must deny credential frames");
+        assert!(error.to_string().contains("rewrite is disabled"), "{error}");
+        let mut sent = Vec::new();
+        service.read_to_end(&mut sent).await.unwrap();
+        assert!(sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn header_credential_query_reflection_is_denied_before_upstream_write() {
+        for with_metadata in [true, false] {
+            let state = placement_test_state_with_metadata(with_metadata);
+            let resolver = state
+                .resolver_for_endpoint("allowed.example.test", 443, "/allowed/search")
+                .unwrap();
+            let token = state.snapshot().child_env["API_TOKEN"].clone();
+            // A pagination service copies extra query parameters into its Link header.
+            // No request bytes may reach it when the parameter contains a header credential.
+            for (target, extra_headers, body, rewrite_body) in [
+                (
+                    format!("/allowed/{token}/search"),
+                    String::new(),
+                    String::new(),
+                    false,
+                ),
+                (
+                    format!("/allowed/search?q=rust&per_page=1&probe={token}"),
+                    String::new(),
+                    String::new(),
+                    false,
+                ),
+                (
+                    "/allowed/search".into(),
+                    format!("X-Reflect: {token}\r\n"),
+                    String::new(),
+                    false,
+                ),
+            ] {
+                let raw = format!(
+                    "GET {target} HTTP/1.1\r\nHost: allowed.example.test\r\n{extra_headers}Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let request = crate::l7::rest::request_from_buffered_http(
+                    "GET",
+                    "/allowed/search",
+                    &target,
+                    raw.into_bytes(),
+                )
+                .unwrap();
+                let (mut app, mut client) = tokio::io::duplex(8192);
+                let (mut upstream, mut service) = tokio::io::duplex(8192);
+                let ctx = L7EvalContext {
+                    host: "allowed.example.test".into(),
+                    port: 443,
+                    ..Default::default()
+                };
+                let outcome = relay_http_request_with_credential_rejection(
+                    &request,
+                    &mut client,
+                    &mut upstream,
+                    crate::l7::rest::RelayRequestOptions {
+                        resolver: Some(&resolver),
+                        request_body_credential_rewrite: rewrite_body,
+                        ..Default::default()
+                    },
+                    &ctx,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(outcome.is_none());
+                drop(client);
+                drop(upstream);
+                let mut response = String::new();
+                app.read_to_string(&mut response).await.unwrap();
+                let mut sent = Vec::new();
+                service.read_to_end(&mut sent).await.unwrap();
+                assert!(
+                    sent.is_empty(),
+                    "placement denial must precede all upstream writes"
+                );
+                assert!(response.contains("403 Forbidden"), "{response}");
+                assert!(
+                    response.contains("credential_placement_mismatch"),
+                    "{response}"
+                );
+                assert!(!response.contains("synthetic-private-token"));
+                assert!(!response.contains(&token));
+            }
+            let finding = crate::l7::build_credential_placement_mismatch_finding(
+                "test",
+                "allowed.example.test",
+                None,
+            )
+            .to_json()
+            .unwrap();
+            assert_eq!(
+                finding["finding_info"]["uid"],
+                "openshell.provider_credential.placement_mismatch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn permitted_auth_formats_preserve_pagination_without_disclosing_credentials() {
+        use base64::Engine as _;
+        for with_metadata in [true, false] {
+            let state = placement_test_state_with_metadata(with_metadata);
+            let resolver = state
+                .resolver_for_endpoint("allowed.example.test", 443, "/allowed/search")
+                .unwrap();
+            let token = state.snapshot().child_env["API_TOKEN"].clone();
+            for (authorization, expected) in [
+                (
+                    format!("Bearer {token}"),
+                    "Bearer synthetic-private-token".to_owned(),
+                ),
+                (
+                    format!("token {token}"),
+                    "token synthetic-private-token".to_owned(),
+                ),
+                (
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD.encode(format!("user:{token}"))
+                    ),
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode("user:synthetic-private-token")
+                    ),
+                ),
+            ] {
+                let target = "/allowed/search?q=rust&per_page=1";
+                let raw = format!(
+                    "GET {target} HTTP/1.1\r\nHost: allowed.example.test\r\nAuthorization: {authorization}\r\n\r\n"
+                );
+                let request = crate::l7::rest::request_from_buffered_http(
+                    "GET",
+                    "/allowed/search",
+                    target,
+                    raw.into_bytes(),
+                )
+                .unwrap();
+                let (mut app, mut client) = tokio::io::duplex(8192);
+                let (mut upstream, mut service) = tokio::io::duplex(8192);
+                let service_task = tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut byte = [0];
+                        service.read_exact(&mut byte).await.unwrap();
+                        bytes.push(byte[0]);
+                        if bytes.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let received = String::from_utf8(bytes).unwrap();
+                    let target = received
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nLink: <https://allowed.example.test{target}&page=2>; rel=\"next\"\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    service.write_all(response.as_bytes()).await.unwrap();
+                    received
+                });
+                crate::l7::rest::relay_http_request_with_options_guarded(
+                    &request,
+                    &mut client,
+                    &mut upstream,
+                    crate::l7::rest::RelayRequestOptions {
+                        resolver: Some(&resolver),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                drop(client);
+                let mut response = String::new();
+                app.read_to_string(&mut response).await.unwrap();
+                let received = service_task.await.unwrap();
+                assert!(
+                    received.contains(&format!("Authorization: {expected}")),
+                    "{received}"
+                );
+                assert!(response.contains("per_page=1&page=2"), "{response}");
+                assert!(!response.contains("synthetic-private-token"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_non_authorization_locations_reach_the_upstream() {
+        for location in ["header", "query", "path"] {
+            let mut metadata = crate::test_support::header_placement_metadata(&["API_TOKEN"]);
+            let declaration = metadata.values_mut().next().unwrap();
+            declaration.auth_style = location.into();
+            declaration.header_name = if location == "header" {
+                "x-api-key"
+            } else {
+                ""
+            }
+            .into();
+            declaration.query_param = if location == "query" { "api_key" } else { "" }.into();
+            declaration.path_template = if location == "path" {
+                "/allowed/{credential}/events"
+            } else {
+                ""
+            }
+            .into();
+            let state = ProviderCredentialState::from_bound_environment(
+                1,
+                TestHashMap::from([("API_TOKEN".into(), "synthetic-private-token".into())]),
+                TestHashMap::new(),
+                metadata,
+                TestHashMap::from([("API_TOKEN".into(), endpoint_binding("provider:API_TOKEN"))]),
+                Vec::new(),
+            )
+            .unwrap();
+            let token = state.snapshot().child_env["API_TOKEN"].clone();
+            let (target, header, expected) = match location {
+                "header" => (
+                    "/allowed/search".into(),
+                    format!("x-api-key: {token}\r\n"),
+                    "x-api-key: synthetic-private-token",
+                ),
+                "query" => (
+                    format!("/allowed/search?api_key={token}"),
+                    String::new(),
+                    "/allowed/search?api_key=synthetic-private-token",
+                ),
+                _ => (
+                    format!("/allowed/{token}/events"),
+                    String::new(),
+                    "/allowed/synthetic-private-token/events",
+                ),
+            };
+            let path = target.split('?').next().unwrap();
+            let resolver = state
+                .resolver_for_endpoint("allowed.example.test", 443, path)
+                .unwrap();
+            let raw =
+                format!("GET {target} HTTP/1.1\r\nHost: allowed.example.test\r\n{header}\r\n");
+            let request =
+                crate::l7::rest::request_from_buffered_http("GET", path, &target, raw.into_bytes())
+                    .unwrap();
+            let (mut _app, mut client) = tokio::io::duplex(8192);
+            let (mut upstream, mut service) = tokio::io::duplex(8192);
+            let service_task = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    service.read_exact(&mut byte).await.unwrap();
+                    bytes.push(byte[0]);
+                    if bytes.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                service
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                String::from_utf8(bytes).unwrap()
+            });
+            crate::l7::rest::relay_http_request_with_options_guarded(
+                &request,
+                &mut client,
+                &mut upstream,
+                crate::l7::rest::RelayRequestOptions {
+                    resolver: Some(&resolver),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let sent = service_task.await.unwrap();
+            assert!(sent.contains(expected), "{location}: {sent}");
+            assert!(!sent.contains(&token));
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_sigv4_signing_preserves_metadata_free_credentials() {
+        let values = TestHashMap::from([
+            ("AWS_ACCESS_KEY_ID".into(), "synthetic-access-key".into()),
+            (
+                "AWS_SECRET_ACCESS_KEY".into(),
+                "synthetic-signing-secret".into(),
+            ),
+            ("AWS_SESSION_TOKEN".into(), "synthetic-session-token".into()),
+        ]);
+        let bindings = values
+            .keys()
+            .map(|key: &String| {
+                let binding = endpoint_binding(&format!("aws:{key}"));
+                (key.clone(), binding)
+            })
+            .collect();
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            values,
+            TestHashMap::new(),
+            TestHashMap::new(),
+            bindings,
+            Vec::new(),
+        )
+        .unwrap();
+        let resolver = state
+            .resolver_for_endpoint("allowed.example.test", 443, "/allowed/api")
+            .unwrap();
+        let request = crate::l7::rest::request_from_buffered_http(
+            "GET",
+            "/allowed/api",
+            "/allowed/api",
+            b"GET /allowed/api HTTP/1.1\r\nHost: allowed.example.test\r\n\r\n".to_vec(),
+        )
+        .unwrap();
+        let (mut _app, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut service) = tokio::io::duplex(8192);
+        let service_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            loop {
+                let mut byte = [0];
+                service.read_exact(&mut byte).await.unwrap();
+                bytes.push(byte[0]);
+                if bytes.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            service
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        crate::l7::rest::relay_http_request_with_options_guarded(
+            &request,
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                resolver: Some(&resolver),
+                credential_signing: crate::l7::CredentialSigning::SigV4NoBody,
+                signing_service: "execute-api",
+                signing_region: "us-west-2",
+                host: "allowed.example.test",
+                port: 443,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let sent = service_task.await.unwrap();
+        assert!(sent.contains("AWS4-HMAC-SHA256"), "{sent}");
+        assert!(sent.contains("synthetic-access-key"));
+        assert!(sent.contains("synthetic-session-token"));
+        assert!(!sent.contains("synthetic-signing-secret"));
     }
 
     #[tokio::test]
@@ -4785,9 +5448,7 @@ network_policies:
                     seconds: 2,
                     nanos: 0,
                 }),
-                tls_ca_cert_pem: Vec::new(),
-                audience: String::new(),
-                allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await
@@ -4806,12 +5467,15 @@ network_policies:
     endpoints:
       - host: api.example.test
         port: 8080
-        protocol: rest
+        protocol: websocket
         token_grant_owner: test-owner
         enforcement: enforce
         rules:
           - allow:
               method: GET
+              path: "/v1/**"
+          - allow:
+              method: WEBSOCKET_TEXT
               path: "/v1/**"
     binaries:
       - { path: /usr/bin/curl }
@@ -4868,7 +5532,10 @@ network_policies:
         )
         .await
         .expect("send upgrade request");
-        seen_rx.recv().await.expect("preflight reached middleware");
+        tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+            .await
+            .expect("preflight timed out")
+            .expect("preflight reached middleware");
         fixture.assert_no_requests();
         release.notify_one();
 
@@ -7604,7 +8271,7 @@ network_policies:
         };
 
         let input = middleware_request_input(
-            openshell_ocsf::ctx::ctx(),
+            &openshell_ocsf::ctx::ctx(),
             "http",
             &req,
             &ctx,
@@ -9411,7 +10078,7 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn rest_websocket_middleware_inspects_compressed_wss_messages() {
+    async fn websocket_middleware_inspects_compressed_wss_messages() {
         let data = r#"
 network_middlewares:
   redact:
@@ -9425,11 +10092,14 @@ network_policies:
     endpoints:
       - host: api.example.test
         port: 8080
-        protocol: rest
+        protocol: websocket
         enforcement: enforce
         rules:
           - allow:
               method: GET
+              path: "/ws"
+          - allow:
+              method: WEBSOCKET_TEXT
               path: "/ws"
     binaries:
       - { path: /usr/bin/node }
@@ -9519,7 +10189,7 @@ network_policies:
     endpoints:
       - host: gateway.example.test
         port: 443
-        protocol: rest
+        protocol: websocket
         enforcement: enforce
         rules:
           - allow:
@@ -9533,7 +10203,7 @@ network_policies:
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
         let configs = vec![L7EndpointConfig {
-            protocol: L7Protocol::Rest,
+            protocol: L7Protocol::Websocket,
             endpoint_id: String::new(),
             policy_hash: String::new(),
             path: "/ws".into(),
@@ -10338,9 +11008,140 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn route_selected_rest_websocket_upgrade_still_relays_beside_mcp() {
-        // The refusal follows the selected endpoint's protocol: a REST
-        // upgrade on the same host and port keeps its documented raw relay.
+    async fn rest_upgrade_refusal_emits_ocsf_denial() {
+        let (configs, _, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+        let config = configs
+            .iter()
+            .find(|c| c.protocol == L7Protocol::Rest)
+            .unwrap();
+        let request = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/api/ws".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /api/ws HTTP/1.1\r\nHost: mcp.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+        let (_app, mut client) = tokio::io::duplex(8192);
+        assert!(
+            deny_unsupported_upgrade_if_requested(&request, config, &ctx, None, &mut client)
+                .await
+                .unwrap()
+        );
+        let events = capture.json_events();
+        assert!(
+            events.iter().any(|event| event["action_id"] == 2
+                && event["status_detail"] == crate::l7::rest::UNSUPPORTED_REST_UPGRADE_DETAIL),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_upgrades_are_refused_in_both_modes_and_relay_paths() {
+        for enforcement in [EnforcementMode::Enforce, EnforcementMode::Audit] {
+            for route_selected in [false, true] {
+                for upgrade in ["websocket", "custom"] {
+                    let (mut configs, engine, ctx) =
+                        jsonrpc_and_rest_route_configs("mcp", "enforce");
+                    let config = configs
+                        .iter_mut()
+                        .find(|c| c.protocol == L7Protocol::Rest)
+                        .unwrap();
+                    config.enforcement = enforcement;
+                    let config = config.clone();
+                    let request = format!(
+                        "GET /api/ws HTTP/1.1\r\nHost: mcp.example.test:8000\r\nConnection: keep-alive, Upgrade\r\nUpgrade: {upgrade}\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                    );
+                    let frame = br#"{"action":"delete"}"#;
+                    let scenario = run_upgrade_scenario(
+                        request.as_bytes(),
+                        frame,
+                        move |mut client, mut upstream| {
+                            tokio::spawn(async move {
+                                if route_selected {
+                                    relay_with_route_selection(
+                                        &configs,
+                                        engine,
+                                        &mut client,
+                                        &mut upstream,
+                                        &ctx,
+                                    )
+                                    .await
+                                } else {
+                                    relay_with_inspection(
+                                        &config,
+                                        engine,
+                                        &mut client,
+                                        &mut upstream,
+                                        &ctx,
+                                    )
+                                    .await
+                                }
+                            })
+                        },
+                    )
+                    .await;
+                    assert_upgrade_refused_before_forwarding(
+                        &scenario,
+                        frame,
+                        crate::l7::rest::UNSUPPORTED_REST_UPGRADE_DETAIL,
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_upgrade_after_ordinary_request_is_refused() {
+        for route_selected in [false, true] {
+            let (configs, engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+            let config = configs
+                .iter()
+                .find(|c| c.protocol == L7Protocol::Rest)
+                .unwrap()
+                .clone();
+            let (mut app, mut client) = tokio::io::duplex(8192);
+            let (mut upstream, mut server) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                if route_selected {
+                    relay_with_route_selection(&configs, engine, &mut client, &mut upstream, &ctx)
+                        .await
+                } else {
+                    relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx).await
+                }
+            });
+            app.write_all(b"GET /api/tickets HTTP/1.1\r\nHost: mcp.example.test:8000\r\n\r\n")
+                .await
+                .unwrap();
+            let forwarded = read_http_headers(&mut server).await;
+            assert!(String::from_utf8_lossy(&forwarded).starts_with("GET /api/tickets "));
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let response = read_http_headers(&mut app).await;
+            assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+            app.write_all(b"GET /api/ws HTTP/1.1\r\nHost: mcp.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").await.unwrap();
+            let mut denied = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                app.read_to_end(&mut denied),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(String::from_utf8_lossy(&denied).starts_with("HTTP/1.1 403"));
+            relay.await.unwrap().unwrap();
+            let mut extra = Vec::new();
+            server.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty(), "upgrade must not reach the upstream");
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selected_rest_websocket_upgrade_is_refused_beside_mcp() {
+        // Both per-request protocols refuse upgrades on their selected path.
         let (configs, tunnel_engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
         let frame = br#"{"type":"ping"}"#;
         let scenario = run_upgrade_scenario(
@@ -10360,15 +11161,11 @@ network_policies:
             },
         )
         .await;
-        assert!(
-            scenario.response.starts_with("HTTP/1.1 101"),
-            "REST upgrade should still switch protocols, got: {}",
-            scenario.response
+        assert_upgrade_refused_before_forwarding(
+            &scenario,
+            frame,
+            crate::l7::rest::UNSUPPORTED_REST_UPGRADE_DETAIL,
         );
-        assert!(contains_bytes(
-            &scenario.upstream_seen,
-            &masked_text_frame(frame)
-        ));
     }
 
     #[tokio::test]

@@ -31,6 +31,11 @@
 /tasks/scripts/check_maintainer_approval_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /tasks/scripts/alert_maintainer_change_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 
+# Reviewer routing registry and helper
+/REVIEWERS.md @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/check_review_readiness.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/check_review_readiness_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+
 # PR issue acceptance checks
 /tasks/scripts/check_issue_acceptance.cjs @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /tasks/scripts/check_issue_acceptance.test.cjs @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr

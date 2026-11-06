@@ -43,14 +43,10 @@ pub struct PodmanComputeConfig {
     /// When empty, the driver selects loopback on Linux or
     /// `host.containers.internal` with Podman Machine, using `gateway_port`.
     pub grpc_endpoint: String,
-    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
-    /// supplies its own export endpoint; driver TOML cannot set it.
+    /// OTLP exports passed to supervisors. The gateway supplies them from
+    /// `[otlp]`; driver TOML cannot set them.
     #[serde(skip)]
-    pub supervisor_otlp_endpoint: Option<String>,
-    /// OCSF event export passed to supervisors. The gateway supplies its own
-    /// export; driver TOML cannot set it.
-    #[serde(skip)]
-    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
 
     /// Gateway name passed to supervisors for their telemetry. The gateway
     /// supplies its own name; driver TOML cannot set it.
@@ -203,6 +199,15 @@ pub struct PodmanComputeConfig {
     /// system CA bundle. The bundle must exist and contain at least one
     /// certificate; this is validated on the gateway host at sandbox-create
     /// time, not deferred until the supervisor container starts.
+    ///
+    /// Populated only from the `--sandbox-additional-ca-bundle` CLI argument
+    /// (or `OPENSHELL_SANDBOX_ADDITIONAL_CA_BUNDLE`) for standalone drivers.
+    /// Deliberately excluded from driver JSON config (`#[serde(skip)]` +
+    /// `deny_unknown_fields`): gateway-managed deployments must use the
+    /// global `[openshell.supervisor.network]` setting so every driver
+    /// receives the same staged bundle, and a per-driver path in operator
+    /// JSON is rejected instead of silently diverging from it.
+    #[serde(skip)]
     pub additional_ca_bundle: Option<String>,
     /// User namespace mode for sandbox containers (e.g. `auto`, `private`).
     /// When unset, containers use the default user namespace.
@@ -538,8 +543,7 @@ impl Default for PodmanComputeConfig {
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
-            supervisor_otlp_endpoint: None,
-            supervisor_ocsf_export: None,
+            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
             supervisor_gateway_name: None,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
@@ -647,6 +651,15 @@ mod tests {
         }))
         .expect_err("legacy sandbox_ssh_socket_path must be rejected");
         assert!(error.to_string().contains("sandbox_ssh_socket_path"));
+    }
+
+    #[test]
+    fn config_rejects_driver_specific_destination_ca_setting() {
+        let error = serde_json::from_value::<PodmanComputeConfig>(serde_json::json!({
+            "additional_ca_bundle": ["/operator/ca.crt"]
+        }))
+        .expect_err("destination trust is global, not a Podman driver setting");
+        assert!(error.to_string().contains("additional_ca_bundle"));
     }
 
     #[test]

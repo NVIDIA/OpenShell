@@ -770,13 +770,16 @@ fn build_probe_dns_response(query: &[u8]) -> std::io::Result<Vec<u8>> {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn block_launcher_signals() -> std::io::Result<()> {
-    let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-    // SAFETY: `signals` points to writable sigset storage and pthread_sigmask
-    // copies it during the call.
+    // Zeroed storage is required: musl's sigfillset writes only the first
+    // word of the 128-byte sigset_t on x86_64 and aarch64, so the rest must
+    // already be initialized before assume_init below.
+    let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
+    // SAFETY: `signals` points to writable sigset storage.
     if unsafe { libc::sigfillset(signals.as_mut_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: sigfillset initialized the value above.
+    // SAFETY: the storage was zero-initialized above, so the whole value is
+    // initialized regardless of how many bytes sigfillset wrote.
     let signals = unsafe { signals.assume_init() };
     // SAFETY: changing the mask affects only the dedicated launcher thread.
     let result =
@@ -825,12 +828,16 @@ unsafe fn reset_child_signal_dispositions() -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn install_child_signal_mask() -> std::io::Result<()> {
-    let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // Zeroed storage is required: musl's sigemptyset writes only the first
+    // word of the 128-byte sigset_t on x86_64 and aarch64, so the rest must
+    // already be initialized before assume_init below.
+    let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
     // SAFETY: `signals` points to writable sigset storage.
     if unsafe { libc::sigemptyset(signals.as_mut_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: sigemptyset initialized the value above.
+    // SAFETY: the storage was zero-initialized above, so the whole value is
+    // initialized regardless of how many bytes sigemptyset wrote.
     let signals = unsafe { signals.assume_init() };
     // SAFETY: this installs the declared empty target mask immediately before
     // exec, after copied sandbox dispositions have been reset.
@@ -1827,6 +1834,78 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[allow(unsafe_code)]
+    fn thread_signal_mask() -> libc::sigset_t {
+        // Zeroed storage for the same reason as the production sites: musl
+        // writes only part of sigset_t when reporting the previous mask.
+        let mut mask = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
+        // SAFETY: `mask` points to writable sigset storage.
+        if unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), mask.as_mut_ptr()) }
+            != 0
+        {
+            panic!("pthread_sigmask failed");
+        }
+        // SAFETY: the storage was zero-initialized above, so the whole value
+        // is initialized regardless of how many bytes pthread_sigmask wrote.
+        unsafe { mask.assume_init() }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn block_launcher_signals_blocks_the_caller_thread() {
+        let previous = thread_signal_mask();
+        block_launcher_signals().unwrap();
+        let current = thread_signal_mask();
+        // SAFETY: `current` is an initialized sigset value.
+        assert_ne!(
+            unsafe { libc::sigismember(&raw const current, libc::SIGTERM) },
+            0
+        );
+        // Restore the mask so nothing leaks if libtest reuses this thread.
+        // SAFETY: `previous` is an initialized sigset value.
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const previous, std::ptr::null_mut())
+            },
+            0
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn install_child_signal_mask_clears_the_caller_thread() {
+        let previous = thread_signal_mask();
+        // Block SIGTERM first so the empty mask the function installs is
+        // observable.
+        let mut blocked = previous;
+        // SAFETY: `blocked` points to writable, initialized sigset storage.
+        assert_eq!(
+            unsafe { libc::sigaddset(&raw mut blocked, libc::SIGTERM) },
+            0
+        );
+        // SAFETY: `blocked` is an initialized sigset value.
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const blocked, std::ptr::null_mut())
+            },
+            0
+        );
+        install_child_signal_mask().unwrap();
+        let current = thread_signal_mask();
+        // SAFETY: `current` is an initialized sigset value.
+        assert_eq!(
+            unsafe { libc::sigismember(&raw const current, libc::SIGTERM) },
+            0
+        );
+        // SAFETY: `previous` is an initialized sigset value.
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const previous, std::ptr::null_mut())
+            },
+            0
+        );
+    }
 
     #[test]
     fn kubernetes_bootstrap_stages_private_memory_bundle() {

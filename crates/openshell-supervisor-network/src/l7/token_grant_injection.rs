@@ -22,12 +22,13 @@ use openshell_core::token_grant_failure::{
 };
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
-    StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
+    StatusId, ctx::ctx as ocsf_ctx,
 };
 use tracing::warn;
 
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
+use crate::telemetry::egress_emit;
 
 /// Borrowed grant configuration for one endpoint-bound provider credential.
 pub struct TokenGrantRequest<'a> {
@@ -53,9 +54,17 @@ pub trait TokenGrantResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>>;
 }
 
-/// Resolves provider tokens using the supervisor's authenticated grant flow.
-#[derive(Default)]
-pub struct SpiffeTokenGrantResolver;
+/// Resolves provider tokens through one sandbox instance's authenticated grant flow.
+pub struct SpiffeTokenGrantResolver {
+    grants: crate::token_grant::SandboxInstanceTokenGrants,
+}
+
+impl SpiffeTokenGrantResolver {
+    #[must_use]
+    pub fn new(grants: crate::token_grant::SandboxInstanceTokenGrants) -> Self {
+        Self { grants }
+    }
+}
 
 impl TokenGrantResolver for SpiffeTokenGrantResolver {
     fn obtain<'a>(
@@ -63,8 +72,8 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
         request: TokenGrantRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>> {
         Box::pin(async move {
-            crate::token_grant::obtain_provider_token(
-                crate::token_grant::ObtainProviderTokenRequest {
+            self.grants
+                .obtain_provider_token(crate::token_grant::ObtainProviderTokenRequest {
                     provider_name: request.provider_key,
                     token_endpoint: request.token_endpoint,
                     jwt_svid_audience: request.jwt_svid_audience,
@@ -75,16 +84,10 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
                     grant_type: request.grant_type,
                     requested_token_type: request.requested_token_type,
                     request_id: request.request_id,
-                },
-            )
-            .await
+                })
+                .await
         })
     }
-}
-
-/// Construct the production SPIFFE-backed resolver.
-pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
-    Arc::new(SpiffeTokenGrantResolver)
 }
 
 /// A refused request: the grant failure and the credential whose grant failed.
@@ -338,7 +341,7 @@ fn report_refused_grant(
             .map_or_else(|| "none".to_string(), |status| status.to_string()),
         "Token grant failed"
     );
-    ocsf_emit!(
+    egress_emit!(
         HttpActivityBuilder::new(ocsf_ctx())
             .activity(ActivityId::Fail)
             .action(ActionId::Denied)
@@ -396,7 +399,7 @@ async fn inject_selected(
             inject_header(&raw_header, &name, &value).map_err(TokenGrantInjectionError::new)?;
     }
     for (provider_key, _) in credentials {
-        ocsf_emit!(
+        egress_emit!(
             HttpActivityBuilder::new(ocsf_ctx())
                 .activity(ActivityId::Other)
                 .action(ActionId::Allowed)

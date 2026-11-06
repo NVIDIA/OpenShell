@@ -870,7 +870,7 @@ async fn run_lifecycle(
                 binary_path: host_proxy_binary_path(&sandbox_config),
                 sandbox_id: Some(sandbox_id.clone()),
                 sandbox_name: Some(sandbox_name.clone()),
-                openshell_endpoint: None,
+                gateway: None,
                 provider_credentials: None,
                 agent_proposals: openshell_core::proposals::AgentProposals::default(),
                 denial_tx: None,

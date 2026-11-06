@@ -21,69 +21,43 @@ jobs:
   create-tag:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: release-prerelease-tags
+      cancel-in-progress: false
+      queue: max
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.10.12"
+          python-version: "3.13"
+          enable-cache: false
 
       - name: Determine next pre-release version
         id: version
         run: |
           set -euo pipefail
-          tags=$(git tag -l)
-          latest=$(printf '%s\n' "$tags" | \
-            { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-pre\.[1-9][0-9]*)?$' || true; } | \
-            sort -V | tail -1)
-          if [[ ! "$latest" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)-pre\.([1-9][0-9]*)$ ]]; then
-            echo "No active pre-release series — skipping tag creation"
+          next=$(uv run --no-project python tasks/scripts/next-prerelease-tag.py --scheduled)
+          if [[ -z "${next}" ]]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          base=${BASH_REMATCH[1]}
-          number=${BASH_REMATCH[2]}
-          if ! git show-ref --verify --quiet "refs/tags/${base}-pre.1"; then
-            echo "No ${base}-pre.1 seed — skipping tag creation"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if git show-ref --verify --quiet "refs/tags/${base}"; then
-            echo "$base is already stable — skipping tag creation"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if ! git merge-base --is-ancestor "$latest" HEAD; then
-            echo "::error::Latest pre-release $latest is not an ancestor of main"
-            exit 1
-          fi
-          echo "Latest tag: $latest"
-
-          # Skip if no new commits since the latest tag
-          commit_count=$(git rev-list "${latest}..HEAD" --count)
-          echo "Commits since $latest: $commit_count"
-          if [ "$commit_count" -eq 0 ]; then
-            echo "No new commits since $latest — skipping tag creation"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          next="${base}-pre.$((number + 1))"
-
-          if git tag -l "$next" | grep -q .; then
-            echo "::error::Tag $next already exists"
-            exit 1
-          fi
-
           echo "next=$next" >> "$GITHUB_OUTPUT"
           echo "Next tag: $next"
 
-      - name: Create and push tag
+      - name: Create tag
         if: steps.version.outputs.skip != 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           NEXT_TAG: ${{ steps.version.outputs.next }}
         run: |
-          git tag "$NEXT_TAG"
-          git push origin "refs/tags/$NEXT_TAG"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${NEXT_TAG}" -f "sha=$(git rev-parse HEAD)"
 
       - name: Trigger Pre-release workflow
         if: steps.version.outputs.skip != 'true'

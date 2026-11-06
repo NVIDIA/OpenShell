@@ -86,6 +86,32 @@ identifies the service being exposed.
   Run `mise run pre-commit`, the affected SDK checks, and relevant server tests
   before submitting the change.
 
+## Compute-driver application endpoints
+
+`compute_driver.proto` is the internal gateway/driver contract. Ordinary
+`GetSandbox` observation does not resolve application routing endpoints.
+The optional `ComputeDriverAppEndpoints.ResolveSupervisorAppEndpoint` service
+returns the current trusted supervisor listener
+and its runtime/ownership binding for advertisement validation. Drivers without
+support return `UNIMPLEMENTED`; a successful response with no endpoint means no
+safe endpoint is currently available. Neither result authorizes publication.
+The gateway owns installation validation and the public discovery API.
+The baseline `ComputeDriver` service and generated server trait stay unchanged.
+
+## Supervisor host protocol
+
+[`supervisor_host.proto`](supervisor_host.proto) is the private stream between
+a gateway and the supervisor process it shares among its sandboxes: the
+supervisor attaches, the gateway sends complete assignment snapshots, and the
+supervisor reports what it hosts. It is a version-locked deployment protocol
+served on the gateway listener but authorized only for the gateway-minted
+supervisor token (`auth_mode: "supervisor"`). It is not imported by
+`openshell.proto`, so SDK generation and
+gRPC reflection exclude it; the server's schema inventory test classifies it
+explicitly. `SandboxInstanceAssignment.launch_material` carries the existing
+JSON sandbox instance registration of `openshell-supervisor-control` and is
+marked secret.
+
 ## Isolation backend protocol
 
 [`isolation_backend.proto`](isolation_backend.proto) defines backend discovery,

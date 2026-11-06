@@ -37,8 +37,7 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use openshell_core::proto::{HealthRequest, ServiceStatus, open_shell_client::OpenShellClient};
 use openshell_server::TlsAcceptor;
-use rustls::pki_types::CertificateDer;
-use rustls_pemfile::certs;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tonic::Status;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
@@ -112,13 +111,15 @@ fn https_client_mtls(
     let roots = build_tls_root(&pki.ca_cert_pem);
     let client_certs = {
         let mut cursor = std::io::Cursor::new(&pki.client_cert_pem);
-        certs(&mut cursor)
+        CertificateDer::pem_reader_iter(&mut cursor)
             .collect::<Result<Vec<CertificateDer<'static>>, _>>()
             .expect("failed to parse client cert pem")
     };
     let client_key = {
         let mut cursor = std::io::Cursor::new(&pki.client_key_pem);
-        rustls_pemfile::private_key(&mut cursor)
+        PrivateKeyDer::pem_reader_iter(&mut cursor)
+            .next()
+            .transpose()
             .expect("failed to parse client key pem")
             .expect("no private key found")
     };

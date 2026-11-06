@@ -1,0 +1,86 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: supervisor affinity
+templates:
+  - templates/supervisor.yaml
+  - templates/statefulset.yaml
+  - templates/gateway-config.yaml
+release:
+  name: openshell
+  namespace: gateway
+set:
+  gatewayConfig:
+    openshell.drivers.kubernetes:
+      supervisor_topology: gateway
+tests:
+  - it: renders supervisor.affinity unchanged on the supervisor Pod
+    template: templates/supervisor.yaml
+    documentIndex: 0
+    set:
+      supervisor:
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: openshell-supervisor
+                    app.kubernetes.io/instance: openshell
+                    app.kubernetes.io/component: supervisor
+                topologyKey: kubernetes.io/hostname
+    asserts:
+      - equal:
+          path: spec.template.spec.affinity
+          value:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: openshell-supervisor
+                      app.kubernetes.io/instance: openshell
+                      app.kubernetes.io/component: supervisor
+                  topologyKey: kubernetes.io/hostname
+  - it: keeps gateway and supervisor affinity separate
+    set:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: example.com/pool
+                    operator: In
+                    values: [gateways]
+      supervisor:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: example.com/pool
+                      operator: In
+                      values: [supervisors]
+    asserts:
+      - equal:
+          path: spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values
+          value: [gateways]
+        template: templates/statefulset.yaml
+      - equal:
+          path: spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values
+          value: [supervisors]
+        template: templates/supervisor.yaml
+        documentIndex: 0
+  - it: renders no gateway affinity when only supervisor.affinity is set
+    template: templates/statefulset.yaml
+    set:
+      supervisor:
+        affinity:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/component: supervisor
+                  topologyKey: kubernetes.io/hostname
+    asserts:
+      - notExists:
+          path: spec.template.spec.affinity

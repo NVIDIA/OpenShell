@@ -490,6 +490,8 @@ async fn canonical_main_has_terminal_result(
                         | SandboxPhase::Error
                         | SandboxPhase::Stopping
                         | SandboxPhase::Stopped
+                        | SandboxPhase::Suspending
+                        | SandboxPhase::Suspended
                         | SandboxPhase::Deleting
                 )
             {

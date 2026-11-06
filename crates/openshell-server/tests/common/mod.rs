@@ -32,8 +32,7 @@ use openshell_core::proto::{
 use openshell_server::{MultiplexedService, Store, TlsAcceptor, health_router};
 use rcgen::{CertificateParams, IsCa};
 use rustls::RootCertStore;
-use rustls::pki_types::CertificateDer;
-use rustls_pemfile::certs;
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -180,6 +179,20 @@ impl OpenShell for TestOpenShell {
     async fn start_sandbox(
         &self,
         _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::SuspendSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ResumeSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
@@ -857,7 +870,7 @@ pub async fn test_health_store() -> Arc<Store> {
 pub fn build_tls_root(cert_pem: &[u8]) -> RootCertStore {
     let mut roots = RootCertStore::empty();
     let mut cursor = std::io::Cursor::new(cert_pem);
-    let parsed = certs(&mut cursor)
+    let parsed = CertificateDer::pem_reader_iter(&mut cursor)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .expect("failed to parse cert pem");
     for cert in parsed {

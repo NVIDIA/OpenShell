@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod app_listener;
 pub mod config;
 pub mod driver;
 pub mod grpc;
@@ -9,12 +10,13 @@ mod lifecycle;
 pub mod otel_tracing;
 mod resource_admission;
 mod sandbox_runtime;
+mod shared_supervisor;
 
 pub use config::{
     DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
     KubernetesComputeConfig, KubernetesControlConnection, KubernetesImagePullPolicy,
-    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, SupervisorTopology, WorkspaceMode,
-    managed_namespace_prefix,
+    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, SharedSupervisorConfig,
+    SupervisorTopology, WorkspaceMode, managed_namespace_prefix,
 };
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;

@@ -230,6 +230,13 @@ pub struct Config {
     /// When `None`, the dedicated metrics listener is disabled.
     pub metrics_bind_address: Option<SocketAddr>,
 
+    /// TLS configuration for the dedicated metrics listener.
+    ///
+    /// When `None`, the metrics listener retains its plaintext HTTP behavior.
+    /// This configuration is intentionally separate from [`Self::tls`] so
+    /// metrics clients can use their own client CA trust boundary.
+    pub metrics_tls: Option<MetricsTlsConfig>,
+
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
 
@@ -251,6 +258,11 @@ pub struct Config {
     /// Allow the WebSocket tunnel used by authenticated edge proxies.
     /// Disabled for local gateways by default.
     pub enable_websocket_tunnel: bool,
+
+    /// Operator activation after all gateways and outstanding legacy driver
+    /// operations have been drained onto the configuration-update-compatible protocol.
+    /// Disabled by default; not a license to run mixed-version writers.
+    pub enable_sandbox_updates: bool,
 
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
@@ -332,6 +344,7 @@ pub struct Config {
 
     /// Browser-facing sandbox service routing configuration.
     pub service_routing: ServiceRoutingConfig,
+    pub supervisor_app_listener: crate::app_listener::AppListenerConfig,
 }
 
 /// Browser-facing sandbox service routing configuration.
@@ -346,6 +359,68 @@ pub struct ServiceRoutingConfig {
     /// Enable TLS-enabled loopback gateway listeners to also accept plaintext
     /// HTTP for sandbox service hostnames.
     pub enable_loopback_service_http: bool,
+
+    /// Format used for newly generated service hostnames.
+    ///
+    /// `Readable` (the default) generates
+    /// `<workspace>--<sandbox>[--<service>]` hostnames. `Hashed` generates a
+    /// stable, one-label opaque hash derived from the gateway installation
+    /// name plus the workspace, sandbox, and service — see
+    /// [`Config::service_routing_discriminator`].
+    pub service_hostname_format: ServiceHostnameFormat,
+}
+
+/// Format of exposed-service hostnames minted by the gateway.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceHostnameFormat {
+    /// Readable `<workspace>--<sandbox>[--<service>]` hostnames.
+    #[default]
+    Readable,
+    /// Opaque one-label hashed hostnames, discriminated by the gateway
+    /// installation name.
+    Hashed,
+}
+
+impl FromStr for ServiceHostnameFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "readable" => Ok(Self::Readable),
+            "hashed" => Ok(Self::Hashed),
+            _ => Err(format!(
+                "invalid service hostname format '{value}'; expected readable or hashed"
+            )),
+        }
+    }
+}
+
+impl ServiceRoutingConfig {
+    /// Validate the service-routing configuration against the gateway
+    /// installation name.
+    ///
+    /// When [`ServiceHostnameFormat::Hashed`] is selected, the installation
+    /// name becomes the hash discriminator and must be a DNS-1123 label —
+    /// 1–63 ASCII bytes of lowercase `a-z`, `0-9`, or `-`, with no leading or
+    /// trailing `-`. It must also be unique among all gateways sharing the
+    /// service base domain; that uniqueness is an operational contract the
+    /// deploying platform is responsible for, since a single gateway cannot
+    /// observe its siblings.
+    pub fn validate(&self, installation_name: &str) -> crate::error::Result<()> {
+        if self.service_hostname_format == ServiceHostnameFormat::Hashed
+            && !is_dns_label(installation_name)
+        {
+            return Err(crate::error::Error::Config {
+                message: format!(
+                    "hashed service hostnames require the gateway installation name to be \
+                     a DNS label (1-63 lowercase ASCII alphanumeric or '-' bytes, no \
+                     leading/trailing '-'): {installation_name:?}"
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// TLS configuration.
@@ -397,6 +472,27 @@ pub struct TlsConfig {
     /// primary (internal) cert.
     #[serde(default)]
     pub external_server_names: Vec<String>,
+}
+
+/// TLS configuration for the dedicated metrics listener.
+///
+/// Unlike [`TlsConfig`], metrics TLS does not support external certificates
+/// or SNI routing. The metrics listener has one narrow HTTPS/mTLS contract
+/// with an optional, metrics-specific client CA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsTlsConfig {
+    /// Path to the TLS certificate file served by the metrics listener.
+    pub cert_path: PathBuf,
+
+    /// Path to the TLS private key file served by the metrics listener.
+    pub key_path: PathBuf,
+
+    /// Path to the CA certificate file used to verify metrics clients.
+    pub client_ca_path: Option<PathBuf>,
+
+    /// Whether metrics clients must present a certificate trusted by
+    /// [`Self::client_ca_path`].
+    pub require_client_auth: bool,
 }
 
 /// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
@@ -541,20 +637,21 @@ impl GatewayInterceptorConfig {
     }
 }
 
-/// Operator policy for authorizing interceptor manifest bindings.
+/// Operator policy for authorizing bindings advertised by an extension.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayInterceptorBindingPolicy {
-    /// Preserve manifest-controlled binding discovery. Configured bindings
-    /// may narrow or disable manifest declarations.
+    /// Preserve manifest-controlled binding discovery.
     #[default]
     Dynamic,
-    /// Enable only configured RPC selectors and phases. Extra manifest
-    /// declarations are ignored.
+    /// Require and enable only configured bindings. Ignore extra declarations.
     Allowlist,
-    /// Require configured and manifest RPC selectors and phases to match.
+    /// Require configured and manifest bindings to match exactly.
     Exact,
 }
+
+/// The binding policy shared by gateway interceptors and supervisor middleware.
+pub use GatewayInterceptorBindingPolicy as ExtensionBindingPolicy;
 
 /// One configured source in the gateway's effective provider-profile catalog.
 ///
@@ -929,6 +1026,7 @@ impl Config {
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
+            metrics_tls: None,
             log_level: default_log_level(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
             config_delivery_mode: ConfigDeliveryMode::default(),
@@ -936,6 +1034,7 @@ impl Config {
             oidc: None,
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
+            enable_sandbox_updates: false,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
@@ -952,6 +1051,7 @@ impl Config {
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
+            supervisor_app_listener: crate::app_listener::AppListenerConfig::default(),
         }
     }
 
@@ -978,6 +1078,13 @@ impl Config {
     #[must_use]
     pub const fn with_metrics_bind_address(mut self, addr: SocketAddr) -> Self {
         self.metrics_bind_address = Some(addr);
+        self
+    }
+
+    /// Create a new configuration with TLS for the dedicated metrics listener.
+    #[must_use]
+    pub fn with_metrics_tls(mut self, tls: MetricsTlsConfig) -> Self {
+        self.metrics_tls = Some(tls);
         self
     }
 
@@ -1125,6 +1232,36 @@ impl Config {
         self
     }
 
+    /// Select the hostname format for exposed sandbox services.
+    ///
+    /// [`ServiceHostnameFormat::Hashed`] derives its discriminator from the
+    /// gateway installation name ([`Config::name`]); see
+    /// [`Self::service_routing_discriminator`].
+    #[must_use]
+    pub fn with_service_hostname_format(mut self, format: ServiceHostnameFormat) -> Self {
+        self.service_routing.service_hostname_format = format;
+        self
+    }
+
+    /// The discriminator hashed into exposed-service hostnames when
+    /// [`ServiceHostnameFormat::Hashed`] is selected: the gateway
+    /// installation name.
+    ///
+    /// Returns `None` while readable hostnames are in use, in which case no
+    /// hashed service hosts exist. The name is an operator- or
+    /// platform-assigned value; it must be unique among all gateways sharing
+    /// the service base domain, an operational contract enforced by the
+    /// deploying platform rather than the gateway itself. Renaming the
+    /// installation changes every minted hostname.
+    ///
+    /// Unrelated to [`GatewayJwtConfig::gateway_id`], which carries security
+    /// and Kubernetes-ownership semantics.
+    #[must_use]
+    pub fn service_routing_discriminator(&self) -> Option<&str> {
+        (self.service_routing.service_hostname_format == ServiceHostnameFormat::Hashed)
+            .then_some(self.name.as_str())
+    }
+
     /// Enable or disable plaintext HTTP routing for loopback sandbox service
     /// hostnames on TLS-enabled gateway listeners.
     #[must_use]
@@ -1146,6 +1283,7 @@ impl Default for ServiceRoutingConfig {
         Self {
             base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
+            service_hostname_format: ServiceHostnameFormat::default(),
         }
     }
 }
@@ -1223,12 +1361,12 @@ mod tests {
     use super::{
         AppArmorProfile, Config, ConfigDeliveryMode, DEFAULT_SERVICE_ROUTING_DOMAIN,
         GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
-        GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy,
-        PolicyValidationFailureMode, UpstreamProxyConfig, default_sandbox_pids_limit,
-        normalize_compute_driver_name,
+        GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig,
+        PolicyValidationFailureMode, ServiceHostnameFormat, UpstreamProxyConfig,
+        default_sandbox_pids_limit, normalize_compute_driver_name,
     };
-    use std::net::SocketAddr;
     use std::time::Duration;
+    use std::{net::SocketAddr, path::PathBuf};
 
     #[test]
     fn policy_validation_failure_mode_is_secure_by_default() {
@@ -1701,6 +1839,75 @@ mod tests {
     }
 
     #[test]
+    fn service_hostname_format_defaults_to_readable() {
+        let cfg = Config::new(None);
+        assert_eq!(
+            cfg.service_routing.service_hostname_format,
+            ServiceHostnameFormat::Readable
+        );
+        assert_eq!(cfg.service_routing_discriminator(), None);
+        cfg.service_routing
+            .validate("any name")
+            .expect("readable is valid");
+    }
+
+    #[test]
+    fn hashed_format_discriminates_on_the_installation_name() {
+        let cfg = Config::new(None)
+            .with_name("gateway-west")
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed);
+        assert_eq!(cfg.service_routing_discriminator(), Some("gateway-west"));
+        cfg.service_routing
+            .validate("gateway-west")
+            .expect("DNS-label installation name is valid");
+    }
+
+    #[test]
+    fn hashed_format_requires_a_dns_label_installation_name() {
+        for name in [
+            "",
+            "Gateway-West",
+            "-gateway",
+            "gateway-",
+            "gateway_west",
+            "gateway west",
+            &"g".repeat(64),
+        ] {
+            let cfg = Config::new(None)
+                .with_name(name)
+                .with_service_hostname_format(ServiceHostnameFormat::Hashed);
+            let error = cfg
+                .service_routing
+                .validate(name)
+                .expect_err(&format!("{name:?} must be rejected"));
+            let message = error.to_string();
+            assert!(
+                message.contains("hashed service hostnames require"),
+                "{name:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_sans_update_preserves_service_hostname_format() {
+        let cfg = Config::new(None)
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed)
+            .with_server_sans(["*.apps.example.com"]);
+
+        assert_eq!(
+            cfg.service_routing.service_hostname_format,
+            ServiceHostnameFormat::Hashed
+        );
+        assert_eq!(
+            cfg.service_routing.base_domains,
+            vec![
+                "apps.example.com".to_string(),
+                DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn service_routing_domains_are_derived_from_wildcard_server_sans() {
         let cfg = Config::new(None).with_server_sans([
             "gateway.example.com",
@@ -1725,6 +1932,23 @@ mod tests {
         let addr: SocketAddr = "0.0.0.0:9090".parse().expect("valid address");
         let cfg = Config::new(None).with_health_bind_address(addr);
         assert_eq!(cfg.health_bind_address, Some(addr));
+    }
+
+    #[test]
+    fn metrics_tls_is_disabled_by_default_and_can_be_configured() {
+        assert!(Config::new(None).metrics_tls.is_none());
+
+        let tls = MetricsTlsConfig {
+            cert_path: PathBuf::from("/etc/openshell-metrics/tls.crt"),
+            key_path: PathBuf::from("/etc/openshell-metrics/tls.key"),
+            client_ca_path: Some(PathBuf::from("/etc/openshell-metrics/ca.crt")),
+            require_client_auth: true,
+        };
+
+        assert_eq!(
+            Config::new(None).with_metrics_tls(tls.clone()).metrics_tls,
+            Some(tls)
+        );
     }
 
     #[test]
