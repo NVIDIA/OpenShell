@@ -816,6 +816,7 @@ impl SharedHost {
             auth_bundle: registration.auth,
             admitted_isolation_backend: Some(openshell_sandbox_backend::BACKEND_NAME.to_string()),
             main_exit_marker: None,
+            termination_ack_marker: None,
             trace_context: registration.trace_context,
             // One process cannot hold a per-sandbox workload identity, so
             // providers that need one fail closed.

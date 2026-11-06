@@ -2461,9 +2461,9 @@ mod linux {
                     timeout: FILESYSTEM_FLUSH_TIMEOUT,
                 }),
                 BoundaryListenerConfig::Unix { .. }
+                | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
                 | BoundaryListenerConfig::TlsTcp { .. }
-                | BoundaryListenerConfig::RuntimeInitiatedTlsTcp { .. }
-                | BoundaryListenerConfig::RuntimeInitiatedUnix { .. } => None,
+                | BoundaryListenerConfig::RuntimeInitiatedTlsTcp { .. } => None,
             }
         }
     }
@@ -2785,6 +2785,7 @@ mod linux {
         Frozen { recovery_id: u64 },
         Terminating,
         Terminal,
+        TerminalFlushFailed,
     }
 
     #[derive(Clone)]
@@ -3061,6 +3062,7 @@ mod linux {
                         *connection,
                         SupervisorConnectionState::Terminating
                             | SupervisorConnectionState::Terminal
+                            | SupervisorConnectionState::TerminalFlushFailed
                     ) {
                         self.connections.mark_terminal();
                         return terminating();
@@ -3078,7 +3080,9 @@ mod linux {
             let mut connection = lock(&self.supervisor_connection);
             if matches!(
                 *connection,
-                SupervisorConnectionState::Terminating | SupervisorConnectionState::Terminal
+                SupervisorConnectionState::Terminating
+                    | SupervisorConnectionState::Terminal
+                    | SupervisorConnectionState::TerminalFlushFailed
             ) {
                 self.connections.mark_terminal();
                 return terminating();
@@ -3296,8 +3300,15 @@ mod linux {
         async fn terminate_boundary(&self) -> Response {
             {
                 let mut connection = lock(&self.supervisor_connection);
-                if *connection == SupervisorConnectionState::Terminal {
-                    return Response::BoundaryTerminated;
+                match *connection {
+                    SupervisorConnectionState::Terminal => return Response::BoundaryTerminated,
+                    SupervisorConnectionState::TerminalFlushFailed => {
+                        return guest_error(
+                            BoundaryErrorKind::Process,
+                            "sandbox filesystem flush failed before termination",
+                        );
+                    }
+                    _ => {}
                 }
                 *connection = SupervisorConnectionState::Terminating;
             }
@@ -3319,35 +3330,33 @@ mod linux {
             };
             // The host may end the VM on acknowledgement. Flush dirty writes
             // first, even if process termination failed.
-            self.flush_filesystem().await;
+            let flushed = self.flush_filesystem().await;
             if let Err(error) = terminated {
+                return guest_error(BoundaryErrorKind::Process, error);
+            }
+            if let Err(error) = flushed {
+                *lock(&self.supervisor_connection) = SupervisorConnectionState::TerminalFlushFailed;
                 return guest_error(BoundaryErrorKind::Process, error);
             }
             *lock(&self.supervisor_connection) = SupervisorConnectionState::Terminal;
             Response::BoundaryTerminated
         }
 
-        /// Log flush failures and timeouts while allowing termination to finish.
-        async fn flush_filesystem(&self) {
+        /// A failed or timed-out flush must prevent a successful shutdown ack.
+        async fn flush_filesystem(&self) -> Result<(), String> {
             let Some(filesystem_flush) = &self.filesystem_flush else {
-                return;
+                return Ok(());
             };
             let run = Arc::clone(&filesystem_flush.run);
             let flush = tokio::task::spawn_blocking(move || run());
             match tokio::time::timeout(filesystem_flush.timeout, flush).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => {
-                    tracing::warn!(%error, "Sandbox filesystem flush failed before termination");
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "Sandbox filesystem flush task failed before termination");
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        timeout = ?filesystem_flush.timeout,
-                        "Sandbox filesystem flush timed out before termination"
-                    );
-                }
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(error))) => Err(format!("sandbox filesystem flush failed: {error}")),
+                Ok(Err(error)) => Err(format!("sandbox filesystem flush task failed: {error}")),
+                Err(_) => Err(format!(
+                    "sandbox filesystem flush timed out after {:?}",
+                    filesystem_flush.timeout
+                )),
             }
         }
 
@@ -5822,6 +5831,19 @@ mod linux {
         fn availability_test_runtime_with(
             flush: Option<FilesystemFlush>,
         ) -> (Arc<BoundaryRuntime>, String) {
+            availability_test_runtime_with_listener(
+                BoundaryListenerConfig::TlsTcp {
+                    address: "127.0.0.1:5500".parse().unwrap(),
+                    tls: placeholder_server_tls(),
+                },
+                flush,
+            )
+        }
+
+        fn availability_test_runtime_with_listener(
+            listener: BoundaryListenerConfig,
+            flush: Option<FilesystemFlush>,
+        ) -> (Arc<BoundaryRuntime>, String) {
             let (broker, launcher) = test_network_broker();
             let (verification_key, token) = test_auth_material("availability");
             let mut runtime = BoundaryRuntime::new(
@@ -5834,10 +5856,7 @@ mod linux {
                     auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
                     gateway_id: "test-gateway".to_string(),
                     verification_keys: vec![verification_key],
-                    listener: BoundaryListenerConfig::TlsTcp {
-                        address: "127.0.0.1:5500".parse().unwrap(),
-                        tls: placeholder_server_tls(),
-                    },
+                    listener,
                     resource_claims: std::collections::BTreeMap::new(),
                     resource_claim_files: std::collections::BTreeMap::new(),
                     workload_identity: test_workload_identity(),
@@ -6108,7 +6127,23 @@ mod linux {
             };
             let flush = FilesystemFlush::for_listener(&vsock).expect("the VM backend flushes");
             assert_eq!(flush.timeout, FILESYSTEM_FLUSH_TIMEOUT);
+            let runtime_vsock = BoundaryListenerConfig::RuntimeInitiatedVsock {
+                host_port: 5500,
+                tls: tls.clone(),
+            };
+            assert!(
+                FilesystemFlush::for_listener(&runtime_vsock).is_some(),
+                "the VM's runtime-initiated vsock listener must flush"
+            );
 
+            let runtime_unix = BoundaryListenerConfig::RuntimeInitiatedUnix {
+                socket_path: "/run/openshell/container-control.sock".into(),
+                tls: tls.clone(),
+            };
+            assert!(
+                FilesystemFlush::for_listener(&runtime_unix).is_none(),
+                "runtime-initiated Unix is used by containers and must not flush"
+            );
             let unix = BoundaryListenerConfig::Unix {
                 socket_path: "/run/openshell/control.sock".into(),
                 tls: tls.clone(),
@@ -6145,6 +6180,24 @@ mod linux {
             );
         }
 
+        #[tokio::test(flavor = "multi_thread")]
+        async fn runtime_initiated_unix_container_termination_does_not_flush() {
+            let listener = BoundaryListenerConfig::RuntimeInitiatedUnix {
+                socket_path: "/run/openshell/container-control.sock".into(),
+                tls: placeholder_server_tls(),
+            };
+            let (runtime, _token) = availability_test_runtime_with_listener(listener, None);
+            assert!(runtime.filesystem_flush.is_none());
+            assert_eq!(
+                runtime.terminate_boundary().await,
+                Response::BoundaryTerminated
+            );
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Terminal
+            );
+        }
+
         /// Exercise the real syscall and open-error path; persistence requires
         /// VM stop/start testing.
         #[test]
@@ -6160,24 +6213,28 @@ mod linux {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn termination_is_acknowledged_when_the_filesystem_flush_fails() {
+        async fn termination_refuses_acknowledgement_when_the_filesystem_flush_fails() {
             let (runtime, _token) = availability_test_runtime_with_flush(FilesystemFlush {
                 run: Arc::new(|| Err(io::Error::other("flush failed"))),
                 timeout: FILESYSTEM_FLUSH_TIMEOUT,
             });
 
-            assert_eq!(
+            assert!(matches!(
                 runtime.terminate_boundary().await,
-                Response::BoundaryTerminated
-            );
+                Response::Error { .. }
+            ));
             assert_eq!(
                 *lock(&runtime.supervisor_connection),
-                SupervisorConnectionState::Terminal
+                SupervisorConnectionState::TerminalFlushFailed
             );
+            assert!(matches!(
+                runtime.terminate_boundary().await,
+                Response::Error { .. }
+            ));
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn termination_is_acknowledged_when_the_filesystem_flush_hangs() {
+        async fn termination_refuses_acknowledgement_when_the_filesystem_flush_hangs() {
             let (release, blocked) = std::sync::mpsc::channel::<()>();
             let blocked = Mutex::new(blocked);
             let (runtime, _token) = availability_test_runtime_with_flush(FilesystemFlush {
@@ -6194,14 +6251,14 @@ mod linux {
             // Let the blocked flush finish so the runtime can shut down.
             release.send(()).expect("release the blocked flush");
 
-            assert_eq!(response, Response::BoundaryTerminated);
+            assert!(matches!(response, Response::Error { .. }));
             assert!(
                 elapsed < Duration::from_secs(2),
-                "a hung flush must not hold the acknowledgement: {elapsed:?}"
+                "a hung flush must be bounded: {elapsed:?}"
             );
             assert_eq!(
                 *lock(&runtime.supervisor_connection),
-                SupervisorConnectionState::Terminal
+                SupervisorConnectionState::TerminalFlushFailed
             );
         }
 

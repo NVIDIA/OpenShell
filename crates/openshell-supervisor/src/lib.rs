@@ -109,6 +109,41 @@ async fn retain_remote_access_plane(
     }
 }
 
+/// A successful terminal response is the guest's flush acknowledgement. Write
+/// it before any later lifecycle error can end this supervisor instance.
+async fn terminate_with_flush_ack<F, E>(
+    termination: F,
+    marker: Option<&std::path::Path>,
+) -> Result<()>
+where
+    F: Future<Output = std::result::Result<(), E>>,
+    E: std::fmt::Display,
+{
+    termination
+        .await
+        .map_err(|error| miette::miette!("sandbox did not acknowledge terminal state: {error}"))?;
+    if let Some(marker) = marker {
+        persist_termination_ack_marker(marker)
+            .into_diagnostic()
+            .wrap_err("persist guest filesystem flush acknowledgement")?;
+    }
+    Ok(())
+}
+
+async fn terminate_on_proxy_exit<F, E>(
+    termination: F,
+    marker: Option<&std::path::Path>,
+) -> Result<i32>
+where
+    F: Future<Output = std::result::Result<(), E>>,
+    E: std::fmt::Display,
+{
+    terminate_with_flush_ack(termination, marker).await?;
+    Err(miette::miette!(
+        "control-mode proxy accept loop exited unexpectedly"
+    ))
+}
+
 async fn completion_phase_or_shutdown<F, S>(phase: F, mut shutdown: Pin<&mut S>) -> bool
 where
     F: Future<Output = ()>,
@@ -920,6 +955,8 @@ pub struct SandboxInstanceConfig {
     pub auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     pub admitted_isolation_backend: Option<String>,
     pub main_exit_marker: Option<std::path::PathBuf>,
+    /// Written only after the guest acknowledges a successful filesystem flush.
+    pub termination_ack_marker: Option<std::path::PathBuf>,
     /// Parent of the startup span.
     pub trace_context: Option<RegistrationTraceContext>,
     /// SPIFFE Workload API socket for provider token grants; absent fails closed.
@@ -1092,6 +1129,7 @@ pub async fn run_sandbox_instance(
         auth_bundle,
         admitted_isolation_backend,
         main_exit_marker,
+        termination_ack_marker,
         trace_context,
         provider_workload_api_socket,
         proxy_tls,
@@ -1792,12 +1830,12 @@ pub async fn run_sandbox_instance(
                     .map_err(|error| miette::miette!(error.to_string()))
             };
             tokio::select! {
-                result = wait => break Some((result?, true)),
+                result = wait => break Some((result?, true, false)),
                 () = &mut proxy_exited => {
-                    let _ = running.terminate().await;
-                    return Err(miette::miette!(
-                        "control-mode proxy accept loop exited unexpectedly"
-                    ));
+                    return Box::pin(terminate_on_proxy_exit(
+                        Box::pin(running.terminate()),
+                        termination_ack_marker.as_deref(),
+                    )).await;
                 }
                 () = &mut shutdown_requested => {
                     let _ = agent
@@ -1810,13 +1848,11 @@ pub async fn run_sandbox_instance(
                         agent.wait().await
                     }
                     .map_err(|error| miette::miette!(error.to_string()))?;
-                    running
-                        .terminate()
-                        .await
-                        .map_err(|error| miette::miette!(
-                            "sandbox did not acknowledge terminal state: {error}"
-                        ))?;
-                    break Some((boundary_exit_code(status), false));
+                    Box::pin(terminate_with_flush_ack(
+                        Box::pin(running.terminate()),
+                        termination_ack_marker.as_deref(),
+                    )).await?;
+                    break Some((boundary_exit_code(status), false, true));
                 }
                 // The agent wait is cancelled while suspending so a fenced
                 // generation's stream failure cannot race the suspension.
@@ -1833,7 +1869,7 @@ pub async fn run_sandbox_instance(
                 }
             }
         };
-        let Some((exit_code, mut retain_access)) = lifecycle else {
+        let Some((exit_code, mut retain_access, boundary_terminated)) = lifecycle else {
             // A suspended boundary is retained by the backend: never send
             // TerminateBoundary or publish a main-process exit. Dropping the
             // access plane closes this supervisor's gateway session.
@@ -1909,7 +1945,27 @@ pub async fn run_sandbox_instance(
         }
         if retain_access {
             info!(backend = %backend_name, "Canonical process exited; retaining control-mode access plane");
-            retain_remote_access_plane(&mut proxy_exited, &mut shutdown_requested).await?;
+            if let Err(error) =
+                retain_remote_access_plane(&mut proxy_exited, &mut shutdown_requested).await
+            {
+                if let Some(marker) = termination_ack_marker.as_deref() {
+                    return Box::pin(terminate_on_proxy_exit(
+                        Box::pin(running.terminate()),
+                        Some(marker),
+                    ))
+                    .await;
+                }
+                return Err(error);
+            }
+        }
+        if let Some(marker) = termination_ack_marker.as_deref()
+            && !boundary_terminated
+        {
+            Box::pin(terminate_with_flush_ack(
+                Box::pin(running.terminate()),
+                Some(marker),
+            ))
+            .await?;
         }
         // Exec sessions served after the main exit may have exported traces;
         // flush those too before the relay goes away.
@@ -1961,6 +2017,10 @@ fn observe_adopted_execs(processes: &[Arc<openshell_sandbox_backend::BoundaryPro
 
 fn persist_main_exit_marker(path: &std::path::Path, exit_code: i32) -> std::io::Result<()> {
     write_private_file_atomically(path, format!("exit_code={exit_code}\n").as_bytes())
+}
+
+fn persist_termination_ack_marker(path: &std::path::Path) -> std::io::Result<()> {
+    write_private_file_atomically(path, b"guest-filesystem-flushed-v1\n")
 }
 
 /// Replace `path` with `contents` via an owner-only (0600) temporary file in
@@ -4707,6 +4767,7 @@ mod tests {
             auth_bundle,
             admitted_isolation_backend: None,
             main_exit_marker: None,
+            termination_ack_marker: None,
             trace_context: None,
             provider_workload_api_socket: None,
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
@@ -4995,6 +5056,29 @@ mod tests {
         );
         assert!(!temporary.exists());
         assert!(write_private_file_atomically(std::path::Path::new("/"), b"x").is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_termination_persists_flush_ack_before_proxy_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("overlay-flush-ack");
+        let error = terminate_on_proxy_exit(async { Ok::<(), &'static str>(()) }, Some(&marker))
+            .await
+            .expect_err("proxy failure still ends the supervisor instance");
+        assert!(error.to_string().contains("proxy accept loop exited"));
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"guest-filesystem-flushed-v1\n"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        let error = terminate_on_proxy_exit(
+            async { Err::<(), &'static str>("flush failed") },
+            Some(&marker),
+        )
+        .await
+        .expect_err("failed guest termination cannot acknowledge the flush");
+        assert!(error.to_string().contains("flush failed"));
+        assert!(!marker.exists());
     }
 
     #[tokio::test]
