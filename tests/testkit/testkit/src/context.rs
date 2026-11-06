@@ -422,9 +422,25 @@ pub struct Sandbox {
 /// The buffered output of an exec.
 #[derive(Debug)]
 pub struct ExecOutput {
+    /// The command as run, for failure messages.
+    pub command: String,
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+impl ExecOutput {
+    /// Fail unless the command exited 0.
+    pub fn success(self) -> Result<Self> {
+        crate::ensure!(
+            self.exit_code == 0,
+            "`{}` exited with {}; stderr: {}",
+            self.command,
+            self.exit_code,
+            self.stderr.trim()
+        );
+        Ok(self)
+    }
 }
 
 impl Sandbox {
@@ -587,10 +603,16 @@ impl Sandbox {
             .await
             .context(format!("exec {command:?} in sandbox {}", self.name))?;
         Ok(ExecOutput {
+            command: command.join(" "),
             exit_code: result.exit_code,
             stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
         })
+    }
+
+    /// Run a shell script with `sh -c` and buffer its output.
+    pub async fn sh(&self, script: &str) -> Result<ExecOutput> {
+        self.exec(["sh", "-c", script]).await
     }
 
     /// Delete the sandbox and wait until it is gone.
