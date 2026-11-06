@@ -4388,6 +4388,7 @@ dependencies = [
  "openshell-bootstrap",
  "openshell-core",
  "openshell-crypto",
+ "openshell-otel",
  "openshell-policy",
  "openshell-providers",
  "openshell-sdk",
