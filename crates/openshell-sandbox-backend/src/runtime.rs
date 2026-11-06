@@ -156,6 +156,16 @@ impl BoundaryTransport {
 
     /// Open one authenticated physical connection, retrying within the
     /// connect window while the remote boundary starts.
+    #[tracing::instrument(
+        name = "boundary.connect",
+        skip_all,
+        fields(transport = match &self.0 {
+            TransportSource::Dial => "dial",
+            TransportSource::Connector(_) => "backend",
+            TransportSource::RuntimeInitiated(_) => "runtime_initiated",
+            TransportSource::Routed(_) => "routed",
+        })
+    )]
     async fn connect(
         &self,
         descriptor: &SandboxRuntimeDescriptor,
@@ -3036,6 +3046,7 @@ pub mod test_support;
 
 #[cfg(test)]
 mod tests {
+    mod connection_tracing;
     mod credential_renewal;
     mod delegated;
     mod flow_control;
