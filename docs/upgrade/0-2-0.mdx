@@ -1,0 +1,236 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Upgrade to NVIDIA OpenShell 0.2.0"
+sidebar-title: "0.2.0"
+description: "Prepare OpenShell operators and users for the breaking changes in version 0.2.0."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Upgrade, Migration"
+---
+
+OpenShell 0.2.0 introduces breaking changes. Review the changes that apply to
+your role before upgrading from OpenShell 0.1.x to 0.2.0.
+
+## Operators
+
+If you run OpenShell for a team, start here.
+
+### Migrate Google Cloud and Vertex AI profiles
+
+In OpenShell 0.1.x, the gateway recognized the Google profile IDs and added SDK
+settings that were absent from the imported YAML. Exporting a profile did not
+show all of its effects, and copying it under a new ID could lose the automatic
+project, region, and client settings.
+
+Google Cloud and Vertex AI profiles must declare their environment defaults and
+local discovery behavior. The `google-cloud` and `google-vertex-ai` IDs no longer
+activate SDK configuration or discovery keys. These declarations let you review
+and customize the SDK settings in the profile itself. A renamed copy keeps the
+same behavior because it carries those settings with it.
+
+The discovery declarations also make the local setup inputs explicit. You can
+review which variables `--from-existing` uses to discover credentials and
+non-secret project or region configuration before creating or updating a
+provider.
+
+<Warning>
+An existing profile without an `environment` block still attaches successfully,
+without a migration warning. Its sandboxes receive credential placeholders but
+no profile-provided project, region, client-selection, or metadata-discovery
+settings, including `GOOSE_PROVIDER`, `ANTHROPIC_VERTEX_PROJECT_ID`, and
+`GCE_METADATA_HOST`.
+
+Without the metadata host setting, Google SDKs can fall back to the cloud
+metadata address `169.254.169.254`, which OpenShell blocks. Workloads can report
+metadata discovery, missing project, or authentication errors even though the
+provider attached successfully.
+</Warning>
+
+Export each existing Google profile before upgrading. For example, export a
+platform-scoped Google Cloud profile:
+
+```shell
+openshell profile export google-cloud -o yaml --global > google-cloud.yaml
+```
+
+Merge `environment.config`, `environment.fixed`, and `discovery.config_env_vars`
+from the current [Google Cloud](https://github.com/NVIDIA/OpenShell/blob/main/providers/google-cloud.yaml)
+or [Vertex AI](https://github.com/NVIDIA/OpenShell/blob/main/providers/google-vertex-ai.yaml)
+example into the exported profile. Preserve its `resource_version`, binary
+restrictions, and endpoints. Keep credentials out of these non-secret fields;
+lint rejects collisions with credential `env_vars`. See
+[profile environment declarations](/how-it-works/providers/profiles#declare-environment-and-discovery-behavior).
+
+For example, merge these declarations into a Vertex profile whose provider
+config uses `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`. Entries under
+`discovery.credentials` refer to names in the profile's top-level `credentials`
+list. This example selects `service_account_token`; keep any other valid
+selections from your exported profile:
+
+```yaml
+environment:
+  config:
+    GCP_PROJECT_ID: VERTEX_AI_PROJECT_ID
+    GOOGLE_CLOUD_PROJECT: VERTEX_AI_PROJECT_ID
+    ANTHROPIC_VERTEX_PROJECT_ID: VERTEX_AI_PROJECT_ID
+    CLOUD_ML_REGION: VERTEX_AI_REGION
+    GCP_LOCATION: VERTEX_AI_REGION
+    VERTEX_LOCATION: VERTEX_AI_REGION
+  fixed:
+    GOOSE_PROVIDER: gcp_vertex_ai
+discovery:
+  credentials: [service_account_token]
+  config_env_vars:
+    - VERTEX_AI_PROJECT_ID
+    - VERTEX_AI_REGION
+```
+
+If a profile declares `GOOGLE_SERVICE_ACCOUNT_KEY`,
+[migrate its private key](#migrate-service-account-private-keys) before updating
+the profile.
+
+On the upgraded gateway, lint the edited profile and update the existing
+definition:
+
+```shell
+openshell profile lint -f google-cloud.yaml --global
+openshell profile update google-cloud -f google-cloud.yaml --global
+```
+
+Repeat for `google-vertex-ai` and any copies imported under other IDs. Use the
+same scope as the existing profile; omit `--global` for workspace-scoped
+profiles. Import is create-only, so use `profile import` only when the profile
+does not already exist. See [profile management](/how-it-works/providers/profiles#provider-profiles).
+
+The Google Cloud metadata example also declares
+`required_platform_adapter: gcp-metadata`. The supervisor provides this service
+for Linux sandboxes using Docker, Podman, Kubernetes, or VM. Windows/MXC does not
+provide the metadata endpoint. Native Vertex bearer-token authentication does
+not require this adapter.
+
+### Migrate service-account private keys
+
+OpenShell 0.2.0 stops injecting `GOOGLE_SERVICE_ACCOUNT_KEY` for every provider
+profile, including custom profiles and renamed forks. Previously, this
+restriction applied only to `google-vertex-ai`.
+
+Service-account JSON contains a long-lived signing key used to mint access
+tokens. Gateway-managed refresh keeps that key in the configured credential
+store and renews short-lived access tokens automatically. Workloads receive an
+opaque token placeholder that OpenShell resolves on authorized outbound
+requests. Applying the restriction to every profile ID keeps the signing key
+out of this legacy credential path even when a profile is renamed or customized.
+
+An older stored provider record can retain this key, but the gateway omits it
+from sandbox workloads. Attachment can still succeed, while a client that
+depends on the key fails to authenticate. In gateway logs, look for
+`skipping non-injectable provider credential` or
+`skipping non-injectable provider credential handle` with the key
+`GOOGLE_SERVICE_ACCOUNT_KEY`. The gateway continues to supply the provider's
+other valid access tokens and declared non-secret SDK settings.
+
+Before upgrading, remove `GOOGLE_SERVICE_ACCOUNT_KEY` from the profile's
+credential declarations and configure its private key as gateway-managed
+refresh material. Use refreshed access tokens in workloads. For new Vertex
+service-account providers, create with `--runtime-credentials` and configure
+refresh directly. Follow the [Vertex service-account workflow](/how-it-works/providers/google#create-a-vertex-ai-provider).
+
+New profile imports reject `GOOGLE_SERVICE_ACCOUNT_KEY` in credential
+declarations and in `environment.config` or `environment.fixed`. Keep the
+private key in refresh configuration when migrating custom profiles.
+
+#### Example custom profile migration
+
+This example migrates an existing platform-scoped profile named `acme-vertex`,
+used by a provider named `acme-vertex-prod`. The profile already declares its
+client's Vertex endpoints and binaries, and uses the environment declarations
+above. Export its current definition:
+
+```shell
+openshell profile export acme-vertex -o yaml --global > acme-vertex.yaml
+```
+
+The legacy entry in its `credentials` list might look like this:
+
+```yaml
+- name: service_account_key
+  env_vars: [GOOGLE_SERVICE_ACCOUNT_KEY]
+  required: true
+```
+
+Replace that entry with a refreshable access-token declaration. These snippets
+show individual credential entries; preserve the rest of the exported profile,
+including its `resource_version`, binary restrictions, and endpoints:
+
+```yaml
+- name: service_account_token
+  env_vars: [ACME_VERTEX_ACCESS_TOKEN]
+  required: false
+  auth_style: bearer
+  header_name: authorization
+  refresh:
+    strategy: google_service_account_jwt
+    token_url: https://oauth2.googleapis.com/token
+    scopes: [https://www.googleapis.com/auth/cloud-platform]
+    refresh_before_seconds: 300
+    max_lifetime_seconds: 3600
+    material:
+      - name: client_email
+        required: true
+      - name: private_key
+        required: true
+        secret: true
+```
+
+If `discovery.credentials` includes `service_account_key`, replace that selection
+with `service_account_token`. Keep any other credential entries and discovery
+selections that still apply. On the upgraded gateway, validate and update the
+existing profile:
+
+```shell
+openshell profile lint -f acme-vertex.yaml --global
+openshell profile update acme-vertex -f acme-vertex.yaml --global
+```
+
+Configure refresh for the existing provider using your service-account JSON
+file. This example requires `jq`; replace `/path/to/key.json` with your file's
+path. `--secret-material-env` reads the private key from the local environment
+and stores it as secret refresh material:
+
+```shell
+export GCP_PRIVATE_KEY="$(jq -er .private_key /path/to/key.json)"
+openshell provider refresh configure acme-vertex-prod \
+  --credential-key ACME_VERTEX_ACCESS_TOKEN \
+  --strategy google-service-account-jwt \
+  --material client_email="$(jq -er .client_email /path/to/key.json)" \
+  --secret-material-env private_key=GCP_PRIVATE_KEY
+unset GCP_PRIVATE_KEY
+
+openshell provider refresh rotate acme-vertex-prod \
+  --credential-key ACME_VERTEX_ACCESS_TOKEN
+openshell provider refresh status acme-vertex-prod
+```
+
+Wait for refresh to complete, then restart clients so they receive the new token
+placeholder. Update clients to send `ACME_VERTEX_ACCESS_TOKEN` as the bearer
+token instead of reading service-account JSON from `GOOGLE_SERVICE_ACCOUNT_KEY`.
+
+#### Verify the migrated credential
+
+For a sandbox named `vertex-agent` with `acme-vertex-prod` attached, launch a new
+process to verify the legacy key is absent and the token authorizes a Vertex
+API request. The image must include `curl`, its executable must be authorized
+by the profile's `binaries`, and the profile must allow the regional Vertex
+endpoint. Set the provider's project and region config to values your service
+account can access. The following request lists models without printing the
+token or response body:
+
+```shell
+openshell sandbox exec -n vertex-agent -- sh -c '
+  test -z "${GOOGLE_SERVICE_ACCOUNT_KEY+x}" &&
+  test -n "${ACME_VERTEX_ACCESS_TOKEN:-}" &&
+  curl --fail --silent --show-error --output /dev/null \
+    -H "Authorization: Bearer $ACME_VERTEX_ACCESS_TOKEN" \
+    "https://${CLOUD_ML_REGION}-aiplatform.googleapis.com/v1/projects/${GOOGLE_CLOUD_PROJECT}/locations/${CLOUD_ML_REGION}/models" &&
+  printf "%s\n" "Vertex authentication succeeded; legacy key absent."
+'
+```
