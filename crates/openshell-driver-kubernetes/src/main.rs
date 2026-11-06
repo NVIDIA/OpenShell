@@ -285,6 +285,7 @@ async fn main() -> Result<()> {
                 app_listener:
                     openshell_driver_kubernetes::config::KubernetesAppListenerConfig::default(),
                 boundary_port: args.sandbox_runtime_boundary_port,
+                ..Default::default()
             },
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,

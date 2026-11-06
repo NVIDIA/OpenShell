@@ -58,6 +58,9 @@ pub const OTLP_AGENT_PROTOCOL: &str = "OPENSHELL_OTLP_AGENT_PROTOCOL";
 /// `openshell.gateway.name` on supervisor telemetry.
 pub const GATEWAY_NAME: &str = "OPENSHELL_GATEWAY_NAME";
 
+/// Seconds the supervisor waits for its first boundary attachment.
+pub const ATTACH_REQUEST_TIMEOUT_SECS: &str = "OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECS";
+
 /// OTLP transport, named with the `OTEL_EXPORTER_OTLP_PROTOCOL` values.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum OtlpProtocol {

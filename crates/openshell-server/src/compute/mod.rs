@@ -99,6 +99,14 @@ pub type SharedComputeDriverConfigurationUpdates = Arc<
         + Sync,
 >;
 
+fn validate_deadline_seconds(name: &str, seconds: u32) -> Result<(), String> {
+    if (1..=86_400).contains(&seconds) {
+        Ok(())
+    } else {
+        Err(format!("{name} must be between 1 and 86400"))
+    }
+}
+
 fn supports_isolation_registration(capabilities: &[String]) -> bool {
     capabilities.iter().any(|capability| {
         capability == openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND
@@ -1335,10 +1343,15 @@ impl ComputeRuntime {
     /// Validate the budget once at startup. Persisted attempts keep their
     /// original deadline even if the operator changes this value on restart.
     pub(crate) fn with_image_preparation_timeout(mut self, seconds: u32) -> Result<Self, String> {
-        if !(1..=86_400).contains(&seconds) {
-            return Err("image_preparation_timeout_seconds must be between 1 and 86400".into());
-        }
+        validate_deadline_seconds("image_preparation_timeout_seconds", seconds)?;
         self.image_preparation_timeout_seconds = seconds;
+        Ok(self)
+    }
+
+    /// Validate the repair window once at startup. It applies process-wide.
+    pub(crate) fn with_admission_repair_window(self, seconds: u32) -> Result<Self, String> {
+        validate_deadline_seconds("admission_repair_window_seconds", seconds)?;
+        provisioning_deadline::set_repair_window_seconds(seconds);
         Ok(self)
     }
 

@@ -47,15 +47,21 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Initial attachment may include runtime image pulls and trusted bootstrap
 /// work before the boundary begins listening. Keep this aligned with the
 /// driver bootstrap grace period rather than the normal operation timeout.
-const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
+/// Slow isolation backends raise it with `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECS`.
+fn initial_attach_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::env::var(openshell_core::sandbox_env::ATTACH_REQUEST_TIMEOUT_SECS)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map_or(Duration::from_mins(5), Duration::from_secs)
+    })
+}
 /// How long one control call keeps retrying boundary connect attempts. Boot-time
 /// callers retry whole calls above this; past boot, exhausting this window
 /// means the remote boundary (or its launcher) is gone rather than still starting.
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bound on a routed sandbox instance's first connection. The instance is
-/// registered before its workload Pod is scheduled and its image pulled; the
-/// driver reaps a bootstrap that is still incomplete after the same interval.
-const ROUTED_FIRST_CONNECT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Bounds the liveness check that decides whether a stream failure lost the
 /// whole connection.
 const CONNECTION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -176,7 +182,9 @@ impl BoundaryTransport {
                 let window = if registration.has_connected() {
                     CONNECT_RETRY_TIMEOUT
                 } else {
-                    ROUTED_FIRST_CONNECT_TIMEOUT
+                    // Registered before the workload Pod is scheduled; the driver
+                    // reaps an incomplete bootstrap after the same interval.
+                    initial_attach_timeout()
                 };
                 return tokio::time::timeout(window, registration.accept(&descriptor.tls))
                     .await
@@ -1871,7 +1879,7 @@ impl BoundaryClient {
         let remember_attach = matches!(request, Request::Attach { .. });
         let remember_confirm = matches!(request, Request::Confirm);
         let timeout = if remember_attach || matches!(request, Request::DiscoverPolicy) {
-            ATTACH_REQUEST_TIMEOUT
+            initial_attach_timeout()
         } else {
             REQUEST_TIMEOUT
         };

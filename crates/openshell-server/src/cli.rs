@@ -705,6 +705,13 @@ fn prepare_server_config_with_drivers(
         config.image_preparation_timeout_seconds = seconds;
     }
 
+    if let Some(seconds) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.admission_repair_window_seconds)
+    {
+        config.admission_repair_window_seconds = seconds;
+    }
+
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
@@ -4869,6 +4876,7 @@ version = 2
 [openshell.gateway]
 policy_validation_failure_mode = "retain_last_valid"
 image_preparation_timeout_seconds = 2400
+admission_repair_window_seconds = 900
 
 [openshell.drivers.docker]
 unknown_docker_key = true
@@ -4895,6 +4903,7 @@ mem_mib = "not-a-number"
 
                 assert_eq!(prepared.config.compute_driver.as_deref(), Some("podman"));
                 assert_eq!(prepared.config.image_preparation_timeout_seconds, 2400);
+                assert_eq!(prepared.config.admission_repair_window_seconds, 900);
                 assert_eq!(
                     prepared.config.policy_validation_failure_mode,
                     openshell_core::PolicyValidationFailureMode::RetainLastValid

@@ -122,12 +122,17 @@ pub struct KubernetesSandboxRuntimeConfig {
     /// TCP port of the Sandbox Protocol listener: the workload boundary for
     /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
     pub boundary_port: u16,
+    /// How long a sandbox runtime bootstrap may take before the driver reaps
+    /// it, in seconds. The supervisor waits as long for its first attachment.
+    /// Raise it for slow isolation backends such as peer-pods.
+    pub bootstrap_grace_seconds: u32,
 }
 
 impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
+            bootstrap_grace_seconds: 300,
             app_listener: KubernetesAppListenerConfig::default(),
         }
     }
@@ -156,6 +161,11 @@ impl KubernetesSandboxRuntimeConfig {
         }
         if self.boundary_port < 1024 {
             return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
+        }
+        if !(1..=86_400).contains(&self.bootstrap_grace_seconds) {
+            return Err(
+                "sandbox_runtime.bootstrap_grace_seconds must be between 1 and 86400".to_string(),
+            );
         }
         Ok(())
     }
@@ -2113,6 +2123,19 @@ mod tests {
             ..KubernetesComputeConfig::default()
         };
         cfg.validate_workspace_mode().unwrap();
+    }
+
+    #[test]
+    fn sandbox_runtime_bootstrap_grace_must_be_bounded() {
+        let mut runtime = KubernetesSandboxRuntimeConfig::default();
+        assert_eq!(runtime.bootstrap_grace_seconds, 300);
+        runtime.validate().unwrap();
+        for seconds in [0, 86_401] {
+            runtime.bootstrap_grace_seconds = seconds;
+            assert!(runtime.validate().is_err());
+        }
+        runtime.bootstrap_grace_seconds = 900;
+        runtime.validate().unwrap();
     }
 
     #[test]

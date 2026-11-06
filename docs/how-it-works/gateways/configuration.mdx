@@ -282,6 +282,10 @@ ssh_session_ttl_secs  = 3600
 # Applies to new attempts only; allowed values are 1 through 86400 seconds.
 image_preparation_timeout_seconds = 1800
 
+# Time to reach Ready after the supervisor's first configuration report.
+# Raise it for slow isolation backends. Allowed values are 1 through 86400.
+admission_repair_window_seconds = 300
+
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.
 policy_validation_failure_mode = "fail_closed"
@@ -1379,6 +1383,10 @@ gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes
 [openshell.drivers.kubernetes.sandbox_runtime]
 # TLS-protected boundary listener reached only by the paired control pod.
 boundary_port = 5500
+# Seconds before the driver reaps an incomplete runtime bootstrap. The
+# supervisor waits as long for its first attachment. Raise it for slow
+# isolation backends. Allowed values are 1 through 86400.
+bootstrap_grace_seconds = 300
 ```
 
 The Kubernetes driver always creates the workload `NetworkPolicy` before
