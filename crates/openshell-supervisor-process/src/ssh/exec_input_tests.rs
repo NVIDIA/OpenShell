@@ -231,6 +231,87 @@ async fn exec_start_failure_keeps_ssh_session_usable() {
 }
 
 #[tokio::test]
+async fn startup_failure_backpressure_does_not_block_sibling_completion() {
+    for window_size in [0, 8, 65_536] {
+        for shell in [false, true] {
+            tokio::time::timeout(DEADLINE, async {
+                let (session, mut control) = exec_session();
+                let client = test_client(
+                    None,
+                    rpc_test::exec(Arc::new(FailThenExec {
+                        failed: AtomicBool::new(false),
+                        session: Mutex::new(Some(session)),
+                    })),
+                    russh::client::Config {
+                        window_size,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let mut rejected = client.channel_open_session().await.unwrap();
+                if shell {
+                    rejected.request_shell(true).await.unwrap();
+                } else {
+                    rejected.exec(true, "rejected").await.unwrap();
+                }
+                assert!(matches!(rejected.wait().await, Some(ChannelMsg::Success)));
+                let mut sibling = start_exec(&client).await;
+                control.stdout.shutdown().await.unwrap();
+                control.stderr.shutdown().await.unwrap();
+                control
+                    .process
+                    .status
+                    .send_replace(Some(BoundaryExitStatus::Exited(0)));
+                // Withhold reads on the failed channel until its sibling has
+                // finished: a small receive window must not stall the session.
+                let mut sibling_exited = false;
+                while let Some(event) = sibling.wait().await {
+                    match event {
+                        ChannelMsg::ExitStatus { exit_status: 0 } => sibling_exited = true,
+                        ChannelMsg::Close => break,
+                        _ => {}
+                    }
+                }
+                assert!(sibling_exited, "sibling must report its exit status");
+                let mut exited = false;
+                let mut eof = false;
+                let mut closed = false;
+                let mut diagnostic = Vec::new();
+                while let Some(event) = rejected.wait().await {
+                    match event {
+                        ChannelMsg::ExtendedData { data, ext: 1 } => {
+                            diagnostic.extend_from_slice(&data);
+                        }
+                        ChannelMsg::ExitStatus { exit_status: 1 } => exited = true,
+                        ChannelMsg::Eof => eof = true,
+                        ChannelMsg::Close => {
+                            closed = true;
+                            break;
+                        }
+                        event => panic!("unexpected failure event: {event:?}"),
+                    }
+                }
+                assert!(
+                    exited && eof && closed,
+                    "failure must finish independently of stderr"
+                );
+                if window_size == 0 {
+                    assert!(diagnostic.is_empty());
+                }
+                if window_size == 65_536 {
+                    assert!(
+                        String::from_utf8_lossy(&diagnostic)
+                            .contains("test boundary admission failure")
+                    );
+                }
+            })
+            .await
+            .expect("startup diagnostic blocked channel closure or sibling completion");
+        }
+    }
+}
+
+#[tokio::test]
 async fn full_input_allows_output_signals_and_channel_close() {
     tokio::time::timeout(DEADLINE, async {
         let (session, mut control) = exec_session();
