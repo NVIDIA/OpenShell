@@ -67,7 +67,8 @@ impl CredentialRuntime {
             .await?;
         handles
             .remove("gateway-access-token")
-            .ok_or_else(|| Status::internal("application credential handle missing"))
+            .filter(|handle| !handle.handle.is_empty())
+            .ok_or_else(|| Status::internal("empty or missing application credential handle"))
     }
 
     pub async fn resolve_application_token(
@@ -450,6 +451,76 @@ mod tests {
             )]),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn application_tokens_preserve_issuer_scope_and_backend_ownership() {
+        let storage = tempfile::tempdir().unwrap();
+        let key_path = storage.path().join("key-encryption-key.bin");
+        let store = Arc::new(crate::persistence::test_store().await);
+        let file = config_file(&format!(
+            "[openshell.gateway.credential_storage]\nkey_encryption_key_path = {}\n",
+            toml_path(&key_path),
+        ));
+        let runtime =
+            CredentialRuntime::from_config_file_with_store(&Config::new(None), Some(&file), store)
+                .await
+                .unwrap();
+        let handle = runtime
+            .store_application_token("workspace-a", "session-a", "session-secret")
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .resolve_application_token("workspace-a", "session-a", handle.clone())
+                .await
+                .unwrap(),
+            "session-secret"
+        );
+        // Storage validates provider/key ownership; the gateway retains
+        // workspace/session authorization before resolving its private handle.
+        for (provider, key) in [
+            ("another-provider", "gateway-access-token"),
+            ("gateway-service-session", "another-key"),
+        ] {
+            assert!(
+                runtime
+                    .resolve_secrets(
+                        SecretOwner::provider("workspace-a", "service-session-session-a", provider),
+                        &Handles::from([(key.into(), handle.clone())]),
+                        openshell_core::time::now_ms(),
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        // The explicit owner kind must preserve the already deployed driver scope.
+        let resolved = runtime
+            .resolve_secrets(
+                SecretOwner::provider(
+                    "workspace-a",
+                    "service-session-session-a",
+                    "gateway-service-session",
+                ),
+                &Handles::from([("gateway-access-token".into(), handle.clone())]),
+                openshell_core::time::now_ms(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.values.get("gateway-access-token").unwrap(),
+            "session-secret"
+        );
+        runtime
+            .delete_application_token("workspace-a", "session-a", handle.clone())
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .resolve_application_token("workspace-a", "session-a", handle)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
