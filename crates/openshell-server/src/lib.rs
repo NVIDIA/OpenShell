@@ -2539,7 +2539,7 @@ mod tests {
     use std::time::{Duration, Instant};
     use tempfile::{TempDir, tempdir};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     use tokio::sync::watch;
     use tokio_rustls::TlsConnector;
 
@@ -3089,7 +3089,7 @@ mod tests {
         let connect_addr: SocketAddr = format!("127.0.0.1:{}", addr.port())
             .parse()
             .expect("failed to build loopback connect addr");
-        let mut stream = TcpStream::connect(connect_addr)
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(connect_addr)
             .await
             .expect("failed to connect to test listener");
         stream
@@ -3298,7 +3298,7 @@ mod tests {
         ));
 
         let connector = test_tls_connector(&tls_dir.path().join("ca.pem"), None);
-        let stream = TcpStream::connect(address)
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("failed to connect to metrics listener");
         let mut tls_stream = connector
@@ -3324,7 +3324,7 @@ mod tests {
             "expected a successful HTTPS metrics response"
         );
 
-        let mut plaintext = TcpStream::connect(address)
+        let mut plaintext = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("failed to connect for plaintext request");
         plaintext
@@ -3403,7 +3403,7 @@ mod tests {
             &directory.path().join("ca.pem"),
             Some((&metrics_client_cert, &metrics_client_key)),
         );
-        let stream = TcpStream::connect(address)
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("failed to connect with metrics client certificate");
         let mut metrics_client = metrics_connector
@@ -3433,7 +3433,7 @@ mod tests {
             &directory.path().join("ca.pem"),
             Some((&gateway_client_cert, &gateway_client_key)),
         );
-        let stream = TcpStream::connect(address)
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("failed to connect with gateway client certificate");
         let rejected_response = match gateway_connector
@@ -3467,7 +3467,7 @@ mod tests {
         );
 
         let anonymous_connector = test_tls_connector(&directory.path().join("ca.pem"), None);
-        let stream = TcpStream::connect(address)
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("failed to connect without a client certificate");
         let anonymous_response = match anonymous_connector

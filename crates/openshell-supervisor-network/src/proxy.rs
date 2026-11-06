@@ -9458,7 +9458,7 @@ network_policies: {}
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let client = tokio::spawn(async move {
-            let mut socket = TcpStream::connect(address).await.unwrap();
+            let mut socket = connect_tcp_nodelay_best_effort(address).await.unwrap();
             socket.write_all(&raw).await.unwrap();
             let mut response = Vec::new();
             socket.read_to_end(&mut response).await.unwrap();
@@ -9686,7 +9686,9 @@ network_policies:
                 body.len(),
             );
             let client = tokio::spawn(async move {
-                let mut socket = TcpStream::connect(proxy_address).await.unwrap();
+                let mut socket = connect_tcp_nodelay_best_effort(proxy_address)
+                    .await
+                    .unwrap();
                 let mut response = Vec::new();
                 socket.read_to_end(&mut response).await.unwrap();
                 response
@@ -9812,7 +9814,7 @@ network_policies:
             "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nAccept: text/event-stream\r\nMCP-Protocol-Version: 2025-11-25\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
         );
         let client = tokio::spawn(async move {
-            let mut socket = TcpStream::connect(proxy_address)
+            let mut socket = connect_tcp_nodelay_best_effort(proxy_address)
                 .await
                 .expect("connect proxy");
             let mut response = Vec::new();
@@ -9930,7 +9932,7 @@ network_policies:
             "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
         );
         let client = tokio::spawn(async move {
-            let mut socket = TcpStream::connect(proxy_address)
+            let mut socket = connect_tcp_nodelay_best_effort(proxy_address)
                 .await
                 .expect("connect proxy");
             let mut response = Vec::new();
@@ -10057,7 +10059,7 @@ network_policies:
             "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
         );
         let client = tokio::spawn(async move {
-            let mut socket = TcpStream::connect(proxy_address)
+            let mut socket = connect_tcp_nodelay_best_effort(proxy_address)
                 .await
                 .expect("connect proxy");
             let mut response = Vec::new();
@@ -10196,7 +10198,7 @@ network_policies:
             "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n"
         );
         let client = tokio::spawn(async move {
-            let mut socket = TcpStream::connect(proxy_address)
+            let mut socket = connect_tcp_nodelay_best_effort(proxy_address)
                 .await
                 .expect("connect proxy");
             let response = read_http_headers_unbounded(&mut socket).await;
@@ -10892,7 +10894,7 @@ network_policies:
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = connect_tcp_nodelay_best_effort(addr).await.unwrap();
         let (mut server, _) = listener.accept().await.unwrap();
 
         client
@@ -15075,7 +15077,7 @@ network_policies:
     async fn connect_without_tls_termination_refused_with_503_before_200() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = connect_tcp_nodelay_best_effort(addr).await.unwrap();
         let (mut server, _) = listener.accept().await.unwrap();
 
         // Terminating route (tls: skip = false) with no termination state.
@@ -15115,7 +15117,7 @@ network_policies:
         for (tls_present, tls_skip) in [(true, false), (false, true), (true, true)] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut client = connect_tcp_nodelay_best_effort(addr).await.unwrap();
             let (mut server, _) = listener.accept().await.unwrap();
 
             let refused = refuse_connect_when_tls_unavailable(&mut server, tls_present, tls_skip)
@@ -15185,7 +15187,9 @@ network_policies:
         // dropped at `budget`, which closes the socket and ends the read.
         let target = connect_target.to_string();
         let client = tokio::spawn(async move {
-            let mut sock = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+            let mut sock = connect_tcp_nodelay_best_effort(("127.0.0.1", proxy_port))
+                .await
+                .unwrap();
             let req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
             sock.write_all(req.as_bytes()).await.unwrap();
             let mut buf = Vec::new();
@@ -15259,7 +15263,9 @@ network_policies:
         let proxy_port = listener.local_addr().unwrap().port();
         let target = target.to_string();
         let client = tokio::spawn(async move {
-            let mut socket = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+            let mut socket = connect_tcp_nodelay_best_effort(("127.0.0.1", proxy_port))
+                .await
+                .unwrap();
             let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
             socket.write_all(request.as_bytes()).await.unwrap();
             let mut response = Vec::new();
@@ -15676,7 +15682,7 @@ network_policies:
     // the same crate so it inherits the user_home_t label.
     fn resolve_process_identity_denies_exec_shared_socket_ambiguity() {
         use crate::identity::BinaryIdentityCache;
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpListener;
         use std::time::{Duration, Instant};
 
         if !std::path::Path::new("/bin/sleep").exists() {
@@ -15696,7 +15702,8 @@ network_policies:
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let proxy_addr = listener.local_addr().unwrap();
-        let stream = TcpStream::connect(proxy_addr).expect("connect");
+        let stream =
+            openshell_core::net::connect_std_tcp_nodelay_best_effort(proxy_addr).expect("connect");
         let workload_addr = stream.local_addr().unwrap();
         let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let (_accepted, _) = listener.accept().expect("accept");

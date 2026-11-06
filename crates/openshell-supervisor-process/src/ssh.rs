@@ -1715,13 +1715,14 @@ mod tests {
             openshell_isolation_interface::contract::BoundaryDuplexStream,
             openshell_isolation_interface::contract::BackendError,
         > {
-            let stream = tokio::net::TcpStream::connect((target.host(), target.port()))
-                .await
-                .map_err(|error| {
-                    openshell_isolation_interface::contract::BackendError::Process(
-                        error.to_string(),
-                    )
-                })?;
+            let stream = openshell_core::net::connect_tcp_nodelay_best_effort((
+                target.host(),
+                target.port(),
+            ))
+            .await
+            .map_err(|error| {
+                openshell_isolation_interface::contract::BackendError::Process(error.to_string())
+            })?;
             Ok(Box::new(stream))
         }
     }

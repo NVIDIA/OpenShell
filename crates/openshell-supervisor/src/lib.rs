@@ -4845,7 +4845,7 @@ mod tests {
                 "net.ipv6.bindv6only=1 must not make the wildcard listener IPv6-only"
             );
         }
-        std::net::TcpStream::connect(("127.0.0.1", port))
+        openshell_core::net::connect_std_tcp_nodelay_best_effort(("127.0.0.1", port))
             .expect("IPv4 kubelet probe reaches the readiness listener");
     }
 
@@ -4861,7 +4861,7 @@ mod tests {
         let connects = || async {
             timeout(
                 Duration::from_millis(100),
-                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+                openshell_core::net::connect_tcp_nodelay_best_effort(("127.0.0.1", port)),
             )
             .await
             .is_ok_and(|result| result.is_ok())
@@ -4908,7 +4908,7 @@ mod tests {
         assert!(
             !timeout(
                 Duration::from_millis(100),
-                tokio::net::TcpStream::connect(("127.0.0.1", port))
+                openshell_core::net::connect_tcp_nodelay_best_effort(("127.0.0.1", port))
             )
             .await
             .is_ok_and(|result| result.is_ok())
@@ -4917,7 +4917,7 @@ mod tests {
         timeout(Duration::from_secs(2), async {
             while !timeout(
                 Duration::from_millis(100),
-                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+                openshell_core::net::connect_tcp_nodelay_best_effort(("127.0.0.1", port)),
             )
             .await
             .is_ok_and(|result| result.is_ok())

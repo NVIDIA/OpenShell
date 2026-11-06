@@ -2699,13 +2699,14 @@ async fn connect_boundary_using_connector(
                 authority,
                 addresses,
             } => {
-                let stream = openshell_core::net::connect_tcp_nodelay_best_effort(addresses)
-                    .await
-                    .map_err(|error| {
-                        BackendError::Unavailable(format!(
-                            "connect to boundary TLS endpoint {authority}: {error}"
-                        ))
-                    })?;
+                let stream =
+                    openshell_core::net::connect_tcp_nodelay_best_effort(addresses.as_slice())
+                        .await
+                        .map_err(|error| {
+                            BackendError::Unavailable(format!(
+                                "connect to boundary TLS endpoint {authority}: {error}"
+                            ))
+                        })?;
                 enable_boundary_tcp_keepalive(&stream);
                 Box::new(stream)
             }
@@ -3559,7 +3560,9 @@ mod tests {
     async fn boundary_tcp_connections_enable_keepalive() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let connected = tokio::spawn(async move { tokio::net::TcpStream::connect(address).await });
+        let connected = tokio::spawn(async move {
+            openshell_core::net::connect_tcp_nodelay_best_effort(address).await
+        });
         let (_server, _) = listener.accept().await.unwrap();
         let client = connected.await.unwrap().unwrap();
 
@@ -4585,7 +4588,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let connector = Arc::new(ReverseTestConnector(listener));
         let server = tokio::spawn(async move {
-            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+                .await
+                .unwrap();
             let stream = tokio_rustls::TlsAcceptor::from(certificate.server_config)
                 .accept(stream)
                 .await
@@ -4619,7 +4624,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let connector = ReverseTestConnector(listener);
         let server = tokio::spawn(async move {
-            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+                .await
+                .unwrap();
             let _ = tokio_rustls::TlsAcceptor::from(server_certificate.server_config)
                 .accept(stream)
                 .await;
@@ -4645,7 +4652,7 @@ mod tests {
         let server_name =
             rustls::pki_types::ServerName::try_from(certificate.client_tls.server_name.clone())
                 .expect("server name");
-        let stream = tokio::net::TcpStream::connect(address)
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("connect to TLS test server");
 

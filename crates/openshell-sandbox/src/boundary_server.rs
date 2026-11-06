@@ -5319,6 +5319,10 @@ mod linux {
     }
 
     #[cfg(test)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "tests dial from the confined workload, where socket options are not under test"
+    )]
     mod tests {
         use super::*;
         use openshell_core::jwt::{
