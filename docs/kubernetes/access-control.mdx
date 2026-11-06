@@ -65,9 +65,9 @@ The `audience` value must match the client ID configured in your identity provid
 | `gatewayConfig.openshell.gateway.oidc.issuer` | `""` | OIDC issuer URL. Empty disables OIDC. |
 | `gatewayConfig.openshell.gateway.oidc.audience` | `openshell-cli` | Expected `aud` claim in the JWT. |
 | `gatewayConfig.openshell.gateway.oidc.jwks_ttl_secs` | `3600` | JWKS key cache TTL in seconds. Must be greater than zero. |
-| `gatewayConfig.openshell.gateway.oidc.roles_claim` | `""` | Dot-separated path to the roles array in JWT claims. |
-| `gatewayConfig.openshell.gateway.oidc.admin_role` | `""` | Role name that grants admin access. |
-| `gatewayConfig.openshell.gateway.oidc.user_role` | `""` | Role name that grants standard user access. |
+| `gatewayConfig.openshell.gateway.oidc.roles_claim` | `realm_access.roles` | Dot-separated path to the roles array in JWT claims. |
+| `gatewayConfig.openshell.gateway.oidc.admin_role` | `openshell-admin` | Role name that grants admin access. |
+| `gatewayConfig.openshell.gateway.oidc.user_role` | `openshell-user` | Role name that grants standard user access. |
 | `gatewayConfig.openshell.gateway.oidc.scopes_claim` | `""` | Dot-separated path to the scopes array in JWT claims. |
 
 The issuer must use HTTPS. The gateway rejects discovery and JWKS redirects,
@@ -77,11 +77,15 @@ a different origin unless that origin appears in `jwks_allowed_origins`. Use
 
 ### Auth-only mode vs. RBAC mode
 
-Leave both `admin_role` and `user_role` empty to use auth-only mode. Authenticated
-users are treated as Platform Admins and bypass workspace membership checks.
-Configured OAuth scope checks still apply.
+When OIDC is enabled, omitting the role fields uses the defaults above and
+enables RBAC. To use auth-only mode, explicitly set both `admin_role` and
+`user_role` to empty strings (`""`) under `gatewayConfig.openshell.gateway.oidc`.
+Authenticated users are treated as Platform Admins and bypass workspace membership
+checks. Configured OAuth scope checks still apply.
 
-Set both values to enable RBAC mode, where the gateway checks the role claim and enforces access based on the assigned role:
+Keep the default role names, or configure both names for your identity provider,
+to use RBAC mode. The gateway checks the role claim and enforces access based on
+the assigned role:
 
 ```shell
 helm upgrade openshell \
@@ -96,7 +100,8 @@ helm upgrade openshell \
   --set 'gatewayConfig.openshell\.gateway\.oidc.user_role=openshell-user'
 ```
 
-Both `admin_role` and `user_role` must be set, or both must be empty. Setting only one is not supported.
+The effective role names must either both be non-empty or both be empty. The
+gateway rejects a configuration with exactly one empty role name.
 
 OIDC RBAC combines method-level role and optional scope checks with workspace
 membership and role checks. Sandboxes and providers belong to a workspace,
