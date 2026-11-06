@@ -813,6 +813,7 @@ pub mod tests {
         let mut state = test_server_state().await;
         let inner = Arc::get_mut(&mut state).unwrap();
         inner.config.auth.allow_unauthenticated_users = false;
+        inner.config.service_routing.auth_enabled = true;
         inner.config.service_routing.base_domains = vec!["services.example.com".into()];
         inner.config.oidc = Some(serde_json::from_value(serde_json::json!({"issuer":server.uri(),"audience":"openshell-cli","scopes_claim":"scope"})).unwrap());
         inner.admin_role = "openshell-admin".into();
@@ -1299,6 +1300,7 @@ pub mod tests {
         let inner = Arc::get_mut(&mut state).unwrap();
         inner.config.service_routing.base_domains = vec!["services.example.com".into()];
         inner.config.auth.allow_unauthenticated_users = false;
+        inner.config.service_routing.auth_enabled = true;
         inner.config.mtls_auth.enabled = true;
         let peer = ServicePeer {
             secure: true,

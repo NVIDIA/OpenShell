@@ -1776,9 +1776,9 @@ an app domain need distinct gateway names; replicas of one installation share
 its name. Changing the mode or installation name requires fresh route
 installation before discovery can advertise the replacement.
 
-Gateway-mediated service HTTP requests and WebSocket upgrades require configured
-gateway authentication and workspace user access with the app listener disabled
-or enabled. OIDC scope enforcement requires `sandbox:write` (or `openshell:all`),
+When `service_auth_enabled` is true, gateway-mediated service HTTP requests and
+WebSocket upgrades require configured gateway authentication and workspace user
+access with the app listener disabled or enabled. OIDC scope enforcement requires `sandbox:write` (or `openshell:all`),
 as for TCP forwarding. Check HTTP 401 for missing/invalid/expired/revoked
 credentials and 403 for role/scope/membership/origin denial. Browser login starts
 at the control-plane `/auth/services?service_origin=...`; the app host receives
@@ -1792,3 +1792,15 @@ application Authorization header. Gateway headers and reserved cookies are
 stripped; application cookies and explicit bearer passthrough remain available.
 Only explicit local-development unauthenticated access bypasses gateway auth.
 Direct listener authentication belongs to the ingress provider.
+
+### Gateway-mediated application authentication
+
+Gateway service auth is opt-in with `[openshell.gateway].service_auth_enabled = true`,
+`--service-auth-enabled true`, or `OPENSHELL_SERVICE_AUTH_ENABLED=true`. Helm uses
+`server.serviceAuthEnabled` or canonical `gatewayConfig.gateway.service_auth_enabled`.
+It defaults to false and is independent of `supervisor_app_listener.enabled`.
+When debugging unexpected application 401/403 responses or browser login, check
+this flag before inspecting the configured gateway authentication and workspace
+membership. Direct app-listener authentication remains the ingress provider's
+responsibility. Disabling service auth retains gateway application routing; it
+does not disable the gateway data path.

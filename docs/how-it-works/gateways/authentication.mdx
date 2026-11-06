@@ -12,13 +12,19 @@ This page describes gateway authentication for CLI clients and sandbox service r
 
 ## Sandbox service requests
 
-Gateway-mediated HTTP requests and WebSocket upgrades authenticate with the
+Gateway application authentication is opt-in. Set
+`service_auth_enabled = true` in `[openshell.gateway]` to enable it. The default
+is `false`, which preserves existing service routing and its header, cookie,
+and path handling. The supervisor app-listener setting does not enable
+this authentication gate.
+
+When enabled, gateway-mediated HTTP requests and WebSocket upgrades authenticate with the
 configured gateway identity and require workspace user access. OIDC users need
 the configured user or admin role and, when scope enforcement is enabled,
 `sandbox:write` or `openshell:all`, matching TCP forwarding. Discovery-only access
 does not grant application access. This applies with the supervisor app listener
 enabled or disabled. Only explicitly enabled unauthenticated local development
-bypasses the gate. Existing unauthenticated service clients must supply gateway
+bypasses the gate. After enabling this flag, existing unauthenticated service clients must supply gateway
 credentials in authenticated deployments.
 
 For a request that uses only gateway bearer authentication:
