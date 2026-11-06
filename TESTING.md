@@ -586,6 +586,13 @@ mise run e2e:oci-image:podman
 Both tasks set `OPENSHELL_TEST_CONTAINER_ENGINE`, the command that builds test
 images into the gateway's image store.
 
+The `host-gateway` feature suite (`tests/suites/features/host-gateway`) checks
+that a sandbox from the Python test image reaches a server the test runs on the
+host through `host.openshell.internal`. CI runs it on Docker rootful, Podman
+rootful and rootless, and the `k3s` and `k3s-ha` installers. The tests run on
+the K3s node, so the K3s installers set the chart's `server.hostGatewayIP` to
+the node's address.
+
 Run the VM-backed Rust CLI e2e suite:
 
 ```shell
