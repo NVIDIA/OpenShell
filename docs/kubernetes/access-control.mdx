@@ -67,7 +67,9 @@ a different origin unless that origin appears in `jwks_allowed_origins`. Use
 
 ### Auth-only mode vs. RBAC mode
 
-Leave both `admin_role` and `user_role` empty to use auth-only mode: any request with a valid JWT from the configured issuer is accepted, but no role distinction is enforced.
+Leave both `admin_role` and `user_role` empty to use auth-only mode. Authenticated
+users are treated as Platform Admins and bypass workspace membership checks.
+Configured OAuth scope checks still apply.
 
 Set both values to enable RBAC mode, where the gateway checks the role claim and enforces access based on the assigned role:
 
@@ -86,7 +88,14 @@ helm upgrade openshell \
 
 Both `admin_role` and `user_role` must be set, or both must be empty. Setting only one is not supported.
 
-OIDC RBAC is method-level authorization. It controls which API operations a caller can perform, but provider and sandbox records are not owned by individual OIDC subjects. In shared clusters, treat provider credentials as gateway-wide resources and use separate gateways or external tenancy controls when users must not see or attach each other's providers and sandboxes.
+OIDC RBAC combines method-level role and optional scope checks with workspace
+membership and role checks. Sandboxes and providers belong to a workspace,
+rather than to individual OIDC subjects. Workspace Users can use sandboxes and
+attach providers within their assigned workspaces; Workspace Admins manage
+resources in those workspaces. Platform Admins bypass workspace membership
+checks. Configure OIDC roles and separate workspace memberships when users must
+not access each other's resources. See
+[Workspaces](/how-it-works/workspaces#understand-the-role-model).
 
 ### Provider-specific rolesClaim paths
 
