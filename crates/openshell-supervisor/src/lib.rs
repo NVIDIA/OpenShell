@@ -1800,6 +1800,7 @@ pub async fn run_sandbox_instance(
                     ));
                 }
                 () = &mut shutdown_requested => {
+                    running.begin_stop();
                     let _ = agent
                         .signal(openshell_isolation_interface::contract::BoundarySignal::Term)
                         .await;
