@@ -1662,14 +1662,11 @@ where
     }
 }
 
-fn select_l7_config_for_path<'a>(
+pub(crate) fn select_l7_config_for_path<'a>(
     configs: &'a [L7EndpointConfig],
     path: &str,
 ) -> Option<&'a L7EndpointConfig> {
-    configs
-        .iter()
-        .filter(|config| config.matches_path(path))
-        .max_by_key(|config| config.path_specificity())
+    openshell_core::endpoint_path::select_most_specific(configs, path, |config| &config.path)
 }
 
 fn emit_l7_request_log(
@@ -10563,6 +10560,157 @@ network_policies:
         drop(app);
         drop(upstream);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+    }
+
+    #[tokio::test]
+    async fn route_protocol_confines_rpc_calls_beside_broad_rest() {
+        for protocol in ["json-rpc", "mcp"] {
+            let rule = if protocol == "mcp" {
+                "{ method: tools/call, tool: read_status }"
+            } else {
+                "{ method: status.get }"
+            };
+            let yaml = format!(
+                r#"
+version: 1
+network_policies:
+  rest_api:
+    endpoints:
+      - host: "*.routes.test"
+        port: 8000
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+    binaries: [{{ path: /usr/bin/python3 }}]
+  rpc_api:
+    endpoints:
+      - host: api.routes.test
+        port: 8000
+        path: /services/**
+        protocol: {protocol}
+        enforcement: enforce
+        rules: [{{ allow: {rule} }}]
+    binaries: [{{ path: /usr/bin/python3 }}]
+"#
+            );
+            for (path, body, expected) in [
+                (
+                    "/services",
+                    if protocol == "mcp" {
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_status","arguments":{}}}"#
+                    } else {
+                        r#"{"jsonrpc":"2.0","id":1,"method":"status.get"}"#
+                    },
+                    "200 OK",
+                ),
+                (
+                    "/services/catalog",
+                    if protocol == "mcp" {
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_status","arguments":{}}}"#
+                    } else {
+                        r#"{"jsonrpc":"2.0","id":2,"method":"status.set"}"#
+                    },
+                    "403 Forbidden",
+                ),
+                ("/public", "{}", "200 OK"),
+            ] {
+                let proto = openshell_policy::parse_sandbox_policy(&yaml).unwrap();
+                let engine = OpaEngine::from_proto(&proto).unwrap();
+                let input = NetworkInput {
+                    host: "api.routes.test".into(),
+                    port: 8000,
+                    binary_path: PathBuf::from("/usr/bin/python3"),
+                    binary_sha256: "unused".into(),
+                    ancestors: vec![],
+                    cmdline_paths: vec![],
+                };
+                let (endpoints, generation) = engine
+                    .query_endpoint_configs_with_generation(&input)
+                    .unwrap();
+                let configs = endpoints
+                    .iter()
+                    .filter_map(crate::l7::parse_l7_config)
+                    .collect::<Vec<_>>();
+                let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+                let ctx = L7EvalContext {
+                    host: input.host,
+                    port: 8000,
+                    request_default_port: Some(8000),
+                    policy_name: "rpc_api".into(),
+                    binary_path: "/usr/bin/python3".into(),
+                    ..Default::default()
+                };
+                let (mut app, mut client) = tokio::io::duplex(8192);
+                let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+                let relay = tokio::spawn(async move {
+                    relay_with_route_selection(
+                        &configs,
+                        tunnel_engine,
+                        &mut client,
+                        &mut relay_upstream,
+                        &ctx,
+                    )
+                    .await
+                });
+                // An accepting upstream makes a policy bypass produce a 200.
+                let server = tokio::spawn(async move {
+                    let mut received = Vec::new();
+                    let mut buffer = [0; 4096];
+                    loop {
+                        let n = upstream.read(&mut buffer).await.unwrap();
+                        if n == 0 {
+                            return received;
+                        }
+                        received.extend_from_slice(&buffer[..n]);
+                        if let Some(head) =
+                            received.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let headers = std::str::from_utf8(&received[..head]).unwrap();
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap();
+                            if received.len() >= head + 4 + length {
+                                upstream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                                return received;
+                            }
+                        }
+                    }
+                });
+                app.write_all(format!(
+                    "POST {path} HTTP/1.1\r\nHost: api.routes.test:8000\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2025-11-25\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+                let mut response = Vec::new();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    app.read_to_end(&mut response),
+                )
+                .await
+                .expect("relay must answer")
+                .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&response).starts_with(&format!("HTTP/1.1 {expected}")),
+                    "{protocol} {path}: {}",
+                    String::from_utf8_lossy(&response)
+                );
+                drop(app);
+                tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let received = server.await.unwrap();
+                assert_eq!(
+                    received.is_empty(),
+                    expected == "403 Forbidden",
+                    "{protocol} {path}: denied calls must not reach upstream"
+                );
+            }
+        }
     }
 
     /// A `tools/call` that no JSON-RPC-family fixture below allows.

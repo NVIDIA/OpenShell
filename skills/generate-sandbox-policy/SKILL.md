@@ -474,7 +474,7 @@ The policy needs to go somewhere. Determine which mode applies:
 
 2. **Check for conflicts**:
    - Does a policy with the same key already exist? If so, ask the user whether to **replace** it, **merge** new endpoints/binaries into it, or use a different key.
-   - Does an existing endpoint selector overlap the new selector? Compatible overlaps are allowed and can intentionally aggregate allow and deny rules. Reject or revise equally specific overlaps that disagree on connection or request-processing metadata, including TLS, destination constraints, protocol/parser behavior, enforcement, or credential handling. A more-specific path selector may override broader request-processing metadata.
+   - Does an existing endpoint selector overlap the new selector? Compatible overlaps are allowed and can intentionally aggregate allow and deny rules. Reject or revise equally specific overlaps that disagree on connection or request-processing metadata, including TLS, destination constraints, protocol/parser behavior, enforcement, or credential handling. A more-specific path selector may override broader request-processing metadata. Its selected protocol limits which matching endpoints contribute allow rules; same-protocol allows combine, and matching denies retain precedence. A broader REST allow does not authorize a request routed to JSON-RPC inspection. Preserve the documented restrictions on mixing MCP with other protocols.
    - If the sandbox uses an attached provider credential, confirm the provider
      profile also declares the intended host, port, and path. A sandbox policy
      allow cannot expand the profile's static credential binding.
