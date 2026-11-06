@@ -79,7 +79,8 @@ run_conformance() {
     return 0
   fi
 
-  e2e_run_openshell_conformance "Kubernetes"
+  OPENSHELL_CONFORMANCE_JUNIT="${OPENSHELL_CONFORMANCE_JUNIT:-${ROOT}/results/${OPENSHELL_E2E_REPORT_NAME:-e2e-kubernetes}-conformance.xml}" \
+    e2e_run_openshell_conformance "Kubernetes"
 }
 
 # `OPENSHELL_E2E_REPORT_NAME` (default `e2e-kubernetes`) names the report

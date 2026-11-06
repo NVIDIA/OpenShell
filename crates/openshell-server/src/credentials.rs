@@ -105,6 +105,10 @@ impl CredentialRuntime {
         ))
     }
 
+    pub(crate) fn issuer(&self) -> Arc<dyn CredentialIssuer> {
+        Arc::clone(&self.issuer)
+    }
+
     pub fn validate_provider_handles(&self, provider: &Provider) -> Result<(), Status> {
         self.issuer.validate_handles(&provider.credential_handles)
     }

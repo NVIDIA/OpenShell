@@ -167,6 +167,25 @@ A provisioning timeout can be repaired by Stop after its original driver work
 settles and cleanup completes. Stop exposes Stopped without discarding the timeout
 diagnosis or storage. This lifecycle behavior also applies when updates are disabled.
 
+## Static credential delivery
+
+Existing polling and configuration-push environments keep their original wire
+shape, delivery behavior, identities, and stable-handle derivation. The gateway
+adds placement-only `ProviderProfileCredential` entries to the existing runtime
+credential map under `static-env:<ENV_KEY>`, for actually delivered static keys.
+Entries are matched to their owning provider binding and contain no token grant,
+refresh configuration, or credential values. The supervisor infers enforcement
+from the auth metadata; the gateway does not enforce placement.
+
+Older supervisors ignore entries without token grants. An older gateway omits
+these entries, so newer supervisors permit static substitution only in
+`Authorization` or explicitly enabled body/WebSocket rewrite contexts. Custom
+placements require a supporting gateway; upgrade it before the supervisor.
+Explicit authored placement is forwarded even when invalid so the supervisor
+can reject it rather than silently apply the default. Metadata travels in the
+same captured environment snapshot; no separate service, capability gate, or
+additional lookup is needed.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment
@@ -194,7 +213,22 @@ closed without falling back to inline values.
 ## Refresh coordination
 
 Explicit rotation, background refresh, and operator refresh-on-read share the
-same refresh coordination:
+same refresh coordination in `openshell-credential-issuer::refresh`. The server's
+`provider_refresh` facade retains public status/configuration adaptation and
+worker startup. `refresh_store` translates the unchanged private durable record
+and leases; `refresh_commit` retains workspace/attachment/provider CAS integration.
+The gateway publishes worker/manual changes at the existing orchestration points;
+export-triggered refresh does not publish. The issuer is still embedded: stable
+reference/version migration must remove the temporary provider commit port before
+remote refresh.
+
+Gateway configuration, status, deletion, export revalidation, and snapshot reads
+use the shared `CredentialRefresh` interface. Deletion does not construct a local
+runtime. The temporary provider-commit adapter uses the same injected
+`RefreshStateStore` for attachment-validation reads, avoiding a runtime ownership
+cycle; neither path calls gateway refresh-persistence helpers directly.
+
+The shared runtime preserves these guarantees:
 
 - A process-local weak keyed mutex coalesces waiters without retaining deleted
   providers indefinitely.

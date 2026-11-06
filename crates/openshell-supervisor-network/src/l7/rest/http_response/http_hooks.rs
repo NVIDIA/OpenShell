@@ -734,7 +734,7 @@ fn emit_http_response_stage_events(
     diagnostics: &HttpStageDiagnostics,
 ) {
     for event in http_response_stage_events(policy_name, target, status_code, diagnostics) {
-        openshell_ocsf::ocsf_emit!(event);
+        crate::telemetry::egress_emit!(event);
     }
 }
 
@@ -899,5 +899,5 @@ fn emit_http_response_middleware_abort(
         ])
         .message("HTTP response middleware failed after response commitment; delivery aborted")
         .build();
-    openshell_ocsf::ocsf_emit!(event);
+    crate::telemetry::egress_emit!(event);
 }

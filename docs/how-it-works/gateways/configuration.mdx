@@ -810,6 +810,7 @@ Each OCSF event becomes one log record:
 | Timestamp | The OCSF `time`. The observed timestamp is when the gateway received the event. |
 | Severity | Unknown, Informational, and Other are INFO, Low is WARN, Medium is WARN2, High is ERROR, Critical is ERROR2, and Fatal is FATAL. The severity text is the OCSF severity name. |
 | Attributes | `ocsf.class_uid`, `ocsf.activity_id`, `ocsf.severity_id`, `ocsf.metadata.uid`, and, for events associated with a sandbox, `openshell.sandbox.id`. |
+| Trace context | The trace and span ID of the sampled span active when the event was emitted, for every OCSF class. Absent when no sampled span was active. |
 
 `schema_version` in this table is deprecated and ignored; the gateway logs a warning at startup when it is set.
 

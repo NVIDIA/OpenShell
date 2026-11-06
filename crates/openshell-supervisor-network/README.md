@@ -45,3 +45,13 @@ at debug, and emits no OCSF denial event: a standard OpenTelemetry SDK retries
 for the life of the agent, and one event per retry would flood the OCSF log.
 The supervisor installs its OTLP relay receiver as the handler while the agent
 trace relay is active.
+
+## Static credential placement
+
+Substitution checks the declared request location before writing upstream.
+Credentials without placement metadata default to the Authorization header. HTTP placement violations return a safe 403 response;
+WebSocket violations close the connection with policy denial. Both paths emit a
+domain event and a detection finding without credential values or placeholders.
+Explicit body and WebSocket
+rewrite flags authorize those locations for ordinary static credentials. SigV4
+signing retains the endpoint-scoped resolver's existing trusted access.

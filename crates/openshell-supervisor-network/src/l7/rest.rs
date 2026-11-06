@@ -94,6 +94,7 @@ pub(crate) const UNSUPPORTED_H2C_UPGRADE_DETAIL: &str =
 pub(crate) const UNSUPPORTED_JSONRPC_UPGRADE_DETAIL: &str =
     "HTTP upgrade is not supported for JSON-RPC or MCP endpoints";
 pub(crate) const UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL: &str = "HTTP upgrade is not supported for GraphQL endpoints; serve GraphQL over WebSocket from a separate protocol: websocket endpoint on another path or port";
+pub(crate) const UNSUPPORTED_REST_UPGRADE_DETAIL: &str = "HTTP upgrade is not supported for REST endpoints; use a separate protocol: websocket endpoint with explicit message rules";
 const MIN_HTTP2_PREFACE_DETECTION_BYTES: usize = 8;
 
 /// Idle timeout for `relay_until_eof`.  If no data arrives within this window
@@ -1263,7 +1264,7 @@ where
                         port = options.port,
                     ))
                     .build();
-                    openshell_ocsf::ocsf_emit!(event);
+                    crate::telemetry::egress_emit!(event);
                 }
                 _ => {
                     return Err(miette::Report::new(CredentialUnavailableError::new(
@@ -1613,8 +1614,9 @@ fn emit_uninspected_body_credential_denial(
             req.action, options.host, options.port
         ))
         .build();
-    openshell_ocsf::ocsf_emit!(event);
+    crate::telemetry::egress_emit!(event);
     let finding = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .action(openshell_ocsf::ActionId::Denied)
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
             "openshell.credentials.traffic_uninspectable",
@@ -1627,7 +1629,7 @@ fn emit_uninspected_body_credential_denial(
         ])
         .message("Request body credential placeholder denied")
         .build();
-    openshell_ocsf::ocsf_emit!(finding);
+    crate::telemetry::egress_emit!(finding);
 }
 
 struct PreparedRequestBody {
@@ -2532,11 +2534,11 @@ pub(crate) fn unsupported_upgrade_detail(
 /// individual HTTP requests, or `None` for a protocol that may relay an
 /// allowed upgrade.
 ///
-/// JSON-RPC, MCP and GraphQL rules inspect each HTTP request body or query.
+/// REST, JSON-RPC, MCP and GraphQL rules inspect individual HTTP requests.
 /// After an upgrade the relay would copy frames that no rule of these
 /// protocols evaluates, so they never upgrade; GraphQL over WebSocket is
 /// served by separate `protocol: websocket` endpoints with GraphQL operation
-/// rules. REST and WebSocket endpoints relay allowed upgrades, and SQL
+/// rules. WebSocket endpoints relay allowed upgrades, and SQL
 /// endpoints keep their existing upgrade behavior. The match is exhaustive so
 /// a new protocol must choose.
 pub(crate) fn upgrade_refusal_for_protocol(
@@ -2546,7 +2548,8 @@ pub(crate) fn upgrade_refusal_for_protocol(
     match protocol {
         L7Protocol::JsonRpc | L7Protocol::Mcp => Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL),
         L7Protocol::Graphql => Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL),
-        L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => None,
+        L7Protocol::Rest => Some(UNSUPPORTED_REST_UPGRADE_DETAIL),
+        L7Protocol::Websocket | L7Protocol::Sql => None,
     }
 }
 
@@ -7089,6 +7092,256 @@ mod tests {
         (outcome, delivered)
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_trace_failure_records_share_the_terminal_decision() {
+        use crate::telemetry::tests::{assert_deny_resolves, deny_spans, exported};
+
+        // This relay fixture has no CONNECT span, so denies are roots at both
+        // levels. The thread-local export harness observes the relay task;
+        // emissions in spawned tasks would need explicit subscriber propagation.
+        for level in ["warn", "debug"] {
+            for (method, script) in [
+                ("GET", ResponseRelayScript::BlockStream),
+                ("GET", ResponseRelayScript::InvalidBodySequence),
+                ("GET", ResponseRelayScript::InvalidWholeBodySequence),
+                ("HEAD", ResponseRelayScript::WholeBody),
+            ] {
+                let (events, received) = exported(level, || {
+                    let (outcome, delivered) = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(run_response_middleware_relay(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                            method,
+                            script,
+                        ))
+                    });
+                    if method == "HEAD"
+                        || matches!(script, ResponseRelayScript::InvalidWholeBodySequence)
+                    {
+                        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+                        assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+                    } else {
+                        assert!(outcome.is_err());
+                        assert!(delivered.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                        assert!(!String::from_utf8_lossy(&delivered).contains("502 Bad Gateway"));
+                    }
+                })
+                .await;
+                let terminal = events
+                    .iter()
+                    .find(|event| {
+                        event["finding_info"]["uid"] == "openshell.middleware.http_response_failure"
+                    })
+                    .expect("terminal delivery failure is recorded");
+                let companions: Vec<_> = events
+                    .iter()
+                    .filter(|event| {
+                        event.get("finding_info").is_some()
+                            || event["unmapped"]["failed"] == true
+                            || event["action_id"] == openshell_ocsf::ActionId::Denied as u8
+                    })
+                    .cloned()
+                    .collect();
+                assert!(companions.len() >= 2, "failure includes diagnostic records");
+                assert_eq!(
+                    deny_spans(&received).len(),
+                    1,
+                    "one response stop is one exported decision"
+                );
+                assert!(terminal.get("trace").is_none());
+                assert_deny_resolves(&companions, &received, true);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_refusal_findings_record_denial_without_http_spans() {
+        let request = L7Request {
+            action: "POST".into(),
+            target: "/api".into(),
+            query_params: HashMap::new(),
+            raw_header: vec![],
+            body_length: BodyLength::None,
+        };
+        let (events, received) = crate::telemetry::tests::exported("warn", || {
+            crate::l7::emit_uninspected_credential_finding("example.test", "p", "test");
+            emit_uninspected_body_credential_denial(
+                &request,
+                &RelayRequestOptions {
+                    host: "example.test",
+                    port: 443,
+                    ..Default::default()
+                },
+                BodyCredentialError::KnownUnavailable,
+            );
+        })
+        .await;
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["class_uid"] == 2004)
+                .count(),
+            2
+        );
+        for event in &events {
+            assert_eq!(event["action_id"], 2);
+            assert_eq!(event["action"], "Denied");
+        }
+        crate::telemetry::tests::assert_no_deny(&events, &received);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_trace_upstream_io_failure_is_not_an_enforced_denial() {
+        struct FailedReader;
+        impl AsyncRead for FailedReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "upstream response interrupted",
+                )))
+            }
+        }
+
+        for script in [ResponseRelayScript::Stream, ResponseRelayScript::WholeBody] {
+            let (events, received) = crate::telemetry::tests::exported("warn", || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let (runner, chain) = response_middleware_fixture(script);
+                        let mut upstream = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
+                            .as_slice()
+                            .chain(FailedReader);
+                        let mut delivered = Vec::new();
+                        let outcome = relay_response(
+                            "GET",
+                            &mut upstream,
+                            &mut delivered,
+                            RelayResponseOptions::default(),
+                            Some(response_middleware_context(&runner, &chain, "GET")),
+                        )
+                        .await;
+                        if matches!(script, ResponseRelayScript::Stream) {
+                            assert!(outcome.is_err());
+                            assert!(delivered.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                            assert!(
+                                !String::from_utf8_lossy(&delivered).contains("502 Bad Gateway")
+                            );
+                        } else {
+                            assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+                            assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+                        }
+                    });
+                });
+            })
+            .await;
+            let finding = events
+                .iter()
+                .find(|event| {
+                    event["finding_info"]["uid"] == "openshell.middleware.http_response_failure"
+                })
+                .expect("upstream I/O failure retains its diagnostic finding");
+            assert!(finding.get("action_id").is_none());
+            assert!(finding.get("action").is_none());
+            crate::telemetry::tests::assert_no_deny(&events, &received);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_trace_downstream_body_failure_is_not_an_enforced_denial() {
+        #[derive(Default)]
+        struct DisconnectAfterHead(Vec<u8>);
+        impl AsyncWrite for DisconnectAfterHead {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                if self.0.ends_with(b"\r\n\r\n") {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "client disconnected",
+                    )));
+                }
+                self.0.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (events, received) = crate::telemetry::tests::exported("warn", || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
+                    let mut upstream =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".as_slice();
+                    let mut delivered = DisconnectAfterHead::default();
+                    let outcome = relay_response(
+                        "GET",
+                        &mut upstream,
+                        &mut delivered,
+                        RelayResponseOptions::default(),
+                        Some(response_middleware_context(&runner, &chain, "GET")),
+                    )
+                    .await;
+                    assert!(outcome.is_err());
+                    assert!(delivered.0.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                    assert!(!String::from_utf8_lossy(&delivered.0).contains("502 Bad Gateway"));
+                });
+            });
+        })
+        .await;
+        let finding = events
+            .iter()
+            .find(|event| {
+                event["finding_info"]["uid"] == "openshell.middleware.http_response_failure"
+            })
+            .expect("downstream I/O failure retains its diagnostic finding");
+        assert!(finding.get("action_id").is_none());
+        assert!(finding.get("action").is_none());
+        crate::telemetry::tests::assert_no_deny(&events, &received);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_trace_allowed_and_fail_open_controls_do_not_create_deny_spans() {
+        for script in [
+            ResponseRelayScript::Stream,
+            ResponseRelayScript::InvalidBodySequence,
+            ResponseRelayScript::InvalidWholeBodySequence,
+        ] {
+            let (events, received) = crate::telemetry::tests::exported("warn", || {
+                let (outcome, delivered) = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        run_response_middleware_relay_with_error(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                            "GET",
+                            script,
+                            openshell_supervisor_middleware::OnError::FailOpen,
+                        ),
+                    )
+                });
+                assert!(outcome.is_ok());
+                assert!(delivered.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            })
+            .await;
+            assert!(!events.is_empty());
+            crate::telemetry::tests::assert_no_deny(&events, &received);
+        }
+    }
+
     #[tokio::test]
     async fn response_middleware_headers_only_mutates_head_and_preserves_framing() {
         let (outcome, delivered) = run_response_middleware_relay(
@@ -9900,16 +10153,10 @@ mod tests {
         let websocket = format!(
             "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         );
-        for protocol in [
-            crate::l7::L7Protocol::Rest,
-            crate::l7::L7Protocol::Websocket,
-        ] {
-            assert_eq!(
-                unsupported_upgrade_detail(websocket.as_bytes(), protocol),
-                None,
-                "{protocol:?}"
-            );
-        }
+        assert_eq!(
+            unsupported_upgrade_detail(websocket.as_bytes(), crate::l7::L7Protocol::Websocket),
+            None,
+        );
 
         // Streamable HTTP requests, a look-alike header name, and a stray
         // `Connection: upgrade` without an `Upgrade` header stay allowed;
@@ -9922,6 +10169,7 @@ mod tests {
         ];
         for raw in ordinary {
             for protocol in [
+                crate::l7::L7Protocol::Rest,
                 crate::l7::L7Protocol::JsonRpc,
                 crate::l7::L7Protocol::Mcp,
                 crate::l7::L7Protocol::Graphql,
@@ -9972,7 +10220,11 @@ mod tests {
             upgrade_refusal_for_protocol(L7Protocol::Graphql),
             Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL)
         );
-        for protocol in [L7Protocol::Rest, L7Protocol::Websocket, L7Protocol::Sql] {
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::Rest),
+            Some(UNSUPPORTED_REST_UPGRADE_DETAIL)
+        );
+        for protocol in [L7Protocol::Websocket, L7Protocol::Sql] {
             assert_eq!(upgrade_refusal_for_protocol(protocol), None, "{protocol:?}");
         }
     }
@@ -10010,6 +10262,7 @@ mod tests {
                 "fixture must be an upgrade to the relay: {raw}"
             );
             for protocol in [
+                crate::l7::L7Protocol::Rest,
                 crate::l7::L7Protocol::JsonRpc,
                 crate::l7::L7Protocol::Mcp,
                 crate::l7::L7Protocol::Graphql,
@@ -10316,6 +10569,70 @@ mod tests {
     // with a placeholder, the relay rewrites it, and we verify what upstream
     // receives.
     // =========================================================================
+
+    fn placed_test_resolver(
+        environment: HashMap<String, String>,
+        host: &str,
+        declarations: &[(&str, &str, &str)],
+    ) -> (HashMap<String, String>, Option<SecretResolver>) {
+        use openshell_core::proto::{
+            ProviderProfileCredential, StaticCredentialBinding, StaticCredentialEndpointBinding,
+        };
+        use openshell_core::provider_credentials::{
+            ProviderCredentialState, STATIC_CREDENTIAL_METADATA_PREFIX,
+        };
+        let metadata = declarations
+            .iter()
+            .map(|(key, style, selector)| {
+                let mut credential = ProviderProfileCredential {
+                    env_vars: vec![(*key).into()],
+                    auth_style: (*style).into(),
+                    ..Default::default()
+                };
+                match *style {
+                    "header" => credential.header_name = (*selector).into(),
+                    "query" => credential.query_param = (*selector).into(),
+                    "path" => credential.path_template = (*selector).into(),
+                    _ => panic!("fixture needs an explicit placement"),
+                }
+                (
+                    format!("{STATIC_CREDENTIAL_METADATA_PREFIX}{key}"),
+                    credential,
+                )
+            })
+            .collect();
+        let bindings = environment
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    StaticCredentialBinding {
+                        credential_identity: format!("fixture:{key}"),
+                        workload_credential_handle: String::new(),
+                        endpoints: vec![StaticCredentialEndpointBinding {
+                            host: host.into(),
+                            port: 443,
+                            path: "/**".into(),
+                        }],
+                    },
+                )
+            })
+            .collect();
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            environment,
+            HashMap::new(),
+            metadata,
+            bindings,
+            Vec::new(),
+        )
+        .unwrap();
+        let child_env = state.snapshot().child_env.clone();
+        let resolver = state
+            .resolver_for_endpoint(host, 443, "/")
+            .map(|resolver| resolver.as_ref().clone());
+        (child_env, resolver)
+    }
 
     /// Helper: run a request through the relay and capture what upstream receives.
     async fn relay_and_capture(
@@ -10994,10 +11311,12 @@ mod tests {
 
     #[tokio::test]
     async fn relay_injects_exact_header_credential() {
-        let (child_env, resolver) = SecretResolver::from_provider_env(
+        let (child_env, resolver) = placed_test_resolver(
             [("CUSTOM_TOKEN".to_string(), "tok-12345".to_string())]
                 .into_iter()
                 .collect(),
+            "api.example.com",
+            &[("CUSTOM_TOKEN", "header", "x-api-key")],
         );
         let placeholder = child_env.get("CUSTOM_TOKEN").unwrap();
 
@@ -11071,10 +11390,12 @@ mod tests {
 
     #[tokio::test]
     async fn relay_injects_query_param_credential() {
-        let (child_env, resolver) = SecretResolver::from_provider_env(
+        let (child_env, resolver) = placed_test_resolver(
             [("YOUTUBE_KEY".to_string(), "AIzaSy-secret".to_string())]
                 .into_iter()
                 .collect(),
+            "www.googleapis.com",
+            &[("YOUTUBE_KEY", "query", "key")],
         );
         let placeholder = child_env.get("YOUTUBE_KEY").unwrap();
 
@@ -11182,13 +11503,15 @@ mod tests {
 
     #[tokio::test]
     async fn relay_injects_url_path_credential_telegram_style() {
-        let (child_env, resolver) = SecretResolver::from_provider_env(
+        let (child_env, resolver) = placed_test_resolver(
             [(
                 "TELEGRAM_TOKEN".to_string(),
                 "123456:ABC-DEF1234ghIkl".to_string(),
             )]
             .into_iter()
             .collect(),
+            "api.telegram.org",
+            &[("TELEGRAM_TOKEN", "path", "/bot{credential}/sendMessage")],
         );
         let placeholder = child_env.get("TELEGRAM_TOKEN").unwrap();
 
@@ -11215,10 +11538,12 @@ mod tests {
 
     #[tokio::test]
     async fn relay_injects_url_path_credential_standalone_segment() {
-        let (child_env, resolver) = SecretResolver::from_provider_env(
+        let (child_env, resolver) = placed_test_resolver(
             [("ORG_TOKEN".to_string(), "org-abc-789".to_string())]
                 .into_iter()
                 .collect(),
+            "api.example.com",
+            &[("ORG_TOKEN", "path", "/api/{credential}/resources")],
         );
         let placeholder = child_env.get("ORG_TOKEN").unwrap();
 
@@ -11245,13 +11570,18 @@ mod tests {
 
     #[tokio::test]
     async fn relay_injects_combined_path_and_header_credentials() {
-        let (child_env, resolver) = SecretResolver::from_provider_env(
+        let (child_env, resolver) = placed_test_resolver(
             [
                 ("PATH_TOKEN".to_string(), "tok-path-123".to_string()),
                 ("HEADER_KEY".to_string(), "sk-header-456".to_string()),
             ]
             .into_iter()
             .collect(),
+            "api.example.com",
+            &[
+                ("PATH_TOKEN", "path", "/bot{credential}/send"),
+                ("HEADER_KEY", "header", "x-api-key"),
+            ],
         );
         let path_ph = child_env.get("PATH_TOKEN").unwrap();
         let header_ph = child_env.get("HEADER_KEY").unwrap();

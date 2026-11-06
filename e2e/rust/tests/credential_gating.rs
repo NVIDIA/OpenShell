@@ -4,15 +4,20 @@
 #![cfg(feature = "e2e")]
 
 //! E2E coverage for credentialed endpoint admission and REST body backstops.
+//!
+//! Each test installs its own provider and profile under a unique name, so the
+//! tests can run in parallel. Each test prints its steps to stderr with the
+//! elapsed time, so a timeout shows which step was slow.
 
+use std::fmt::Display;
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::binary::{openshell_bin, openshell_cmd};
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use sha1::{Digest, Sha1};
 use tempfile::NamedTempFile;
@@ -20,8 +25,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-const PROFILE_ID: &str = "e2e-credential-gating";
-const PROVIDER_NAME: &str = "e2e-credential-gating";
 const TEST_HOST: &str = "host.openshell.internal";
 const TOKEN_ENV: &str = "E2E_GATING_TOKEN";
 const TEST_SECRET: &str = "e2e-gating-secret-value";
@@ -53,21 +56,68 @@ async fn run_cli(args: &[&str]) -> (bool, String) {
     )
 }
 
+/// Prints a test's steps to stderr with the time since the test started.
+#[derive(Clone, Copy)]
+struct Progress {
+    scenario: &'static str,
+    started: Instant,
+}
+
+impl Progress {
+    fn start(scenario: &'static str) -> Self {
+        let progress = Self {
+            scenario,
+            started: Instant::now(),
+        };
+        progress.step("start");
+        progress
+    }
+
+    fn step(self, message: impl Display) {
+        eprintln!(
+            "credential_gating[{}] +{:.1}s {message}",
+            self.scenario,
+            self.started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+fn utf8_path(file: &NamedTempFile) -> Result<&str, String> {
+    file.path()
+        .to_str()
+        .ok_or_else(|| format!("{} is not UTF-8", file.path().display()))
+}
+
 /// Retry a delete until it takes effect.
 ///
 /// The gateway refuses to delete a provider or a profile that a sandbox still
 /// references, and sandbox teardown drains asynchronously, so a single attempt
-/// can be rejected right after a sandbox was removed.
-async fn delete_until_gone(args: &[&str]) -> Result<(), String> {
+/// can be rejected right after a sandbox was removed. This runs from `Drop`,
+/// so it blocks instead of awaiting.
+fn delete_until_gone(args: &[&str]) -> Result<(), String> {
     const ATTEMPTS: u32 = 40;
+    let binary = openshell_bin();
     let mut last_output = String::new();
     for _ in 0..ATTEMPTS {
-        let (deleted, output) = run_cli(args).await;
-        if deleted || output.to_lowercase().contains("not found") {
-            return Ok(());
+        match std::process::Command::new(&binary)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(output) => {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if output.status.success() || combined.to_lowercase().contains("not found") {
+                    return Ok(());
+                }
+                last_output = combined;
+            }
+            Err(error) => last_output = format!("spawn openshell CLI: {error}"),
         }
-        last_output = output;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        std::thread::sleep(Duration::from_millis(500));
     }
     Err(format!(
         "'{}' still failing after {ATTEMPTS} attempts:\n{last_output}",
@@ -75,28 +125,97 @@ async fn delete_until_gone(args: &[&str]) -> Result<(), String> {
     ))
 }
 
-/// Strict teardown for the install paths: every test resource must be gone
-/// before it is recreated, otherwise creation fails with "already exists".
-async fn ensure_provider_resources_absent() -> Result<(), String> {
-    delete_until_gone(&["provider", "delete", PROVIDER_NAME]).await?;
-    delete_until_gone(&["profile", "delete", PROFILE_ID]).await
+/// A provider and the profile it uses, both under one name unique to the
+/// test. Dropping it deletes both, also when the test fails.
+struct GatingProvider {
+    name: String,
+    progress: Progress,
 }
 
-/// Best-effort teardown. Never fails the test: it also runs on the failure
-/// path, where the original assertion is the interesting one.
-async fn cleanup_provider_resources() {
-    if let Err(error) = ensure_provider_resources_absent().await {
-        eprintln!("provider cleanup did not settle: {error}");
+impl GatingProvider {
+    async fn install_with_endpoints(
+        progress: Progress,
+        rest_port: u16,
+        websocket_port: u16,
+    ) -> Result<Self, String> {
+        let name = unique_name(progress.scenario);
+        let profile = write_provider_profile(&name, rest_port, websocket_port)?;
+        Self::install(progress, name, &profile).await
+    }
+
+    async fn install_endpointless(progress: Progress) -> Result<Self, String> {
+        let name = unique_name(progress.scenario);
+        let profile = write_endpointless_provider_profile(&name)?;
+        Self::install(progress, name, &profile).await
+    }
+
+    async fn install(
+        progress: Progress,
+        name: String,
+        profile: &NamedTempFile,
+    ) -> Result<Self, String> {
+        progress.step(format_args!("importing profile {name}"));
+        let (imported, output) =
+            run_cli(&["profile", "import", "--file", utf8_path(profile)?]).await;
+        if !imported {
+            return Err(format!("profile import failed:\n{output}"));
+        }
+        let provider = Self { name, progress };
+        progress.step(format_args!("creating provider {}", provider.name));
+        let credential = format!("{TOKEN_ENV}={TEST_SECRET}");
+        let (created, output) = run_cli(&[
+            "provider",
+            "create",
+            "--name",
+            &provider.name,
+            "--type",
+            &provider.name,
+            "--credential",
+            &credential,
+        ])
+        .await;
+        if !created {
+            return Err(format!("provider create failed:\n{output}"));
+        }
+        Ok(provider)
     }
 }
 
-fn write_provider_profile(rest_port: u16, websocket_port: u16) -> Result<NamedTempFile, String> {
+impl Drop for GatingProvider {
+    fn drop(&mut self) {
+        self.progress
+            .step(format_args!("deleting provider and profile {}", self.name));
+        for kind in ["provider", "profile"] {
+            if let Err(error) = delete_until_gone(&[kind, "delete", &self.name]) {
+                self.progress
+                    .step(format_args!("{kind} cleanup did not settle: {error}"));
+            }
+        }
+        self.progress.step("cleanup finished");
+    }
+}
+
+/// A provider and profile name that does not collide with parallel tests or
+/// earlier runs against the same gateway.
+fn unique_name(scenario: &str) -> String {
+    format!(
+        "e2e-cg-{scenario}-{}-{:08x}",
+        std::process::id(),
+        rand::random::<u32>()
+    )
+}
+
+fn write_provider_profile(
+    profile_id: &str,
+    rest_port: u16,
+    websocket_port: u16,
+) -> Result<NamedTempFile, String> {
     let mut file = tempfile::Builder::new()
         .suffix(".yaml")
         .tempfile()
         .map_err(|error| format!("create profile: {error}"))?;
     let profile = format!(
-        r"id: {PROFILE_ID}
+        r"id: {profile_id}
 display_name: E2E Credential Gating
 category: other
 credentials:
@@ -127,42 +246,13 @@ binaries:
     Ok(file)
 }
 
-async fn install_provider(rest_port: u16, websocket_port: u16) -> Result<(), String> {
-    ensure_provider_resources_absent().await?;
-    let profile = write_provider_profile(rest_port, websocket_port)?;
-    let profile_path = profile
-        .path()
-        .to_str()
-        .ok_or_else(|| "profile path is not UTF-8".to_string())?;
-    let (imported, output) = run_cli(&["profile", "import", "--file", profile_path]).await;
-    if !imported {
-        return Err(format!("profile import failed:\n{output}"));
-    }
-    let credential = format!("{TOKEN_ENV}={TEST_SECRET}");
-    let (created, output) = run_cli(&[
-        "provider",
-        "create",
-        "--name",
-        PROVIDER_NAME,
-        "--type",
-        PROFILE_ID,
-        "--credential",
-        &credential,
-    ])
-    .await;
-    if !created {
-        return Err(format!("provider create failed:\n{output}"));
-    }
-    Ok(())
-}
-
-fn write_endpointless_provider_profile() -> Result<NamedTempFile, String> {
+fn write_endpointless_provider_profile(profile_id: &str) -> Result<NamedTempFile, String> {
     let mut file = tempfile::Builder::new()
         .suffix(".yaml")
         .tempfile()
         .map_err(|error| format!("create endpointless profile: {error}"))?;
     let profile = format!(
-        r"id: {PROFILE_ID}
+        r"id: {profile_id}
 display_name: E2E Endpointless Credential Gating
 category: other
 credentials:
@@ -184,35 +274,6 @@ binaries:
     Ok(file)
 }
 
-async fn install_endpointless_provider() -> Result<(), String> {
-    ensure_provider_resources_absent().await?;
-    let profile = write_endpointless_provider_profile()?;
-    let profile_path = profile
-        .path()
-        .to_str()
-        .ok_or_else(|| "endpointless profile path is not UTF-8".to_string())?;
-    let (imported, output) = run_cli(&["profile", "import", "--file", profile_path]).await;
-    if !imported {
-        return Err(format!("endpointless profile import failed:\n{output}"));
-    }
-    let credential = format!("{TOKEN_ENV}={TEST_SECRET}");
-    let (created, output) = run_cli(&[
-        "provider",
-        "create",
-        "--name",
-        PROVIDER_NAME,
-        "--type",
-        PROFILE_ID,
-        "--credential",
-        &credential,
-    ])
-    .await;
-    if !created {
-        return Err(format!("endpointless provider create failed:\n{output}"));
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 enum EndpointMode {
     L4,
@@ -232,6 +293,7 @@ fn write_policy(
     port: u16,
     mode: EndpointMode,
     credential_source: CredentialSource,
+    provider: &str,
 ) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
     let endpoint_options = match mode {
@@ -250,11 +312,11 @@ fn write_policy(
     let credential_binding = match credential_source {
         CredentialSource::ProviderProfile => String::new(),
         CredentialSource::PolicyBinding => {
-            format!("        credential_binding:\n          provider: {PROVIDER_NAME}\n")
+            format!("        credential_binding:\n          provider: {provider}\n")
         }
     };
     let policy = format!(
-        r#"version: 1
+        r"version: 1
 filesystem_policy:
   include_workdir: true
   read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
@@ -274,7 +336,7 @@ network_policies:
       - path: /usr/bin/python*
       - path: /usr/local/bin/python*
       - path: /sandbox/.uv/python/*/bin/python*
-"#,
+",
     );
     file.write_all(policy.as_bytes())
         .map_err(|error| format!("write policy: {error}"))?;
@@ -631,7 +693,15 @@ with socket.create_connection((host, port), timeout=10) as sock:
     )
 }
 
-async fn sandbox_create_failure(policy: &NamedTempFile) -> String {
+async fn sandbox_create_failure(
+    progress: Progress,
+    label: &str,
+    provider: &str,
+    policy: &NamedTempFile,
+) -> String {
+    progress.step(format_args!(
+        "{label}: creating sandbox, expecting rejection"
+    ));
     let policy_path = policy.path().to_str().expect("policy path is UTF-8");
     let (success, output) = run_cli(&[
         "sandbox",
@@ -639,54 +709,71 @@ async fn sandbox_create_failure(policy: &NamedTempFile) -> String {
         "--policy",
         policy_path,
         "--provider",
-        PROVIDER_NAME,
+        provider,
         "--",
         "echo",
         "must-not-run",
     ])
     .await;
     assert!(!success, "sandbox create unexpectedly succeeded:\n{output}");
+    progress.step(format_args!("{label}: rejected"));
     output
 }
 
+/// Create a sandbox, run one command in it, and delete it.
+///
+/// Returns the create output followed by the command output.
+async fn run_in_sandbox(
+    progress: Progress,
+    label: &str,
+    create_args: &[&str],
+    command: &[&str],
+) -> Result<String, String> {
+    progress.step(format_args!("{label}: creating sandbox"));
+    let mut sandbox = SandboxGuard::create(create_args).await?;
+    progress.step(format_args!(
+        "{label}: sandbox {} ready, running command",
+        sandbox.name
+    ));
+    let output = sandbox.exec(command).await;
+    progress.step(format_args!("{label}: deleting sandbox {}", sandbox.name));
+    sandbox.cleanup().await;
+    progress.step(format_args!("{label}: sandbox deleted"));
+    Ok(format!("{}{}", sandbox.create_output, output?))
+}
+
 async fn assert_gateway_admission(
+    progress: Progress,
+    provider: &str,
     port: u16,
     credential_source: CredentialSource,
 ) -> Result<(), String> {
-    let l4 = write_policy(port, EndpointMode::L4, credential_source)?;
-    let l4_error = sandbox_create_failure(&l4).await;
+    let l4 = write_policy(port, EndpointMode::L4, credential_source, provider)?;
+    let l4_error = sandbox_create_failure(progress, "L4-only policy", provider, &l4).await;
     assert!(l4_error.contains("credentialed endpoint"), "{l4_error}");
     assert!(l4_error.contains("L4-only"), "{l4_error}");
 
-    let tls_skip = write_policy(port, EndpointMode::TlsSkip, credential_source)?;
-    let tls_error = sandbox_create_failure(&tls_skip).await;
+    let tls_skip = write_policy(port, EndpointMode::TlsSkip, credential_source, provider)?;
+    let tls_error = sandbox_create_failure(progress, "tls: skip policy", provider, &tls_skip).await;
     assert!(tls_error.contains("credentialed endpoint"), "{tls_error}");
     assert!(
         tls_error.contains("tls:") && tls_error.contains("skip"),
         "{tls_error}"
     );
 
-    let opt_in = write_policy(port, EndpointMode::L4OptIn, credential_source)?;
-    let opt_in_path = opt_in
-        .path()
-        .to_str()
-        .ok_or_else(|| "opt-in policy path is not UTF-8".to_string())?;
+    let opt_in = write_policy(port, EndpointMode::L4OptIn, credential_source, provider)?;
     let accepted_marker = match credential_source {
         CredentialSource::ProviderProfile => "OPT_IN_ACCEPTED",
         CredentialSource::PolicyBinding => "ENDPOINTLESS_OPT_IN_ACCEPTED",
     };
-    let mut sandbox = SandboxGuard::create(&[
-        "--policy",
-        opt_in_path,
-        "--provider",
-        PROVIDER_NAME,
-        "--",
-        "echo",
-        accepted_marker,
-    ])
+    let output = run_in_sandbox(
+        progress,
+        "opt-in policy",
+        &["--policy", utf8_path(&opt_in)?, "--provider", provider],
+        &["echo", accepted_marker],
+    )
     .await?;
-    assert!(sandbox.create_output.contains(accepted_marker));
-    sandbox.cleanup().await;
+    assert!(output.contains(accepted_marker), "{output}");
     Ok(())
 }
 
@@ -712,168 +799,120 @@ async fn wait_for_provider_key_presence(
     ))
 }
 
-async fn assert_endpointless_provider_env_live_update(port: u16) -> Result<(), String> {
+async fn set_policy(progress: Progress, sandbox: &str, policy_path: &str) -> Result<(), String> {
+    let (success, output) = run_cli(&[
+        "policy",
+        "set",
+        sandbox,
+        "--policy",
+        policy_path,
+        "--wait",
+        "--timeout",
+        "120",
+    ])
+    .await;
+    if !success {
+        return Err(format!("policy update failed:\n{output}"));
+    }
+    progress.step("policy applied");
+    Ok(())
+}
+
+async fn assert_endpointless_provider_env_live_update(
+    progress: Progress,
+    provider: &str,
+    port: u16,
+) -> Result<(), String> {
     let unbound = write_policy(
         port,
         EndpointMode::RestBody { rewrite: false },
         CredentialSource::ProviderProfile,
+        provider,
     )?;
     let bound = write_policy(
         port,
         EndpointMode::RestBody { rewrite: false },
         CredentialSource::PolicyBinding,
+        provider,
     )?;
-    let unbound_path = unbound
-        .path()
-        .to_str()
-        .ok_or_else(|| "unbound policy path is not UTF-8".to_string())?;
-    let bound_path = bound
-        .path()
-        .to_str()
-        .ok_or_else(|| "bound policy path is not UTF-8".to_string())?;
+    let unbound_path = utf8_path(&unbound)?;
+    let bound_path = utf8_path(&bound)?;
 
+    progress.step("creating long-running sandbox with the unbound policy");
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &[
-            "--policy",
-            unbound_path,
-            "--provider",
-            PROVIDER_NAME,
-            "--no-tty",
-        ],
+        &["--policy", unbound_path, "--provider", provider, "--no-tty"],
         &["sh", "-c", "echo PROVIDER_UPDATE_READY && sleep infinity"],
         "PROVIDER_UPDATE_READY",
     )
     .await?;
 
     let result = async {
+        progress.step(format_args!(
+            "sandbox {} ready, waiting for the token to be absent",
+            sandbox.name
+        ));
         wait_for_provider_key_presence(&sandbox, false).await?;
 
-        let (success, output) = run_cli(&[
-            "policy",
-            "set",
-            &sandbox.name,
-            "--policy",
-            bound_path,
-            "--wait",
-            "--timeout",
-            "120",
-        ])
-        .await;
-        if !success {
-            return Err(format!("binding policy update failed:\n{output}"));
-        }
+        progress.step("binding the provider with policy set --wait");
+        set_policy(progress, &sandbox.name, bound_path)
+            .await
+            .map_err(|error| format!("binding {error}"))?;
+        progress.step("waiting for the token placeholder");
         wait_for_provider_key_presence(&sandbox, true).await?;
 
-        let (success, output) = run_cli(&[
-            "policy",
-            "set",
-            &sandbox.name,
-            "--policy",
-            unbound_path,
-            "--wait",
-            "--timeout",
-            "120",
-        ])
-        .await;
-        if !success {
-            return Err(format!("unbinding policy update failed:\n{output}"));
-        }
+        progress.step("unbinding the provider with policy set --wait");
+        set_policy(progress, &sandbox.name, unbound_path)
+            .await
+            .map_err(|error| format!("unbinding {error}"))?;
+        progress.step("waiting for the token to be absent");
         wait_for_provider_key_presence(&sandbox, false).await
     }
     .await;
 
+    progress.step(format_args!("deleting sandbox {}", sandbox.name));
     sandbox.cleanup().await;
+    progress.step("sandbox deleted");
     result
 }
 
 async fn run_body_sandbox(
+    progress: Progress,
+    provider: &str,
     port: u16,
     mode: EndpointMode,
     credential_source: CredentialSource,
 ) -> Result<String, String> {
-    let policy = write_policy(port, mode, credential_source)?;
-    let policy_path = policy
-        .path()
-        .to_str()
-        .ok_or_else(|| "body policy path is not UTF-8".to_string())?;
+    let policy = write_policy(port, mode, credential_source, provider)?;
     let script = body_client_script(port);
-    let mut sandbox = SandboxGuard::create(&[
-        "--policy",
-        policy_path,
-        "--provider",
-        PROVIDER_NAME,
-        "--",
-        "python3",
-        "-c",
-        &script,
-    ])
-    .await?;
-    let output = sandbox.create_output.clone();
-    sandbox.cleanup().await;
-    Ok(output)
+    run_in_sandbox(
+        progress,
+        "REST body client",
+        &["--policy", utf8_path(&policy)?, "--provider", provider],
+        &["python3", "-c", &script],
+    )
+    .await
 }
 
-async fn run_profile_body_sandbox(port: u16) -> Result<String, String> {
-    let policy = write_policy(
-        port,
-        EndpointMode::RestBody { rewrite: false },
-        CredentialSource::ProviderProfile,
-    )?;
-    let policy_path = policy
-        .path()
-        .to_str()
-        .ok_or_else(|| "body policy path is not UTF-8".to_string())?;
-    let script = body_client_script(port);
-    let mut sandbox = SandboxGuard::create(&[
-        "--policy",
-        policy_path,
-        "--provider",
-        PROVIDER_NAME,
-        "--",
-        "python3",
-        "-c",
-        &script,
-    ])
-    .await?;
-    let output = sandbox.create_output.clone();
-    sandbox.cleanup().await;
-    Ok(output)
-}
-
-async fn assert_rest_body_preserves_placeholder(server: &HttpProbeServer) -> Result<(), String> {
-    let output = run_profile_body_sandbox(server.port).await?;
-    assert!(output.contains("BODY_TEXT"));
-    let observations = server.wait_for_observations(1).await;
-    assert_eq!(observations.len(), 1, "observations: {observations:?}");
-    assert!(observations[0].saw_placeholder);
-    assert!(!observations[0].saw_secret);
-    Ok(())
-}
-
-async fn assert_websocket_binary_denied(server: &BinaryWebSocketProbeServer) -> Result<(), String> {
+async fn assert_websocket_binary_denied(
+    progress: Progress,
+    provider: &str,
+    server: &BinaryWebSocketProbeServer,
+) -> Result<(), String> {
     let policy = write_policy(
         server.port,
         EndpointMode::WebSocket,
         CredentialSource::ProviderProfile,
+        provider,
     )?;
-    let policy_path = policy
-        .path()
-        .to_str()
-        .ok_or_else(|| "WebSocket policy path is not UTF-8".to_string())?;
     let script = binary_websocket_client_script(server.port);
-    let mut sandbox = SandboxGuard::create(&[
-        "--policy",
-        policy_path,
-        "--provider",
-        PROVIDER_NAME,
-        "--",
-        "python3",
-        "-c",
-        &script,
-    ])
+    let output = run_in_sandbox(
+        progress,
+        "WebSocket client",
+        &["--policy", utf8_path(&policy)?, "--provider", provider],
+        &["python3", "-c", &script],
+    )
     .await?;
-    assert!(sandbox.create_output.contains("BINARY_DENIED"));
-    sandbox.cleanup().await;
+    assert!(output.contains("BINARY_DENIED"), "{output}");
     assert!(
         server.wait_for_handshake().await,
         "upstream should receive the WebSocket handshake"
@@ -885,56 +924,134 @@ async fn assert_websocket_binary_denied(server: &BinaryWebSocketProbeServer) -> 
     Ok(())
 }
 
-#[tokio::test]
-async fn credentialed_endpoint_gates_work_end_to_end() {
+/// Start both probe servers and install a provider whose profile declares
+/// their endpoints.
+async fn profile_endpoint_fixture(
+    progress: Progress,
+) -> (HttpProbeServer, BinaryWebSocketProbeServer, GatingProvider) {
     let server = HttpProbeServer::start().await.expect("start HTTP probe");
     let websocket_server = BinaryWebSocketProbeServer::start()
         .await
         .expect("start WebSocket probe");
-    install_provider(server.port, websocket_server.port)
-        .await
-        .expect("install credentialed provider");
+    let provider =
+        GatingProvider::install_with_endpoints(progress, server.port, websocket_server.port)
+            .await
+            .expect("install credentialed provider");
+    (server, websocket_server, provider)
+}
 
-    let result = async {
-        assert_rest_body_preserves_placeholder(&server).await?;
-        assert_websocket_binary_denied(&websocket_server).await
-    }
-    .await;
-
-    cleanup_provider_resources().await;
-    result.expect("credential gating E2E");
-
-    install_endpointless_provider()
+/// Start the HTTP probe server and install a provider whose profile declares
+/// no endpoints, so policies must bind it explicitly.
+async fn endpointless_fixture(progress: Progress) -> (HttpProbeServer, GatingProvider) {
+    let server = HttpProbeServer::start().await.expect("start HTTP probe");
+    let provider = GatingProvider::install_endpointless(progress)
         .await
         .expect("install endpointless provider");
-    let endpointless_result = async {
-        assert_gateway_admission(server.port, CredentialSource::PolicyBinding).await?;
-        let literal = run_body_sandbox(
-            server.port,
-            EndpointMode::RestBody { rewrite: false },
-            CredentialSource::PolicyBinding,
-        )
-        .await?;
-        assert!(literal.contains("BODY_TEXT"));
-        let rewritten = run_body_sandbox(
-            server.port,
-            EndpointMode::RestBody { rewrite: true },
-            CredentialSource::PolicyBinding,
-        )
-        .await?;
-        assert!(rewritten.contains("BODY_REWRITTEN"));
-        assert!(!rewritten.contains(TEST_SECRET));
-        assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
-        let observations = server.wait_for_observations(3).await;
-        assert_eq!(observations.len(), 3, "observations: {observations:?}");
-        assert!(observations[1].saw_placeholder);
-        assert!(!observations[1].saw_secret);
-        assert!(!observations[2].saw_placeholder);
-        assert!(observations[2].saw_secret);
-        assert_endpointless_provider_env_live_update(server.port).await?;
-        Ok::<(), String>(())
-    }
-    .await;
-    cleanup_provider_resources().await;
-    endpointless_result.expect("endpointless provider credential gating E2E");
+    (server, provider)
+}
+
+#[tokio::test]
+async fn profile_rest_endpoint_keeps_body_placeholder() {
+    let progress = Progress::start("profile-rest");
+    let (server, _websocket_server, provider) = profile_endpoint_fixture(progress).await;
+
+    let output = run_body_sandbox(
+        progress,
+        &provider.name,
+        server.port,
+        EndpointMode::RestBody { rewrite: false },
+        CredentialSource::ProviderProfile,
+    )
+    .await
+    .expect("run REST body client");
+    assert!(output.contains("BODY_TEXT"), "{output}");
+    let observations = server.wait_for_observations(1).await;
+    assert_eq!(observations.len(), 1, "observations: {observations:?}");
+    assert!(observations[0].saw_placeholder);
+    assert!(!observations[0].saw_secret);
+    progress.step("checks passed");
+}
+
+#[tokio::test]
+async fn profile_websocket_endpoint_denies_binary_frames() {
+    let progress = Progress::start("profile-websocket");
+    let (_server, websocket_server, provider) = profile_endpoint_fixture(progress).await;
+
+    assert_websocket_binary_denied(progress, &provider.name, &websocket_server)
+        .await
+        .expect("run WebSocket client");
+    progress.step("checks passed");
+}
+
+#[tokio::test]
+async fn policy_binding_requires_inspection_or_opt_in() {
+    let progress = Progress::start("binding-admission");
+    let (server, provider) = endpointless_fixture(progress).await;
+
+    assert_gateway_admission(
+        progress,
+        &provider.name,
+        server.port,
+        CredentialSource::PolicyBinding,
+    )
+    .await
+    .expect("gateway admission");
+    progress.step("checks passed");
+}
+
+#[tokio::test]
+async fn policy_binding_rest_body_keeps_placeholder_without_rewrite() {
+    let progress = Progress::start("binding-body");
+    let (server, provider) = endpointless_fixture(progress).await;
+
+    let literal = run_body_sandbox(
+        progress,
+        &provider.name,
+        server.port,
+        EndpointMode::RestBody { rewrite: false },
+        CredentialSource::PolicyBinding,
+    )
+    .await
+    .expect("run REST body client");
+    assert!(literal.contains("BODY_TEXT"), "{literal}");
+    let observations = server.wait_for_observations(1).await;
+    assert_eq!(observations.len(), 1, "observations: {observations:?}");
+    assert!(observations[0].saw_placeholder);
+    assert!(!observations[0].saw_secret);
+    progress.step("checks passed");
+}
+
+#[tokio::test]
+async fn policy_binding_rest_body_rewrite_sends_secret_upstream() {
+    let progress = Progress::start("binding-rewrite");
+    let (server, provider) = endpointless_fixture(progress).await;
+
+    let rewritten = run_body_sandbox(
+        progress,
+        &provider.name,
+        server.port,
+        EndpointMode::RestBody { rewrite: true },
+        CredentialSource::PolicyBinding,
+    )
+    .await
+    .expect("run REST body client");
+    assert!(rewritten.contains("BODY_REWRITTEN"));
+    assert!(!rewritten.contains(TEST_SECRET));
+    assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
+    let observations = server.wait_for_observations(1).await;
+    assert_eq!(observations.len(), 1, "observations: {observations:?}");
+    assert!(!observations[0].saw_placeholder);
+    assert!(observations[0].saw_secret);
+    progress.step("checks passed");
+}
+
+#[tokio::test]
+async fn policy_binding_updates_provider_environment_live() {
+    let progress = Progress::start("binding-live-update");
+    let (server, provider) = endpointless_fixture(progress).await;
+
+    assert_endpointless_provider_env_live_update(progress, &provider.name, server.port)
+        .await
+        .expect("provider environment live update");
+    progress.step("checks passed");
 }

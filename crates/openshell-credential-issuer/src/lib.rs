@@ -6,6 +6,7 @@
 
 mod embedded;
 mod owner;
+pub mod refresh;
 mod refresh_material;
 
 pub use embedded::EmbeddedCredentialIssuer;
@@ -84,7 +85,7 @@ impl RefreshMaterialScope<'_> {
 
 /// Plain Rust projection of a pending deletion; no gateway-private protobufs
 /// cross the issuer boundary. Missing fields retain existing recovery errors.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RefreshMaterialDeletion {
     pub material_key: String,
     pub handle: Option<CredentialHandle>,
