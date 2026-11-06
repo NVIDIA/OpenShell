@@ -14,8 +14,8 @@ A middleware service handles one or more operations, such as HTTP requests or We
 
 | Operation | Phase | When OpenShell calls your service | RPC |
 | --- | --- | --- | --- |
-| `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `HttpHooks.EvaluateRequest`, or legacy `EvaluateHttpRequest` |
-| `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `HttpHooks.EvaluateResponse`, or legacy `HttpResponsePreReturn.Evaluate` |
+| `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `HttpHooks.EvaluateHttpRequestHook`, or legacy `EvaluateHttpRequest` |
+| `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `HttpHooks.EvaluateHttpResponseHook`, or legacy `HttpResponsePreReturn.Evaluate` |
 | `WEBSOCKET_MESSAGE` | `PRE_CREDENTIALS` | When the sandbox opens a WebSocket connection, and for each text message it sends. | `EvaluateWebSocketSession` |
 
 Your service declares each operation it supports as a binding, an operation and its phase, in its `Describe` manifest. OpenShell calls your service only for the operations it declares.
@@ -42,7 +42,7 @@ OpenShell never forwards free-form text from your service to the sandbox or to l
 
 ## HTTP
 
-HTTP middleware inspects requests before OpenShell injects provider credentials and responses before the sandbox receives them. Implement `HttpHooks.EvaluateRequest` for `HTTP_REQUEST`, `HttpHooks.EvaluateResponse` for `HTTP_RESPONSE`, or both.
+HTTP middleware inspects requests before OpenShell injects provider credentials and responses before the sandbox receives them. Implement `HttpHooks.EvaluateHttpRequestHook` for `HTTP_REQUEST`, `HttpHooks.EvaluateHttpResponseHook` for `HTTP_RESPONSE`, or both.
 
 Serve `HttpHooks` on the same endpoint as `SupervisorMiddleware`, which handles discovery and configuration. Each RPC invocation serves one binding phase, identified by `phase` in its preflight. Requests currently use `PRE_CREDENTIALS`; responses use `PRE_RETURN`.
 

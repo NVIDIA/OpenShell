@@ -9,6 +9,21 @@ import "google/protobuf/struct.proto";
 import "google/protobuf/duration.proto";
 import "extension.proto";
 
+// Service and RPC naming.
+//
+// A middleware implements SupervisorMiddleware and the hook services for the
+// traffic it wants to inspect, all on one endpoint. Generated servers in some
+// languages, such as Python and Go, name each handler method after the RPC
+// alone, so one object that implements several of these services can have
+// only one handler per RPC name. Every RPC name must therefore be unique across
+// all services in this package, including deprecated ones.
+//
+// To add hooks for another protocol, add a <Protocol>Hooks service. Name each
+// RPC Evaluate<Protocol><Unit>Hook, after the unit it evaluates, and its
+// messages <Protocol><Unit>HookEvent and <Protocol><Unit>HookResult. For
+// example: HttpHooks.EvaluateHttpRequestHook(stream HttpRequestHookEvent)
+// returns (stream HttpRequestHookResult).
+
 // SupervisorMiddleware discovers and configures one operator-run middleware.
 // It evaluates legacy HTTP requests and WebSocket messages.
 // Hook-specific services share the same registration and endpoint.
@@ -20,7 +35,7 @@ service SupervisorMiddleware {
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
 
   // Deprecated: legacy HTTP hooks, removed in 0.2.0. Use
-  // HttpHooks.EvaluateRequest.
+  // HttpHooks.EvaluateHttpRequestHook.
   // EvaluateHttpRequest returns an allow, deny, or mutation decision for one
   // buffered HTTP request. OpenShell calls it for the HTTP_REQUEST bindings of
   // a service that does not require the HTTP hooks capability.
@@ -49,14 +64,14 @@ service HttpHooks {
   // extension.required_capabilities. Peers that predate HTTP hooks
   // reject such a service at Describe. One stream per request and middleware
   // stage. The first event is a request preflight.
-  rpc EvaluateRequest(stream HttpRequestHookEvent)
+  rpc EvaluateHttpRequestHook(stream HttpRequestHookEvent)
       returns (stream HttpRequestHookResult);
 
   // HTTP hooks for responses, for the HTTP_RESPONSE bindings of a
   // service that requires the HTTP hooks capability. One stream per
   // response and middleware stage. The first event is a preflight of the
   // response head.
-  rpc EvaluateResponse(stream HttpResponseHookEvent)
+  rpc EvaluateHttpResponseHook(stream HttpResponseHookEvent)
       returns (stream HttpResponseHookResult);
 }
 
@@ -67,7 +82,7 @@ message MiddlewareDescribeRequest {
 }
 
 // Deprecated: legacy HTTP hooks, removed in 0.2.0. Use
-// HttpHooks.EvaluateResponse.
+// HttpHooks.EvaluateHttpResponseHook.
 // HttpResponsePreReturn evaluates one response for one middleware stage before
 // OpenShell returns it to the sandbox. OpenShell calls it for the HTTP_RESPONSE
 // bindings of a service that does not require the HTTP hooks
@@ -146,7 +161,7 @@ message ValidateConfigResponse {
   string reason = 2;
 }
 
-// HTTP hooks. One ordered event in a HttpHooks.EvaluateRequest
+// HTTP hooks. One ordered event in a HttpHooks.EvaluateHttpRequestHook
 // stream. Preflight is always first and sees the preceding stage's completed
 // output headers. An inspect result is followed by begin
 // and exactly one body lifecycle: whole_body for WHOLE_BODY, or input_chunk
@@ -163,7 +178,7 @@ message HttpRequestHookEvent {
   }
 }
 
-// HTTP hooks. One ordered event in a HttpHooks.EvaluateResponse
+// HTTP hooks. One ordered event in a HttpHooks.EvaluateHttpResponseHook
 // stream, in the order HttpRequestHookEvent describes.
 message HttpResponseHookEvent {
   oneof event {
@@ -176,7 +191,7 @@ message HttpResponseHookEvent {
   }
 }
 
-// HTTP hooks. One ordered result in a HttpHooks.EvaluateRequest
+// HTTP hooks. One ordered result in a HttpHooks.EvaluateHttpRequestHook
 // stream. Preflight requires preflight_result or deny. WHOLE_BODY ends with
 // whole_body_result or deny. DUPLEX sends output_start before any
 // output_chunk, even for an empty output, and ends with finish or deny. An
@@ -196,7 +211,7 @@ message HttpRequestHookResult {
   }
 }
 
-// HTTP hooks. One ordered result in a HttpHooks.EvaluateResponse
+// HTTP hooks. One ordered result in a HttpHooks.EvaluateHttpResponseHook
 // stream, under the rules HttpRequestHookResult describes, with
 // block_delivery instead of deny. Blocking delivery does not undo the
 // request already handled by the external service.
@@ -911,13 +926,13 @@ message MiddlewareExchangeProtocolError {}
 enum SupervisorMiddlewareOperation {
   SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
   // An HTTP request at PRE_CREDENTIALS. OpenShell calls
-  // HttpHooks.EvaluateRequest when the service requires the
+  // HttpHooks.EvaluateHttpRequestHook when the service requires the
   // openshell.supervisor-middleware.http-hooks capability, and the
   // deprecated EvaluateHttpRequest otherwise.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
   SUPERVISOR_MIDDLEWARE_OPERATION_WEBSOCKET_MESSAGE = 2;
   // A final HTTP response at PRE_RETURN. OpenShell calls
-  // HttpHooks.EvaluateResponse when the service requires the HTTP
+  // HttpHooks.EvaluateHttpResponseHook when the service requires the HTTP
   // hooks capability, and the deprecated HttpResponsePreReturn.Evaluate
   // otherwise.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE = 3;

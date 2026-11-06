@@ -19,7 +19,7 @@ links:
 |------|------------|--------|
 | 2026-07-17 | [#2010](https://github.com/NVIDIA/OpenShell/issues/2010) | Added unary HTTP request middleware with built-in and operator-run services. |
 | 2026-07-28 | [#2428](https://github.com/NVIDIA/OpenShell/issues/2428) | Added WebSocket preflight and text-message evaluation, and aligned the middleware API names, limits, and diagnostics. |
-| 2026-10-08 | [#2431](https://github.com/NVIDIA/OpenShell/issues/2431), [#3307](https://github.com/NVIDIA/OpenShell/issues/3307) | Added HTTP hooks (`HttpHooks.EvaluateRequest` and `HttpHooks.EvaluateResponse`), selected by a required extension capability, with buffered and streamed bodies, and deprecated legacy HTTP hooks. |
+| 2026-10-08 | [#2431](https://github.com/NVIDIA/OpenShell/issues/2431), [#3307](https://github.com/NVIDIA/OpenShell/issues/3307) | Added HTTP hooks (`HttpHooks.EvaluateHttpRequestHook` and `HttpHooks.EvaluateHttpResponseHook`), selected by a required extension capability, with buffered and streamed bodies, and deprecated legacy HTTP hooks. |
 
 ## Summary
 
@@ -305,7 +305,7 @@ The `originating_process` is the same identity OpenShell resolves on the egress 
 
 #### HTTP hooks
 
-- **RPCs.** `HttpHooks.EvaluateRequest` and `HttpHooks.EvaluateResponse` are bidirectional streams, each with its own event and result messages. One stream serves one stage for one HTTP message.
+- **RPCs.** `HttpHooks.EvaluateHttpRequestHook` and `HttpHooks.EvaluateHttpResponseHook` are bidirectional streams, each with its own event and result messages. One stream serves one stage for one HTTP message.
 - **Lifecycle.** Each stream starts with a preflight. The stage then continues without the body, rejects, or inspects the body as one `WHOLE_BODY` message or as a `DUPLEX` stream. HTTP preflights handle HTTP messages only, so connections OpenShell cannot inspect follow the chain-level rule above.
 - **Limits.** A `DUPLEX` stream has no total time or size limit, unless the route buffers request output before upstream contact. Then the preflight reports the route's own buffering limit as `max_output_body_bytes`, such as 10 MiB for SigV4 body signing.
 - **Failure behavior.** HTTP hooks always fail closed. The gateway rejects `on_error: fail_open` for them.
