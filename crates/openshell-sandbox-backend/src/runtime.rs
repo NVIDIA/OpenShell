@@ -494,10 +494,6 @@ impl OpenShellRuntimeBackend {
         };
         validate_runtime_descriptor(&runtime_descriptor, &sandbox)?;
         let host_gateway_ip = runtime_descriptor.host_gateway_ip;
-        let resource_claims = runtime_descriptor.resource_claims.clone();
-        let generation = runtime_descriptor.generation.clone();
-        let session_id = runtime_descriptor.session_id;
-        let provisioning_evidence = runtime_descriptor.provisioning_evidence.clone();
         let mut client = BoundaryClient::with_backend(
             runtime_descriptor,
             self.sandbox_bearer.clone(),
@@ -524,14 +520,7 @@ impl OpenShellRuntimeBackend {
                 supervisor_recovery_timeout_secs: client.recovery_timeout_secs,
             })
             .await?;
-        let Response::Attached { snapshot } = response else {
-            return Err(unexpected_response("attached", &response));
-        };
-        if snapshot.generation != generation {
-            return Err(BackendError::Confirm(
-                "sandbox session snapshot generation does not match runtime descriptor".to_string(),
-            ));
-        }
+        let snapshot = client.check_attached(response)?;
         let takeover = self.takeover.is_some().then(|| RecoveredSession {
             // Later reconnects reattach without the grant, with the launch
             // controls the runtime already enforces.
@@ -547,10 +536,6 @@ impl OpenShellRuntimeBackend {
             ca_file_paths: self.ca_file_paths.clone(),
             provider_credentials: self.provider_credentials.clone(),
             identity: sandbox.identity,
-            generation,
-            session_id,
-            resource_claims,
-            provisioning_evidence,
             takeover,
         }))
     }
@@ -694,10 +679,6 @@ pub struct BoundBoundary {
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     identity: ResolvedWorkloadIdentity,
-    generation: String,
-    session_id: openshell_core::SandboxSessionId,
-    resource_claims: std::collections::BTreeMap<String, String>,
-    provisioning_evidence: openshell_isolation_interface::contract::ProvisioningEvidence,
     takeover: Option<RecoveredSession>,
 }
 
@@ -741,9 +722,7 @@ impl BoundBoundary {
 
     pub async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
         let response = self.client.call_idempotent(Request::Confirm).await?;
-        let Response::Confirmed { confirmation } = response else {
-            return Err(unexpected_response("confirmed", &response));
-        };
+        let confirmation = self.client.launch_confirmation(response)?;
         // A confirmed takeover pins this process at the granted epoch. From
         // now on a reconnect reattaches without the grant, so its expiry
         // cannot break transport recovery while confirmation is validated.
@@ -753,17 +732,6 @@ impl BoundBoundary {
             .map(|takeover| takeover.reattach_policy.clone());
         if let Some(policy) = &reattach_policy {
             self.client.forget_takeover_grant(policy.clone())?;
-        }
-        if confirmation.generation != self.generation
-            || confirmation.session_id != self.session_id
-            || confirmation.resource_claims != self.resource_claims
-            || confirmation.provisioning_evidence_digest
-                != self.provisioning_evidence.evidence_digest
-        {
-            return Err(BackendError::Confirm(
-                "sandbox confirmation generation, session, resource claims, or provisioning evidence do not match runtime descriptor"
-                    .to_string(),
-            ));
         }
         if self.client.backend_name == crate::BACKEND_NAME {
             crate::audit::validate_native_linux_audit(&confirmation.backend_audit)?;
@@ -1803,6 +1771,54 @@ impl BoundaryClient {
         }
     }
 
+    /// Check an Attach reply, including replays on reconnect, against the launch.
+    fn check_attached(
+        &self,
+        response: Response,
+    ) -> Result<crate::boundary_protocol::SessionSnapshotWire, BackendError> {
+        let Response::Attached { snapshot } = response else {
+            return Err(unexpected_response("attached", &response));
+        };
+        if snapshot.generation != self.runtime_descriptor.generation {
+            return Err(BackendError::Confirm(
+                "sandbox session snapshot generation does not match runtime descriptor".to_string(),
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    /// Check a Confirm reply against the launch. Reconnect, credential renewal
+    /// and liveness probes replay Confirm, so every reply gets the same check.
+    fn launch_confirmation(
+        &self,
+        response: Response,
+    ) -> Result<Box<BoundaryConfirmation>, BackendError> {
+        let Response::Confirmed { confirmation } = response else {
+            return Err(unexpected_response("confirmed", &response));
+        };
+        let launch = &self.runtime_descriptor;
+        let mismatch = if confirmation.identity != launch.workload_identity {
+            "identity"
+        } else if confirmation.generation.is_empty() {
+            "generation (empty)"
+        } else if confirmation.generation != launch.generation {
+            "generation"
+        } else if confirmation.session_id != launch.session_id {
+            "session"
+        } else if confirmation.resource_claims != launch.resource_claims {
+            "resource claims"
+        } else if confirmation.provisioning_evidence_digest
+            != launch.provisioning_evidence.evidence_digest
+        {
+            "provisioning evidence"
+        } else {
+            return Ok(confirmation);
+        };
+        Err(BackendError::Confirm(format!(
+            "sandbox confirmation {mismatch} does not match runtime descriptor"
+        )))
+    }
+
     /// Reattach on the confirmed connection as the promoted owner and read the
     /// processes to adopt from that snapshot.
     async fn refresh_recovered_processes(
@@ -1817,14 +1833,7 @@ impl BoundaryClient {
                 supervisor_recovery_timeout_secs: self.recovery_timeout_secs,
             })
             .await?;
-        let Response::Attached { snapshot } = response else {
-            return Err(unexpected_response("attached", &response));
-        };
-        if snapshot.generation != self.runtime_descriptor.generation {
-            return Err(BackendError::Confirm(
-                "sandbox session snapshot generation does not match runtime descriptor".to_string(),
-            ));
-        }
+        let snapshot = self.check_attached(response)?;
         Ok(RecoveredProcesses::from_snapshot(&snapshot))
     }
 
@@ -2138,7 +2147,12 @@ impl BoundaryClient {
             .map_err(|_| {
                 BackendError::Unavailable("boundary credential renewal timed out".to_string())
             })??;
-            expect_response(response, "confirmed")?;
+            if let Err(error) = self.launch_confirmation(response) {
+                // A backend answering for another launch keeps no live streams.
+                cached.transport.abort();
+                *self.mediation.lock().await = None;
+                return Err(error);
+            }
             if let Some(current) = self.grpc_channel.lock().await.as_mut()
                 && current.generation == cached.generation
             {
@@ -2260,14 +2274,15 @@ impl BoundaryClient {
         let Ok(credential) = BoundaryCredential::capture(&self.sandbox_bearer) else {
             return false;
         };
-        matches!(
-            tokio::time::timeout(
-                CONNECTION_PROBE_TIMEOUT,
-                self.exchange_on_channel(cached.channel.clone(), confirm, &credential),
-            )
-            .await,
-            Ok(Ok(Response::Confirmed { .. }))
+        let Ok(Ok(response)) = tokio::time::timeout(
+            CONNECTION_PROBE_TIMEOUT,
+            self.exchange_on_channel(cached.channel.clone(), confirm, &credential),
         )
+        .await
+        else {
+            return false;
+        };
+        self.launch_confirmation(response).is_ok()
     }
 
     /// Open a new physical connection and replay the authenticated lifecycle,
@@ -2280,11 +2295,15 @@ impl BoundaryClient {
     ) -> Result<(tonic::transport::Channel, Arc<TransportAbort>), BackendError> {
         let (channel, transport) = self.build_grpc_channel(credential).await?;
         let result = async {
-            self.exchange_on_channel(channel.clone(), attach, credential)
+            let attached = self
+                .exchange_on_channel(channel.clone(), attach, credential)
                 .await?;
+            self.check_attached(attached)?;
             if let Some(confirm) = confirm {
-                self.exchange_on_channel(channel.clone(), confirm, credential)
+                let confirmed = self
+                    .exchange_on_channel(channel.clone(), confirm, credential)
                     .await?;
+                self.launch_confirmation(confirmed)?;
             }
             Ok(())
         }
@@ -2933,9 +2952,7 @@ fn connect_host_vsock(
 fn expect_response(response: Response, expected: &str) -> Result<(), BackendError> {
     let matches = matches!(
         (&response, expected),
-        (Response::Attached { .. }, "attached")
-            | (Response::Confirmed { .. }, "confirmed")
-            | (Response::Signaled, "signaled")
+        (Response::Signaled, "signaled")
             | (Response::Terminated, "terminated")
             | (Response::BoundaryTerminated, "boundary_terminated")
     );
@@ -3570,6 +3587,7 @@ mod tests {
 
     #[derive(Clone)]
     struct TestGrpcBoundary {
+        attach_generation: String,
         wait_for_half_close: bool,
         expected_token: String,
         requests: Arc<std::sync::atomic::AtomicUsize>,
@@ -3611,6 +3629,7 @@ mod tests {
             let mediation_ready = self.mediation_ready;
             let provider_environment_generation = self.provider_environment_generation;
             let confirmation = self.confirmation.clone();
+            let attach_generation = self.attach_generation.clone();
             let attach_snapshots = self.attach_snapshots.clone();
             let received = self.received.clone();
             let (outbound, outbound_rx) = tokio::sync::mpsc::channel(1);
@@ -3680,7 +3699,7 @@ mod tests {
                                     .unwrap_or_default();
                                 Response::Attached {
                                     snapshot: crate::boundary_protocol::SessionSnapshotWire {
-                                        generation: "test-generation".to_string(),
+                                        generation: attach_generation,
                                         processes,
                                         bound_policy: None,
                                     },
@@ -3809,6 +3828,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let service = TestGrpcBoundary {
+            attach_generation: "test-generation".to_string(),
             wait_for_half_close: false,
             expected_token: "a".repeat(32),
             requests: requests.clone(),
@@ -3885,6 +3905,7 @@ mod tests {
                     .unwrap();
                 server_accepted.fetch_add(1, Ordering::AcqRel);
                 let service = TestGrpcBoundary {
+                    attach_generation: "test-generation".to_string(),
                     wait_for_half_close: false,
                     expected_token: "a".repeat(32),
                     requests: server_requests.clone(),
@@ -4000,6 +4021,7 @@ mod tests {
                     .await
                     .unwrap();
                 let service = TestGrpcBoundary {
+                    attach_generation: "test-generation".to_string(),
                     wait_for_half_close: false,
                     expected_token: "a".repeat(32),
                     requests: server_requests.clone(),
@@ -4059,6 +4081,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let service = TestGrpcBoundary {
+            attach_generation: "test-generation".to_string(),
             wait_for_half_close: true,
             expected_token: "a".repeat(32),
             requests,
@@ -4263,6 +4286,7 @@ mod tests {
         confirmation: BoundaryConfirmation,
     ) {
         let service = TestGrpcBoundary {
+            attach_generation: "test-generation".to_string(),
             wait_for_half_close: false,
             expected_token,
             requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4374,7 +4398,6 @@ mod tests {
         });
 
         let descriptor = tls_runtime_descriptor(address, certificate.client_tls);
-        let provisioning_evidence = descriptor.provisioning_evidence.clone();
         let context = sandbox();
         let client = Arc::new(BoundaryClient::new(
             descriptor,
@@ -4397,10 +4420,6 @@ mod tests {
                     HashMap::new(),
                 ),
             identity: context.identity,
-            generation: "test-generation".to_string(),
-            session_id: test_session_id(),
-            resource_claims: std::collections::BTreeMap::new(),
-            provisioning_evidence,
             takeover: None,
         };
 
@@ -4785,6 +4804,7 @@ mod tests {
         let accepted_by_server = accepted.clone();
         let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let service = TestGrpcBoundary {
+            attach_generation: "test-generation".to_string(),
             wait_for_half_close: false,
             expected_token: "a".repeat(32),
             requests: handled.clone(),
@@ -4860,6 +4880,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let service = TestGrpcBoundary {
+            attach_generation: "test-generation".to_string(),
             wait_for_half_close: false,
             expected_token: "a".repeat(32),
             requests: requests.clone(),
@@ -4930,6 +4951,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let service = TestGrpcBoundary {
+            attach_generation: "test-generation".to_string(),
             wait_for_half_close: false,
             expected_token: "a".repeat(32),
             requests: requests.clone(),
@@ -5071,6 +5093,7 @@ mod tests {
         ])));
         let received = Arc::new(std::sync::Mutex::new(Vec::new()));
         let service = TestGrpcBoundary {
+            attach_generation: "test-generation".to_string(),
             wait_for_half_close: false,
             expected_token: "a".repeat(32),
             requests: Arc::default(),
