@@ -115,13 +115,6 @@ it. For a protocol in which the server sends first, such as SMTP, set
 Use an inspected endpoint when the request, not only the destination,
 determines the risk, such as allowing reads but not writes on an API.
 
-For HTTP traffic that OpenShell parses inside a CONNECT tunnel, it closes the
-client connection when the upstream closes while idle. If forwarding fails before the
-upstream sends any response bytes, OpenShell returns `502 Bad Gateway` with
-`Connection: close` and logs the upstream failure. OpenShell does not replay
-the request: a missing response does not prove that the upstream did not execute
-it. Once a response has started, a transport failure closes the connection.
-
 ### Enforcement
 
 The `enforcement` field on an inspected endpoint decides what happens when a

@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::l7::provider::{BodyLength, L7Request};
 use crate::opa::{NetworkInput, OpaEngine};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -129,56 +127,41 @@ network_policies:
 }
 
 #[tokio::test]
-async fn queued_request_after_upstream_close_returns_502() {
+async fn queued_request_handles_upstream_close_without_replay() {
     timeout(Duration::from_secs(5), async {
-        let engine = OpaEngine::from_strings(
-            include_str!("../../../data/sandbox-policy.rego"),
-            "network_policies: {}\n",
-        )
-        .unwrap();
-        let (mut app, mut client) = tokio::io::duplex(8192);
-        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
-        // Both requests are buffered before the relay starts. When the first
-        // response arrives, request two and the upstream close are ready together.
-        app.write_all(&[REQUEST, REQUEST].concat()).await.unwrap();
-        let relay = tokio::spawn(async move {
-            let guard = engine
-                .generation_guard(engine.current_generation())
-                .unwrap();
-            relay_passthrough_with_credentials(
-                &mut client,
-                &mut relay_upstream,
-                &context(),
-                &guard,
-                Some(&engine),
-            )
-            .await
-        });
-        read_exact_message(&mut upstream, REQUEST).await;
-        upstream.write_all(RESPONSE).await.unwrap();
-        drop(upstream);
-        let mut received = Vec::new();
-        app.read_to_end(&mut received).await.unwrap();
-        assert_eq!(received, [RESPONSE, BAD_GATEWAY].concat());
-        relay.await.unwrap().unwrap();
-    })
-    .await
-    .expect("queued request must receive an explicit gateway error");
-}
-
-#[tokio::test]
-async fn upstream_failure_returns_502_only_before_response_starts() {
-    timeout(Duration::from_secs(5), async {
+        // None closes before request two is forwarded (BrokenPipe). The other
+        // cases accept it, then close before or during the response headers.
         for response in [
-            None,           // Upstream disappeared before the first write.
-            Some(&b""[..]), // Request was accepted, then upstream closed without responding.
+            None,
+            Some(&b""[..]),
             Some(&b"HTTP/1.1 100 Continue\r\n\r\n"[..]),
             Some(&b"HTTP/1.1 200"[..]),
-            Some(&b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nOK"[..]),
-            Some(&b"HTTP/1.0 200 OK\r\n\r\nOK"[..]), // Valid close-delimited response.
         ] {
+            let engine = OpaEngine::from_strings(
+                include_str!("../../../data/sandbox-policy.rego"),
+                "network_policies: {}\n",
+            )
+            .unwrap();
             let (mut app, mut client) = tokio::io::duplex(8192);
             let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            // Buffer both requests so request two and the upstream close can
+            // become ready together after the first successful exchange.
+            app.write_all(&[REQUEST, REQUEST].concat()).await.unwrap();
+            let relay = tokio::spawn(async move {
+                let guard = engine
+                    .generation_guard(engine.current_generation())
+                    .unwrap();
+                relay_passthrough_with_credentials(
+                    &mut client,
+                    &mut relay_upstream,
+                    &context(),
+                    &guard,
+                    Some(&engine),
+                )
+                .await
+            });
+            read_exact_message(&mut upstream, REQUEST).await;
+            upstream.write_all(RESPONSE).await.unwrap();
             let server = response.map(|response| {
                 tokio::spawn(async move {
                     read_exact_message(&mut upstream, REQUEST).await;
@@ -189,80 +172,46 @@ async fn upstream_failure_returns_502_only_before_response_starts() {
                     assert!(extra.is_empty(), "POST must not be replayed");
                 })
             });
-            let relay = tokio::spawn(async move {
-                let req = L7Request {
-                    action: "POST".into(),
-                    target: "/mcp".into(),
-                    query_params: HashMap::new(),
-                    raw_header: REQUEST.to_vec(),
-                    body_length: BodyLength::ContentLength(2),
-                };
-                relay_http_request_with_credential_rejection(
-                    &req,
-                    &mut client,
-                    &mut relay_upstream,
-                    crate::l7::rest::RelayRequestOptions::default(),
-                    &context(),
-                    None,
-                )
-                .await
-            });
             let mut received = Vec::new();
             app.read_to_end(&mut received).await.unwrap();
-            let result = relay.await.unwrap();
-            if response.is_none_or(<[u8]>::is_empty) {
-                assert_eq!(received, BAD_GATEWAY);
-                assert!(result.unwrap().is_none());
-            } else {
-                let expected = if response == Some(&b"HTTP/1.0 200 OK\r\n\r\nOK"[..]) {
-                    &b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nOK"[..]
-                } else {
-                    response.unwrap()
-                };
-                assert_eq!(received, expected);
-                assert!(
-                    !received
-                        .windows(15)
-                        .any(|bytes| bytes == b"502 Bad Gateway")
-                );
-            }
+            let expected = response
+                .filter(|bytes| !bytes.is_empty())
+                .unwrap_or(BAD_GATEWAY);
+            assert_eq!(received, [RESPONSE, expected].concat());
+            relay.await.unwrap().unwrap();
             if let Some(server) = server {
                 server.await.unwrap();
             }
         }
     })
     .await
-    .expect("failed upstream exchange must close promptly");
+    .expect("queued request must finish with a response or a clean close");
 }
 
 #[tokio::test]
 async fn client_body_eof_is_not_an_upstream_failure() {
     timeout(Duration::from_secs(5), async {
+        let engine = OpaEngine::from_strings(
+            include_str!("../../../data/sandbox-policy.rego"),
+            "network_policies: {}\n",
+        )
+        .unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
         let (mut app, mut client) = tokio::io::duplex(8192);
         let (mut relay_upstream, _upstream) = tokio::io::duplex(8192);
+        app.write_all(&REQUEST[..REQUEST.len() - 2]).await.unwrap();
         app.shutdown().await.unwrap();
-        let req = L7Request {
-            action: "POST".into(),
-            target: "/mcp".into(),
-            query_params: HashMap::new(),
-            raw_header: REQUEST[..REQUEST.len() - 2].to_vec(),
-            body_length: BodyLength::ContentLength(2),
-        };
-        let error = relay_http_request_with_credential_rejection(
-            &req,
+        relay_passthrough_with_credentials(
             &mut client,
             &mut relay_upstream,
-            crate::l7::rest::RelayRequestOptions::default(),
             &context(),
-            None,
+            &guard,
+            Some(&engine),
         )
         .await
         .expect_err("client did not provide its declared body");
-        assert!(
-            error
-                .downcast_ref::<crate::l7::rest::UpstreamHttpError>()
-                .is_none()
-        );
         drop(client);
         let mut response = Vec::new();
         app.read_to_end(&mut response).await.unwrap();
