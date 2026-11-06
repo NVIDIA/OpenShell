@@ -1513,9 +1513,11 @@ fn apply_ocsf_json_setting(
 fn apply_process_exec_setting(
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
 ) {
-    crate::process_activity::request_exec_events(
-        extract_bool_setting(settings, "ocsf_process_exec_enabled").unwrap_or(false),
-    );
+    crate::process_activity::request_recording(crate::process_activity::Recording {
+        executions: extract_bool_setting(settings, "ocsf_process_exec_enabled").unwrap_or(false),
+        command_lines: extract_bool_setting(settings, "ocsf_process_cmdline_enabled")
+            .unwrap_or(false),
+    });
 }
 
 /// Extract a bool value from an effective setting, if present.
@@ -1773,10 +1775,26 @@ mod tests {
             effective_bool(true),
         );
         apply_process_exec_setting(&settings);
-        assert!(process_activity::exec_events_requested());
+        assert_eq!(
+            process_activity::recording_requested(),
+            process_activity::Recording {
+                executions: true,
+                command_lines: false,
+            }
+        );
+
+        settings.insert(
+            "ocsf_process_cmdline_enabled".to_string(),
+            effective_bool(true),
+        );
+        apply_process_exec_setting(&settings);
+        assert!(process_activity::recording_requested().command_lines);
 
         apply_process_exec_setting(&std::collections::HashMap::new());
-        assert!(!process_activity::exec_events_requested());
+        assert_eq!(
+            process_activity::recording_requested(),
+            process_activity::Recording::default()
+        );
     }
 
     #[test]

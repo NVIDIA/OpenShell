@@ -98,6 +98,18 @@ The sandbox writes the record when the workload requests the exec, so the exec c
 
 Each process recorded this way also gets a Process Activity `Terminate` when it exits, named by the last file it requested to exec. On Linux 6.15 and later it carries `exit_code`; on earlier kernels only when the sandbox read the exit before the process's parent collected it, and otherwise its `status` is `Unknown` and it has no `exit_code`. The sandbox watches up to 1,024 running processes, fewer when its open-file limit is low; a process it cannot watch is counted in the `Other` record instead.
 
+### Record command lines
+
+Set `ocsf_process_cmdline_enabled` to also record the arguments of each process in its Process Activity `Launch`, as `process.cmd_line`. It covers the entrypoint and session processes and, with `ocsf_process_exec_enabled`, each exec in the workload. It applies globally or per sandbox and takes effect on the next poll cycle.
+
+```shell
+openshell settings set my-sandbox --key ocsf_process_cmdline_enabled --value true
+```
+
+Arguments often hold secrets such as tokens and passwords. Command lines appear in every OCSF destination: the shorthand log that `openshell logs`, the supervisor's stderr, and `/var/log/openshell.log` carry, and the OCSF JSON export when it is enabled. Enable this only where all of those may hold secrets.
+
+The sandbox records up to 256 arguments and 4 KiB per process and ends a shortened command line with `…`. Arguments with spaces or other special characters are single-quoted as a shell would read them, and arguments with control characters use `$'…'` quoting so each record stays on one line. An exec's arguments are read when the workload requests it, so a workload can make them differ from the arguments the process receives.
+
 ### Windows MXC gateways
 
 MXC audit events originate in the Windows gateway rather than an in-sandbox

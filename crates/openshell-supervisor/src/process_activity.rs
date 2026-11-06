@@ -5,6 +5,7 @@
 //! directly, the entrypoint and exec sessions, and for each exec in the
 //! workload when the `ocsf_process_exec_enabled` setting asks for them.
 
+use std::fmt::Write as _;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -15,28 +16,38 @@ use openshell_ocsf::{
 };
 use openshell_sandbox_backend::ProcessEventSource;
 use openshell_sandbox_backend::boundary_protocol::{
-    ExitStatusWire, ProcessEventKindWire, ProcessEventWire,
+    CommandLineWire, ExitStatusWire, ProcessEventKindWire, ProcessEventWire,
 };
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// The `ocsf_process_exec_enabled` setting, `None` until it is applied.
-static EXEC_EVENTS: LazyLock<tokio::sync::watch::Sender<Option<bool>>> =
+/// What the runtime records beyond the processes it starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Recording {
+    /// Each exec in the workload, from `ocsf_process_exec_enabled`.
+    pub executions: bool,
+    /// Each recorded process's arguments, from `ocsf_process_cmdline_enabled`.
+    pub command_lines: bool,
+}
+
+/// The settings, `None` until they are applied.
+static RECORDING: LazyLock<tokio::sync::watch::Sender<Option<Recording>>> =
     LazyLock::new(|| tokio::sync::watch::Sender::new(None));
 
-/// Ask the runtime to record, or stop recording, each exec in the workload.
-pub fn request_exec_events(enabled: bool) {
-    if EXEC_EVENTS.send_if_modified(|current| current.replace(enabled) != Some(enabled)) {
+/// Ask the runtime to record, or stop recording, what `recording` names.
+pub fn request_recording(recording: Recording) {
+    if RECORDING.send_if_modified(|current| current.replace(recording) != Some(recording)) {
         tracing::info!(
-            ocsf_process_exec_enabled = enabled,
-            "OCSF exec events toggled"
+            ocsf_process_exec_enabled = recording.executions,
+            ocsf_process_cmdline_enabled = recording.command_lines,
+            "OCSF process recording changed"
         );
     }
 }
 
 #[cfg(test)]
-pub fn exec_events_requested() -> bool {
-    EXEC_EVENTS.borrow().unwrap_or_default()
+pub fn recording_requested() -> Recording {
+    RECORDING.borrow().unwrap_or_default()
 }
 
 /// Reads process events from `source` and emits them until dropped.
@@ -51,7 +62,7 @@ impl Drop for ProcessActivityRelay {
 pub fn start(source: ProcessEventSource) -> ProcessActivityRelay {
     ProcessActivityRelay(tokio::spawn(relay(
         source,
-        EXEC_EVENTS.subscribe(),
+        RECORDING.subscribe(),
         |event| ocsf_emit!(event),
     )))
 }
@@ -62,7 +73,7 @@ trait ProcessEventReader {
     fn read(
         &self,
         after_sequence: u64,
-        executions: Option<bool>,
+        recording: Option<Recording>,
     ) -> impl Future<Output = Result<(Vec<ProcessEventWire>, u64), BackendError>> + Send;
 }
 
@@ -73,37 +84,44 @@ impl ProcessEventReader for ProcessEventSource {
     fn read(
         &self,
         after_sequence: u64,
-        executions: Option<bool>,
+        recording: Option<Recording>,
     ) -> impl Future<Output = Result<(Vec<ProcessEventWire>, u64), BackendError>> + Send {
-        Self::read(self, after_sequence, executions)
+        Self::read(
+            self,
+            after_sequence,
+            recording.map(|recording| recording.executions),
+            recording.map(|recording| recording.command_lines),
+        )
     }
 }
 
 async fn relay(
     source: impl ProcessEventReader,
-    mut exec_events: tokio::sync::watch::Receiver<Option<bool>>,
+    mut settings: tokio::sync::watch::Receiver<Option<Recording>>,
     emit: impl Fn(OcsfEvent),
 ) {
     let mut cursor = Cursor::default();
     let mut failing = false;
-    let mut executions = None;
+    let mut recording = None;
     loop {
-        let requested = *exec_events.borrow_and_update();
-        if requested != executions {
-            executions = requested;
-            if executions == Some(true) && !source.records_executions() {
+        let requested = *settings.borrow_and_update();
+        if requested != recording {
+            recording = requested;
+            if recording.is_some_and(|recording| recording.executions)
+                && !source.records_executions()
+            {
                 tracing::warn!("the sandbox runtime does not record exec events");
             }
         }
         // A changed setting reissues the read so the runtime applies it.
         let read = tokio::select! {
-            read = source.read(cursor.after, executions) => read,
-            _ = exec_events.changed() => continue,
+            read = source.read(cursor.after, recording) => read,
+            _ = settings.changed() => continue,
         };
         match read {
             Ok((events, lost)) => {
                 failing = false;
-                for event in cursor.accept(events, lost) {
+                for event in cursor.accept(withhold_command_lines(events, recording), lost) {
                     emit(event);
                 }
             }
@@ -172,12 +190,75 @@ fn named(executable: &str) -> &str {
     }
 }
 
+/// The arguments as a shell would read them, with `…` after a truncated list.
+/// An argument with control or text-direction characters is ANSI-C quoted
+/// so the command line stays on one line in every log.
+fn cmd_line(command_line: &CommandLineWire) -> String {
+    let quoted = command_line.arguments.iter().map(|argument| {
+        let plain = !argument.is_empty()
+            && argument
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_./=:,+@%".contains(&byte));
+        let escaped = argument.chars().any(|character| {
+            character.is_control() || openshell_ocsf::is_direction_control(character)
+        });
+        if plain {
+            argument.clone()
+        } else if escaped {
+            ansi_c_quoted(argument)
+        } else {
+            format!("'{}'", argument.replace('\'', "'\\''"))
+        }
+    });
+    let truncated = command_line.truncated.then(|| "…".to_string());
+    quoted.chain(truncated).collect::<Vec<_>>().join(" ")
+}
+
+fn ansi_c_quoted(argument: &str) -> String {
+    let mut quoted = String::from("$'");
+    for character in argument.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '\'' => quoted.push_str("\\'"),
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            '\r' => quoted.push_str("\\r"),
+            c if c.is_control() || openshell_ocsf::is_direction_control(c) => {
+                let _ = write!(quoted, "\\u{:04x}", u32::from(c));
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// `events` without their command lines unless `recording` asks for them, so
+/// none recorded under an earlier setting is reported.
+fn withhold_command_lines(
+    mut events: Vec<ProcessEventWire>,
+    recording: Option<Recording>,
+) -> Vec<ProcessEventWire> {
+    if !recording.is_some_and(|recording| recording.command_lines) {
+        for event in &mut events {
+            event.command_line = None;
+        }
+    }
+    events
+}
+
 fn process_activity(event: &ProcessEventWire) -> OcsfEvent {
     let instance = event.process;
     let process = |parent: Process| {
-        Process::new(named(&event.executable), i64::from(instance.pid))
+        let process = Process::new(named(&event.executable), i64::from(instance.pid))
             .with_parent(parent)
-            .with_instance(instance.parent_pid, instance.start_time_ms)
+            .with_instance(instance.parent_pid, instance.start_time_ms);
+        match &event.command_line {
+            Some(command_line) if !command_line.arguments.is_empty() => {
+                process.with_cmd_line(&cmd_line(command_line))
+            }
+            _ => process,
+        }
     };
     let launcher = || Process::new("openshell-sandbox", i64::from(instance.parent_pid));
     match &event.kind {
@@ -299,7 +380,9 @@ fn process_change<'a>(
 mod tests {
     use super::*;
     use openshell_isolation_interface::contract::ProcessInstance;
-    use openshell_sandbox_backend::boundary_protocol::{ExitStatusWire, ProcessEventKindWire};
+    use openshell_sandbox_backend::boundary_protocol::{
+        CommandLineWire, ExitStatusWire, ProcessEventKindWire,
+    };
 
     fn event(sequence: u64, kind: ProcessEventKindWire) -> ProcessEventWire {
         ProcessEventWire {
@@ -312,6 +395,7 @@ mod tests {
             executable: "/usr/bin/sh".to_string(),
             kind,
             time_ms: 1_793_750_400_200 + i64::try_from(sequence).unwrap(),
+            command_line: None,
         }
     }
 
@@ -381,6 +465,7 @@ mod tests {
                 parent_executable: "/usr/bin/bash".to_string(),
             },
             time_ms: 1_793_750_400_310,
+            command_line: None,
         };
         let emitted = process_activity(&exec);
         let json = serde_json::to_value(&emitted).unwrap();
@@ -412,6 +497,85 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_command_line_becomes_the_process_cmd_line() {
+        let mut exec = event(
+            12,
+            ProcessEventKindWire::Executed {
+                previous_executable: "/usr/bin/bash".to_string(),
+                parent_executable: "/usr/bin/bash".to_string(),
+            },
+        );
+        exec.command_line = Some(CommandLineWire {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo hi".to_string(),
+                "it's".to_string(),
+                String::new(),
+            ],
+            truncated: true,
+        });
+        let json = serde_json::to_value(process_activity(&exec)).unwrap();
+        assert_eq!(
+            json["process"]["cmd_line"],
+            "sh -c 'echo hi' 'it'\\''s' '' …"
+        );
+
+        // Control and direction characters stay escaped on one line.
+        exec.command_line = Some(CommandLineWire {
+            arguments: vec!["printf".to_string(), "a\nb\u{1b}[31m\u{202e}'".to_string()],
+            truncated: false,
+        });
+        let json = serde_json::to_value(process_activity(&exec)).unwrap();
+        assert_eq!(
+            json["process"]["cmd_line"],
+            "printf $'a\\nb\\u001b[31m\\u202e\\''"
+        );
+
+        for command_line in [
+            None,
+            Some(CommandLineWire {
+                arguments: Vec::new(),
+                truncated: false,
+            }),
+        ] {
+            exec.command_line = command_line;
+            let json = serde_json::to_value(process_activity(&exec)).unwrap();
+            assert!(json["process"].get("cmd_line").is_none());
+        }
+    }
+
+    /// Command lines recorded before the setting was turned off, or before a
+    /// replacement supervisor applied it, are not reported.
+    #[test]
+    fn command_lines_are_withheld_unless_the_setting_asks_for_them() {
+        let with_command_line = || {
+            let mut launch = event(1, ProcessEventKindWire::Launched);
+            launch.command_line = Some(CommandLineWire {
+                arguments: vec!["secret".to_string()],
+                truncated: false,
+            });
+            vec![launch]
+        };
+        let asked = Recording {
+            executions: false,
+            command_lines: true,
+        };
+        assert!(
+            withhold_command_lines(with_command_line(), Some(asked))[0]
+                .command_line
+                .is_some()
+        );
+        for recording in [None, Some(Recording::default())] {
+            assert!(
+                withhold_command_lines(with_command_line(), recording)[0]
+                    .command_line
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn a_descendant_exit_becomes_a_terminate_by_the_process_itself() {
         let ended = |status| ProcessEventWire {
             sequence: 11,
@@ -423,6 +587,7 @@ mod tests {
             executable: "/usr/bin/true".to_string(),
             kind: ProcessEventKindWire::Ended(status),
             time_ms: 1_793_750_400_500,
+            command_line: None,
         };
         let known = process_activity(&ended(Some(ExitStatusWire::Exited(3))));
         let json = serde_json::to_value(&known).unwrap();
@@ -464,6 +629,7 @@ mod tests {
             executable: "/opt/openshell/bin/openshell-sandbox".to_string(),
             kind: ProcessEventKindWire::Suppressed { count: 12 },
             time_ms: 1_793_750_400_400,
+            command_line: None,
         };
         let mut cursor = Cursor { after: 6 };
         let emitted = cursor.accept(vec![suppressed], 3);
@@ -549,7 +715,7 @@ mod tests {
 
     /// Each read reports the setting it carried, and the first read waits
     /// like an idle long poll.
-    struct IdleReader(std::sync::Mutex<Vec<Option<bool>>>);
+    struct IdleReader(std::sync::Mutex<Vec<Option<Recording>>>);
 
     impl ProcessEventReader for &IdleReader {
         fn records_executions(&self) -> bool {
@@ -558,11 +724,11 @@ mod tests {
         async fn read(
             &self,
             _after_sequence: u64,
-            executions: Option<bool>,
+            recording: Option<Recording>,
         ) -> Result<(Vec<ProcessEventWire>, u64), BackendError> {
             let first = {
                 let mut reads = self.0.lock().unwrap();
-                reads.push(executions);
+                reads.push(recording);
                 reads.len() == 1
             };
             if first {
@@ -577,20 +743,24 @@ mod tests {
     #[tokio::test]
     async fn a_setting_change_reissues_the_waiting_read() {
         let reader = IdleReader(std::sync::Mutex::default());
+        let everything = Recording {
+            executions: true,
+            command_lines: true,
+        };
         let (setting, exec_events) = tokio::sync::watch::channel(None);
         let relayed = relay(&reader, exec_events, |_| {});
         let toggle = async {
             while reader.0.lock().unwrap().is_empty() {
                 tokio::task::yield_now().await;
             }
-            setting.send(Some(true)).unwrap();
+            setting.send(Some(everything)).unwrap();
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(relayed, toggle);
         })
         .await
         .expect("relay reissued its read");
-        assert_eq!(*reader.0.lock().unwrap(), [None, Some(true)]);
+        assert_eq!(*reader.0.lock().unwrap(), [None, Some(everything)]);
     }
 
     #[test]

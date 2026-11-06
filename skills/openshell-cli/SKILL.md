@@ -990,7 +990,7 @@ openshell settings get --global --json
 openshell settings set --global --key ocsf_json_enabled --value true
 ```
 
-Enabling `ocsf_json_enabled` adds compact `OCSF-JSON` records to the supervisor's stderr, alongside shorthand, and to its JSONL file when file storage is available. Collect these records through the supervisor's platform logs (`docker logs`, `podman logs`, or `kubectl logs`); `openshell logs` still serves shorthand. Match the `OCSF-JSON` marker after the timestamp and parse the remainder as JSON. See the published [OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export) for delivery and retention limits. Set `ocsf_process_exec_enabled` the same way to also record a Process Activity `Launch` for each exec in the workload.
+Enabling `ocsf_json_enabled` adds compact `OCSF-JSON` records to the supervisor's stderr, alongside shorthand, and to its JSONL file when file storage is available. Collect these records through the supervisor's platform logs (`docker logs`, `podman logs`, or `kubectl logs`); `openshell logs` still serves shorthand. Match the `OCSF-JSON` marker after the timestamp and parse the remainder as JSON. See the published [OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export) for delivery and retention limits. Set `ocsf_process_exec_enabled` the same way to also record a Process Activity `Launch` for each exec in the workload, and `ocsf_process_cmdline_enabled` to include each process's arguments, which can hold secrets.
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
 

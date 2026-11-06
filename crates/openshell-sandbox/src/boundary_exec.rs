@@ -227,6 +227,10 @@ impl LocalBoundaryExec {
         self.runtime.ensure_active()?;
         let mut command = self.command(spec)?;
         let program = command.get_program().to_string_lossy().into_owned();
+        let arguments: Vec<String> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -295,7 +299,7 @@ impl LocalBoundaryExec {
         let process = Arc::new(LocalExecProcess::new(
             child,
             pid,
-            &program,
+            crate::process_events::record_launch(pid, &program, &arguments),
             self.runtime.clone(),
             process_terminal,
             signal_lock,
@@ -342,6 +346,10 @@ impl LocalBoundaryExec {
             .map_err(|error| BackendError::Process(error.to_string()))?;
         let mut command = self.command(spec)?;
         let program = command.get_program().to_string_lossy().into_owned();
+        let arguments: Vec<String> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
         command.stdin(stdin).stdout(stdout).stderr(slave);
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
@@ -392,7 +400,7 @@ impl LocalBoundaryExec {
         let process = Arc::new(LocalExecProcess::new(
             child,
             pid,
-            &program,
+            crate::process_events::record_launch(pid, &program, &arguments),
             self.runtime.clone(),
             process_terminal,
             signal_lock,
@@ -576,7 +584,7 @@ impl LocalExecProcess {
     fn new(
         child: Child,
         pid: u32,
-        program: &str,
+        launched: Option<crate::process_events::Launched>,
         runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
         terminal: Arc<std::sync::atomic::AtomicBool>,
         signal_lock: Arc<std::sync::Mutex<()>>,
@@ -591,7 +599,6 @@ impl LocalExecProcess {
         let registration_terminal = terminal.clone();
         #[cfg(target_os = "linux")]
         let signal_lock_for_wait = signal_lock.clone();
-        let launched = crate::process_events::record_launch(pid, program);
         tokio::spawn(async move {
             let waited = tokio::task::spawn_blocking(move || {
                 let mut child = child;
