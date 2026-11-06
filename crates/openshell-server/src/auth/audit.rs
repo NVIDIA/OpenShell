@@ -65,6 +65,7 @@ impl RequestOrigin {
 }
 
 use super::authenticator::{AuthFailureReason, AuthMechanism, AuthRejection, bearer_credential};
+use super::edge::edge_credential;
 
 fn severity(reason: AuthFailureReason) -> SeverityId {
     match reason {
@@ -230,7 +231,8 @@ fn mechanism(principal: &Principal) -> Option<AuthMechanism> {
         Principal::User(user) => match user.identity.provider {
             IdentityProvider::Oidc => Some(AuthMechanism::Oidc),
             IdentityProvider::Mtls => Some(AuthMechanism::Mtls),
-            IdentityProvider::CloudflareAccess | IdentityProvider::LocalDev => None,
+            IdentityProvider::CloudflareAccess => Some(AuthMechanism::CloudflareAccess),
+            IdentityProvider::LocalDev => None,
         },
         Principal::Sandbox(sandbox) => Some(match sandbox.source {
             SandboxIdentitySource::BootstrapJwt { .. } => AuthMechanism::SandboxJwt,
@@ -243,7 +245,7 @@ fn mechanism(principal: &Principal) -> Option<AuthMechanism> {
 }
 
 /// A digest identifying the credential that established `principal`: the
-/// operator's or mTLS user's certificate, or the bearer token.
+/// operator's or mTLS user's certificate, the edge token, or the bearer token.
 ///
 /// Only verified material goes in, so headers the authenticator ignored
 /// cannot make a new logon.
@@ -252,10 +254,15 @@ fn credential_digest(
     headers: &http::HeaderMap,
     peer_certificate_sha256: Option<&str>,
 ) -> Option<[u8; 32]> {
+    let edge_token;
     let credential = match principal {
         Principal::Operator(operator) => operator.certificate_sha256.as_str(),
         Principal::User(user) if user.identity.provider == IdentityProvider::Mtls => {
             peer_certificate_sha256.unwrap_or_default()
+        }
+        Principal::User(user) if user.identity.provider == IdentityProvider::CloudflareAccess => {
+            edge_token = edge_credential(headers);
+            edge_token.as_deref().unwrap_or_default()
         }
         _ => bearer_credential(headers).unwrap_or_default(),
     };
@@ -628,6 +635,52 @@ pub fn emit_authorization_denial_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::principal::UserPrincipal;
+
+    fn edge_user() -> Principal {
+        Principal::User(UserPrincipal {
+            identity: super::super::identity::Identity {
+                subject: "user-1".to_string(),
+                display_name: None,
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::CloudflareAccess,
+            },
+        })
+    }
+
+    fn edge_headers(pairs: &[(&'static str, &str)]) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, http::HeaderValue::from_str(value).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn edge_user_logon_is_keyed_by_the_edge_token() {
+        let user = edge_user();
+        let by_header = credential_digest(
+            &user,
+            &edge_headers(&[("cf-access-jwt-assertion", "token-a")]),
+            None,
+        );
+        let by_cookie = credential_digest(
+            &user,
+            &edge_headers(&[("cookie", "CF_Authorization=token-a")]),
+            None,
+        );
+        let other_token = credential_digest(
+            &user,
+            &edge_headers(&[("cf-access-jwt-assertion", "token-b")]),
+            None,
+        );
+
+        assert!(by_header.is_some());
+        assert_eq!(by_header, by_cookie, "same token, same logon");
+        assert_ne!(by_header, other_token, "a new token is a new logon");
+        assert_eq!(mechanism(&user), Some(AuthMechanism::CloudflareAccess));
+    }
 
     #[test]
     fn credential_logs_on_again_after_the_window() {

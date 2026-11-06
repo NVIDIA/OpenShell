@@ -22,6 +22,7 @@
 //! - [`super::supervisor_token::SupervisorTokenAuthenticator`] — the shared
 //!   supervisor's gateway-minted token for the assignment stream
 //! - [`super::oidc::OidcAuthenticator`] — user OIDC Bearer tokens
+//! - [`super::edge::EdgeAuthenticator`]: the edge proxy's signed token
 use super::principal::Principal;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -115,6 +116,8 @@ impl AuthFailureReason {
 pub enum AuthMechanism {
     Mtls,
     Oidc,
+    /// The signed token a Cloudflare Access proxy attaches to each request.
+    CloudflareAccess,
     SandboxJwt,
     ComputeDriver,
     GatewayPeer,
@@ -131,6 +134,7 @@ impl AuthMechanism {
         match self {
             Self::Mtls => "mtls",
             Self::Oidc => "oidc",
+            Self::CloudflareAccess => "cloudflare_access",
             Self::SandboxJwt => "sandbox_jwt",
             Self::ComputeDriver => "compute_driver",
             Self::GatewayPeer => "k8s_service_account",

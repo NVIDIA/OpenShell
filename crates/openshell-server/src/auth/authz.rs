@@ -39,6 +39,23 @@ pub struct AuthzPolicy {
 }
 
 impl AuthzPolicy {
+    /// The policy for the configured user authentication mode, or `None`
+    /// when neither OIDC nor edge authentication is configured.
+    pub fn from_config(config: &openshell_core::Config) -> Option<Self> {
+        if let Some(oidc) = &config.oidc {
+            return Some(Self {
+                admin_role: oidc.admin_role.clone(),
+                user_role: oidc.user_role.clone(),
+                scopes_enabled: !oidc.scopes_claim.is_empty(),
+            });
+        }
+        config.edge_auth.as_ref().map(|edge| Self {
+            admin_role: edge.admin_role.clone(),
+            user_role: edge.user_role.clone(),
+            scopes_enabled: false,
+        })
+    }
+
     /// Validate the policy configuration.
     ///
     /// Returns an error if only one of admin/user role is set — either
@@ -48,7 +65,7 @@ impl AuthzPolicy {
         let user_set = !self.user_role.is_empty();
         if admin_set != user_set {
             return Err(format!(
-                "OIDC RBAC misconfiguration: admin_role={:?}, user_role={:?}. \
+                "RBAC misconfiguration: admin_role={:?}, user_role={:?}. \
                  Either set both roles (RBAC mode) or leave both empty (authentication-only mode).",
                 self.admin_role, self.user_role,
             ));
@@ -193,6 +210,42 @@ mod tests {
             scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
             provider: IdentityProvider::Oidc,
         }
+    }
+
+    #[test]
+    fn from_config_selects_the_configured_user_authentication_mode() {
+        use openshell_core::{Config, EdgeAuthConfig, EdgeAuthProvider, OidcConfig};
+
+        assert!(AuthzPolicy::from_config(&Config::new(None)).is_none());
+
+        let edge = Config::new(None).with_edge_auth(EdgeAuthConfig {
+            provider: EdgeAuthProvider::CloudflareAccess,
+            issuer: "https://team.cloudflareaccess.com".to_string(),
+            audience: "aud".to_string(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_string(),
+            admin_role: "edge-admin".to_string(),
+            user_role: "edge-user".to_string(),
+        });
+        let policy = AuthzPolicy::from_config(&edge).expect("edge policy");
+        assert_eq!(policy.admin_role, "edge-admin");
+        assert_eq!(policy.user_role, "edge-user");
+        assert!(!policy.scopes_enabled);
+
+        let oidc = OidcConfig {
+            issuer: "https://idp.example.com".to_string(),
+            dangerously_allow_insecure_http: false,
+            jwks_allowed_origins: Vec::new(),
+            audience: "cli".to_string(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "roles".to_string(),
+            admin_role: "oidc-admin".to_string(),
+            user_role: "oidc-user".to_string(),
+            scopes_claim: "scope".to_string(),
+        };
+        let policy = AuthzPolicy::from_config(&edge.with_oidc(oidc)).expect("oidc policy");
+        assert_eq!(policy.admin_role, "oidc-admin");
+        assert!(policy.scopes_enabled);
     }
 
     #[test]
