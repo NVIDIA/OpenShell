@@ -128,9 +128,9 @@ pub struct Run<'a> {
     /// The gateway name the installer registers with the CLI.
     pub gateway: &'a str,
     pub bundle: &'a Bundle,
-    /// A nextest filterset (`-E`) narrowing the tests in the bundle. Unused
-    /// with a program bundle.
-    pub filter: Option<&'a str>,
+    /// Narrowing the tests in the bundle: nextest filtersets (`-E`) for a
+    /// nextest bundle, parts of test names for a program bundle.
+    pub filters: &'a [String],
     /// Where `junit.xml`, `nextest.log` and, after a failure, the guest's
     /// `diagnostics/` go.
     pub results: &'a Path,
@@ -335,13 +335,21 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
                 "--no-tests",
                 "fail",
             ]);
-            if let Some(filter) = run.filter {
+            for filter in run.filters {
                 tests.extend(["-E", filter]);
             }
         }
         // The program runs its tests one at a time, and writes the report
         // where `collect_results` looks for it.
-        Kind::Program => tests.extend([program.as_str(), "run", "--junit", &junit]),
+        Kind::Program => {
+            tests.extend([program.as_str(), "run", "--junit", &junit]);
+            // `run` takes name filters as arguments, after `--` so that one
+            // starting with a dash isn't read as an option.
+            if !run.filters.is_empty() {
+                tests.push("--");
+                tests.extend(run.filters.iter().map(String::as_str));
+            }
+        }
     }
     // nextest writes its output to a file in the guest, so a run that times
     // out or loses SSH still leaves a log for `collect_results`. The guest
