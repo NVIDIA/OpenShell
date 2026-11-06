@@ -275,6 +275,46 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 /// wait on itself until the acquire times out.
 pub const MIN_MAX_CONNECTIONS: u32 = 2;
 
+/// How long a data-pool caller waits for a connection, including opening one.
+pub(super) const DATA_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether a connect or migration failure means `PostgreSQL` is not serving
+/// yet, so startup retries it. A bad host, credentials, or certificate stays
+/// fatal.
+fn is_unavailable_at_startup(error: &sqlx::Error) -> bool {
+    use std::io::ErrorKind;
+    match error {
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Io(error) => matches!(
+            error.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+                | ErrorKind::BrokenPipe
+                | ErrorKind::TimedOut
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+        ),
+        // read_only_sql_transaction, too_many_connections, admin_shutdown,
+        // crash_shutdown, cannot_connect_now.
+        sqlx::Error::Database(error) => matches!(
+            error.code().as_deref(),
+            Some("25006" | "53300" | "57P01" | "57P02" | "57P03")
+        ),
+        _ => false,
+    }
+}
+
+fn map_startup_error(error: &sqlx::Error) -> PersistenceError {
+    if is_unavailable_at_startup(error) {
+        PersistenceError::Unavailable(error.to_string())
+    } else {
+        map_db_error(error)
+    }
+}
+
 impl PostgresStore {
     /// Connect and size the data and lock pools, falling back to
     /// [`DEFAULT_MAX_CONNECTIONS`] and `MUTATION_LOCK_POOL_MAX_CONNECTIONS`.
@@ -304,9 +344,10 @@ impl PostgresStore {
         );
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            .acquire_timeout(DATA_POOL_ACQUIRE_TIMEOUT)
             .connect(url)
             .await
-            .map_err(|e| map_db_error(&e))?;
+            .map_err(|e| map_startup_error(&e))?;
         let lock_pool = PgPoolOptions::new()
             .max_connections(lock_pool_size)
             .min_connections(0)
@@ -351,22 +392,30 @@ impl PostgresStore {
         POSTGRES_MIGRATOR
             .run(&self.pool)
             .await
-            .map_err(|e| map_migrate_error(&e))?;
+            .map_err(|e| match &e {
+                sqlx::migrate::MigrateError::Execute(error)
+                | sqlx::migrate::MigrateError::ExecuteMigration(error, _)
+                    if is_unavailable_at_startup(error) =>
+                {
+                    PersistenceError::Unavailable(e.to_string())
+                }
+                _ => map_migrate_error(&e),
+            })?;
         self.migrate_legacy_time_payloads().await
     }
 
     async fn migrate_legacy_time_payloads(&self) -> PersistenceResult<()> {
-        let mut transaction = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        let mut transaction = self.pool.begin().await.map_err(|e| map_startup_error(&e))?;
         // Serialize this application-level data migration across gateway replicas.
         sqlx::query("SELECT pg_advisory_xact_lock(3052)")
             .execute(&mut *transaction)
             .await
-            .map_err(|e| map_db_error(&e))?;
+            .map_err(|e| map_startup_error(&e))?;
         let rows =
             sqlx::query("SELECT id, object_type, payload FROM objects ORDER BY id FOR UPDATE")
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|e| map_db_error(&e))?;
+                .map_err(|e| map_startup_error(&e))?;
 
         for row in rows {
             let id: String = row.try_get("id").map_err(|e| map_db_error(&e))?;
@@ -384,11 +433,14 @@ impl PostgresStore {
                     .bind(id)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|e| map_db_error(&e))?;
+                    .map_err(|e| map_startup_error(&e))?;
             }
         }
 
-        transaction.commit().await.map_err(|e| map_db_error(&e))
+        transaction
+            .commit()
+            .await
+            .map_err(|e| map_startup_error(&e))
     }
 
     /// Verify the database is reachable by acquiring a pooled connection
@@ -2282,6 +2334,55 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_to_a_refusing_server_fails_unavailable_within_the_acquire_timeout() {
+        let url = PostgresStore::refusing_url_for_tests().await;
+        let started = std::time::Instant::now();
+
+        let error = PostgresStore::connect(&url, None, None)
+            .await
+            .expect_err("nothing listens on the port");
+
+        assert!(
+            matches!(error, PersistenceError::Unavailable(_)),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() < DATA_POOL_ACQUIRE_TIMEOUT + Duration::from_secs(3),
+            "connect waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn startup_retries_io_errors_only_while_postgres_does_not_answer() {
+        use std::io::ErrorKind;
+        let io = |kind: ErrorKind| map_startup_error(&sqlx::Error::Io(kind.into()));
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::TimedOut,
+            ErrorKind::HostUnreachable,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                matches!(io(kind), PersistenceError::Unavailable(_)),
+                "{kind:?}"
+            );
+        }
+        // An unresolvable host, a missing certificate file, a failed TLS handshake.
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::NotFound,
+            ErrorKind::InvalidData,
+        ] {
+            assert!(
+                matches!(io(kind), PersistenceError::Database(_)),
+                "{kind:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn lock_connection_timeout_is_contention_only_if_the_pool_filled_during_the_wait() {
