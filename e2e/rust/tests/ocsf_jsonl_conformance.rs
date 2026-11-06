@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use openshell_e2e::harness::cli::run_cli;
 use openshell_e2e::harness::container::{ContainerEngine, ContainerHttpServer};
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
 use serde_json::Value;
 use tempfile::NamedTempFile;
 
@@ -182,6 +182,21 @@ fn supervisor_records(engine: &ContainerEngine, sandbox: &str) -> Result<Vec<Val
 #[tokio::test]
 async fn supervisor_jsonl_conforms_to_the_native_schema() {
     let engine = ContainerEngine::from_env().expect("container engine");
+    let image = engine
+        .command()
+        .args([
+            "image",
+            "inspect",
+            E2E_WORKLOAD_IMAGE,
+            "--format",
+            "{{.Id}}",
+        ])
+        .output()
+        .expect("inspect workload image");
+    assert!(image.status.success(), "inspect workload image: {image:?}");
+    let image_uid = String::from_utf8(image.stdout).expect("image UID is UTF-8");
+    let image_uid = image_uid.trim().trim_start_matches("sha256:");
+    assert!(!image_uid.is_empty());
     let server = ContainerHttpServer::start_python("ocsf-l7.openshell.test", HTTP_SERVER)
         .await
         .expect("start test server");
@@ -229,17 +244,21 @@ async fn supervisor_jsonl_conforms_to_the_native_schema() {
     );
     let mut failures = Vec::new();
     for record in &records {
-        match openshell_ocsf_validate::validate_event(record) {
-            Ok(()) => {}
-            Err(openshell_ocsf_validate::Error::UnsupportedVersion(version)) => panic!(
-                "record labelled {version}; native validation needs ocsf_schema_version unset \
-                 for this sandbox and the gateway"
-            ),
-            Err(reason) => failures.push(format!(
+        assert!(
+            record.get("container").is_none(),
+            "top-level container: {record}"
+        );
+        assert_eq!(record["device"]["container"]["name"], guard.name);
+        let recorded_image_uid = record["device"]["container"]["image"]["uid"]
+            .as_str()
+            .expect("resolved workload image identity");
+        assert_eq!(recorded_image_uid.trim_start_matches("sha256:"), image_uid);
+        if let Err(reason) = openshell_ocsf_validate::validate_event(record) {
+            failures.push(format!(
                 "{} \"{}\": {reason}",
                 record["class_name"],
                 record["message"].as_str().unwrap_or_default()
-            )),
+            ));
         }
     }
     assert!(

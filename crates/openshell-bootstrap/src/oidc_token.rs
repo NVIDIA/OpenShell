@@ -194,6 +194,17 @@ mod tests {
     }
 
     #[test]
+    fn conformance_fixture_matches_cli_serialization() {
+        const FIXTURE: &str = include_str!("../../../sdk/conformance/oidc-token-bundle.json");
+        let bundle: OidcTokenBundle = serde_json::from_str(FIXTURE).unwrap();
+        assert!(bundle.refresh_token.is_some() && bundle.expires_at.is_some());
+        assert_eq!(
+            serde_json::to_value(&bundle).unwrap(),
+            serde_json::from_str::<serde_json::Value>(FIXTURE).unwrap()
+        );
+    }
+
+    #[test]
     fn oidc_login_prompt_marker_is_per_gateway() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), |_| {

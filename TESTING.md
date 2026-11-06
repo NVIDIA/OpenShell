@@ -181,8 +181,15 @@ by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
-Suites live under `tests/suites/<family>/`. Each family is a Cargo workspace
-with its own lockfile. Run the `conformance` suites against a local Docker
+The conformance crate also builds `openshell-conformance`, a program that
+runs the conformance suite against a gateway without cargo or nextest
+(`openshell-conformance list`, `ready`, `run`). It covers only the
+conformance suite. See
+[tests/suites/conformance/README.md](tests/suites/conformance/README.md).
+
+Suites live under `tests/suites/`, in Cargo workspaces with their own
+lockfiles: `conformance`, `features`, and one workspace per driver suite under
+`drivers/<driver>`. Run the `conformance` suites against a local Docker
 gateway with:
 
 ```shell
@@ -196,25 +203,49 @@ verifies this, and `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix
 re-locks a workspace from the root lockfile. Add new testkit workspaces to
 `ALIGNED_WORKSPACES` in that script.
 
+#### What a conformance test may assert
+
+Conformance tests run on every compute driver, so they check the public
+contract and nothing a driver is free to change.
+
+- Assert only what the public contract promises: the comments in `proto/` and
+  the published docs.
+- Assert on `phase` and `exit_code`. Don't assert on condition reasons or
+  messages.
+- To check that something did not happen, read the state that shows it. Don't
+  sleep and hope.
+- If a behavior isn't documented, open an issue to document it. Don't write a
+  test for it. A behavior that only some drivers have belongs in
+  `tests/suites/features` or `tests/suites/drivers`.
+- The only way to skip a test is `#[ignore = "<issue link>"]`, for a broken or
+  flaky test.
+
+Adapted from the handover notes in NVIDIA/OpenShell#4629 by Evan Lezar.
+
 ### Running suites in a tmachine environment (`tests/runner/`)
 
 `openshell-test-runner` runs a test family inside a tmachine VM, against the
-OpenShell that the VM's installer set up.
+OpenShell that the VM's installer set up. `--family` is the path of the
+workspace under `tests/suites/`, such as `conformance` or `drivers/podman`, and
+`--package` narrows it to some of its packages. It must name a workspace, so
+`drivers` alone fails. The `family` input of the `E2E Suites` workflow instead
+selects every row whose family is that name or lies under it, so `drivers`
+selects all the driver suites.
 
 ```shell
 nix run .#openshell-test-runner -- \
   --environment ubuntu-docker-rootful --installer deb \
-  --family conformance --package sandbox
+  --family conformance --package conformance
 ```
 
-It needs KVM, and tmachine only boots guests of the host's architecture. The
-runner points the tests at the installed CLI and the gateway the installer
-registered (`--gateway`, default `openshell`). A run passes if nextest
-succeeds; nextest fails a run with no tests. The runner exits with 1 when a
-test failed and 2 when the run could not complete, for example because the
-environment didn't come up. It writes `junit.xml`, `nextest.log` and, after a
-failure, the guest's diagnostics to `artifacts/test-results/` (`--results`),
-even when the run timed out.
+It needs KVM on Linux or the Hypervisor framework on macOS, and tmachine only
+boots guests of the host's architecture. The runner points the tests at the
+installed CLI and the gateway the installer registered (`--gateway`, default
+`openshell`). A run passes if nextest succeeds; nextest fails a run with no
+tests. The runner exits with 1 when a test failed and 2 when the run could not
+complete, for example because the environment didn't come up. It writes
+`junit.xml`, `nextest.log` and, after a failure, the guest's diagnostics to
+`artifacts/test-results/` (`--results`), even when the run timed out.
 
 `--filter <filterset>` narrows the tests with a nextest filterset, and
 `--keep` leaves the VM running until you press Enter. Two runs on one host
@@ -226,9 +257,65 @@ A flaky or broken test is marked `#[ignore = "<issue link>"]`, which takes it
 out of every environment until it's fixed.
 
 **CI.** `.github/workflows/e2e-suites.yml` lists the environments and suites as
-an explicit matrix and runs the runner once per row. Branch E2E calls it when
-the `test:e2e` label is set, and a failure fails the Core E2E result. To run
-a suite in another environment on CI, add a row.
+an explicit matrix and runs the runner once per row. Branch E2E calls it once
+per family when the `test:e2e` label is set, and a failure fails the Core E2E
+result. Release Dev and Release Qualification run the conformance and feature
+families. To run a suite in another environment on CI, add a row.
+
+### Adding a feature suite
+
+Feature suites live in the `tests/suites/features` workspace, one crate per
+suite, with a name that says what the suite tests.
+`tests/suites/features/keycloak-provider-refresh` is the example to copy.
+
+1. Add a crate under `tests/suites/features/<name>` that depends on
+   `openshell-testkit`, and add it to `members` in
+   `tests/suites/features/Cargo.toml`.
+2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions.
+3. Re-lock the workspace: `cargo metadata --manifest-path
+   tests/suites/features/Cargo.toml`, then
+   `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`. `cargo fmt`
+   and `cargo clippy` already cover every package in the workspace.
+4. Add a row for the suite to the matrix in `.github/workflows/e2e-suites.yml`.
+
+If the feature only needs the gateway, run the suite in an existing
+environment such as `ubuntu-docker-rootful`, and skip the rest of this
+section.
+
+**Suites that need a service.** A feature that needs something besides the
+gateway, such as an OIDC issuer, runs in a tmachine environment that provides
+it. The environment and the suite share a contract: a set of
+`OPENSHELL_TEST_<SERVICE>_*` environment variables that say how to reach the
+service.
+
+- **Environment.** Add an environment to `tests/tmachine/config.nix` whose
+  setup playbook starts the service (with a restart policy, since setup is
+  cached as a disk) and writes the variables as `KEY=VALUE` lines to
+  `/etc/openshell-test/env.d/<service>.env`. Pass files the playbook needs
+  through the environment's setup `inputs`, and add them to the tmachine disk
+  cache key in `e2e-suites.yml`. The runner rejects names without the
+  `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest, so
+  values never appear in a runner command. Values are taken literally, without
+  quoting.
+- **Fixture.** Put the service's fixture in a support crate under
+  `tests/support/<service>`, named `<service>-support`, so any suite can
+  depend on it, or reuse the existing one. It defines the variable names as constants and a
+  `<Service>Context::new(cx)` that reads them, waits for the service, and
+  wraps the testkit `Context`. Each test calls it on its first line.
+  Nextest runs each test in its own process, so the fixture builds its
+  clients there from the variables. A missing variable fails the test; it
+  never skips it.
+- **Documentation.** Document the variables in the fixture's module docs, so
+  anyone can run the suite against their own deployment by setting them.
+
+The Keycloak fixture is `tests/support/keycloak`. Run the suite that uses it
+with:
+
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful-keycloak --installer deb \
+  --family features --package keycloak-provider-refresh
+```
 
 ### Python E2E (`e2e/python/`)
 
@@ -336,24 +423,26 @@ HTTP `Host`, TLS SNI, and mTLS handling.
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`tests/suites/conformance`) - portable Cargo tests for
-  lifecycle, mechanistic drafts, file transfer, and the sandbox-local API,
-  including agent-authored permission requests. Driver E2E runs the complete
-  Cargo test package. The installed-artifact conformance suite runs the same
-  tests from a nextest archive and offers a focused `policy-advisor` testsuite
-  for manual integration runs.
+- Conformance (`tests/suites/conformance`) - the testkit `conformance` crate:
+  lifecycle, the CLI, persistent workspaces, file transfer, and the policy
+  advisor. Driver E2E runs it with `openshell-conformance` against the lane's
+  gateway and writes a JUnit report under `results/`; set
+  `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program, as Branch E2E does
+  with the static build it makes once per architecture. The
+  installed-artifact conformance lanes run the same crate through
+  `openshell-test-runner` (see above).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
-  `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
+  `e2e-vm`) - conformance plus the common and driver-specific coverage for
   the selected deployment.
 - Docker suite (`--features e2e-docker`) - includes Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway start.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
-- Configuration push suite (`--features e2e-config-push`) - CLI conformance and the policy tests against a Docker gateway with `config_delivery_mode = "push"`. Run it with `mise run e2e:rust:push`.
+- Configuration push suite (`--features e2e-config-push`) - conformance and the policy tests against a Docker gateway with `config_delivery_mode = "push"`. Run it with `mise run e2e:rust:push`.
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
 - Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
 
-The Docker, Podman, Kubernetes, and VM runners execute CLI
-conformance before their Rust tests. Set the driver's feature variable
-(`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURES`,
+The Docker, Podman, Kubernetes, and VM runners execute conformance before
+their Rust tests; a run with no conformance tests fails. Set the driver's
+feature variable (`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURES`,
 `OPENSHELL_E2E_KUBERNETES_FEATURES`, or `OPENSHELL_E2E_VM_FEATURES`) to
 `e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
 it skips them. Unset or empty values select the driver's default Rust
@@ -379,52 +468,27 @@ Run the Docker-backed Rust CLI e2e suite:
 mise run e2e:docker
 ```
 
-Run the portable CLI conformance suite against the gateway selected in your
-OpenShell CLI configuration:
+Run the conformance suite against the gateway selected in your OpenShell CLI
+configuration:
 
 ```shell
 cargo build --package openshell-cli
 OPENSHELL_BIN="$PWD/target/debug/openshell" \
-  cargo test \
+  cargo nextest run \
     --locked \
     --manifest-path tests/suites/conformance/Cargo.toml \
-    --package openshell-test-conformance-cli \
-    --no-fail-fast \
-    -- \
-    --test-threads=1 \
-    --nocapture
+    --test-threads 1 \
+    --no-fail-fast
 ```
 
 The gateway must already be installed, reachable, and selected before the tests
 start. The test suite does not provision a gateway or select a compute driver.
 Set `OPENSHELL_BIN` to another executable to test a different prebuilt CLI.
+[tests/testkit/README.md](tests/testkit/README.md) covers gateway selection and
+cleanup.
 
-The phase-1 scenario verifies the complete CLI-to-gateway-to-driver path without
-depending on how the gateway was installed or which driver is configured. It
-requires machine-readable gRPC status, creates a uniquely named detached
-sandbox with the configured default image, verifies the sandbox is `Ready` by finding its
-unique name in paginated JSON list output, executes `echo` with a run-specific
-marker, deletes the sandbox, and verifies that its name no longer appears.
-Driver suites enable the same profile
-instead of maintaining a separate smoke implementation. Sandbox lifecycle,
-label matrices, VM overlay, and TLS-key permission assertions remain regular
-E2E coverage.
-
-Each invocation prints a ten-character run ID before creating resources.
-Conformance sandboxes use names such as `ct-<run-id>-01`. The runner tracks the
-exact name and uses it for cleanup; phase 1 does not add ownership labels.
-
-The runner deletes owned resources after both success and failure. If the test
-process is interrupted before cleanup, locate leftovers without touching
-unrelated gateway state:
-
-```shell
-openshell sandbox list --output json
-openshell sandbox delete <sandbox-name>
-```
-
-Gateway-backed Rust E2E tasks run the CLI conformance Cargo tests against the
-configured gateway, then run any lane-specific Rust tests that still apply.
+Gateway-backed Rust E2E tasks run the conformance suite against the configured
+gateway, then run any lane-specific Rust tests that still apply.
 Run the Podman-backed Rust CLI e2e suite:
 
 ```shell
@@ -451,7 +515,9 @@ rebuilds only the RPMs. Run conformance against the installed RPMs:
 
 ```shell
 nix run .#build-artifacts
-nix run .#tmachine -- test fedora-podman-rootful rpm conformance
+nix run .#openshell-test-runner -- \
+  --environment fedora-podman-rootful --installer rpm \
+  --family conformance --package conformance
 ```
 
 Run the portable subset in a disposable rootless Podman guest:
@@ -459,7 +525,6 @@ Run the portable subset in a disposable rootless Podman guest:
 ```shell
 nix run .#build-artifacts
 nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
-nix run .#tmachine -- test fedora-podman-rootless binaries driver-podman
 ```
 
 Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
@@ -470,22 +535,38 @@ nix run .#generate-podman-e2e-ci-tests
 
 The `e2e-podman` testsuite runs a nextest archive built with the corresponding
 Rust feature and preloads its Python workload image into the rootless Podman
-store. The separate `driver-podman` testsuite compares OpenShell and direct
-Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
-profiles. The E2E archive excludes binaries that still depend on wrapper-owned
+store. The E2E archive excludes binaries that still depend on wrapper-owned
 gateway controls, SPIFFE fixtures, the caller driver-config setting, or other
-guest setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
-binary. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
+guest setup. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
 
-The `oci-image` feature testsuite (`tests/suites/features/oci-image`) checks
-OCI image identity and working-directory behavior shared by the Docker and
-Podman drivers against installed deb packages on Ubuntu and rpm packages on
-Fedora. CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
+Driver suites live in `tests/suites/drivers/<driver>`, with the package named
+after the driver. Each driver suite is its own workspace with its own lockfile,
+so a change to one driver's tests or dependencies doesn't touch another's. Add
+a new one to the `rust:format`, `rust:format:check` and `rust:lint` tasks, the
+matching lines in `branch-checks.yml`, and `ALIGNED_WORKSPACES`. The Podman
+driver suite (`tests/suites/drivers/podman`) compares OpenShell and direct
+Podman user-namespace mappings.
+Each `fedora-podman-{rootful,rootless}-userns-<mode>` environment configures
+the gateway with one mode (`default`, `auto`, `keep-id` or `private`); only the
+`binaries` installer applies it:
 
 ```shell
-nix run .#tmachine -- test ubuntu-docker-rootful deb oci-image
+nix run .#openshell-test-runner -- \
+  --environment fedora-podman-rootless-userns-keep-id --installer binaries \
+  --gateway tmachine --family drivers/podman
+```
+
+The `oci-image` feature suite (`tests/suites/features/oci-image`) checks OCI
+image identity and working-directory behavior shared by the Docker and Podman
+drivers against installed deb packages on Ubuntu and rpm packages on Fedora.
+CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
+
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family features --package oci-image
 ```
 
 The shared suite also runs in the existing ARM64 Docker E2E workflow for
@@ -672,7 +753,7 @@ Available task variants:
 | `e2e:kubernetes:v1alpha1` | Agent Sandbox v1alpha1 compatibility |
 | `e2e:kubernetes:external-driver` | External Kubernetes driver sidecar |
 | `e2e:kubernetes:shared-supervisor` | One-member shared supervisor pool for the gateway's sandboxes (gateway TLS through the port-forward) |
-| `e2e:kubernetes:shared-supervisor-ha` | Two-replica shared supervisor pool: kills the member that owns a sandbox and checks the sandbox is adopted, not restarted |
+| `e2e:kubernetes:shared-supervisor-ha` | Two-replica shared supervisor pool behind two gateway replicas on PostgreSQL: kills the member that owns a sandbox and checks the sandbox is adopted, not restarted; crashes and restarts gateways and checks each sandbox's session stays on its supervisor's gateway |
 | `e2e:kubernetes:shared-supervisor-scaling` | One-member shared supervisor pool: scales it to two members and back with `helm upgrade`, checking sandboxes stay running and the removed member hands its sandboxes off |
 
 Kubernetes e2e environment variables:

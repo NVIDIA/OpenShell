@@ -1149,8 +1149,8 @@ impl CredentialRefreshProfile {
 /// Whether the gateway can mint credentials for this refresh strategy (as
 /// opposed to strategies resolved elsewhere, e.g. `Static`/`External`).
 ///
-/// Single source of truth shared with `openshell-server`; keep in sync with the
-/// dispatch in `provider_refresh::mint_credential`.
+/// Profile capability predicate. Gateway parity tests keep this aligned with the
+/// embedded issuer's built-in minter registry without a catalog dependency.
 #[must_use]
 pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy) -> bool {
     matches!(

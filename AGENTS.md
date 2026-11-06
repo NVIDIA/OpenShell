@@ -22,8 +22,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | Path | Components | Purpose |
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
-| `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
+| `crates/openshell-credential-issuer/` | Embedded credential issuer | Credential storage, built-in refresh execution/recovery/scheduling, typed secret owners, and existing driver transport |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
 | `crates/openshell-supervisor-control/` | Shared supervisor control | Gateway-owned assignment controller, launch registrations, recovery coordination, and host observations for a supervisor shared by many sandboxes |
@@ -193,12 +193,8 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 
 ## Go SDK (`sdk/go/`)
 
-- The Go SDK lives in `sdk/go/` with module path `github.com/NVIDIA/OpenShell/sdk/go`.
-- Run `mise run go:ci` for the full SDK CI pipeline (lint, build, test, proto-check, docs-check).
-- Proto bindings are generated with `mise run go:proto:gen` from the `.proto` files in `proto/`.
-- Domain types in `sdk/go/openshell/v1/types/` must not import proto packages.
-- Converters in `sdk/go/openshell/v1/internal/converter/` deep-copy slices and maps at boundaries.
-- Tests use bufconn for in-process gRPC and testify for assertions.
+- The Go SDK moved to [ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go) (module `github.com/ai-openshell/sdk-go`). Open SDK changes there.
+- `sdk/go/` is frozen until it is removed; Branch Checks fails PRs that change it. Proto changes do not need regenerated Go bindings.
 
 ## TypeScript SDK (`sdk/typescript/`)
 
@@ -240,7 +236,7 @@ When behavior, commands, or development workflows change, review the related age
 
 ## Security
 
-- Route first-party security-sensitive cryptographic operations through `openshell-crypto`. If an operation is missing, extend the facade and backend implementation instead of adding a direct cryptographic implementation in an application crate. Preserve protocol compatibility and propagate backend failures without fallback. Protocol/parsing types and documented non-security or dependency-owned exceptions remain permitted; classify exceptions explicitly. Follow [Cryptography and FIPS](crates/openshell-crypto/CRYPTO.md).
+- Route first-party security-sensitive cryptographic operations through `openshell-crypto`. If an operation is missing, extend the facade and backend implementation instead of adding a direct cryptographic implementation in an application crate. Preserve protocol compatibility and propagate backend failures without fallback. Protocol/parsing types and documented exceptions remain permitted; classify exceptions explicitly. Run `mise run rust:deny:policy` when changing crypto dependencies; review `deny.toml` exceptions rather than widening them to pass CI. Follow [Cryptography and FIPS](crates/openshell-crypto/CRYPTO.md).
 - Never commit secrets, API keys, or credentials. If a file looks like it contains secrets (`.env`, `credentials.json`, etc.), do not stage it.
 - Do not run destructive operations (force push, hard reset, database drops) without explicit human confirmation.
 - Scope changes to the issue at hand. Do not make unrelated changes in the same branch.

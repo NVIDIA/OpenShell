@@ -35,7 +35,7 @@ def test_generate_package_relative_bindings(tmp_path: Path, no_pyi: bool) -> Non
     }
     suffixes = ["_pb2.py", "_pb2_grpc.py"]
     if not no_pyi:
-        suffixes.append("_pb2.pyi")
+        suffixes.extend(["_pb2.pyi", "_pb2_grpc.pyi"])
     assert {path.name for path in output.iterdir()} == {
         f"{stem}{suffix}" for stem in stems for suffix in suffixes
     }

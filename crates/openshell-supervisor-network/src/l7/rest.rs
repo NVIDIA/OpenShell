@@ -9670,6 +9670,70 @@ mod tests {
     // receives.
     // =========================================================================
 
+    fn placed_test_resolver(
+        environment: HashMap<String, String>,
+        host: &str,
+        declarations: &[(&str, &str, &str)],
+    ) -> (HashMap<String, String>, Option<SecretResolver>) {
+        use openshell_core::proto::{
+            ProviderProfileCredential, StaticCredentialBinding, StaticCredentialEndpointBinding,
+        };
+        use openshell_core::provider_credentials::{
+            ProviderCredentialState, STATIC_CREDENTIAL_METADATA_PREFIX,
+        };
+        let metadata = declarations
+            .iter()
+            .map(|(key, style, selector)| {
+                let mut credential = ProviderProfileCredential {
+                    env_vars: vec![(*key).into()],
+                    auth_style: (*style).into(),
+                    ..Default::default()
+                };
+                match *style {
+                    "header" => credential.header_name = (*selector).into(),
+                    "query" => credential.query_param = (*selector).into(),
+                    "path" => credential.path_template = (*selector).into(),
+                    _ => panic!("fixture needs an explicit placement"),
+                }
+                (
+                    format!("{STATIC_CREDENTIAL_METADATA_PREFIX}{key}"),
+                    credential,
+                )
+            })
+            .collect();
+        let bindings = environment
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    StaticCredentialBinding {
+                        credential_identity: format!("fixture:{key}"),
+                        workload_credential_handle: String::new(),
+                        endpoints: vec![StaticCredentialEndpointBinding {
+                            host: host.into(),
+                            port: 443,
+                            path: "/**".into(),
+                        }],
+                    },
+                )
+            })
+            .collect();
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            environment,
+            HashMap::new(),
+            metadata,
+            bindings,
+            Vec::new(),
+        )
+        .unwrap();
+        let child_env = state.snapshot().child_env.clone();
+        let resolver = state
+            .resolver_for_endpoint(host, 443, "/")
+            .map(|resolver| resolver.as_ref().clone());
+        (child_env, resolver)
+    }
+
     /// Helper: run a request through the relay and capture what upstream receives.
     async fn relay_and_capture(
         raw_header: Vec<u8>,
@@ -10347,10 +10411,12 @@ mod tests {
 
     #[tokio::test]
     async fn relay_injects_exact_header_credential() {
-        let (child_env, resolver) = SecretResolver::from_provider_env(
+        let (child_env, resolver) = placed_test_resolver(
             [("CUSTOM_TOKEN".to_string(), "tok-12345".to_string())]
                 .into_iter()
                 .collect(),
+            "api.example.com",
+            &[("CUSTOM_TOKEN", "header", "x-api-key")],
         );
         let placeholder = child_env.get("CUSTOM_TOKEN").unwrap();
 
@@ -10424,10 +10490,12 @@ mod tests {
 
     #[tokio::test]
     async fn relay_injects_query_param_credential() {
-        let (child_env, resolver) = SecretResolver::from_provider_env(
+        let (child_env, resolver) = placed_test_resolver(
             [("YOUTUBE_KEY".to_string(), "AIzaSy-secret".to_string())]
                 .into_iter()
                 .collect(),
+            "www.googleapis.com",
+            &[("YOUTUBE_KEY", "query", "key")],
         );
         let placeholder = child_env.get("YOUTUBE_KEY").unwrap();
 
@@ -10535,13 +10603,15 @@ mod tests {
 
     #[tokio::test]
     async fn relay_injects_url_path_credential_telegram_style() {
-        let (child_env, resolver) = SecretResolver::from_provider_env(
+        let (child_env, resolver) = placed_test_resolver(
             [(
                 "TELEGRAM_TOKEN".to_string(),
                 "123456:ABC-DEF1234ghIkl".to_string(),
             )]
             .into_iter()
             .collect(),
+            "api.telegram.org",
+            &[("TELEGRAM_TOKEN", "path", "/bot{credential}/sendMessage")],
         );
         let placeholder = child_env.get("TELEGRAM_TOKEN").unwrap();
 
@@ -10568,10 +10638,12 @@ mod tests {
 
     #[tokio::test]
     async fn relay_injects_url_path_credential_standalone_segment() {
-        let (child_env, resolver) = SecretResolver::from_provider_env(
+        let (child_env, resolver) = placed_test_resolver(
             [("ORG_TOKEN".to_string(), "org-abc-789".to_string())]
                 .into_iter()
                 .collect(),
+            "api.example.com",
+            &[("ORG_TOKEN", "path", "/api/{credential}/resources")],
         );
         let placeholder = child_env.get("ORG_TOKEN").unwrap();
 
@@ -10598,13 +10670,18 @@ mod tests {
 
     #[tokio::test]
     async fn relay_injects_combined_path_and_header_credentials() {
-        let (child_env, resolver) = SecretResolver::from_provider_env(
+        let (child_env, resolver) = placed_test_resolver(
             [
                 ("PATH_TOKEN".to_string(), "tok-path-123".to_string()),
                 ("HEADER_KEY".to_string(), "sk-header-456".to_string()),
             ]
             .into_iter()
             .collect(),
+            "api.example.com",
+            &[
+                ("PATH_TOKEN", "path", "/bot{credential}/send"),
+                ("HEADER_KEY", "header", "x-api-key"),
+            ],
         );
         let path_ph = child_env.get("PATH_TOKEN").unwrap();
         let header_ph = child_env.get("HEADER_KEY").unwrap();

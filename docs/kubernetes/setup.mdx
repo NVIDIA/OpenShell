@@ -409,13 +409,19 @@ managed mode, the configured image-pull Secrets. The gateway stages their
 contents into each sandbox runtime generation's Secrets in the workspace
 namespace.
 
-The namespaced Role covers sandbox lifecycle and identity:
+The namespaced Role covers sandbox lifecycle, supervisor resources, and identity.
+Both the gateway chart and separate workspace chart grant these permissions.
+Stopped-sandbox updates use direct Pod `get` requests to check known workload and
+supervisor Pod names for remaining Pods.
 
 | API Group | Resource | Verbs |
 |---|---|---|
 | `agents.x-k8s.io` | `sandboxes`, `sandboxes/status` | create, delete, get, list, patch, update, watch |
 | `""` | `events` | get, list, watch |
-| `""` | `pods` | get |
+| `""` | `pods` | create, delete, get, list, patch, watch |
+| `""` | `services` | create, get |
+| `""` | `secrets` | create, delete |
+| `networking.k8s.io` | `networkpolicies` | create, get |
 
 The ClusterRole grants node inspection and token validation:
 

@@ -140,6 +140,18 @@ impl OcsfEvent {
         }
     }
 
+    /// Context-derived sandbox attribution, never request-supplied resources.
+    #[must_use]
+    pub fn sandbox_id(&self) -> Option<&str> {
+        self.base()
+            .device
+            .as_ref()
+            .and_then(|device| device.container.as_ref())
+            .and_then(|container| container.uid.as_deref())
+            .or_else(|| self.base().unmapped.as_ref()?.get("sandbox_id")?.as_str())
+            .filter(|id| !id.is_empty())
+    }
+
     /// Returns the base event data common to all event classes.
     #[must_use]
     pub fn base(&self) -> &BaseEventData {

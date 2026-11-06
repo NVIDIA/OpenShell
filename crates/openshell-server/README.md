@@ -123,6 +123,69 @@ or two minutes after the withdrawal, after their owner was told to stop them.
 Pool members still authenticate with the one shared supervisor token, so a
 member identity is asserted by its hello rather than bound to its Pod.
 
+## Optional in-process sandbox updates
+
+`SharedComputeDriver` retains the generated baseline compute-driver trait, and
+`ComputeDriverInstance` retains its existing variants. Existing compiled drivers
+and factories need no new trait implementation or registration method.
+
+A supporting factory overrides `ComputeDriverFactory::build_with_configuration_updates`
+to return its ordinary instance plus a separately registered updater. The default
+calls `build` and returns no updater. External drivers serve
+`ComputeDriverConfigurationUpdates` on their existing endpoint. Workload updates
+require `openshell.compute.update-sandbox-configuration` for image, command, or
+environment changes. Metadata-only replacements use one database CAS and update
+the label index without invoking a driver.
+
+New updates require operator activation and compatible gateway membership.
+Accepted updates recover from private durable intent at startup and in periodic
+reconciliation, including when activation is subsequently disabled. Recovery
+pages through a partial database index of pending private update records instead
+of scanning sandboxes or completed receipts. Acceptance and completion maintain
+the indexed status in the same transaction as the intent and lifecycle interlock.
+Each gateway keeps automatic recovery backoff in memory. Failed attempts wait
+1, 2, 4, 8, then 15 minutes; each failure log includes the attempt and retry delay.
+Replicas retry independently, and a gateway restart resets its backoff. A new
+operation starts without delay. Completed or deleted updates are removed from
+the backoff map as recovery observes them.
+An authorized `UpdateSandbox` with no selected fields and the current resource
+version resumes immediately, bypassing backoff without reconstructing its selections. Completion retains the
+exact operation receipt for idempotent completion across replicas; a newer update
+invalidates it. Ambiguous results retain the baseline provisioning interlock.
+Explicit deletion can supersede a pending update: the driver only patches the
+original immutable resource and never creates a replacement. The Deleting CAS
+prevents delayed completion. Cleanup bypasses the pending-driver guard only when
+the pending operation ID matches the persisted update intent. Final removal
+deletes the sandbox and private intent atomically, retaining that evidence if
+cleanup fails or loses a resource-version race.
+
+Metadata replacement preserves gateway-owned keys, including retention, while
+other user keys under OpenShell domains remain editable. Completion preserves
+later annotation merges accepted through `UpdateConfig`.
+
+A provisioning timeout can be repaired by Stop after its original driver work
+settles and cleanup completes. Stop exposes Stopped without discarding the timeout
+diagnosis or storage. This lifecycle behavior also applies when updates are disabled.
+
+## Static credential delivery
+
+Existing polling and configuration-push environments keep their original wire
+shape, delivery behavior, identities, and stable-handle derivation. The gateway
+adds placement-only `ProviderProfileCredential` entries to the existing runtime
+credential map under `static-env:<ENV_KEY>`, for actually delivered static keys.
+Entries are matched to their owning provider binding and contain no token grant,
+refresh configuration, or credential values. The supervisor infers enforcement
+from the auth metadata; the gateway does not enforce placement.
+
+Older supervisors ignore entries without token grants. An older gateway omits
+these entries, so newer supervisors permit static substitution only in
+`Authorization` or explicitly enabled body/WebSocket rewrite contexts. Custom
+placements require a supporting gateway; upgrade it before the supervisor.
+Explicit authored placement is forwarded even when invalid so the supervisor
+can reject it rather than silently apply the default. Metadata travels in the
+same captured environment snapshot; no separate service, capability gate, or
+additional lookup is needed.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment
@@ -150,7 +213,22 @@ closed without falling back to inline values.
 ## Refresh coordination
 
 Explicit rotation, background refresh, and operator refresh-on-read share the
-same refresh coordination:
+same refresh coordination in `openshell-credential-issuer::refresh`. The server's
+`provider_refresh` facade retains public status/configuration adaptation and
+worker startup. `refresh_store` translates the unchanged private durable record
+and leases; `refresh_commit` retains workspace/attachment/provider CAS integration.
+The gateway publishes worker/manual changes at the existing orchestration points;
+export-triggered refresh does not publish. The issuer is still embedded: stable
+reference/version migration must remove the temporary provider commit port before
+remote refresh.
+
+Gateway configuration, status, deletion, export revalidation, and snapshot reads
+use the shared `CredentialRefresh` interface. Deletion does not construct a local
+runtime. The temporary provider-commit adapter uses the same injected
+`RefreshStateStore` for attachment-validation reads, avoiding a runtime ownership
+cycle; neither path calls gateway refresh-persistence helpers directly.
+
+The shared runtime preserves these guarantees:
 
 - A process-local weak keyed mutex coalesces waiters without retaining deleted
   providers indefinitely.
@@ -189,3 +267,31 @@ runs under `mise run test:rust:postgres` (see `TESTING.md`) and still accepts
 `OPENSHELL_REFRESH_TEST_DATABASE_URL` pointing to a disposable PostgreSQL database.
 It exercises independent sessions without the local mutex. Do not point this
 fixture at an existing deployment database.
+
+## Application route installation records
+
+Supervisor installation reports arrive only through the authenticated sandbox
+session. The gateway issues bounded, single-use lease challenges and validates
+reports under the sandbox mutation guard. Accepted records contain current
+service declarations, configuration/runtime identity, session fencing, a
+trusted driver-resolved app endpoint, and gateway lease expiry. The private
+`ComputeDriverAppEndpoints.ResolveSupervisorAppEndpoint` extension RPC resolves this endpoint separately
+from `GetSandbox`: endpoint lookup failures do not affect ordinary sandbox
+observation. Unsupported drivers return `UNIMPLEMENTED`; an absent endpoint
+withholds application publication. The gateway resolves the endpoint once before
+issuing each challenge and binds that result to the session and lease sequence.
+Acceptance rechecks durable ownership, shared member/readiness authority, runtime,
+and configuration without another driver lookup. The next challenge resolves
+afresh; the saved result never extends the original lease expiry.
+In-process factories opt in with
+`ComputeDriverBuildContext::register_app_endpoints`; baseline factories need no
+changes. Standalone drivers register the extension on their existing endpoint.
+The generic
+store key is prefixed `service-installation:`; records are ephemeral and do not
+change durable sandbox protobufs. Reads revalidate owner, configuration,
+generation, and expiry. Cleanup scans bounded pages and uses conditional deletes
+so concurrent renewals are preserved. Cursor progress survives partial sweep
+timeouts; bounded record attempts prevent a malformed or stalled record from
+starving later cleanup. Failed attempts are revisited on the next scan.
+Discovery consumers must not treat these
+records as application health or external ingress readiness.
