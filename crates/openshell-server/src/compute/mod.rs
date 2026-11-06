@@ -19286,7 +19286,10 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
     async fn seed_provisioning_attempt(runtime: &ComputeRuntime) -> Sandbox {
         let mut sandbox = sandbox_record("sb-ttl", "sandbox-ttl", SandboxPhase::Provisioning);
         let status = sandbox.status.as_mut().unwrap();
-        status.provisioning = Some(provisioning_deadline::new_record(0, 300_000));
+        status.provisioning = Some(provisioning_deadline::new_record(
+            0,
+            runtime.provisioning_repair_window_ms,
+        ));
         status.configuration_activated = Some(false);
         status.configuration_admission =
             Some(openshell_core::proto::SandboxConfigurationAdmission {
@@ -20987,29 +20990,30 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
     #[tokio::test]
     async fn provisioning_timeout_persists_error_before_cleanup_and_preserves_record() {
         let driver = ControlledDriver::new();
-        let runtime = test_runtime(driver.clone()).await;
+        let runtime = test_runtime(driver.clone())
+            .await
+            .with_provisioning_repair_window_ms(900_000)
+            .unwrap();
         let sandbox = seed_provisioning_attempt(&runtime).await;
         let gate = runtime.lifecycle_gates.lock_for("sb-ttl").await;
         let sandbox_guard = runtime.lock_sandbox_for_lifecycle(&gate).await;
         assert!(
             runtime
-                .claim_provisioning_timeout(&sandbox, 299_999)
+                .claim_provisioning_timeout(&sandbox, 899_999)
                 .await
                 .unwrap()
                 .is_none()
         );
         let expired = runtime
-            .claim_provisioning_timeout(&sandbox, 300_000)
+            .claim_provisioning_timeout(&sandbox, 900_000)
             .await
             .unwrap()
             .unwrap();
         drop(sandbox_guard);
         assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
-        assert!(
-            ready_condition(&expired)
-                .unwrap()
-                .message
-                .contains("Provider requires an inspected endpoint")
+        assert_eq!(
+            ready_condition(&expired).unwrap().message,
+            "Provisioning repair window expired: Provider requires an inspected endpoint"
         );
         assert_eq!(driver.stop_calls(), 0);
         runtime

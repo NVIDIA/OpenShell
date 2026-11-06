@@ -652,10 +652,10 @@ impl super::ComputeRuntime {
                     let message = if preparation_expired {
                         "Image preparation or initial supervisor startup exceeded its absolute deadline".to_string()
                     } else if diagnostic.is_empty() {
-                        "Provisioning repair window expired after 300 seconds".to_string()
+                        "Provisioning repair window expired".to_string()
                     } else {
                         format!(
-                            "Provisioning repair window expired after 300 seconds: {diagnostic}"
+                            "Provisioning repair window expired: {diagnostic}"
                         )
                     };
                     status
