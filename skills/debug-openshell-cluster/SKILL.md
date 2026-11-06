@@ -530,6 +530,14 @@ kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
 
+Gateway pod scheduling accepts top-level `nodeSelector`, `affinity`,
+`tolerations`, `priorityClassName`, and `topologySpreadConstraints` values for
+both StatefulSet and Deployment workloads. The last two default to unset.
+If a gateway pod stays Pending, inspect its scheduling events, confirm the
+named PriorityClass exists (`kubectl get priorityclass`), and check that topology
+spread selectors match the gateway pod labels and that eligible nodes have the
+required topology labels. These values apply only to gateway pods.
+
 #### Additional destination CA ConfigMap
 
 When `supervisor.network.additionalCaConfigMapName` is set, Helm must mount the
