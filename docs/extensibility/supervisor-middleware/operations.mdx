@@ -99,7 +99,7 @@ OpenShell removes body modes that cannot safely inspect or transform the message
 | Bodyless response, partial response, or `Cache-Control: no-transform` | Not applicable | No body modes |
 | Declared length exceeds the stage's payload limit | No WHOLE_BODY | No WHOLE_BODY |
 | `text/event-stream` or `multipart/x-mixed-replace` | No additional restriction | No WHOLE_BODY |
-| Request or response is not HTTP/1.1 | No additional restriction | No DUPLEX |
+| HTTP/1.0 is involved and the response cannot be chunked | No additional restriction | No DUPLEX |
 
 A WHOLE_BODY body that exceeds the selected limit fails closed. OpenShell does not switch it to DUPLEX. If no mode suits your service, continue without inspection or deny the message with a reason code that says why.
 
@@ -129,12 +129,12 @@ HTTP hooks always fail closed. The gateway rejects `on_error: fail_open` for the
 
 | Result | Before forwarding starts | After forwarding starts |
 | --- | --- | --- |
-| Request `deny` | `403 Forbidden`, `error: middleware_denied` | Close the upstream connection before the request completes. |
+| Request `deny` | `403 Forbidden`, `error: middleware_denied` | Close the upstream connection before the request completes. The sandbox still receives `403 Forbidden`, `error: middleware_denied`, and OpenShell relays no upstream response. |
 | Request failure | `403 Forbidden`, `error: middleware_failed` | Close the upstream connection before the request completes. |
 | Response `block_delivery` | `403 Forbidden`, `error: middleware_denied` | Abort response delivery without an error body. |
 | Response failure | `502 Bad Gateway`, `error: response_delivery_failed` | Abort response delivery without an error body. |
 
-Denials include the policy entry's `middleware` name and the validated `reason_code`, if supplied. Failures include a platform-owned `failure_code` and identify the failed stage when known:
+Denials include the policy entry's `middleware` name and the validated `reason_code`, if supplied. Both `middleware_failed` and `response_delivery_failed` bodies include a platform-owned `failure_code` and identify the failed stage when known:
 
 | `failure_code` | Cause |
 | --- | --- |

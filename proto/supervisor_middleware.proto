@@ -119,7 +119,9 @@ message MiddlewareBinding {
   // Required for payload-bearing operations. An HTTP binding of a service that
   // requires the HTTP hooks capability may leave this zero: OpenShell
   // then offers it no body modes, so it can only continue or deny at
-  // preflight.
+  // preflight. Such a binding is excluded from the comparison with the
+  // registration's operator-configured max_payload_bytes; every other binding
+  // uses the operator limit, which cannot exceed what that binding advertises.
   uint64 max_payload_bytes = 3;
   // Optional binding-specific RPC timeout. Empty uses the operator-configured
   // service timeout, or the 500ms platform default when that is also omitted.
@@ -386,8 +388,8 @@ message HttpPreflightResult {
   // Content-Range, and request headers omitted because they carry a credential
   // placeholder. OpenShell does not update integrity headers such
   // as ETag, Content-MD5, or Content-Digest when a body changes: a stage that
-  // changes the body removes them or writes new values, typically in its late
-  // head mutations. Limited to 64
+  // changes the body removes them or writes new values, typically in
+  // HttpWholeBodyResult.header_mutations or HttpOutputStart.header_mutations. Limited to 64
   // operations, 32 KiB of name/value data, and 64 KiB encoded.
   repeated HeaderMutation header_mutations = 3;
   MiddlewareDiagnostics diagnostics = 4;
@@ -494,6 +496,9 @@ message HttpFinish {
 // 403 middleware denial with the validated reason_code. A message already
 // partly delivered stays incomplete: OpenShell withholds its terminating chunk
 // or final byte, trailers, and any error body, and closes that connection.
+// A DUPLEX request denied after its output has started upstream aborts the
+// upstream request, relays no upstream response, and still answers the
+// sandbox with the canonical 403 middleware denial.
 // A stage that cannot inspect an HTTP message, such as a body in a format it
 // does not understand, denies it with a reason_code that says so.
 message HttpDenial {
