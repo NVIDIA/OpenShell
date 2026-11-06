@@ -12,7 +12,7 @@ use openshell_sdk::{
 };
 use rand::Rng;
 
-use crate::cleanup::{CLEANUP_TIMEOUT, Cleanup};
+use crate::cleanup::{CLEANUP_TIMEOUT, Cleanup, Key};
 use crate::cli::{Cli, CliOutput};
 use crate::error::{Error, Result, ResultExt};
 use crate::poll::{Poll, poll_until};
@@ -269,18 +269,22 @@ fn track_sandbox(cleanup: &Cleanup, client: &WorkspaceScopedClient, name: &str) 
     let owned = name.to_string();
     // The timeout wraps the whole hook, not just the wait, so a gateway that
     // never answers the delete cannot hang cleanup.
-    cleanup.push_keyed(name, format!("delete sandbox {name}"), async move || {
-        client
-            .delete_sandbox(
-                &owned,
-                DeleteOptions {
-                    allow_missing: true,
-                },
-            )
-            .await?;
-        client.wait_deleted(&owned, CLEANUP_TIMEOUT, None).await?;
-        Ok(())
-    });
+    cleanup.push_keyed(
+        Key::Sandbox(name.to_string()),
+        format!("delete sandbox {name}"),
+        async move || {
+            client
+                .delete_sandbox(
+                    &owned,
+                    DeleteOptions {
+                        allow_missing: true,
+                    },
+                )
+                .await?;
+            client.wait_deleted(&owned, CLEANUP_TIMEOUT, None).await?;
+            Ok(())
+        },
+    );
 }
 
 /// The generated gRPC client, for public API the SDK does not wrap yet.
@@ -603,7 +607,7 @@ impl Sandbox {
             .wait_deleted(&self.name, DELETE_TIMEOUT, Some(&self.id))
             .await
             .context(format!("wait for sandbox {} to be deleted", self.name))?;
-        self.cleanup.remove(&self.name);
+        self.cleanup.remove(&Key::Sandbox(self.name.clone()));
         Ok(())
     }
 }
