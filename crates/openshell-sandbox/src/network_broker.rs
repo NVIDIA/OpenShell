@@ -1226,6 +1226,9 @@ fn connect_local_tcp(
         }
         return match started {
             Ok(()) => listener.respond_value(notification.id, 0),
+            Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => {
+                listener.respond_errno(notification.id, libc::EINPROGRESS)
+            }
             Err(error) => Err(error),
         };
     }
@@ -3034,6 +3037,61 @@ mod tests {
             "mediated socket creation waited {blocking_wait:?} behind a slow connect"
         );
         assert_eq!(nonblocking_result, Some(libc::EINPROGRESS));
+    }
+
+    #[test]
+    fn nonblocking_loopback_connect_completes_after_in_progress() {
+        // A nonblocking loopback connect reports progress, then completes on the
+        // workload's own socket: it becomes writable, SO_ERROR is clear, a repeat
+        // reports EISCONN, and data reaches the peer.
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let mut received = [0_u8; 4];
+            stream.read_exact(&mut received).unwrap();
+            received
+        });
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let (first, ready, socket_error, repeated) = launcher
+            .execute(move || {
+                let socket = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::STREAM.nonblocking(),
+                    None,
+                )
+                .unwrap();
+                let first = socket
+                    .connect(&address.into())
+                    .err()
+                    .and_then(|error| error.raw_os_error());
+                let mut poll = libc::pollfd {
+                    fd: socket.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: poll points to one live pollfd.
+                let ready = unsafe { libc::poll(&raw mut poll, 1, 5_000) };
+                let socket_error = socket
+                    .take_error()
+                    .unwrap()
+                    .and_then(|error| error.raw_os_error());
+                let repeated = socket
+                    .connect(&address.into())
+                    .err()
+                    .and_then(|error| error.raw_os_error());
+                socket.set_nonblocking(false).unwrap();
+                (&socket).write_all(b"ping").unwrap();
+                (first, ready, socket_error, repeated)
+            })
+            .expect("launcher result");
+        assert_eq!(first, Some(libc::EINPROGRESS));
+        assert_eq!(ready, 1, "socket never became writable");
+        assert_eq!(socket_error, None);
+        assert_eq!(repeated, Some(libc::EISCONN));
+        assert_eq!(&peer.join().unwrap(), b"ping");
     }
 
     #[test]
