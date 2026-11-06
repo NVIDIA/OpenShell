@@ -490,7 +490,8 @@ The proxy does not rewrite cookies, response content, unsupported request
 bodies, or WebSocket binary frames.
 
 Explicit endpoint policies can enable credential rewriting in request bodies
-or WebSocket text messages. These flags do not authorize arbitrary query
+or WebSocket text messages. WebSocket text message rewriting requires
+`protocol: websocket`. These flags do not authorize arbitrary query
 parameters, path slots, or unrelated headers. See [Profiles](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding)
 for placement configuration and upgrade requirements.
 
