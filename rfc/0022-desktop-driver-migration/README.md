@@ -7,6 +7,8 @@ links:
   - https://github.com/NVIDIA/OpenShell/issues/4425
   - https://github.com/NVIDIA/OpenShell/pull/4426
   - https://github.com/NVIDIA/OpenShell/pull/5202
+  - https://github.com/NVIDIA/OpenShell/issues/4848
+  - https://github.com/NVIDIA/OpenShell/pull/5138
 ---
 
 # RFC 0022 - Moving the Desktop Drivers to a Separate Repository
@@ -99,17 +101,18 @@ Four rules shape the design:
    and the driver SDK.
 3. `packages` assembles pinned core and `desktop` releases and owns the
    compatibility matrix.
-4. Conformance (the driver-agnostic test suite in `openshell-conformance`) is
-   owned by core and run by `desktop`.
+4. Conformance (the driver-agnostic suite, shipped as the `openshell-conformance`
+   program) is owned by core and run by `desktop` against its own gateway.
 
 ```mermaid
 graph TD
     P["packages<br/>install.sh, DEB/RPM/snap, Homebrew,<br/>bundle pins and canary"]
-    C["core (openshell)<br/>gateway, CLI, supervisor, Kubernetes driver,<br/>driver SDK, conformance harness"]
+    C["core (openshell)<br/>gateway, CLI, supervisor, Kubernetes driver,<br/>driver SDK, conformance suite"]
     D["desktop (ai-openshell/desktop)<br/>Docker, Podman, later VM"]
     P -->|pins release| C
     P -->|pins release| D
-    D -->|"git dependency on SDK tag<br/>runs conformance"| C
+    D -->|"git dependency on SDK tag"| C
+    D -->|"runs openshell-conformance<br/>from the same tag"| C
 ```
 
 ### Part A: Prerequisite, external compute drivers
@@ -249,8 +252,8 @@ crate stays in this workspace until phase 8, and its e2e runs as an external
 target. Core's own tests that construct real desktop drivers use lightweight
 in-test doubles, and core's e2e runs on Kubernetes. Once the VM driver moves,
 Kubernetes is core's only e2e driver until a Linux-process driver exists. The
-conformance harness stays in core and is the interface `desktop` uses to test its
-drivers.
+conformance suite stays in core and is the interface `desktop` uses to test its
+drivers. It ships as a standalone program that needs no core build.
 
 ### Part B: Moving the desktop drivers
 
@@ -287,9 +290,15 @@ N-1 lines are supported.
 
 #### B3. Conformance and testing
 
-Core publishes the conformance harness with the SDK. `desktop` runs it against
-its drivers on every change, against core's latest stable and N-1 releases, and
-on a schedule against core's `dev`. A core change that breaks a driver therefore
+Core publishes conformance as the `openshell-conformance` program
+([#5138](https://github.com/NVIDIA/OpenShell/pull/5138)), a release artifact that
+runs against any gateway, so `desktop` does not build core to run it. `desktop`
+is its first external consumer, and
+[#4848](https://github.com/NVIDIA/OpenShell/issues/4848) tracks making it usable
+by any external driver. Publishing the program is not yet done, so this RFC
+depends on it. `desktop` pins the program to the same core tag as the SDK and runs
+it unfiltered against its drivers on every change, against core's latest stable
+and N-1 releases, and on a schedule against core's `dev`. A core change that breaks a driver therefore
 shows up in `desktop` CI within a day. Docker, Podman, and VM e2e scripts and
 the nix test guest and tmachine pieces they use move to `desktop` with the
 drivers.
@@ -350,8 +359,8 @@ Part B starts once Part A is complete and RFC 0019's repository layout is
 accepted.
 
 - **Phase 6: Stand up `desktop`.** CI against a pinned core tag, the git SDK
-  dependency, the `deny.toml` allowance, conformance in CI, and named
-  maintainers. A minimal driver passes conformance before anything moves.
+  dependency, the `deny.toml` allowance, conformance in CI with the published `openshell-conformance` program (a
+  prerequisite), and named maintainers. A minimal driver passes conformance before anything moves.
 - **Phase 7: Move Docker and Podman** with the shared crate, history, CI, and
   documentation. `packages` publishes its first bundle from a pinned core and
   `desktop` release.
@@ -374,6 +383,9 @@ are updated with each phase that changes them, not with this RFC.
   also depends on core by git tag, which needs a `deny.toml` exception there and
   is less ergonomic than a registry. The `Cargo.lock` commit pin keeps builds
   reproducible.
+- **Conformance publication.** Part B depends on the `openshell-conformance`
+  program being published as a release artifact. Until it is, `desktop` cannot run
+  conformance without building core.
 - **Cross-repository coordination.** More repositories mean more CI and release
   coordination, and an integration can fall behind core. The bundle, the
   scheduled `dev` conformance job, and the refusal-on-mismatch rule contain the
