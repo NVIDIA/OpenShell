@@ -517,6 +517,10 @@ pub struct Config {
 pub struct ServiceRoutingConfig {
     /// Publish gateway URLs and forward application requests through the gateway.
     pub enabled: bool,
+    /// Opt in to gateway authentication for proxied application requests.
+    /// Independent of the supervisor application listener.
+    pub auth_enabled: bool,
+
     /// Base domains accepted for `sandbox--service.<domain>` routes.
     /// The first domain is used when the gateway prints endpoint URLs.
     pub base_domains: Vec<String>,
@@ -1484,6 +1488,13 @@ impl Config {
         self
     }
 
+    /// Opt in to configured gateway authentication on application requests.
+    #[must_use]
+    pub const fn with_service_auth(mut self, enabled: bool) -> Self {
+        self.service_routing.auth_enabled = enabled;
+        self
+    }
+
     /// Enable or disable plaintext HTTP routing for loopback sandbox service
     /// hostnames on TLS-enabled gateway listeners.
     #[must_use]
@@ -1504,6 +1515,7 @@ impl Default for ServiceRoutingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            auth_enabled: false,
             base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
             service_hostname_format: ServiceHostnameFormat::default(),
@@ -2043,6 +2055,8 @@ mod tests {
             vec![DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()]
         );
         assert!(cfg.service_routing.enable_loopback_service_http);
+        assert!(!cfg.service_routing.auth_enabled);
+        assert!(cfg.with_service_auth(true).service_routing.auth_enabled);
     }
 
     #[test]
