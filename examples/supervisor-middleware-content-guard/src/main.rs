@@ -4,8 +4,8 @@
 //! Example OpenShell supervisor middleware service.
 //!
 //! The content guard redacts or denies configured terms in HTTP request and
-//! response bodies through HTTP hooks (`HttpHooks.EvaluateRequest`
-//! and `HttpHooks.EvaluateResponse`), and in WebSocket text messages. Its
+//! response bodies through HTTP hooks (`HttpHooks.EvaluateHttpRequestHook`
+//! and `HttpHooks.EvaluateHttpResponseHook`), and in WebSocket text messages. Its
 //! manifest requires the `openshell.supervisor-middleware.http-hooks`
 //! capability, which gateways and supervisors that predate HTTP hooks
 //! do not support, so they refuse it at Describe.
@@ -151,20 +151,20 @@ impl SupervisorMiddleware for ContentGuard {
 
 #[tonic::async_trait]
 impl HttpHooks for ContentGuard {
-    type EvaluateRequestStream = HttpRequestHookResultStream;
-    type EvaluateResponseStream = HttpResponseHookResultStream;
+    type EvaluateHttpRequestHookStream = HttpRequestHookResultStream;
+    type EvaluateHttpResponseHookStream = HttpResponseHookResultStream;
 
-    async fn evaluate_request(
+    async fn evaluate_http_request_hook(
         &self,
         request: Request<tonic::Streaming<HttpRequestHookEvent>>,
-    ) -> Result<Response<Self::EvaluateRequestStream>, Status> {
+    ) -> Result<Response<Self::EvaluateHttpRequestHookStream>, Status> {
         Ok(Response::new(http::request_stream(request.into_inner())))
     }
 
-    async fn evaluate_response(
+    async fn evaluate_http_response_hook(
         &self,
         request: Request<tonic::Streaming<HttpResponseHookEvent>>,
-    ) -> Result<Response<Self::EvaluateResponseStream>, Status> {
+    ) -> Result<Response<Self::EvaluateHttpResponseHookStream>, Status> {
         Ok(Response::new(http::response_stream(request.into_inner())))
     }
 }

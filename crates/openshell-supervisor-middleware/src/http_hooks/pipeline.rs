@@ -447,7 +447,7 @@ pub struct PreflightFields {
 }
 
 impl PreflightFields {
-    /// An `HttpHooks.EvaluateRequest` preflight at `PRE_CREDENTIALS`.
+    /// An `HttpHooks.EvaluateHttpRequestHook` preflight at `PRE_CREDENTIALS`.
     pub fn request(self, request: HttpRequestPreflightHead) -> StagePreflight {
         StagePreflight::Request(HttpRequestHookPreflight {
             request: Some(request),
@@ -462,7 +462,7 @@ impl PreflightFields {
         })
     }
 
-    /// An `HttpHooks.EvaluateResponse` preflight at `PRE_RETURN`.
+    /// An `HttpHooks.EvaluateHttpResponseHook` preflight at `PRE_RETURN`.
     pub fn response(self, head: HttpResponsePreflightHead) -> StagePreflight {
         StagePreflight::Response(HttpResponseHookPreflight {
             response: Some(head),

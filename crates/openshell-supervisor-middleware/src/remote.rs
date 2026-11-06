@@ -248,7 +248,7 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
     ) -> std::result::Result<HttpRequestHookResultStream, Status> {
         let mut client = self.http_hooks_client.clone();
         let responses = client
-            .evaluate_request(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+            .evaluate_http_request_hook(Request::new(tokio_stream::wrappers::ReceiverStream::new(
                 receiver,
             )))
             .await?
@@ -262,7 +262,7 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
     ) -> std::result::Result<HttpResponseHookResultStream, Status> {
         let mut client = self.http_hooks_client.clone();
         let responses = client
-            .evaluate_response(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+            .evaluate_http_response_hook(Request::new(tokio_stream::wrappers::ReceiverStream::new(
                 receiver,
             )))
             .await?
@@ -301,13 +301,13 @@ mod tests {
 
     #[tonic::async_trait]
     impl HttpHooks for HttpHooksService {
-        type EvaluateRequestStream = HttpRequestHookResultStream;
-        type EvaluateResponseStream = HttpResponseHookResultStream;
+        type EvaluateHttpRequestHookStream = HttpRequestHookResultStream;
+        type EvaluateHttpResponseHookStream = HttpResponseHookResultStream;
 
-        async fn evaluate_request(
+        async fn evaluate_http_request_hook(
             &self,
             request: Request<tonic::Streaming<HttpRequestHookEvent>>,
-        ) -> std::result::Result<Response<Self::EvaluateRequestStream>, Status> {
+        ) -> std::result::Result<Response<Self::EvaluateHttpRequestHookStream>, Status> {
             let event = request
                 .into_inner()
                 .message()
@@ -329,10 +329,10 @@ mod tests {
             )]))))
         }
 
-        async fn evaluate_response(
+        async fn evaluate_http_response_hook(
             &self,
             request: Request<tonic::Streaming<HttpResponseHookEvent>>,
-        ) -> std::result::Result<Response<Self::EvaluateResponseStream>, Status> {
+        ) -> std::result::Result<Response<Self::EvaluateHttpResponseHookStream>, Status> {
             let event = request
                 .into_inner()
                 .message()

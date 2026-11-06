@@ -10,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 
 This configured-literal guard applies the same case-sensitive terms to HTTP request bodies, HTTP response bodies, and client WebSocket text messages. It is not a general PII detector.
 
-The guard implements [HTTP hooks](../../docs/extensibility/supervisor-middleware/operations.mdx) (`HttpHooks.EvaluateRequest` and `HttpHooks.EvaluateResponse`) only. Its manifest requires the `openshell.supervisor-middleware.http-hooks` capability. Gateways and supervisors that predate HTTP hooks do not support it, so they refuse the service at startup. The example released with v0.1.2 is the legacy HTTP hook reference.
+The guard implements [HTTP hooks](../../docs/extensibility/supervisor-middleware/operations.mdx) (`HttpHooks.EvaluateHttpRequestHook` and `HttpHooks.EvaluateHttpResponseHook`) only. Its manifest requires the `openshell.supervisor-middleware.http-hooks` capability. Gateways and supervisors that predate HTTP hooks do not support it, so they refuse the service at startup. The example released with v0.1.2 is the legacy HTTP hook reference.
 
 The guard serves `HttpHooks` and `SupervisorMiddleware` on the same endpoint. `SupervisorMiddleware` handles discovery, configuration, and WebSocket sessions.
 

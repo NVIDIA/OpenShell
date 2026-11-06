@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP hooks (`HttpHooks.EvaluateRequest` and
-//! `HttpHooks.EvaluateResponse`) for requests and responses.
+//! HTTP hooks (`HttpHooks.EvaluateHttpRequestHook` and
+//! `HttpHooks.EvaluateHttpResponseHook`) for requests and responses.
 //!
 //! The guard selects its configured body mode, `WHOLE_BODY` by default, and falls
 //! back to the other mode when OpenShell offers only that one. A message
@@ -34,7 +34,7 @@ use crate::guard::{
     BodyMode, GuardConfig, GuardOutcome, MAX_PAYLOAD_BYTES, Mode, StreamScanner, inspect, outcome,
 };
 
-/// Run one `HttpHooks.EvaluateRequest` exchange.
+/// Run one `HttpHooks.EvaluateHttpRequestHook` exchange.
 pub(crate) fn request_stream<S>(events: S) -> HttpRequestHookResultStream
 where
     S: Stream<Item = Result<HttpRequestHookEvent, Status>> + Send + Unpin + 'static,
@@ -44,7 +44,7 @@ where
     })
 }
 
-/// Run one `HttpHooks.EvaluateResponse` exchange.
+/// Run one `HttpHooks.EvaluateHttpResponseHook` exchange.
 pub(crate) fn response_stream<S>(events: S) -> HttpResponseHookResultStream
 where
     S: Stream<Item = Result<HttpResponseHookEvent, Status>> + Send + Unpin + 'static,

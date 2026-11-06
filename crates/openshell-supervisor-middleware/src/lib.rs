@@ -410,8 +410,8 @@ pub enum HttpHookVersion {
     /// Legacy HTTP hooks (`EvaluateHttpRequest`, `HttpResponsePreReturn`).
     /// Deprecated and removed in 0.2.0.
     Legacy,
-    /// HTTP hooks (`HttpHooks.EvaluateRequest`,
-    /// `HttpHooks.EvaluateResponse`), selected by requiring
+    /// HTTP hooks (`HttpHooks.EvaluateHttpRequestHook`,
+    /// `HttpHooks.EvaluateHttpResponseHook`), selected by requiring
     /// [`SUPERVISOR_MIDDLEWARE_HTTP_HOOKS`]. Always fail-closed.
     Current,
 }

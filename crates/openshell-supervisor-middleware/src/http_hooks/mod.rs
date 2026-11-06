@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP hooks (`HttpHooks.EvaluateRequest` and `HttpHooks.EvaluateResponse`).
+//! HTTP hooks (`HttpHooks.EvaluateHttpRequestHook` and `HttpHooks.EvaluateHttpResponseHook`).
 //!
 //! Legacy HTTP hooks keep their own engines. A chain runs on exactly one hook
 //! version: every selected entry for one HTTP message must use the same

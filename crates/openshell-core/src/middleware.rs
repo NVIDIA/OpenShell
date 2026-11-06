@@ -18,13 +18,13 @@ use crate::proto::{
     WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
-/// Transport-neutral result stream for one `HttpHooks.EvaluateRequest`
+/// Transport-neutral result stream for one `HttpHooks.EvaluateHttpRequestHook`
 /// exchange.
 pub type HttpRequestHookResultStream = Pin<
     Box<dyn tokio_stream::Stream<Item = Result<HttpRequestHookResult, Status>> + Send + 'static>,
 >;
 
-/// Transport-neutral result stream for one `HttpHooks.EvaluateResponse`
+/// Transport-neutral result stream for one `HttpHooks.EvaluateHttpResponseHook`
 /// exchange.
 pub type HttpResponseHookResultStream = Pin<
     Box<dyn tokio_stream::Stream<Item = Result<HttpResponseHookResult, Status>> + Send + 'static>,
@@ -81,7 +81,7 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         ))
     }
 
-    /// Open one HTTP hook request exchange (`HttpHooks.EvaluateRequest`).
+    /// Open one HTTP hook request exchange (`HttpHooks.EvaluateHttpRequestHook`).
     async fn open_http_request_hook(
         &self,
         _requests: mpsc::Receiver<HttpRequestHookEvent>,
@@ -91,7 +91,7 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         ))
     }
 
-    /// Open one HTTP hook response exchange (`HttpHooks.EvaluateResponse`).
+    /// Open one HTTP hook response exchange (`HttpHooks.EvaluateHttpResponseHook`).
     async fn open_http_response_hook(
         &self,
         _requests: mpsc::Receiver<HttpResponseHookEvent>,
@@ -314,7 +314,7 @@ pub trait InProcessMiddleware: Send + Sync {
         ))
     }
 
-    /// Open one HTTP hook request exchange (`HttpHooks.EvaluateRequest`),
+    /// Open one HTTP hook request exchange (`HttpHooks.EvaluateHttpRequestHook`),
     /// for one HTTP request.
     ///
     /// Implementations that do not require the HTTP hooks capability
@@ -328,7 +328,7 @@ pub trait InProcessMiddleware: Send + Sync {
         ))
     }
 
-    /// Open one HTTP hook response exchange (`HttpHooks.EvaluateResponse`).
+    /// Open one HTTP hook response exchange (`HttpHooks.EvaluateHttpResponseHook`).
     ///
     /// Implementations that do not require the HTTP hooks capability
     /// may keep the default unsupported response.
