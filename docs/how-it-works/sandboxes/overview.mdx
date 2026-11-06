@@ -822,8 +822,6 @@ The dashboard has three panels stacked vertically: Gateways, Providers (or Globa
 
 The sandbox table’s NOTES column shows `Invalid config` when policy or provider configuration blocks provisioning. Open the sandbox detail view for the full rejection reason, or run `openshell sandbox get <name> -o json`. The note clears after the configuration is repaired; active port forwards remain listed.
 
-In the sandbox detail view, the Policy tab lists MCP allow and deny methods with each selected tool or tool-name pattern on its own line. Scroll through the pane to inspect the complete list. These entries show the configured policy rules; they do not establish whether an MCP tool is read-only.
-
 Press `c` in the Sandboxes panel to create a sandbox. In the optional Command field, use quotes or backslashes to group arguments containing spaces. For example, `/bin/sh -c "echo GOOD; read x"` prints `GOOD` and waits for Enter. Invalid quoting keeps the form open without creating a sandbox. The field does not expand variables or evaluate shell operators; invoke a shell explicitly with `sh -c` when you need that behavior.
 
 ## Port Forwarding
