@@ -610,7 +610,7 @@ that the previous process has stopped, not that sharing a SQLite file enables HA
 
 ## Database Pool
 
-`[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving.
+`[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving. On Postgres, a caller that gets no connection within 5 seconds fails instead of waiting for the database to answer, usually with a retryable `UNAVAILABLE` error whose reason is `DATABASE_UNAVAILABLE`.
 
 Omit the key to use the backend default, which is unchanged from earlier releases:
 
@@ -810,6 +810,7 @@ Each OCSF event becomes one log record:
 | Timestamp | The OCSF `time`. The observed timestamp is when the gateway received the event. |
 | Severity | Unknown, Informational, and Other are INFO, Low is WARN, Medium is WARN2, High is ERROR, Critical is ERROR2, and Fatal is FATAL. The severity text is the OCSF severity name. |
 | Attributes | `ocsf.class_uid`, `ocsf.activity_id`, `ocsf.severity_id`, `ocsf.metadata.uid`, and, for events associated with a sandbox, `openshell.sandbox.id`. |
+| Trace context | The trace and span ID of the sampled span active when the event was emitted, for every OCSF class. Absent when no sampled span was active. |
 
 `schema_version` in this table is deprecated and ignored; the gateway logs a warning at startup when it is set.
 
@@ -1932,3 +1933,23 @@ unnamed service on sandbox `demo` in workspace `default` uses SNI and Host
 the owning supervisor while preserving that hostname. Automatic discovery and
 application URL publication are separate work; current CLI URLs still identify
 the existing gateway path.
+
+Enabled supervisors report installed service routes through their authenticated
+gateway sessions. The gateway accepts only current configuration and ownership,
+resolves the supervisor endpoint through the compute driver, and expires
+installation evidence unless renewed. Reports do not establish application
+health or confirm that external ingress is ready. No additional reporting port
+or application credentials are required. Shared Kubernetes discovery selects the
+acknowledged pool owner's Pod IP and app port. The gateway revalidates the
+ownership term and live membership against shared storage. During takeover,
+old installations are withdrawn and the new endpoint appears only after the
+replacement installs the configuration. Application connections may need to
+reconnect; the sandbox workload and public URL remain unchanged.
+
+Shared listeners require both current configuration and a gateway-issued serving
+lease of at most fifteen seconds. Lease deadlines include queueing time; keep
+supervisor and gateway clocks synchronized. Loss of serving authority closes
+application streams even if configuration continues renewing. Under a partition,
+allow for pool membership failure detection before the last serving lease expires.
+Storage errors prevent lease renewal. Discovery expiry and serving expiry are
+separate from external ingress readiness.

@@ -130,7 +130,7 @@ pub async fn resolve_workspace(
     let ws: Option<Workspace> = store
         .get_message_by_name("", &name)
         .await
-        .map_err(|e| Status::internal(format!("workspace lookup failed: {e}")))?;
+        .map_err(|e| super::persistence_error_to_status(e, "workspace lookup"))?;
 
     match ws {
         Some(ws) => {

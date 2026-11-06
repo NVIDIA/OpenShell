@@ -14,9 +14,7 @@ repository.workspace = true
 openshell-crypto = { workspace = true, features = ["tls-kube", "tls-sqlx"] }
 openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-core = { path = "../openshell-core", default-features = false, features = ["jwt", "oauth", "otel"] }
-openshell-driver-db-credstore = { path = "../openshell-driver-db-credstore" }
-openshell-driver-kubernetes-secrets = { path = "../openshell-driver-kubernetes-secrets" }
-openshell-driver-vault = { path = "../openshell-driver-vault" }
+openshell-credential-issuer = { path = "../openshell-credential-issuer" }
 openshell-extension-core = { path = "../openshell-extension-core" }
 openshell-gateway-interceptors = { path = "../openshell-gateway-interceptors" }
 openshell-ocsf = { path = "../openshell-ocsf" }
@@ -96,8 +94,6 @@ tokio-stream = { workspace = true }
 sqlx = { workspace = true }
 sqlx-core = { workspace = true }
 reqwest = { workspace = true }
-aws-config = { workspace = true }
-aws-sdk-sts = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
@@ -126,13 +122,14 @@ default = ["telemetry"]
 telemetry = ["openshell-core/telemetry"]
 vendored-z3 = ["openshell-prover/vendored-z3"]
 prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
-test-support = []
+test-support = ["openshell-credential-issuer/test-support"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+openshell-credential-issuer = { path = "../openshell-credential-issuer", features = ["test-support"] }
 tracing-core = "0.1"
 rustls-pki-types = "1.9"
 tokio = { workspace = true, features = ["test-util"] }
