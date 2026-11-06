@@ -4,20 +4,17 @@
 //! Microbenchmark entry point for the production seccomp network broker.
 
 #[cfg(target_os = "linux")]
-use std::net::SocketAddr;
-
-#[cfg(target_os = "linux")]
 use clap::builder::{PossibleValue, PossibleValuesParser};
 #[cfg(target_os = "linux")]
 use clap::{Parser, Subcommand, ValueEnum as _};
 #[cfg(target_os = "linux")]
-use openshell_sandbox::perf::{BenchmarkOptions, Layer, Protocol};
+use openshell_sandbox::perf::{BenchmarkOptions, Layer, Protocol, Target};
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Parser)]
 #[command(
-    about = "Measure native and seccomp-filtered socket performance",
-    long_about = "Measure native and seccomp-filtered TCP socket performance."
+    about = "Measure native and seccomp-filtered socket and file-open performance",
+    long_about = "Measure native and seccomp-filtered TCP socket and file-open performance."
 )]
 struct Cli {
     /// Benchmark layer: native, filtered, or all.
@@ -34,6 +31,10 @@ struct Cli {
     concurrency: usize,
     #[arg(long, default_value_t = 64)]
     payload_bytes: usize,
+    /// Filtered-only background load: cold external connects run against the
+    /// broker during each filtered measurement.
+    #[arg(long, default_value_t = 0)]
+    background_cold_connects: usize,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -56,8 +57,9 @@ enum Command {
     Worker {
         #[arg(long)]
         protocol: Protocol,
+        /// Worker target: a socket address, or a file path for file-open.
         #[arg(long)]
-        target: SocketAddr,
+        target: String,
         #[arg(long)]
         iterations: u64,
         #[arg(long)]
@@ -67,30 +69,38 @@ enum Command {
         #[arg(long)]
         payload_bytes: usize,
     },
+    #[command(hide = true)]
+    ColdConnect,
 }
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if let Some(Command::Worker {
-        protocol,
-        target,
-        iterations,
-        warmup,
-        concurrency,
-        payload_bytes,
-    }) = cli.command
-    {
-        let report = openshell_sandbox::perf::run_worker(
+    match cli.command {
+        Some(Command::Worker {
             protocol,
             target,
             iterations,
             warmup,
             concurrency,
             payload_bytes,
-        )?;
-        println!("{}", serde_json::to_string(&report)?);
-        return Ok(());
+        }) => {
+            let report = openshell_sandbox::perf::run_worker(
+                protocol,
+                Target::parse(protocol, &target)?,
+                iterations,
+                warmup,
+                concurrency,
+                payload_bytes,
+            )?;
+            println!("{}", serde_json::to_string(&report)?);
+            return Ok(());
+        }
+        Some(Command::ColdConnect) => {
+            openshell_sandbox::perf::run_cold_connect_probe()?;
+            return Ok(());
+        }
+        None => {}
     }
 
     let options = BenchmarkOptions {
@@ -100,6 +110,7 @@ fn main() -> anyhow::Result<()> {
         warmup: cli.warmup,
         concurrency: cli.concurrency,
         payload_bytes: cli.payload_bytes,
+        background_cold_connects: cli.background_cold_connects,
     };
     for report in openshell_sandbox::perf::run(options)? {
         println!("{}", serde_json::to_string(&report)?);
