@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/oci-resource-principal.yaml
+#   openshell provider profile import -f providers/oci-resource-principal.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   none declared — this profile grants no egress.
+# Reference layout:  a gateway running where OCI provisions a resource
+#                    principal (Functions, Data Science, Container Instances,
+#                    and similar). The platform writes a session token and a
+#                    private key to paths named by OCI_RESOURCE_PRINCIPAL_RPST
+#                    and OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM and rotates them;
+#                    the gateway re-reads both on every refresh.
+# Credential scope:  OCI_KEY_ID (`ST$<token>`) and OCI_PRIVATE_KEY (base64
+#                    PKCS#8 PEM), republished from the platform-managed files.
+# Endpoint access:   none. Pair with a sandbox policy or another profile that
+#                    names the OCI hosts the workload needs, sets
+#                    `credential_signing: oci`, and selects this provider with
+#                    `credential_binding.provider`.
+# Smoke test:        openshell provider create --name oci-rp --type oci-resource-principal \
+#                      --runtime-credentials
+#                    openshell provider refresh configure --provider oci-rp \
+#                      --credential-key OCI_KEY_ID --strategy oci-resource-principal
+#                    then call a signed OCI endpoint from a sandbox with a
+#                    policy that binds `oci-rp`.
+
+id: oci-resource-principal
+display_name: OCI Resource Principal
+description: Oracle Cloud Infrastructure access as the gateway's resource principal, republishing the platform-rotated session token and key
+category: other
+credentials:
+  - name: key_id
+    description: OCI resource principal session token key id (ST$<token>), read from the platform-managed token
+    env_vars: [OCI_KEY_ID]
+    required: true
+    refresh:
+      strategy: oci_resource_principal
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      additional_outputs:
+        - output: private_key
+          credential: private_key
+      material:
+        - name: rpst_file
+          description: Path to the resource principal session token; defaults to the OCI_RESOURCE_PRINCIPAL_RPST environment variable of the gateway
+          required: false
+          secret: false
+        - name: private_key_file
+          description: Path to the resource principal private key PEM; defaults to the OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM environment variable of the gateway
+          required: false
+          secret: false
+  - name: private_key
+    description: Resource principal private key (base64 PKCS#8 or PKCS#1 PEM) that pairs with the token; co-managed with key_id
+    env_vars: [OCI_PRIVATE_KEY]
+    required: true

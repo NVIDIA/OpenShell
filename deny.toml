@@ -136,6 +136,7 @@ name = "sha1"
 reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
 wrappers = [
     "axum",
+    "openshell-credential-issuer",
     "openshell-supervisor-network",
     "russh",
     "ssh-key",

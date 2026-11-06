@@ -45,6 +45,7 @@ pub mod net;
 pub mod network_trust;
 #[cfg(feature = "oauth")]
 pub mod oauth;
+pub mod oci_signature;
 pub mod paths;
 pub mod policy;
 pub use openshell_policy_schema::yaml;
