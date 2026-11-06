@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -24,8 +24,6 @@ pub(crate) const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const MAX_DNS_MESSAGE_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RETAINED_ADDRESSES: usize = 16;
 pub(crate) const MAX_CNAME_HOPS: usize = 8;
-/// How long a fallback stays first before the primary is retried.
-const PREFERENCE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum AddressFamily {
@@ -98,7 +96,6 @@ pub(crate) trait TrustedResolver: Send + Sync {
 pub(crate) struct SocketTrustedResolver {
     servers: Mutex<Vec<SocketAddr>>,
     conf_path: Option<PathBuf>,
-    preferred: Mutex<Option<(SocketAddr, Instant)>>,
     exchange_timeout: Duration,
 }
 
@@ -113,7 +110,6 @@ impl SocketTrustedResolver {
         Self {
             servers: Mutex::new(vec![server]),
             conf_path: None,
-            preferred: Mutex::new(None),
             exchange_timeout,
         }
     }
@@ -135,24 +131,14 @@ impl SocketTrustedResolver {
         Ok(Self {
             servers: Mutex::new(servers),
             conf_path: Some(path),
-            preferred: Mutex::new(None),
             exchange_timeout: DEFAULT_EXCHANGE_TIMEOUT,
         })
     }
 
-    /// Servers in configured order, with a recent fallback first until it
-    /// expires or the config changes. A bad read keeps the last good list.
+    /// Servers in configured order. A bad read keeps the last good list.
     fn current_servers(&self) -> Vec<SocketAddr> {
-        self.servers_at(Instant::now())
-    }
-
-    fn servers_at(&self, now: Instant) -> Vec<SocketAddr> {
         let mut servers = self
             .servers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut preferred = self
-            .preferred
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(path) = &self.conf_path
@@ -162,17 +148,9 @@ impl SocketTrustedResolver {
             if !fresh.is_empty() && fresh != *servers {
                 tracing::info!(servers = ?fresh, "policy DNS upstream servers changed");
                 *servers = fresh;
-                *preferred = None;
             }
         }
-        if preferred.is_some_and(|(_, since)| now.duration_since(since) >= PREFERENCE_TTL) {
-            *preferred = None;
-        }
-        let mut list = servers.clone();
-        if let Some(index) = preferred.and_then(|(p, _)| list.iter().position(|s| *s == p)) {
-            list[..=index].rotate_right(1);
-        }
-        list
+        servers.clone()
     }
 
     async fn exchange(&self, name: Name, record_type: RecordType) -> Result<Message, ResolveError> {
@@ -183,20 +161,11 @@ impl SocketTrustedResolver {
         request.queries.push(query.clone());
         let wire = request.to_vec().map_err(|_| ResolveError::Malformed)?;
 
+        // Always start at the configured primary; fall back only on failure.
         let mut failure = ResolveError::Timeout;
         for server in self.current_servers() {
             match self.exchange_with(server, &wire, id, &query).await {
-                Ok(response) => {
-                    let mut preferred = self
-                        .preferred
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    // Keep the old timestamp so it can expire.
-                    if preferred.is_none_or(|(p, _)| p != server) {
-                        *preferred = Some((server, Instant::now()));
-                    }
-                    return Ok(response);
-                }
+                Ok(response) => return Ok(response),
                 Err(error @ (ResolveError::Timeout | ResolveError::Io(_))) => failure = error,
                 Err(error) => return Err(error),
             }
@@ -653,6 +622,16 @@ mod tests {
             ["192.0.2.10:53".parse::<SocketAddr>().unwrap()]
         );
 
+        // A retained server moved behind a new primary stays behind it.
+        std::fs::write(&path, "nameserver 198.51.100.53\nnameserver 192.0.2.10\n").unwrap();
+        assert_eq!(
+            resolver.current_servers(),
+            [
+                "198.51.100.53:53".parse::<SocketAddr>().unwrap(),
+                "192.0.2.10:53".parse().unwrap()
+            ]
+        );
+
         std::fs::write(&path, "nameserver 198.51.100.53\n").unwrap();
         assert_eq!(
             resolver.current_servers(),
@@ -666,40 +645,6 @@ mod tests {
     }
 
     #[test]
-    fn preference_is_dropped_when_resolv_conf_changes() {
-        let (a, b): (SocketAddr, SocketAddr) = (
-            "192.0.2.10:53".parse().unwrap(),
-            "192.0.2.20:53".parse().unwrap(),
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("resolv.conf");
-        std::fs::write(&path, "nameserver 192.0.2.10\nnameserver 192.0.2.20\n").unwrap();
-        let resolver = SocketTrustedResolver::from_resolv_conf(&path).unwrap();
-        *resolver.preferred.lock().unwrap() = Some((b, Instant::now()));
-        assert_eq!(resolver.current_servers(), [b, a]);
-
-        std::fs::write(&path, "nameserver 192.0.2.20\nnameserver 192.0.2.10\n").unwrap();
-        *resolver.preferred.lock().unwrap() = Some((a, Instant::now()));
-        assert_eq!(resolver.current_servers(), [b, a]);
-        assert_eq!(*resolver.preferred.lock().unwrap(), None);
-    }
-
-    #[test]
-    fn preference_expires_so_the_configured_primary_is_retried() {
-        let (a, b): (SocketAddr, SocketAddr) = (
-            "192.0.2.10:53".parse().unwrap(),
-            "192.0.2.20:53".parse().unwrap(),
-        );
-        let resolver = SocketTrustedResolver::with_timeout(a, DEFAULT_EXCHANGE_TIMEOUT);
-        resolver.servers.lock().unwrap().push(b);
-        let since = Instant::now();
-        *resolver.preferred.lock().unwrap() = Some((b, since));
-
-        assert_eq!(resolver.servers_at(since + Duration::from_secs(1)), [b, a]);
-        assert_eq!(resolver.servers_at(since + PREFERENCE_TTL), [a, b]);
-    }
-
-    #[test]
     fn resolv_conf_without_nameserver_is_rejected_at_start() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("resolv.conf");
@@ -707,45 +652,58 @@ mod tests {
         assert!(SocketTrustedResolver::from_resolv_conf(&path).is_err());
     }
 
-    #[tokio::test]
-    async fn unresponsive_server_falls_through_to_next_and_is_remembered() {
-        let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let live_addr = live.local_addr().unwrap();
-        let task = tokio::spawn(async move {
+    /// Answers each datagram with `address`, ignoring the first `skip`.
+    fn spawn_dns_server(
+        socket: UdpSocket,
+        skip: usize,
+        address: A,
+        answers: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
             let mut wire = [0_u8; MAX_DNS_MESSAGE_BYTES];
-            for _ in 0..2 {
-                let (length, peer) = live.recv_from(&mut wire).await.unwrap();
+            for index in 0..skip + answers {
+                let (length, peer) = socket.recv_from(&mut wire).await.unwrap();
+                if index < skip {
+                    continue;
+                }
                 let request = Message::from_vec(&wire[..length]).unwrap();
                 let mut response = Message::response(request.metadata.id, OpCode::Query);
                 response.queries = request.queries.clone();
                 response.add_answer(Record::from_rdata(
                     request.queries[0].name.clone(),
                     10,
-                    RData::A(A::new(8, 8, 8, 8)),
+                    RData::A(address),
                 ));
-                live.send_to(&response.to_vec().unwrap(), peer)
+                socket
+                    .send_to(&response.to_vec().unwrap(), peer)
                     .await
                     .unwrap();
             }
-        });
-        let resolver = SocketTrustedResolver::with_timeout(
-            dead.local_addr().unwrap(),
-            Duration::from_millis(50),
+        })
+    }
+
+    #[tokio::test]
+    async fn fallback_is_used_only_while_the_primary_fails() {
+        // The primary drops its first query, then recovers.
+        let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fallback = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (primary_addr, fallback_addr) = (
+            primary.local_addr().unwrap(),
+            fallback.local_addr().unwrap(),
         );
-        resolver.servers.lock().unwrap().push(live_addr);
+        let primary_task = spawn_dns_server(primary, 1, A::new(1, 1, 1, 1), 2);
+        // The fallback must see exactly one query.
+        let fallback_task = spawn_dns_server(fallback, 0, A::new(8, 8, 8, 8), 1);
+        let resolver = SocketTrustedResolver::with_timeout(primary_addr, Duration::from_millis(50));
+        resolver.servers.lock().unwrap().push(fallback_addr);
         let name = NormalizedName::parse("db.example").unwrap();
-        let mut promoted = None;
-        for _ in 0..2 {
+
+        for expected in ["8.8.8.8", "1.1.1.1", "1.1.1.1"] {
             let answer = resolver.resolve(&name, AddressFamily::Ipv4).await.unwrap();
-            assert_eq!(answer.addresses, ["8.8.8.8".parse::<IpAddr>().unwrap()]);
-            // Later successes must not refresh the expiry.
-            let preferred = *resolver.preferred.lock().unwrap();
-            assert_eq!(*promoted.get_or_insert(preferred), preferred);
+            assert_eq!(answer.addresses, [expected.parse::<IpAddr>().unwrap()]);
         }
-        assert_eq!(resolver.current_servers()[0], live_addr);
-        task.await.unwrap();
-        drop(dead);
+        primary_task.await.unwrap();
+        fallback_task.await.unwrap();
     }
 
     #[test]
