@@ -125,6 +125,7 @@ mod tests {
             executable: leaf,
             ancestors,
             cmdline_paths: Vec::new(),
+            process: None,
         }
     }
 

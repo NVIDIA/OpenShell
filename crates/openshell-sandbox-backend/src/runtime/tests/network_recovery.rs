@@ -243,6 +243,7 @@ fn network_response() -> Response {
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            process: None,
         },
         destination: "203.0.113.1:443".parse().unwrap(),
         socket: Some(NetworkSocketMetadata {

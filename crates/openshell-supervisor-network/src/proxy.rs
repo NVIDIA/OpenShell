@@ -39,7 +39,7 @@ use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked}
 use openshell_isolation_interface::contract::ExecutableIdentity as ContractExecutableIdentity;
 use openshell_isolation_interface::contract::{
     BinaryIdentity as ContractBinaryIdentity, BoundaryDuplexStream, MediationTiming,
-    PendingTcpOpen, ResolveError, TcpOpenDecision, TcpOpenDenial,
+    PendingTcpOpen, ProcessInstance, ResolveError, TcpOpenDecision, TcpOpenDenial,
 };
 use openshell_ocsf::{
     ActionId, ActivityId, BaseEventBuilder, DispositionId, Endpoint, HttpActivityBuilder,
@@ -962,8 +962,8 @@ fn build_staged_transparent_denial_event(
     reason: &str,
     status_detail: &'static str,
 ) -> openshell_ocsf::OcsfEvent {
-    let (binary, ancestors, cmdline) = identity.as_ref().map_or_else(
-        |_| ("-".to_string(), "-".to_string(), "-".to_string()),
+    let (binary, ancestors, cmdline, process) = identity.as_ref().map_or_else(
+        |_| ("-".to_string(), "-".to_string(), "-".to_string(), None),
         |identity| {
             (
                 identity.executable.path.display().to_string(),
@@ -979,9 +979,11 @@ fn build_staged_transparent_denial_event(
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", "),
+                identity.process,
             )
         },
     );
+    let pid = process.map_or_else(|| "-".to_string(), |process| process.pid.to_string());
     NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
@@ -989,7 +991,9 @@ fn build_staged_transparent_denial_event(
         .severity(SeverityId::Medium)
         .status(StatusId::Failure)
         .dst_endpoint(transparent_destination_endpoint(destination, mapped_host))
-        .actor_process(Process::from_bypass(&binary, "-", &ancestors).with_cmd_line(&cmdline))
+        .actor_process(egress::actor_process(
+            &binary, &pid, &ancestors, &cmdline, process,
+        ))
         .message(format!("Transparent TCP denied before relay: {reason}"))
         .status_detail(status_detail)
         .build()
@@ -2009,10 +2013,7 @@ fn build_connect_allow_ocsf_event(
     peer_addr: SocketAddr,
     host: &str,
     port: u16,
-    binary: &str,
-    pid: &str,
-    ancestors: &str,
-    cmdline: &str,
+    actor: &Process,
     policy: &str,
     l7_inspection: bool,
 ) -> openshell_ocsf::OcsfEvent {
@@ -2029,7 +2030,7 @@ fn build_connect_allow_ocsf_event(
         .status(StatusId::Success)
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(actor.clone())
         .firewall_rule(policy, "opa")
         .message(format!("{connect_msg} allowed {host}:{port}"))
         .build()
@@ -2042,10 +2043,7 @@ fn build_forward_allow_ocsf_event(
     host: &str,
     port: u16,
     path: &str,
-    binary: &str,
-    pid: &str,
-    ancestors: &str,
-    cmdline: &str,
+    actor: &Process,
     policy: &str,
 ) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -2060,7 +2058,7 @@ fn build_forward_allow_ocsf_event(
         ))
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(actor.clone())
         .firewall_rule(policy, "opa")
         .message(format!("FORWARD allowed {method} {host}:{port}{path}"))
         .build()
@@ -2128,10 +2126,7 @@ fn build_forward_l7_parse_rejection_ocsf_event(
     host: &str,
     port: u16,
     path: &str,
-    binary: &str,
-    pid: &str,
-    ancestors: &str,
-    cmdline: &str,
+    actor: &Process,
     policy: &str,
     detail: &str,
 ) -> openshell_ocsf::OcsfEvent {
@@ -2147,7 +2142,7 @@ fn build_forward_l7_parse_rejection_ocsf_event(
         ))
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(actor.clone())
         .firewall_rule(policy, "l7")
         .message(format!(
             "FORWARD_L7 denied non-canonical request-target for {method} {host}:{port}{path}"
@@ -2163,10 +2158,7 @@ fn build_forward_policy_deny_ocsf_event(
     host: &str,
     port: u16,
     path: &str,
-    binary: &str,
-    pid: &str,
-    ancestors: &str,
-    cmdline: &str,
+    actor: &Process,
     reason: &str,
 ) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -2181,7 +2173,7 @@ fn build_forward_policy_deny_ocsf_event(
         ))
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(actor.clone())
         .firewall_rule("-", "opa")
         .message(format!("FORWARD denied {method} {host}:{port}{path}"))
         .status_detail(reason)
@@ -2238,10 +2230,7 @@ fn build_connect_destination_deny_ocsf_event(
     peer_addr: SocketAddr,
     host: &str,
     port: u16,
-    binary: &str,
-    pid: &str,
-    ancestors: &str,
-    cmdline: &str,
+    actor: &Process,
 ) -> openshell_ocsf::OcsfEvent {
     let detail = destination_denial_detail(denial.kind);
     let message = if denial.kind == DestinationDenialKind::InternalAddress {
@@ -2258,7 +2247,7 @@ fn build_connect_destination_deny_ocsf_event(
         .status(StatusId::Failure)
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(actor.clone())
         .firewall_rule("-", "ssrf")
         .message(message)
         .status_detail(&denial.reason)
@@ -2273,10 +2262,7 @@ fn build_forward_destination_deny_ocsf_event(
     host: &str,
     port: u16,
     path: &str,
-    binary: &str,
-    pid: &str,
-    ancestors: &str,
-    cmdline: &str,
+    actor: &Process,
     policy: &str,
 ) -> openshell_ocsf::OcsfEvent {
     let detail = destination_denial_detail(denial.kind);
@@ -2298,7 +2284,7 @@ fn build_forward_destination_deny_ocsf_event(
         ))
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(actor.clone())
         .firewall_rule(policy, "ssrf")
         .message(format!("FORWARD blocked: {log_detail} for {host}:{port}"))
         .status_detail(&denial.reason)
@@ -2313,9 +2299,7 @@ async fn deny_connect_destination<C>(
     host: &str,
     port: u16,
     binary: &str,
-    pid: &str,
-    ancestors: &str,
-    cmdline: &str,
+    actor: &Process,
     decision: &EgressDecision,
     denial_tx: &Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: &Option<ActivitySender>,
@@ -2325,7 +2309,7 @@ where
 {
     let detail = destination_denial_detail(denial.kind);
     ocsf_emit!(build_connect_destination_deny_ocsf_event(
-        denial, peer_addr, host, port, binary, pid, ancestors, cmdline,
+        denial, peer_addr, host, port, actor,
     ));
 
     emit_denial(
@@ -2364,9 +2348,7 @@ async fn deny_forward_destination<C>(
     port: u16,
     path: &str,
     binary: &str,
-    pid: &str,
-    ancestors: &str,
-    cmdline: &str,
+    actor: &Process,
     policy: &str,
     decision: &EgressDecision,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
@@ -2377,7 +2359,7 @@ where
 {
     let detail = destination_denial_detail(denial.kind);
     ocsf_emit!(build_forward_destination_deny_ocsf_event(
-        denial, peer_addr, method, host, port, path, binary, pid, ancestors, cmdline, policy,
+        denial, peer_addr, method, host, port, path, actor, policy,
     ));
 
     emit_denial_simple(
@@ -2786,33 +2768,8 @@ async fn handle_mediated_connection(
     };
 
     // Build log context fields (shared by deny log below and deferred allow log after L7 check)
-    let binary_str = decision
-        .binary
-        .as_ref()
-        .map_or_else(|| "-".to_string(), |p| p.display().to_string());
-    let pid_str = decision
-        .binary_pid
-        .map_or_else(|| "-".to_string(), |p| p.to_string());
-    let ancestors_str = if decision.ancestors.is_empty() {
-        "-".to_string()
-    } else {
-        decision
-            .ancestors
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" -> ")
-    };
-    let cmdline_str = if decision.cmdline_paths.is_empty() {
-        "-".to_string()
-    } else {
-        decision
-            .cmdline_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let binary_str = decision.binary_display();
+    let actor = decision.actor_process();
     let policy_str = matched_policy.as_deref().unwrap_or("-");
 
     // Log denied connections immediately — they never reach L7.
@@ -2827,10 +2784,7 @@ async fn handle_mediated_connection(
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(actor.clone())
             .firewall_rule("-", "opa")
             .message(format!("CONNECT denied {host_lc}:{port}"))
             .status_detail(&deny_reason)
@@ -2913,9 +2867,7 @@ async fn handle_mediated_connection(
                     &host_lc,
                     port,
                     &binary_str,
-                    &pid_str,
-                    &ancestors_str,
-                    &cmdline_str,
+                    &actor,
                     &decision,
                     &denial_tx,
                     &activity_tx,
@@ -2956,9 +2908,7 @@ async fn handle_mediated_connection(
                     &host_lc,
                     port,
                     &binary_str,
-                    &pid_str,
-                    &ancestors_str,
-                    &cmdline_str,
+                    &actor,
                     &decision,
                     &denial_tx,
                     &activity_tx,
@@ -2990,10 +2940,7 @@ async fn handle_mediated_connection(
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(actor.clone())
             .firewall_rule(policy_str, "tls")
             .message(format!(
                 "CONNECT refused for {host_lc}:{port}: {TLS_TERMINATION_UNAVAILABLE_DETAIL}"
@@ -3028,10 +2975,7 @@ async fn handle_mediated_connection(
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(actor.clone())
             .firewall_rule(policy_str, "credentials")
             .message(format!(
                 "CONNECT refused for {host_lc}:{port}: uninspected credential traffic"
@@ -3124,10 +3068,7 @@ async fn handle_mediated_connection(
         workload_addr,
         &host_lc,
         port,
-        &binary_str,
-        &pid_str,
-        &ancestors_str,
-        &cmdline_str,
+        &actor,
         policy_str,
         should_inspect_l7,
     ));
@@ -3284,10 +3225,7 @@ async fn handle_mediated_connection(
                 .status(StatusId::Failure)
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(actor.clone())
                 .firewall_rule(policy_str, "tls")
                 .message(format!("CONNECT refused for {host_lc}:{port}: {DETAIL}"))
                 .status_detail(DETAIL)
@@ -3355,10 +3293,7 @@ async fn handle_mediated_connection(
                 .status(StatusId::Failure)
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(actor.clone())
                 .firewall_rule(policy_str, "l7")
                 .message(format!(
                     "CONNECT_L7 blocked unsupported tunnel protocol for {host_lc}:{port}"
@@ -3672,6 +3607,7 @@ fn authorize_egress_intent_inner(
             endpoint: EndpointDecision::default(),
             binary,
             binary_pid,
+            process: None,
             ancestors,
             cmdline_paths,
         }
@@ -3729,6 +3665,7 @@ fn authorize_egress_intent_inner(
             endpoint: EndpointDecision::from_authorization(&authorization),
             binary: Some(bin_path),
             binary_pid: Some(binary_pid),
+            process: None,
             ancestors,
             cmdline_paths,
         },
@@ -3777,6 +3714,7 @@ fn evaluate_endpoint_only_opa_inner(engine: &OpaEngine, intent: EgressIntent) ->
             endpoint: EndpointDecision::from_authorization(&authorization),
             binary: None,
             binary_pid: None,
+            process: None,
             ancestors: vec![],
             cmdline_paths: vec![],
         },
@@ -3792,6 +3730,7 @@ fn evaluate_endpoint_only_opa_inner(engine: &OpaEngine, intent: EgressIntent) ->
             endpoint: EndpointDecision::default(),
             binary: None,
             binary_pid: None,
+            process: None,
             ancestors: vec![],
             cmdline_paths: vec![],
         },
@@ -3844,6 +3783,7 @@ fn authorize_supplied_identity_with_denial_inner(
 ) -> SuppliedIdentityAuthorization {
     let deny = |reason: String,
                 binary: Option<PathBuf>,
+                process: Option<ProcessInstance>,
                 ancestors: Vec<PathBuf>,
                 cmdline_paths: Vec<PathBuf>| EgressDecision {
         intent: intent.clone(),
@@ -3852,7 +3792,8 @@ fn authorize_supplied_identity_with_denial_inner(
         identity: ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::LookupFailed),
         endpoint: EndpointDecision::default(),
         binary,
-        binary_pid: None,
+        binary_pid: process.map(|process| process.pid),
+        process,
         ancestors,
         cmdline_paths,
     };
@@ -3863,6 +3804,7 @@ fn authorize_supplied_identity_with_denial_inner(
             return SuppliedIdentityAuthorization {
                 decision: deny(
                     format!("backend identity resolution failed: {error}"),
+                    None,
                     None,
                     vec![],
                     vec![],
@@ -3885,6 +3827,7 @@ fn authorize_supplied_identity_with_denial_inner(
             decision: deny(
                 error.to_string(),
                 Some(identity.executable.path.clone()),
+                identity.process,
                 ancestor_paths,
                 identity.cmdline_paths.clone(),
             ),
@@ -3911,13 +3854,15 @@ fn authorize_supplied_identity_with_denial_inner(
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::from_authorization(&authorization),
             binary: Some(identity.executable.path.clone()),
-            binary_pid: None,
+            binary_pid: identity.process.map(|process| process.pid),
+            process: identity.process,
             ancestors: ancestor_paths,
             cmdline_paths: identity.cmdline_paths.clone(),
         },
         Err(error) => deny(
             format!("policy evaluation error: {error}"),
             Some(identity.executable.path.clone()),
+            identity.process,
             ancestor_paths,
             identity.cmdline_paths.clone(),
         ),
@@ -3949,6 +3894,7 @@ fn authorize_egress_intent_inner(
         endpoint: EndpointDecision::default(),
         binary: None,
         binary_pid: None,
+        process: None,
         ancestors: vec![],
         cmdline_paths: vec![],
     }
@@ -5611,33 +5557,9 @@ async fn handle_forward_proxy(
     );
 
     // Build log context
-    let binary_str = decision
-        .binary
-        .as_ref()
-        .map_or_else(|| "-".to_string(), |p| p.display().to_string());
-    let pid_str = decision
-        .binary_pid
-        .map_or_else(|| "-".to_string(), |p| p.to_string());
-    let ancestors_str = if decision.ancestors.is_empty() {
-        "-".to_string()
-    } else {
-        decision
-            .ancestors
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" -> ")
-    };
-    let cmdline_str = if decision.cmdline_paths.is_empty() {
-        "-".to_string()
-    } else {
-        decision
-            .cmdline_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let binary_str = decision.binary_display();
+    let pid_str = decision.pid_display();
+    let actor = decision.actor_process();
 
     // 4. Only proceed on explicit Allow — reject Deny
     let matched_policy = match &decision.action {
@@ -5649,10 +5571,7 @@ async fn handle_forward_proxy(
                 &host_lc,
                 port,
                 &telemetry_path,
-                &binary_str,
-                &pid_str,
-                &ancestors_str,
-                &cmdline_str,
+                &actor,
                 reason,
             ));
             emit_denial_simple(
@@ -5922,10 +5841,7 @@ async fn handle_forward_proxy(
                 &host_lc,
                 port,
                 &telemetry_path,
-                &binary_str,
-                &pid_str,
-                &ancestors_str,
-                &cmdline_str,
+                &actor,
                 policy_str,
                 FORWARD_ENCODED_SLASH_REJECTION_DETAIL,
             ));
@@ -5964,8 +5880,7 @@ async fn handle_forward_proxy(
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                 .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
+                    actor.clone(),
                 )
                 .firewall_rule(policy_str, "l7")
                 .message(format!(
@@ -6223,10 +6138,7 @@ async fn handle_forward_proxy(
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(actor.clone())
                 .firewall_rule(policy_str, engine_type)
                 .message(log_message)
                 .build();
@@ -6288,9 +6200,7 @@ async fn handle_forward_proxy(
                 port,
                 &telemetry_path,
                 &binary_str,
-                &pid_str,
-                &ancestors_str,
-                &cmdline_str,
+                &actor,
                 policy_str,
                 &decision,
                 denial_tx,
@@ -6326,9 +6236,7 @@ async fn handle_forward_proxy(
                 port,
                 &telemetry_path,
                 &binary_str,
-                &pid_str,
-                &ancestors_str,
-                &cmdline_str,
+                &actor,
                 policy_str,
                 &decision,
                 denial_tx,
@@ -6734,10 +6642,7 @@ async fn handle_forward_proxy(
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(actor.clone())
                 .message(format!(
                     "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
                 ))
@@ -6878,10 +6783,7 @@ async fn handle_forward_proxy(
         &host_lc,
         port,
         &telemetry_path,
-        &binary_str,
-        &pid_str,
-        &ancestors_str,
-        &cmdline_str,
+        &actor,
         policy_str,
     ));
     emit_forward_success_activity(activity_tx, l7_activity_pending);
@@ -7281,6 +7183,7 @@ process:
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            process: None,
         });
 
         let mut decision = authorize_supplied_identity(
@@ -7298,6 +7201,85 @@ process:
             .expect("supplied identity must retain L7 metadata");
         assert_eq!(route.configs.len(), 1);
         assert!(route.configs[0].config.request_body_credential_rewrite);
+    }
+
+    #[test]
+    fn supplied_process_reaches_the_network_event_actor() {
+        let engine = native_identity_engine(
+            include_str!("../data/sandbox-policy.rego"),
+            r"
+network_policies:
+  api:
+    name: api
+    endpoints:
+      - host: api.example.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+",
+        )
+        .expect("load policy");
+        let identity = Ok(ContractBinaryIdentity {
+            executable: ContractExecutableIdentity {
+                path: executable_path("/usr/bin/curl"),
+                digest: Some("00".repeat(32).parse().expect("digest")),
+            },
+            ancestors: vec![ContractExecutableIdentity {
+                path: executable_path("/usr/bin/sh"),
+                digest: Some("11".repeat(32).parse().expect("digest")),
+            }],
+            cmdline_paths: Vec::new(),
+            process: Some(ProcessInstance {
+                pid: 57,
+                parent_pid: 42,
+                start_time_ms: 1_793_750_400_123,
+            }),
+        });
+
+        let decision = authorize_supplied_identity(
+            &engine,
+            &BinaryIdentityCache::new(),
+            EgressIntent::connect("api.example.com".to_string(), 443),
+            &identity,
+        );
+        let event = build_connect_allow_ocsf_event(
+            "127.0.0.1:40000".parse().unwrap(),
+            "api.example.com",
+            443,
+            &decision.actor_process(),
+            "api",
+            false,
+        );
+
+        let json = serde_json::to_value(&event).unwrap();
+        let actor = &json["actor"]["process"];
+        assert_eq!(actor["pid"], 57);
+        assert_eq!(actor["created_time"], 1_793_750_400_123_i64);
+        assert_eq!(actor["parent_process"]["pid"], 42);
+        assert!(event.format_shorthand().contains("curl(57)"));
+    }
+
+    #[test]
+    fn supplied_process_names_a_parent_with_the_binary_path() {
+        let process = ProcessInstance {
+            pid: 81,
+            parent_pid: 77,
+            start_time_ms: 1,
+        };
+        let actor =
+            egress::actor_process("/usr/bin/bash", "81", "/usr/bin/bash", "-", Some(process));
+        let parent = actor.parent_process.expect("parent process");
+        assert_eq!(parent.name, "/usr/bin/bash");
+        assert_eq!(parent.pid, 77);
     }
 
     #[test]
@@ -7339,6 +7321,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                process: None,
             })
         };
         let intent = || EgressIntent::connect("api.example.com".to_string(), 443);
@@ -7397,6 +7380,7 @@ process:
                     digest: Some(ancestor_digest.repeat(32).parse().expect("digest")),
                 }],
                 cmdline_paths: Vec::new(),
+                process: None,
             })
         };
         let intent = || EgressIntent::connect("api.example.com".to_string(), 443);
@@ -7447,6 +7431,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                process: None,
             })
         };
         let identity_cache = BinaryIdentityCache::new();
@@ -7507,6 +7492,7 @@ process:
                 digest: None,
             }],
             cmdline_paths: Vec::new(),
+            process: None,
         });
 
         let decision = authorize_supplied_identity(
@@ -7562,6 +7548,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                process: None,
             })
         };
         let pending = |destination: &str| {
@@ -7765,6 +7752,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                     },
                     ancestors: Vec::new(),
                     cmdline_paths: Vec::new(),
+                    process: None,
                 }),
                 destination,
                 socket: Some(
@@ -8376,6 +8364,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            process: None,
         };
         let (stream, mut workload) = tokio::io::duplex(4096);
         let (decision, completion) = tokio::sync::oneshot::channel();
@@ -8515,6 +8504,7 @@ network_policies:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                process: None,
             }),
             destination,
             socket: Some(
@@ -8659,6 +8649,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                process: None,
             }),
             destination: "203.0.113.7:443".parse().unwrap(),
             socket: Some(
@@ -8731,6 +8722,7 @@ process:
                     },
                     ancestors: Vec::new(),
                     cmdline_paths: Vec::new(),
+                    process: None,
                 })
                 .unwrap();
         }
@@ -8745,6 +8737,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                process: None,
             }),
             destination: "203.0.113.7:443".parse().unwrap(),
             socket: Some(
@@ -8836,6 +8829,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                process: None,
             }),
             destination: destination.parse().unwrap(),
             socket: Some(
@@ -10518,10 +10512,8 @@ network_policies:
             "api.example.com",
             80,
             "/v1/models",
-            "/usr/bin/curl",
-            "42",
-            "/usr/bin/bash",
-            "curl http://api.example.com/v1/models",
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash")
+                .with_cmd_line("curl http://api.example.com/v1/models"),
             reason,
         );
         let json = event.to_json().unwrap();
@@ -10539,10 +10531,8 @@ network_policies:
             "api.example.com",
             80,
             "/admin/x%2Fy",
-            "/usr/bin/curl",
-            "42",
-            "/usr/bin/bash",
-            "curl http://api.example.com/admin/x%2Fy",
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash")
+                .with_cmd_line("curl http://api.example.com/admin/x%2Fy"),
             "allow_api",
             FORWARD_ENCODED_SLASH_REJECTION_DETAIL,
         );
@@ -10713,10 +10703,7 @@ network_policies:
             "api.example.com",
             80,
             &path,
-            "/usr/bin/curl",
-            "42",
-            "/usr/bin/bash",
-            "curl",
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash").with_cmd_line("curl"),
             "allow_api",
         )
         .to_json()
@@ -10727,10 +10714,7 @@ network_policies:
             "api.example.com",
             80,
             &path,
-            "/usr/bin/curl",
-            "42",
-            "/usr/bin/bash",
-            "curl",
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash").with_cmd_line("curl"),
             "policy denied",
         )
         .to_json()
@@ -10753,10 +10737,7 @@ network_policies:
             &host,
             port,
             &forward_telemetry_path(target),
-            "/usr/bin/curl",
-            "42",
-            "/usr/bin/bash",
-            "curl",
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/bash").with_cmd_line("curl"),
             "allow_api",
         )
         .to_json()
@@ -11858,6 +11839,7 @@ network_policies:
             endpoint: EndpointDecision::from_authorization(&authorization),
             binary: Some(PathBuf::from("/usr/bin/node")),
             binary_pid: None,
+            process: None,
             ancestors: vec![],
             cmdline_paths: vec![],
         };
@@ -15481,6 +15463,7 @@ network_policies:
                 endpoint: EndpointDecision::from_authorization(&authorization),
                 binary: Some(input.binary_path),
                 binary_pid: Some(1),
+                process: None,
                 ancestors: vec![],
                 cmdline_paths: vec![],
             };

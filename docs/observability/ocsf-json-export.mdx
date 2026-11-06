@@ -157,6 +157,7 @@ Some fields depend on the event class:
 
 - SSH Activity records name the supervisor's SSH server as `dst_endpoint`, with `svc_name: "ssh"` and the listen socket path in `name`, because the server listens on a Unix socket rather than a network address.
 - Process Activity records from the sandbox name the `openshell-sandbox` launcher as `actor.process`.
+- Network and HTTP Activity records for connections the sandbox runtime mediates name the process that opened the connection as `actor.process`, with its `pid` as the sandbox sees it and its start time in `created_time`. When the parent process is identified, `parent_process` carries its `pid`. A `pid` can be reused after its process exits; `pid` and `created_time` together identify one process.
 - `connection_info` carries `direction_id` and `direction`. OpenShell reports Unknown (`0`) where it does not track the direction.
 
 Each JSONL file line, or the payload after the stderr marker, is a complete OCSF v1.8.0 JSON object. Supervisor records identify the sandbox under `device.container` and validate against OCSF v1.8.0 without a top-level `container` exception. Here is an example of a network connection event:
@@ -200,7 +201,12 @@ Each JSONL file line, or the payload after the stderr marker, is a complete OCSF
   "actor": {
     "process": {
       "name": "/usr/bin/curl",
-      "pid": 57
+      "pid": 57,
+      "created_time": 1775014138702,
+      "parent_process": {
+        "name": "/usr/bin/bash",
+        "pid": 42
+      }
     }
   },
   "firewall_rule": {

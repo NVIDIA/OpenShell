@@ -13,6 +13,8 @@
 
 use super::destination::DestinationValidationPlan;
 use crate::opa::NetworkAction;
+use openshell_isolation_interface::contract::ProcessInstance;
+use openshell_ocsf::Process;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -164,10 +166,80 @@ pub(super) struct EgressDecision {
     pub(super) binary: Option<PathBuf>,
     /// PID owning the socket.
     pub(super) binary_pid: Option<u32>,
+    /// Owning process with its parent and start time, when the backend
+    /// reports them.
+    pub(super) process: Option<ProcessInstance>,
     /// Ancestor binary paths from process tree walk.
     pub(super) ancestors: Vec<PathBuf>,
     /// Cmdline-derived absolute paths (for script detection).
     pub(super) cmdline_paths: Vec<PathBuf>,
+}
+
+impl EgressDecision {
+    pub(super) fn binary_display(&self) -> String {
+        self.binary
+            .as_ref()
+            .map_or_else(|| "-".to_string(), |path| path.display().to_string())
+    }
+
+    pub(super) fn pid_display(&self) -> String {
+        self.binary_pid
+            .map_or_else(|| "-".to_string(), |pid| pid.to_string())
+    }
+
+    pub(super) fn ancestors_display(&self) -> String {
+        join_paths(&self.ancestors, " -> ")
+    }
+
+    pub(super) fn cmdline_display(&self) -> String {
+        join_paths(&self.cmdline_paths, ", ")
+    }
+
+    /// OCSF actor for the process that owns the connection.
+    pub(super) fn actor_process(&self) -> Process {
+        actor_process(
+            &self.binary_display(),
+            &self.pid_display(),
+            &self.ancestors_display(),
+            &self.cmdline_display(),
+            self.process,
+        )
+    }
+}
+
+pub(super) fn actor_process(
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    process: Option<ProcessInstance>,
+) -> Process {
+    let mut actor = Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline);
+    let Some(process) = process else {
+        return actor;
+    };
+    // `from_bypass` drops a sole ancestor named like the binary, such as bash
+    // started by bash, but the process instance identifies that parent.
+    if actor.parent_process.is_none()
+        && let Some(parent) = ancestors
+            .split(" -> ")
+            .next()
+            .filter(|name| !name.is_empty() && *name != "-")
+    {
+        actor = actor.with_parent(Process::new(parent, 0));
+    }
+    actor.with_instance(process.parent_pid, process.start_time_ms)
+}
+
+fn join_paths(paths: &[PathBuf], separator: &str) -> String {
+    if paths.is_empty() {
+        return "-".to_string();
+    }
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(separator)
 }
 
 pub(super) fn connect_span(intent: &EgressIntent) -> tracing::Span {
@@ -252,6 +324,7 @@ mod tests {
             endpoint: EndpointDecision::default(),
             binary: None,
             binary_pid: None,
+            process: None,
             ancestors: vec![],
             cmdline_paths: vec![],
         }

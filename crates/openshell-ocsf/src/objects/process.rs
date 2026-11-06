@@ -23,6 +23,10 @@ pub struct Process {
     /// Parent process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_process: Option<Box<Self>>,
+
+    /// Process start time, in milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_time: Option<i64>,
 }
 
 impl Process {
@@ -34,6 +38,7 @@ impl Process {
             pid,
             cmd_line: None,
             parent_process: None,
+            created_time: None,
         }
     }
 
@@ -48,6 +53,16 @@ impl Process {
     #[must_use]
     pub fn with_parent(mut self, parent: Self) -> Self {
         self.parent_process = Some(Box::new(parent));
+        self
+    }
+
+    /// Set the start time and the pid of the direct parent, when one is named.
+    #[must_use]
+    pub fn with_instance(mut self, parent_pid: u32, created_time: i64) -> Self {
+        self.created_time = Some(created_time);
+        if let Some(parent) = self.parent_process.as_mut() {
+            parent.pid = i64::from(parent_pid);
+        }
         self
     }
 
@@ -120,6 +135,21 @@ mod tests {
         assert_eq!(proc.name, "python3");
         assert_eq!(proc.pid, 42);
         assert_eq!(proc.cmd_line.as_deref(), Some("python3 /app/main.py"));
+    }
+
+    #[test]
+    fn process_instance_sets_start_time_and_parent_pid() {
+        let proc = Process::from_bypass("/usr/bin/curl", "57", "/usr/bin/sh")
+            .with_instance(42, 1_793_750_400_123);
+        let json = serde_json::to_value(&proc).unwrap();
+        assert_eq!(json["pid"], 57);
+        assert_eq!(json["created_time"], 1_793_750_400_123_i64);
+        assert_eq!(json["parent_process"]["name"], "/usr/bin/sh");
+        assert_eq!(json["parent_process"]["pid"], 42);
+
+        let orphan = Process::new("/usr/bin/curl", 57).with_instance(42, 1);
+        assert!(orphan.parent_process.is_none());
+        assert_eq!(orphan.created_time, Some(1));
     }
 
     #[test]

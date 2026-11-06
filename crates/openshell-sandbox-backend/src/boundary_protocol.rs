@@ -25,7 +25,8 @@ use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
     BackendDescriptor, BackendError, BinaryIdentity, BoundaryConfirmation, BoundaryExitStatus,
-    BoundarySignal, ExecSpec, ExecutableIdentity, ProvisioningEvidence, ResolveError, ShellSpec,
+    BoundarySignal, ExecSpec, ExecutableIdentity, ProcessInstance, ProvisioningEvidence,
+    ResolveError, ShellSpec,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
 use serde::{Deserialize, Serialize};
@@ -1135,6 +1136,8 @@ pub enum BinaryIdentityWire {
         executable: ExecutableIdentityWire,
         ancestors: Vec<ExecutableIdentityWire>,
         cmdline_paths: Vec<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process: Option<ProcessInstance>,
     },
     Failed {
         message: String,
@@ -1148,6 +1151,7 @@ impl From<Result<BinaryIdentity, ResolveError>> for BinaryIdentityWire {
                 executable: identity.executable.into(),
                 ancestors: identity.ancestors.into_iter().map(Into::into).collect(),
                 cmdline_paths: identity.cmdline_paths,
+                process: identity.process,
             },
             Err(error) => Self::Failed {
                 message: error.to_string(),
@@ -1163,10 +1167,12 @@ impl BinaryIdentityWire {
                 executable,
                 ancestors,
                 cmdline_paths,
+                process,
             } => Ok(BinaryIdentity {
                 executable: executable.into(),
                 ancestors: ancestors.into_iter().map(Into::into).collect(),
                 cmdline_paths,
+                process,
             }),
             Self::Failed { message } => Err(ResolveError::Failed(message)),
         }
@@ -1643,6 +1649,11 @@ mod tests {
                 digest: Some("b".repeat(64).parse().unwrap()),
             }],
             cmdline_paths: Vec::new(),
+            process: Some(ProcessInstance {
+                pid: 57,
+                parent_pid: 42,
+                start_time_ms: 1_793_750_400_123,
+            }),
         }));
         let encoded = serde_json::to_vec(&identity).unwrap();
         assert_eq!(
