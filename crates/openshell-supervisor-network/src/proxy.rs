@@ -5371,6 +5371,7 @@ where
         client,
         upstream,
         crate::l7::rest::RelayRequestOptions {
+            request_id: None,
             resolver: options.secret_resolver,
             body_classifier: options.body_classifier,
             mcp_request_validation: None,
@@ -6835,27 +6836,45 @@ async fn handle_forward_proxy(
     .await;
     let outcome_result = match outcome_result {
         Err(report) => {
-            if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
+            if let Some(error) = report.downcast_ref::<crate::l7::rest::UpstreamHttpError>() {
                 if let Some(session) = middleware_session.take() {
                     session
-                        .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                        .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                         .await;
                 }
-                let _ = upstream.shutdown().await;
-                crate::l7::relay::reject_body_credential(client, *error).await?;
-                return Ok(());
-            }
-            if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
-                if let Some(session) = middleware_session.take() {
-                    session
-                        .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
-                        .await;
+                crate::l7::relay::handle_upstream_http_error(
+                    client,
+                    &mut upstream,
+                    &l7_ctx,
+                    method,
+                    Some(&request_id),
+                    error,
+                )
+                .await?;
+                Ok(crate::l7::provider::RelayOutcome::Consumed)
+            } else {
+                if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                            .await;
+                    }
+                    let _ = upstream.shutdown().await;
+                    crate::l7::relay::reject_body_credential(client, *error).await?;
+                    return Ok(());
                 }
-                crate::l7::relay::reject_credential_resolution(client, &l7_ctx, method, error)
-                    .await?;
-                return Ok(());
+                if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                            .await;
+                    }
+                    crate::l7::relay::reject_credential_resolution(client, &l7_ctx, method, error)
+                        .await?;
+                    return Ok(());
+                }
+                Err(report)
             }
-            Err(report)
         }
         outcome => outcome,
     };
@@ -9547,6 +9566,92 @@ network_policies: {}
                 "malformed request for {host} must fail at ingress"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn forward_upstream_eof_returns_502_and_preserves_allow_activity() {
+        let Some(ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no non-loopback IPv4 address");
+            return;
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = TcpListener::bind((ip, 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let data = serde_json::json!({"network_policies":{"upstream":{
+                "name":"upstream", "endpoints":[{"host":ip.to_string(),"port":port}],
+                "binaries":[{"path":"/usr/bin/python3"}]
+            }}});
+            let engine = Arc::new(
+                native_identity_engine(
+                    include_str!("../data/sandbox-policy.rego"),
+                    &data.to_string(),
+                )
+                .unwrap(),
+            );
+            let identity = Ok(ContractBinaryIdentity {
+                executable: ContractExecutableIdentity {
+                    path: executable_path("/usr/bin/python3"),
+                    digest: Some("00".repeat(32).parse().unwrap()),
+                },
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            });
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(request.starts_with(b"GET /mcp HTTP/1.1"));
+                // Accept the allowed request, then close before its response.
+            });
+            let target = format!("http://{ip}:{port}/mcp");
+            let request = format!("GET {target} HTTP/1.1\r\nHost: {ip}:{port}\r\n\r\n");
+            let (mut app, client) = tokio::io::duplex(8192);
+            let mut client: ProxyClient = tokio::io::BufReader::new(Box::new(client));
+            let (activity, mut events) = mpsc::channel(4);
+            Box::pin(handle_forward_proxy(
+                "GET",
+                &target,
+                request.as_bytes(),
+                request.len(),
+                &mut client,
+                Some(&identity),
+                None,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                Arc::new(None),
+                None,
+                None,
+                None,
+                Some(&activity),
+                None,
+            ))
+            .await
+            .unwrap();
+            drop(client);
+            let mut response = String::new();
+            app.read_to_string(&mut response).await.unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+                "{response}"
+            );
+            assert!(response.contains("x-openshell-request-id:"));
+            assert!(response.contains("Connection: close\r\n"));
+            assert!(
+                !events.try_recv().unwrap().denied,
+                "allowed decision must survive upstream EOF"
+            );
+            server.await.unwrap();
+        })
+        .await
+        .expect("forward EOF must yield a response");
     }
 
     #[tokio::test]

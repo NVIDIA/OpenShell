@@ -95,11 +95,9 @@ where
             if let Some(observer) = options.observer.as_ref() {
                 observer.observe(EndpointResult::TransportFailed);
             }
-            if !buf.is_empty() {
-                client.write_all(&buf).await.into_diagnostic()?;
-            }
             return Err(miette::Report::new(UpstreamHttpError {
-                response_started: !buf.is_empty() || informational_header_bytes > 0,
+                response_started: informational_header_bytes > 0,
+                source: miette!("HTTP upstream closed before a complete response header"),
             }));
         }
         buf.extend_from_slice(&tmp[..n]);
@@ -1365,7 +1363,9 @@ impl<'a, R: AsyncRead + Unpin> BufferedResponseReader<'a, R> {
         while self.exact_buffer.len() < length {
             let remaining = length - self.exact_buffer.len();
             let Some(data) = self.read_some(remaining).await? else {
-                return Err(miette!("HTTP response body ended unexpectedly"));
+                return Err(miette::Report::new(IncompleteHttpBody(
+                    "HTTP response body ended unexpectedly".into(),
+                )));
             };
             self.exact_buffer.extend_from_slice(&data);
         }
@@ -1376,7 +1376,9 @@ impl<'a, R: AsyncRead + Unpin> BufferedResponseReader<'a, R> {
     async fn read_line(&mut self) -> Result<Vec<u8>> {
         loop {
             let Some(byte) = self.read_some(1).await? else {
-                return Err(miette!("HTTP response ended before line terminator"));
+                return Err(miette::Report::new(IncompleteHttpBody(
+                    "HTTP response ended before line terminator".into(),
+                )));
             };
             self.line_buffer.push(byte[0]);
             if self.line_buffer.len() > MAX_HEADER_BYTES {
@@ -1727,7 +1729,11 @@ where
         } else {
             read.await
         };
-        let data = result?.ok_or_else(|| miette!("HTTP response body ended unexpectedly"))?;
+        let data = result?.ok_or_else(|| {
+            miette::Report::new(IncompleteHttpBody(
+                "HTTP response body ended unexpectedly".into(),
+            ))
+        })?;
         payload.extend_from_slice(&data);
         if payload.len() == limit {
             return Ok(payload);

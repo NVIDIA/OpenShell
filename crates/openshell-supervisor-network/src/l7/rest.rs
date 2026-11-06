@@ -747,6 +747,7 @@ where
         client,
         upstream,
         RelayRequestOptions {
+            request_id: None,
             resolver,
             body_classifier: None,
             mcp_request_validation: None,
@@ -774,6 +775,7 @@ pub(crate) enum WebSocketExtensionMode {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RelayRequestOptions<'a> {
+    pub(crate) request_id: Option<&'a str>,
     pub(crate) resolver: Option<&'a SecretResolver>,
     pub(crate) body_classifier: Option<&'a openshell_core::secrets::body::BodyCredentialClassifier>,
     /// Revalidate buffered MCP requests after header transformations.
@@ -830,10 +832,18 @@ impl std::error::Error for CredentialUnavailableError {}
 
 impl miette::Diagnostic for CredentialUnavailableError {}
 
+/// A body ended before its declared framing was complete. The upstream
+/// adapter identifies the origin when the same readers handle request bodies.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct IncompleteHttpBody(String);
+impl miette::Diagnostic for IncompleteHttpBody {}
+
 /// An upstream transport failure, distinct from client I/O and credential refusals.
 #[derive(Debug)]
 pub(crate) struct UpstreamHttpError {
     pub(crate) response_started: bool,
+    source: miette::Report,
 }
 
 impl fmt::Display for UpstreamHttpError {
@@ -842,7 +852,11 @@ impl fmt::Display for UpstreamHttpError {
     }
 }
 
-impl std::error::Error for UpstreamHttpError {}
+impl std::error::Error for UpstreamHttpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
 impl miette::Diagnostic for UpstreamHttpError {}
 
 impl<'a> CredentialGenerationGuard<'a> {
@@ -919,26 +933,43 @@ where
     let mut observed_upstream = ObservedUpstream {
         upstream,
         observer,
-        response_started: false,
         transport_failed: false,
+        read_eof: false,
+    };
+    let mut client = ResponseProgress {
+        client,
+        response_started: false,
     };
     let result = relay_http_exchange(
         req,
-        client,
+        &mut client,
         &mut observed_upstream,
         options,
         response_middleware,
         observer,
     )
     .await;
-    // IntoDiagnostic hides the concrete I/O error. Classify at the adapter's
-    // owner, where an upstream failure remains distinct from client I/O.
-    if result.is_err() && observed_upstream.transport_failed {
-        return Err(miette::Report::new(UpstreamHttpError {
-            response_started: observed_upstream.response_started,
-        }));
+    // Classify at the I/O adapters' owner: only bytes accepted by the
+    // client stream commit a response, and clean body EOF is not a failure.
+    match result {
+        Err(mut report) => {
+            if let Some(error) = report.downcast_mut::<UpstreamHttpError>() {
+                error.response_started = client.response_started;
+                Err(report)
+            } else if observed_upstream.transport_failed
+                || (observed_upstream.read_eof
+                    && report.downcast_ref::<IncompleteHttpBody>().is_some())
+            {
+                Err(miette::Report::new(UpstreamHttpError {
+                    response_started: client.response_started,
+                    source: report,
+                }))
+            } else {
+                Err(report)
+            }
+        }
+        result => result,
     }
-    result
 }
 
 async fn relay_http_exchange<C, U>(
@@ -1339,6 +1370,52 @@ fn ensure_body_generation_current(options: RelayRequestOptions<'_>) -> Result<()
     Ok(())
 }
 
+/// Track bytes accepted by the client independently of upstream buffering.
+struct ResponseProgress<'a, C> {
+    client: &'a mut C,
+    response_started: bool,
+}
+
+impl<C: AsyncRead + Unpin> AsyncRead for ResponseProgress<'_, C> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut *this.client).poll_read(cx, buf)
+    }
+}
+
+impl<C: AsyncWrite + Unpin> AsyncWrite for ResponseProgress<'_, C> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.client).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = result {
+            this.response_started |= n > 0;
+        }
+        result
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut *this.client).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut *this.client).poll_shutdown(cx)
+    }
+}
+
 /// Upstream-only I/O adapter that cannot accidentally classify client errors.
 ///
 /// Once a valid response status consumes the observation token, later stream
@@ -1346,8 +1423,8 @@ fn ensure_body_generation_current(options: RelayRequestOptions<'_>) -> Result<()
 struct ObservedUpstream<'a, U> {
     upstream: &'a mut U,
     observer: Option<&'a EndpointObserver>,
-    response_started: bool,
     transport_failed: bool,
+    read_eof: bool,
 }
 
 impl<U> ObservedUpstream<'_, U> {
@@ -1368,8 +1445,11 @@ impl<U: AsyncRead + Unpin> AsyncRead for ObservedUpstream<'_, U> {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let before = buf.filled().len();
+        let can_read = buf.remaining() > 0;
         let result = std::pin::Pin::new(&mut *this.upstream).poll_read(cx, buf);
-        this.response_started |= buf.filled().len() > before;
+        this.read_eof |= matches!(result, std::task::Poll::Ready(Ok(())))
+            && can_read
+            && buf.filled().len() == before;
         match result {
             std::task::Poll::Ready(Err(error)) => {
                 std::task::Poll::Ready(Err(this.transport_error(error)))
@@ -3266,9 +3346,9 @@ where
             .min(buf.len());
         let n = reader.read(&mut buf[..to_read]).await.into_diagnostic()?;
         if n == 0 {
-            return Err(miette!(
+            return Err(miette::Report::new(IncompleteHttpBody(format!(
                 "Connection closed with {remaining} bytes remaining"
-            ));
+            ))));
         }
         if let Some(guard) = generation_guard {
             guard.ensure_current()?;
@@ -3456,7 +3536,9 @@ impl<'a> ChunkedRelayInput<'a> {
                 .into_diagnostic()?;
             if read == 0 {
                 self.pending.truncate(start);
-                return Err(miette!(eof_message));
+                return Err(miette::Report::new(IncompleteHttpBody(
+                    eof_message.to_string(),
+                )));
             }
             self.pending.truncate(start + read);
             if let Some(guard) = generation_guard {
@@ -3480,7 +3562,9 @@ impl<'a> ChunkedRelayInput<'a> {
         let byte = match reader.read_u8().await {
             Ok(byte) => byte,
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(miette!(eof_message));
+                return Err(miette::Report::new(IncompleteHttpBody(
+                    eof_message.to_string(),
+                )));
             }
             Err(error) => return Err(error).into_diagnostic(),
         };
@@ -6562,8 +6646,8 @@ mod tests {
             let mut upstream = ObservedUpstream {
                 upstream: &mut response,
                 observer: Some(&observer),
-                response_started: false,
                 transport_failed: false,
+                read_eof: false,
             };
             let mut client = Vec::new();
             relay_response(
@@ -7172,6 +7256,7 @@ mod tests {
 
     async fn run_response_relay_across_policy_reload(
         script: ResponseRelayScript,
+        close_delimited: bool,
     ) -> (Result<RelayOutcome>, Vec<u8>) {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
@@ -7198,14 +7283,28 @@ mod tests {
             .expect("initial generation guard");
         let mut middleware = response_middleware_context(&runner, &chain, "GET");
         middleware.generation_guard = Some(&guard);
-        let mut upstream = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".as_slice();
-        let mut delivered = Vec::new();
-        let relay = relay_response(
-            "GET",
+        let (mut upstream, mut server) = tokio::io::duplex(8192);
+        let (mut app, mut client) = tokio::io::duplex(8192);
+        let raw = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let request = request_from_buffered_http("GET", "/", "/", raw.to_vec()).unwrap();
+        let response = if close_delimited {
+            &b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello"[..]
+        } else {
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"[..]
+        };
+        let writer = tokio::spawn(async move {
+            let mut received = vec![0; raw.len()];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, raw);
+            server.write_all(response).await.unwrap();
+        });
+        let relay = relay_http_request_with_response_middleware_guarded_observed(
+            &request,
+            &mut client,
             &mut upstream,
-            &mut delivered,
-            RelayResponseOptions::default(),
+            RelayRequestOptions::default(),
             Some(middleware),
+            None,
         );
         let reload = async {
             entered.notified().await;
@@ -7215,28 +7314,50 @@ mod tests {
             release.notify_one();
         };
         let (outcome, ()) = tokio::join!(relay, reload);
+        writer.await.unwrap();
+        drop(client);
+        let mut delivered = Vec::new();
+        app.read_to_end(&mut delivered).await.unwrap();
         (outcome, delivered)
     }
 
     #[tokio::test]
     async fn response_middleware_rechecks_generation_after_stream_exchange() {
-        let (outcome, delivered) =
-            run_response_relay_across_policy_reload(ResponseRelayScript::Stream).await;
+        for close_delimited in [false, true] {
+            let (outcome, delivered) = run_response_relay_across_policy_reload(
+                ResponseRelayScript::Stream,
+                close_delimited,
+            )
+            .await;
 
-        let error = outcome.expect_err("stale stream output must not be delivered");
-        assert!(error.to_string().contains("policy generation is stale"));
-        assert!(delivered.ends_with(b"\r\n\r\n"));
-        assert!(!delivered.windows(5).any(|window| window == b"HELLO"));
+            let error = outcome.expect_err("stale stream output must not be delivered");
+            assert!(
+                error.downcast_ref::<UpstreamHttpError>().is_none(),
+                "normal EOF then policy reload is not an upstream failure"
+            );
+            assert!(error.to_string().contains("policy generation is stale"));
+            assert!(delivered.ends_with(b"\r\n\r\n"));
+            assert!(!delivered.windows(5).any(|window| window == b"HELLO"));
+        }
     }
 
     #[tokio::test]
     async fn response_middleware_rechecks_generation_after_whole_body_finish() {
-        let (outcome, delivered) =
-            run_response_relay_across_policy_reload(ResponseRelayScript::WholeBody).await;
+        for close_delimited in [false, true] {
+            let (outcome, delivered) = run_response_relay_across_policy_reload(
+                ResponseRelayScript::WholeBody,
+                close_delimited,
+            )
+            .await;
 
-        let error = outcome.expect_err("stale whole-body output must not be delivered");
-        assert!(error.to_string().contains("policy generation is stale"));
-        assert!(delivered.is_empty());
+            let error = outcome.expect_err("stale whole-body output must not be delivered");
+            assert!(
+                error.downcast_ref::<UpstreamHttpError>().is_none(),
+                "normal EOF then policy reload is not an upstream failure"
+            );
+            assert!(error.to_string().contains("policy generation is stale"));
+            assert!(delivered.is_empty());
+        }
     }
 
     #[tokio::test]
