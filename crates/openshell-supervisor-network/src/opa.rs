@@ -145,7 +145,7 @@ fn emit_binary_identity_mode(require_binary_identity: bool, source: &str) {
         require_binary_identity,
         source, "Configured OPA runtime binary identity mode"
     );
-    openshell_ocsf::ocsf_emit!(
+    crate::telemetry::egress_emit!(
         openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(openshell_ocsf::SeverityId::Informational)
             .status(openshell_ocsf::StatusId::Success)
@@ -1427,7 +1427,7 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
 
 fn emit_l7_config_warnings(warnings: &[String], prefix: &str) {
     for w in warnings {
-        openshell_ocsf::ocsf_emit!(
+        crate::telemetry::egress_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::Medium)
                 .status(openshell_ocsf::StatusId::Success)

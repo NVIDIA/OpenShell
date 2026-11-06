@@ -1265,7 +1265,7 @@ where
                         port = options.port,
                     ))
                     .build();
-                    openshell_ocsf::ocsf_emit!(event);
+                    crate::telemetry::egress_emit!(event);
                 }
                 _ => {
                     return Err(miette::Report::new(CredentialUnavailableError::new(
@@ -1681,8 +1681,9 @@ fn emit_uninspected_body_credential_denial(
             req.action, options.host, options.port
         ))
         .build();
-    openshell_ocsf::ocsf_emit!(event);
+    crate::telemetry::egress_emit!(event);
     let finding = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .action(openshell_ocsf::ActionId::Denied)
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
             "openshell.credentials.traffic_uninspectable",
@@ -1695,7 +1696,7 @@ fn emit_uninspected_body_credential_denial(
         ])
         .message("Request body credential placeholder denied")
         .build();
-    openshell_ocsf::ocsf_emit!(finding);
+    crate::telemetry::egress_emit!(finding);
 }
 
 struct PreparedRequestBody {
@@ -7082,6 +7083,256 @@ mod tests {
         let mut delivered = Vec::new();
         client_read.read_to_end(&mut delivered).await.unwrap();
         (outcome, delivered)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_trace_failure_records_share_the_terminal_decision() {
+        use crate::telemetry::tests::{assert_deny_resolves, deny_spans, exported};
+
+        // This relay fixture has no CONNECT span, so denies are roots at both
+        // levels. The thread-local export harness observes the relay task;
+        // emissions in spawned tasks would need explicit subscriber propagation.
+        for level in ["warn", "debug"] {
+            for (method, script) in [
+                ("GET", ResponseRelayScript::BlockStream),
+                ("GET", ResponseRelayScript::InvalidBodySequence),
+                ("GET", ResponseRelayScript::InvalidWholeBodySequence),
+                ("HEAD", ResponseRelayScript::WholeBody),
+            ] {
+                let (events, received) = exported(level, || {
+                    let (outcome, delivered) = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(run_response_middleware_relay(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                            method,
+                            script,
+                        ))
+                    });
+                    if method == "HEAD"
+                        || matches!(script, ResponseRelayScript::InvalidWholeBodySequence)
+                    {
+                        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+                        assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+                    } else {
+                        assert!(outcome.is_err());
+                        assert!(delivered.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                        assert!(!String::from_utf8_lossy(&delivered).contains("502 Bad Gateway"));
+                    }
+                })
+                .await;
+                let terminal = events
+                    .iter()
+                    .find(|event| {
+                        event["finding_info"]["uid"] == "openshell.middleware.http_response_failure"
+                    })
+                    .expect("terminal delivery failure is recorded");
+                let companions: Vec<_> = events
+                    .iter()
+                    .filter(|event| {
+                        event.get("finding_info").is_some()
+                            || event["unmapped"]["failed"] == true
+                            || event["action_id"] == openshell_ocsf::ActionId::Denied as u8
+                    })
+                    .cloned()
+                    .collect();
+                assert!(companions.len() >= 2, "failure includes diagnostic records");
+                assert_eq!(
+                    deny_spans(&received).len(),
+                    1,
+                    "one response stop is one exported decision"
+                );
+                assert!(terminal.get("trace").is_none());
+                assert_deny_resolves(&companions, &received, true);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_refusal_findings_record_denial_without_http_spans() {
+        let request = L7Request {
+            action: "POST".into(),
+            target: "/api".into(),
+            query_params: HashMap::new(),
+            raw_header: vec![],
+            body_length: BodyLength::None,
+        };
+        let (events, received) = crate::telemetry::tests::exported("warn", || {
+            crate::l7::emit_uninspected_credential_finding("example.test", "p", "test");
+            emit_uninspected_body_credential_denial(
+                &request,
+                &RelayRequestOptions {
+                    host: "example.test",
+                    port: 443,
+                    ..Default::default()
+                },
+                BodyCredentialError::KnownUnavailable,
+            );
+        })
+        .await;
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["class_uid"] == 2004)
+                .count(),
+            2
+        );
+        for event in &events {
+            assert_eq!(event["action_id"], 2);
+            assert_eq!(event["action"], "Denied");
+        }
+        crate::telemetry::tests::assert_no_deny(&events, &received);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_trace_upstream_io_failure_is_not_an_enforced_denial() {
+        struct FailedReader;
+        impl AsyncRead for FailedReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "upstream response interrupted",
+                )))
+            }
+        }
+
+        for script in [ResponseRelayScript::Stream, ResponseRelayScript::WholeBody] {
+            let (events, received) = crate::telemetry::tests::exported("warn", || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let (runner, chain) = response_middleware_fixture(script);
+                        let mut upstream = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
+                            .as_slice()
+                            .chain(FailedReader);
+                        let mut delivered = Vec::new();
+                        let outcome = relay_response(
+                            "GET",
+                            &mut upstream,
+                            &mut delivered,
+                            RelayResponseOptions::default(),
+                            Some(response_middleware_context(&runner, &chain, "GET")),
+                        )
+                        .await;
+                        if matches!(script, ResponseRelayScript::Stream) {
+                            assert!(outcome.is_err());
+                            assert!(delivered.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                            assert!(
+                                !String::from_utf8_lossy(&delivered).contains("502 Bad Gateway")
+                            );
+                        } else {
+                            assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+                            assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+                        }
+                    });
+                });
+            })
+            .await;
+            let finding = events
+                .iter()
+                .find(|event| {
+                    event["finding_info"]["uid"] == "openshell.middleware.http_response_failure"
+                })
+                .expect("upstream I/O failure retains its diagnostic finding");
+            assert!(finding.get("action_id").is_none());
+            assert!(finding.get("action").is_none());
+            crate::telemetry::tests::assert_no_deny(&events, &received);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_trace_downstream_body_failure_is_not_an_enforced_denial() {
+        #[derive(Default)]
+        struct DisconnectAfterHead(Vec<u8>);
+        impl AsyncWrite for DisconnectAfterHead {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                if self.0.ends_with(b"\r\n\r\n") {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "client disconnected",
+                    )));
+                }
+                self.0.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (events, received) = crate::telemetry::tests::exported("warn", || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
+                    let mut upstream =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".as_slice();
+                    let mut delivered = DisconnectAfterHead::default();
+                    let outcome = relay_response(
+                        "GET",
+                        &mut upstream,
+                        &mut delivered,
+                        RelayResponseOptions::default(),
+                        Some(response_middleware_context(&runner, &chain, "GET")),
+                    )
+                    .await;
+                    assert!(outcome.is_err());
+                    assert!(delivered.0.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                    assert!(!String::from_utf8_lossy(&delivered.0).contains("502 Bad Gateway"));
+                });
+            });
+        })
+        .await;
+        let finding = events
+            .iter()
+            .find(|event| {
+                event["finding_info"]["uid"] == "openshell.middleware.http_response_failure"
+            })
+            .expect("downstream I/O failure retains its diagnostic finding");
+        assert!(finding.get("action_id").is_none());
+        assert!(finding.get("action").is_none());
+        crate::telemetry::tests::assert_no_deny(&events, &received);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_trace_allowed_and_fail_open_controls_do_not_create_deny_spans() {
+        for script in [
+            ResponseRelayScript::Stream,
+            ResponseRelayScript::InvalidBodySequence,
+            ResponseRelayScript::InvalidWholeBodySequence,
+        ] {
+            let (events, received) = crate::telemetry::tests::exported("warn", || {
+                let (outcome, delivered) = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        run_response_middleware_relay_with_error(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                            "GET",
+                            script,
+                            openshell_supervisor_middleware::OnError::FailOpen,
+                        ),
+                    )
+                });
+                assert!(outcome.is_ok());
+                assert!(delivered.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            })
+            .await;
+            assert!(!events.is_empty());
+            crate::telemetry::tests::assert_no_deny(&events, &received);
+        }
     }
 
     #[tokio::test]

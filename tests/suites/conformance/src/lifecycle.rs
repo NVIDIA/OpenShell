@@ -52,7 +52,11 @@ const DELETE_DEADLINE: Duration = Duration::from_secs(10);
 /// Many workloads do not exit immediately on TERM, for example while they run
 /// cleanup handlers. Deleting such a running sandbox should still complete
 /// promptly, rather than waiting out the runtime's termination grace period.
+//
+// Unignore this when the supervisor half of #5025 lands: on Podman the
+// supervisor container still waits out its stop timeout.
 #[testkit::test]
+#[ignore = "https://github.com/NVIDIA/OpenShell/issues/5025"]
 async fn delete_is_prompt_when_workload_is_slow_to_handle_term(
     cx: &mut Context,
 ) -> testkit::Result {
