@@ -44,6 +44,12 @@ use crate::boundary_protocol::{
 use crate::mediation::{self, DnsQueryWire, MediationFrame, MediationFrameKind};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a queued response may still be written after the sandbox upload fails.
+///
+/// A live relay has no deadline. This bound applies only once the upload
+/// direction has already failed, so an untrusted body is not read indefinitely
+/// while a rejection already sitting in the reverse buffer is delivered.
+const RELAY_REVERSE_DRAIN: Duration = Duration::from_secs(1);
 /// Initial attachment may include runtime image pulls and trusted bootstrap
 /// work before the boundary begins listening. Keep this aligned with the
 /// driver bootstrap grace period rather than the normal operation timeout.
@@ -1407,7 +1413,7 @@ impl NetworkMediationSource {
 
 async fn complete_network_open(
     mut boundary: BoundaryDuplexStream,
-    mut transport: tokio::io::DuplexStream,
+    transport: tokio::io::DuplexStream,
     completion: tokio::sync::oneshot::Receiver<TcpOpenDecision>,
 ) {
     let decision = completion
@@ -1427,7 +1433,7 @@ async fn complete_network_open(
         return;
     }
     if matches!(decision, TcpOpenDecision::RelayReady) {
-        let _ = tokio::io::copy_bidirectional(&mut boundary, &mut transport).await;
+        relay_ready_streams(boundary, transport).await;
     } else {
         // The write only queues the decision for the request pump. Dropping the
         // response stream now cancels the RPC before that pump can deliver it.
@@ -1437,6 +1443,53 @@ async fn complete_network_open(
             boundary.read_u8().await
         })
         .await;
+    }
+}
+
+/// Copy both directions of a committed network relay.
+///
+/// `copy_bidirectional` returns the first write error and abandons the other
+/// direction. An early HTTP rejection is already buffered toward the sandbox
+/// when the proxy stops reading the body, so that upload `BrokenPipe` used to
+/// discard the response. A clean EOF still half-closes that direction and runs
+/// the other to completion. An upload error stops further body reads and gives
+/// the reverse direction [`RELAY_REVERSE_DRAIN`] to flush bytes already queued.
+/// A response error stops immediately and does not drain the upload.
+async fn relay_ready_streams(boundary: BoundaryDuplexStream, transport: tokio::io::DuplexStream) {
+    let (mut boundary_read, mut boundary_write) = tokio::io::split(boundary);
+    let (mut transport_read, mut transport_write) = tokio::io::split(transport);
+    let upload = async {
+        let copied = tokio::io::copy(&mut boundary_read, &mut transport_write).await;
+        let _ = transport_write.shutdown().await;
+        copied
+    };
+    let download = async {
+        let copied = tokio::io::copy(&mut transport_read, &mut boundary_write).await;
+        let _ = boundary_write.shutdown().await;
+        copied
+    };
+    tokio::pin!(upload);
+    tokio::pin!(download);
+
+    // Biased so a ready upload is observed before the response copy is polled.
+    // The response future then stays safe to poll again, including after the
+    // upload writer has already failed.
+    tokio::select! {
+        biased;
+        upload_result = upload.as_mut() => match upload_result {
+            Ok(_) => {
+                let _ = download.as_mut().await;
+            }
+            Err(_) => {
+                let _ = tokio::time::timeout(RELAY_REVERSE_DRAIN, download.as_mut()).await;
+            }
+        },
+        download_result = download.as_mut() => {
+            // A response error must not keep reading the upload.
+            if download_result.is_ok() {
+                let _ = upload.as_mut().await;
+            }
+        }
     }
 }
 
@@ -3040,6 +3093,7 @@ mod tests {
     mod delegated;
     mod flow_control;
     mod network_recovery;
+    mod network_relay;
     mod protocol_errors;
 
     use crate::isolation_protocol::exchange_frame;
