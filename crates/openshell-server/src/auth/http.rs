@@ -90,11 +90,14 @@ fn sanitize_callback_host(raw: &Option<String>) -> (String, String) {
 
 /// Create the auth router.
 pub fn router(state: Arc<ServerState>) -> Router {
-    Router::new()
-        .route(
+    let mut router = Router::new();
+    if state.config.service_routing.auth_enabled {
+        router = router.route(
             "/auth/services",
             get(service_browser_login).post(service_browser_login),
-        )
+        );
+    }
+    router
         .route("/auth/connect", get(auth_connect))
         .route("/auth/oidc-config", get(oidc_config_handler))
         .route("/.well-known/jwks.json", get(gateway_jwks_handler))
