@@ -229,6 +229,7 @@ fn agent() -> AgentSpec {
         timeout_secs: 15,
         interactive: false,
         otlp_relay_active: false,
+        process_activity_enabled: false,
     }
 }
 
@@ -320,6 +321,7 @@ impl PreparedBackend for TestLaunch {
                                 kind: ProcessKindWire::Main,
                                 terminal: false,
                                 status: None,
+                                process_identity: None,
                                 retained_output: OutputWindowWire {
                                     first_sequence: 0,
                                     next_sequence: 0,
@@ -386,6 +388,7 @@ impl PreparedBackend for TestLaunch {
                             process_id: "main".into(),
                             provider_env_revision,
                             provider_env_generation: 1,
+                            process_identity: None,
                         }
                     }
                     Request::Wait { .. } => Response::Exited {

@@ -198,6 +198,41 @@ A process launched inside the sandbox:
 OCSF PROC:LAUNCH [INFO] sleep(49)
 ```
 
+### Boundary process events
+
+To record launch and exit events for the entrypoint and processes started by
+`sandbox exec` or SSH, enable the setting before starting a sandbox:
+
+```shell
+openshell settings set --global --key process_activity_enabled --value true
+```
+
+The setting defaults to `false` and is captured at sandbox startup. When it is
+off, the existing entrypoint launch event remains. When it is on, the sandbox
+runtime captures each directly started process and sends its identity to the
+supervisor. The supervisor emits one launch and one termination event to the
+gateway stream and, when enabled, its OCSF JSONL output. The runtime also
+emits these events to its own container log. This covers piped and PTY sessions.
+The events never include argv or command lines. Each source emits at most two
+additional records per process the runtime directly starts.
+
+```text
+OCSF PROC:LAUNCH [INFO] /bin/sh(57) [ppid:1] [start:1793620000120] [process_uid:57:123456] [parent_uid:1:34]
+OCSF PROC:TERMINATE [INFO] /bin/sh(57) [ppid:1] [start:1793620000120] [process_uid:57:123456] [parent_uid:1:34] [exit:0]
+```
+
+`ppid` is the PID namespace parent. `start` is the process start time in Unix
+milliseconds. `process_uid` and `parent_uid` identify process instances as
+`pid:start_ticks`, where `start_ticks` is field 22 of `/proc/<pid>/stat`.
+Signal exits carry `[signal:N]` in place of `[exit:N]`. Forked descendants and
+an executable that replaces itself are outside this setting's current event
+coverage. The log stream can drop records under pressure, so these events do
+not prove that a process tree is complete.
+
+Use `openshell logs <sandbox> --source sandbox` to read the supervisor records
+through the gateway. See [Accessing Logs](/observability/accessing-logs) for
+stream retention and loss behavior.
+
 A policy reload after a settings change:
 
 ```text

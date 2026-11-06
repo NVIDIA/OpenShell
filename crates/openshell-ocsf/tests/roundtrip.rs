@@ -125,8 +125,14 @@ fn process_activity_round_trips() {
         .activity(ActivityId::Open)
         .process(
             Process::new("/usr/bin/python3", 4713)
+                .with_uid("4713:123456")
+                .with_created_time(1_793_620_000_120)
                 .with_cmd_line("python3 -m pytest")
-                .with_parent(Process::new("/bin/sh", 4701)),
+                .with_parent(
+                    Process::new("/bin/sh", 4701)
+                        .with_uid("4701:123400")
+                        .with_created_time(1_793_619_999_560),
+                ),
         )
         .actor_process(Process::new("openshell-sandbox", 4700))
         .launch_type(LaunchTypeId::Other)
@@ -137,6 +143,7 @@ fn process_activity_round_trips() {
         .build();
 
     assert_round_trips("process_activity", &event);
+    openshell_ocsf_validate::validate_event(&event.to_json().unwrap()).unwrap();
 }
 
 #[test]

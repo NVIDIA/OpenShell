@@ -25,6 +25,7 @@ use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::contract::{
     BackendError, BoundaryExitStatus, BoundaryInput, BoundaryOutput, BoundarySignal, ExecSpec,
 };
+use openshell_ocsf::ocsf_emit;
 
 /// The sandbox executor. Every spawn reuses the same admitted policy and
 /// execution-environment controls while taking a fresh provider credential
@@ -38,6 +39,7 @@ pub struct LocalBoundaryExec {
     user_environment: HashMap<String, String>,
     runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
     otlp_relay_active: bool,
+    process_activity_enabled: bool,
     #[cfg(target_os = "linux")]
     launcher: crate::linux::workload_launcher::WorkloadLauncher,
 }
@@ -54,6 +56,7 @@ impl LocalBoundaryExec {
         user_environment: HashMap<String, String>,
         runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
         otlp_relay_active: bool,
+        process_activity_enabled: bool,
         #[cfg(target_os = "linux")] launcher: crate::linux::workload_launcher::WorkloadLauncher,
     ) -> Self {
         Self {
@@ -64,6 +67,7 @@ impl LocalBoundaryExec {
             user_environment,
             runtime,
             otlp_relay_active,
+            process_activity_enabled,
             #[cfg(target_os = "linux")]
             launcher,
         }
@@ -226,6 +230,9 @@ impl LocalBoundaryExec {
     fn spawn_piped(&self, spec: &ExecSpec) -> Result<SpawnedExec, BackendError> {
         self.runtime.ensure_active()?;
         let mut command = self.command(spec)?;
+        let audit_program = self
+            .process_activity_enabled
+            .then(|| command.get_program().to_string_lossy().into_owned());
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -275,6 +282,11 @@ impl LocalBoundaryExec {
         let managed_child = child_registry.register(pid);
         #[cfg(target_os = "linux")]
         drop(child_registry);
+        let audit =
+            audit_program.map(|program| crate::process_audit::ProcessAudit::capture(&program, pid));
+        if let Some(audit) = &audit {
+            ocsf_emit!(audit.launch_event());
+        }
         let stdin = child.stdin.take().map(|file| -> BoundaryInput {
             let fd: OwnedFd = file.into();
             Box::new(tokio::fs::File::from_std(std::fs::File::from(fd)))
@@ -297,6 +309,7 @@ impl LocalBoundaryExec {
             self.runtime.clone(),
             process_terminal,
             signal_lock,
+            audit,
             #[cfg(target_os = "linux")]
             managed_child,
         ));
@@ -339,6 +352,9 @@ impl LocalBoundaryExec {
             .try_clone()
             .map_err(|error| BackendError::Process(error.to_string()))?;
         let mut command = self.command(spec)?;
+        let audit_program = self
+            .process_activity_enabled
+            .then(|| command.get_program().to_string_lossy().into_owned());
         command.stdin(stdin).stdout(stdout).stderr(slave);
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
@@ -385,6 +401,11 @@ impl LocalBoundaryExec {
         let managed_child = child_registry.register(pid);
         #[cfg(target_os = "linux")]
         drop(child_registry);
+        let audit =
+            audit_program.map(|program| crate::process_audit::ProcessAudit::capture(&program, pid));
+        if let Some(audit) = &audit {
+            ocsf_emit!(audit.launch_event());
+        }
         let terminal: Arc<dyn BoundaryTerminal> = Arc::new(LocalTerminal { master });
         let process = Arc::new(LocalExecProcess::new(
             child,
@@ -392,6 +413,7 @@ impl LocalBoundaryExec {
             self.runtime.clone(),
             process_terminal,
             signal_lock,
+            audit,
             #[cfg(target_os = "linux")]
             managed_child,
         ));
@@ -561,6 +583,7 @@ impl BoundaryTerminal for LocalTerminal {
 
 struct LocalExecProcess {
     pid: u32,
+    process_identity: Option<openshell_sandbox_backend::boundary_protocol::ProcessIdentityWire>,
     result: Arc<std::sync::Mutex<Option<Result<BoundaryExitStatus, String>>>>,
     exited: Arc<tokio::sync::Notify>,
     runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
@@ -575,8 +598,12 @@ impl LocalExecProcess {
         runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
         terminal: Arc<std::sync::atomic::AtomicBool>,
         signal_lock: Arc<std::sync::Mutex<()>>,
+        audit: Option<crate::process_audit::ProcessAudit>,
         #[cfg(target_os = "linux")] managed_child: Option<crate::managed_children::ManagedChild>,
     ) -> Self {
+        let process_identity = audit
+            .as_ref()
+            .map(crate::process_audit::ProcessAudit::identity);
         let result = Arc::new(std::sync::Mutex::new(None));
         let exited = Arc::new(tokio::sync::Notify::new());
         let result_for_wait = result.clone();
@@ -630,6 +657,11 @@ impl LocalExecProcess {
                 }
                 BoundaryExitStatus::Exited(status.code().unwrap_or(1))
             });
+            if let Some(audit) = &audit
+                && let Ok(status) = waited.as_ref()
+            {
+                ocsf_emit!(audit.terminate_event(*status));
+            }
             runtime_for_wait.unregister_process_group(pid, &registration_terminal);
             if let Ok(mut slot) = result_for_wait.lock() {
                 *slot = Some(waited);
@@ -638,6 +670,7 @@ impl LocalExecProcess {
         });
         Self {
             pid,
+            process_identity,
             result,
             exited,
             runtime,
@@ -662,6 +695,11 @@ impl LocalExecProcess {
 
 #[async_trait]
 impl BoundaryProcess for LocalExecProcess {
+    fn process_identity(
+        &self,
+    ) -> Option<openshell_sandbox_backend::boundary_protocol::ProcessIdentityWire> {
+        self.process_identity.clone()
+    }
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
         loop {
             let notified = self.exited.notified();
@@ -737,6 +775,7 @@ mod tests {
             HashMap::new(),
             crate::boundary_io::BoundaryRuntimeState::new(),
             otlp_relay_active,
+            false,
             launcher,
         )
     }

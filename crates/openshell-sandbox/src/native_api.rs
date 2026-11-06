@@ -12,6 +12,12 @@ use std::sync::Arc;
 
 #[async_trait]
 pub trait BoundaryProcess: Send + Sync {
+    /// Identity captured at spawn time, when this process is opted in to audit.
+    fn process_identity(
+        &self,
+    ) -> Option<openshell_sandbox_backend::boundary_protocol::ProcessIdentityWire> {
+        None
+    }
     /// Attach to the admitted process's retained standard I/O. The boundary
     /// remains the process owner and may permit only one control attachment.
     async fn attach(&self) -> Result<ProcessAttachment, BackendError> {
