@@ -5339,6 +5339,7 @@ dependencies = [
  "openshell-sandbox-backend",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
+ "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost-types",

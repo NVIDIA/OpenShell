@@ -8,6 +8,7 @@
 //! doing a raw `copy_bidirectional`. Each request within the tunnel is parsed,
 //! evaluated against OPA policy, and either forwarded or denied.
 
+pub(crate) mod correlation;
 pub mod graphql;
 pub(crate) mod http;
 pub mod jsonrpc;

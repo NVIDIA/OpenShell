@@ -34,6 +34,7 @@ const MAX_EXPORT_ATTEMPTS: usize = 4;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
 const GAP_EVENT: &str = "openshell.ocsf.gap";
+const CORRELATION_UID_ATTRIBUTE: &str = "ocsf.metadata.correlation_uid";
 
 /// Exports OCSF events to an OTLP collector as log records.
 pub struct OcsfOtlp {
@@ -391,6 +392,9 @@ fn log_record(
     if let Some(uid) = &base.metadata.uid {
         record.add_attribute("ocsf.metadata.uid", uid.clone());
     }
+    if let Some(uid) = &base.metadata.correlation_uid {
+        record.add_attribute(CORRELATION_UID_ATTRIBUTE, uid.clone());
+    }
     if let Some(sandbox_id) = event.sandbox_id() {
         record.add_attribute("openshell.sandbox.id", sandbox_id.to_string());
     }
@@ -630,6 +634,16 @@ mod tests {
     }
 
     #[test]
+    fn correlation_uid_is_a_stable_otlp_attribute() {
+        let mut event = event("sandbox-1", SeverityId::Informational);
+        event.set_correlation_uid("request-123");
+        assert_eq!(
+            attribute(&record(&event), CORRELATION_UID_ATTRIBUTE),
+            Some(AnyValue::String("request-123".into()))
+        );
+    }
+
+    #[test]
     fn events_without_a_sandbox_carry_no_sandbox_attribute() {
         let record = record(&event("", SeverityId::Informational));
         assert!(attribute(&record, "openshell.sandbox.id").is_none());
@@ -785,7 +799,11 @@ mod tests {
                 .build();
             let subscriber = tracing_subscriber::registry()
                 .with(crate::layer(&tracer, "ocsf-test"))
-                .with(otlp.layer());
+                .with(
+                    Some(otlp.layer()).with_filter(tracing_subscriber::filter::filter_fn(
+                        |metadata| metadata.target() == OCSF_TARGET,
+                    )),
+                );
             let span_context = tracing::subscriber::with_default(subscriber, || {
                 let span = tracing::info_span!("decision");
                 span.in_scope(|| ocsf_emit!(event("sandbox-1", SeverityId::Medium)));

@@ -17,6 +17,12 @@ macro_rules! egress_emit {
 }
 pub(crate) use egress_emit;
 
+/// Emit an inspected request event whose request already owns the decision span.
+#[allow(clippy::disallowed_macros)]
+pub fn emit_correlated(event: OcsfEvent) {
+    openshell_ocsf::ocsf_emit!(event);
+}
+
 fn is_denied(event: &OcsfEvent) -> bool {
     match event {
         OcsfEvent::NetworkActivity(event) => event.action == Some(ActionId::Denied),

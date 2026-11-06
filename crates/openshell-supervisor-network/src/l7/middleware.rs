@@ -668,8 +668,11 @@ pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpi
     ctx: &L7EvalContext,
     denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
     redacted_target: &str,
+    request_id: Option<&str>,
 ) -> Result<()> {
-    let context = Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx));
+    let context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx);
+    let context = request_id.map_or(context, |request_id| context.with_request_id(request_id));
+    let context = Some(context);
     if let Some(denial) = denial {
         crate::l7::rest::send_middleware_deny_response(
             req,
@@ -699,13 +702,16 @@ pub async fn send_middleware_admission_exhausted_response<
     client: &mut C,
     ctx: &L7EvalContext,
     redacted_target: &str,
+    request_id: Option<&str>,
 ) -> Result<()> {
+    let context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx);
+    let context = request_id.map_or(context, |request_id| context.with_request_id(request_id));
     crate::l7::rest::send_middleware_unavailable_response(
         req,
         &ctx.policy_name,
         client,
         Some(redacted_target),
-        Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
+        Some(context),
     )
     .await
 }
@@ -1397,9 +1403,16 @@ mod tests {
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
-        send_middleware_rejection_response(&req, &mut server, &ctx, Some(&denial), "/v1/messages")
-            .await
-            .expect("send denial");
+        send_middleware_rejection_response(
+            &req,
+            &mut server,
+            &ctx,
+            Some(&denial),
+            "/v1/messages",
+            Some("00000000-0000-4000-8000-000000000010"),
+        )
+        .await
+        .expect("send denial");
         drop(server);
 
         let mut response = Vec::new();
@@ -1408,9 +1421,13 @@ mod tests {
             .await
             .expect("read denial");
         let response = String::from_utf8(response).expect("UTF-8 response");
+        assert!(
+            response.contains("x-openshell-request-id: 00000000-0000-4000-8000-000000000010\r\n")
+        );
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
         assert_eq!(body["error"], "middleware_denied");
+        assert_eq!(body["request_id"], "00000000-0000-4000-8000-000000000010");
         assert_eq!(body["middleware"], "prototype-content-guard");
         assert_eq!(body["reason_code"], "content_match");
         assert!(body.get("rule_missing").is_none());
@@ -1490,9 +1507,16 @@ mod tests {
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
-        send_middleware_rejection_response(&req, &mut server, &ctx, None, "/v1/messages")
-            .await
-            .expect("send failure");
+        send_middleware_rejection_response(
+            &req,
+            &mut server,
+            &ctx,
+            None,
+            "/v1/messages",
+            Some("00000000-0000-4000-8000-000000000011"),
+        )
+        .await
+        .expect("send failure");
         drop(server);
 
         let mut response = Vec::new();
@@ -1501,9 +1525,13 @@ mod tests {
             .await
             .expect("read failure");
         let response = String::from_utf8(response).expect("UTF-8 response");
+        assert!(
+            response.contains("x-openshell-request-id: 00000000-0000-4000-8000-000000000011\r\n")
+        );
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
         assert_eq!(body["error"], "middleware_failed");
+        assert_eq!(body["request_id"], "00000000-0000-4000-8000-000000000011");
         assert_eq!(
             body["detail"],
             "Request could not be processed by configured middleware"
