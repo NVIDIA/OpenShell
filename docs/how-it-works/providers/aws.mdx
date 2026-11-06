@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "AWS SigV4 Credential Signing"
 sidebar-title: "AWS"
-description: "Configure proxy-side AWS SigV4 request signing so sandbox agents can reach AWS services through CONNECT tunnels without holding real credentials."
+description: "Configure proxy-side AWS SigV4 request signing so sandbox agents can reach AWS services through CONNECT tunnels using placeholder credentials."
 keywords: "Generative AI, Cybersecurity, AI Agents, AWS, SigV4, Bedrock, S3, Credential Signing, Sandbox"
 ---
 
-AWS SigV4 credential signing lets sandbox agents call AWS services (Bedrock, S3, STS, and others) through the proxy's CONNECT tunnel. The proxy intercepts outbound requests, strips the sandbox client's placeholder `Authorization` header, and re-signs the request with real AWS credentials from the provider. The sandbox never sees the real credentials.
+AWS SigV4 credential signing lets sandbox agents call AWS services (Bedrock, S3, STS, and others) through the proxy's CONNECT tunnel. The proxy intercepts outbound requests, strips the sandbox client's placeholder `Authorization` header, and re-signs the request with real AWS credentials from the provider. The sandbox uses placeholder credentials; signing with the provider's credentials happens in the proxy. See [How Credential Injection Works](/how-it-works/providers/overview#how-credential-injection-works) for credential delivery and response-handling limits.
 
 ## Prerequisites
 
@@ -169,7 +169,7 @@ endpoints:
 
 ## Use from a Sandbox
 
-Inside a sandbox, configure the AWS SDK with placeholder credentials. The proxy replaces them with real credentials during re-signing:
+Inside a sandbox, configure the AWS SDK with placeholder credentials. The proxy uses the provider's real credentials to re-sign requests:
 
 ```shell
 export AWS_ACCESS_KEY_ID=placeholder
