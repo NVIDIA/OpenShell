@@ -1527,7 +1527,7 @@ gateway chart.
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:
 
-- The VM driver process is running and reachable by the gateway.
+- The VM driver process is running and reachable by the gateway. On RPM hosts, use `rpm -q openshell-driver-vm` and `rpm -ql openshell-driver-vm` to confirm that the matching package owns `/usr/libexec/openshell/openshell-driver-vm`. Preflight checks host tools but does not resolve or launch the driver binary.
 - The runtime rootfs exists and matches the expected architecture.
 - `mke2fs` or `mkfs.ext4`, `debugfs`, and `e2fsck` from e2fsprogs are installed. Run `openshell-gateway config preflight` with the intended local VM configuration, service account, and environment to check the selected paths and versions before startup. A remote endpoint reports that host checks were not performed. Explicit `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
 - A persisted overlay identity error is resolved from its owner marker, overlay

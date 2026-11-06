@@ -32,6 +32,36 @@ interface.
 this, the gateway auto-detects in order: Kubernetes, Podman, Docker. Pinning
 prevents unexpected driver selection if Docker is also installed on the host.
 
+### MicroVM driver
+
+On a Fedora or RHEL host with KVM, install the optional VM driver RPM:
+
+```shell
+sudo dnf install openshell-driver-vm
+```
+
+The package installs `/usr/libexec/openshell/openshell-driver-vm`, which the
+gateway searches without a `driver_dir` override. It requires the matching
+`openshell-gateway` build and `e2fsprogs` 1.43 or newer. In your existing
+`~/.config/openshell/gateway.toml`, change the gateway selector to:
+
+```toml
+[openshell.gateway]
+compute_driver = "vm"
+```
+
+Keep the other settings in that file. Check the selected VM host tools, then
+restart the service:
+
+```shell
+openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
+systemctl --user restart openshell-gateway
+```
+
+The RPM default remains Podman until you select `vm`. See the [VM driver
+configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#microvm)
+for VM-specific settings.
+
 ### Customizing the configuration
 
 Edit `~/.config/openshell/gateway.toml` directly. The package-owned template at
@@ -319,6 +349,7 @@ For air-gapped environments:
 | Purpose | Path |
 |---------|------|
 | Gateway binary | `/usr/bin/openshell-gateway` |
+| Optional VM driver binary | `/usr/libexec/openshell/openshell-driver-vm` |
 | CLI binary | `/usr/bin/openshell` |
 | Systemd user unit | `/usr/lib/systemd/user/openshell-gateway.service` |
 | Default TOML config template (read-only) | `/usr/share/openshell-gateway/gateway.toml.default` |

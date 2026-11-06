@@ -1692,7 +1692,15 @@ runtime-selected profile.
 
 Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. Use this driver when you want stronger isolation than container namespaces alone.
 
-The example uses explicit launch-signing paths. Point them at an existing signing bundle, or omit the `gateway_jwt` table to use local discovery. Listener and guest TLS certificates do not supply these signing credentials.
+On Fedora or RHEL with KVM, install the optional RPM before selecting the driver. It places the binary where the gateway already searches and requires the matching gateway build and `e2fsprogs`:
+
+```shell
+sudo dnf install openshell-driver-vm
+```
+
+In the RPM user service's existing `~/.config/openshell/gateway.toml`, change `compute_driver = "podman"` to `compute_driver = "vm"` and keep the other settings. No `driver_dir` override is needed. Run `openshell-gateway config preflight --path ~/.config/openshell/gateway.toml` before restarting the service.
+
+The following example shows a custom deployment with explicit paths, including launch-signing paths. Point them at an existing signing bundle, or omit the `gateway_jwt` table to use local discovery. Listener and guest TLS certificates do not supply these signing credentials.
 
 ```toml
 [openshell]
@@ -1715,8 +1723,8 @@ gateway_id       = "openshell"
 
 [openshell.drivers.vm]
 state_dir        = "/var/lib/openshell/vm"
-# Where the gateway looks for the openshell-driver-vm subprocess binary.
-driver_dir       = "/usr/local/libexec/openshell"
+# Optional override; omit for the RPM's /usr/libexec/openshell path.
+# driver_dir     = "/usr/local/libexec/openshell"
 default_image    = "nvcr.io/nvidia/base/ubuntu:24.04"
 # Optional override. When omitted, the gateway derives
 # https://host.openshell.internal:<gateway-port> for the VM driver.
@@ -1865,7 +1873,7 @@ systemctl --user restart openshell-gateway
 
 ### Check local VM host tools
 
-For an explicitly selected local `vm` driver, preflight also checks a formatter (`mke2fs` or `mkfs.ext4`), `debugfs`, and `e2fsck`. Install e2fsprogs 1.43 or newer with your operating system's package manager. OpenShell does not install or manage these host dependencies.
+For an explicitly selected local `vm` driver, preflight also checks a formatter (`mke2fs` or `mkfs.ext4`), `debugfs`, and `e2fsck`. The RPM driver package requires e2fsprogs 1.43 or newer. For other installs, install these host tools with your operating system's package manager.
 
 For example, on macOS:
 

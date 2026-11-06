@@ -157,7 +157,7 @@ openshell sandbox provider attach <sandbox> openai
 ## Next steps
 
 - See CONFIGURATION.md for TLS settings, environment variables, and
-  file locations.
+  file locations, including how to install and select the optional MicroVM driver.
 - See TROUBLESHOOTING.md for CLI compatibility notes, remote access,
   and common issues.
 - Run `man openshell` for the CLI reference.
