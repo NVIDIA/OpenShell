@@ -1299,6 +1299,39 @@ async fn postgres_data_pool_fails_unavailable_while_postgres_does_not_answer() {
     schema.drop_schema().await;
 }
 
+/// Migrating against a read-only server, as a standby before promotion,
+/// fails as retryable rather than as a fatal migration error.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_migrate_on_a_read_only_server_fails_unavailable() {
+    let schema = TestSchema::create("read_only").await;
+    let mut url = url::Url::parse(schema.url()).expect("parse the PostgreSQL URL");
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| {
+            let value = if key == "options" {
+                format!("{value} -cdefault_transaction_read_only=on")
+            } else {
+                value.into_owned()
+            };
+            (key.into_owned(), value)
+        })
+        .collect();
+    url.query_pairs_mut().clear().extend_pairs(pairs);
+    let store = PostgresStore::connect(url.as_str(), None, None)
+        .await
+        .expect("connect to the read-only server");
+
+    let result = store.migrate().await;
+    assert!(
+        matches!(result, Err(PersistenceError::Unavailable(_))),
+        "{result:?}"
+    );
+
+    drop(store);
+    schema.drop_schema().await;
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
 async fn postgres_mutation_lock_unrelated_sandboxes_outpace_global_serialization() {

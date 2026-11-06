@@ -69,8 +69,9 @@ pub enum PersistenceError {
     /// request's guarded writes did not run; the operation is safe to retry.
     #[error("mutation lock timeout: {0}")]
     LockTimeout(String),
-    /// No database connection was available before the pool's acquire
-    /// timeout, so the failed statement was never sent.
+    /// The database is not serving. At request time, no connection was
+    /// available before the pool's acquire timeout, so the failed statement
+    /// was never sent.
     #[error("database unavailable: {0}")]
     Unavailable(String),
 }
