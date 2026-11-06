@@ -21,6 +21,7 @@ use http_response::{
 };
 
 use crate::l7::EndpointObserver;
+use crate::l7::correlation::RequestCorrelation;
 use crate::l7::http::{parse_chunk_size_line, validate_chunk_trailer_line};
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
@@ -157,6 +158,7 @@ pub(crate) struct DenyResponseContext<'a> {
     pub(crate) port: Option<u16>,
     pub(crate) binary: Option<&'a str>,
     pub(crate) agent_proposals_enabled: bool,
+    pub(crate) request_id: Option<&'a str>,
 }
 
 impl<'a> DenyResponseContext<'a> {
@@ -167,7 +169,14 @@ impl<'a> DenyResponseContext<'a> {
             port: Some(ctx.port),
             binary: Some(&ctx.binary_path),
             agent_proposals_enabled: ctx.agent_proposals.enabled(),
+            request_id: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_request_id(mut self, request_id: &'a str) -> Self {
+        self.request_id = Some(request_id);
+        self
     }
 }
 
@@ -301,6 +310,8 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
         )?;
     }
 
+    buf = strip_platform_request_id_from_head(&buf);
+
     Ok(Some(L7Request {
         action: method,
         target: canonical.path,
@@ -331,6 +342,8 @@ pub(crate) fn request_from_buffered_http(
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
     let body_length = parse_body_length(header_str)?;
     let (_, query_params) = parse_target_query(query_target)?;
+
+    let raw_header = strip_platform_request_id_from_head(&raw_header);
 
     Ok(L7Request {
         action: action.into(),
@@ -812,12 +825,33 @@ pub(crate) struct CredentialGenerationGuard<'a> {
 #[derive(Debug)]
 pub(crate) struct CredentialUnavailableError {
     reason: &'static str,
+    kind: CredentialUnavailableKind,
 }
 
 impl CredentialUnavailableError {
     fn new(reason: &'static str) -> Self {
-        Self { reason }
+        Self {
+            reason,
+            kind: CredentialUnavailableKind::MaterialUnavailable,
+        }
     }
+
+    fn generation_changed(reason: &'static str) -> Self {
+        Self {
+            reason,
+            kind: CredentialUnavailableKind::GenerationChanged,
+        }
+    }
+
+    pub(crate) fn generation_is_stale(&self) -> bool {
+        self.kind == CredentialUnavailableKind::GenerationChanged
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialUnavailableKind {
+    MaterialUnavailable,
+    GenerationChanged,
 }
 
 impl fmt::Display for CredentialUnavailableError {
@@ -859,9 +893,11 @@ impl<'a> CredentialGenerationGuard<'a> {
         {
             Ok(())
         } else {
-            Err(miette::Report::new(CredentialUnavailableError::new(
-                "provider credential generation changed before upstream write",
-            )))
+            Err(miette::Report::new(
+                CredentialUnavailableError::generation_changed(
+                    "provider credential generation changed before upstream write",
+                ),
+            ))
         }
     }
 }
@@ -896,6 +932,31 @@ pub(crate) async fn relay_http_request_with_response_middleware_guarded_observed
     options: RelayRequestOptions<'_>,
     response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
     observer: Option<&EndpointObserver>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    relay_http_request_with_response_middleware_guarded_observed_correlated(
+        req,
+        client,
+        upstream,
+        options,
+        response_middleware,
+        observer,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn relay_http_request_with_response_middleware_guarded_observed_correlated<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: RelayRequestOptions<'_>,
+    response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
+    observer: Option<&EndpointObserver>,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -961,13 +1022,14 @@ where
             raw_header,
             body_length: req.body_length,
         };
-        if !crate::l7::relay::enforce_final_mcp_protocol_version(
+        if !crate::l7::relay::enforce_final_mcp_protocol_version_correlated(
             validation.config,
             &outgoing,
             client,
             validation.ctx,
             validation.redacted_target,
             observer,
+            correlation,
         )
         .await?
         {
@@ -1269,6 +1331,7 @@ where
             websocket: websocket_response,
             client_requested_upgrade,
             observer,
+            correlation,
         },
         response_middleware,
     )
@@ -1471,10 +1534,16 @@ where
                 if contains_reserved_credential_marker_bytes(&trailer) {
                     return Err(BodyCredentialError::Trailer.into());
                 }
-                write_body_bytes(upstream, &trailer, options).await?;
-                write_body_bytes(upstream, b"\r\n", options).await?;
                 if trailer.is_empty() {
+                    write_body_bytes(upstream, b"\r\n", options).await?;
                     return Ok(());
+                }
+                if !http_field_line_has_name(
+                    &trailer,
+                    openshell_core::token_grant_failure::REQUEST_ID_HEADER,
+                ) {
+                    write_body_bytes(upstream, &trailer, options).await?;
+                    write_body_bytes(upstream, b"\r\n", options).await?;
                 }
             }
         }
@@ -2291,6 +2360,89 @@ fn strip_header(headers: &[u8], strip_name: &str) -> Result<Vec<u8>> {
     Ok(out.into_bytes())
 }
 
+fn strip_platform_request_id_from_head(headers: &[u8]) -> Vec<u8> {
+    let header_end = headers
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(headers.len(), |position| position + 4);
+    let (header_block, buffered_suffix) = headers.split_at(header_end);
+    let protected = openshell_core::token_grant_failure::REQUEST_ID_HEADER.as_bytes();
+    let mut out = Vec::with_capacity(headers.len());
+    let mut position = 0usize;
+
+    while position < header_block.len() {
+        let line_end = header_block[position..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map_or(header_block.len(), |end| position + end);
+        let line = &header_block[position..line_end];
+        if line.is_empty() {
+            out.extend_from_slice(b"\r\n");
+            break;
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+            position = line_end.saturating_add(2);
+            continue;
+        };
+        let name = trim_ascii_ows(&line[..colon]);
+        if name.eq_ignore_ascii_case(protected) {
+            position = line_end.saturating_add(2);
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"trailer") {
+            let values: Vec<_> = line[colon + 1..]
+                .split(|byte| *byte == b',')
+                .filter(|value| !trim_ascii_ows(value).eq_ignore_ascii_case(protected))
+                .collect();
+            if values.len() != line[colon + 1..].split(|byte| *byte == b',').count() {
+                if values.iter().all(|value| trim_ascii_ows(value).is_empty()) {
+                    position = line_end.saturating_add(2);
+                    continue;
+                }
+                out.extend_from_slice(&line[..=colon]);
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(value);
+                }
+                out.extend_from_slice(b"\r\n");
+                position = line_end.saturating_add(2);
+                continue;
+            }
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+        position = line_end.saturating_add(2);
+    }
+    out.extend_from_slice(buffered_suffix);
+    out
+}
+
+fn trim_ascii_ows(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn http_field_line_has_name(line: &[u8], expected: &str) -> bool {
+    line.iter()
+        .position(|byte| *byte == b':')
+        .is_some_and(|end| line[..end].eq_ignore_ascii_case(expected.as_bytes()))
+}
+
 pub(crate) fn connection_nominated_header_names(headers: &[u8]) -> Result<HashSet<String>> {
     validate_http_request_header_block(headers)?;
     let header_str =
@@ -2813,7 +2965,15 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
     let body = deny_response_body(req, policy_name, reason, redacted_target, context);
-    send_forbidden_json(policy_name, body, client).await
+    send_json_response_internal(
+        policy_name,
+        body,
+        client,
+        "403 Forbidden",
+        None,
+        context.and_then(|context| context.request_id),
+    )
+    .await
 }
 
 /// Send a middleware-specific 403 response without policy-advisor guidance.
@@ -2829,7 +2989,15 @@ pub(crate) async fn send_middleware_deny_response<C: AsyncWrite + Unpin>(
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
     let body = middleware_deny_response_body(req, policy_name, denial, redacted_target, context);
-    send_forbidden_json(policy_name, body, client).await
+    send_json_response_internal(
+        policy_name,
+        body_with_request_id(body, context.and_then(|context| context.request_id)),
+        client,
+        "403 Forbidden",
+        None,
+        context.and_then(|context| context.request_id),
+    )
+    .await
 }
 
 /// Send a platform-owned response for fail-closed middleware failures.
@@ -2845,7 +3013,15 @@ pub(crate) async fn send_middleware_failure_response<C: AsyncWrite + Unpin>(
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
     let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
-    send_forbidden_json(policy_name, body, client).await
+    send_json_response_internal(
+        policy_name,
+        body_with_request_id(body, context.and_then(|context| context.request_id)),
+        client,
+        "403 Forbidden",
+        None,
+        context.and_then(|context| context.request_id),
+    )
+    .await
 }
 
 /// Send a platform-owned availability response when shared middleware work
@@ -2858,15 +3034,25 @@ pub(crate) async fn send_middleware_unavailable_response<C: AsyncWrite + Unpin>(
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
     let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
-    send_json_response(policy_name, body, client, "503 Service Unavailable").await
+    send_json_response_internal(
+        policy_name,
+        body_with_request_id(body, context.and_then(|context| context.request_id)),
+        client,
+        "503 Service Unavailable",
+        None,
+        context.and_then(|context| context.request_id),
+    )
+    .await
 }
 
-async fn send_forbidden_json<C: AsyncWrite + Unpin>(
-    policy_name: &str,
-    body: serde_json::Value,
-    client: &mut C,
-) -> Result<()> {
-    send_json_response(policy_name, body, client, "403 Forbidden").await
+fn body_with_request_id(
+    mut body: serde_json::Value,
+    request_id: Option<&str>,
+) -> serde_json::Value {
+    if let (Some(request_id), serde_json::Value::Object(fields)) = (request_id, &mut body) {
+        fields.insert("request_id".to_string(), serde_json::json!(request_id));
+    }
+    body
 }
 
 /// Send a platform-owned JSON response with an explicit HTTP status.
@@ -2888,14 +3074,67 @@ pub(crate) async fn send_json_response_with_allow<C: AsyncWrite + Unpin>(
     status: &str,
     allowed_methods: Option<&'static str>,
 ) -> Result<()> {
+    send_json_response_internal(policy_name, body, client, status, allowed_methods, None).await
+}
+
+pub(crate) async fn send_json_response_with_allow_and_request_id<C: AsyncWrite + Unpin>(
+    policy_name: &str,
+    mut body: serde_json::Value,
+    client: &mut C,
+    status: &str,
+    allowed_methods: Option<&'static str>,
+    request_id: &str,
+) -> Result<()> {
+    if let serde_json::Value::Object(fields) = &mut body {
+        fields.insert("request_id".to_string(), serde_json::json!(request_id));
+    }
+    send_json_response_internal(
+        policy_name,
+        body,
+        client,
+        status,
+        allowed_methods,
+        Some(request_id),
+    )
+    .await
+}
+
+pub(crate) async fn send_json_response_with_request_id<C: AsyncWrite + Unpin>(
+    policy_name: &str,
+    mut body: serde_json::Value,
+    client: &mut C,
+    status: &str,
+    request_id: &str,
+) -> Result<()> {
+    if let serde_json::Value::Object(fields) = &mut body {
+        fields.insert("request_id".to_string(), serde_json::json!(request_id));
+    }
+    send_json_response_internal(policy_name, body, client, status, None, Some(request_id)).await
+}
+
+async fn send_json_response_internal<C: AsyncWrite + Unpin>(
+    policy_name: &str,
+    body: serde_json::Value,
+    client: &mut C,
+    status: &str,
+    allowed_methods: Option<&'static str>,
+    request_id: Option<&str>,
+) -> Result<()> {
     let body_bytes = body.to_string();
     let allow = allowed_methods.map_or_else(String::new, |methods| format!("Allow: {methods}\r\n"));
+    let request_id = request_id.map_or_else(String::new, |request_id| {
+        format!(
+            "{}: {request_id}\r\n",
+            openshell_core::token_grant_failure::REQUEST_ID_HEADER
+        )
+    });
     let response = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          X-OpenShell-Policy: {}\r\n\
          {allow}\
+         {request_id}\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -3028,6 +3267,9 @@ fn deny_response_body(
     }
     if let Some(binary) = binary {
         body.insert("binary".to_string(), serde_json::json!(binary));
+    }
+    if let Some(request_id) = context.request_id {
+        body.insert("request_id".to_string(), serde_json::json!(request_id));
     }
     body.insert(
         "rule_missing".to_string(),
@@ -3251,6 +3493,7 @@ where
             let mut trailer_count = 0usize;
             let mut trailer_bytes = 0usize;
             loop {
+                let pending_start = input.pending_len();
                 let trailer_line = input
                     .read_line(
                         reader,
@@ -3275,6 +3518,12 @@ where
                         "relay_chunked complete"
                     );
                     return Ok(());
+                }
+                if http_field_line_has_name(
+                    &trailer_line,
+                    openshell_core::token_grant_failure::REQUEST_ID_HEADER,
+                ) {
+                    input.pending.truncate(pending_start);
                 }
                 if trailer_count == MAX_CHUNK_TRAILER_FIELDS {
                     return Err(miette!(
@@ -4631,6 +4880,7 @@ mod tests {
                 port: Some(443),
                 binary: Some("/usr/bin/gh"),
                 agent_proposals_enabled: true,
+                request_id: None,
             }),
         );
 
@@ -4695,6 +4945,7 @@ mod tests {
                 port: Some(443),
                 binary: Some("/usr/bin/gh"),
                 agent_proposals_enabled: false,
+                request_id: None,
             }),
         );
 
@@ -4798,6 +5049,7 @@ mod tests {
                 port: Some(443),
                 binary: Some("/usr/bin/curl"),
                 agent_proposals_enabled: true,
+                request_id: None,
             }),
         );
 
@@ -4836,6 +5088,7 @@ mod tests {
                     port: Some(443),
                     binary: Some("/usr/bin/gh"),
                     agent_proposals_enabled: true,
+                    request_id: Some("request-123"),
                 }),
             )
             .await
@@ -4850,12 +5103,14 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
         assert!(response.contains("Content-Type: application/json"));
         assert!(response.contains("X-OpenShell-Policy: github-readonly"));
+        assert!(response.contains("x-openshell-request-id: request-123"));
 
         let (_, body) = response.split_once("\r\n\r\n").unwrap();
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["error"], "policy_denied");
         assert_eq!(body["method"], "POST");
         assert_eq!(body["path"], "/user/repos");
+        assert_eq!(body["request_id"], "request-123");
         assert_eq!(body["rule_missing"]["host"], "api.github.com");
         assert_eq!(body["next_steps"][2]["action"], "inspect_recent_denials");
         assert!(body["agent_guidance"].as_str().unwrap().contains("retry"));
@@ -5003,6 +5258,42 @@ mod tests {
         let mut expected = already_read.to_vec();
         expected.extend_from_slice(body_remainder);
         assert_eq!(forwarded, expected);
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_strips_platform_request_id_trailer() {
+        let mut reader =
+            b"3\r\nabc\r\n0\r\nX-OpenShell-Request-ID: forged\r\nX-Checksum: ok\r\n\r\n".as_slice();
+        let mut writer = Vec::new();
+
+        relay_chunked(&mut reader, &mut writer, &[], None)
+            .await
+            .expect("chunked body should relay");
+
+        assert_eq!(writer, b"3\r\nabc\r\n0\r\nX-Checksum: ok\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn guarded_chunked_request_strips_platform_request_id_trailer() {
+        let mut reader =
+            b"3\r\nabc\r\n0\r\nx-openshell-request-id: forged\r\nX-Checksum: ok\r\n\r\n".as_slice();
+        let mut writer = Vec::new();
+
+        relay_chunked_with_marker_guard(
+            &mut reader,
+            &mut writer,
+            &[],
+            RelayRequestOptions::default(),
+        )
+        .await
+        .expect("guarded chunked body should relay");
+
+        assert!(
+            !String::from_utf8_lossy(&writer)
+                .to_ascii_lowercase()
+                .contains("x-openshell-request-id")
+        );
+        assert!(String::from_utf8_lossy(&writer).contains("X-Checksum: ok\r\n"));
     }
 
     #[tokio::test]
@@ -5260,6 +5551,18 @@ mod tests {
         let headers =
             "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: gzip\r\n\r\n";
         assert!(parse_body_length(headers).is_err());
+    }
+
+    #[test]
+    fn platform_request_id_is_stripped_without_touching_body() {
+        let suffix = b"4\r\nbody\r\n0\r\nX-OpenShell-Request-ID: forged-trailer\r\n\r\n";
+        let mut request = b"POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nX-Opaque: \xff\xfe\r\nX-OpenShell-Request-ID: forged-head\r\nTrailer: X-OpenShell-Request-ID, X-Checksum\r\n\r\n".to_vec();
+        request.extend_from_slice(suffix);
+
+        let stripped = strip_platform_request_id_from_head(&request);
+        let mut expected = b"POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nX-Opaque: \xff\xfe\r\nTrailer: X-Checksum\r\n\r\n".to_vec();
+        expected.extend_from_slice(suffix);
+        assert_eq!(stripped, expected);
     }
 
     #[test]
@@ -6510,11 +6813,31 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_observation_rejects_malformed_http_status() {
-        assert_observed_response_result(
-            b"not-http 200 nope\r\nContent-Length: 0\r\n\r\n",
-            EndpointResult::TransportFailed,
+        let (observer, mut receiver) = test_endpoint_observer().await;
+        let mut upstream = &b"not-http 200 nope\r\nContent-Length: 0\r\n\r\n"[..];
+        let mut client = Vec::new();
+
+        let result = relay_response(
+            "POST",
+            &mut upstream,
+            &mut client,
+            RelayResponseOptions {
+                observer: Some(&observer),
+                ..Default::default()
+            },
+            None,
         )
         .await;
+
+        assert!(result.is_err(), "malformed response must fail closed");
+        assert!(client.is_empty());
+        assert!(matches!(
+            receiver.try_recv().expect("transport failure observation"),
+            EndpointStatusCommand::Observe {
+                result: EndpointResult::TransportFailed,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -7605,8 +7928,16 @@ mod tests {
 
     #[tokio::test]
     async fn response_middleware_rejects_malformed_response_fields_before_commit() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nBad Name: value\r\nContent-Length: 0\r\n\r\n",
+            "GET",
+            ResponseRelayScript::WholeBody,
+        )
+        .await;
+        assert!(outcome.is_err());
+        assert!(delivered.is_empty());
+
         for response in [
-            b"HTTP/1.1 200 OK\r\nBad Name: value\r\nContent-Length: 0\r\n\r\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nTrailer: content-length\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nConnection: x-private\r\nTrailer: x-private\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(),
         ] {
@@ -7856,17 +8187,30 @@ mod tests {
     #[tokio::test]
     async fn response_middleware_obs_text_does_not_bypass_unsafe_headers() {
         for response in [
-            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nBad Name: value\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nBad Name: value\r\nContent-Length: 2\r\n\r\nok"
+                .as_slice(),
             b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\x00\r\nContent-Length: 2\r\n\r\nok".as_slice(),
-            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nTrailer: content-length\r\nContent-Length: 2\r\n\r\nok".as_slice(),
         ] {
             let (outcome, delivered) = run_response_middleware_relay_with_error(
-                response, "GET", ResponseRelayScript::HeadersOnly,
+                response,
+                "GET",
+                ResponseRelayScript::HeadersOnly,
                 openshell_supervisor_middleware::OnError::FailOpen,
-            ).await;
-            assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
-            assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+            )
+            .await;
+            assert!(outcome.is_err());
+            assert!(delivered.is_empty());
         }
+
+        let (outcome, delivered) = run_response_middleware_relay_with_error(
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nTrailer: content-length\r\nContent-Length: 2\r\n\r\nok",
+            "GET",
+            ResponseRelayScript::HeadersOnly,
+            openshell_supervisor_middleware::OnError::FailOpen,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
     }
 
     #[tokio::test]

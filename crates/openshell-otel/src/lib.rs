@@ -34,7 +34,8 @@ pub use ocsf::{OcsfOtlp, OcsfOtlpLayer};
 pub use propagation::{
     HeaderMapExtractor, MetadataMapInjector, TRACEPARENT_ENV, TRACESTATE_ENV,
     TraceContextInterceptor, current_trace_context_carrier, current_trace_context_environment,
-    set_parent_from_environment, set_parent_from_trace_context, trace_context_environment,
+    set_parent_from_environment, set_parent_from_headers, set_parent_from_trace_context,
+    trace_context_environment,
 };
 pub use tls::{MAX_TLS_FILE_BYTES, OtlpTls, TlsError, TlsFileError};
 

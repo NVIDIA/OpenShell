@@ -138,6 +138,42 @@ pub fn set_parent_from_trace_context(
     set_parent_from_carrier(span, &carrier);
 }
 
+/// Parent `span` under valid W3C trace context from HTTP headers.
+///
+/// Returns `false` when `traceparent` is absent, duplicated, invalid, or
+/// unsampled. Remote context is correlation data only and does not authenticate
+/// its sender. Unsampled remote context is linked rather than adopted so an
+/// untrusted caller cannot suppress locally exported enforcement telemetry.
+/// `tracestate` is not accepted across this trust boundary.
+#[must_use]
+pub fn set_parent_from_headers(span: &tracing::Span, headers: &HeaderMap) -> bool {
+    use opentelemetry::trace::TraceContextExt as _;
+
+    if headers.get_all("traceparent").iter().count() != 1 {
+        return false;
+    }
+
+    let Some(traceparent) = headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let carrier = BTreeMap::from([("traceparent".to_string(), traceparent.to_string())]);
+    let parent = TraceContextPropagator::new().extract(&TraceContextMapExtractor(&carrier));
+    let parent_span = parent.span();
+    let parent_context = parent_span.span_context();
+    if !parent_context.is_valid() {
+        return false;
+    }
+    if !parent_context.is_sampled() {
+        span.add_link(parent_context.clone());
+        return false;
+    }
+
+    span.set_parent(parent).is_ok()
+}
+
 fn set_parent_from_carrier(span: &tracing::Span, carrier: &BTreeMap<String, String>) {
     use opentelemetry::trace::TraceContextExt as _;
 
@@ -281,6 +317,116 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         let orphan = spans.iter().find(|span| span.name == "orphan").unwrap();
         assert_eq!(orphan.parent_span_id, opentelemetry::trace::SpanId::INVALID);
+    }
+
+    #[test]
+    fn http_headers_parent_a_span_only_with_one_valid_traceparent() {
+        use opentelemetry::trace::TraceContextExt as _;
+
+        let _tracing_lock = crate::test_lock();
+        let (_provider, exporter, subscriber) = env_test_exporter();
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let parent_span_id = "00f067aa0ba902b7";
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                format!("00-{trace_id}-{parent_span_id}-01")
+                    .parse()
+                    .unwrap(),
+            );
+            headers.insert("tracestate", "opaque-vendor=untrusted".parse().unwrap());
+            let child = tracing::info_span!("http-child");
+            assert!(set_parent_from_headers(&child, &headers));
+            let context = child.context();
+            assert_eq!(
+                context.span().span_context().trace_id().to_string(),
+                trace_id
+            );
+            assert_eq!(context.span().span_context().trace_state().header(), "");
+        });
+
+        let child = exporter
+            .get_finished_spans()
+            .unwrap()
+            .into_iter()
+            .find(|span| span.name == "http-child")
+            .unwrap();
+        assert_eq!(child.parent_span_id.to_string(), parent_span_id);
+    }
+
+    #[test]
+    fn duplicate_and_malformed_http_traceparent_are_rejected() {
+        let _tracing_lock = crate::test_lock();
+        let (_provider, _exporter, subscriber) = env_test_exporter();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut duplicate = HeaderMap::new();
+            duplicate.append(
+                "traceparent",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                    .parse()
+                    .unwrap(),
+            );
+            duplicate.append(
+                "traceparent",
+                "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+                    .parse()
+                    .unwrap(),
+            );
+            assert!(!set_parent_from_headers(
+                &tracing::info_span!("duplicate"),
+                &duplicate
+            ));
+
+            let mut malformed = HeaderMap::new();
+            malformed.insert("traceparent", "invalid".parse().unwrap());
+            assert!(!set_parent_from_headers(
+                &tracing::info_span!("malformed"),
+                &malformed
+            ));
+        });
+    }
+
+    #[test]
+    fn unsampled_http_traceparent_cannot_suppress_local_span_export() {
+        use opentelemetry::trace::TraceContextExt as _;
+
+        let _tracing_lock = crate::test_lock();
+        let (_provider, exporter, subscriber) = env_test_exporter();
+        let incoming_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut unsampled = HeaderMap::new();
+            unsampled.insert(
+                "traceparent",
+                format!("00-{incoming_trace_id}-00f067aa0ba902b7-00")
+                    .parse()
+                    .unwrap(),
+            );
+            let child = tracing::info_span!("unsampled-child");
+            assert!(!set_parent_from_headers(&child, &unsampled));
+            let context = child.context();
+            let span = context.span();
+            let span_context = span.span_context();
+            assert!(span_context.is_valid());
+            assert!(span_context.is_sampled());
+            assert_ne!(span_context.trace_id().to_string(), incoming_trace_id);
+        });
+
+        let child = exporter
+            .get_finished_spans()
+            .unwrap()
+            .into_iter()
+            .find(|span| span.name == "unsampled-child")
+            .expect("the locally sampled enforcement span is exported");
+        assert_eq!(child.parent_span_id, opentelemetry::trace::SpanId::INVALID);
+        assert_eq!(child.links.len(), 1);
+        assert_eq!(
+            child.links[0].span_context.trace_id().to_string(),
+            incoming_trace_id
+        );
     }
 
     #[test]
