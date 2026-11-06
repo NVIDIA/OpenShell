@@ -3774,6 +3774,7 @@ mod tests {
             &self,
             request: tonic::Request<tonic::Streaming<MediateFrame>>,
         ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
+            #[allow(deprecated, reason = "try_update requires Rust 1.95; MSRV is 1.94")]
             if self
                 .mediation_failures
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {

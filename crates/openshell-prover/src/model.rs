@@ -274,8 +274,12 @@ impl ReachabilityModel {
     pub fn validate(&self) -> miette::Result<()> {
         match self.solver.check() {
             SatResult::Sat => Ok(()),
-            SatResult::Unsat => miette::bail!("inconsistent reachability model"),
-            SatResult::Unknown => miette::bail!("reachability model validation inconclusive"),
+            SatResult::Unsat => {
+                miette::bail!("inconsistent reachability model");
+            }
+            SatResult::Unknown => {
+                miette::bail!("reachability model validation inconclusive");
+            }
         }
     }
 

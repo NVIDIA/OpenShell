@@ -630,11 +630,13 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
             let compatibility = match ll.compatibility.as_str() {
                 "hard_requirement" => LandlockCompatibilityDef::HardRequirement,
                 "best_effort" | "" => LandlockCompatibilityDef::BestEffort,
-                otherwise => miette::bail!(
-                    "invalid landlock.compatibility {:?}; accepted: {}",
-                    otherwise,
-                    openshell_core::policy::LANDLOCK_COMPATIBILITY_VALUES.join(", ")
-                ),
+                otherwise => {
+                    miette::bail!(
+                        "invalid landlock.compatibility {:?}; accepted: {}",
+                        otherwise,
+                        openshell_core::policy::LANDLOCK_COMPATIBILITY_VALUES.join(", ")
+                    );
+                }
             };
             Some(LandlockDef { compatibility })
         }
