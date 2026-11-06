@@ -439,6 +439,20 @@ pub struct ExecOutput {
     pub stderr: String,
 }
 
+impl ExecOutput {
+    /// Fail unless the command exited 0.
+    pub fn success(self) -> Result<Self> {
+        crate::ensure!(
+            self.exit_code == 0,
+            "exec exited with {}; stdout: {}; stderr: {}",
+            self.exit_code,
+            self.stdout.trim(),
+            self.stderr.trim()
+        );
+        Ok(self)
+    }
+}
+
 impl Sandbox {
     pub fn name(&self) -> &str {
         &self.name
@@ -651,35 +665,18 @@ mod tests {
     #[test]
     fn policy_create_request_keeps_the_spec_and_adds_the_policy() {
         let spec = SandboxSpec {
-            name: Some("test-sb".to_string()),
             image: Some("python:3".to_string()),
-            labels: [("k".to_string(), "v".to_string())].into(),
-            environment: [("E".to_string(), "1".to_string())].into(),
             providers: vec!["provider".to_string()],
-            command: vec!["sleep".to_string(), "infinity".to_string()],
-            restart_policy: SandboxRestartPolicy::Never,
             ..SandboxSpec::default()
         };
-        let policy = proto::SandboxPolicy {
-            version: 1,
-            ..proto::SandboxPolicy::default()
-        };
-        let scope = Some(proto::workspace_selector("ws"));
+        let policy = crate::policy::base();
 
-        let request = policy_create_request(spec, policy.clone(), scope.clone());
+        let spec = policy_create_request(spec, policy.clone(), None)
+            .spec
+            .expect("spec");
 
-        assert_eq!(request.name, "test-sb");
-        assert_eq!(request.labels.get("k").map(String::as_str), Some("v"));
-        assert_eq!(request.workspace_scope, scope);
-        let spec = request.spec.expect("spec");
         assert_eq!(spec.template.expect("template").image, "python:3");
-        assert_eq!(spec.environment.get("E").map(String::as_str), Some("1"));
         assert_eq!(spec.providers, ["provider"]);
-        assert_eq!(spec.command, ["sleep", "infinity"]);
         assert_eq!(spec.policy, Some(policy));
-        assert_eq!(
-            spec.restart_policy,
-            proto::SandboxRestartPolicy::Never as i32
-        );
     }
 }

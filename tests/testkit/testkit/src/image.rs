@@ -17,6 +17,15 @@ const PYTHON_IMAGE_ENV: &str = "OPENSHELL_TEST_PYTHON_IMAGE";
 /// `mise run e2e:workload:build` builds it locally.
 const DEFAULT_PYTHON_IMAGE: &str = "openshell/e2e-python:dev";
 
+/// The paths `python3` runs from in [`python_image`] images, as network
+/// policy binaries: the system Python, the pullable uv image's Python, and the
+/// workload image's uv-installed Python behind its virtualenv.
+pub const PYTHON_BINARIES: &[&str] = &[
+    "/usr/bin/python*",
+    "/usr/local/bin/python*",
+    "/sandbox/.uv/python/*/bin/python*",
+];
+
 /// The image named by [`BASE_IMAGE_ENV`], or [`DEFAULT_BASE_IMAGE`].
 pub fn base_image() -> String {
     image_from_env(BASE_IMAGE_ENV, DEFAULT_BASE_IMAGE)

@@ -32,11 +32,14 @@ mod context;
 mod error;
 pub mod gateway;
 mod image;
+pub mod policy;
 mod poll;
 pub mod program;
+mod provider;
 mod ready;
 mod registry;
 mod run;
+mod yaml_file;
 
 pub use cleanup::CLEANUP_TIMEOUT;
 pub use cli::{CLI_TIMEOUT, Cli, CliOutput};
@@ -46,14 +49,16 @@ pub use context::{
 };
 pub use error::{Error, Result, ResultExt};
 pub use gateway::Gateway;
-pub use image::{base_image, python_image};
+pub use image::{PYTHON_BINARIES, base_image, python_image};
 pub use openshell_sdk as sdk;
 pub use poll::{Poll, poll_until};
 pub use program::main;
+pub use provider::install_provider;
 pub use ready::check as check_ready;
 pub use registry::Test;
 pub use run::{TestInfo, run};
 pub use testkit_macros::test;
+pub use yaml_file::YamlFile;
 
 #[doc(hidden)]
 pub mod __private {
