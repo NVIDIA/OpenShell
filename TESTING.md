@@ -251,7 +251,9 @@ complete, for example because the environment didn't come up. It writes
 `--keep` leaves the VM running until you press Enter. `--program <path>` runs a
 prebuilt testkit program, such as a static `openshell-conformance` for the
 guest's architecture, instead of building the family's tests; it can't be
-combined with `--package` or `--filter`. The runner runs the program's `ready`
+combined with `--package`. With it, `--filter` (repeatable) takes parts of test
+names, as the program does, such as `--filter policy_advisor::`, rather than a
+nextest filterset. The runner runs the program's `ready`
 and `run` commands in the guest and still writes `junit.xml` and `nextest.log`
 (the program's output) to the results directory. Branch E2E builds
 `openshell-conformance` once and passes it to every conformance row this way. Two runs on one host

@@ -42,10 +42,12 @@ struct Cli {
         conflicts_with = "program"
     )]
     packages: Vec<String>,
-    /// A nextest filterset narrowing the tests that run, e.g.
-    /// `test(/^smoke::/)`.
-    #[arg(long, value_name = "FILTERSET", conflicts_with = "program")]
-    filter: Option<String>,
+    /// Narrow the tests that run; repeat to run the tests that match any
+    /// filter. Without `--program` a filter is a nextest filterset, e.g.
+    /// `test(/^smoke::/)`. With it, a filter is a part of a test's name, e.g.
+    /// `smoke::`, as the program takes them.
+    #[arg(long, value_name = "FILTER")]
+    filter: Vec<String>,
     /// Run this prebuilt testkit program, such as `openshell-conformance`,
     /// instead of building the family's tests. It must be a static binary for
     /// the guest's architecture (a `*-unknown-linux-musl` build).
@@ -116,7 +118,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             installer: &cli.installer,
             gateway: &cli.gateway,
             bundle: &bundle,
-            filter: cli.filter.as_deref(),
+            filters: &cli.filter,
             results: &results,
             keep: cli.keep,
         },
