@@ -9,13 +9,13 @@
 use crate::l7::relay::{L7EvalContext, evaluate_l7_request};
 use crate::l7::{EnforcementMode, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::telemetry::egress_emit;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::{SecretResolver, contains_reserved_credential_marker};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId, StatusId,
-    ocsf_emit,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -584,7 +584,7 @@ where
     if let Err(termination) = &result {
         let error = termination.error.to_string();
         if error.contains(CREDENTIAL_PLACEMENT_MISMATCH) {
-            ocsf_emit!(
+            egress_emit!(
                 NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(ActivityId::Fail)
                     .action(ActionId::Denied)
@@ -597,7 +597,7 @@ where
                     .status_detail("credential_placement_mismatch")
                     .build()
             );
-            ocsf_emit!(crate::l7::build_credential_placement_mismatch_finding(
+            egress_emit!(crate::l7::build_credential_placement_mismatch_finding(
                 options.policy_name,
                 host,
                 Some("websocket"),
@@ -641,7 +641,7 @@ async fn write_policy_violation_close<W: AsyncWrite + Unpin>(writer: &mut W) -> 
 }
 
 fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
-    ocsf_emit!(
+    egress_emit!(
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Fail)
             .action(ActionId::Denied)
@@ -656,7 +656,7 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
             .status_detail("credential_endpoint_mismatch")
             .build()
     );
-    ocsf_emit!(crate::l7::build_credential_endpoint_mismatch_finding(
+    egress_emit!(crate::l7::build_credential_endpoint_mismatch_finding(
         policy_name,
         host,
         Some("websocket"),
@@ -1412,7 +1412,7 @@ fn emit_uninspected_credential_denial(host: &str, port: u16, policy_name: &str, 
             "WebSocket credential traffic denied for {host}:{port}"
         ))
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
     crate::l7::emit_uninspected_credential_finding(host, policy_name, surface);
 }
 
@@ -2087,7 +2087,7 @@ fn emit_rewrite_event(host: &str, port: u16, policy_name: &str, replacements: us
         .firewall_rule(policy_name, "l7-websocket")
         .message(rewrite_event_message(host, port, replacements))
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
 }
 
 fn rewrite_event_message(host: &str, port: u16, replacements: usize) -> String {
@@ -2140,7 +2140,7 @@ fn emit_websocket_l7_event(
             request_info.action, request_info.target, summary
         ))
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
 }
 
 fn observe_termination(
@@ -2153,7 +2153,7 @@ fn observe_termination(
         emit_protocol_failure(host, port, policy_name, failure_class);
     }
     if termination.cause == WebSocketTerminationCause::CapacityExhausted {
-        ocsf_emit!(
+        egress_emit!(
             NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Open)
                 .action(ActionId::Denied)
@@ -2177,7 +2177,7 @@ fn emit_protocol_failure(
     policy_name: &str,
     failure_class: FrameFailureClass,
 ) {
-    ocsf_emit!(protocol_failure_event(
+    egress_emit!(protocol_failure_event(
         host,
         port,
         policy_name,
