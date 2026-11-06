@@ -236,10 +236,16 @@ async fn client_body_eof_is_not_an_upstream_failure() {
 
 #[test]
 fn upstream_failure_event_reports_502_without_request_secrets() {
-    for response_started in [false, true] {
+    let request_id = "9b8a7f6e-5d4c-4b3a-9f8e-7d6c5b4a3f2e";
+    for (response_started, request_id) in [
+        (false, Some(request_id)),
+        (true, Some(request_id)),
+        (false, None),
+    ] {
         let event = build_upstream_http_failure_event(
             &context(),
             "POST",
+            request_id,
             (!response_started).then_some(502),
         );
         let json = event.to_json().unwrap();
@@ -247,6 +253,10 @@ fn upstream_failure_event_reports_502_without_request_secrets() {
         assert_eq!(json["status_detail"], "upstream_http_transport_failure");
         assert_eq!(json["http_request"]["http_method"], "POST");
         assert!(json["http_request"].get("url").is_none());
+        assert_eq!(
+            json["unmapped"].get("request_id"),
+            request_id.map(serde_json::Value::from).as_ref()
+        );
         if response_started {
             assert!(json.get("http_response").is_none());
         } else {

@@ -826,6 +826,7 @@ where
 fn build_upstream_http_failure_event(
     ctx: &L7EvalContext,
     method: &str,
+    request_id: Option<&str>,
     response_code: Option<u16>,
 ) -> openshell_ocsf::OcsfEvent {
     let mut event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -838,6 +839,9 @@ fn build_upstream_http_failure_event(
         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
         .message("HTTP upstream connection closed or failed")
         .status_detail("upstream_http_transport_failure");
+    if let Some(request_id) = request_id {
+        event = event.unmapped("request_id", request_id);
+    }
     if let Some(code) = response_code {
         event = event.http_response(openshell_ocsf::HttpResponse { code });
     }
@@ -869,6 +873,7 @@ where
     egress_emit!(build_upstream_http_failure_event(
         ctx,
         method,
+        request_id,
         response_code
     ));
     delivery
