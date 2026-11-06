@@ -75,6 +75,7 @@ struct MockState {
     get_calls: AtomicU32,
     phase_sequence: Vec<proto::SandboxPhase>,
     get_sandbox_id: Option<String>,
+    get_exit_code: Option<i32>,
     get_error: Option<Status>,
     delete_response: Option<proto::DeleteSandboxResponse>,
     get_returns_not_found: bool,
@@ -537,6 +538,9 @@ impl OpenShell for TestOpenShell {
         let mut sandbox = sandbox_with_phase(&name, phase);
         if let Some(id) = &self.state.get_sandbox_id {
             sandbox.metadata.as_mut().unwrap().id.clone_from(id);
+        }
+        if let Some(status) = sandbox.status.as_mut() {
+            status.exit_code = self.state.get_exit_code;
         }
         let mut response = Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
@@ -1592,93 +1596,174 @@ async fn suspend_and_resume_map_requests_and_phases() {
     assert_eq!(selected_workspace(&resume.workspace_scope), Some("default"));
 }
 
-#[tokio::test]
-async fn wait_ready_fails_fast_on_suspended_phase() {
-    let state = Arc::new(MockState {
-        phase_sequence: vec![proto::SandboxPhase::Suspended],
-        ..Default::default()
-    });
-    let endpoint = start_mock(state).await;
-    let client = connect(&endpoint).await;
+/// Run `wait_ready` through both the default-workspace client and a
+/// workspace-scoped client, returning the result and the workspace the
+/// gateway saw on the last lookup.
+async fn wait_ready_both(
+    state: MockState,
+    timeout: Duration,
+) -> Vec<(
+    Result<openshell_sdk::SandboxRef, openshell_sdk::SdkError>,
+    Option<String>,
+    u32,
+)> {
+    let mut out = Vec::new();
+    for workspace in [None, Some("team")] {
+        let state = Arc::new(MockState {
+            phase_sequence: state.phase_sequence.clone(),
+            get_exit_code: state.get_exit_code,
+            ..Default::default()
+        });
+        let endpoint = start_mock(state.clone()).await;
+        let client = connect(&endpoint).await;
+        let result = match workspace {
+            Some(ws) => client.workspace(ws).wait_ready("my-box", timeout).await,
+            None => client.wait_ready("my-box", timeout).await,
+        };
+        let seen = state.last_get_workspace.lock().await.clone();
+        out.push((result, seen, state.get_calls.load(Ordering::SeqCst)));
+    }
+    out
+}
 
-    let err = client
-        .wait_ready("frozen", Duration::from_secs(5))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), "connect");
-    assert!(err.to_string().contains("suspended"), "{err}");
+#[tokio::test]
+async fn wait_ready_targets_the_requested_workspace() {
+    let state = MockState {
+        phase_sequence: vec![proto::SandboxPhase::Ready],
+        ..Default::default()
+    };
+    let results = wait_ready_both(state, Duration::from_secs(5)).await;
+    assert_eq!(results[0].1.as_deref(), Some("default"));
+    assert_eq!(results[1].1.as_deref(), Some("team"));
 }
 
 #[tokio::test]
 async fn wait_ready_transitions_through_phases() {
-    let state = Arc::new(MockState {
+    let state = MockState {
         phase_sequence: vec![
             proto::SandboxPhase::Provisioning,
             proto::SandboxPhase::Provisioning,
             proto::SandboxPhase::Ready,
         ],
         ..Default::default()
-    });
-    let endpoint = start_mock(state.clone()).await;
-    let client = connect(&endpoint).await;
-
-    let sandbox = client
-        .wait_ready("my-box", Duration::from_secs(5))
-        .await
-        .unwrap();
-    assert_eq!(sandbox.phase, SandboxPhase::Ready);
-    assert!(state.get_calls.load(Ordering::SeqCst) >= 3);
+    };
+    for (result, _, calls) in wait_ready_both(state, Duration::from_secs(5)).await {
+        assert_eq!(result.unwrap().phase, SandboxPhase::Ready);
+        assert!(calls >= 3);
+    }
 }
 
 #[tokio::test]
-async fn wait_ready_accepts_successful_completion() {
-    let state = Arc::new(MockState {
+async fn wait_ready_rejects_completion() {
+    let state = MockState {
         phase_sequence: vec![
             proto::SandboxPhase::Provisioning,
             proto::SandboxPhase::Completed,
         ],
         ..Default::default()
-    });
-    let endpoint = start_mock(state).await;
-    let client = connect(&endpoint).await;
-
-    let sandbox = client
-        .wait_ready("short-job", Duration::from_secs(5))
-        .await
-        .unwrap();
-    assert_eq!(sandbox.phase, SandboxPhase::Completed);
+    };
+    for (result, _, calls) in wait_ready_both(state, Duration::from_secs(5)).await {
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), "connect");
+        assert!(
+            err.to_string()
+                .contains("sandbox 'my-box' completed before becoming ready"),
+            "unexpected message: {err}"
+        );
+        assert_eq!(calls, 2, "must fail fast instead of polling to timeout");
+    }
 }
 
 #[tokio::test]
-async fn wait_ready_surfaces_stopped_phase_without_timing_out() {
-    let state = Arc::new(MockState {
+async fn wait_ready_reports_exit_code_when_stopped() {
+    let state = MockState {
+        phase_sequence: vec![proto::SandboxPhase::Stopped],
+        get_exit_code: Some(7),
+        ..Default::default()
+    };
+    for (result, _, calls) in wait_ready_both(state, Duration::from_secs(5)).await {
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), "connect");
+        assert!(
+            err.to_string()
+                .contains("sandbox 'my-box' main process failed with status 7"),
+            "unexpected message: {err}"
+        );
+        assert_eq!(calls, 1, "must fail fast instead of polling to timeout");
+    }
+}
+
+#[tokio::test]
+async fn wait_ready_reports_stopped_without_exit_code() {
+    let state = MockState {
         phase_sequence: vec![proto::SandboxPhase::Stopped],
         ..Default::default()
-    });
-    let endpoint = start_mock(state).await;
-    let client = connect(&endpoint).await;
-
-    let err = client
-        .wait_ready("failed-job", Duration::from_secs(5))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), "connect");
+    };
+    for (result, _, calls) in wait_ready_both(state, Duration::from_secs(5)).await {
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), "connect");
+        assert!(
+            err.to_string()
+                .contains("sandbox 'my-box' stopped before becoming ready"),
+            "unexpected message: {err}"
+        );
+        assert_eq!(calls, 1);
+    }
 }
 
 #[tokio::test]
 async fn wait_ready_surfaces_error_phase() {
-    let state = Arc::new(MockState {
+    let state = MockState {
         phase_sequence: vec![proto::SandboxPhase::Error],
         ..Default::default()
-    });
-    let endpoint = start_mock(state.clone()).await;
-    let client = connect(&endpoint).await;
+    };
+    for (result, _, calls) in wait_ready_both(state, Duration::from_secs(5)).await {
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), "connect");
+        assert!(err.to_string().contains("entered error phase"), "{err}");
+        assert_eq!(calls, 1);
+    }
+}
 
-    let err = client
-        .wait_ready("my-box", Duration::from_secs(5))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), "connect");
+#[tokio::test]
+async fn wait_ready_fails_fast_on_suspended_phases() {
+    for phase in [
+        proto::SandboxPhase::Suspending,
+        proto::SandboxPhase::Suspended,
+    ] {
+        let state = MockState {
+            phase_sequence: vec![phase],
+            ..Default::default()
+        };
+        for (result, _, calls) in wait_ready_both(state, Duration::from_secs(5)).await {
+            let err = result.unwrap_err();
+            assert_eq!(err.code(), "connect");
+            assert!(err.to_string().contains("is suspended"), "{err}");
+            assert_eq!(calls, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn wait_ready_times_out_while_provisioning() {
+    let state = MockState {
+        phase_sequence: vec![proto::SandboxPhase::Provisioning],
+        ..Default::default()
+    };
+    for (result, _, calls) in wait_ready_both(state, Duration::from_millis(50)).await {
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), "connect");
+        let message = err.to_string();
+        assert!(
+            message.contains("timed out waiting for sandbox 'my-box' to become ready"),
+            "{message}"
+        );
+        assert!(
+            message.contains("last observation: phase Provisioning"),
+            "{message}"
+        );
+        assert!(calls >= 1);
+    }
 }
 
 #[tokio::test]
@@ -1778,7 +1863,15 @@ async fn wait_deleted_does_not_complete_while_expected_identity_remains() {
         }
         .unwrap_err();
         assert_eq!(error.code(), "connect");
-        assert!(error.to_string().contains("timed out waiting"));
+        let message = error.to_string();
+        assert!(
+            message.contains("timed out waiting for sandbox 'my-box' to be deleted"),
+            "{message}"
+        );
+        assert!(
+            message.contains("last observation: phase Ready"),
+            "{message}"
+        );
         assert_eq!(state.get_calls.load(Ordering::SeqCst), 1);
     }
 }

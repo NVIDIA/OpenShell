@@ -49,6 +49,43 @@ pub struct OpenShellClient {
     owners: OwnerCache,
 }
 
+/// Outcome of one poll attempt in [`poll_until`].
+enum Poll<T> {
+    /// The wait is satisfied.
+    Ready(T),
+    /// Keep polling; the string describes what the attempt observed.
+    Pending(String),
+}
+
+/// Run `step` until it yields [`Poll::Ready`], backing off from 250ms to 2s
+/// between attempts, or until `timeout` elapses.
+///
+/// `step` returns `Ok(Poll::Pending(observation))` to keep polling and `Err`
+/// to stop with that error unchanged. Only the timeout error is created here;
+/// `waiting_for` names what was being waited on and the timeout error appends
+/// the last observation.
+async fn poll_until<T, F, Fut>(timeout: Duration, waiting_for: String, mut step: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Poll<T>>>,
+{
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_millis(250);
+    loop {
+        let observation = match step().await? {
+            Poll::Ready(value) => return Ok(value),
+            Poll::Pending(observation) => observation,
+        };
+        if Instant::now() >= deadline {
+            return Err(SdkError::connect(format!(
+                "timed out waiting for {waiting_for}; last observation: {observation}"
+            )));
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(2));
+    }
+}
+
 impl OpenShellClient {
     /// Open a connection to the gateway described by `config`.
     ///
@@ -447,29 +484,18 @@ impl OpenShellClient {
     }
 
     /// Poll [`OpenShellClient::get_sandbox`] until the sandbox reaches
-    /// [`SandboxPhase::Ready`] or successful [`SandboxPhase::Completed`], or
-    /// until the `timeout` elapses.
+    /// [`SandboxPhase::Ready`], or until the `timeout` elapses.
     ///
-    /// Returns the terminal sandbox snapshot on success. Returns an
-    /// [`SdkError::Connect`] when the timeout expires, or whatever error
-    /// the gateway returns if the sandbox transitions into
+    /// Returns the sandbox snapshot on success. Returns an
+    /// [`SdkError::Connect`] when the timeout expires, or when the sandbox
+    /// transitions into [`SandboxPhase::Completed`],
     /// [`SandboxPhase::Stopped`], [`SandboxPhase::Error`],
     /// [`SandboxPhase::Suspending`], or [`SandboxPhase::Suspended`].
+    /// A sandbox that completes before becoming ready is an error: callers
+    /// that need to wait for a finished workload should poll
+    /// [`OpenShellClient::get_sandbox`] themselves.
     pub async fn wait_ready(&self, name: &str, timeout: Duration) -> Result<SandboxRef> {
-        self.wait_for(name, timeout, |phase| match phase {
-            SandboxPhase::Ready | SandboxPhase::Completed => Some(Ok(())),
-            SandboxPhase::Stopped => Some(Err(SdkError::connect(format!(
-                "sandbox '{name}' main process failed"
-            )))),
-            SandboxPhase::Error => Some(Err(SdkError::connect(format!(
-                "sandbox '{name}' entered error phase"
-            )))),
-            SandboxPhase::Suspending | SandboxPhase::Suspended => Some(Err(SdkError::connect(
-                format!("sandbox '{name}' is suspended; resume it before waiting for ready"),
-            ))),
-            _ => None,
-        })
-        .await
+        self.wait_ready_in("default", name, timeout).await
     }
 
     /// Poll until the sandbox is gone (gRPC `NotFound`) or the timeout elapses.
@@ -483,25 +509,8 @@ impl OpenShellClient {
         timeout: Duration,
         expected_sandbox_id: Option<&str>,
     ) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        let mut delay = Duration::from_millis(250);
-        loop {
-            match self.get_sandbox(name).await {
-                Err(SdkError::NotFound { .. }) => return Ok(()),
-                Err(other) => return Err(other),
-                Ok(snapshot) if expected_sandbox_id.is_some_and(|id| snapshot.id != id) => {
-                    return Ok(());
-                }
-                Ok(_) => {}
-            }
-            if Instant::now() >= deadline {
-                return Err(SdkError::connect(format!(
-                    "timed out waiting for sandbox '{name}' to delete"
-                )));
-            }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(2));
-        }
+        self.wait_deleted_in("default", name, timeout, expected_sandbox_id)
+            .await
     }
 
     /// Return a workspace-scoped handle for sandbox operations.
@@ -964,26 +973,69 @@ impl OpenShellClient {
         }
     }
 
-    async fn wait_for<F>(&self, name: &str, timeout: Duration, mut decide: F) -> Result<SandboxRef>
-    where
-        F: FnMut(SandboxPhase) -> Option<Result<()>>,
-    {
-        let deadline = Instant::now() + timeout;
-        let mut delay = Duration::from_millis(250);
-        loop {
-            let snapshot = self.get_sandbox(name).await?;
-            if let Some(verdict) = decide(snapshot.phase) {
-                verdict?;
-                return Ok(snapshot);
-            }
-            if Instant::now() >= deadline {
-                return Err(SdkError::connect(format!(
-                    "timed out waiting for sandbox '{name}'"
-                )));
-            }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(2));
-        }
+    async fn wait_ready_in(
+        &self,
+        workspace: &str,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<SandboxRef> {
+        poll_until(
+            timeout,
+            format!("sandbox '{name}' to become ready"),
+            || async {
+                let snapshot = self.get_sandbox_in(workspace, name).await?;
+                match snapshot.phase {
+                    SandboxPhase::Ready => Ok(Poll::Ready(snapshot)),
+                    SandboxPhase::Completed => Err(SdkError::connect(format!(
+                        "sandbox '{name}' completed before becoming ready"
+                    ))),
+                    SandboxPhase::Stopped => {
+                        let detail = snapshot.exit_code.map_or_else(
+                            || "stopped before becoming ready".to_string(),
+                            |code| format!("main process failed with status {code}"),
+                        );
+                        Err(SdkError::connect(format!("sandbox '{name}' {detail}")))
+                    }
+                    SandboxPhase::Error => Err(SdkError::connect(format!(
+                        "sandbox '{name}' entered error phase"
+                    ))),
+                    SandboxPhase::Suspending | SandboxPhase::Suspended => {
+                        Err(SdkError::connect(format!(
+                            "sandbox '{name}' is suspended; resume it before waiting for ready"
+                        )))
+                    }
+                    phase => Ok(Poll::Pending(format!(
+                        "phase {phase:?}, exit code {:?}",
+                        snapshot.exit_code
+                    ))),
+                }
+            },
+        )
+        .await
+    }
+
+    async fn wait_deleted_in(
+        &self,
+        workspace: &str,
+        name: &str,
+        timeout: Duration,
+        expected_sandbox_id: Option<&str>,
+    ) -> Result<()> {
+        poll_until(
+            timeout,
+            format!("sandbox '{name}' to be deleted"),
+            || async {
+                match self.get_sandbox_in(workspace, name).await {
+                    Err(SdkError::NotFound { .. }) => Ok(Poll::Ready(())),
+                    Err(other) => Err(other),
+                    Ok(snapshot) if expected_sandbox_id.is_some_and(|id| snapshot.id != id) => {
+                        Ok(Poll::Ready(()))
+                    }
+                    Ok(snapshot) => Ok(Poll::Pending(format!("phase {:?}", snapshot.phase))),
+                }
+            },
+        )
+        .await
     }
 }
 
@@ -1263,42 +1315,15 @@ impl WorkspaceScopedClient {
         sandbox_from_response(response.sandbox)
     }
 
-    /// Poll until the sandbox reaches [`SandboxPhase::Ready`] or successful
-    /// [`SandboxPhase::Completed`], or the timeout elapses.
+    /// Poll until the sandbox reaches [`SandboxPhase::Ready`], or the timeout
+    /// elapses.
+    ///
+    /// Fails fast, like [`OpenShellClient::wait_ready`], when the sandbox
+    /// completes, stops, errors or is suspended before becoming ready.
     pub async fn wait_ready(&self, name: &str, timeout: Duration) -> Result<SandboxRef> {
-        let deadline = Instant::now() + timeout;
-        let mut delay = Duration::from_millis(250);
-        loop {
-            let snapshot = self.get_sandbox(name).await?;
-            match snapshot.phase {
-                SandboxPhase::Ready | SandboxPhase::Completed => return Ok(snapshot),
-                SandboxPhase::Stopped => {
-                    let detail = snapshot.exit_code.map_or_else(
-                        || "stopped before becoming ready".to_string(),
-                        |code| format!("main process failed with status {code}"),
-                    );
-                    return Err(SdkError::connect(format!("sandbox '{name}' {detail}")));
-                }
-                SandboxPhase::Error => {
-                    return Err(SdkError::connect(format!(
-                        "sandbox '{name}' entered error phase"
-                    )));
-                }
-                SandboxPhase::Suspending | SandboxPhase::Suspended => {
-                    return Err(SdkError::connect(format!(
-                        "sandbox '{name}' is suspended; resume it before waiting for ready"
-                    )));
-                }
-                _ => {}
-            }
-            if Instant::now() >= deadline {
-                return Err(SdkError::connect(format!(
-                    "timed out waiting for sandbox '{name}'"
-                )));
-            }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(2));
-        }
+        self.client
+            .wait_ready_in(&self.workspace, name, timeout)
+            .await
     }
 
     /// Poll until the sandbox is gone (`NotFound`) or the timeout elapses.
@@ -1312,25 +1337,9 @@ impl WorkspaceScopedClient {
         timeout: Duration,
         expected_sandbox_id: Option<&str>,
     ) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        let mut delay = Duration::from_millis(250);
-        loop {
-            match self.get_sandbox(name).await {
-                Err(SdkError::NotFound { .. }) => return Ok(()),
-                Err(other) => return Err(other),
-                Ok(snapshot) if expected_sandbox_id.is_some_and(|id| snapshot.id != id) => {
-                    return Ok(());
-                }
-                Ok(_) => {}
-            }
-            if Instant::now() >= deadline {
-                return Err(SdkError::connect(format!(
-                    "timed out waiting for sandbox '{name}' to delete"
-                )));
-            }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(2));
-        }
+        self.client
+            .wait_deleted_in(&self.workspace, name, timeout, expected_sandbox_id)
+            .await
     }
 
     /// Run a command inside a sandbox and buffer stdout/stderr.
