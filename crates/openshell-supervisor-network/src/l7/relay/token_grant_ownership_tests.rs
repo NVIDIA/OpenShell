@@ -1840,6 +1840,11 @@ async fn duplex_request_deny_after_upstream_start_returns_403_and_aborts_upstrea
         "{}",
         capture.requests[0]
     );
+    assert!(
+        !capture.requests[0].ends_with("0\r\n\r\n"),
+        "the upstream body is not terminated: {:?}",
+        capture.requests[0]
+    );
 }
 
 #[tokio::test]

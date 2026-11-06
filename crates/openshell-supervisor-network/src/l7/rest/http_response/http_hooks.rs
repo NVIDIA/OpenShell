@@ -364,6 +364,7 @@ where
                 &middleware.target,
                 status_code,
                 framing.expect("a committed response has framing"),
+                false,
             );
             Err(error.into_report())
         }
@@ -391,6 +392,7 @@ where
                 &middleware.target,
                 status_code,
                 framing.expect("a committed response has framing"),
+                true,
             );
             Err(miette!(
                 "HTTP response middleware failed after commitment: {}",
@@ -755,6 +757,7 @@ fn http_response_stage_events(
         if invocation.outcome == HttpStageOutcome::Deny {
             events.push(
                 openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
+                    .action(openshell_ocsf::ActionId::Denied)
                     .severity(openshell_ocsf::SeverityId::Medium)
                     .finding_info(openshell_ocsf::FindingInfo::new(
                         "openshell.middleware.http_response_blocked",
@@ -876,15 +879,21 @@ fn push_trailer(
 }
 
 /// The response was committed when the stages failed or rejected it, or its
-/// upstream failed, so delivery was aborted.
+/// upstream failed, so delivery was aborted. `denied` is true when a stage
+/// stopped delivery, matching the legacy delivery failure finding.
 fn emit_http_response_middleware_abort(
     policy_name: &str,
     target: &HttpRequestTarget,
     status_code: u16,
     framing: OutputFraming,
+    denied: bool,
 ) {
     let status_code = status_code.to_string();
-    let event = openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
+    let mut builder = openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx());
+    if denied {
+        builder = builder.action(openshell_ocsf::ActionId::Denied);
+    }
+    let event = builder
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
             "openshell.middleware.http_response_failure",
@@ -900,4 +909,46 @@ fn emit_http_response_middleware_abort(
         .message("HTTP response middleware failed after response commitment; delivery aborted")
         .build();
     crate::telemetry::egress_emit!(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn denied_stage_emits_blocked_finding_with_denied_action() {
+        let target = HttpRequestTarget {
+            scheme: "https".into(),
+            host: "example.test".into(),
+            port: 443,
+            method: "GET".into(),
+            path: "/data".into(),
+            query: String::new(),
+        };
+        let diagnostics = HttpStageDiagnostics {
+            invocations: vec![HttpStageInvocation {
+                config_name: "guard".into(),
+                implementation: "test/guard".into(),
+                outcome: HttpStageOutcome::Deny,
+                input_bytes: 0,
+                output_bytes: None,
+                transformed: false,
+                failed: false,
+                reason_code: Some("blocked".into()),
+                failure_reason: None,
+            }],
+            ..Default::default()
+        };
+
+        let events = http_response_stage_events("policy", &target, 200, &diagnostics);
+        let blocked = events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .find(|event| {
+                event["finding_info"]["uid"] == "openshell.middleware.http_response_blocked"
+            })
+            .expect("a denied stage emits its blocked finding");
+        assert_eq!(blocked["action_id"], openshell_ocsf::ActionId::Denied as u8);
+        assert_eq!(blocked["action"], "Denied");
+    }
 }
