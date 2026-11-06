@@ -37,7 +37,7 @@
   <rect x="40" y="70" width="360" height="420" rx="18" class="soft"/>
   <rect x="75" y="105" width="290" height="110" rx="14" class="trusted"/>
   <text x="220" y="145" text-anchor="middle" class="label">API Server</text>
-  <text x="220" y="171" text-anchor="middle" class="small">signs every JWT</text>
+  <text x="220" y="171" text-anchor="middle" class="small">signs the JWT pair</text>
   <text x="220" y="192" text-anchor="middle" class="small">checks the sandbox record</text>
   <rect x="75" y="360" width="290" height="100" rx="14" class="green"/>
   <text x="220" y="398" text-anchor="middle" class="label">Compute driver</text>
@@ -81,5 +81,5 @@
   <text x="845" y="198" text-anchor="middle" class="tiny">4 · SANDBOX JWT</text>
   <text x="845" y="232" text-anchor="middle" class="tiny">SERVER TLS</text>
 
-  <text x="40" y="530" class="small">Every JWT names one sandbox and one run of it. Restarting a sandbox issues new tokens and TLS certificates.</text>
+  <text x="40" y="530" class="small">Each session JWT names one sandbox and one run of it. Restarting a sandbox issues new tokens and TLS certificates.</text>
 </svg>
