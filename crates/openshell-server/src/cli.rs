@@ -770,6 +770,13 @@ fn prepare_server_config_with_drivers(
     })
 }
 
+const UNAUTHENTICATED_USERS_WARNING: &str = "unauthenticated user access is enabled; only use this for trusted local development or a fully trusted fronting proxy";
+
+fn unauthenticated_users_allowed(file: Option<&ConfigFile>) -> bool {
+    file.and_then(|file| file.openshell.gateway.auth.as_ref())
+        .is_some_and(|auth| auth.allow_unauthenticated_users)
+}
+
 /// Reject an implicit development gateway before starting any listeners or services.
 fn validate_user_auth(config: &openshell_core::Config) -> Result<()> {
     if !config.auth.allow_unauthenticated_users
@@ -915,9 +922,7 @@ async fn run_from_args(
         );
     }
     if prepared.config.auth.allow_unauthenticated_users {
-        warn!(
-            "Unauthenticated user access enabled — only use this for trusted local development or a fully trusted fronting proxy"
-        );
+        warn!("{UNAUTHENTICATED_USERS_WARNING}");
     }
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
@@ -1157,7 +1162,12 @@ fn run_effective_config_preflight(
     })();
 
     match (validation, path.as_ref()) {
-        (Ok(driver), _) => Ok(driver),
+        (Ok(driver), _) => {
+            if unauthenticated_users_allowed(file.as_ref()) {
+                eprintln!("warning: {UNAUTHENTICATED_USERS_WARNING}");
+            }
+            Ok(driver)
+        }
         (Err(_), Some(path)) => Err(miette::miette!(
             "{}",
             config_file::ConfigPreflightError::invalid_current(path)
@@ -1719,6 +1729,20 @@ mod tests {
                 "authentication combination {mechanisms}"
             );
         }
+    }
+
+    #[test]
+    fn preflight_detects_unauthenticated_users_opt_in() {
+        let parse =
+            |auth: &str| config_file_from_toml(&format!("[openshell]\nversion = 2\n{auth}"));
+        assert!(!super::unauthenticated_users_allowed(None));
+        assert!(!super::unauthenticated_users_allowed(Some(&parse(""))));
+        assert!(!super::unauthenticated_users_allowed(Some(&parse(
+            "[openshell.gateway.auth]\nallow_unauthenticated_users = false\n"
+        ))));
+        assert!(super::unauthenticated_users_allowed(Some(&parse(
+            "[openshell.gateway.auth]\nallow_unauthenticated_users = true\n"
+        ))));
     }
 
     #[test]
