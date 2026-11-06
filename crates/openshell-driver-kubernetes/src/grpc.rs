@@ -337,6 +337,72 @@ impl ComputeDriver for ComputeDriverService {
     }
 }
 
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for ComputeDriverService {
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::RESOLVE_SUPERVISOR_APP_ENDPOINT,
+                async {
+                    let request = request.into_inner();
+                    if request.sandbox_id.is_empty() {
+                        return Err(Status::invalid_argument("sandbox_id is required"));
+                    }
+                    let endpoint = self
+                        .driver
+                        .supervisor_app_endpoint(&request.sandbox_id)
+                        .await
+                        .map_err(|e| Status::unavailable(e.to_string()))?;
+                    Ok(Response::new(
+                        openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse {
+                            sandbox_id: request.sandbox_id,
+                            supervisor_app_endpoint: endpoint,
+                        },
+                    ))
+                },
+            )
+            .await
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for ComputeDriverService {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::UPDATE_SANDBOX_CONFIGURATION, async {
+                self.driver
+                    .update_sandbox_configuration(&request.into_inner())
+                    .await
+                    .map_err(|error| {
+                        Status::from(openshell_core::ComputeDriverError::from(error))
+                    })?;
+                Ok(Response::new(
+                    openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse {},
+                ))
+            })
+            .await
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates for ComputeDriverService {
+    async fn update_sandbox_configuration(&self, request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>, Status> {
+        openshell_core::compute::ComputeDriver::update_sandbox_configuration(self, request).await
+    }
+}
+
 fn workspace_delete_requires_namespace_access(mode: WorkspaceMode) -> bool {
     matches!(mode, WorkspaceMode::Managed)
 }

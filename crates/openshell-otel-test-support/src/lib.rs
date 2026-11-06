@@ -3,6 +3,12 @@
 
 //! Shared OTLP collector fixture for `OpenShell` tracing tests.
 
+mod http;
+mod tls;
+
+pub use http::{HttpExport, OtlpHttpTestServer};
+pub use tls::{PemIdentity, ServerTls, TestPki};
+
 /// Helpers for tests that exercise the supervisor's agent trace relay from
 /// the agent side: the attribution keys the relay sets and a builder for the
 /// protobuf export request an SDK would send.
@@ -104,6 +110,7 @@ pub async fn assert_compute_driver_tracing(
     let collector = OtlpTestServer::start().await;
     let (provider, error) = descriptor.provider_for(
         Some(collector.endpoint()),
+        &openshell_otel::CollectorTransport::default(),
         service_version,
         Some("test-gateway"),
         Some(descriptor.compute_driver()),
@@ -137,6 +144,8 @@ pub struct ReceivedTraces {
     pub spans: Vec<Span>,
     /// String bodies of exported log records.
     pub log_bodies: Vec<String>,
+    /// `authorization` metadata of each trace export request.
+    pub trace_authorizations: Vec<String>,
     /// `authorization` metadata of each log export request.
     pub log_authorizations: Vec<String>,
     pub service_names: Vec<String>,
@@ -211,6 +220,15 @@ impl TraceService for Collector {
             {
                 received.encodings.push(encoding.to_string());
             }
+            if let Some(authorization) = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+            {
+                received
+                    .trace_authorizations
+                    .push(authorization.to_string());
+            }
             for resource_span in request.into_inner().resource_spans {
                 let attributes = received.record_resource(resource_span.resource);
                 for scope_span in resource_span.scope_spans {
@@ -280,7 +298,18 @@ impl OtlpTestServer {
 
     /// Serve over TLS at `https://localhost:<port>` using `identity`.
     pub async fn start_tls(identity: tonic::transport::Identity) -> Self {
-        Self::try_start_with(LOOPBACK_EPHEMERAL, Some(identity))
+        Self::try_start_with(
+            LOOPBACK_EPHEMERAL,
+            Some(tonic::transport::ServerTlsConfig::new().identity(identity)),
+        )
+        .await
+        .expect("OTLP test collector should bind a loopback listener")
+    }
+
+    /// Serve over TLS at `https://localhost:<port>` with `tls`, which can
+    /// require client certificates.
+    pub async fn start_with_tls(tls: &ServerTls) -> Self {
+        Self::try_start_with(LOOPBACK_EPHEMERAL, Some(tls.tonic_config()))
             .await
             .expect("OTLP test collector should bind a loopback listener")
     }
@@ -301,13 +330,13 @@ impl OtlpTestServer {
 
     async fn try_start_with(
         addr: SocketAddr,
-        identity: Option<tonic::transport::Identity>,
+        tls: Option<tonic::transport::ServerTlsConfig>,
     ) -> std::io::Result<Self> {
         let received = Arc::new(Mutex::new(ReceivedTraces::default()));
         let exported = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
-        let endpoint = if identity.is_some() {
+        let endpoint = if tls.is_some() {
             format!("https://localhost:{}", local_addr.port())
         } else {
             format!("http://{local_addr}")
@@ -317,9 +346,9 @@ impl OtlpTestServer {
             exported: Arc::clone(&exported),
         };
         let mut server = tonic::transport::Server::builder();
-        if let Some(identity) = identity {
+        if let Some(tls) = tls {
             server = server
-                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .tls_config(tls)
                 .expect("OTLP test collector should accept its TLS identity");
         }
         let trace_service = TraceServiceServer::new(collector.clone())

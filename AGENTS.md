@@ -22,8 +22,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | Path | Components | Purpose |
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
-| `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
+| `crates/openshell-credential-issuer/` | Embedded credential issuer | Credential storage, built-in refresh execution/recovery/scheduling, typed secret owners, and existing driver transport |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
 | `crates/openshell-supervisor-control/` | Shared supervisor control | Gateway-owned assignment controller, launch registrations, recovery coordination, and host observations for a supervisor shared by many sandboxes |
@@ -35,6 +35,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
+| `crates/openshell-ocsf-validate/` | OCSF validation | Test-time validation of OCSF events against vendored OCSF JSON Schemas |
 | `crates/openshell-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
 | `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
 | `crates/openshell-crypto/` | Crypto backend | Backend-neutral primitives and TLS, PKI, JWT adapters; AWS-LC implementation |
@@ -152,6 +153,7 @@ ocsf_emit!(event);
 
 - `crate::ocsf_ctx()` returns the process-wide `EventContext`. It is always available (falls back to defaults in tests).
 - `ocsf_emit!()` is non-blocking and cannot panic. It stores the event in a thread-local and emits via `tracing::info!()`.
+- In `openshell-supervisor-network`, emit with `crate::telemetry::egress_emit!` instead, or `crate::telemetry::emit_decision` for the records of one decision, so denied HTTP decisions get a deny span. Clippy rejects `ocsf_emit!` there.
 - The shorthand layer and JSONL layer extract the event from the thread-local. The shorthand format is derived automatically from the builder fields.
 - For security findings, **dual-emit**: one domain event (e.g., `SshActivityBuilder`) AND one `DetectionFindingBuilder` for the same incident.
 - Never log secrets, credentials, or query parameters in OCSF messages. The OCSF JSONL file may be shipped to external systems.
@@ -192,12 +194,8 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 
 ## Go SDK (`sdk/go/`)
 
-- The Go SDK lives in `sdk/go/` with module path `github.com/NVIDIA/OpenShell/sdk/go`.
-- Run `mise run go:ci` for the full SDK CI pipeline (lint, build, test, proto-check, docs-check).
-- Proto bindings are generated with `mise run go:proto:gen` from the `.proto` files in `proto/`.
-- Domain types in `sdk/go/openshell/v1/types/` must not import proto packages.
-- Converters in `sdk/go/openshell/v1/internal/converter/` deep-copy slices and maps at boundaries.
-- Tests use bufconn for in-process gRPC and testify for assertions.
+- The Go SDK moved to [ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go) (module `github.com/ai-openshell/sdk-go`). Open SDK changes there.
+- `sdk/go/` is frozen until it is removed; Branch Checks fails PRs that change it. Proto changes do not need regenerated Go bindings.
 
 ## TypeScript SDK (`sdk/typescript/`)
 
@@ -239,7 +237,7 @@ When behavior, commands, or development workflows change, review the related age
 
 ## Security
 
-- Route first-party security-sensitive cryptographic operations through `openshell-crypto`. If an operation is missing, extend the facade and backend implementation instead of adding a direct cryptographic implementation in an application crate. Preserve protocol compatibility and propagate backend failures without fallback. Protocol/parsing types and documented non-security or dependency-owned exceptions remain permitted; classify exceptions explicitly. Follow [Cryptography and FIPS](crates/openshell-crypto/CRYPTO.md).
+- Route first-party security-sensitive cryptographic operations through `openshell-crypto`. If an operation is missing, extend the facade and backend implementation instead of adding a direct cryptographic implementation in an application crate. Preserve protocol compatibility and propagate backend failures without fallback. Protocol/parsing types and documented exceptions remain permitted; classify exceptions explicitly. Run `mise run rust:deny:policy` when changing crypto dependencies; review `deny.toml` exceptions rather than widening them to pass CI. Follow [Cryptography and FIPS](crates/openshell-crypto/CRYPTO.md).
 - Never commit secrets, API keys, or credentials. If a file looks like it contains secrets (`.env`, `credentials.json`, etc.), do not stage it.
 - Do not run destructive operations (force push, hard reset, database drops) without explicit human confirmation.
 - Scope changes to the issue at hand. Do not make unrelated changes in the same branch.

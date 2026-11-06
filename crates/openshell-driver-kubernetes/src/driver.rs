@@ -90,6 +90,9 @@ use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
+#[path = "image_update.rs"]
+mod image_update;
+
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
 
@@ -486,7 +489,7 @@ pub enum KubernetesDriverError {
 }
 
 impl KubernetesDriverError {
-    fn from_kube(err: KubeError) -> Self {
+    pub(crate) fn from_kube(err: KubeError) -> Self {
         match err {
             KubeError::Api(api) if api.code == 409 && api.reason == "AlreadyExists" => {
                 Self::AlreadyExists
@@ -1109,22 +1112,9 @@ impl KubernetesComputeDriver {
     /// trace, OCSF events, and relayed workload traces, identifying the
     /// gateway that launched it.
     fn supervisor_otlp_environment(&self) -> Vec<(&'static str, String)> {
-        let mut environment = Vec::new();
-        if let Some(endpoint) = self.config.supervisor_otlp_endpoint.as_deref() {
-            environment.push((
-                openshell_core::sandbox_env::OTLP_ENDPOINT,
-                endpoint.to_string(),
-            ));
+        let mut environment = self.config.supervisor_otlp.environment();
+        if self.config.supervisor_otlp.traces.is_some() {
             environment.extend(openshell_otel::current_trace_context_environment());
-        }
-        if let Some(export) = &self.config.supervisor_ocsf_export {
-            environment.extend(export.environment());
-        }
-        if let Some(endpoint) = &self.config.supervisor_otlp_agent_endpoint {
-            environment.push((
-                openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT,
-                endpoint.clone(),
-            ));
         }
         if let Some(name) = &self.config.supervisor_gateway_name {
             environment.push((openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
@@ -1283,11 +1273,7 @@ impl KubernetesComputeDriver {
         if let Some(shared) = &shared_supervisor {
             shared.spawn_token_secret_writer(client.clone(), shutdown_rx.clone());
         }
-        if shared_supervisor.is_some()
-            && (config.supervisor_otlp_endpoint.is_some()
-                || config.supervisor_ocsf_export.is_some()
-                || config.supervisor_otlp_agent_endpoint.is_some())
-        {
+        if shared_supervisor.is_some() && !config.supervisor_otlp.is_empty() {
             warn!(
                 "the gateway supervisor topology does not export supervisor OTLP traces or OCSF events or relay workload traces; shared sandbox instances keep console logs and gateway log push"
             );
@@ -1341,7 +1327,10 @@ impl KubernetesComputeDriver {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/kubernetes",
                 openshell_core::VERSION,
-                [],
+                [
+                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
+                        .to_string(),
+                ],
             )),
         })
     }
@@ -2233,6 +2222,201 @@ impl KubernetesComputeDriver {
             ));
         }
         Ok(())
+    }
+
+    /// Resolve only a unique, live driver-owned supervisor. Multi-member pool
+    /// resolution must use the HA assignment/member API rather than guess.
+    pub async fn supervisor_app_endpoint(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<
+        Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>,
+        KubernetesDriverError,
+    > {
+        if !self.config.sandbox_runtime.app_listener.common.enabled {
+            return Ok(None);
+        }
+        let api = self
+            .supported_sandbox_api_for_lookup(self.client.clone())
+            .await
+            .map_err(KubernetesDriverError::Message)?;
+        let objects = api
+            .api
+            .list(&ListParams::default().labels(&self.sandbox_lookup_selector(sandbox_id)))
+            .await
+            .map_err(KubernetesDriverError::from_kube)?
+            .items;
+        let [object]: [DynamicObject; 1] = match objects.try_into() {
+            Ok(objects) => objects,
+            Err(_) => return Ok(None),
+        };
+        let namespace = object.metadata.namespace.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Precondition("sandbox namespace missing".into())
+        })?;
+        let uid = object
+            .metadata
+            .uid
+            .as_deref()
+            .ok_or_else(|| KubernetesDriverError::Precondition("sandbox UID missing".into()))?;
+        let placement = supervisor_placement(&object)?;
+        let mut pool_route = String::new();
+        let mut ownership_epoch = 0;
+        let mut member_address = None;
+        let pods = if let SupervisorPlacement::Shared { route } = &placement {
+            let Some(shared) = &self.shared_supervisor else {
+                return Ok(None);
+            };
+            let controller = shared.supervision().controller();
+            let Some(view) = controller.pool_view() else {
+                return Ok(None);
+            };
+            let Some(owner) = view
+                .owners
+                .get(route)
+                .filter(|_| view.desired.contains(route))
+            else {
+                return Ok(None);
+            };
+            let Some(member) = view.members.iter().find(|member| {
+                member.member_id == owner.member_id
+                    && member.process_id == owner.process_id
+                    && !member.leaving
+            }) else {
+                return Ok(None);
+            };
+            if !matches!(controller.observed(route),
+                openshell_supervisor_control::ObservedInstance::Reported(status)
+                    if status.sandbox_id == sandbox_id && status.ready
+                        && status.phase == openshell_supervisor_control::proto::SandboxInstancePhase::Supervising as i32)
+            {
+                return Ok(None);
+            }
+            let address = member
+                .runtime_address
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| {
+                    KubernetesDriverError::Precondition(
+                        "pool member runtime address is not an IP endpoint".into(),
+                    )
+                })?;
+            let pod =
+                Api::<Pod>::namespaced(self.client.clone(), &shared.config().service_namespace)
+                    .get_opt(&owner.member_id)
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?;
+            let Some(pod) = pod else {
+                return Ok(None);
+            };
+            let service =
+                Api::<Service>::namespaced(self.client.clone(), &shared.config().service_namespace)
+                    .get(&shared.config().service_name)
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?;
+            let Some(selector) = service
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.selector.as_ref())
+                .filter(|selector| !selector.is_empty())
+            else {
+                return Ok(None);
+            };
+            if !selector.iter().all(|(key, value)| {
+                pod.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(key))
+                    == Some(value)
+            }) {
+                return Ok(None);
+            }
+            pool_route = route.clone();
+            ownership_epoch = owner.auth_epoch;
+            member_address = Some(address.ip());
+            vec![pod]
+        } else {
+            let selector =
+                format!("openshell.ai/sandbox-id={sandbox_id},openshell.ai/component=supervisor");
+            Api::<Pod>::namespaced(self.client.clone(), namespace)
+                .list(&ListParams::default().labels(&selector))
+                .await
+                .map_err(KubernetesDriverError::from_kube)?
+                .items
+        };
+        // Includes terminating members in the ambiguity check; never guess a
+        // replacement's ownership during a rollout.
+        let [pod]: [Pod; 1] = match pods.try_into() {
+            Ok(pods) => pods,
+            Err(_) => return Ok(None),
+        };
+        if pod.metadata.deletion_timestamp.is_some() {
+            return Ok(None);
+        }
+        let app_port = i32::from(self.config.sandbox_runtime.app_listener.common.port);
+        if !pod
+            .spec
+            .as_ref()
+            .and_then(|spec| {
+                spec.containers
+                    .iter()
+                    .find(|container| container.name == "supervisor")
+            })
+            .is_some_and(|container| {
+                container.ports.as_ref().is_some_and(|ports| {
+                    ports.iter().any(|port| {
+                        port.name.as_deref() == Some("app") && port.container_port == app_port
+                    })
+                }) && container.env.as_ref().is_some_and(|env| {
+                    env.iter().any(|entry| {
+                        entry.name == "OPENSHELL_APP_LISTENER_ENABLED"
+                            && entry.value.as_deref() == Some("true")
+                    })
+                })
+            })
+        {
+            return Ok(None);
+        }
+        let Some(pod_uid) = pod.metadata.uid.as_deref() else {
+            return Ok(None);
+        };
+        if matches!(placement, SupervisorPlacement::Dedicated)
+            && !pod
+                .metadata
+                .owner_references
+                .as_ref()
+                .is_some_and(|owners| owners.iter().any(|o| o.uid == uid && o.kind == "Sandbox"))
+        {
+            return Ok(None);
+        }
+        let Some(status) = pod.status else {
+            return Ok(None);
+        };
+        if status.phase.as_deref() != Some("Running") {
+            return Ok(None);
+        }
+        let Some(host) = status
+            .pod_ip
+            .filter(|ip| ip.parse::<std::net::IpAddr>().is_ok())
+        else {
+            return Ok(None);
+        };
+        if member_address
+            .is_some_and(|address| host.parse::<std::net::IpAddr>().ok() != Some(address))
+        {
+            return Ok(None);
+        }
+        let component = match placement {
+            SupervisorPlacement::Dedicated => pod_uid.to_string(),
+            SupervisorPlacement::Shared { route } => route,
+        };
+        Ok(Some(
+            openshell_core::proto::compute::v1::SupervisorAppEndpoint {
+                host,
+                port: u32::from(self.config.sandbox_runtime.app_listener.common.port),
+                runtime_identity: kubernetes_runtime_identity(namespace, uid, &component),
+                pool_route,
+                ownership_epoch,
+            },
+        ))
     }
 
     pub async fn get_sandbox(&self, sandbox_id: &str) -> Result<Option<Sandbox>, String> {
@@ -3362,44 +3546,47 @@ impl KubernetesComputeDriver {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         pods.create(
             &PostParams::default(),
-            &supervisor_pod(
-                namespace,
-                names,
-                sandbox_id,
-                sandbox_name,
-                &self.config.gateway_id,
-                &self.config.supervisor_image,
-                self.config.supervisor_image_pull_policy,
-                &self.config.service_account_name,
-                agent_uid,
-                agent_gid,
-                &self.generation_image_pull_secret_names(names),
-                &self.config.grpc_endpoint,
-                self.config.supervisor_client_tls(),
-                main_process_spec,
-                log_level,
-                self.config.effective_sa_token_ttl_secs(),
-                self.config.https_proxy.as_deref(),
-                self.config.no_proxy.as_deref(),
-                self.config
-                    .proxy_auth_secret_name
-                    .as_deref()
-                    .zip(self.config.proxy_auth_secret_key.as_deref()),
-                self.config.proxy_auth_allow_insecure == Some(true),
-                self.config.proxy_connect_by_hostname == Some(true),
-                upstream_proxy_ca_bundle_staged,
-                self.config.provider_spiffe_enabled().then_some(
+            &crate::app_listener::configure_supervisor_pod(
+                supervisor_pod(
+                    namespace,
+                    names,
+                    sandbox_id,
+                    sandbox_name,
+                    &self.config.gateway_id,
+                    &self.config.supervisor_image,
+                    self.config.supervisor_image_pull_policy,
+                    &self.config.service_account_name,
+                    agent_uid,
+                    agent_gid,
+                    &self.generation_image_pull_secret_names(names),
+                    &self.config.grpc_endpoint,
+                    self.config.supervisor_client_tls(),
+                    main_process_spec,
+                    log_level,
+                    self.config.effective_sa_token_ttl_secs(),
+                    self.config.https_proxy.as_deref(),
+                    self.config.no_proxy.as_deref(),
                     self.config
-                        .provider_spiffe_workload_api_socket_path
-                        .as_str(),
-                ),
-                network_additional_ca
-                    .as_ref()
-                    .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
-                owner,
-                &self.supervisor_otlp_environment(),
-            )
-            .map_err(KubernetesDriverError::Message)?,
+                        .proxy_auth_secret_name
+                        .as_deref()
+                        .zip(self.config.proxy_auth_secret_key.as_deref()),
+                    self.config.proxy_auth_allow_insecure == Some(true),
+                    self.config.proxy_connect_by_hostname == Some(true),
+                    upstream_proxy_ca_bundle_staged,
+                    self.config.provider_spiffe_enabled().then_some(
+                        self.config
+                            .provider_spiffe_workload_api_socket_path
+                            .as_str(),
+                    ),
+                    network_additional_ca
+                        .as_ref()
+                        .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
+                    owner,
+                    &self.supervisor_otlp_environment(),
+                )
+                .map_err(KubernetesDriverError::Message)?,
+                &self.config.sandbox_runtime.app_listener,
+            ),
         )
         .await
         .map_err(KubernetesDriverError::from_kube)?
@@ -6931,17 +7118,13 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
     namespace: &str,
     obj: DynamicObject,
 ) -> Result<(String, Sandbox), String> {
-    let bootstrapping = sandbox_runtime_bootstrap_in_progress(&obj);
     let sandbox_id = sandbox_id_from_object(&obj).unwrap_or_default();
     let object_namespace = obj
         .metadata
         .namespace
         .clone()
         .unwrap_or_else(|| namespace.to_string());
-    let (name, mut sandbox) = sandbox_from_object(namespace, obj.clone())?;
-    if bootstrapping {
-        mark_sandbox_runtime_bootstrapping(&mut sandbox);
-    }
+    let (name, mut sandbox) = sandbox_from_object_with_bootstrap_state(namespace, &obj)?;
     if !sandbox_id.is_empty() {
         let dependencies = Box::pin(generation_control_availability(
             client,
@@ -6980,11 +7163,33 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
     Ok((name, sandbox))
 }
 
+fn sandbox_from_object_with_bootstrap_state(
+    namespace: &str,
+    obj: &DynamicObject,
+) -> Result<(String, Sandbox), String> {
+    let (name, mut sandbox) = sandbox_from_object(namespace, obj.clone())?;
+    if sandbox_runtime_bootstrap_in_progress(obj) {
+        if sandbox_runtime_bootstrap_operation(obj) == Some("stop") {
+            mark_sandbox_runtime_stopping(&mut sandbox);
+        } else {
+            mark_sandbox_runtime_bootstrapping(&mut sandbox);
+        }
+    }
+    Ok((name, sandbox))
+}
+
+/// A stop holds the bootstrap annotations until its completion patch, but it
+/// is not a start: the gateway reads `Bootstrapping=True` as an accepted
+/// start that may replace a settled Stopped phase. Withhold the suspension
+/// until the stop completes, as a start does.
+fn mark_sandbox_runtime_stopping(sandbox: &mut Sandbox) {
+    clear_sandbox_runtime_operation_conditions(sandbox);
+    mark_sandbox_runtime_control_unavailable(sandbox);
+}
+
 fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
+    clear_sandbox_runtime_operation_conditions(sandbox);
     if let Some(status) = sandbox.status.as_mut() {
-        status.conditions.retain(|condition| {
-            condition.r#type != SANDBOX_SUSPENDED_CONDITION && condition.r#type != "Bootstrapping"
-        });
         status.conditions.push(SandboxCondition {
             r#type: "Bootstrapping".to_string(),
             status: "True".to_string(),
@@ -6994,6 +7199,14 @@ fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
         });
     }
     mark_sandbox_runtime_control_unavailable(sandbox);
+}
+
+fn clear_sandbox_runtime_operation_conditions(sandbox: &mut Sandbox) {
+    if let Some(status) = sandbox.status.as_mut() {
+        status.conditions.retain(|condition| {
+            condition.r#type != SANDBOX_SUSPENDED_CONDITION && condition.r#type != "Bootstrapping"
+        });
+    }
 }
 
 fn mark_sandbox_runtime_control_unavailable(sandbox: &mut Sandbox) {
@@ -8979,51 +9192,78 @@ mod tests {
     #[tokio::test]
     async fn supervisor_otlp_environment_carries_only_configured_signals() {
         use openshell_core::sandbox_env::{
-            OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
+            OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
+            OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol, SupervisorOtlp,
         };
 
-        let names = |config: KubernetesComputeConfig| {
-            KubernetesComputeDriver::new_for_test(config)
-                .supervisor_otlp_environment()
+        let export = |endpoint: &str, protocol| {
+            Some(OtlpExport {
+                endpoint: endpoint.into(),
+                protocol,
+            })
+        };
+        let environment = |supervisor_otlp| {
+            KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+                supervisor_otlp,
+                ..Default::default()
+            })
+            .supervisor_otlp_environment()
+        };
+        let names = |supervisor_otlp| {
+            environment(supervisor_otlp)
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect::<Vec<_>>()
         };
-        assert!(names(KubernetesComputeConfig::default()).is_empty());
-        assert_eq!(
-            names(KubernetesComputeConfig {
-                supervisor_otlp_endpoint: Some("http://traces:4317".into()),
-                ..Default::default()
-            })
-            .first(),
-            Some(&OTLP_ENDPOINT)
-        );
-
-        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
-            supervisor_ocsf_export: Some(OcsfOtlpExport {
-                endpoint: "http://siem:4317".into(),
-                schema_version: Some("1.1".into()),
-            }),
+        assert!(names(SupervisorOtlp::default()).is_empty());
+        let traces = names(SupervisorOtlp {
+            traces: export("http://traces:4317", OtlpProtocol::Grpc),
             ..Default::default()
         });
+        assert_eq!(traces.first(), Some(&OTLP_ENDPOINT));
+        assert!(!traces.contains(&OTLP_PROTOCOL));
         assert_eq!(
-            driver.supervisor_otlp_environment(),
+            names(SupervisorOtlp {
+                traces: export("http://traces:4318", OtlpProtocol::HttpProtobuf),
+                ..Default::default()
+            })[..2],
+            [OTLP_ENDPOINT, OTLP_PROTOCOL]
+        );
+
+        assert_eq!(
+            environment(SupervisorOtlp {
+                ocsf: export("http://siem:4317", OtlpProtocol::Grpc),
+                ..Default::default()
+            }),
+            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),]
+        );
+        assert_eq!(
+            environment(SupervisorOtlp {
+                ocsf: export("http://siem:4318", OtlpProtocol::HttpProtobuf),
+                ..Default::default()
+            }),
             [
-                (OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),
-                (OTLP_OCSF_SCHEMA_VERSION, "1.1".to_string()),
+                (OTLP_OCSF_ENDPOINT, "http://siem:4318".to_string()),
+                (OTLP_OCSF_PROTOCOL, "http/protobuf".to_string()),
             ]
         );
 
-        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
-            supervisor_otlp_agent_endpoint: Some("http://agents:4317".into()),
-            ..Default::default()
-        });
         assert_eq!(
-            driver.supervisor_otlp_environment(),
-            [(
-                openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT,
-                "http://agents:4317".to_string()
-            )]
+            environment(SupervisorOtlp {
+                agent: export("http://agents:4317", OtlpProtocol::Grpc),
+                ..Default::default()
+            }),
+            [(OTLP_AGENT_ENDPOINT, "http://agents:4317".to_string())]
+        );
+        assert_eq!(
+            environment(SupervisorOtlp {
+                agent: export("http://agents:4318", OtlpProtocol::HttpProtobuf),
+                ..Default::default()
+            }),
+            [
+                (OTLP_AGENT_ENDPOINT, "http://agents:4318".to_string()),
+                (OTLP_AGENT_PROTOCOL, "http/protobuf".to_string()),
+            ]
         );
 
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
@@ -14430,6 +14670,104 @@ mod tests {
                 && condition.status == "True"
                 && condition.reason == "SandboxRuntimeGenerationStarting"
         }));
+    }
+
+    fn sandbox_cr_mid_operation(operation: Option<&str>) -> DynamicObject {
+        let mut annotations = BTreeMap::from([
+            (
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.to_string(),
+                "true".to_string(),
+            ),
+            (
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
+                SandboxRuntimeBootstrapPhase::Suspending
+                    .as_str()
+                    .to_string(),
+            ),
+        ]);
+        if let Some(operation) = operation {
+            annotations.insert(
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
+                operation.to_string(),
+            );
+        }
+        DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("alpha--work".to_string()),
+                namespace: Some("default".to_string()),
+                annotations: Some(annotations),
+                labels: Some(BTreeMap::from([
+                    (LABEL_SANDBOX_ID.to_string(), "uuid-123".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "work".to_string()),
+                    (LABEL_SANDBOX_WORKSPACE.to_string(), "alpha".to_string()),
+                    (
+                        LABEL_MANAGED_BY.to_string(),
+                        LABEL_MANAGED_BY_VALUE.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            },
+            data: serde_json::json!({
+                "status": {
+                    "conditions": [
+                        {"type": "Ready", "status": "False", "reason": "SandboxSuspended"},
+                        {"type": "Suspended", "status": "True", "reason": "PodTerminated"},
+                    ]
+                }
+            }),
+        }
+    }
+
+    fn has_condition(sandbox: &Sandbox, r#type: &str, status: &str) -> bool {
+        sandbox.status.as_ref().is_some_and(|sandbox_status| {
+            sandbox_status
+                .conditions
+                .iter()
+                .any(|condition| condition.r#type == r#type && condition.status == status)
+        })
+    }
+
+    // The gateway treats Bootstrapping=True as an accepted start and lets it
+    // replace a settled Stopped phase. A snapshot taken while a stop still
+    // holds its bootstrap annotations can arrive after that stop settled
+    // (#5195), so it must not claim a starting generation.
+    #[test]
+    fn stop_snapshot_does_not_report_a_starting_generation() {
+        let (_, sandbox) = sandbox_from_object_with_bootstrap_state(
+            "default",
+            &sandbox_cr_mid_operation(Some("stop")),
+        )
+        .unwrap();
+
+        assert!(!has_condition(&sandbox, "Bootstrapping", "True"));
+        // Suspension is still published only once the stop completes.
+        assert!(!has_condition(
+            &sandbox,
+            SANDBOX_SUSPENDED_CONDITION,
+            "True"
+        ));
+        assert!(!has_condition(&sandbox, "Ready", "True"));
+    }
+
+    #[test]
+    fn start_snapshots_report_a_starting_generation() {
+        for operation in [Some("create"), Some("restart"), None] {
+            let (_, sandbox) = sandbox_from_object_with_bootstrap_state(
+                "default",
+                &sandbox_cr_mid_operation(operation),
+            )
+            .unwrap();
+
+            assert!(
+                has_condition(&sandbox, "Bootstrapping", "True"),
+                "{operation:?}"
+            );
+            assert!(
+                !has_condition(&sandbox, SANDBOX_SUSPENDED_CONDITION, "True"),
+                "{operation:?}"
+            );
+        }
     }
 
     #[test]

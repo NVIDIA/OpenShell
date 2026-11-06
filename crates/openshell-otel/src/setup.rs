@@ -1,15 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OTLP/gRPC export setup: resources, providers, and tracing layers.
+//! OTLP export setup: resources, providers, and tracing layers.
 //!
 //! Compiled only with the `export` feature; see the crate-level documentation.
 
+use crate::tls::{OtlpTls, TlsError, TlsFileError};
+use crate::transport::{self, OtlpHttpClient, signal_url};
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 pub use opentelemetry_otlp::LogExporter;
-use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
-use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
+use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracer;
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -18,6 +20,18 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::registry::LookupSpan;
+
+/// Export supervisor spans at INFO by default, or DEBUG and TRACE when enabled.
+/// Dependency spans remain at INFO.
+#[must_use]
+pub fn supervisor_span_filter(log_level: &str) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::filter::LevelFilter;
+    let level = log_level
+        .parse::<LevelFilter>()
+        .unwrap_or(LevelFilter::INFO)
+        .max(LevelFilter::INFO);
+    tracing_subscriber::EnvFilter::new(format!("info,openshell={level}"))
+}
 
 const SDK_UNKNOWN_SERVICE_PREFIX: &str = "unknown_service";
 
@@ -102,13 +116,40 @@ pub enum ServiceName<'a> {
     EnvironmentOr(&'a str),
 }
 
-/// Inputs for OTLP/gRPC export.
+/// OTLP transport to a collector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Protocol {
+    #[default]
+    Grpc,
+    HttpProtobuf,
+}
+
+/// Inputs for OTLP export.
 #[derive(Debug, Clone)]
 pub struct OtlpExportConfig<'a> {
     pub endpoint: &'a str,
     pub service_name: ServiceName<'a>,
     pub service_version: Option<&'a str>,
     pub resource_attributes: Vec<KeyValue>,
+}
+
+/// How exports reach a collector: the transport, request headers, and TLS.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct CollectorTransport {
+    pub protocol: Protocol,
+    pub headers: http::HeaderMap,
+    pub tls: OtlpTls,
+}
+
+impl std::fmt::Debug for CollectorTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CollectorTransport")
+            .field("protocol", &self.protocol)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 /// Failure to set up OTLP export.
@@ -125,6 +166,24 @@ pub enum SetupError {
 
     #[error("failed to build the OTLP exporter: {0}")]
     Exporter(#[from] opentelemetry_otlp::ExporterBuildError),
+
+    #[error("invalid OTLP endpoint {endpoint:?}: {source}")]
+    InvalidSignalUrl {
+        endpoint: String,
+        source: http::Error,
+    },
+
+    #[error("OTLP TLS settings need an https:// endpoint, not {endpoint:?}")]
+    TlsWithoutHttps { endpoint: String },
+
+    #[error("invalid OTLP TLS settings: {0}")]
+    Tls(#[from] TlsError),
+
+    #[error("invalid OTLP TLS files: {0}")]
+    TlsFiles(#[from] TlsFileError),
+
+    #[error("OTLP/HTTP export needs a tokio runtime")]
+    NoRuntime,
 }
 
 fn resource_attributes(config: &OtlpExportConfig<'_>) -> Vec<KeyValue> {
@@ -185,13 +244,30 @@ pub fn validated_endpoint(endpoint: &str) -> Result<(&str, http::Uri), SetupErro
     Ok((endpoint, uri))
 }
 
-/// A validated OTLP/gRPC collector endpoint and the resource that every
-/// signal exported to it describes.
-#[derive(Debug, Clone)]
+/// A validated OTLP collector endpoint and the resource that every signal
+/// exported to it describes.
+#[derive(Clone)]
 pub struct OtlpTarget {
-    endpoint: String,
-    tls: bool,
-    resource: Resource,
+    pub(crate) endpoint: String,
+    pub(crate) tls: bool,
+    pub(crate) protocol: Protocol,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) tls_settings: OtlpTls,
+    pub(crate) resource: Resource,
+}
+
+impl std::fmt::Debug for OtlpTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OtlpTarget")
+            .field("endpoint", &self.endpoint)
+            .field("tls", &self.tls)
+            .field("protocol", &self.protocol)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("tls_settings", &self.tls_settings)
+            .field("resource", &self.resource)
+            .finish()
+    }
 }
 
 impl OtlpTarget {
@@ -201,8 +277,52 @@ impl OtlpTarget {
         Ok(Self {
             endpoint: endpoint.to_string(),
             tls: uri.scheme() == Some(&http::uri::Scheme::HTTPS),
+            protocol: Protocol::Grpc,
+            headers: http::HeaderMap::new(),
+            tls_settings: OtlpTls::default(),
             resource: resource_for(config),
         })
+    }
+
+    /// Export over `protocol` instead of gRPC.
+    #[must_use]
+    pub fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// Send `headers` with every export request. Headers from the process
+    /// environment (`OTEL_EXPORTER_OTLP_*HEADERS`) still apply and replace
+    /// any of the same name.
+    #[must_use]
+    pub fn with_headers(mut self, headers: http::HeaderMap) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Reach the collector the way `transport` describes.
+    #[must_use]
+    pub fn with_transport(self, transport: &CollectorTransport) -> Self {
+        self.with_protocol(transport.protocol)
+            .with_headers(transport.headers.clone())
+            .with_tls(transport.tls.clone())
+    }
+
+    /// Verify an `https://` collector and authenticate to it with `tls`.
+    #[must_use]
+    pub fn with_tls(mut self, tls: OtlpTls) -> Self {
+        self.tls_settings = tls;
+        self
+    }
+
+    /// The URL of `signal_path` under the endpoint, for OTLP/HTTP export.
+    pub(crate) fn http_signal_url(&self, signal_path: &str) -> Result<String, SetupError> {
+        signal_url(&self.endpoint, signal_path)
+            .map(|url| url.to_string())
+            .map_err(|source| SetupError::InvalidSignalUrl {
+                endpoint: self.endpoint.clone(),
+                source,
+            })
     }
 
     /// Point an exporter builder at this target, over TLS for `https://`.
@@ -210,13 +330,43 @@ impl OtlpTarget {
     where
         B: WithExportConfig + WithTonicConfig,
     {
-        let builder = builder.with_endpoint(self.endpoint.clone());
+        let builder = builder
+            .with_endpoint(self.endpoint.clone())
+            .with_metadata(MetadataMap::from_headers(self.headers.clone()));
         if self.tls {
-            // Tonic trusts nothing by default, so enable the platform roots.
-            builder.with_tls_config(ClientTlsConfig::new().with_enabled_roots())
+            builder.with_tls_config(self.tls_settings.grpc_config())
         } else {
             builder
         }
+    }
+
+    /// Point an OTLP/HTTP exporter builder at `signal_path` under this
+    /// target.
+    pub(crate) fn configure_http<B>(
+        &self,
+        builder: B,
+        signal_path: &str,
+        timeout_var: &str,
+    ) -> Result<B, SetupError>
+    where
+        B: WithExportConfig + WithHttpConfig,
+    {
+        // The SDK percent-decodes these values again.
+        let headers = self
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                Some((name.to_string(), value.to_str().ok()?.replace('%', "%25")))
+            })
+            .collect();
+        Ok(builder
+            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+            .with_endpoint(self.http_signal_url(signal_path)?)
+            .with_http_client(OtlpHttpClient::new(
+                self.tls.then_some(&self.tls_settings),
+                transport::export_timeout(timeout_var),
+            )?)
+            .with_headers(headers))
     }
 
     #[must_use]
@@ -229,11 +379,32 @@ impl OtlpTarget {
         &self.resource
     }
 
+    /// Fails when TLS settings are given for a plaintext endpoint.
+    pub(crate) fn check_tls(&self) -> Result<(), SetupError> {
+        if self.tls || self.tls_settings.is_default() {
+            Ok(())
+        } else {
+            Err(SetupError::TlsWithoutHttps {
+                endpoint: self.endpoint.clone(),
+            })
+        }
+    }
+
     /// Build a trace provider that exports spans to this target in batches.
     pub fn tracer_provider(&self) -> Result<SdkTracerProvider, SetupError> {
-        let exporter = self
-            .configure(SpanExporter::builder().with_tonic())
-            .build()?;
+        self.check_tls()?;
+        let exporter = match self.protocol {
+            Protocol::Grpc => self
+                .configure(SpanExporter::builder().with_tonic())
+                .build()?,
+            Protocol::HttpProtobuf => self
+                .configure_http(
+                    SpanExporter::builder().with_http(),
+                    "v1/traces",
+                    "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+                )?
+                .build()?,
+        };
         Ok(SdkTracerProvider::builder()
             .with_batch_exporter(exporter)
             .with_resource(self.resource.clone())
@@ -241,7 +412,7 @@ impl OtlpTarget {
     }
 }
 
-/// Build an OTLP/gRPC trace provider.
+/// Build an OTLP trace provider.
 pub fn build_provider(config: &OtlpExportConfig<'_>) -> Result<SdkTracerProvider, SetupError> {
     OtlpTarget::new(config)?.tracer_provider()
 }
@@ -366,6 +537,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse_otlp_headers;
+
+    #[test]
+    fn supervisor_span_filter_raises_only_openshell_targets() {
+        let directives = |log_level: &str| supervisor_span_filter(log_level).to_string();
+        assert_eq!(directives("warn"), "openshell=info,info");
+        assert_eq!(directives("info"), "openshell=info,info");
+        assert_eq!(directives("debug"), "openshell=debug,info");
+        assert_eq!(directives("info,h2=debug"), "openshell=info,info");
+    }
 
     #[test]
     fn error_status_guard_marks_only_unfinished_results() {
@@ -526,6 +707,80 @@ mod tests {
                 .map(|value| value.to_string()),
             Some("vm-dev".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn tls_settings_need_an_https_endpoint() {
+        let pki = openshell_otel_test_support::TestPki::generate();
+        let tls = OtlpTls::from_pem(Some(pki.ca_pem.as_bytes()), None).unwrap();
+        for protocol in [Protocol::Grpc, Protocol::HttpProtobuf] {
+            let target = |endpoint| {
+                OtlpTarget::new(&OtlpExportConfig {
+                    endpoint,
+                    service_name: ServiceName::Fixed("test-service"),
+                    service_version: None,
+                    resource_attributes: Vec::new(),
+                })
+                .unwrap()
+                .with_protocol(protocol)
+                .with_tls(tls.clone())
+            };
+            assert!(matches!(
+                target("http://collector:4317").tracer_provider(),
+                Err(SetupError::TlsWithoutHttps { .. })
+            ));
+            assert!(matches!(
+                target("http://collector:4317").log_exporter(),
+                Err(SetupError::TlsWithoutHttps { .. })
+            ));
+            assert!(target("https://collector:4317").tracer_provider().is_ok());
+        }
+    }
+
+    #[test]
+    fn debug_output_names_headers_without_their_values() {
+        let target = OtlpTarget::new(&OtlpExportConfig {
+            endpoint: "http://collector:4317",
+            service_name: ServiceName::Fixed("test-service"),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        })
+        .unwrap()
+        .with_headers(parse_otlp_headers("authorization=Bearer%20secret-token"));
+
+        let debug = format!("{target:?}");
+        assert!(debug.contains("authorization"), "{debug}");
+        assert!(!debug.contains("secret-token"), "{debug}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_provider_sends_headers_as_grpc_metadata() {
+        crate::test_environment::Environment::new()
+            .remove("OTEL_EXPORTER_OTLP_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+            .run_async(async {
+                use opentelemetry::trace::Tracer as _;
+
+                let collector = openshell_otel_test_support::OtlpTestServer::start().await;
+                let provider = OtlpTarget::new(&OtlpExportConfig {
+                    endpoint: collector.endpoint(),
+                    service_name: ServiceName::Fixed("test-service"),
+                    service_version: None,
+                    resource_attributes: Vec::new(),
+                })
+                .unwrap()
+                .with_headers(parse_otlp_headers("authorization=Bearer%20token"))
+                .tracer_provider()
+                .unwrap();
+                provider.tracer("test").in_span("grpc-span", |_| {});
+                let flush = tokio::task::spawn_blocking(move || provider.force_flush());
+
+                collector.wait_for_export().await;
+                flush.await.unwrap().expect("flush succeeds");
+                assert_eq!(collector.received().trace_authorizations, ["Bearer token"]);
+            })
+            .await;
     }
 
     #[tokio::test]

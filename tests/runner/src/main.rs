@@ -17,6 +17,7 @@ use crate::execute::{Run, Status};
 
 mod bundle;
 mod execute;
+mod test_env;
 
 /// Build a test family for the guest, boot a tmachine environment with
 /// OpenShell installed, run the tests in it, and check the results.
@@ -29,14 +30,15 @@ struct Cli {
     /// The tmachine installer that installs OpenShell, e.g. `deb`.
     #[arg(long)]
     installer: String,
-    /// The test family: a workspace under `tests/suites/`, e.g. `conformance`.
+    /// The test family: the path of a workspace under `tests/suites/`, e.g.
+    /// `conformance` or `drivers/podman`.
     #[arg(long)]
     family: String,
     /// Only build these packages of the family [default: every package].
     #[arg(long = "package", short = 'p', value_name = "PACKAGE")]
     packages: Vec<String>,
     /// A nextest filterset narrowing the tests that run, e.g.
-    /// `binary(smoke)`.
+    /// `test(/^smoke::/)`.
     #[arg(long, value_name = "FILTERSET")]
     filter: Option<String>,
     /// The gateway name the installer registers with the CLI. The packaged
@@ -71,16 +73,7 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<ExitCode> {
     let root = repo_root()?;
-    ensure!(
-        !cli.family.is_empty()
-            && cli
-                .family
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-        "--family must name a workspace directly under tests/suites/, got {:?}",
-        cli.family
-    );
-    let workspace = root.join("tests/suites").join(&cli.family);
+    let workspace = family_workspace(&root, &cli.family)?;
     // Absolute, because `load_tmachine` changes the working directory.
     let results = std::path::absolute(&cli.results)
         .with_context(|| format!("resolve {}", cli.results.display()))?;
@@ -126,6 +119,23 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     Ok(status.exit_code())
 }
 
+/// The workspace directory of `family`, a relative path under
+/// `tests/suites/` such as `drivers/podman`. Each part of the path must be a
+/// plain name, so it can't be absolute or leave `tests/suites/`.
+fn family_workspace(root: &Path, family: &str) -> Result<PathBuf> {
+    let plain = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    ensure!(
+        family.split('/').all(plain),
+        "--family must be the path of a workspace under tests/suites/, such as conformance or drivers/podman, got {family:?}"
+    );
+    Ok(root.join("tests/suites").join(family))
+}
+
 /// On GitHub Actions, show `message` as an error on the run's summary page.
 fn annotate(title: &str, message: &str) {
     if std::env::var_os("GITHUB_ACTIONS").is_none() {
@@ -161,4 +171,36 @@ fn repo_root() -> Result<PathBuf> {
         "not inside the OpenShell repository"
     );
     Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn family_is_a_path_under_tests_suites() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            family_workspace(root, "conformance").unwrap(),
+            Path::new("/repo/tests/suites/conformance")
+        );
+        assert_eq!(
+            family_workspace(root, "drivers/podman").unwrap(),
+            Path::new("/repo/tests/suites/drivers/podman")
+        );
+        for family in [
+            "",
+            "/etc",
+            "drivers/",
+            "drivers//podman",
+            "../tests",
+            "drivers/../..",
+            ".",
+            "..",
+            "drivers/.",
+            "a b",
+        ] {
+            assert!(family_workspace(root, family).is_err(), "{family:?}");
+        }
+    }
 }

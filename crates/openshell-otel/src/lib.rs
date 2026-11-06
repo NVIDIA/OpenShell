@@ -8,10 +8,10 @@
 //! - Trace-context propagation, always compiled in: W3C `traceparent` /
 //!   `tracestate` extraction and injection for HTTP headers, tonic metadata,
 //!   and process environments.
-//! - The `export` feature (on by default): OTLP/gRPC tracer providers,
-//!   tracing layers, compute-driver and gRPC tracing machinery, and the OCSF
-//!   log bridge. Services that report to a collector keep the default;
-//!   clients that only forward trace context (e.g. the CLI) opt out with
+//! - The `export` feature (on by default): OTLP tracer providers, tracing
+//!   layers, compute-driver and gRPC tracing machinery, and the OCSF log
+//!   bridge. Services that report to a collector keep the default; clients
+//!   that only forward trace context (e.g. the CLI) opt out with
 //!   `default-features = false` to keep the exporter stack out of their
 //!   binaries.
 
@@ -25,15 +25,30 @@ pub use propagation::{
 };
 
 #[cfg(feature = "export")]
+mod correlation;
+#[cfg(feature = "export")]
 mod driver;
 #[cfg(feature = "export")]
 mod grpc;
+#[cfg(feature = "export")]
+mod headers;
 #[cfg(feature = "export")]
 mod logs;
 #[cfg(feature = "export")]
 mod ocsf;
 #[cfg(feature = "export")]
 mod setup;
+#[cfg(feature = "export")]
+mod tls;
+#[cfg(feature = "export")]
+mod transport;
+
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;
+
+#[cfg(feature = "export")]
+pub use correlation::current_ocsf_trace_correlation;
 
 #[cfg(feature = "export")]
 pub use driver::{
@@ -47,7 +62,17 @@ pub use grpc::{
     grpc_status_code_name, record_grpc_status, rpc,
 };
 #[cfg(feature = "export")]
+pub use headers::{encode_otlp_headers, merge_otlp_headers, parse_otlp_headers};
+#[cfg(feature = "export")]
 pub use ocsf::{OcsfOtlp, OcsfOtlpLayer};
+#[cfg(feature = "export")]
+pub use tls::{MAX_TLS_FILE_BYTES, OtlpTls, TlsError, TlsFileError};
+#[cfg(feature = "export")]
+pub use transport::{
+    CONNECT_TIMEOUT, OtlpHttpClient, TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL,
+    TCP_KEEPALIVE_RETRIES, signal_url,
+};
+
 #[cfg(feature = "export")]
 pub use setup::*;
 

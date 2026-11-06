@@ -43,6 +43,7 @@ def _wheel_files() -> set[str]:
         files.add(f"openshell/_proto/{stem}_pb2.py")
         files.add(f"openshell/_proto/{stem}_pb2.pyi")
         files.add(f"openshell/_proto/{stem}_pb2_grpc.py")
+        files.add(f"openshell/_proto/{stem}_pb2_grpc.pyi")
     return files
 
 
@@ -86,8 +87,10 @@ def test_requires_exactly_one_wheel_in_directory(tmp_path: Path) -> None:
         verifier.verify_wheel(tmp_path)
 
 
-@pytest.mark.parametrize("stem", ["sandbox", "credential_driver", "extension"])
-@pytest.mark.parametrize("suffix", ["_pb2.py", "_pb2.pyi", "_pb2_grpc.py"])
+@pytest.mark.parametrize("stem", verifier.PROTO_STEMS)
+@pytest.mark.parametrize(
+    "suffix", ["_pb2.py", "_pb2.pyi", "_pb2_grpc.py", "_pb2_grpc.pyi"]
+)
 def test_rejects_missing_generated_proto(
     tmp_path: Path, stem: str, suffix: str
 ) -> None:

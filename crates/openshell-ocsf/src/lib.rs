@@ -31,10 +31,10 @@ pub mod events;
 pub mod format;
 pub mod objects;
 pub mod sanitize;
-pub mod tracing_layers;
+mod trace;
 
-#[cfg(any(test, feature = "test-support"))]
-pub mod validation;
+pub use trace::{TraceCorrelation, register_trace_correlation_extractor};
+pub mod tracing_layers;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -62,8 +62,6 @@ pub use objects::{
 
 // --- Sanitizers ---
 pub use sanitize::sanitize_reason_for_audit;
-
-pub use format::downgrade::OcsfSchemaVersion;
 
 // --- Builders ---
 pub use builders::{

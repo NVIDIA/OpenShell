@@ -13,10 +13,11 @@
 /// ```ignore
 /// impl_builder_setters!(MyBuilder);            // severity + status + message
 /// impl_builder_setters!(MyBuilder, no_status); // severity + message only
+/// impl_builder_setters!(MyBuilder<State>);     // for a type-state builder
 /// ```
 macro_rules! impl_builder_setters {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the event severity.
             #[must_use]
             pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
@@ -37,8 +38,8 @@ macro_rules! impl_builder_setters {
             }
         }
     };
-    ($builder:ident, no_status) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?, no_status) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the event severity.
             #[must_use]
             pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
@@ -58,8 +59,8 @@ macro_rules! impl_builder_setters {
 /// Generate the `activity` setter used by every event builder that carries an
 /// `activity` field.
 macro_rules! impl_activity_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the event activity identifier.
             #[must_use]
             pub fn activity(mut self, id: $crate::enums::ActivityId) -> Self {
@@ -70,11 +71,11 @@ macro_rules! impl_activity_setter {
     };
 }
 
-/// Generate `action` and `disposition` setters shared by network, HTTP, SSH,
-/// process, and detection-finding builders.
+/// Generate `action` and `disposition` setters shared by every builder whose
+/// event records an action and its disposition.
 macro_rules! impl_action_disposition_setters {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the action taken.
             #[must_use]
             pub fn action(mut self, id: $crate::enums::ActionId) -> Self {
@@ -145,6 +146,8 @@ pub struct EventContext {
     pub sandbox_name: String,
     /// Container image reference.
     pub container_image: String,
+    /// Immutable workload image ID resolved by the compute driver at launch.
+    pub container_image_uid: Option<String>,
     /// Device hostname.
     pub hostname: String,
     /// Product version string.
@@ -205,28 +208,39 @@ impl EventContext {
             EventOrigin::Supervisor => Product::openshell_sandbox(&self.product_version),
             EventOrigin::Gateway { .. } => Product::openshell_gateway(&self.product_version),
         };
+        let profiles: Vec<String> = profiles
+            .iter()
+            .filter(|p| **p != "container" || matches!(self.origin, EventOrigin::Supervisor))
+            .map(|s| (*s).to_string())
+            .collect();
         Metadata {
             version: OCSF_VERSION.to_string(),
             product,
-            profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
+            profiles,
             uid: Some(uuid::Uuid::new_v4().to_string()),
             log_source: None,
             correlation_uid: None,
         }
     }
 
-    /// Build the OCSF `Container` object when the event concerns a sandbox.
+    /// Build the OCSF `Container` object for an in-sandbox supervisor.
     #[must_use]
     pub fn container(&self) -> Option<Container> {
-        if self.sandbox_id.is_empty() {
+        if self.sandbox_id.is_empty() || matches!(self.origin, EventOrigin::Gateway { .. }) {
             return None;
         }
         Some(Container {
             name: self.sandbox_name.clone(),
             uid: Some(self.sandbox_id.clone()),
-            image: (!self.container_image.is_empty()).then(|| Image {
-                name: self.container_image.clone(),
-            }),
+            image: self
+                .container_image_uid
+                .as_ref()
+                .filter(|uid| !uid.trim().is_empty())
+                .map(|uid| Image {
+                    uid: uid.clone(),
+                    name: (!self.container_image.trim().is_empty())
+                        .then(|| self.container_image.clone()),
+                }),
         })
     }
 
@@ -234,10 +248,12 @@ impl EventContext {
     /// on (Linux for the in-sandbox supervisor, Windows for the MXC gateway).
     #[must_use]
     pub fn device(&self) -> Device {
-        match &self.origin {
+        let mut device = match &self.origin {
             EventOrigin::Supervisor => Device::for_current_os(&self.hostname),
             EventOrigin::Gateway { name } => Device::gateway(&self.hostname, name),
-        }
+        };
+        device.container = self.container();
+        device
     }
 
     /// Build the `proxy_endpoint` object for the Network Proxy profile.
@@ -261,8 +277,21 @@ impl EventContext {
             base.set_message(m);
         }
         base.set_device(self.device());
-        if let Some(container) = self.container() {
-            base.set_container(container);
+        // Only trusted context identity may route an event to a sandbox.
+        // Resources can name request-supplied targets, including denied ones.
+        if matches!(self.origin, EventOrigin::Gateway { .. }) && !self.sandbox_id.is_empty() {
+            base.add_unmapped("sandbox_id", self.sandbox_id.clone());
+            if !self.sandbox_name.is_empty() {
+                base.add_unmapped("sandbox_name", self.sandbox_name.clone());
+            }
+        }
+        if self
+            .container_image_uid
+            .as_ref()
+            .is_none_or(|uid| uid.trim().is_empty())
+            && !self.container_image.trim().is_empty()
+        {
+            base.add_unmapped("container_image", self.container_image.clone());
         }
     }
 }
@@ -273,6 +302,7 @@ pub(crate) fn test_sandbox_context() -> EventContext {
         sandbox_id: "sandbox-abc123".to_string(),
         sandbox_name: "my-sandbox".to_string(),
         container_image: "ghcr.io/openshell/sandbox:latest".to_string(),
+        container_image_uid: None,
         hostname: "sandbox-abc123".to_string(),
         product_version: "0.1.0".to_string(),
         proxy_ip: "10.42.0.1".parse().unwrap(),
@@ -395,6 +425,7 @@ pub(crate) fn test_gateway_context() -> EventContext {
         sandbox_id: String::new(),
         sandbox_name: String::new(),
         container_image: String::new(),
+        container_image_uid: None,
         hostname: "openshell-gateway-0".to_string(),
         product_version: "0.1.0".to_string(),
         proxy_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -410,6 +441,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_identity_preserves_references_and_omits_missing_names() {
+        for uid in [None, Some(""), Some(" "), Some("sha256:resolved-workload")] {
+            for reference in ["", " ", "registry.example/workload:latest"] {
+                let mut ctx = test_sandbox_context();
+                ctx.container_image_uid = uid.map(str::to_string);
+                ctx.container_image = reference.into();
+                let resolved = uid.filter(|uid| !uid.trim().is_empty());
+                for (class, event) in sample_events(&ctx) {
+                    let json = event.to_json().unwrap();
+                    openshell_ocsf_validate::validate_event(&json)
+                        .unwrap_or_else(|error| panic!("{class}: {error}"));
+                    let image = &json["device"]["container"]["image"];
+                    if class != "authentication" && resolved.is_some() {
+                        assert_eq!(image["uid"].as_str(), resolved);
+                        assert_eq!(
+                            image.get("name").and_then(serde_json::Value::as_str),
+                            (!reference.trim().is_empty()).then_some(reference)
+                        );
+                    } else {
+                        assert!(image.is_null());
+                    }
+                    assert_eq!(
+                        json["unmapped"]["container_image"].as_str(),
+                        (resolved.is_none() && !reference.trim().is_empty()).then_some(reference)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_gateway_class_routes_only_by_context_identity() {
+        for sandbox_id in ["", "sb-context"] {
+            let mut ctx = test_gateway_context();
+            ctx.sandbox_id = sandbox_id.into();
+            for (class, event) in sample_events(&ctx) {
+                let json = event.to_json().unwrap();
+                assert_eq!(
+                    event.sandbox_id(),
+                    (!sandbox_id.is_empty()).then_some(sandbox_id),
+                    "{class}"
+                );
+                assert!(json["unmapped"].get("sandbox_name").is_none(), "{class}");
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_container_image_matches_schema() {
+        let mut ctx = test_sandbox_context();
+        ctx.container_image_uid = Some("sha256:resolved-workload".into());
+        for (class, event) in sample_events(&ctx) {
+            let json = event.to_json().unwrap();
+            openshell_ocsf_validate::validate_event(&json)
+                .unwrap_or_else(|error| panic!("{class}: {error}"));
+            if class != "authentication" {
+                assert_eq!(
+                    json["device"]["container"]["image"]["uid"],
+                    "sha256:resolved-workload"
+                );
+                assert_eq!(
+                    json["device"]["container"]["image"]["name"],
+                    ctx.container_image
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sandbox_identity_matches_every_event_class_schema() {
+        let ctx = test_sandbox_context();
+        for (class_name, event) in sample_events(&ctx) {
+            let json = event.to_json().unwrap();
+            openshell_ocsf_validate::validate_event(&json)
+                .unwrap_or_else(|e| panic!("{class_name}: {e}"));
+            assert!(json.get("container").is_none(), "{class_name}");
+            if class_name == "authentication" {
+                assert!(json["device"].get("container").is_none());
+                assert!(event.sandbox_id().is_none());
+                continue;
+            }
+            assert!(
+                json["metadata"]["profiles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p == "container"),
+                "{class_name}"
+            );
+            let device = &json["device"];
+            let container = &device["container"];
+            assert_eq!(container["uid"], ctx.sandbox_id, "{class_name}");
+            assert_eq!(container["name"], ctx.sandbox_name, "{class_name}");
+            assert!(
+                container.get("image").is_none(),
+                "image reference alone is insufficient"
+            );
+            let decoded: crate::OcsfEvent = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(decoded.to_json().unwrap(), json, "{class_name}");
+        }
+    }
+
+    #[test]
     fn test_sandbox_context_metadata() {
         let ctx = test_sandbox_context();
         let meta = ctx.metadata(&["security_control", "container"]);
@@ -421,29 +555,16 @@ mod tests {
         assert_ne!(uid, "sandbox-abc123");
     }
 
-    #[test]
-    fn test_emitted_device_matches_vendored_schema() {
-        use crate::validation::schema::{
-            load_object_schema, validate_enum_value, validate_required_fields,
-        };
-
-        let device = serde_json::to_value(test_sandbox_context().device()).unwrap();
-        let schema = load_object_schema("device");
-        validate_required_fields(&device, &schema);
-        validate_enum_value(&device, "type_id", &schema);
-    }
-
     /// One event per builder, built with a production-like sandbox context
     /// (container image set), must validate against the vendored 1.8.0 schemas.
     #[test]
     fn every_builder_emits_schema_conformant_events() {
-        use crate::validation::schema::{load_class_schema, validate_required_fields};
-
         let ctx = test_sandbox_context();
         let events = sample_events(&ctx);
         for (class, event) in &events {
             let json = event.to_json().unwrap();
-            validate_required_fields(&json, &load_class_schema(class));
+            openshell_ocsf_validate::validate_event(&json)
+                .unwrap_or_else(|e| panic!("{class}: {e}"));
         }
     }
 

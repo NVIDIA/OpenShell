@@ -256,6 +256,51 @@ fi
     printf 'ok - bounds state history\n'
 }
 
+test_runtime_prompt_is_literal_and_stable() {
+    local tmp
+    tmp="$(mktemp -d)"
+    make_payload "$tmp/payload" '
+[[ -z "${OPENSHELL_AGENT_TASK+x}" ]] || exit 20
+cat "$1" > "${OPENSHELL_AGENT_TEST_STATE}.prompt"
+state_file="${OPENSHELL_AGENT_TEST_STATE}"
+if [[ ! -f "$state_file" ]]; then
+    cp "${state_file}.prompt" "${state_file}.first"
+    touch "$state_file"
+    # Even if a cycle could alter the template, it must not change the captured
+    # instructions for the next cycle.
+    printf "tampered prompt" > "$(dirname "${BASH_SOURCE[0]}")/../../../agent-prompt.md"
+    printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"waiting\",\"reason\":\"checks_pending\",\"next_poll_seconds\":1}"
+else
+    cmp "${state_file}.first" "${state_file}.prompt"
+    printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
+fi
+'
+    printf '%s\n' '{{HARNESS}}/{{RUN_MODE}}/{{POLL_INTERVAL_SECONDS}}' '{{USER_PROMPT}}' > "$tmp/payload/agent-prompt.md"
+    # Shell syntax, template tokens, and sentinel-like text in the assignment
+    # must all remain literal instruction data.
+    local task='Review PR #123; $(exit 99) `exit 98` {{RUN_MODE}} & /ok to test'
+    OPENSHELL_AGENT_TASK="$task" OPENSHELL_AGENT_TEST_STATE="$tmp/count" \
+        run_supervisor "$tmp/payload" watch "$tmp/output"
+    assert_contains "$tmp/count.prompt" 'test/watch/1'
+    assert_contains "$tmp/count.prompt" "$task"
+    [[ "$(grep -Fc "$task" "$tmp/count.prompt")" -eq 1 ]] || fail "task duplicated"
+    printf 'ok - runtime prompt is literal and stable across cycles\n'
+}
+
+test_missing_runtime_task_fails_closed() {
+    local tmp
+    tmp="$(mktemp -d)"
+    make_payload "$tmp/payload" 'touch "${OPENSHELL_AGENT_TEST_STATE}"'
+    printf '%s\n' '{{USER_PROMPT}}' > "$tmp/payload/agent-prompt.md"
+    if OPENSHELL_AGENT_TASK='' OPENSHELL_AGENT_TEST_STATE="$tmp/started" \
+        run_supervisor "$tmp/payload" once "$tmp/output"; then
+        fail "missing task accepted"
+    fi
+    [[ ! -e "$tmp/started" ]] || fail "harness started without task"
+    assert_contains "$tmp/output" 'Missing or unsupported runtime prompt variable: USER_PROMPT'
+    printf 'ok - missing runtime task fails closed\n'
+}
+
 test_once_requires_sentinel
 test_watch_retries_missing_sentinel_until_complete
 test_watch_retries_invalid_status_until_complete
@@ -266,3 +311,5 @@ test_watch_transient_failure_honors_next_poll_seconds
 test_watch_prints_active_cycle_heartbeat
 test_persists_agent_notes_and_terminal_state
 test_bounds_state_history
+test_runtime_prompt_is_literal_and_stable
+test_missing_runtime_task_fails_closed
