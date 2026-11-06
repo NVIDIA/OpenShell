@@ -236,23 +236,32 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
             .map_err(|error| BackendError::Process(error.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let landlock_report = crate::sandbox::linux::LandlockReportPipe::new()
+            .map_err(|error| BackendError::Process(error.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let landlock_report_fd = landlock_report.child_fd();
         crate::pty::install_dedicated_process_group(&mut command);
         crate::pty::install_pre_exec_no_pty(
             &mut command,
             self.policy.clone(),
             effective_workdir.map(str::to_string),
             #[cfg(target_os = "linux")]
-            prepared,
-            #[cfg(target_os = "linux")]
-            child_hardening,
+            crate::sandbox::linux::ChildSandboxInstall::new(
+                prepared,
+                child_hardening,
+                landlock_report_fd,
+            ),
         )
         .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(target_os = "linux")]
         let mut child_registry = crate::managed_children::lock();
         #[cfg(target_os = "linux")]
-        let mut child =
-            crate::process::spawn_std_command_with_workload_launcher(&self.launcher, command)
-                .map_err(|error| BackendError::Process(error.to_string()))?;
+        let mut child = landlock_report
+            .spawn_and_drain(|| {
+                crate::process::spawn_std_command_with_workload_launcher(&self.launcher, command)
+            })
+            .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(not(target_os = "linux"))]
         let mut child = command
             .spawn()
@@ -346,23 +355,32 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
             .map_err(|error| BackendError::Process(error.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let landlock_report = crate::sandbox::linux::LandlockReportPipe::new()
+            .map_err(|error| BackendError::Process(error.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let landlock_report_fd = landlock_report.child_fd();
         crate::pty::install_pre_exec(
             &mut command,
             self.policy.clone(),
             effective_workdir.map(str::to_string),
             slave_fd,
             #[cfg(target_os = "linux")]
-            prepared,
-            #[cfg(target_os = "linux")]
-            child_hardening,
+            crate::sandbox::linux::ChildSandboxInstall::new(
+                prepared,
+                child_hardening,
+                landlock_report_fd,
+            ),
         )
         .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(target_os = "linux")]
         let mut child_registry = crate::managed_children::lock();
         #[cfg(target_os = "linux")]
-        let mut child =
-            crate::process::spawn_std_command_with_workload_launcher(&self.launcher, command)
-                .map_err(|error| BackendError::Process(error.to_string()))?;
+        let mut child = landlock_report
+            .spawn_and_drain(|| {
+                crate::process::spawn_std_command_with_workload_launcher(&self.launcher, command)
+            })
+            .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(not(target_os = "linux"))]
         let mut child = command
             .spawn()
@@ -1146,6 +1164,56 @@ mod tests {
             BoundaryExitStatus::Exited(0)
         );
         assert_eq!(runtime.registered_process_group_count(), 0);
+    }
+
+    /// A failed spawn must return promptly with the Landlock report drain
+    /// already run. Every spawn surface drains through
+    /// `LandlockReportPipe::spawn_and_drain`, which drops the parent's write
+    /// end and drains on both spawn outcomes before the error is mapped, so
+    /// the error path cannot stall on a never-EOF pipe (a drain that never
+    /// drops the parent's write end blocks forever). Forcing a real
+    /// `restrict_self` degradation through this public
+    /// spawn API is not possible — the blocking seccomp filter used in the
+    /// landlock tests can only be installed in a forked child — so this pins
+    /// the closest observable contract: both spawn surfaces return the spawn
+    /// error instead of hanging. Each exec runs on a dedicated thread waited
+    /// with a channel timeout, so a stalled drain fails the test cleanly
+    /// instead of deadlocking the test runtime's shutdown.
+    #[test]
+    fn failed_exec_drains_the_landlock_report_pipe_before_returning() {
+        for pty in [false, true] {
+            let mut executor = executor();
+            // Best-effort Landlock over a real path, so the forked child
+            // prepares and enforces a ruleset before the exec failure.
+            let root = tempfile::tempdir().unwrap();
+            executor.policy.filesystem.read_only = vec![root.path().to_path_buf()];
+            executor.policy.landlock.compatibility =
+                openshell_core::policy::LandlockCompatibility::BestEffort;
+            let spec = ExecSpec {
+                program: "/definitely/missing/openshell-exec".to_string(),
+                args: vec![],
+                shell: None,
+                runtime_helper: None,
+                env: vec![],
+                workdir: None,
+                pty,
+            };
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build exec runtime");
+                let _ = result_tx.send(runtime.block_on(executor.exec(spec)));
+            });
+            let result = result_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("exec must return instead of stalling on the Landlock report pipe");
+            assert!(
+                matches!(result, Err(BackendError::Process(_))),
+                "the missing entrypoint must surface as the spawn error"
+            );
+        }
     }
 
     #[tokio::test]
