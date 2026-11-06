@@ -149,8 +149,9 @@ return lazy `Pager` instances; use `list_all()` only when you want to fetch the
 complete collection.
 
 Delete calls use the client timeout, 30 seconds by default. Kubernetes gateways
-can hold a delete open until the pod terminates, so pass a larger `timeout` to
-`delete`, or `delete_timeout_seconds` (for example, 120) to `Sandbox`.
+can hold a delete open until the pod terminates, so pass a larger
+`timeout_seconds` to `delete`, or `delete_timeout_seconds` (for example, 120) to
+`Sandbox`.
 
 ## Call Generated RPCs
 

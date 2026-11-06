@@ -56,7 +56,10 @@ def cluster_name() -> str | None:
 
 @pytest.fixture(scope="session")
 def sandbox_client(cluster_name: str | None) -> Iterator[SandboxClient]:
-    with SandboxClient.from_active_cluster(cluster=cluster_name) as client:
+    # Direct deletes can wait out the Kubernetes pod grace period.
+    with SandboxClient.from_active_cluster(
+        cluster=cluster_name, timeout=120.0
+    ) as client:
         yield client
 
 

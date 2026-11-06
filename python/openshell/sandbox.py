@@ -681,10 +681,10 @@ class SandboxSession:
         )
 
     def delete(
-        self, *, allow_missing: bool = False, timeout: float | None = None
+        self, *, allow_missing: bool = False, timeout_seconds: float | None = None
     ) -> DeletionResult:
-        # Forward `timeout` only on opt-in so older client subclasses still work.
-        extra = {} if timeout is None else {"timeout": timeout}
+        # Forward `timeout_seconds` only on opt-in so older clients still work.
+        extra = {} if timeout_seconds is None else {"timeout_seconds": timeout_seconds}
         return self._client.delete(
             self.sandbox.name,
             workspace=self._workspace,
@@ -1150,11 +1150,11 @@ class SandboxClient:
         *,
         workspace: str,
         allow_missing: bool = False,
-        timeout: float | None = None,
+        timeout_seconds: float | None = None,
     ) -> DeletionResult:
         """Delete a sandbox.
 
-        `timeout` is the gRPC deadline in seconds for this call (default: the
+        `timeout_seconds` is the gRPC deadline for this call (default: the
         client timeout).
         """
         response = self._stub.DeleteSandbox(
@@ -1163,7 +1163,7 @@ class SandboxClient:
                 name=name,
                 allow_missing=allow_missing,
             ),
-            timeout=self._timeout if timeout is None else timeout,
+            timeout=self._timeout if timeout_seconds is None else timeout_seconds,
         )
         return DeletionResult(
             DeletionOutcome(response.outcome), response.sandbox_id or None
@@ -1896,7 +1896,7 @@ class Sandbox:
                 and self._client is not None
             ):
                 result = self._session.delete(
-                    allow_missing=True, timeout=self._delete_timeout_seconds
+                    allow_missing=True, timeout_seconds=self._delete_timeout_seconds
                 )
                 if result.outcome == DeletionOutcome.ACCEPTED:
                     self._client.wait_deleted(
