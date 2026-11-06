@@ -1679,6 +1679,169 @@ impl openshell_core::middleware::InProcessMiddleware for ForwardedHeadStage {
     }
 }
 
+/// HTTP hook stage that streams a request body upstream in DUPLEX mode and
+/// denies it only after reading the whole input.
+struct DenyAfterOutputStage;
+
+#[tonic::async_trait]
+impl openshell_core::middleware::InProcessMiddleware for DenyAfterOutputStage {
+    async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+        use openshell_core::proto::{
+            MiddlewareBinding, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+        };
+        openshell_core::proto::MiddlewareManifest {
+            name: "test/deny-after-output".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_payload_bytes: 4096,
+                request_timeout: None,
+            }],
+            expected_audience: String::new(),
+            extension: Some(
+                openshell_core::extension_protocol::http_hooks_middleware_metadata(
+                    "openshell/test-deny-after-output",
+                    "test",
+                ),
+            ),
+        }
+    }
+
+    async fn validate_config(
+        &self,
+        _middleware_name: &str,
+        _config: &prost_types::Struct,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        _request: openshell_core::middleware::HttpRequestView<'_>,
+    ) -> Result<openshell_core::proto::HttpRequestResult> {
+        Err(miette!("HTTP hook test stage"))
+    }
+
+    async fn open_http_request_hook(
+        &self,
+        mut events: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpRequestHookEvent>,
+    ) -> std::result::Result<openshell_core::middleware::HttpRequestHookResultStream, tonic::Status>
+    {
+        use openshell_core::proto::{
+            HttpDenial, HttpDuplexMode, HttpInspect, HttpOutputChunk, HttpOutputStart,
+            HttpPreflightResult, HttpRequestHookResult, MiddlewareDiagnostics, http_inspect,
+            http_preflight_result, http_request_hook_event, http_request_hook_result,
+        };
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let result = match event.event {
+                    Some(http_request_hook_event::Event::Preflight(_)) => {
+                        http_request_hook_result::Result::PreflightResult(HttpPreflightResult {
+                            decision: Some(http_preflight_result::Decision::Inspect(HttpInspect {
+                                mode: Some(http_inspect::Mode::Duplex(HttpDuplexMode {})),
+                            })),
+                            ..Default::default()
+                        })
+                    }
+                    Some(http_request_hook_event::Event::Begin(_)) => {
+                        http_request_hook_result::Result::OutputStart(HttpOutputStart {
+                            header_mutations: Vec::new(),
+                            output_body_bytes: None,
+                        })
+                    }
+                    Some(http_request_hook_event::Event::InputChunk(chunk)) => {
+                        http_request_hook_result::Result::OutputChunk(HttpOutputChunk {
+                            data: chunk.data,
+                        })
+                    }
+                    Some(http_request_hook_event::Event::InputEnd(_)) => {
+                        http_request_hook_result::Result::Deny(HttpDenial {
+                            diagnostics: Some(MiddlewareDiagnostics::default()),
+                        })
+                    }
+                    _ => break,
+                };
+                if sender
+                    .send(Ok(HttpRequestHookResult {
+                        result: Some(result),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+            receiver,
+        )))
+    }
+}
+
+#[tokio::test]
+async fn duplex_request_deny_after_upstream_start_returns_403_and_aborts_upstream() {
+    let mut fixture = Fixture::new(
+        &[Route {
+            method: "POST",
+            ..route("items", "/v1/items")
+        }],
+        &[("/v1/items", "items", "aud-items")],
+        1,
+    );
+    let mut data: serde_json::Value =
+        serde_json::from_str(&fixture.policy_data).expect("fixture policy data");
+    data["network_middlewares"] = serde_json::json!({
+        "deny-after-output": {
+            "middleware": "test/deny-after-output",
+            "on_error": "fail_closed",
+            "endpoints": {"include": [HOST]},
+        }
+    });
+    fixture.policy_data = data.to_string();
+    fixture.reload_policy();
+    fixture.engine.set_middleware_runner_for_tests(
+        openshell_supervisor_middleware::ChainRunner::new(Arc::new(DenyAfterOutputStage)),
+    );
+
+    let mut connection = fixture.connect();
+    timeout(
+        WAIT,
+        connection.app.write_all(
+            format!(
+                "POST /v1/items HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+            )
+            .as_bytes(),
+        ),
+    )
+    .await
+    .expect("client request write completes")
+    .expect("client request write");
+    let response = connection.response().await;
+    assert!(
+        connection.observes_eof().await,
+        "the sandbox connection closes"
+    );
+    let capture = connection.finish().await;
+
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert!(
+        !response.contains("HTTP/1.1 204"),
+        "no upstream response is relayed: {response}"
+    );
+    // The upstream request started with a chunked body, which the denial
+    // leaves unterminated.
+    assert_eq!(capture.requests.len(), 1);
+    assert!(
+        capture.requests[0]
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked\r\n"),
+        "{}",
+        capture.requests[0]
+    );
+}
+
 #[tokio::test]
 async fn response_middleware_sees_the_forwarded_request_head_without_injected_grants() {
     let mut fixture = Fixture::new(

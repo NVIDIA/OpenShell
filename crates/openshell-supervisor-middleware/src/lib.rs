@@ -4488,6 +4488,47 @@ mod tests {
     }
 
     #[test]
+    fn zero_limit_http_hooks_binding_is_excluded_from_the_operator_limit() {
+        let registration = external_registration(4096);
+        let binding =
+            |operation: SupervisorMiddlewareOperation, max_payload_bytes| MiddlewareBinding {
+                operation: operation as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_payload_bytes,
+                request_timeout: None,
+            };
+        let manifest = MiddlewareManifest {
+            name: "example/mixed".into(),
+            service_version: "test".into(),
+            bindings: vec![
+                binding(SupervisorMiddlewareOperation::HttpRequest, 0),
+                binding(SupervisorMiddlewareOperation::WebsocketMessage, 8192),
+            ],
+            expected_audience: String::new(),
+            extension: Some(
+                openshell_core::extension_protocol::http_hooks_middleware_metadata(
+                    "openshell/test-middleware",
+                    "test",
+                ),
+            ),
+        };
+
+        let bindings =
+            authorize_external_manifest(&registration, &manifest, false, &BindingPolicy::Dynamic)
+                .expect("a zero-limit HTTP hooks binding does not constrain the operator limit");
+        assert_eq!(bindings.len(), 2);
+        for binding in &bindings {
+            let is_http = binding.operation == SupervisorMiddlewareOperation::HttpRequest as i32;
+            assert_eq!(
+                binding_requires_payload_limit(&manifest, binding),
+                !is_http,
+                "operation {}",
+                binding.operation
+            );
+        }
+    }
+
+    #[test]
     fn external_websocket_binding_rejects_operator_limit_above_capability() {
         let registration = external_registration(4097);
         let manifest = MiddlewareManifest {
