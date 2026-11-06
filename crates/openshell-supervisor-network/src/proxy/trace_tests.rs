@@ -128,7 +128,6 @@ async fn forward_denials_use_the_saved_connect_parent() {
                 "curl",
                 "42",
                 "-",
-                "curl",
                 "forward-policy",
                 &decision,
                 None,
