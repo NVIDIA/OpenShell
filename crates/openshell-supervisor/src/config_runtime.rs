@@ -1687,6 +1687,9 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 )]
 mod tests {
     use super::*;
+
+    mod delivery_qualification_tests;
+
     use crate::tests::{
         proto_policy_fixture, proto_tcp_policy_fixture, settings_poll_result, startup_provider,
         test_gateway,

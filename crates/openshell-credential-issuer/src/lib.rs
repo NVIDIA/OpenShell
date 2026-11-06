@@ -6,6 +6,7 @@
 
 mod embedded;
 mod owner;
+pub mod references;
 pub mod refresh;
 mod refresh_material;
 

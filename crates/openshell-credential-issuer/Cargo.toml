@@ -26,6 +26,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
 hyper-util = { workspace = true }
+prost = { workspace = true }
 prost-types = { workspace = true }
 rustix = { workspace = true }
 tokio = { workspace = true }

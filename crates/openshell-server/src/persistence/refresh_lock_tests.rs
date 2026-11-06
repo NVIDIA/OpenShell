@@ -73,3 +73,59 @@ async fn postgres_refresh_locks_coordinate_independent_replica_sessions() {
     first.close().await;
     second.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_activation_lock_preserves_legacy_key_without_consuming_data_capacity() {
+    let schema = super::test_postgres::TestSchema::create("activation_lock").await;
+    let first = Store::connect_with_pool_sizes(schema.url(), Some(2), Some(1))
+        .await
+        .unwrap();
+    let second = Store::connect_with_pool_sizes(schema.url(), Some(2), Some(1))
+        .await
+        .unwrap();
+    let issuer = uuid::Uuid::new_v4().to_string();
+    let legacy = first
+        .acquire_refresh_guard(&issuer, "migration")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            second.acquire_credential_activation_guard(&issuer)
+        )
+        .await
+        .is_err()
+    );
+    drop(legacy);
+    let activation = tokio::time::timeout(
+        Duration::from_secs(2),
+        second.acquire_credential_activation_guard(&issuer),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            first.acquire_refresh_guard(&issuer, "migration")
+        )
+        .await
+        .is_err()
+    );
+    // One lock-pool slot and one data-pool slot are now retained; database work
+    // must still progress with the supported two data connections.
+    let credential = second
+        .acquire_refresh_guard("provider", "TOKEN")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), second.ping())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(credential);
+    drop(activation);
+    first.close().await;
+    second.close().await;
+    schema.drop_schema().await;
+}

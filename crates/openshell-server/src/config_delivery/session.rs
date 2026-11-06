@@ -26,8 +26,9 @@ use uuid::Uuid;
 use super::{DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, SupervisorConfig};
 use crate::ServerState;
 use crate::grpc::policy::{
-    build_provider_environment_snapshot_from_inputs, build_sandbox_config_snapshot_from_inputs,
-    is_configuration_rejection, load_sandbox_config_inputs, unadmitted_sandbox_config,
+    SandboxConfigInputs, build_provider_environment_snapshot_from_inputs,
+    build_sandbox_config_snapshot_from_inputs, is_configuration_rejection,
+    unadmitted_sandbox_config,
 };
 use crate::persistence::ObjectId;
 use crate::supervisor_session::{AcceptedSession, SupervisorSessionRegistry};
@@ -83,8 +84,14 @@ pub struct ConfigSessionState {
     in_flight: Option<InFlightConfigUpdate>,
     /// Newest configuration built while an update was in flight.
     pending: Option<SupervisorConfig>,
-    /// The configuration the supervisor last applied.
+    /// Durable successful identity eligible for duplicate suppression. A
+    /// retained-policy failure may have revoked its credentials, so this is
+    /// not a historical record of the last successful result.
     acknowledged: Option<ConfigFingerprint>,
+    /// Complete installed identity confirmed by a durably recorded successful
+    /// result, including degraded-but-applied updates. Cleared when a failure
+    /// can retain policy but revoke credentials; never names a failed candidate.
+    installed: Option<ConfigFingerprint>,
     /// The admission this session last persisted. The admission is written
     /// again only when it changes, so a redelivered configuration writes
     /// nothing.
@@ -171,6 +178,7 @@ impl ConfigSessionState {
             in_flight: None,
             pending: None,
             acknowledged: None,
+            installed: None,
             persisted_admission: None,
             unrecorded_policy_loads: UnrecordedPolicyLoads::default(),
         }
@@ -248,11 +256,29 @@ impl ConfigSessionState {
         }
         self.in_flight = None;
         if acknowledge && outcome_acknowledges_revision(completed.outcome) {
+            self.installed = Some(completed.fingerprint.clone());
             // A degraded supervisor enforces this configuration but failed to
             // reload part of its runtime, so reconciliation delivers it again
             // to retry the reload, as the next poll would.
             self.acknowledged = (completed.outcome != ConfigApplyOutcome::Degraded)
                 .then(|| completed.fingerprint.clone());
+        } else if matches!(
+            completed.outcome,
+            ConfigApplyOutcome::FailedClosed | ConfigApplyOutcome::FailedRetainedLastKnownGood
+        ) || outcome_acknowledges_revision(completed.outcome)
+        {
+            // Retaining policy does not promise retaining its environment:
+            // an unresolved update revokes static credentials before policy
+            // reconciliation. Neither the old complete identity nor the
+            // failed candidate describes that mixed runtime. Forget both
+            // slots, even if recording this result failed, so recovery to the
+            // identical previous generation (including pending recovery) is
+            // delivered rather than suppressed. An applied result we could
+            // not durably acknowledge likewise cannot leave an older identity
+            // authoritative. Only a later durable successful result restores
+            // suppression and endpoint evidence.
+            self.installed = None;
+            self.acknowledged = None;
         }
         let pending = self.pending.take()?;
         if self.acknowledged.as_ref() == Some(&ConfigFingerprint::of(&pending.sandbox_config)) {
@@ -267,6 +293,24 @@ impl ConfigSessionState {
 }
 
 impl SupervisorSessionRegistry {
+    /// Endpoint evidence for streamed configurations belongs to the exact
+    /// capture the supervisor acknowledged, not a new backend read. Refresh
+    /// may advance the current reference before its update is installed.
+    pub(crate) fn installed_endpoint_configuration(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> Option<(String, u64)> {
+        self.with_config_session(sandbox_id, session_id, |session| {
+            let fingerprint = session?.installed.as_ref()?;
+            Some((
+                fingerprint.policy_hash.clone(),
+                fingerprint.provider_env_revision,
+            ))
+        })
+        .flatten()
+    }
+
     /// Hand a configuration to the session it was built for. A replacement
     /// session received its own bootstrap and must not receive an older
     /// build.
@@ -903,12 +947,15 @@ async fn build_config_bootstrap(
 ) -> Result<SessionBootstrap, Status> {
     tokio::time::timeout(CONFIG_BOOTSTRAP_BUILD_TIMEOUT, async {
         let built = async {
-            let inputs = load_sandbox_config_inputs(state, sandbox.clone()).await?;
+            let mut inputs = SandboxConfigInputs::load_metadata(state, sandbox.clone()).await?;
+            let mut credential_budget = super::PROVIDER_ENVIRONMENT_BUILD_TIMEOUT;
+            super::capture_credentials_for_delivery(state, &mut inputs, &mut credential_budget)
+                .await;
             let sandbox_config = build_sandbox_config_snapshot_from_inputs(state, &inputs).await?;
-            Ok::<_, Status>((inputs, sandbox_config))
+            Ok::<_, Status>((inputs, sandbox_config, credential_budget))
         }
         .await;
-        let (inputs, sandbox_config) = match built {
+        let (inputs, sandbox_config, credential_budget) = match built {
             Ok(built) => built,
             Err(error) if is_configuration_rejection(&error) => {
                 let sandbox_config = unadmitted_sandbox_config(state, sandbox, &error);
@@ -925,7 +972,7 @@ async fn build_config_bootstrap(
             Err(error) => return Err(error),
         };
         let provider_environment = tokio::time::timeout(
-            super::PROVIDER_ENVIRONMENT_BUILD_TIMEOUT,
+            credential_budget,
             build_provider_environment_snapshot_from_inputs(state, &inputs, true, true),
         )
         .await;
@@ -1570,6 +1617,73 @@ mod tests {
     }
 
     #[test]
+    fn versioned_endpoint_identity_tracks_applied_not_pending_or_failed_closed() {
+        let registry = SupervisorSessionRegistry::new();
+        let mut first = config(7);
+        first.sandbox_config.policy_hash = "policy".into();
+        first.sandbox_config.provider_env_revision = 101;
+        let (mut slots, bootstrap) =
+            register_bootstrapped_session(&registry, "sb-1", "session-1", first.clone());
+        assert_eq!(
+            registry.installed_endpoint_configuration("sb-1", "session-1"),
+            None
+        );
+        answer_bootstrap(
+            &registry,
+            "sb-1",
+            "session-1",
+            &bootstrap,
+            ConfigApplyOutcome::Applied,
+        );
+        assert_eq!(
+            registry.installed_endpoint_configuration("sb-1", "session-1"),
+            Some(("policy".into(), 101))
+        );
+        let mut refreshed = first;
+        refreshed.sandbox_config.provider_env_revision = 102;
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", refreshed.clone()),
+            DeliveryDisposition::Queued
+        );
+        let update = take_update(&mut slots).unwrap();
+        assert_eq!(
+            registry.installed_endpoint_configuration("sb-1", "session-1"),
+            Some(("policy".into(), 101))
+        );
+        answer_bootstrap(
+            &registry,
+            "sb-1",
+            "session-1",
+            &update,
+            ConfigApplyOutcome::Degraded,
+        );
+        assert_eq!(
+            registry.installed_endpoint_configuration("sb-1", "session-1"),
+            Some(("policy".into(), 102))
+        );
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", refreshed),
+            DeliveryDisposition::Queued
+        );
+        let retry = take_update(&mut slots).unwrap();
+        answer_bootstrap(
+            &registry,
+            "sb-1",
+            "session-1",
+            &retry,
+            ConfigApplyOutcome::FailedClosed,
+        );
+        assert_eq!(
+            registry.installed_endpoint_configuration("sb-1", "session-1"),
+            None
+        );
+        assert_eq!(
+            registry.installed_endpoint_configuration("sb-1", "replaced"),
+            None
+        );
+    }
+
+    #[test]
     fn bootstrap_result_acknowledges_only_an_applied_configuration() {
         let registry = SupervisorSessionRegistry::new();
         let (mut slots, bootstrap) =
@@ -1624,6 +1738,218 @@ mod tests {
         report(ConfigApplyOutcome::Applied);
         assert_eq!(
             registry.deliver_config("sb-1", "session-1", config(7)),
+            DeliveryDisposition::SuppressedUnchanged
+        );
+    }
+
+    #[test]
+    fn retained_failure_redelivers_previous_generation_including_coalesced_recovery() {
+        for coalesced in [false, true] {
+            for recorded in [false, true] {
+                let (tx, _rx) = mpsc::channel(4);
+                let mut state = ConfigSessionState::new(tx);
+                let mut healthy = config(7);
+                healthy.sandbox_config.policy_hash = "last-successful-policy".into();
+                healthy.sandbox_config.provider_env_revision = 101;
+                let fingerprint = ConfigFingerprint::of(&healthy.sandbox_config);
+                let first = sent_update(state.deliver(healthy.clone()).unwrap().message);
+                let applied = state
+                    .complete(&update_result(&first, ConfigApplyOutcome::Applied))
+                    .unwrap();
+                assert!(state.finalize(&applied, true).is_none());
+                assert_eq!(state.acknowledged, Some(fingerprint.clone()));
+                assert_eq!(state.installed, Some(fingerprint.clone()));
+
+                let mut candidate = config(8);
+                candidate.sandbox_config.policy_hash = "tightened-but-uninstalled-policy".into();
+                candidate.sandbox_config.provider_env_revision = 202;
+                let unresolved = sent_update(state.deliver(candidate).unwrap().message);
+                assert_eq!(state.installed, Some(fingerprint.clone()));
+                if coalesced {
+                    assert!(matches!(
+                        state.deliver(healthy.clone()),
+                        Err(DeliveryDisposition::Coalesced)
+                    ));
+                }
+                let failed = state
+                    .complete(&update_result(
+                        &unresolved,
+                        ConfigApplyOutcome::FailedRetainedLastKnownGood,
+                    ))
+                    .unwrap();
+                let released = state.finalize(&failed, recorded);
+                assert_eq!(state.acknowledged, None);
+                assert_eq!(
+                    state.installed, None,
+                    "retained policy is not a complete installed configuration"
+                );
+                // Finalizing the same result twice cannot invalidate or
+                // release a newer update.
+                assert!(state.finalize(&failed, true).is_none());
+                let recovery = if coalesced {
+                    sent_update(
+                        released
+                            .expect("pending recovery must not be dropped")
+                            .message,
+                    )
+                } else {
+                    assert!(released.is_none());
+                    sent_update(state.deliver(healthy.clone()).unwrap().message)
+                };
+                assert_eq!(
+                    ConfigFingerprint::of(recovery.sandbox_config.as_ref().unwrap()),
+                    fingerprint
+                );
+                // A failed recovery is still retryable, even though this was
+                // once the durable successful identity.
+                let retry = state
+                    .complete(&update_result(
+                        &recovery,
+                        ConfigApplyOutcome::FailedRetainedLastKnownGood,
+                    ))
+                    .unwrap();
+                assert!(state.finalize(&retry, true).is_none());
+                let recovery = sent_update(state.deliver(healthy.clone()).unwrap().message);
+                let applied = state
+                    .complete(&update_result(&recovery, ConfigApplyOutcome::Applied))
+                    .unwrap();
+                assert!(state.finalize(&applied, true).is_none());
+                assert_eq!(state.installed, Some(fingerprint.clone()));
+                assert_eq!(state.acknowledged, Some(fingerprint));
+                assert!(
+                    matches!(
+                        state.deliver(healthy),
+                        Err(DeliveryDisposition::SuppressedUnchanged)
+                    ),
+                    "successful recovery must stop duplicate retries"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unrecorded_success_cannot_preserve_an_older_suppression_or_report_identity() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut state = ConfigSessionState::new(tx);
+        let healthy = config(7);
+        let first = sent_update(state.deliver(healthy.clone()).unwrap().message);
+        let applied = state
+            .complete(&update_result(&first, ConfigApplyOutcome::Applied))
+            .unwrap();
+        state.finalize(&applied, true);
+        let newer = sent_update(state.deliver(config(8)).unwrap().message);
+        assert!(matches!(
+            state.deliver(healthy.clone()),
+            Err(DeliveryDisposition::Coalesced)
+        ));
+        let applied = state
+            .complete(&update_result(&newer, ConfigApplyOutcome::Applied))
+            .unwrap();
+        let recovery = state
+            .finalize(&applied, false)
+            .expect("unrecorded update cannot suppress pending recovery");
+        assert_eq!(state.installed, None);
+        assert_eq!(state.acknowledged, None);
+        let recovery = sent_update(recovery.message);
+        let duplicate = state
+            .complete(&update_result(
+                &recovery,
+                ConfigApplyOutcome::IgnoredDuplicate,
+            ))
+            .unwrap();
+        state.finalize(&duplicate, true);
+        assert!(matches!(
+            state.deliver(healthy),
+            Err(DeliveryDisposition::SuppressedUnchanged)
+        ));
+    }
+
+    #[test]
+    fn ignored_stale_and_unsupported_do_not_forget_a_successful_configuration() {
+        for outcome in [
+            ConfigApplyOutcome::IgnoredStale,
+            ConfigApplyOutcome::Unsupported,
+        ] {
+            let (tx, _rx) = mpsc::channel(4);
+            let mut state = ConfigSessionState::new(tx);
+            let healthy = config(7);
+            let fingerprint = ConfigFingerprint::of(&healthy.sandbox_config);
+            let first = sent_update(state.deliver(healthy.clone()).unwrap().message);
+            let applied = state
+                .complete(&update_result(&first, ConfigApplyOutcome::Applied))
+                .unwrap();
+            state.finalize(&applied, true);
+            let ignored = sent_update(state.deliver(config(8)).unwrap().message);
+            assert!(matches!(
+                state.deliver(healthy.clone()),
+                Err(DeliveryDisposition::Coalesced)
+            ));
+            let completed = state.complete(&update_result(&ignored, outcome)).unwrap();
+            assert!(state.finalize(&completed, true).is_none());
+            assert_eq!(state.installed, Some(fingerprint.clone()));
+            assert_eq!(state.acknowledged, Some(fingerprint));
+            assert!(matches!(
+                state.deliver(healthy),
+                Err(DeliveryDisposition::SuppressedUnchanged)
+            ));
+        }
+    }
+
+    #[test]
+    fn retained_failure_from_replaced_session_cannot_invalidate_recovery() {
+        let registry = SupervisorSessionRegistry::new();
+        let (mut old_slots, bootstrap) =
+            register_bootstrapped_session(&registry, "sb-1", "old", config(7));
+        answer_bootstrap(
+            &registry,
+            "sb-1",
+            "old",
+            &bootstrap,
+            ConfigApplyOutcome::Applied,
+        );
+        assert_eq!(
+            registry.deliver_config("sb-1", "old", config(8)),
+            DeliveryDisposition::Queued
+        );
+        let failed = take_update(&mut old_slots).unwrap();
+        assert_eq!(
+            registry.deliver_config("sb-1", "old", config(7)),
+            DeliveryDisposition::Coalesced
+        );
+        let completed = registry
+            .complete_config_update(
+                "sb-1",
+                "old",
+                &update_result(&failed, ConfigApplyOutcome::FailedRetainedLastKnownGood),
+            )
+            .unwrap();
+
+        let (mut new_slots, bootstrap) =
+            register_bootstrapped_session(&registry, "sb-1", "new", config(7));
+        assert_eq!(
+            registry.installed_endpoint_configuration("sb-1", "new"),
+            None
+        );
+        answer_bootstrap(
+            &registry,
+            "sb-1",
+            "new",
+            &bootstrap,
+            ConfigApplyOutcome::Applied,
+        );
+        registry.finalize_config_update("sb-1", "old", &completed, false);
+        assert!(take_update(&mut old_slots).is_none());
+        assert!(take_update(&mut new_slots).is_none());
+        assert_eq!(
+            registry.installed_endpoint_configuration("sb-1", "old"),
+            None
+        );
+        assert_eq!(
+            registry.installed_endpoint_configuration("sb-1", "new"),
+            Some((String::new(), 0))
+        );
+        assert_eq!(
+            registry.deliver_config("sb-1", "new", config(7)),
             DeliveryDisposition::SuppressedUnchanged
         );
     }

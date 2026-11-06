@@ -249,9 +249,16 @@ pub struct CredentialRefreshProfile {
     #[serde(
         default = "default_refresh_strategy",
         deserialize_with = "deserialize_refresh_strategy",
-        serialize_with = "serialize_refresh_strategy"
+        serialize_with = "serialize_refresh_strategy",
+        skip_serializing_if = "is_unspecified_refresh_strategy"
     )]
     pub strategy: ProviderCredentialRefreshStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_name: Option<String>,
+    /// Unknown wire integers survive import/export, but never pass validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[doc(hidden)]
+    pub strategy_unknown_value: Option<i32>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub token_url: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -288,6 +295,8 @@ pub struct CredentialRefreshProfile {
 impl PartialEq for CredentialRefreshProfile {
     fn eq(&self, other: &Self) -> bool {
         self.strategy == other.strategy
+            && self.strategy_name == other.strategy_name
+            && self.strategy_unknown_value == other.strategy_unknown_value
             && self.token_url == other.token_url
             && self.scopes == other.scopes
             && self.refresh_before_seconds == other.refresh_before_seconds
@@ -971,7 +980,8 @@ impl ProviderTypeProfile {
 
         self.credentials.iter().find(|cred| {
             cred.refresh.as_ref().is_some_and(|refresh| {
-                refresh.strategy == ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+                refresh.effective_strategy().ok()
+                    == Some(ProviderCredentialRefreshStrategy::Oauth2RefreshToken)
                     && ADC_MATERIAL_KEYS
                         .iter()
                         .all(|key| refresh.material.iter().any(|m| m.name == *key))
@@ -1140,9 +1150,24 @@ impl CredentialProfile {
 }
 
 impl CredentialRefreshProfile {
+    /// Structural selection only. Runtime availability is checked separately
+    /// against the embedding gateway's minter registry.
+    pub fn effective_strategy(&self) -> Result<ProviderCredentialRefreshStrategy, String> {
+        if let Some(value) = self.strategy_unknown_value
+            && ProviderCredentialRefreshStrategy::try_from(value).is_ok()
+        {
+            return Err("strategy_unknown_value must contain an unknown enum integer".into());
+        }
+        ProviderCredentialRefreshStrategy::resolve_input(
+            self.strategy_unknown_value.unwrap_or(self.strategy as i32),
+            self.strategy_name.as_deref(),
+        )
+    }
+
     #[must_use]
     pub fn is_gateway_mintable(&self) -> bool {
-        is_gateway_mintable_strategy(self.strategy)
+        self.effective_strategy()
+            .is_ok_and(is_gateway_mintable_strategy)
     }
 }
 
@@ -1282,6 +1307,11 @@ fn is_zero_i64(value: &i64) -> bool {
 
 fn default_refresh_strategy() -> ProviderCredentialRefreshStrategy {
     ProviderCredentialRefreshStrategy::Unspecified
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip predicate signature
+fn is_unspecified_refresh_strategy(strategy: &ProviderCredentialRefreshStrategy) -> bool {
+    *strategy == ProviderCredentialRefreshStrategy::Unspecified
 }
 
 fn default_token_grant_type() -> ProviderCredentialTokenGrantType {
@@ -1452,6 +1482,10 @@ fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> Credent
     CredentialRefreshProfile {
         strategy: ProviderCredentialRefreshStrategy::try_from(refresh.strategy)
             .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified),
+        strategy_name: refresh.strategy_name.clone(),
+        strategy_unknown_value: ProviderCredentialRefreshStrategy::try_from(refresh.strategy)
+            .is_err()
+            .then_some(refresh.strategy),
         token_url: refresh.token_url.clone(),
         scopes: refresh.scopes.clone(),
         refresh_before_seconds: 0,
@@ -1494,7 +1528,10 @@ fn validate_profile_duration(value: &prost_types::Duration) -> Result<(), String
 
 fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCredentialRefresh {
     ProviderCredentialRefresh {
-        strategy: refresh.strategy as i32,
+        strategy: refresh
+            .strategy_unknown_value
+            .unwrap_or(refresh.strategy as i32),
+        strategy_name: refresh.strategy_name.clone(),
         token_url: refresh.token_url.clone(),
         scopes: refresh.scopes.clone(),
         refresh_before: profile_duration_to_proto(
@@ -2421,7 +2458,19 @@ pub fn validate_profile_set(
             }
 
             if let Some(refresh) = credential.refresh.as_ref() {
-                if refresh.strategy == ProviderCredentialRefreshStrategy::Unspecified {
+                let strategy = match refresh.effective_strategy() {
+                    Ok(strategy) => strategy,
+                    Err(error) => {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.strategy_name",
+                            error,
+                        ));
+                        ProviderCredentialRefreshStrategy::Unspecified
+                    }
+                };
+                if strategy == ProviderCredentialRefreshStrategy::Unspecified {
                     diagnostics.push(ProfileValidationDiagnostic::error(
                         source,
                         profile_id,
@@ -2521,8 +2570,8 @@ pub fn validate_profile_set(
                     }
                 }
 
-                let strategy_name = provider_refresh_strategy_to_yaml(refresh.strategy);
-                let (required_outputs, optional_outputs) = strategy_output_spec(refresh.strategy);
+                let strategy_name = provider_refresh_strategy_to_yaml(strategy);
+                let (required_outputs, optional_outputs) = strategy_output_spec(strategy);
                 let known_outputs: HashSet<&str> = required_outputs
                     .iter()
                     .chain(optional_outputs.iter())
@@ -2610,7 +2659,7 @@ pub fn validate_profile_set(
                         continue;
                     }
                     let resolved = sibling.env_vars[0].as_str();
-                    if let Some(expected) = strategy_output_env_key(refresh.strategy, output_id)
+                    if let Some(expected) = strategy_output_env_key(strategy, output_id)
                         && resolved != expected
                     {
                         diagnostics.push(ProfileValidationDiagnostic::error(
@@ -2637,7 +2686,7 @@ pub fn validate_profile_set(
                     }
                 }
 
-                if let Some(expected_primary) = strategy_primary_env_key(refresh.strategy)
+                if let Some(expected_primary) = strategy_primary_env_key(strategy)
                     && (credential.env_vars.len() != 1
                         || credential.env_vars[0] != expected_primary)
                 {
@@ -3737,7 +3786,10 @@ mod tests {
     use std::collections::HashMap;
 
     use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
-    use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
+    use openshell_core::proto::{
+        ProviderCredentialRefresh, ProviderCredentialRefreshStrategy,
+        ProviderCredentialTokenGrantType, ProviderProfileCategory,
+    };
 
     use super::{
         DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile,
@@ -6474,6 +6526,89 @@ binaries:
     }
 
     #[test]
+    fn strategy_names_roundtrip_without_changing_enum_presence() {
+        for strategy in [
+            ProviderCredentialRefreshStrategy::Static,
+            ProviderCredentialRefreshStrategy::External,
+            ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+            ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+            ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt,
+            ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+        ] {
+            for enum_value in [0, strategy as i32] {
+                let proto = ProviderCredentialRefresh {
+                    strategy: enum_value,
+                    strategy_name: Some(strategy.canonical_name().to_string()),
+                    ..Default::default()
+                };
+                let profile = super::credential_refresh_from_proto(&proto);
+                assert_eq!(profile.effective_strategy().unwrap(), strategy);
+                assert_eq!(super::credential_refresh_to_proto(&profile), proto);
+                let yaml = serde_yml::to_string(&profile).unwrap();
+                let decoded: super::CredentialRefreshProfile = serde_yml::from_str(&yaml).unwrap();
+                assert_eq!(decoded, profile);
+                assert_eq!(super::credential_refresh_to_proto(&decoded), proto);
+            }
+        }
+    }
+
+    #[test]
+    fn authored_strategy_names_reject_conflicts_and_preserve_unknown_wire_values() {
+        for (strategy, name) in [
+            (i32::MAX, "oauth2_refresh_token"),
+            (-1, "oauth2_refresh_token"),
+            (
+                ProviderCredentialRefreshStrategy::External as i32,
+                "oauth2_refresh_token",
+            ),
+            (0, "custom:example"),
+            (0, ""),
+        ] {
+            let proto = ProviderCredentialRefresh {
+                strategy,
+                strategy_name: Some(name.into()),
+                ..Default::default()
+            };
+            let refresh = super::credential_refresh_from_proto(&proto);
+            assert!(refresh.effective_strategy().is_err());
+            assert!(!refresh.is_gateway_mintable());
+            assert_eq!(super::credential_refresh_to_proto(&refresh), proto);
+            let mut profile = example_profile("aws").clone();
+            profile.credentials[0].refresh = Some(refresh);
+            assert!(
+                validate_profile_set(&[("test".into(), profile)])
+                    .iter()
+                    .any(|diagnostic| diagnostic.severity == "error")
+            );
+        }
+    }
+
+    #[test]
+    fn name_only_aws_keeps_output_validation_and_runtime_resolution() {
+        let mut profile = example_profile("aws").clone();
+        let refresh = profile.credentials[0].refresh.as_mut().unwrap();
+        refresh.strategy = ProviderCredentialRefreshStrategy::Unspecified;
+        refresh.strategy_name = Some("aws_sts_assume_role".into());
+        assert!(refresh.is_gateway_mintable());
+        assert!(
+            !validate_profile_set(&[("test".into(), profile.clone())])
+                .iter()
+                .any(|diagnostic| diagnostic.severity == "error")
+        );
+        profile.credentials[0]
+            .refresh
+            .as_mut()
+            .unwrap()
+            .additional_outputs
+            .clear();
+        assert!(
+            validate_profile_set(&[("test".into(), profile)])
+                .iter()
+                .any(|diagnostic| diagnostic.severity == "error")
+        );
+    }
+
+    #[test]
     fn aws_sts_strategy_serde_roundtrip() {
         use openshell_core::proto::ProviderCredentialRefreshStrategy;
         assert_eq!(
@@ -6502,7 +6637,7 @@ binaries:
         let refresh = access_key.refresh.as_ref().unwrap();
         assert_eq!(
             refresh.strategy,
-            openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            ProviderCredentialRefreshStrategy::AwsStsAssumeRole
         );
         assert!(
             refresh
@@ -6604,7 +6739,7 @@ binaries:
     #[test]
     fn is_gateway_mintable_strategy_includes_aws_sts() {
         assert!(super::is_gateway_mintable_strategy(
-            openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            ProviderCredentialRefreshStrategy::AwsStsAssumeRole
         ));
     }
 

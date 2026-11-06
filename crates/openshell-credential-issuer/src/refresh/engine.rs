@@ -8,15 +8,13 @@ use super::minter::{
     refresh_strategy_name,
 };
 use super::{
-    CredentialRefresh, RefreshAttempt, RefreshChange, RefreshOutputs, RefreshRuntime, RefreshState,
-    RefreshStateStore, minter,
+    CredentialRefresh, ReferenceActivationError, RefreshAttempt, RefreshChange, RefreshOutputs,
+    RefreshRuntime, RefreshState, RefreshStateStore, minter,
 };
 use crate::{CredentialIssuer, RefreshMaterialScope, StoreSecrets};
 use crate::{Handles, RefreshMaterialDeletion, SecretOwner};
 use async_trait::async_trait;
-use openshell_core::proto::{
-    CredentialHandle, ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStrategy,
-};
+use openshell_core::proto::{CredentialHandle, ProviderCredentialRefreshRecoveryAction};
 use openshell_core::time::now_ms as current_time_ms;
 use openshell_core::{ObjectId, ObjectWorkspace};
 use std::time::Duration;
@@ -172,18 +170,9 @@ pub async fn delete_refresh_states_for_provider_with_credentials(
 ) -> Result<u64, Status> {
     let states = list_refresh_states_for_provider(store, provider_id).await?;
     let mut deleted = 0;
-    for state in &states {
-        if delete_refresh_state_with_credentials(
-            store,
-            credentials,
-            state.object_workspace(),
-            provider_id,
-            &state.credential_key,
-        )
-        .await?
-        {
-            deleted += 1;
-        }
+    for state in states {
+        delete_observed_refresh_state_with_credentials(store, credentials, state).await?;
+        deleted += 1;
     }
     Ok(deleted)
 }
@@ -457,19 +446,41 @@ pub async fn refresh_provider_credential(
     provider_name: &str,
     credential_key: &str,
 ) -> Result<RefreshState, Status> {
-    let provider = runtime
-        .gateway
-        .observe(workspace, provider_name)
-        .await
-        .map_err(simple_observe_error)?;
-    let snapshot = get_refresh_state(
-        &runtime.store,
-        workspace,
-        provider.owner().legacy_scope().id,
-        credential_key,
-    )
-    .await?
-    .ok_or_else(|| Status::not_found("provider refresh state not found"))?;
+    let snapshot = if let Some(gateway) = &runtime.gateway {
+        let provider = gateway
+            .observe(workspace, provider_name)
+            .await
+            .map_err(simple_observe_error)?;
+        get_refresh_state(
+            &runtime.store,
+            workspace,
+            provider.owner().legacy_scope().id,
+            credential_key,
+        )
+        .await?
+        .ok_or_else(|| Status::not_found("provider refresh state not found"))?
+    } else {
+        // Active grants are issuer-owned. No provider name lookup or callback
+        // into gateway persistence is permitted in reference mode.
+        let mut states = runtime.store.list(None).await?.into_iter().filter(|state| {
+            state.object_workspace() == workspace
+                && state.provider_name == provider_name
+                && state.credential_key == credential_key
+                && state
+                    .metadata
+                    .as_ref()
+                    .is_none_or(|m| m.deletion_time.is_none())
+        });
+        let state = states
+            .next()
+            .ok_or_else(|| Status::not_found("provider refresh state not found"))?;
+        if states.next().is_some() {
+            return Err(Status::failed_precondition(
+                "ambiguous active provider grant identity",
+            ));
+        }
+        state
+    };
     refresh_from_snapshot_with_trigger(runtime, snapshot, RefreshTrigger::ExplicitRotation).await
 }
 
@@ -546,14 +557,18 @@ async fn refresh_from_snapshot_with_trigger(
         {
             return Ok(latest);
         }
-        let provider = runtime
-            .gateway
-            .observe(snapshot.object_workspace(), &snapshot.provider_name)
-            .await
-            .map_err(simple_observe_error)?;
-        if provider.owner().legacy_scope().id != snapshot.provider_id {
-            return Err(Status::aborted("provider was replaced"));
-        }
+        let provider = if let Some(gateway) = &runtime.gateway {
+            let provider = gateway
+                .observe(snapshot.object_workspace(), &snapshot.provider_name)
+                .await
+                .map_err(simple_observe_error)?;
+            if provider.owner().legacy_scope().id != snapshot.provider_id {
+                return Err(Status::aborted("provider was replaced"));
+            }
+            Some(provider)
+        } else {
+            None
+        };
         if matches!(
             latest.status.as_str(),
             "refresh_in_progress" | "refresh_committing"
@@ -565,13 +580,7 @@ async fn refresh_from_snapshot_with_trigger(
         if trigger == RefreshTrigger::Automatic {
             ensure_automatic_refresh_ready(&latest, current_time_ms())?;
         }
-        refresh_provider_credential_locked(
-            &runtime,
-            snapshot.object_workspace(),
-            &snapshot.provider_name,
-            &snapshot.credential_key,
-        )
-        .await
+        refresh_provider_credential_locked(&runtime, latest, provider).await
     })
     .await
     .map_err(|_| Status::internal("credential refresh worker failed"))?
@@ -579,27 +588,16 @@ async fn refresh_from_snapshot_with_trigger(
 
 async fn refresh_provider_credential_locked(
     runtime: &RefreshRuntime,
-    workspace: &str,
-    provider_name: &str,
-    credential_key: &str,
+    mut state: RefreshState,
+    provider: Option<Box<dyn RefreshAttempt>>,
 ) -> Result<RefreshState, Status> {
+    let credential_key = state.credential_key.clone();
     let store = &runtime.store;
     let credentials = runtime.credentials.as_ref().ok_or_else(|| {
         Status::failed_precondition(
             "provider refresh material requires the configured credential runtime",
         )
     })?;
-    let provider = runtime.gateway.observe(workspace, provider_name).await?;
-    let Some(state) = get_refresh_state(
-        store,
-        workspace,
-        provider.owner().legacy_scope().id,
-        credential_key,
-    )
-    .await?
-    else {
-        return Err(Status::not_found("provider refresh state not found"));
-    };
     if state
         .metadata
         .as_ref()
@@ -609,7 +607,6 @@ async fn refresh_provider_credential_locked(
             "provider refresh is being deleted",
         ));
     }
-    let mut state = state;
     validate_secret_material_references(&state)?;
     // Generation of the refresh at the start of the rotation. Terminal persists
     // match on it so a concurrent delete or rotation is detected rather than
@@ -802,47 +799,119 @@ async fn refresh_provider_credential_locked(
                 }
             };
 
-            // Generation is ours; write the minted credentials into the provider.
-            if let Err(err) = apply_minted_credential(
-                Some(credentials),
-                provider.as_ref(),
-                credential_key,
-                &minted,
-            )
-            .await
-            {
-                // Reflect the failure on the state we just wrote; skip silently
-                // if it was deleted concurrently (it is not recreated).
-                let failure = RefreshFailure::from_status(&err);
-                persist_refresh_failure_state(store, &mut state, new_version, &failure).await?;
-                warn!(
-                    provider = %state.provider_name,
-                    credential_key = %state.credential_key,
-                    strategy = %refresh_strategy_name(state.strategy),
-                    status = %state.status,
-                    next_refresh_at_ms = state.next_refresh_at_ms,
-                    seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
-                    error = %err,
-                    "provider credential refresh errored"
-                );
-                return Err(err);
-            }
-            // A success snapshot must not become visible before its provider
-            // handles are committed. Park incomplete commits rather than minting
-            // again after a crash or lost database session.
-            state.status = "refreshed".to_string();
-            state.next_refresh_at_ms = completed_next_refresh_at_ms;
-            if let Some(metadata) = state.metadata.as_mut() {
-                metadata.annotations.insert(
-                    COMPLETED_MINT_ANNOTATION.to_string(),
-                    uuid::Uuid::new_v4().to_string(),
-                );
-            }
-            let new_version = persist_refresh_state_if_current(store, &state, new_version)
-                .await?
-                .ok_or_else(|| {
-                    Status::aborted("provider refresh changed during credential commit")
-                })?;
+            let new_version = if let Some(outputs) = &runtime.outputs {
+                let mut completed = state.clone();
+                completed.status = "refreshed".to_string();
+                completed.next_refresh_at_ms = completed_next_refresh_at_ms;
+                if let Some(metadata) = completed.metadata.as_mut() {
+                    metadata.annotations.insert(
+                        COMPLETED_MINT_ANNOTATION.to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                    );
+                }
+                let expected_mint = completed_mint(&completed).map(str::to_owned);
+                let mut values =
+                    HashMap::from([(credential_key.clone(), minted.access_token.clone())]);
+                values.extend(minted.additional_credentials.clone());
+                let expiration = openshell_core::time::optional_timestamp_from_legacy_millis(
+                    minted.expires_at_ms,
+                )
+                .map_err(|error| Status::internal(error.to_string()))?;
+                // One issuer manifest CAS exposes values/versions and terminal
+                // grant state together. No gateway provider write occurs.
+                match outputs
+                    .activate(completed, new_version, values, expiration)
+                    .await
+                {
+                    Ok(committed) => {
+                        state = committed;
+                    }
+                    Err(ReferenceActivationError::NotActivated {
+                        state: staged,
+                        error,
+                    }) => {
+                        // Output storage failed before activation. The staging
+                        // journal advanced, so use its actual CAS version and
+                        // retain rotated material and staged-write evidence.
+                        state = *staged;
+                        if let Some(metadata) = state.metadata.as_mut() {
+                            metadata.annotations.remove(COMPLETED_MINT_ANNOTATION);
+                        }
+                        let staged_version = state
+                            .metadata
+                            .as_ref()
+                            .map_or(0, |metadata| metadata.resource_version);
+                        let failure = RefreshFailure::from_status(&error);
+                        persist_refresh_failure_state(store, &mut state, staged_version, &failure)
+                            .await?;
+                        return Err(error);
+                    }
+                    Err(ReferenceActivationError::Uncertain(error)) => {
+                        // A lost response may follow a successful activation.
+                        // Recognize only this exact completed mint; otherwise
+                        // leave uncertainty parked, never schedule a remint.
+                        if let Ok(Some(committed)) = store.get_by_id(state.object_id()).await
+                            && committed.object_id() == state.object_id()
+                            && committed.status == "refreshed"
+                            && expected_mint.as_deref() == completed_mint(&committed)
+                            && effective_authorization_epoch(&committed)?
+                                == effective_authorization_epoch(&state)?
+                        {
+                            state = committed;
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                }
+                state
+                    .metadata
+                    .as_ref()
+                    .map_or(0, |metadata| metadata.resource_version)
+            } else {
+                // Generation is ours; write the minted credentials into the provider.
+                if let Err(err) = apply_minted_credential(
+                    Some(credentials),
+                    provider
+                        .as_deref()
+                        .ok_or_else(|| Status::internal("legacy refresh commit is unavailable"))?,
+                    &credential_key,
+                    &minted,
+                )
+                .await
+                {
+                    // Reflect the failure on the state we just wrote; skip silently
+                    // if it was deleted concurrently (it is not recreated).
+                    let failure = RefreshFailure::from_status(&err);
+                    persist_refresh_failure_state(store, &mut state, new_version, &failure).await?;
+                    warn!(
+                        provider = %state.provider_name,
+                        credential_key = %state.credential_key,
+                        strategy = %refresh_strategy_name(state.strategy),
+                        status = %state.status,
+                        next_refresh_at_ms = state.next_refresh_at_ms,
+                        seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
+                        error = %err,
+                        "provider credential refresh errored"
+                    );
+                    return Err(err);
+                }
+                // A success snapshot must not become visible before its provider
+                // handles are committed. Park incomplete commits rather than minting
+                // again after a crash or lost database session.
+                state.status = "refreshed".to_string();
+                state.next_refresh_at_ms = completed_next_refresh_at_ms;
+                if let Some(metadata) = state.metadata.as_mut() {
+                    metadata.annotations.insert(
+                        COMPLETED_MINT_ANNOTATION.to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                    );
+                }
+                persist_refresh_state_if_current(store, &state, new_version)
+                    .await?
+                    .ok_or_else(|| {
+                        Status::aborted("provider refresh changed during credential commit")
+                    })?
+            };
             info!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
@@ -1058,14 +1127,9 @@ pub async fn refresh_states(
                 );
                 continue;
             };
-            if let Err(err) = delete_refresh_state_with_credentials(
-                store,
-                credentials,
-                state.object_workspace(),
-                &state.provider_id,
-                &state.credential_key,
-            )
-            .await
+            if let Err(err) =
+                delete_observed_refresh_state_with_credentials(store, credentials, state.clone())
+                    .await
             {
                 warn!(
                     provider = %state.provider_name,
@@ -1089,9 +1153,9 @@ pub async fn refresh_states(
                 "provider refresh material cleanup failed; continuing with live refresh"
             );
         }
-        let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
-            .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
-        if !minter::can_mint(strategy as i32) {
+        if !minter::built_in_minters()
+            .can_mint_input(state.strategy, state.strategy_name.as_deref())
+        {
             warn!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
@@ -1201,12 +1265,80 @@ fn seconds_until_ms(now_ms: i64, target_ms: i64) -> i64 {
     }
 }
 
+/// Project an observed durable state into an embedded invalidation hint.
+///
+/// Callers retain publication ownership and must supply the committed snapshot,
+/// not an in-memory candidate prepared before activation.
 pub fn change(state: &RefreshState) -> RefreshChange {
+    let authorization_epoch = effective_authorization_epoch(state).ok();
+    let owner = crate::references::OwnerIdentity::of(SecretOwner::provider(
+        state.object_workspace(),
+        &state.provider_id,
+        &state.provider_name,
+    ));
+    // Preserve name-scoped invalidation even for corrupt state, without
+    // fabricating identity or advertising a partial/inconsistent output bundle.
+    let projections: Option<Vec<_>> = state
+        .output_references
+        .iter()
+        .map(|(key, handle)| {
+            crate::references::ReferenceProjection::from_handle(handle)
+                .ok()
+                .flatten()
+                .map(|projection| (key, projection))
+        })
+        .collect();
+    let projections = projections.filter(|projections| {
+        projections.first().is_some_and(|(_, first)| {
+            !first.namespace.is_empty()
+                && !first.manifest_id.is_empty()
+                && !state.object_id().is_empty()
+                && !state.provider_id.is_empty()
+                && projections.iter().all(|(key, projection)| {
+                    projection.namespace == first.namespace
+                        && projection.manifest_id == first.manifest_id
+                        && projection.owner == owner
+                        && projection.credential_key == **key
+                        && Some(projection.epoch.as_str()) == authorization_epoch
+                        && !projection.reference_id.is_empty()
+                })
+        })
+    });
     RefreshChange {
         workspace: state.object_workspace().to_string(),
         provider_name: state.provider_name.clone(),
+        provider_id: state.provider_id.clone(),
+        grant_id: state.object_id().to_owned(),
+        authorization_epoch: authorization_epoch.map(str::to_owned),
+        issuer_namespace: projections
+            .as_ref()
+            .and_then(|projections| projections.first())
+            .map(|(_, projection)| projection.namespace.clone()),
         credential_key: state.credential_key.clone(),
         completed_mint: completed_mint(state).map(str::to_owned),
+        references: if state.status == "refreshed"
+            && state.reference_generation > 0
+            && state
+                .metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.deletion_time.is_none())
+        {
+            // A fixed grant bundle starts all outputs at one and advances
+            // every output in each atomic activation. Unlike row versions,
+            // its generation therefore equals each committed secret version.
+            projections
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(key, projection)| {
+                    (
+                        key.clone(),
+                        (projection.reference_id, state.reference_generation),
+                    )
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        },
     }
 }
 

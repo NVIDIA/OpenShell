@@ -249,12 +249,16 @@ The gateway stores secret refresh material through its active credential driver.
 With Vault selected, refresh tokens, client secrets, and private keys live in
 Vault alongside injectable provider credentials; refresh state contains only
 opaque handles. A credential-backend read or write failure makes refresh fail
-closed rather than falling back to inline storage. Before OpenShell 0.1.0, the
-gateway does not migrate legacy inline refresh material or move secrets between
-credential backends. Reconfigure affected grants after upgrading, and remove or
-reconfigure credentials while the original backend remains available before
-changing backends. Do not run mixed gateway versions against the same refresh
-records.
+closed rather than falling back to inline storage. Legacy mode does not
+migrate inline refresh material automatically. Versioned credential activation
+is a separate, default-off operator maintenance procedure: drain all incompatible
+writers and take coordinated database/backend backups before enabling it. It
+adopts existing handles and migrates inline material through the selected backend;
+it does not move secrets between backends. Do not enable it as a workaround for a
+credential error or run mixed gateway versions against converted records. After
+the first incompatible binding change, disabling the option is not a downgrade
+path. Follow the published [gateway activation guidance](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#versioned-credential-activation)
+and the `debug-openshell-cluster` skill.
 
 Gateway-managed refresh credentials use an identity-stable workload handle.
 Routine automatic refresh and `provider refresh rotate` update the access token
@@ -268,7 +272,11 @@ While gateway-managed refresh is configured, `provider update --credential`
 cannot replace or delete the refresh-owned primary credential or any co-minted
 output. Use `provider refresh rotate`, reconfigure refresh, or delete refresh
 before returning those keys to manual management. Unrelated provider fields
-remain updateable.
+remain updateable. In versioned mode, if backend cleanup leaves the current
+refresh state in `deleting`, restore backend access and repeat
+`provider refresh delete` for the same key. Credential-specific status still
+shows that cleanup debt; do not reconfigure or manually replace its keys until
+deletion completes.
 
 When OAuth refresh fails, inspect the `RECOVERY` and `FAILURE_CODE` columns from
 `provider refresh status`; do not infer the remedy from HTTP status or parse

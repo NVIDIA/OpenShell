@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Default)]
 struct RefreshProbe {
     records: Mutex<Vec<RefreshState>>,
+    listed_snapshot: Option<Vec<RefreshState>>,
     deleted: Mutex<Vec<RefreshState>>,
     gets: AtomicUsize,
     lists: AtomicUsize,
@@ -41,6 +42,9 @@ impl CredentialRefresh for RefreshProbe {
     }
     async fn list(&self, provider_id: Option<&str>) -> Result<Vec<RefreshState>, Status> {
         self.lists.fetch_add(1, Ordering::SeqCst);
+        if let Some(snapshot) = &self.listed_snapshot {
+            return Ok(snapshot.clone());
+        }
         Ok(self
             .records
             .lock()
@@ -183,7 +187,7 @@ async fn provider_deletion_uses_injected_refresh_lifecycle() {
     let deleted = refresh.deleted.lock().unwrap();
     assert_eq!(deleted.len(), 1);
     assert_eq!(deleted[0].object_id(), grant.object_id());
-    assert_eq!(refresh.gets.load(Ordering::SeqCst), 1);
+    assert_eq!(refresh.gets.load(Ordering::SeqCst), 0);
     assert_eq!(refresh.lists.load(Ordering::SeqCst), 1);
 }
 
@@ -211,4 +215,61 @@ async fn observed_refresh_deletion_preserves_snapshot_without_local_lookup() {
     );
     assert_eq!(refresh.gets.load(Ordering::SeqCst), 0);
     assert_eq!(refresh.lists.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn bulk_refresh_deletion_targets_observed_ids_not_concurrent_same_key_winner() {
+    let (provider, observed, mut refresh) = fixture();
+    refresh.listed_snapshot = Some(vec![observed.clone()]);
+    refresh.records.lock().unwrap()[0]
+        .metadata
+        .as_mut()
+        .unwrap()
+        .id = "concurrent-winner".into();
+    assert_eq!(
+        crate::provider_refresh::delete_refresh_states_for_provider_with_credentials(
+            &refresh,
+            provider.object_id(),
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let deleted = refresh.deleted.lock().unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].object_id(), observed.object_id());
+    assert_eq!(deleted[0].metadata, observed.metadata);
+    assert_eq!(
+        refresh.records.lock().unwrap()[0].object_id(),
+        "concurrent-winner"
+    );
+    assert_eq!(refresh.gets.load(Ordering::SeqCst), 0);
+    assert_eq!(refresh.lists.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn bulk_refresh_deletion_consumes_live_and_cleanup_snapshots_with_same_key() {
+    let (provider, live, refresh) = fixture();
+    let mut deleting = live.clone();
+    deleting.metadata.as_mut().unwrap().id = "cleanup-debt".into();
+    deleting.metadata.as_mut().unwrap().deletion_time =
+        Some(openshell_core::time::timestamp_from_millis(openshell_core::time::now_ms()).unwrap());
+    deleting.status = "deleting".into();
+    refresh.records.lock().unwrap().push(deleting.clone());
+    assert_eq!(
+        crate::provider_refresh::delete_refresh_states_for_provider_with_credentials(
+            &refresh,
+            provider.object_id(),
+        )
+        .await
+        .unwrap(),
+        2
+    );
+    assert!(refresh.records.lock().unwrap().is_empty());
+    let deleted = refresh.deleted.lock().unwrap();
+    assert_eq!(deleted.len(), 2);
+    assert_eq!(deleted[0].object_id(), live.object_id());
+    assert_eq!(deleted[1].object_id(), deleting.object_id());
+    assert_eq!(deleted[1].metadata, deleting.metadata);
+    assert_eq!(refresh.gets.load(Ordering::SeqCst), 0);
 }

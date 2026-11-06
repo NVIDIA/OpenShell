@@ -852,9 +852,20 @@ macro_rules! refresh_mutation {
                 let Outcome::Refresh(reference) = outcome else {
                     return Err(replay_unavailable());
                 };
+                let provider: Provider = live(store, &reference.provider_id).await?;
                 let state: StoredProviderCredentialRefreshState =
-                    live(store, &reference.id).await?;
-                let _: Provider = live(store, &reference.provider_id).await?;
+                    if crate::credential_activation::uses_reference_records(store).await? {
+                        let grant = crate::versioned_credentials::replay_state(
+                            store,
+                            &provider,
+                            &reference.id,
+                        )
+                        .await
+                        .map_err(|_| replay_unavailable())?;
+                        (&grant).into()
+                    } else {
+                        live(store, &reference.id).await?
+                    };
                 if state
                     .metadata
                     .as_ref()

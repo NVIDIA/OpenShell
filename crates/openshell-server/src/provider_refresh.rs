@@ -39,6 +39,15 @@ pub fn runtime(
     credentials: Option<&CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
 ) -> RefreshRuntime {
+    if let Some(credentials) = credentials
+        && let Some(versioned) = credentials.versioned()
+    {
+        return RefreshRuntime::with_references(
+            versioned.clone(),
+            credentials.issuer(),
+            versioned.clone(),
+        );
+    }
     let refresh_store: Arc<dyn RefreshStateStore> =
         Arc::new(crate::refresh_store::ServerRefreshStore(Arc::clone(store)));
     RefreshRuntime::new(
@@ -94,6 +103,10 @@ pub fn refresh_status_from_state(
         provider_id: state.provider_id.clone(),
         credential_key: state.credential_key.clone(),
         strategy: state.strategy,
+        strategy_name: ProviderCredentialRefreshStrategy::try_from(state.strategy)
+            .ok()
+            .filter(|strategy| *strategy != ProviderCredentialRefreshStrategy::Unspecified)
+            .map(|strategy| strategy.canonical_name().to_string()),
         status: state.status.clone(),
         expiration_time: if refresh_has_expiration(state) {
             openshell_core::time::timestamp_from_millis(state.expires_at_ms).ok()
@@ -279,13 +292,10 @@ pub async fn delete_refresh_states_for_provider_with_credentials(
     let states = refresh.list(Some(provider_id)).await?;
     let mut deleted = 0;
     for state in states {
-        if let Some(latest) = refresh
-            .get(state.object_workspace(), provider_id, &state.credential_key)
-            .await?
-        {
-            refresh.delete(latest).await?;
-            deleted += 1;
-        }
+        // Enumeration includes revoked cleanup debt. Its immutable identity,
+        // not a later same-key winner, is the deletion target.
+        refresh.delete(state).await?;
+        deleted += 1;
     }
     Ok(deleted)
 }

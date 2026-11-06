@@ -169,7 +169,8 @@ pub(super) async fn record_provider_mutation(
     mutation_id: &str,
 ) -> Result<ProviderMutationReceipt, Status> {
     let mut desired = target_identity(sandbox, expected_provider);
-    let snapshot_reason = match load_current_snapshot(state, sandbox, provider_name).await {
+    let snapshot_reason = match Box::pin(load_current_snapshot(state, sandbox, provider_name)).await
+    {
         Ok((snapshot, _)) if same_authority(&desired, &snapshot) => {
             desired = snapshot;
             ProviderReadinessReason::Unspecified
@@ -393,20 +394,21 @@ async fn handle_get_sandbox_provider_status_resolved(
         return Err(Status::not_found("provider receipt not found"));
     }
     let current_authority = current_target_identity(state, &sandbox, &receipt.provider).await?;
-    let (current, current_reason) =
-        if let Ok(snapshot) = load_current_snapshot(state, &sandbox, &receipt.provider).await {
-            snapshot
-        } else {
-            // A temporarily unreadable config cannot prove supersession or
-            // completion. Metadata changes remain comparable independently.
-            let mut fallback = current_authority;
-            if let Some(desired) = receipt.desired.as_ref() {
-                fallback.provider_env_revision = desired.provider_env_revision;
-                fallback.config_revision = desired.config_revision;
-                fallback.policy_hash.clone_from(&desired.policy_hash);
-            }
-            (fallback, ProviderReadinessReason::CredentialsWithheld)
-        };
+    let (current, current_reason) = if let Ok(snapshot) =
+        Box::pin(load_current_snapshot(state, &sandbox, &receipt.provider)).await
+    {
+        snapshot
+    } else {
+        // A temporarily unreadable config cannot prove supersession or
+        // completion. Metadata changes remain comparable independently.
+        let mut fallback = current_authority;
+        if let Some(desired) = receipt.desired.as_ref() {
+            fallback.provider_env_revision = desired.provider_env_revision;
+            fallback.config_revision = desired.config_revision;
+            fallback.policy_hash.clone_from(&desired.policy_hash);
+        }
+        (fallback, ProviderReadinessReason::CredentialsWithheld)
+    };
     // Refresh lifecycle identity after configuration reads. Another gateway
     // replica may have accepted a new supervisor while this replica retained
     // the predecessor's local connection and installation evidence.

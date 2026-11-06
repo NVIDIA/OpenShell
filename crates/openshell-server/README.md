@@ -215,18 +215,49 @@ closed without falling back to inline values.
 Explicit rotation, background refresh, and operator refresh-on-read share the
 same refresh coordination in `openshell-credential-issuer::refresh`. The server's
 `provider_refresh` facade retains public status/configuration adaptation and
-worker startup. `refresh_store` translates the unchanged private durable record
-and leases; `refresh_commit` retains workspace/attachment/provider CAS integration.
-The gateway publishes worker/manual changes at the existing orchestration points;
-export-triggered refresh does not publish. The issuer is still embedded: stable
-reference/version migration must remove the temporary provider commit port before
-remote refresh.
+worker startup. In default-off legacy mode, `refresh_store` translates the frozen
+V1/V2 records and leases, and `refresh_commit` retains the provider-CAS integration.
+With `enable_versioned_credentials`, startup checks the stable JWT/TLS key
+required for protected credential writes before creating migration state, then
+migration adopts existing handles into issuer-owned references and grants.
+Refresh then atomically activates output
+versions and the grant journal without provider writes or a gateway commit
+callback. Configuration and revocation remain gateway-owned recoverable
+transitions; disabling refresh retains one coherent output bundle in static
+bindings. Ordinary static value updates preserve their reference identities and
+advance versions only after provider publication, using a recoverable transition
+marker. Unknown provider-write outcomes retain preparation rather than deleting
+a possibly winning authorization.
+
+Snapshot assembly captures values, versions, and expiration together. Both push
+and poll hash the captured versions, so a refresh changes the revision without a
+provider-row write. Polling endpoint reports capture credentials before acquiring
+mutation locks, then revalidate session authority, sandbox/catalog/settings and
+provider/refresh metadata plus reference authorization under the mutation guard.
+This prevents passive reporting from blocking revocation behind a slow backend
+read. Streamed reports use the durable installed identity without secret reads.
+Subject-token cache entries also bind the captured reference, epoch, and version. The gateway publishes non-secret version hints at existing
+worker/manual orchestration points; export-triggered refresh does not publish.
+Public provider responses project expiration from committed manifests without
+secret reads, preserving shorter provider-authored limits. Shared credential
+capture retains its twenty-second backend budget independently of the five-second
+metadata/configuration budget. This remains an embedded library, not a remote
+issuer service. See the issuer's
+[transition contract](../openshell-credential-issuer/REFERENCE_TRANSITIONS.md) and
+[gateway activation guidance](../../docs/how-it-works/gateways/configuration.mdx).
 
 Gateway configuration, status, deletion, export revalidation, and snapshot reads
 use the shared `CredentialRefresh` interface. Deletion does not construct a local
-runtime. The temporary provider-commit adapter uses the same injected
-`RefreshStateStore` for attachment-validation reads, avoiding a runtime ownership
-cycle; neither path calls gateway refresh-persistence helpers directly.
+runtime. Only legacy mode uses the temporary provider-commit adapter and its
+injected `RefreshStateStore` for attachment-validation reads. Activated grants
+pin validated output mappings and use the issuer manifest as their authority;
+frozen legacy formats remain migration inputs, not live journals. After verifying
+the durable issuer grant, startup retires its exact legacy source row using a
+non-secret source-version intent and atomic deletion/completion. It also repairs
+already-active deployments that retained those rows. A retirement failure blocks
+startup and remains retryable; changed or recreated source generations fail
+closed. This removes live application-row plaintext, not backups or historical
+database pages and journals.
 
 The shared runtime preserves these guarantees:
 
@@ -237,11 +268,11 @@ The shared runtime preserves these guarantees:
   advisory lock; SQLite uses the local mutex. Worker secret cleanup takes the
   same locks and reloads state before changing its resource version.
 - A durable `refresh_in_progress` marker precedes upstream minting. A
-  `refresh_committing` marker protects the interval between grant persistence
-  and provider-handle persistence. Only a completed provider commit publishes
-  `refreshed` state, with a unique completed-mint identity in metadata
-  annotations. Waiters coalesce against that identity, not bookkeeping changes
-  to the resource version.
+  `refresh_committing` marker protects staged output persistence. Activated mode
+  commits the output bundle, checked secret versions, and terminal grant journal
+  in one owner-record CAS; legacy mode finishes its provider-handle commit.
+  Waiters coalesce against completed-mint identity, not bookkeeping changes to
+  the resource version. Cleanup or a lost response cannot repeat activation.
 - Automatic callers recheck live recovery and retry deadlines under both locks.
   A failed mint blocks queued automatic exchanges without disabling scheduled
   worker retries or a separately requested manual rotation.
@@ -254,6 +285,23 @@ The shared runtime preserves these guarantees:
 A crash or lost database-lock session can leave a parked marker. Reconfigure or
 reauthorize the refresh grant after investigating its issuer state. Changing a
 marker directly is not a supported recovery workflow.
+
+### Configuration delivery during credential outages
+
+Failed or timed-out credential capture delivers the admitted policy snapshot
+with a distinct unresolved environment instead of withholding the update. The
+supervisor revokes static credentials before rejecting that environment. Its
+`FailedRetainedLastKnownGood` outcome retains the previous policy, not necessarily
+its credentials; it does not prove that a newly tightened policy was installed.
+Existing dynamic grants and policy-retention behavior are unchanged.
+
+After this outcome the gateway clears duplicate suppression and complete
+installed-configuration evidence, without acknowledging the failed candidate.
+It can then redeliver the identical last successful generation once the backend
+recovers, including recovery coalesced behind the failed update. Endpoint reports
+require a new durable successful install result before that complete identity
+becomes authoritative again. Successful recovery resumes unchanged-update
+suppression; failed builds/results remain eligible for normal reconciliation.
 
 ## Focused verification
 

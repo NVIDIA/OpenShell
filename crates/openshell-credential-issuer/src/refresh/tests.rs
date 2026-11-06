@@ -255,6 +255,14 @@ async fn cleanup_failure_is_not_a_provider_commit_failure_and_sweep_returns_comm
     assert_eq!(f.snapshot().status, "refreshed");
     assert_eq!(changes, vec![engine::change(&f.snapshot())]);
     assert!(changes[0].completed_mint.is_some());
+    assert_eq!(changes[0].provider_id, f.gateway.id);
+    assert_eq!(changes[0].grant_id, f.snapshot().object_id());
+    assert_eq!(
+        changes[0].authorization_epoch.as_deref(),
+        Some(f.snapshot().authorization_epoch.as_str())
+    );
+    assert!(changes[0].issuer_namespace.is_none());
+    assert!(changes[0].references.is_empty());
     assert!(!format!("{changes:?}").contains("new-secret"));
     assert_eq!(f.gateway.commits.load(Ordering::SeqCst), 1);
     // The retained superseded handle is cleanup debt, not a reason to mint again.
@@ -281,4 +289,185 @@ async fn independent_runtimes_coalesce_and_caller_cancellation_keeps_the_lease()
     assert_eq!(committed.status, "refreshed");
     assert_eq!(f.gateway.commits.load(Ordering::SeqCst), 1);
     assert_eq!(f.store.leases.load(Ordering::SeqCst), 0);
+}
+
+fn notification_state(provider_id: &str, grant_id: &str, epoch: &str) -> RefreshState {
+    let mut state = RefreshState {
+        metadata: Some(ObjectMeta {
+            id: grant_id.into(),
+            workspace: "default".into(),
+            resource_version: 87,
+            ..Default::default()
+        }),
+        provider_id: provider_id.into(),
+        provider_name: "same-display-name".into(),
+        credential_key: "TOKEN".into(),
+        authorization_epoch: epoch.into(),
+        status: "refreshed".into(),
+        reference_generation: 3,
+        material: HashMap::from([("client_secret".into(), "raw-secret-material".into())]),
+        ..Default::default()
+    };
+    for key in ["TOKEN", "SECONDARY"] {
+        let projection = crate::references::ReferenceProjection {
+            namespace: "durable-embedded-namespace".into(),
+            owner: crate::references::OwnerIdentity::of(SecretOwner::provider(
+                "default",
+                provider_id,
+                &state.provider_name,
+            )),
+            credential_key: key.into(),
+            epoch: epoch.into(),
+            manifest_id: "fixed-output-manifest".into(),
+            reference_id: format!("reference-{key}"),
+        };
+        state.output_references.insert(
+            key.into(),
+            openshell_core::proto::CredentialHandle {
+                driver: "test-static".into(),
+                handle: format!("opaque-handle-{key}"),
+                metadata: HashMap::from([(
+                    "openshell.issuer.reference.v1".into(),
+                    serde_json::to_string(&projection).unwrap(),
+                )]),
+            },
+        );
+    }
+    state
+}
+
+#[test]
+fn notification_identity_distinguishes_same_name_owners_grants_and_epochs() {
+    use openshell_core::ObjectId as _;
+
+    let first = notification_state("provider-a", "grant-a", "epoch-a");
+    let change = engine::change(&first);
+    assert_eq!(change.workspace, "default");
+    assert_eq!(change.provider_id, "provider-a");
+    assert_eq!(change.grant_id, first.object_id());
+    assert_eq!(change.authorization_epoch.as_deref(), Some("epoch-a"));
+    assert_eq!(
+        change.issuer_namespace.as_deref(),
+        Some("durable-embedded-namespace")
+    );
+    for replacement in [
+        notification_state("provider-b", "grant-a", "epoch-a"),
+        notification_state("provider-a", "grant-b", "epoch-a"),
+        notification_state("provider-a", "grant-a", "epoch-b"),
+    ] {
+        let replacement = engine::change(&replacement);
+        assert_eq!(change.provider_name, replacement.provider_name);
+        assert_eq!(change.references, replacement.references);
+        assert_ne!(change, replacement);
+    }
+    let mut renamed = first;
+    renamed.provider_name = "renamed".into();
+    let mut expected = change;
+    expected.provider_name = "renamed".into();
+    assert_eq!(engine::change(&renamed), expected);
+}
+
+#[test]
+fn notification_versions_use_one_committed_generation_not_row_versions_or_staging() {
+    let mut state = notification_state("provider", "grant", "epoch");
+    let change = engine::change(&state);
+    assert_eq!(change.references.len(), 2);
+    assert_eq!(change.references["TOKEN"], ("reference-TOKEN".into(), 3));
+    assert!(change.references.values().all(|(_, version)| *version == 3));
+    for status in ["configured", "refreshing", "refresh_committing", "error"] {
+        state.status = status.into();
+        assert!(engine::change(&state).references.is_empty(), "{status}");
+    }
+    state.status = "refreshed".into();
+    state.reference_generation = 0;
+    assert!(engine::change(&state).references.is_empty());
+    let debug = format!("{change:?}");
+    assert!(!debug.contains("raw-secret-material"));
+    assert!(!debug.contains("opaque-handle"));
+    assert!(!debug.contains("fixed-output-manifest"));
+}
+
+#[test]
+fn notification_legacy_epoch_and_deletion_retain_identity_without_versions() {
+    let mut legacy = notification_state("provider", "legacy-grant", "");
+    legacy.output_references.clear();
+    let change = engine::change(&legacy);
+    assert_eq!(change.provider_id, "provider");
+    assert_eq!(change.grant_id, "legacy-grant");
+    assert_eq!(change.authorization_epoch.as_deref(), Some("legacy-grant"));
+    assert!(change.issuer_namespace.is_none());
+    assert!(change.references.is_empty());
+
+    let mut deleted = notification_state("provider", "grant", "epoch");
+    deleted.metadata.as_mut().unwrap().deletion_time = Some(prost_types::Timestamp {
+        seconds: 1,
+        nanos: 0,
+    });
+    // A tombstone can retain the last successful status/generation. It must not
+    // advertise those outputs as a new committed activation on deletion.
+    let change = engine::change(&deleted);
+    assert_eq!(change.grant_id, "grant");
+    assert_eq!(change.authorization_epoch.as_deref(), Some("epoch"));
+    assert!(change.issuer_namespace.is_some());
+    assert!(change.references.is_empty());
+}
+
+#[test]
+fn notification_corrupt_epoch_is_absent_without_fallback_or_panic() {
+    let mut state = notification_state("provider", "", "");
+    for metadata_missing in [false, true] {
+        if metadata_missing {
+            state.metadata = None;
+        }
+        let change = engine::change(&state);
+        assert_eq!(change.provider_name, "same-display-name");
+        assert_eq!(change.provider_id, "provider");
+        assert!(change.grant_id.is_empty());
+        assert!(change.authorization_epoch.is_none());
+        assert!(change.issuer_namespace.is_none());
+        assert!(change.references.is_empty());
+    }
+}
+
+#[test]
+fn notification_malformed_or_mixed_bundles_never_advertise_partial_versions() {
+    for field in [
+        "namespace",
+        "owner",
+        "epoch",
+        "credential_key",
+        "manifest_id",
+    ] {
+        let mut state = notification_state("provider", "grant", "epoch");
+        let handle = state.output_references.get_mut("SECONDARY").unwrap();
+        let projection = handle
+            .metadata
+            .get_mut("openshell.issuer.reference.v1")
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(projection).unwrap();
+        if field == "owner" {
+            value[field]["id"] = "another-provider".into();
+        } else {
+            value[field] = "another-value".into();
+        }
+        *projection = serde_json::to_string(&value).unwrap();
+        let change = engine::change(&state);
+        assert!(change.issuer_namespace.is_none(), "{field}");
+        assert!(change.references.is_empty(), "{field}");
+    }
+    for malformed in [None, Some("not-json"), Some("null")] {
+        let mut state = notification_state("provider", "grant", "epoch");
+        let metadata = &mut state
+            .output_references
+            .get_mut("SECONDARY")
+            .unwrap()
+            .metadata;
+        metadata.clear();
+        if let Some(value) = malformed {
+            metadata.insert("openshell.issuer.reference.v1".into(), value.into());
+        }
+        let change = engine::change(&state);
+        assert!(change.issuer_namespace.is_none());
+        assert!(change.references.is_empty());
+    }
 }

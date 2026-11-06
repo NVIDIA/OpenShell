@@ -493,7 +493,7 @@ pub(super) fn validate_annotations(
 }
 
 /// Annotation key prefix owned by the gateway.
-const RESERVED_ANNOTATION_PREFIX: &str = "internal.openshell.ai/";
+pub(super) const RESERVED_ANNOTATION_PREFIX: &str = "internal.openshell.ai/";
 
 /// Validate annotations supplied by an API caller.
 ///

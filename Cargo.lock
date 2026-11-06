@@ -4474,6 +4474,7 @@ dependencies = [
  "openshell-driver-db-credstore",
  "openshell-driver-kubernetes-secrets",
  "openshell-driver-vault",
+ "prost",
  "prost-types",
  "reqwest 0.12.28",
  "rustix 1.1.4",

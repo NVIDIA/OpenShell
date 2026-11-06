@@ -66,6 +66,11 @@ pub(super) fn redact_provider_credentials(mut provider: Provider) -> Provider {
             .or_insert_with(|| "REDACTED".to_string());
     }
     provider.credential_handles.clear();
+    if let Some(metadata) = provider.metadata.as_mut() {
+        metadata
+            .annotations
+            .retain(|key, _| !key.starts_with("internal.openshell.ai/issuer-"));
+    }
     provider
 }
 
@@ -93,13 +98,29 @@ pub(super) struct ProviderEnvironment {
 /// The persistence metadata is kept alongside the decoded provider so callers
 /// can derive both the revision and credential identities from the exact same
 /// records used to resolve environment values and dynamic grants.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct ProviderEnvironmentRecord {
     pub name: String,
     pub object_id: String,
     pub resource_version: u64,
     pub provider: Provider,
     pub refresh_states: Vec<StoredProviderCredentialRefreshState>,
+    /// One immutable value/version/expiry capture shared by both builders.
+    /// Absent in legacy mode, whose lazy resolution behavior is unchanged.
+    pub resolved_credentials: Option<Arc<crate::credentials::ResolvedProviderCredentials>>,
+}
+
+impl std::fmt::Debug for ProviderEnvironmentRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A capture owns plaintext. Never let an incidental record diagnostic
+        // print either inline provider credentials or captured values.
+        formatter
+            .debug_struct("ProviderEnvironmentRecord")
+            .field("name", &self.name)
+            .field("object_id", &self.object_id)
+            .field("resource_version", &self.resource_version)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProviderEnvironment {
@@ -204,6 +225,14 @@ async fn create_provider_record_validating(
         ));
     }
 
+    // Issuer binding/recovery markers are gateway-owned, never authored by a
+    // provider creator. Public projections omit these internal annotations.
+    if let Some(metadata) = provider.metadata.as_ref() {
+        super::validation::validate_caller_annotations(
+            &metadata.annotations,
+            "provider.metadata.annotations",
+        )?;
+    }
     // Validate field sizes before any I/O.
     validate_provider_fields(&provider)?;
 
@@ -353,9 +382,10 @@ async fn reject_refresh_owned_credential_updates(
 
     let mut refresh_owned_keys = HashSet::new();
     for refresh_state in refresh.list(Some(provider_id)).await? {
-        let strategy =
-            ProviderCredentialRefreshStrategy::try_from(refresh_state.strategy).unwrap_or_default();
-        if !crate::provider_refresh::is_gateway_mintable_strategy(strategy) {
+        if !openshell_credential_issuer::refresh::minter::built_in_minters().can_mint_input(
+            refresh_state.strategy,
+            refresh_state.strategy_name.as_deref(),
+        ) {
             continue;
         }
 
@@ -440,8 +470,27 @@ async fn update_provider_record_validating(
         expected_resource_version
     };
 
-    // Apply merge to create candidate
+    // A previous winning CAS may have been interrupted before activation.
+    // Settle that exact transition before preparing another static mutation.
+    if let Some(versioned) = credentials.and_then(crate::credentials::CredentialRuntime::versioned)
+    {
+        Box::pin(crate::versioned_credentials::static_updates::finish(
+            versioned, &existing,
+        ))
+        .await?;
+    }
+
+    // Apply merge to create candidate. The completed internal receipt is no
+    // longer needed once a later provider mutation supersedes it; keep its
+    // potentially large recovery payload out of caller-metadata validation.
     let mut candidate = existing.clone();
+    if credentials.is_some_and(crate::credentials::CredentialRuntime::is_versioned)
+        && let Some(metadata) = candidate.metadata.as_mut()
+    {
+        metadata
+            .annotations
+            .remove(crate::versioned_credentials::static_updates::ANNOTATION);
+    }
     let existing_handles = existing.credential_handles.clone();
     let removed_credential_handles = credential_handles_removed_by_update(&existing, &provider);
     let updated_credential_values = provider
@@ -471,7 +520,17 @@ async fn update_provider_record_validating(
     // from `existing` and re-running full `validate_provider_fields` here would
     // strand legacy records whose stored type predates current limits. See
     // #1347.
-    super::validation::validate_object_metadata(candidate.metadata.as_ref(), "provider")?;
+    // Internal recovery markers are gateway-owned and never caller metadata.
+    // Migration may add them to a provider already at the caller annotation
+    // quota. Validate the caller projection without charging those markers;
+    // retain the complete trusted metadata on the persisted candidate.
+    let mut caller_metadata = candidate.metadata.clone();
+    if let Some(metadata) = caller_metadata.as_mut() {
+        metadata
+            .annotations
+            .retain(|key, _| !key.starts_with(super::validation::RESERVED_ANNOTATION_PREFIX));
+    }
+    super::validation::validate_object_metadata(caller_metadata.as_ref(), "provider")?;
     let credential_update = prepare_provider_credential_update(
         credentials,
         candidate.object_name(),
@@ -495,8 +554,20 @@ async fn update_provider_record_validating(
     }
     candidate
         .credential_handles
-        .extend(credential_update.pre_stored_handles.clone());
+        .extend(credential_update.published_handles.clone());
+    if let Some(marker) = &credential_update.static_marker {
+        candidate
+            .metadata
+            .as_mut()
+            .ok_or_else(|| Status::internal("provider metadata missing"))?
+            .annotations
+            .insert(
+                crate::versioned_credentials::static_updates::ANNOTATION.to_owned(),
+                marker.clone(),
+            );
+    }
 
+    let mut provider_write_attempted = false;
     let cas_result = async {
         validate_provider_mutable_fields(&candidate)?;
         if let Some(profile) = get_provider_type_profile_for_scope(
@@ -525,6 +596,7 @@ async fn update_provider_record_validating(
             )
         };
 
+        provider_write_attempted = true;
         store
             .put_if(
                 Provider::object_type(),
@@ -543,17 +615,34 @@ async fn update_provider_record_validating(
     let result = match cas_result {
         Ok(result) => result,
         Err(err) => {
-            cleanup_pre_stored_provider_credentials(
-                credentials,
-                candidate.object_name(),
-                candidate.object_workspace(),
-                candidate.object_id(),
-                &credential_update.pre_stored_handles,
-            )
-            .await;
+            // A storage error may follow a committed provider CAS. Preserve the
+            // exact staged candidates for marker recovery on uncertain outcomes.
+            if credential_update.static_marker.is_none()
+                || !provider_write_attempted
+                || err.code() == tonic::Code::Aborted
+            {
+                cleanup_pre_stored_provider_credentials(
+                    credentials,
+                    candidate.object_name(),
+                    candidate.object_workspace(),
+                    candidate.object_id(),
+                    &credential_update.pre_stored_handles,
+                )
+                .await;
+            }
             return Err(err);
         }
     };
+
+    if credential_update.static_marker.is_some()
+        && let Some(versioned) =
+            credentials.and_then(crate::credentials::CredentialRuntime::versioned)
+    {
+        Box::pin(crate::versioned_credentials::static_updates::finish(
+            versioned, &candidate,
+        ))
+        .await?;
+    }
 
     // The provider CAS already excludes these handles. Keep the committed
     // result and its receipts available if retirement fails; the unused
@@ -630,6 +719,15 @@ pub(super) async fn delete_provider_record_with_credentials(
         )));
     }
 
+    // Finish any accepted static publication before revoking its destination.
+    // If the later provider-row deletion fails, startup sees a completed receipt
+    // rather than trying to activate into references already revoked here.
+    if let Some(versioned) = credentials.versioned() {
+        Box::pin(crate::versioned_credentials::static_updates::finish(
+            versioned, &provider,
+        ))
+        .await?;
+    }
     crate::provider_refresh::delete_refresh_states_for_provider_with_credentials(
         refresh,
         provider.object_id(),
@@ -822,12 +920,14 @@ fn credential_handles_removed_by_update(
 #[derive(Debug, Clone, Default)]
 struct ProviderCredentialUpdate {
     pre_stored_handles: HashMap<String, CredentialHandle>,
+    published_handles: HashMap<String, CredentialHandle>,
+    static_marker: Option<String>,
     replaced_handles: HashMap<String, CredentialHandle>,
 }
 
-// Each candidate owns distinct backend objects before its provider CAS. A
-// published resource version therefore identifies fully stored credentials,
-// and a concurrent loser cannot overwrite the winner's credential values.
+// Each candidate owns distinct backend objects before its provider CAS. In
+// versioned mode that CAS publishes stable destinations plus a pending marker;
+// only the winning marker may activate candidates into the live references.
 async fn prepare_provider_credential_update(
     credentials: Option<&crate::credentials::CredentialRuntime>,
     provider_name: &str,
@@ -869,15 +969,41 @@ async fn prepare_provider_credential_update(
         })
         .collect();
 
+    let (published_handles, static_marker, replaced_handles) =
+        if let Some(versioned) = credentials.versioned() {
+            let prepared = Box::pin(crate::versioned_credentials::static_updates::prepare(
+                versioned,
+                openshell_credential_issuer::SecretOwner::provider(
+                    workspace,
+                    provider_id,
+                    provider_name,
+                ),
+                &pre_stored_handles,
+                existing_handles,
+            ))
+            .await?;
+            // Existing references remain the provider's stable destinations. The
+            // owner-record activation retires staged aliases and prior candidates.
+            (
+                prepared.published_handles,
+                Some(prepared.marker),
+                HashMap::new(),
+            )
+        } else {
+            (pre_stored_handles.clone(), None, replaced_handles)
+        };
+
     Ok(ProviderCredentialUpdate {
         pre_stored_handles,
+        published_handles,
+        static_marker,
         replaced_handles,
     })
 }
 
-// Retire only handles replaced by the successful provider CAS. Readers of an
-// older record can fail resolution after retirement, but cannot resolve its
-// handles to credential values from a different provider resource version.
+// Retire only handles removed by the successful provider CAS. Versioned same-
+// epoch replacements keep their stable destinations and retire old candidates
+// inside the issuer; never delete those live references here.
 async fn finish_provider_credential_update(
     credentials: Option<&crate::credentials::CredentialRuntime>,
     provider_name: &str,
@@ -1081,6 +1207,7 @@ async fn load_provider_environment_record(
         resource_version: record.resource_version,
         provider,
         refresh_states,
+        resolved_credentials: None,
     }))
 }
 
@@ -1116,6 +1243,18 @@ pub(super) async fn load_provider_environment_records(
                 .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))
         })
         .collect()
+}
+
+/// Selection checks shared by versioned capture and legacy lazy resolution.
+pub(super) fn validate_provider_environment_selection(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[ProviderEnvironmentRecord],
+) -> Result<(), Status> {
+    validate_provider_environment_records_unique_at(
+        catalog,
+        records,
+        crate::persistence::current_time_ms(),
+    )
 }
 
 /// Like [`load_provider_environment_records`], but returns the names of
@@ -1388,9 +1527,14 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             }
         }
 
-        let resolved_refs = credentials
-            .resolve_provider_handles(provider, now_ms)
-            .await?;
+        let resolved_refs = match &record.resolved_credentials {
+            Some(captured) => captured.as_ref().clone(),
+            None => {
+                credentials
+                    .resolve_provider_handles(provider, now_ms)
+                    .await?
+            }
+        };
         // Expired handles are removed by the credential runtime before values
         // reach this loop. Preserve omission evidence without exposing handles.
         if provider.credential_handles.keys().any(|key| {
@@ -1425,6 +1569,19 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                 continue;
             }
             if is_valid_env_key(&key) {
+                // A captured build may be held while another component is
+                // assembled. Never deliver a value whose captured lifetime
+                // has elapsed in the meantime.
+                if resolved_refs
+                    .expires_at_ms
+                    .get(&key)
+                    .is_some_and(|expiry| *expiry <= now_ms)
+                {
+                    readiness_reason =
+                        openshell_core::proto::ProviderReadinessReason::CredentialExpired;
+                    expired_static_keys.insert(key);
+                    continue;
+                }
                 if has_no_usable_endpoint {
                     warn!(
                         provider_name = %name,
@@ -2879,7 +3036,7 @@ pub(super) async fn handle_create_provider(
             );
             publish_provider_change(state, &workspace, provider.object_name());
             Ok(Response::new(ProviderResponse {
-                provider: Some(provider),
+                provider: Some(project_public_provider(state, provider).await?),
                 ..Default::default()
             }))
         }
@@ -2892,6 +3049,37 @@ pub(super) async fn handle_create_provider(
             Err(err)
         }
     }
+}
+
+/// Enrich public expiration from committed manifests, never from staged grant
+/// journals or secret reads. Mutation helpers may already have redacted their
+/// result; reload only the exact returned provider version before projection.
+async fn project_public_provider(
+    state: &ServerState,
+    provider: Provider,
+) -> Result<Provider, Status> {
+    let Some(versioned) = state.credentials.versioned() else {
+        return Ok(redact_provider_credentials(provider));
+    };
+    let mut current = state
+        .store
+        .get_message::<Provider>(provider.object_id())
+        .await
+        .map_err(|_| Status::unavailable("read public provider expiration failed"))?
+        .ok_or_else(|| Status::aborted("provider changed before public projection"))?;
+    if current
+        .metadata
+        .as_ref()
+        .map(|meta| (&meta.id, meta.resource_version))
+        != provider
+            .metadata
+            .as_ref()
+            .map(|meta| (&meta.id, meta.resource_version))
+    {
+        return Err(Status::aborted("provider changed before public projection"));
+    }
+    versioned.project_expirations(&mut current).await?;
+    Ok(redact_provider_credentials(current))
 }
 
 pub(super) async fn handle_get_provider(
@@ -2914,7 +3102,7 @@ pub(super) async fn handle_get_provider(
     let provider = get_provider_record(state.store.as_ref(), &workspace, &req.name).await?;
 
     Ok(Response::new(ProviderResponse {
-        provider: Some(provider),
+        provider: Some(project_public_provider(state, provider).await?),
         ..Default::default()
     }))
 }
@@ -2967,11 +3155,10 @@ pub(super) async fn handle_list_providers(
         .list_message_page::<Provider>(query, after.as_ref(), pagination.page_size())
         .await
         .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
-    let providers = page
-        .messages
-        .into_iter()
-        .map(redact_provider_credentials)
-        .collect();
+    let mut providers = Vec::with_capacity(page.messages.len());
+    for provider in page.messages {
+        providers.push(project_public_provider(state, provider).await?);
+    }
     let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
     Ok(Response::new(ListProvidersResponse {
         providers,
@@ -3100,6 +3287,14 @@ pub(super) async fn handle_import_provider_profiles(
         profile_conflict_diagnostics(state.store.as_ref(), &catalog, &workspace, &profiles).await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(profile_strategy_availability_diagnostics(
+        &profiles,
+        |name| {
+            openshell_credential_issuer::refresh::minter::built_in_minters()
+                .lookup(name)
+                .is_some()
+        },
+    ));
     if !has_errors(&diagnostics) {
         diagnostics.extend(
             profile_attached_sandbox_diagnostics(
@@ -3204,6 +3399,14 @@ pub(super) async fn handle_update_provider_profiles(
         .await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(profile_strategy_availability_diagnostics(
+        &profiles,
+        |name| {
+            openshell_credential_issuer::refresh::minter::built_in_minters()
+                .lookup(name)
+                .is_some()
+        },
+    ));
     let expected_resource_version = if request.expected_resource_version != 0 {
         Some(request.expected_resource_version)
     } else {
@@ -3325,6 +3528,14 @@ pub(super) async fn handle_lint_provider_profiles(
         profile_conflict_diagnostics(state.store.as_ref(), &catalog, &workspace, &profiles).await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(profile_strategy_availability_diagnostics(
+        &profiles,
+        |name| {
+            openshell_credential_issuer::refresh::minter::built_in_minters()
+                .lookup(name)
+                .is_some()
+        },
+    ));
     let valid = !has_errors(&diagnostics);
 
     Ok(Response::new(LintProviderProfilesResponse {
@@ -3556,10 +3767,13 @@ fn validate_strategy_profile_binding(
             "strategy '{strategy_name}' requires a provider profile that declares this refresh on credential {expected_primary}"
         ))
     })?;
-    if refresh_defaults.strategy != strategy {
+    let profile_strategy = refresh_defaults
+        .effective_strategy()
+        .map_err(Status::failed_precondition)?;
+    if profile_strategy != strategy {
         return Err(Status::failed_precondition(format!(
             "provider profile declares strategy '{}' for {credential_key}, not '{strategy_name}'",
-            crate::provider_refresh::refresh_strategy_name(refresh_defaults.strategy as i32)
+            profile_strategy.canonical_name()
         )));
     }
     if credential_key != expected_primary {
@@ -3776,6 +3990,45 @@ fn profiles_from_import_items(
         profiles.push((source, ProviderTypeProfile::from_proto(profile)));
     }
     (profiles, diagnostics)
+}
+
+/// Execution availability is an embedding concern, not an offline profile
+/// parser dependency on the issuer. Static/external profiles remain valid.
+fn profile_strategy_availability_diagnostics(
+    profiles: &[(String, ProviderTypeProfile)],
+    available: impl Fn(&str) -> bool,
+) -> Vec<ProfileValidationDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for (source, profile) in profiles {
+        for credential in &profile.credentials {
+            let Some(refresh) = credential.refresh.as_ref() else {
+                continue;
+            };
+            let Ok(strategy) = refresh.effective_strategy() else {
+                continue; // Structural validation reports invalid selectors.
+            };
+            if matches!(
+                strategy,
+                ProviderCredentialRefreshStrategy::Unspecified
+                    | ProviderCredentialRefreshStrategy::Static
+                    | ProviderCredentialRefreshStrategy::External
+            ) || available(strategy.canonical_name())
+            {
+                continue;
+            }
+            diagnostics.push(ProfileValidationDiagnostic {
+                source: source.clone(),
+                profile_id: profile.id.clone(),
+                field: "credentials.refresh.strategy_name".into(),
+                message: format!(
+                    "refresh strategy '{}' is not available",
+                    strategy.canonical_name()
+                ),
+                severity: "error".into(),
+            });
+        }
+    }
+    diagnostics
 }
 
 fn add_empty_profile_set_diagnostic(
@@ -4250,7 +4503,7 @@ pub(super) async fn handle_update_provider(
             );
             publish_provider_change(state, &workspace, provider.object_name());
             Ok(Response::new(ProviderResponse {
-                provider: Some(provider),
+                provider: Some(project_public_provider(state, provider).await?),
                 target_receipts,
                 mutation_id,
             }))
@@ -4506,7 +4759,7 @@ async fn exchange_provider_subject_token_inner(
     }
     // Validate configuration before identity acquisition, cache lookup or any
     // token exchange; invalid configuration must never trigger an outbound grant.
-    let (cache_ttl, subject_token_expires_at_ms) = validate_intermediate_grant_configuration(
+    let (cache_ttl, _) = validate_intermediate_grant_configuration(
         token_grant,
         &provider,
         &subject_token.credential,
@@ -4527,10 +4780,15 @@ async fn exchange_provider_subject_token_inner(
     )
     .await?;
 
+    // Identity acquisition can await external I/O. Recheck the captured
+    // authorization after it, without resolving another secret generation.
+    validate_subject_token_capture(state, &provider, &stored_subject_token).await?;
+
     let intermediate_cache_key = intermediate_token_cache_key(IntermediateTokenCacheKeyInput {
         provider: &provider,
         dynamic_credential: &req.credential_key,
         subject_credential: &subject_token.credential,
+        subject_version: stored_subject_token.version.as_ref(),
         token_endpoint: &token_grant.token_endpoint,
         client_assertion_type: effective_client_assertion_type(&token_grant.client_assertion_type),
         subject_token_type: effective_token_type(&subject_token.subject_token_type),
@@ -4555,7 +4813,7 @@ async fn exchange_provider_subject_token_inner(
         &TokenExchangeParams {
             client_assertion: &gateway_jwt_svid,
             client_assertion_type: &token_grant.client_assertion_type,
-            subject_token: &stored_subject_token,
+            subject_token: &stored_subject_token.value,
             subject_token_type: &subject_token.subject_token_type,
             audience: &supervisor_claims.sub,
             scopes: &[],
@@ -4564,10 +4822,11 @@ async fn exchange_provider_subject_token_inner(
         request_id,
     )
     .await?;
+    validate_subject_token_capture(state, &provider, &stored_subject_token).await?;
     let cache_expires_at_ms = intermediate_token_cache_expires_at_ms(
         &token_response,
         cache_ttl,
-        subject_token_expires_at_ms.unwrap_or_default(),
+        stored_subject_token.expires_at_ms.unwrap_or_default(),
         supervisor_claims.exp,
     );
     if cache_expires_at_ms > crate::persistence::current_time_ms() {
@@ -4600,11 +4859,65 @@ fn validate_intermediate_grant_configuration(
     Ok((cache_ttl, subject_expires_at_ms))
 }
 
+/// Transient subject capture. Debug is redacted because this contains a secret.
+struct ResolvedSubjectTokenCredential {
+    value: String,
+    version: Option<crate::credentials::ResolvedCredentialVersion>,
+    expires_at_ms: Option<i64>,
+    capture: Option<crate::credentials::ResolvedProviderCredentials>,
+}
+
+impl std::fmt::Debug for ResolvedSubjectTokenCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResolvedSubjectTokenCredential([REDACTED])")
+    }
+}
+
+async fn validate_subject_token_capture(
+    state: &ServerState,
+    provider: &Provider,
+    subject: &ResolvedSubjectTokenCredential,
+) -> Result<(), Status> {
+    if let Some(capture) = subject.capture.as_ref() {
+        let current = state
+            .store
+            .get_by_name(
+                Provider::object_type(),
+                provider.object_workspace(),
+                provider.object_name(),
+            )
+            .await
+            .map_err(|_| token_grant_store_status())?
+            .ok_or_else(token_grant_authorization_required_status)?;
+        if current.id != provider.object_id()
+            || current.resource_version
+                != provider
+                    .metadata
+                    .as_ref()
+                    .map_or(0, |metadata| metadata.resource_version)
+        {
+            return Err(token_grant_authorization_required_status());
+        }
+        state
+            .credentials
+            .validate_provider_capture(provider, capture)
+            .await
+            .map_err(token_grant_dependency_status)?;
+    }
+    if subject
+        .expires_at_ms
+        .is_some_and(|expiry| expiry <= crate::persistence::current_time_ms())
+    {
+        return Err(token_grant_authorization_required_status());
+    }
+    Ok(())
+}
+
 async fn resolve_subject_token_credential(
     credentials: &crate::credentials::CredentialRuntime,
     provider: &Provider,
     credential_key: &str,
-) -> Result<String, Status> {
+) -> Result<ResolvedSubjectTokenCredential, Status> {
     // Check the provider's expiry before asking a credential driver to resolve
     // a handle; stale stored material cannot authorize another grant attempt.
     ensure_subject_token_credential_not_expired(provider, credential_key)?;
@@ -4613,7 +4926,15 @@ async fn resolve_subject_token_credential(
         .get(credential_key)
         .filter(|value| !value.is_empty())
     {
-        return Ok(value.clone());
+        if credentials.is_versioned() {
+            return Err(token_grant_authorization_required_status());
+        }
+        return Ok(ResolvedSubjectTokenCredential {
+            value: value.clone(),
+            version: None,
+            expires_at_ms: provider_credential_expiration_ms(provider, credential_key)?,
+            capture: None,
+        });
     }
 
     if provider.credential_handles.contains_key(credential_key) {
@@ -4626,7 +4947,15 @@ async fn resolve_subject_token_credential(
             .get(credential_key)
             .filter(|value| !value.is_empty())
         {
-            return Ok(value.clone());
+            if credentials.is_versioned() && !resolved.versions.contains_key(credential_key) {
+                return Err(token_grant_authorization_required_status());
+            }
+            return Ok(ResolvedSubjectTokenCredential {
+                value: value.clone(),
+                version: resolved.versions.get(credential_key).cloned(),
+                expires_at_ms: resolved.expires_at_ms.get(credential_key).copied(),
+                capture: credentials.is_versioned().then_some(resolved),
+            });
         }
     }
 
@@ -4670,6 +4999,7 @@ struct IntermediateTokenCacheKeyInput<'a> {
     provider: &'a Provider,
     dynamic_credential: &'a str,
     subject_credential: &'a str,
+    subject_version: Option<&'a crate::credentials::ResolvedCredentialVersion>,
     token_endpoint: &'a str,
     client_assertion_type: &'a str,
     subject_token_type: &'a str,
@@ -4692,7 +5022,7 @@ fn intermediate_token_cache_key(input: IntermediateTokenCacheKeyInput<'_>) -> St
         .metadata
         .as_ref()
         .map_or(0, |metadata| metadata.resource_version);
-    format!(
+    let mut key = format!(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         provider_id,
         provider_resource_version,
@@ -4705,7 +5035,23 @@ fn intermediate_token_cache_key(input: IntermediateTokenCacheKeyInput<'_>) -> St
         input.requested_token_type,
         input.supervisor_subject,
         input.gateway_subject
-    )
+    );
+    if let Some(version) = input.subject_version {
+        // Length-prefix opaque strings, which need not exclude delimiters.
+        // Legacy subjects retain exactly the original key.
+        use std::fmt::Write as _;
+        write!(
+            key,
+            "\treference-v1:{}:{}:{}:{}:{}",
+            version.reference.len(),
+            version.reference,
+            version.authorization_epoch.len(),
+            version.authorization_epoch,
+            version.version,
+        )
+        .expect("write to String");
+    }
+    key
 }
 
 fn intermediate_token_cache_expires_at_ms(
@@ -4902,6 +5248,12 @@ pub(super) async fn handle_get_provider_refresh_status(
 
     let states = if request.credential_key.trim().is_empty() {
         state.refresh.list(Some(provider.object_id())).await?
+    } else if let Some(versioned) = state.credentials.versioned() {
+        versioned
+            .current_refresh_state(&provider, request.credential_key.trim())
+            .await?
+            .into_iter()
+            .collect()
     } else {
         state
             .refresh
@@ -4954,12 +5306,18 @@ pub(super) async fn handle_configure_provider_refresh(
             "credential_key must be a valid environment variable name",
         ));
     }
-    let strategy = ProviderCredentialRefreshStrategy::try_from(request.strategy)
-        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
+    let strategy = ProviderCredentialRefreshStrategy::resolve_input(
+        request.strategy,
+        request.strategy_name.as_deref(),
+    )
+    .map_err(Status::invalid_argument)?;
     if strategy == ProviderCredentialRefreshStrategy::Unspecified {
         return Err(Status::invalid_argument("refresh strategy is required"));
     }
-    if !crate::provider_refresh::is_gateway_mintable_strategy(strategy) {
+    if openshell_credential_issuer::refresh::minter::built_in_minters()
+        .lookup(strategy.canonical_name())
+        .is_none()
+    {
         return Err(Status::invalid_argument(format!(
             "refresh strategy '{}' is not gateway-mintable; update current credentials with provider update instead",
             crate::provider_refresh::refresh_strategy_name(strategy as i32)
@@ -5063,7 +5421,7 @@ pub(super) async fn handle_configure_provider_refresh(
     // Every provider attached to one sandbox lives in this workspace, so holding
     // the workspace key exclusively also excludes sandbox create and attach,
     // which hold it shared.
-    let _mutation_guard = state
+    let mutation_guard = state
         .compute
         .mutation_guard(MutationScope::Workspace(&workspace))
         .await
@@ -5184,12 +5542,18 @@ pub(super) async fn handle_configure_provider_refresh(
                 .to_proto(refresh.max_lifetime_seconds)
         }),
     };
-    let existing_refresh_state = state
-        .refresh
-        .get(&workspace, provider.object_id(), credential_key)
-        .await?
-        .as_ref()
-        .map(Into::<StoredProviderCredentialRefreshState>::into);
+    let existing_refresh_state = if let Some(versioned) = state.credentials.versioned() {
+        versioned
+            .current_refresh_state(&provider, credential_key)
+            .await?
+    } else {
+        state
+            .refresh
+            .get(&workspace, provider.object_id(), credential_key)
+            .await?
+    }
+    .as_ref()
+    .map(Into::<StoredProviderCredentialRefreshState>::into);
     if existing_refresh_state.as_ref().is_some_and(|state| {
         state
             .metadata
@@ -5271,6 +5635,38 @@ pub(super) async fn handle_configure_provider_refresh(
         )
         .await?;
     state_record.secret_material_handles = staged_material_handles.clone();
+    if let Some(versioned) = state.credentials.versioned() {
+        let mut grant = openshell_credential_issuer::refresh::RefreshState::from(&state_record);
+        grant.strategy_name = Some(strategy.canonical_name().to_owned());
+        let result = versioned
+            .configure(
+                &provider,
+                grant,
+                state.credentials.storage_driver_name(),
+                requested_expiration_ms
+                    .map(openshell_core::time::timestamp_from_millis)
+                    .transpose()
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                mutation_guard,
+            )
+            .await;
+        let configured = match result {
+            Ok(configured) => configured,
+            Err(error) => {
+                // A failed post-binding activation remains recoverable. Its
+                // material must not be deleted as if preparation had lost.
+                return Err(error);
+            }
+        };
+        let projected = StoredProviderCredentialRefreshState::from(&configured);
+        replay_facts.refresh(&projected)?;
+        publish_provider_change(state, &workspace, provider_name);
+        return Ok(Response::new(ConfigureProviderRefreshResponse {
+            status: Some(crate::provider_refresh::refresh_status_from_state(
+                &projected,
+            )),
+        }));
+    }
     let persist_result = if let Some(expected_version) = existing_refresh_version {
         match state
             .refresh
@@ -5442,12 +5838,70 @@ pub(super) async fn handle_delete_provider_refresh(
     if credential_key.is_empty() {
         return Err(Status::invalid_argument("credential_key is required"));
     }
+    let versioned_guard = if state.credentials.is_versioned() {
+        Some(
+            state
+                .compute
+                .mutation_guard(MutationScope::Workspace(&workspace))
+                .await
+                .map_err(|error| {
+                    super::persistence_error_to_status(error, "acquire provider mutation lock")
+                })?,
+        )
+    } else {
+        None
+    };
     let provider = state
         .store
         .get_message_by_name::<Provider>(&workspace, provider_name)
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
+    if let Some(versioned) = state.credentials.versioned() {
+        let versioned = versioned.clone();
+        let server = Arc::clone(state);
+        let key = credential_key.to_owned();
+        let deleted = tokio::spawn(async move {
+            let _guard = versioned_guard;
+            let _lease = versioned
+                .store
+                .acquire_refresh_guard(provider.object_id(), &key)
+                .await
+                .map_err(|_| {
+                    Status::unavailable("credential refresh deletion coordination unavailable")
+                })?;
+            let Some(grant) = versioned.current_refresh_state(&provider, &key).await? else {
+                return Ok::<_, Status>(false);
+            };
+            if grant
+                .metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.deletion_time.is_none())
+            {
+                versioned
+                    .retain_static_outputs(
+                        &provider,
+                        &grant,
+                        server.credentials.storage_driver_name(),
+                    )
+                    .await?;
+            }
+            server.refresh.delete(grant).await?;
+            Ok(true)
+        })
+        .await
+        .map_err(|_| Status::internal("credential refresh deletion worker failed"))??;
+        if deleted {
+            publish_provider_change(state, &workspace, provider_name);
+        }
+        return Ok(Response::new(DeleteProviderRefreshResponse {
+            outcome: super::deletion_outcome(
+                deleted,
+                request.allow_missing,
+                "provider refresh configuration",
+            )?,
+        }));
+    }
     let existing_refresh_state = state
         .refresh
         .get(&workspace, provider.object_id(), credential_key)
@@ -5616,10 +6070,21 @@ fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
 #[cfg(test)]
 #[path = "provider_refresh_routing_tests.rs"]
 mod refresh_routing_tests;
+#[cfg(test)]
+#[path = "provider_subject_version_tests.rs"]
+mod subject_version_tests;
+
+#[cfg(test)]
+#[path = "provider_refresh_delete_tests.rs"]
+mod refresh_delete_tests;
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "provider_static_update_tests.rs"]
+mod static_update_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7269,6 +7734,7 @@ mod tests {
             query_param: String::new(),
             path_template: String::new(),
             refresh: Some(ProviderCredentialRefresh {
+                strategy_name: None,
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
                 token_url: "https://auth.example.com/token".to_string(),
                 scopes: Vec::new(),
@@ -8445,6 +8911,7 @@ mod tests {
         let response = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -8541,6 +9008,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -8681,6 +9149,7 @@ mod tests {
         .await
         .unwrap();
         let request = |client_secret: &str| ConfigureProviderRefreshRequest {
+            strategy_name: None,
             request_id: String::new(),
             provider: "configure-conflict".to_string(),
             credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -8804,6 +9273,7 @@ mod tests {
             first_state.credentials.clone(),
         ));
         let request = |client_secret: &str| ConfigureProviderRefreshRequest {
+            strategy_name: None,
             request_id: String::new(),
             provider: "configure-create-race".to_string(),
             credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -8939,6 +9409,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "provider-a".to_string(),
                 credential_key: "REFRESH_TOKEN".to_string(),
@@ -9089,6 +9560,7 @@ mod tests {
         let response = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "vertex-sa".to_string(),
                 credential_key: "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
@@ -9163,6 +9635,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -9278,6 +9751,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "aws-delete".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
@@ -9530,6 +10004,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "refreshing-graph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -9613,6 +10088,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "first-graph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -9635,6 +10111,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "second-graph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -9697,6 +10174,7 @@ mod tests {
         let endpoint_override = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -9725,6 +10203,7 @@ mod tests {
         let missing_material = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -9741,6 +10220,181 @@ mod tests {
         .unwrap_err();
         assert_eq!(missing_material.code(), Code::InvalidArgument);
         assert!(missing_material.message().contains("client_id material"));
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_selects_all_builtin_names_without_enum() {
+        let state = test_server_state().await;
+        for strategy in [
+            ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+            ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+            ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt,
+            ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+        ] {
+            let is_aws = strategy == ProviderCredentialRefreshStrategy::AwsStsAssumeRole;
+            let name = format!("named-{}", strategy.canonical_name().replace('_', "-"));
+            create_provider_record(
+                state.store.as_ref(),
+                "default",
+                Provider {
+                    metadata: Some(openshell_core::proto::ObjectMeta {
+                        name: name.clone(),
+                        workspace: "default".into(),
+                        ..Default::default()
+                    }),
+                    r#type: if is_aws { "aws" } else { "unprofiled" }.into(),
+                    profile_workspace: if is_aws { "default" } else { "" }.into(),
+                    credentials: HashMap::from([(
+                        if is_aws {
+                            "AWS_ACCESS_KEY_ID"
+                        } else {
+                            "ACCESS_TOKEN"
+                        }
+                        .into(),
+                        "initial".into(),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let material = match strategy {
+                ProviderCredentialRefreshStrategy::Oauth2RefreshToken => HashMap::from([
+                    ("client_id".into(), "client".into()),
+                    ("refresh_token".into(), "refresh".into()),
+                ]),
+                ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => HashMap::from([
+                    ("client_id".into(), "client".into()),
+                    ("client_secret".into(), "secret".into()),
+                ]),
+                ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => HashMap::from([
+                    ("client_email".into(), "service@example.test".into()),
+                    ("private_key".into(), "not-used-until-mint".into()),
+                ]),
+                ProviderCredentialRefreshStrategy::AwsStsAssumeRole => HashMap::from([(
+                    "role_arn".into(),
+                    "arn:aws:iam::123456789012:role/Test".into(),
+                )]),
+                _ => unreachable!(),
+            };
+            let status = handle_configure_provider_refresh(
+                &state,
+                authed_request(ConfigureProviderRefreshRequest {
+                    provider: name,
+                    credential_key: if is_aws {
+                        "AWS_ACCESS_KEY_ID"
+                    } else {
+                        "ACCESS_TOKEN"
+                    }
+                    .into(),
+                    strategy_name: Some(strategy.canonical_name().into()),
+                    material,
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner()
+            .status
+            .unwrap();
+            assert_eq!(status.strategy, strategy as i32);
+            assert_eq!(
+                status.strategy_name.as_deref(),
+                Some(strategy.canonical_name())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_accepts_name_only_and_matching_builtin_selectors() {
+        let state = test_server_state().await;
+        let mut profile = custom_profile("named-refresh");
+        profile.credentials = vec![refreshable_credential("token", "ACCESS_TOKEN")];
+        let declaration = profile.credentials[0].refresh.as_mut().unwrap();
+        declaration.strategy = 0;
+        declaration.strategy_name = Some("oauth2_client_credentials".into());
+        let imported = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "test".into(),
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(imported.imported, "{:?}", imported.diagnostics);
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::ObjectMeta {
+                    name: "named-provider".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                r#type: "named-refresh".into(),
+                profile_workspace: "default".into(),
+                credentials: HashMap::from([("ACCESS_TOKEN".into(), "initial".into())]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let request = ConfigureProviderRefreshRequest {
+            provider: "named-provider".into(),
+            credential_key: "ACCESS_TOKEN".into(),
+            strategy_name: Some("oauth2_client_credentials".into()),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            material: HashMap::from([
+                ("client_id".into(), "client".into()),
+                ("client_secret".into(), "secret".into()),
+            ]),
+            ..Default::default()
+        };
+        for strategy in [
+            0,
+            ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+        ] {
+            let mut request = request.clone();
+            request.strategy = strategy;
+            let status = handle_configure_provider_refresh(&state, authed_request(request))
+                .await
+                .unwrap()
+                .into_inner()
+                .status
+                .unwrap();
+            assert_eq!(
+                status.strategy,
+                ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32
+            );
+            assert_eq!(
+                status.strategy_name.as_deref(),
+                Some("oauth2_client_credentials")
+            );
+        }
+        for (strategy, name) in [
+            (i32::MAX, "oauth2_client_credentials"),
+            (
+                ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                "oauth2_client_credentials",
+            ),
+            (0, "custom:example"),
+            (0, ""),
+        ] {
+            let mut request = request.clone();
+            request.strategy = strategy;
+            request.strategy_name = Some(name.into());
+            let error = handle_configure_provider_refresh(&state, authed_request(request))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+        }
     }
 
     #[tokio::test]
@@ -9782,6 +10436,7 @@ mod tests {
             let err = handle_configure_provider_refresh(
                 &state,
                 authed_request(ConfigureProviderRefreshRequest {
+                    strategy_name: None,
                     request_id: String::new(),
                     provider: "msgraph".to_string(),
                     credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -10373,7 +11028,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(subject_token, "user-token");
+        assert_eq!(subject_token.value, "user-token");
     }
 
     #[tokio::test]
@@ -11723,6 +12378,7 @@ mod tests {
                             query_param: String::new(),
                             path_template: String::new(),
                             refresh: Some(ProviderCredentialRefresh {
+                                strategy_name: None,
                                 strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken
                                     as i32,
                                 token_url: "https://login.example/token".to_string(),
@@ -12439,6 +13095,7 @@ mod tests {
             resource_version: 1,
             provider: Provider::default(),
             refresh_states: Vec::new(),
+            resolved_credentials: None,
         };
         let endpoints = vec![StaticCredentialEndpointBinding {
             host: "api.example.com".to_string(),
@@ -12622,6 +13279,7 @@ mod tests {
         .await
         .unwrap();
         let configure = || ConfigureProviderRefreshRequest {
+            strategy_name: None,
             request_id: String::new(),
             provider: "stable-refresh".to_string(),
             credential_key: "ACCESS_TOKEN".to_string(),
@@ -15147,10 +15805,11 @@ mod tests {
         let response = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: Some("aws_sts_assume_role".into()),
                 request_id: String::new(),
                 provider: "my-aws-v2".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                strategy: ProviderCredentialRefreshStrategy::Unspecified as i32,
                 material: HashMap::from([(
                     "role_arn".to_string(),
                     "arn:aws:iam::123456789012:role/Test".to_string(),
@@ -15206,6 +15865,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "aws-endpoint-override".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
@@ -15286,6 +15946,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "aws-partial-source".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
@@ -15342,6 +16003,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "aws-lone-session".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
@@ -15401,6 +16063,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "aws-outputs".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
@@ -15482,6 +16145,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "aws-update-guard".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
@@ -15579,6 +16243,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "generic-no-profile".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
@@ -15634,6 +16299,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "aws-wrong-key".to_string(),
                 credential_key: "AWS_SECRET_ACCESS_KEY".to_string(),
@@ -15820,6 +16486,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: "new-aws-provider".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
@@ -15898,6 +16565,7 @@ mod tests {
 
         let configure = |provider: &str| {
             authed_request(ConfigureProviderRefreshRequest {
+                strategy_name: None,
                 request_id: String::new(),
                 provider: provider.to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),

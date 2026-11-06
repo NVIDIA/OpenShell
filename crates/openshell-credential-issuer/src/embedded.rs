@@ -197,6 +197,11 @@ impl EmbeddedCredentialIssuer {
         self.registry.validate_handles(handles)
     }
 
+    /// Selected existing backend identity, used for inactive reference bindings.
+    pub fn storage_driver_name(&self) -> String {
+        self.registry.storage_owner_name()
+    }
+
     pub fn stores_provider_credentials(&self) -> bool {
         let driver_name = self.registry.storage_owner_name();
         self.drivers.contains_key(&driver_name)

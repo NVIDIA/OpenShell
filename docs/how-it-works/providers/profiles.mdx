@@ -566,6 +566,13 @@ Profile YAML can declare these refresh strategies:
 
 `openshell provider refresh configure` accepts only gateway-mintable strategies: `oauth2-refresh-token`, `oauth2-client-credentials`, `google-service-account-jwt`, and `aws-sts-assume-role`. Use `openshell provider update` for `static` and `external` refresh patterns.
 
+Profiles and the configure API also accept an optional `strategy_name` using
+the exact underscore-separated name from the table. You can omit `strategy`
+when supplying a name, or supply both if they agree. Existing enum-only inputs
+remain supported. Unknown names, unknown enum values, conflicting selectors,
+and reserved `custom:` names are rejected. Refresh status includes the selected
+canonical name when known. `static` and `external` remain non-minting strategies.
+
 Gateway-managed refresh strategies use these material keys:
 
 | Strategy | Material keys |
@@ -834,6 +841,13 @@ OpenShell skips expired provider credentials when it builds a sandbox provider e
 
 The gateway sends a complete host, port, and path binding for every emitted static credential key. It derives bindings from profile endpoints or explicit sandbox policy endpoints for endpointless profiles. It withholds static credential keys from endpointless selected profiles that have no explicit policy binding. Supervisors reject other incomplete binding metadata and clear previously active provider material when a refresh fails validation. Refer to [Static Credential Endpoint Binding](#understand-static-credential-endpoint-binding) for matching, denial, lifecycle, and migration behavior.
 
+With versioned credentials enabled, a credential-store read failure revokes
+static credential material on a connected supervisor. When the backend recovers,
+the gateway retries delivery even if the credential versions have not changed.
+A rejected configuration can retain the previous policy and dynamic grants, so
+delivery of a policy change during the outage does not prove that the supervisor
+applied it. Check sandbox provider readiness before relying on activation.
+
 ### Keep an Externally Updated Placeholder Stable
 
 An MCP client may configure its caller-assertion header once at startup using the reference supplied by OpenShell. A host service rotates the assertion and updates the provider before the old assertion expires. The client needs its next request to use the new assertion without restarting or reloading its environment reference. Gateway-managed token refresh already provides this continuity; `stable_placeholder` extends it to externally supplied static credentials.
@@ -1018,6 +1032,12 @@ openshell provider refresh delete my-graph \
 ```
 
 Deleting refresh state clears the provider credential expiry only when that expiry came from the deleted refresh state, including an explicit Unix epoch expiry. If you later set a different expiry manually with `openshell provider update --credential-expires-at`, OpenShell preserves the manual value.
+
+With versioned credentials enabled, a backend cleanup failure can leave the
+current refresh state in `deleting`. Both provider-wide and credential-specific
+status show this state. Restore backend access and repeat the same delete
+command to resume cleanup. Do not reconfigure refresh or manually replace its
+credential keys until deletion completes.
 
 ### Refresh Logs
 

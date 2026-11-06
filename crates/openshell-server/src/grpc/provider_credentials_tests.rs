@@ -974,3 +974,375 @@ async fn refresh_publication_stays_with_manual_callers_not_export_or_cancelled_r
         "detached engine must not publish after RPC cancellation"
     );
 }
+
+/// Real activated reference/grant composition; the legacy export fixture above
+/// deliberately remains unchanged as compatibility coverage.
+struct ActivatedExport {
+    _directory: tempfile::TempDir,
+    state: Arc<ServerState>,
+    endpoint: wiremock::MockServer,
+    profile: ProviderProfile,
+    static_expiration: prost_types::Timestamp,
+}
+
+impl ActivatedExport {
+    async fn new(expired: bool) -> Self {
+        use openshell_core::proto::ProviderCredentialRefresh;
+        use openshell_credential_issuer::{Handles, SecretOwner, StoreSecrets};
+        let (directory, state) = crate::config_delivery::versioned_tests::versioned_state().await;
+        let endpoint = wiremock::MockServer::start().await;
+        let profile = ProviderProfile {
+            id: "activated-export".into(),
+            credentials: vec![
+                ProviderProfileCredential {
+                    name: "access_token".into(),
+                    env_vars: vec!["ACCESS_TOKEN".into()],
+                    refresh: Some(ProviderCredentialRefresh {
+                        strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                        token_url: endpoint.uri(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ProviderProfileCredential {
+                    name: "static_key".into(),
+                    env_vars: vec!["STATIC_KEY".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                profile.clone(),
+            ))
+            .await
+            .unwrap();
+        let owner = SecretOwner::provider("default", "activated-provider", "provider");
+        let raw = state
+            .credentials
+            .issuer()
+            .store(StoreSecrets {
+                owner,
+                object_id: Some("initial-export-values"),
+                values: &HashMap::from([
+                    ("ACCESS_TOKEN".into(), "activated-old-access".into()),
+                    ("STATIC_KEY".into(), "activated-static".into()),
+                ]),
+                existing_handles: &Handles::new(),
+            })
+            .await
+            .unwrap();
+        // Match production static adoption: unrelated keys have independent
+        // manifests, rather than sharing one all-or-nothing refresh bundle.
+        let mut handles = Handles::new();
+        for (key, handle) in raw {
+            handles.extend(
+                state
+                    .credentials
+                    .versioned()
+                    .unwrap()
+                    .references
+                    .adopt_with_expiration(
+                        owner,
+                        "static",
+                        &HashMap::from([(key.clone(), handle)]),
+                        None,
+                        &format!("adopt-export-{key}"),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let static_expiration = openshell_core::time::timestamp_from_millis(
+            crate::persistence::current_time_ms() + 8 * 3_600_000,
+        )
+        .unwrap();
+        state
+            .store
+            .put_message(&Provider {
+                metadata: Some(ObjectMeta {
+                    id: "activated-provider".into(),
+                    name: "provider".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                r#type: profile.id.clone(),
+                credential_handles: handles,
+                credential_expiration_times: HashMap::from([(
+                    "STATIC_KEY".into(),
+                    static_expiration,
+                )]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let fixture = Self {
+            _directory: directory,
+            state,
+            endpoint,
+            profile,
+            static_expiration,
+        };
+        fixture.configure(expired).await;
+        fixture
+    }
+
+    async fn configure(&self, expired: bool) {
+        crate::grpc::provider::handle_configure_provider_refresh(
+            &self.state,
+            crate::grpc::test_support::authed_request(
+                openshell_core::proto::ConfigureProviderRefreshRequest {
+                    workspace_scope: Some(workspace_selector("default")),
+                    provider: "provider".into(),
+                    credential_key: "ACCESS_TOKEN".into(),
+                    strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                    material: HashMap::from([
+                        ("refresh_token".into(), "activated-private-refresh".into()),
+                        ("client_id".into(), "activated-client".into()),
+                    ]),
+                    expiration_time: Some(
+                        openshell_core::time::timestamp_from_millis(if expired {
+                            1
+                        } else {
+                            crate::persistence::current_time_ms() + 3_600_000
+                        })
+                        .unwrap(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn request(keys: &[&str]) -> Request<GetProviderCredentialsRequest> {
+        let mut inner = request(keys);
+        inner.workspace_scope = Some(workspace_selector("default"));
+        authenticated(inner)
+    }
+
+    async fn provider(&self) -> Provider {
+        self.state
+            .store
+            .get_message_by_name("default", "provider")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn mint_response(&self, lifetime: i64) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "refresh_token=activated-private-refresh",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "client_id=activated-client",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"access_token":"activated-new-access", "expires_in":lifetime}),
+            ))
+            .expect(1)
+            .mount(&self.endpoint)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn activated_export_refreshes_without_provider_write_and_preserves_independent_expiration() {
+    let f = ActivatedExport::new(true).await;
+    let before = f.provider().await;
+    let captured = f
+        .state
+        .credentials
+        .resolve_provider_handles(&before, 0)
+        .await
+        .unwrap();
+    f.mint_response(3600).await;
+    let values = handle(
+        &f.state,
+        ActivatedExport::request(&["ACCESS_TOKEN", "STATIC_KEY"]),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .credentials;
+    assert_eq!(values.len(), 2);
+    assert_eq!(values["ACCESS_TOKEN"].value, "activated-new-access");
+    assert_eq!(values["STATIC_KEY"].value, "activated-static");
+    assert_eq!(
+        values["STATIC_KEY"].expiration_time,
+        Some(f.static_expiration)
+    );
+    let access_expiration = values["ACCESS_TOKEN"].expiration_time.unwrap();
+    assert!(
+        openshell_core::time::timestamp_to_millis(&access_expiration).unwrap()
+            < openshell_core::time::timestamp_to_millis(&f.static_expiration).unwrap()
+    );
+    assert!(
+        openshell_core::time::timestamp_to_millis(&access_expiration).unwrap()
+            > crate::persistence::current_time_ms() + 3_500_000
+    );
+    assert_eq!(
+        f.provider().await,
+        before,
+        "issuer-only refresh must not write the Provider"
+    );
+    let refreshed = f
+        .state
+        .credentials
+        .resolve_provider_handles(&before, crate::persistence::current_time_ms())
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed.versions["ACCESS_TOKEN"].version,
+        captured.versions["ACCESS_TOKEN"].version + 1
+    );
+    assert_eq!(
+        refreshed.versions["STATIC_KEY"],
+        captured.versions["STATIC_KEY"]
+    );
+    let again = handle(&f.state, ActivatedExport::request(&["ACCESS_TOKEN"]))
+        .await
+        .unwrap()
+        .into_inner()
+        .credentials;
+    assert_eq!(again.len(), 1);
+    assert_eq!(again["ACCESS_TOKEN"], values["ACCESS_TOKEN"]);
+    f.endpoint.verify().await;
+    assert_eq!(f.endpoint.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn activated_export_minimum_lifetime_rejects_whole_selected_bundle() {
+    let f = ActivatedExport::new(true).await;
+    let before = f.provider().await;
+    f.mint_response(30).await;
+    let mut selected = ActivatedExport::request(&["STATIC_KEY", "ACCESS_TOKEN"]);
+    selected.get_mut().minimum_remaining_lifetime = Some(prost_types::Duration {
+        seconds: 120,
+        nanos: 0,
+    });
+    let error = handle(&f.state, selected).await.unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(!error.message().contains("activated-static"));
+    assert!(!error.message().contains("activated-new-access"));
+    let static_only = handle(&f.state, ActivatedExport::request(&["STATIC_KEY"]))
+        .await
+        .unwrap()
+        .into_inner()
+        .credentials;
+    assert_eq!(static_only.len(), 1);
+    assert_eq!(static_only["STATIC_KEY"].value, "activated-static");
+    let mut short = ActivatedExport::request(&["ACCESS_TOKEN"]);
+    short.get_mut().minimum_remaining_lifetime = Some(prost_types::Duration {
+        seconds: 1,
+        nanos: 0,
+    });
+    assert_eq!(
+        handle(&f.state, short)
+            .await
+            .unwrap()
+            .into_inner()
+            .credentials["ACCESS_TOKEN"]
+            .value,
+        "activated-new-access"
+    );
+    assert_eq!(f.provider().await, before);
+    f.endpoint.verify().await;
+    assert_eq!(f.endpoint.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn activated_export_reauthorizes_after_concurrent_grant_or_profile_mutation() {
+    for mutation in ["reconfigure", "delete", "provider_delete", "profile"] {
+        let f = ActivatedExport::new(false).await;
+        let before = f.provider().await;
+        let (entered, release) = f.state.credentials.gate_next_resolve();
+        let caller_state = f.state.clone();
+        let caller = tokio::spawn(async move {
+            handle(
+                &caller_state,
+                ActivatedExport::request(&["STATIC_KEY", "ACCESS_TOKEN"]),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        match mutation {
+            "reconfigure" => f.configure(false).await,
+            "delete" => {
+                crate::grpc::provider::handle_delete_provider_refresh(
+                    &f.state,
+                    crate::grpc::test_support::authed_request(
+                        openshell_core::proto::DeleteProviderRefreshRequest {
+                            workspace_scope: Some(workspace_selector("default")),
+                            provider: "provider".into(),
+                            credential_key: "ACCESS_TOKEN".into(),
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            "provider_delete" => {
+                crate::grpc::provider::handle_delete_provider(
+                    &f.state,
+                    crate::grpc::test_support::authed_request(
+                        openshell_core::proto::DeleteProviderRequest {
+                            workspace_scope: Some(workspace_selector("default")),
+                            name: "provider".into(),
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            "profile" => {
+                let mut profile = f.profile.clone();
+                profile
+                    .credentials
+                    .retain(|credential| credential.name != "access_token");
+                f.state
+                    .store
+                    .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                        profile,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        release.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(10), caller)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.code(),
+                Code::Aborted | Code::NotFound | Code::FailedPrecondition
+            ),
+            "{mutation}: {error}"
+        );
+        assert!(!error.message().contains("activated-static"));
+        assert!(
+            f.endpoint.received_requests().await.unwrap().is_empty(),
+            "valid initial credentials need no upstream request ({mutation})"
+        );
+        if mutation == "profile" {
+            assert_eq!(
+                f.provider().await,
+                before,
+                "profile-only authorization change"
+            );
+        }
+    }
+}

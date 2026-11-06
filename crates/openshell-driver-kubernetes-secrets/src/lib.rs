@@ -31,6 +31,13 @@ const MANAGED_BY_VALUE: &str = "openshell";
 const OWNER_ANNOTATION: &str = "openshell.nvidia.com/provider-credential-id";
 const CONFLICT_RETRY_LIMIT: u32 = 3;
 
+/// Recover an immutable, non-owner-default object ID by exact owner/key/value.
+///
+/// A conflict verifies the stored value rather than overwriting it. No secret
+/// hash is persisted for this purpose.
+pub const RECOVERABLE_IMMUTABLE_WRITE_CAPABILITY: &str =
+    "openshell.credentials.recoverable-immutable-write";
+
 pub struct KubernetesSecretsCredentialDriver {
     client: Client,
     settings: KubernetesSecretsDriverSettings,
@@ -201,8 +208,13 @@ impl KubernetesSecretsCredentialDriver {
             self.overwrite_secret_value(&reference, &owner_id, &request.value)
                 .await?;
         } else {
-            self.create_secret_value(&reference, &owner_id, &request.value)
-                .await?;
+            self.create_secret_value(
+                &reference,
+                &owner_id,
+                &request.value,
+                object_id != request.provider_id,
+            )
+            .await?;
         }
         Ok(CredentialHandle {
             driver: Self::NAME.to_string(),
@@ -317,11 +329,33 @@ impl KubernetesSecretsCredentialDriver {
         reference: &KubernetesSecretReference,
         owner_id: &str,
         value: &str,
+        recover_attempt: bool,
     ) -> Result<(), Status> {
         let api: Api<Secret> = Api::namespaced(self.client.clone(), &reference.namespace);
         let secret = managed_secret(&reference.secret_name, &reference.key, owner_id, value);
         match api.create(&PostParams::default(), &secret).await {
             Ok(_) => Ok(()),
+            Err(kube::Error::Api(api_err)) if api_err.code == 409 && recover_attempt => {
+                // Exact attempt paths are immutable. A previous create may
+                // have committed before its response/journal update was lost.
+                // Verify ownership, key, and the actual stored value; never
+                // overwrite, and never persist a bare secret-intent hash.
+                let existing = api.get(&reference.secret_name).await.map_err(|error| {
+                    kube_error_to_status(&reference.namespace, &reference.secret_name, error)
+                })?;
+                ensure_secret_is_managed_for(&existing, reference, owner_id)?;
+                if existing
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get(&reference.key))
+                    .is_none_or(|stored| stored.0.as_slice() != value.as_bytes())
+                {
+                    return Err(Status::already_exists(
+                        "credential write identity was reused for different intent",
+                    ));
+                }
+                Ok(())
+            }
             Err(kube::Error::Api(api_err)) if api_err.code == 409 => {
                 Err(Status::already_exists(format!(
                     "Kubernetes Secret '{}' in namespace '{}' already exists; refusing to overwrite a Secret not created for this provider credential",
@@ -347,7 +381,9 @@ impl KubernetesSecretsCredentialDriver {
             let secret = match api.get(&reference.secret_name).await {
                 Ok(secret) => secret,
                 Err(kube::Error::Api(api_err)) if api_err.code == 404 => {
-                    return self.create_secret_value(reference, owner_id, value).await;
+                    return self
+                        .create_secret_value(reference, owner_id, value, false)
+                        .await;
                 }
                 Err(err) => {
                     return Err(kube_error_to_status(
@@ -450,7 +486,7 @@ impl CredentialDriver for CredentialDriverService {
                 openshell_core::extension_protocol::ExtensionFamily::Credentials,
                 "openshell/kubernetes-secrets",
                 VERSION,
-                [],
+                [RECOVERABLE_IMMUTABLE_WRITE_CAPABILITY.to_owned()],
             )),
         };
         openshell_core::extension_protocol::validate_gateway_metadata(

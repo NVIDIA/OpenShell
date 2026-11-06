@@ -5,6 +5,8 @@
 
 pub mod session;
 mod task;
+#[cfg(test)]
+pub mod versioned_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -29,7 +31,7 @@ use crate::gateway_members::{GatewayMember, GatewayMemberIndex, MEMBER_TTL};
 use crate::grpc::policy::{
     SandboxConfigInputs, build_provider_environment_snapshot_from_inputs,
     build_sandbox_config_snapshot_from_inputs, is_configuration_rejection,
-    load_sandbox_config_inputs, unadmitted_sandbox_config,
+    unadmitted_sandbox_config,
 };
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex, dialable_peer_endpoint};
 
@@ -40,14 +42,13 @@ use task::{Deliver, FanoutScope, SessionRecord};
 /// envelope fields.
 pub const MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES: usize =
     openshell_core::grpc_client::MAX_SUPERVISOR_STREAM_MESSAGE_BYTES - 1024 * 1024;
-/// Loading inputs and building the sandbox configuration only read the store,
-/// which answers in milliseconds when healthy; anything slower means the
-/// store is in trouble.
+/// Metadata reads and policy/configuration assembly share this budget. Secret
+/// capture is excluded and uses the credential backend budget below.
 const SANDBOX_CONFIG_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
-/// Building the provider environment also resolves credentials. Covers a cold
-/// Vault Kubernetes-auth login plus a read at the default 10-second request
-/// timeout.
-const PROVIDER_ENVIRONMENT_BUILD_TIMEOUT: Duration = Duration::from_secs(20);
+/// Versioned credential capture and provider-environment assembly share this
+/// budget. Covers a cold Vault Kubernetes-auth login plus a read at the default
+/// 10-second request timeout. Legacy credentials resolve during assembly.
+pub const PROVIDER_ENVIRONMENT_BUILD_TIMEOUT: Duration = Duration::from_secs(20);
 /// Concurrent snapshot builds allowed per pooled database connection. Builds
 /// are short bursts of small queries, so a little oversubscription keeps the
 /// pool busy without stacking every waiter on the acquire timeout.
@@ -305,12 +306,12 @@ pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
     }
     let state = Arc::clone(state);
     tokio::spawn(async move {
-        task::run(
+        Box::pin(task::run(
             record,
             &state.config_delivery.builds,
             &Builder(&state),
             task::RECONCILE_INTERVAL,
-        )
+        ))
         .await;
     });
 }
@@ -337,20 +338,16 @@ impl Deliver for Builder<'_> {
         let state = self.0;
         let sandbox_id = record.sandbox_id.as_str();
         let started = Instant::now();
-        let built = tokio::time::timeout(
-            SANDBOX_CONFIG_BUILD_TIMEOUT,
-            build_sandbox_config(state, sandbox_id),
-        )
-        .await;
-        let (inputs, sandbox_config) = match built {
-            Ok(Ok(Some(BuiltSandboxConfig::Built(inputs, sandbox_config)))) => {
-                (*inputs, sandbox_config)
+        let built = Box::pin(build_sandbox_config(state, sandbox_id)).await;
+        let (inputs, sandbox_config, credential_budget) = match built {
+            Ok(Some(BuiltSandboxConfig::Built(inputs, sandbox_config, credential_budget))) => {
+                (*inputs, sandbox_config, credential_budget)
             }
-            Ok(Ok(Some(BuiltSandboxConfig::Rejected {
+            Ok(Some(BuiltSandboxConfig::Rejected {
                 sandbox_config,
                 providers,
                 error_code,
-            }))) => {
+            })) => {
                 record_build_failure(sandbox_id, "rejected", error_code, started.elapsed());
                 let provider_environment = unresolved_provider_environment(&sandbox_config);
                 let config = SupervisorConfig {
@@ -363,19 +360,19 @@ impl Deliver for Builder<'_> {
                 }
                 return (matches!(owner, OwnerCheck::Unknown), Some(providers));
             }
-            Ok(Ok(None)) => {
+            Ok(None) => {
                 record_build("ok", started.elapsed());
                 return (false, None);
             }
-            Ok(Err(error)) => {
-                record_build_failure(sandbox_id, "failed", error.code(), started.elapsed());
-                return (true, None);
-            }
-            Err(_) => {
+            Err(error) => {
                 record_build_failure(
                     sandbox_id,
-                    "timeout",
-                    Code::DeadlineExceeded,
+                    if error.code() == Code::DeadlineExceeded {
+                        "timeout"
+                    } else {
+                        "failed"
+                    },
+                    error.code(),
                     started.elapsed(),
                 );
                 return (true, None);
@@ -388,7 +385,7 @@ impl Deliver for Builder<'_> {
             .map(|spec| spec.providers.iter().cloned().collect())
             .unwrap_or_default();
         let (provider_environment, failed) =
-            provider_environment(state, record, &inputs, &sandbox_config).await;
+            provider_environment(state, record, &inputs, &sandbox_config, credential_budget).await;
         if failed.is_none() {
             record_build("ok", started.elapsed());
         }
@@ -411,7 +408,7 @@ impl Deliver for Builder<'_> {
 }
 
 enum BuiltSandboxConfig {
-    Built(Box<SandboxConfigInputs>, SandboxConfigSnapshot),
+    Built(Box<SandboxConfigInputs>, SandboxConfigSnapshot, Duration),
     /// The stored configuration is invalid, so the supervisor receives the
     /// not-admitted configuration polling serves and fails closed.
     Rejected {
@@ -421,28 +418,60 @@ enum BuiltSandboxConfig {
     },
 }
 
+/// Charge only the current stage to its budget. Metadata stages on either side
+/// of secret capture share five seconds, but backend wait time cannot consume
+/// that allowance. Provider assembly likewise shares its remaining allowance
+/// with versioned capture rather than receiving a second twenty seconds.
+async fn budgeted_build_step<T>(
+    remaining: &mut Duration,
+    step: impl Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(*remaining, step).await;
+    *remaining = remaining.saturating_sub(started.elapsed());
+    result.map_err(|_| Status::deadline_exceeded("supervisor configuration build timed out"))?
+}
+
 /// Read the sandbox and the inputs its configuration shares, and build its
 /// sandbox configuration, or `None` once the sandbox is gone.
 async fn build_sandbox_config(
     state: &Arc<ServerState>,
     sandbox_id: &str,
 ) -> Result<Option<BuiltSandboxConfig>, Status> {
-    let Some(sandbox) = state
-        .store
-        .get_message::<Sandbox>(sandbox_id)
-        .await
-        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+    let mut metadata_budget = SANDBOX_CONFIG_BUILD_TIMEOUT;
+    let Some(sandbox) = budgeted_build_step(&mut metadata_budget, async {
+        state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))
+    })
+    .await?
     else {
         return Ok(None);
     };
     let built = async {
-        let inputs = load_sandbox_config_inputs(state, sandbox.clone()).await?;
-        let snapshot = build_sandbox_config_snapshot_from_inputs(state, &inputs).await?;
-        Ok::<_, Status>((inputs, snapshot))
+        let mut inputs = budgeted_build_step(
+            &mut metadata_budget,
+            SandboxConfigInputs::load_metadata(state, sandbox.clone()),
+        )
+        .await?;
+        let mut credential_budget = PROVIDER_ENVIRONMENT_BUILD_TIMEOUT;
+        capture_credentials_for_delivery(state, &mut inputs, &mut credential_budget).await;
+        let snapshot = budgeted_build_step(
+            &mut metadata_budget,
+            build_sandbox_config_snapshot_from_inputs(state, &inputs),
+        )
+        .await?;
+        Ok::<_, Status>((inputs, snapshot, credential_budget))
     }
     .await;
     match built {
-        Ok((inputs, snapshot)) => Ok(Some(BuiltSandboxConfig::Built(Box::new(inputs), snapshot))),
+        Ok((inputs, snapshot, credential_budget)) => Ok(Some(BuiltSandboxConfig::Built(
+            Box::new(inputs),
+            snapshot,
+            credential_budget,
+        ))),
         Err(error) if is_configuration_rejection(&error) => {
             Ok(Some(BuiltSandboxConfig::Rejected {
                 sandbox_config: unadmitted_sandbox_config(state, &sandbox, &error),
@@ -458,6 +487,20 @@ async fn build_sandbox_config(
     }
 }
 
+/// A backend outage must not hold policy tightening or revocation hostage.
+/// Discard the whole capture, even if cancellation interrupts its final check.
+pub async fn capture_credentials_for_delivery(
+    state: &ServerState,
+    inputs: &mut SandboxConfigInputs,
+    credential_budget: &mut Duration,
+) {
+    if let Err(error) =
+        budgeted_build_step(credential_budget, inputs.capture_credentials(state)).await
+    {
+        inputs.mark_credentials_unresolved(error);
+    }
+}
+
 /// The provider environment `sandbox` names. The session's last resolved
 /// environment is reused while the name is unchanged, so only a change
 /// resolves credentials. A failed resolution returns the unresolved
@@ -467,7 +510,21 @@ async fn provider_environment(
     record: &SessionRecord,
     inputs: &SandboxConfigInputs,
     sandbox: &SandboxConfigSnapshot,
+    credential_budget: Duration,
 ) -> (ProviderEnvironmentSnapshot, Option<(&'static str, Code)>) {
+    if let Some(error) = inputs.credential_capture_error() {
+        return (
+            unresolved_provider_environment(sandbox),
+            Some((
+                if error.code() == Code::DeadlineExceeded {
+                    "timeout"
+                } else {
+                    "failed"
+                },
+                error.code(),
+            )),
+        );
+    }
     if let Some(cached) = record
         .provider_environment()
         .filter(|cached| names_provider_environment(sandbox, cached))
@@ -475,7 +532,7 @@ async fn provider_environment(
         return (cached, None);
     }
     let built = tokio::time::timeout(
-        PROVIDER_ENVIRONMENT_BUILD_TIMEOUT,
+        credential_budget,
         build_provider_environment_snapshot_from_inputs(state, inputs, true, true),
     )
     .await;
@@ -920,6 +977,7 @@ fn record_peer_notify(outcome: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grpc::policy::load_sandbox_config_inputs;
     use crate::grpc::test_support::{
         StreamFeatures, SupervisorStreamHarness, connect_supervisor_stream,
         reconnect_supervisor_stream, test_server_state,
@@ -1927,6 +1985,123 @@ mod tests {
             panic!("expected a configuration update");
         };
         update.clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn versioned_capture_budgets_exclude_backend_wait_from_metadata_allowance() {
+        let mut metadata = SANDBOX_CONFIG_BUILD_TIMEOUT;
+        let mut credentials = PROVIDER_ENVIRONMENT_BUILD_TIMEOUT;
+        let delay = |seconds| async move {
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            Ok::<_, Status>(())
+        };
+        budgeted_build_step(&mut metadata, delay(3)).await.unwrap();
+        budgeted_build_step(&mut credentials, delay(6))
+            .await
+            .unwrap();
+        assert_eq!(metadata, Duration::from_secs(2));
+        assert_eq!(credentials, Duration::from_secs(14));
+        // The final metadata/policy stage gets the remainder, not another 5s.
+        assert_eq!(
+            budgeted_build_step(&mut metadata, delay(3))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DeadlineExceeded
+        );
+        assert!(metadata.is_zero());
+        // Capture and provider assembly likewise share a total of 20s.
+        assert_eq!(
+            budgeted_build_step(&mut credentials, delay(15))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DeadlineExceeded
+        );
+        assert!(credentials.is_zero());
+    }
+
+    #[tokio::test]
+    async fn versioned_capture_slower_than_metadata_budget_delivers_one_coherent_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let signing_key = directory.path().join("intent-key");
+        std::fs::write(
+            &signing_key,
+            b"test-only stable credential write intent key",
+        )
+        .unwrap();
+        let mut state = push_state().await;
+        let mut config = state.config.clone();
+        config.enable_versioned_credentials = true;
+        config.gateway_jwt = Some(openshell_core::config::GatewayJwtConfig {
+            signing_key_path: signing_key,
+            public_key_path: directory.path().join("public"),
+            kid_path: directory.path().join("kid"),
+            gateway_id: "test".into(),
+            ttl_secs: None,
+        });
+        let credentials = crate::credentials::CredentialRuntime::from_config_file_with_store(
+            &config,
+            None,
+            Arc::clone(&state.store),
+        )
+        .await
+        .unwrap();
+        let mutable = Arc::get_mut(&mut state).unwrap();
+        mutable.refresh = crate::provider_refresh::runtime(
+            &mutable.store,
+            Some(&credentials),
+            Some(&mutable.compute),
+        );
+        mutable.credentials = credentials;
+        let (mut harness, record) = driver_backed_session(&state).await;
+        change_policy(&state, "sandbox", 1).await;
+        let record = Arc::new(record);
+        let (resolve_hit, release_resolve) = state.credentials.gate_next_resolve();
+        let delivery = tokio::spawn({
+            let state = Arc::clone(&state);
+            let record = Arc::clone(&record);
+            async move { Builder(&state).deliver(&record).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), resolve_hit)
+            .await
+            .expect("versioned capture reaches the backend")
+            .unwrap();
+        tokio::time::sleep(SANDBOX_CONFIG_BUILD_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(
+            !delivery.is_finished(),
+            "backend capture must have its 20s budget, not the metadata 5s budget"
+        );
+        // Any second resolution while building the revision/payload would stall
+        // here. A coherent build must reuse its first value/version capture.
+        let (mut second_resolve_hit, _release_second_resolve) =
+            state.credentials.gate_next_resolve();
+        release_resolve.send(()).unwrap();
+        let (failed, _) = tokio::time::timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("released capture completes delivery")
+            .unwrap();
+        assert!(!failed);
+        assert_eq!(
+            second_resolve_hit.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        let update = sent_config(
+            &next_update(&mut harness, Duration::from_secs(5))
+                .await
+                .expect("configuration update"),
+        );
+        let sandbox = update.sandbox_config.unwrap();
+        let provider = update.provider_environment.unwrap();
+        assert_eq!(sandbox.version, 1);
+        assert!(names_provider_environment(&sandbox, &provider));
+        assert!(
+            provider
+                .values
+                .iter()
+                .any(|value| { value.name == "GITHUB_TOKEN" && value.value == "token" })
+        );
+        assert_eq!(record.provider_environment(), Some(provider));
     }
 
     #[tokio::test]
