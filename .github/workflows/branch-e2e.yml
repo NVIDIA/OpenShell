@@ -296,7 +296,7 @@ jobs:
 
   # Run driver-independent conformance tests.
   conformance-integration:
-    needs: prepare-integration
+    needs: [prepare-integration, build-conformance]
     permissions:
       actions: read
       contents: read
@@ -304,6 +304,7 @@ jobs:
     uses: ./.github/workflows/e2e-suites.yml
     with:
       family: conformance
+      prebuilt-conformance: true
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
     secrets:

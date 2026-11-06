@@ -35,12 +35,22 @@ struct Cli {
     #[arg(long)]
     family: String,
     /// Only build these packages of the family [default: every package].
-    #[arg(long = "package", short = 'p', value_name = "PACKAGE")]
+    #[arg(
+        long = "package",
+        short = 'p',
+        value_name = "PACKAGE",
+        conflicts_with = "program"
+    )]
     packages: Vec<String>,
     /// A nextest filterset narrowing the tests that run, e.g.
     /// `test(/^smoke::/)`.
-    #[arg(long, value_name = "FILTERSET")]
+    #[arg(long, value_name = "FILTERSET", conflicts_with = "program")]
     filter: Option<String>,
+    /// Run this prebuilt testkit program, such as `openshell-conformance`,
+    /// instead of building the family's tests. It must be a static binary for
+    /// the guest's architecture (a `*-unknown-linux-musl` build).
+    #[arg(long, value_name = "PATH")]
+    program: Option<PathBuf>,
     /// The gateway name the installer registers with the CLI. The packaged
     /// installers register `openshell`.
     #[arg(long, default_value = "openshell")]
@@ -78,20 +88,25 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let results = std::path::absolute(&cli.results)
         .with_context(|| format!("resolve {}", cli.results.display()))?;
 
-    let target = bundle::guest_target()?;
-    // The builds block, so they run off the runtime thread to keep the
-    // signal handlers responsive.
-    let bundle = tokio::task::spawn_blocking({
-        let (root, family, packages) = (root.clone(), cli.family.clone(), cli.packages.clone());
-        move || {
-            eprintln!("==> building {} for {target}", bundle::READY_BINARY);
-            let ready = bundle::build_ready(&root, target)?;
-            eprintln!("==> building the {family} tests for {target}");
-            bundle::build(&workspace, &packages, target, &ready)
-        }
-    })
-    .await
-    .context("build task panicked")??;
+    let bundle = if let Some(program) = &cli.program {
+        eprintln!("==> using the prebuilt {}", program.display());
+        bundle::program(program)?
+    } else {
+        let target = bundle::guest_target()?;
+        // The builds block, so they run off the runtime thread to keep the
+        // signal handlers responsive.
+        tokio::task::spawn_blocking({
+            let (root, family, packages) = (root.clone(), cli.family.clone(), cli.packages.clone());
+            move || {
+                eprintln!("==> building {} for {target}", bundle::READY_BINARY);
+                let ready = bundle::build_ready(&root, target)?;
+                eprintln!("==> building the {family} tests for {target}");
+                bundle::build(&workspace, &packages, target, &ready)
+            }
+        })
+        .await
+        .context("build task panicked")??
+    };
 
     let tmachine = load_tmachine(&root)?;
     let status = execute::run(

@@ -248,7 +248,13 @@ complete, for example because the environment didn't come up. It writes
 `artifacts/test-results/` (`--results`), even when the run timed out.
 
 `--filter <filterset>` narrows the tests with a nextest filterset, and
-`--keep` leaves the VM running until you press Enter. Two runs on one host
+`--keep` leaves the VM running until you press Enter. `--program <path>` runs a
+prebuilt testkit program, such as a static `openshell-conformance` for the
+guest's architecture, instead of building the family's tests; it can't be
+combined with `--package` or `--filter`. The runner runs the program's `ready`
+and `run` commands in the guest and still writes `junit.xml` and `nextest.log`
+(the program's output) to the results directory. Branch E2E builds
+`openshell-conformance` once and passes it to every conformance row this way. Two runs on one host
 need different `TMACHINE_SSH_PORT` values (default 2222). The installer
 inputs, such as the Debian package and the images, come from `artifacts/`,
 built by `nix run .#build-artifacts` or downloaded by CI.
