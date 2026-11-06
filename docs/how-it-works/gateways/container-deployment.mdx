@@ -201,8 +201,10 @@ sudo cp /var/lib/openshell/tls/ca.crt \
   /var/lib/openshell/tls/client/tls.crt \
   /var/lib/openshell/tls/client/tls.key "$mtls"/
 sudo chown "$USER" "$mtls"/*
-openshell gateway add https://127.0.0.1:8080 --local --name local
+openshell gateway add https://127.0.0.1:8080 --local --name local --preserve-mtls-bundle
 ```
+
+`--preserve-mtls-bundle` keeps the copied container bundle: without it, `gateway add --local` refreshes the CLI bundle from the package-managed TLS directory when one exists on this machine, which would replace the container gateway's client certificate with the package's.
 
 ## Using Podman
 

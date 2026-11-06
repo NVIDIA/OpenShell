@@ -217,6 +217,17 @@ pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientCon
         .into_diagnostic()
 }
 
+/// Validate raw TLS materials using the same Rustls configuration path used
+/// by the CLI client, without exposing the internal material container.
+pub fn validate_rustls_materials(ca: &[u8], cert: &[u8], key: &[u8]) -> Result<()> {
+    let materials = TlsMaterials {
+        ca: ca.to_vec(),
+        cert: cert.to_vec(),
+        key: key.to_vec(),
+    };
+    build_rustls_config(&materials).map(drop)
+}
+
 #[derive(Debug)]
 struct InsecureServerCertVerifier;
 
