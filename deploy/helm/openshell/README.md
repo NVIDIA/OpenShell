@@ -722,6 +722,7 @@ discovery endpoint or its TLS CA.
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
 | server.sandboxUid | string | `""` | UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift SCC namespace annotation if present, otherwise the driver default. Must be an integer between 1 and 4294967294. |
+| server.serviceAuthEnabled | bool | `false` | Opt in to gateway authentication for proxied application requests. Independent of the supervisor app listener; disabled preserves existing routing. |
 | server.serviceHostnameFormat | string | `""` | Hostname format for exposed sandbox services. Empty or "readable" keeps readable `<workspace>--<sandbox>[--<service>]` hostnames; "hashed" mints opaque one-label hostnames discriminated by the gateway installation name (server.name, defaulting to the release name). The name must be unique among all gateways sharing the service base domain, and renaming the installation changes every minted hostname. |
 | server.telemetryEnabled | bool | `true` | Enable anonymous OpenShell telemetry from the gateway and the sandbox supervisors it launches. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
