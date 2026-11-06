@@ -18,7 +18,12 @@ use tokio::sync::watch;
 
 use openshell_isolation_interface::contract::BoundarySignal;
 
+use crate::terminal_state::TerminalState;
+
 const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
+/// How long an attachment waits for the program to react to the interim
+/// size before restoring the real one.
+const REDRAW_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[derive(Clone, Debug)]
 pub enum MainOutput {
@@ -47,25 +52,31 @@ struct OutputLogState {
     events: VecDeque<SequencedOutput>,
     retained_bytes: usize,
     next_sequence: u64,
+    /// Terminal state at the oldest retained event, built from evicted
+    /// output so a replay can start from a matching terminal.
+    evicted_terminal: TerminalState,
 }
 
 #[derive(Debug)]
 struct OutputLog {
     state: Mutex<OutputLogState>,
+    terminal: bool,
     version: watch::Sender<u64>,
     terminal_reported: std::sync::atomic::AtomicBool,
     terminal_reported_notify: Notify,
 }
 
 impl OutputLog {
-    fn new() -> Arc<Self> {
+    fn new(terminal: bool) -> Arc<Self> {
         let (version, _) = watch::channel(0);
         Arc::new(Self {
             state: Mutex::new(OutputLogState {
                 events: VecDeque::new(),
                 retained_bytes: 0,
                 next_sequence: 0,
+                evicted_terminal: TerminalState::default(),
             }),
+            terminal,
             version,
             terminal_reported: std::sync::atomic::AtomicBool::new(false),
             terminal_reported_notify: Notify::new(),
@@ -87,26 +98,44 @@ impl OutputLog {
                     break;
                 };
                 state.retained_bytes = state.retained_bytes.saturating_sub(removed.event.len());
+                if self.terminal
+                    && let MainOutput::Stdout(data) = &removed.event
+                {
+                    state.evicted_terminal.advance(data, None);
+                }
             }
             state.next_sequence
         };
         self.version.send_replace(version);
     }
 
-    fn subscribe(self: &Arc<Self>) -> MainOutputCursor {
+    fn subscribe(self: &Arc<Self>) -> (MainOutputCursor, TerminalReplay) {
         let version = self.version.subscribe();
         let state = self.state.lock().expect("main output log lock poisoned");
         let next_sequence = state
             .events
             .front()
             .map_or(state.next_sequence, |retained| retained.sequence);
+        let replay = TerminalReplay {
+            start: state.evicted_terminal.clone(),
+            end: state.next_sequence,
+        };
         drop(state);
-        MainOutputCursor {
+        let cursor = MainOutputCursor {
             output: Arc::clone(self),
             next_sequence,
             version,
-        }
+        };
+        (cursor, replay)
     }
+}
+
+/// Where a TTY attachment's replay of retained output ends, and the terminal
+/// state in effect where it begins.
+pub struct TerminalReplay {
+    pub start: TerminalState,
+    /// First sequence produced after the attachment subscribed.
+    pub end: u64,
 }
 
 #[derive(Debug)]
@@ -135,6 +164,12 @@ pub struct MainOutputCursor {
 }
 
 impl MainOutputCursor {
+    /// Sequence of the next event `recv` returns.
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.next_sequence
+    }
+
     pub async fn recv(&mut self) -> Result<MainOutput, MainOutputLagged> {
         loop {
             let next = {
@@ -185,6 +220,8 @@ pub struct MainSession {
     next_owner: AtomicU64,
     boundary_process: Option<Arc<BoundaryProcess>>,
     boundary_terminal: Option<Arc<BoundaryTerminal>>,
+    /// Latest size requested for the boundary terminal.
+    terminal_size: Mutex<Option<(u16, u16)>>,
     readers_remaining: AtomicUsize,
     readers_done: Notify,
     finished: std::sync::atomic::AtomicBool,
@@ -201,15 +238,27 @@ impl MainSession {
 
     #[cfg(test)]
     pub fn inert_with_input() -> (Arc<Self>, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+        Self::inert_session(false)
+    }
+
+    /// An inert session whose main process has a TTY.
+    #[cfg(test)]
+    pub fn inert_terminal() -> (Arc<Self>, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+        Self::inert_session(true)
+    }
+
+    #[cfg(test)]
+    fn inert_session(terminal: bool) -> (Arc<Self>, tokio::sync::mpsc::Receiver<Vec<u8>>) {
         let (input, input_rx) = tokio::sync::mpsc::channel(64);
         let session = Arc::new(Self {
-            terminal: false,
+            terminal,
             input,
-            output: OutputLog::new(),
+            output: OutputLog::new(terminal),
             input_owner: Mutex::new(None),
             next_owner: AtomicU64::new(1),
             boundary_process: None,
             boundary_terminal: None,
+            terminal_size: Mutex::new(None),
             readers_remaining: AtomicUsize::new(0),
             readers_done: Notify::new(),
             finished: std::sync::atomic::AtomicBool::new(false),
@@ -242,11 +291,12 @@ impl MainSession {
         let session = Arc::new(Self {
             terminal: terminal_mode,
             input,
-            output: OutputLog::new(),
+            output: OutputLog::new(terminal_mode),
             input_owner: Mutex::new(None),
             next_owner: AtomicU64::new(1),
             boundary_process: Some(process),
             boundary_terminal: terminal,
+            terminal_size: Mutex::new(None),
             readers_remaining: AtomicUsize::new(if terminal_mode { 1 } else { 2 }),
             readers_done: Notify::new(),
             finished: std::sync::atomic::AtomicBool::new(false),
@@ -372,6 +422,13 @@ impl MainSession {
     }
 
     pub fn subscribe(&self) -> MainOutputCursor {
+        self.output.subscribe().0
+    }
+
+    /// Subscribe a terminal attachment, which needs to know where its replay
+    /// of retained output ends and the terminal state where it begins.
+    #[must_use]
+    pub fn subscribe_terminal(&self) -> (MainOutputCursor, TerminalReplay) {
         self.output.subscribe()
     }
 
@@ -482,14 +539,45 @@ impl MainSession {
     }
 
     pub async fn resize(&self, columns: u32, rows: u32, _pixel_width: u32, _pixel_height: u32) {
+        let size = terminal_size(columns, rows);
+        *self
+            .terminal_size
+            .lock()
+            .expect("terminal size lock poisoned") = Some(size);
         if let Some(terminal) = self.boundary_terminal.as_ref() {
-            let _ = terminal
-                .resize(
-                    u16::try_from(columns.max(1)).unwrap_or(u16::MAX),
-                    u16::try_from(rows.max(1)).unwrap_or(u16::MAX),
-                )
-                .await;
+            let _ = terminal.resize(size.0, size.1).await;
         }
+    }
+
+    /// Size the terminal for a new attachment and make the program repaint.
+    ///
+    /// Linux signals `SIGWINCH` only when the size changes, and programs
+    /// that receive it compare against the size they last drew for. Moving
+    /// through an interim size, as `kubectl attach` does, forces a full
+    /// redraw even when the attachment matches the current size. Call this
+    /// after subscribing so the redraw follows the replay.
+    pub async fn resize_for_attachment(&self, columns: u32, rows: u32) {
+        let (columns, rows) = terminal_size(columns, rows);
+        *self
+            .terminal_size
+            .lock()
+            .expect("terminal size lock poisoned") = Some((columns, rows));
+        let Some(terminal) = self.boundary_terminal.as_ref() else {
+            return;
+        };
+        let interim = if rows > 1 { rows - 1 } else { rows + 1 };
+        let mut version = self.output.version.subscribe();
+        let _ = terminal.resize(columns, interim).await;
+        // Let the program read the interim size, or it may find the size
+        // unchanged by the time it handles the signal.
+        let _ = tokio::time::timeout(REDRAW_SETTLE, version.changed()).await;
+        // A window change during the wait wins over this attachment's size.
+        let latest = *self
+            .terminal_size
+            .lock()
+            .expect("terminal size lock poisoned");
+        let (columns, rows) = latest.unwrap_or((columns, rows));
+        let _ = terminal.resize(columns, rows).await;
     }
 
     /// Delegate process-group signaling to the isolation backend.
@@ -513,6 +601,13 @@ impl MainSession {
     pub fn finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
     }
+}
+
+fn terminal_size(columns: u32, rows: u32) -> (u16, u16) {
+    (
+        u16::try_from(columns.max(1)).unwrap_or(u16::MAX),
+        u16::try_from(rows.max(1)).unwrap_or(u16::MAX),
+    )
 }
 
 #[cfg(test)]
@@ -542,16 +637,39 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct TestBoundaryTerminal {
-        size: Mutex<Option<(u16, u16)>>,
+        sizes: Mutex<Vec<(u16, u16)>>,
     }
 
     #[async_trait::async_trait]
     impl rpc_test::BoundaryTerminal for TestBoundaryTerminal {
         async fn resize(&self, cols: u16, rows: u16) -> Result<(), BackendError> {
-            *self.size.lock().unwrap() = Some((cols, rows));
+            self.sizes.lock().unwrap().push((cols, rows));
             Ok(())
         }
+    }
+
+    fn terminal_session(
+        terminal: Arc<TestBoundaryTerminal>,
+    ) -> (Arc<MainSession>, tokio::io::DuplexStream) {
+        let (stdin, _stdin_peer) = tokio::io::duplex(1024);
+        let (stdout, stdout_peer) = tokio::io::duplex(1024);
+        let stdin: BoundaryInput = Box::new(stdin);
+        let stdout: BoundaryOutput = Box::new(stdout);
+        let attachment = ProcessAttachment {
+            stdin,
+            stdout,
+            stderr: None,
+            terminal: Some(rpc_test::terminal(terminal)),
+        };
+        let process = Arc::new(TestBoundaryProcess {
+            signals: Mutex::new(Vec::new()),
+        });
+        (
+            MainSession::from_boundary(attachment, rpc_test::process(process)),
+            stdout_peer,
+        )
     }
 
     #[tokio::test]
@@ -561,9 +679,7 @@ mod tests {
         let process = Arc::new(TestBoundaryProcess {
             signals: Mutex::new(Vec::new()),
         });
-        let terminal = Arc::new(TestBoundaryTerminal {
-            size: Mutex::new(None),
-        });
+        let terminal = Arc::new(TestBoundaryTerminal::default());
         let stdin: BoundaryInput = Box::new(stdin);
         let stdout: BoundaryOutput = Box::new(stdout);
         let attachment = ProcessAttachment {
@@ -588,12 +704,70 @@ mod tests {
         assert_eq!(&received, b"hello\n");
 
         session.resize(120, 40, 0, 0).await;
-        assert_eq!(*terminal.size.lock().unwrap(), Some((120, 40)));
+        assert_eq!(*terminal.sizes.lock().unwrap(), vec![(120, 40)]);
         session
             .signal_boundary_group(BoundarySignal::Int)
             .await
             .unwrap();
         assert_eq!(*process.signals.lock().unwrap(), vec![BoundarySignal::Int]);
+    }
+
+    #[tokio::test]
+    async fn attachment_resize_moves_through_an_interim_size() {
+        let terminal = Arc::new(TestBoundaryTerminal::default());
+        let (session, _stdout_peer) = terminal_session(terminal.clone());
+        session.resize(80, 24, 0, 0).await;
+        session.resize_for_attachment(80, 24).await;
+        session.resize_for_attachment(100, 1).await;
+        assert_eq!(
+            *terminal.sizes.lock().unwrap(),
+            vec![(80, 24), (80, 23), (80, 24), (100, 2), (100, 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_resize_waits_for_the_program_to_react() {
+        let terminal = Arc::new(TestBoundaryTerminal::default());
+        let (session, mut stdout_peer) = terminal_session(terminal.clone());
+        let resize = tokio::spawn({
+            let session = session.clone();
+            async move { session.resize_for_attachment(120, 40).await }
+        });
+        while terminal.sizes.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*terminal.sizes.lock().unwrap(), vec![(120, 39)]);
+        // A window change while waiting replaces the attachment's size.
+        session.resize(132, 50, 0, 0).await;
+        stdout_peer.write_all(b"redraw").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), resize)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *terminal.sizes.lock().unwrap(),
+            vec![(120, 39), (132, 50), (132, 50)]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_replay_starts_from_the_state_of_evicted_output() {
+        let (session, _input) = MainSession::inert_terminal();
+        session.publish(MainOutput::Stdout(Bytes::from_static(
+            b"\x1b[?1049h\x1b[?2004h\x1b[?10",
+        )));
+        let filler = Bytes::from(vec![b'x'; OUTPUT_BUFFER_BYTES]);
+        session.publish(MainOutput::Stdout(filler.clone()));
+        let (cursor, replay) = session.subscribe_terminal();
+        assert_eq!(cursor.position(), 1);
+        assert_eq!(replay.end, 2);
+        assert_eq!(replay.start.restore_sequence(), b"\x1b[?1049h\x1b[?2004h");
+
+        // Non-terminal sessions keep no terminal state.
+        let (session, _input) = MainSession::inert_with_input();
+        session.publish(MainOutput::Stdout(Bytes::from_static(b"\x1b[?1049h")));
+        session.publish(MainOutput::Stdout(filler));
+        assert_eq!(session.subscribe_terminal().1.start.restore_sequence(), b"");
     }
 
     #[test]
