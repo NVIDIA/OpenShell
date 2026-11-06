@@ -156,14 +156,15 @@ fn resolve_linux_process(
     })
 }
 
-/// The process `pid` names, as procfs reports it now. `None` when procfs does
-/// not report it.
+/// The process that owns task `tid`, as procfs reports it now. `None` when
+/// procfs does not report it.
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn observe_process(pid: u32) -> Option<ProcessInstance> {
+pub fn observe_process(tid: u32) -> Option<ProcessInstance> {
+    let pid = thread_group_id(tid).ok()?;
     let (parent_pid, start_time) = process_stat(pid).ok()?;
     Some(ProcessInstance {
-        pid: thread_group_id(pid).ok()?,
+        pid,
         parent_pid,
         start_time_ms: start_time_ms(start_time)?,
     })
@@ -699,6 +700,28 @@ mod tests {
         assert!(resolved.is_some());
         assert_eq!(observe_process(pid), resolved);
         assert_eq!(observe_process(u32::MAX), None);
+    }
+
+    #[test]
+    fn observing_a_thread_reports_its_process() {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let link = std::fs::read_link("/proc/thread-self").unwrap();
+            let tid: u32 = link
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse().ok())
+                .unwrap();
+            tid_tx.send(tid).unwrap();
+            let _ = release_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        let observed = observe_process(tid);
+        drop(release_tx);
+        thread.join().unwrap();
+        assert_eq!(observed, observe_process(std::process::id()));
     }
 
     #[test]

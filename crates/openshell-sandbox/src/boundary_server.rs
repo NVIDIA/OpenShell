@@ -3460,7 +3460,13 @@ mod linux {
                     provider_files,
                 ),
                 Request::Wait { process_id } => self.wait(&process_id),
-                Request::ReadProcessEvents { after_sequence } => {
+                Request::ReadProcessEvents {
+                    after_sequence,
+                    executions,
+                } => {
+                    if let Some(executions) = executions {
+                        crate::process_events::set_record_executions(executions);
+                    }
                     let (events, lost) = crate::process_events::log().read(
                         after_sequence,
                         crate::process_events::MAX_READ,
@@ -9034,7 +9040,10 @@ mod linux {
 
             // Reading process events holds no ownership guard, so a long
             // poll never delays a promotion; only the owner in force reads.
-            let read_events = Request::ReadProcessEvents { after_sequence: 0 };
+            let read_events = Request::ReadProcessEvents {
+                after_sequence: 0,
+                executions: None,
+            };
             assert!(
                 boundary
                     .authorize_request(&old, &read_events)

@@ -195,6 +195,10 @@ message AcceptNetwork {}
 // are none; an empty response means none arrived.
 message ReadProcessEvents {
   uint64 after_sequence = 1;
+  // Requires the openshell.sandbox.process-exec-events capability. Whether
+  // the runtime records each exec in the workload from now on; unset keeps
+  // its current choice.
+  optional bool executions = 2;
 }
 
 // No image policy is yaml absent with invalid=false. invalid=true reports an
@@ -249,9 +253,28 @@ message ProcessEvent {
   oneof event {
     ProcessLaunched launched = 4;
     ExitStatus exited = 5;
+    ProcessExecuted executed = 7;
+    ProcessEventsSuppressed suppressed = 8;
+    ProcessEnded ended = 9;
   }
-  // When the runtime observed the launch or exit.
+  // When the runtime observed the event.
   google.protobuf.Timestamp time = 6;
+}
+// The process replaced its image with `executable`.
+message ProcessExecuted {
+  string previous_executable = 1;
+  string parent_executable = 2;
+}
+// Exec events the runtime did not record because they exceeded its rate. The
+// event's process is the runtime.
+message ProcessEventsSuppressed {
+  uint64 count = 1;
+}
+// A process whose exec the runtime recorded exited. status is set when the
+// kernel keeps it with the process's pidfd (Linux 6.15 and later), or when
+// the runtime read it before the process's parent reaped it.
+message ProcessEnded {
+  ExitStatus status = 1;
 }
 message ProcessLaunched {}
 message LoopbackConnected {}

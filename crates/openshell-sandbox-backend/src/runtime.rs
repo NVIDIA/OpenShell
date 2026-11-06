@@ -916,16 +916,29 @@ pub struct ProcessEventSource {
 }
 
 impl ProcessEventSource {
+    /// Whether the runtime can record each exec in the workload.
+    #[must_use]
+    pub fn records_executions(&self) -> bool {
+        self.client
+            .backend_supports_process_exec_events
+            .load(Ordering::Acquire)
+    }
+
     /// Events after `after_sequence` and how many of those the runtime no
     /// longer retains. Returns empty when none arrive within the runtime's
-    /// read wait.
+    /// read wait. `executions` sets whether the runtime records each exec
+    /// from now on; it is ignored unless [`Self::records_executions`].
     pub async fn read(
         &self,
         after_sequence: u64,
+        executions: Option<bool>,
     ) -> Result<(Vec<crate::boundary_protocol::ProcessEventWire>, u64), BackendError> {
         let response = self
             .client
-            .call_wait(Request::ReadProcessEvents { after_sequence })
+            .call_wait(Request::ReadProcessEvents {
+                after_sequence,
+                executions: executions.filter(|_| self.records_executions()),
+            })
             .await?;
         let Response::ProcessEvents { events, lost } = response else {
             return Err(unexpected_response("process_events", &response));
@@ -1621,6 +1634,7 @@ struct BoundaryClient {
     launch_outcome: std::sync::OnceLock<BoundaryLaunchOutcome>,
     backend_supports_suspend: AtomicBool,
     backend_supports_process_events: AtomicBool,
+    backend_supports_process_exec_events: AtomicBool,
     supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
@@ -1825,6 +1839,7 @@ impl BoundaryClient {
             launch_outcome: std::sync::OnceLock::new(),
             backend_supports_suspend: AtomicBool::new(false),
             backend_supports_process_events: AtomicBool::new(false),
+            backend_supports_process_exec_events: AtomicBool::new(false),
             supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId::new(),
             sandbox_bearer,
             grpc_channel: tokio::sync::Mutex::new(None),
@@ -2656,10 +2671,18 @@ impl BoundaryClient {
         }
         self.backend_supports_suspend
             .store(supports_suspend, Ordering::Release);
+        let supports = |name: &str| {
+            backend
+                .supported_capabilities
+                .iter()
+                .any(|capability| capability == name)
+        };
         self.backend_supports_process_events.store(
-            backend.supported_capabilities.iter().any(|capability| {
-                capability == crate::isolation_protocol::PROCESS_EVENTS_CAPABILITY
-            }),
+            supports(crate::isolation_protocol::PROCESS_EVENTS_CAPABILITY),
+            Ordering::Release,
+        );
+        self.backend_supports_process_exec_events.store(
+            supports(crate::isolation_protocol::PROCESS_EXEC_EVENTS_CAPABILITY),
             Ordering::Release,
         );
         Ok(())
@@ -3477,6 +3500,34 @@ mod tests {
                 .backend_supports_process_events
                 .load(Ordering::Acquire)
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exec_events_are_requested_only_from_a_runtime_that_records_them() {
+        let (client, server) =
+            isolation_control_client(TestIsolationBackend::default(), None).await;
+        client.grpc_channel().await.unwrap();
+        let source = ProcessEventSource {
+            client: Arc::new(client),
+        };
+        assert!(source.records_executions());
+        server.abort();
+
+        let mut legacy = crate::isolation_protocol::metadata("legacy/runtime");
+        legacy.supported_capabilities.retain(|capability| {
+            capability != crate::isolation_protocol::PROCESS_EXEC_EVENTS_CAPABILITY
+        });
+        let service = TestIsolationBackend {
+            metadata: Some(legacy),
+            ..TestIsolationBackend::default()
+        };
+        let (client, server) = isolation_control_client(service, None).await;
+        client.grpc_channel().await.unwrap();
+        let source = ProcessEventSource {
+            client: Arc::new(client),
+        };
+        assert!(!source.records_executions());
         server.abort();
     }
 

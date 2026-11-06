@@ -70,6 +70,7 @@ bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 [dev-dependencies]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
+openshell-ocsf-validate = { path = "../openshell-ocsf-validate" }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 tonic-prost = { workspace = true }

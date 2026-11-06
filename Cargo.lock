@@ -5220,6 +5220,7 @@ dependencies = [
  "openshell-extension-core",
  "openshell-isolation-interface",
  "openshell-ocsf",
+ "openshell-ocsf-validate",
  "openshell-otel",
  "openshell-otel-test-support",
  "openshell-policy",
