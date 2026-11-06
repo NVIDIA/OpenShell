@@ -6,6 +6,9 @@
 #[path = "preparation.rs"]
 mod preparation;
 
+#[path = "image_cache_admin.rs"]
+pub mod image_cache_admin;
+
 #[cfg(test)]
 #[path = "registry_cache_tests.rs"]
 mod registry_cache_tests;
@@ -1869,6 +1872,24 @@ impl VmDriver {
             .await?
         };
         let image_identity = image_plan.image_identity.clone();
+        let bootstrap_image_ref = self.bootstrap_image_ref()?;
+        if let Err(error) = image_cache_admin::record_use(
+            &self.config.state_dir,
+            &image_plan.bootstrap_image_identity,
+            Some(bootstrap_image_ref.as_str()),
+        ) {
+            warn!(%error, "vm driver: could not record bootstrap cache use");
+        }
+        if image_plan.image_disk.is_some()
+            && let Err(error) = record_prepared_image_use(
+                &self.config.state_dir,
+                &image_identity,
+                &image_ref,
+                driver_config_had_rootfs_tar,
+            )
+        {
+            warn!(%error, "vm driver: could not record prepared image cache use");
+        }
         self.ensure_provisioning_active(&sandbox.id).await?;
         info!(
             sandbox_id = %sandbox.id,
@@ -1918,8 +1939,13 @@ impl VmDriver {
             .map_err(|err| Status::internal(format!("prepare guest overlay disk failed: {err}")))?;
         self.ensure_provisioning_active(&sandbox.id).await?;
 
-        if let Err(err) =
-            write_sandbox_image_metadata(&state_dir, &image_ref, &image_identity).await
+        if let Err(err) = write_sandbox_image_metadata(
+            &state_dir,
+            &image_ref,
+            &image_identity,
+            &image_plan.bootstrap_image_identity,
+        )
+        .await
         {
             return Err(Status::internal(format!(
                 "write sandbox image metadata failed: {err}"
@@ -5197,6 +5223,11 @@ impl VmDriver {
 #[doc(hidden)]
 pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), String> {
     let (request, directory) = preparation::read_request(request_path)?;
+    let _cache_lease = image_cache_admin::lock_cache(
+        &request.config.state_dir,
+        image_cache_admin::LockMode::Shared,
+    )
+    .map_err(|error| format!("lock image cache for preparation: {error}"))?;
     validate_sandbox_id(&request.sandbox_id).map_err(|error| error.message().to_string())?;
     preparation::watch_parent(request.parent_pid)?;
     tracing_subscriber::fmt()
@@ -7333,22 +7364,57 @@ fn unique_image_cache_suffix() -> String {
     format!("{}-{counter}", openshell_core::time::now_ms())
 }
 
+fn record_prepared_image_use(
+    state_dir: &Path,
+    image_identity: &str,
+    image_ref: &str,
+    from_rootfs_tar: bool,
+) -> Result<(), std::io::Error> {
+    image_cache_admin::record_use(
+        state_dir,
+        image_identity,
+        (!from_rootfs_tar).then_some(image_ref),
+    )
+}
+
+async fn write_sandbox_identity_file(
+    state_dir: &Path,
+    filename: &str,
+    identity: &str,
+) -> Result<(), std::io::Error> {
+    let sequence = IMAGE_CACHE_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary = state_dir.join(format!(".{filename}.{}.{sequence}.tmp", std::process::id()));
+    let result = async {
+        write_private_file(&temporary, format!("{identity}\n").into_bytes()).await?;
+        tokio::fs::rename(&temporary, state_dir.join(filename)).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result
+}
+
 async fn write_sandbox_image_metadata(
     state_dir: &Path,
     image_ref: &str,
     image_identity: &str,
+    bootstrap_image_identity: &str,
 ) -> Result<(), std::io::Error> {
-    tokio::fs::write(
-        state_dir.join(IMAGE_IDENTITY_FILE),
-        format!("{image_identity}\n"),
+    // Write the bootstrap reference first. If this fails, the old image
+    // identity still protects its disk when prune scans persisted state.
+    write_sandbox_identity_file(
+        state_dir,
+        image_cache_admin::BOOTSTRAP_IDENTITY_FILE,
+        bootstrap_image_identity,
     )
     .await?;
+    write_sandbox_identity_file(state_dir, IMAGE_IDENTITY_FILE, image_identity).await?;
     tokio::fs::write(
         state_dir.join(IMAGE_REFERENCE_FILE),
         format!("{image_ref}\n"),
     )
     .await?;
-
     Ok(())
 }
 
@@ -9116,6 +9182,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn failed_bootstrap_identity_write_preserves_prior_image_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path();
+        tokio::fs::write(state_dir.join(IMAGE_IDENTITY_FILE), b"prior-image\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(state_dir.join(image_cache_admin::BOOTSTRAP_IDENTITY_FILE))
+            .await
+            .unwrap();
+
+        assert!(
+            write_sandbox_image_metadata(
+                state_dir,
+                "new-image",
+                "new-image-id",
+                "new-bootstrap-id",
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(state_dir.join(IMAGE_IDENTITY_FILE))
+                .await
+                .unwrap(),
+            "prior-image\n"
+        );
+    }
+
+    #[test]
+    fn rootfs_tar_cache_use_has_no_image_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_id = "sandbox-prepared-rootfs-ext4-umoci-v4-openshell-rootfs-tar";
+        let disk = image_cache_rootfs_image(temp.path(), cache_id);
+        fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        fs::write(&disk, b"disk").unwrap();
+
+        record_prepared_image_use(temp.path(), cache_id, "unrelated/image:tag", true).unwrap();
+        let lease = image_cache_admin::lock_cache(temp.path(), image_cache_admin::LockMode::Shared)
+            .unwrap();
+        let entry = lease.list().unwrap().pop().unwrap();
+        assert_eq!(entry.image_ref, None);
+        assert!(entry.last_used_unix_ms.is_some());
+    }
+
     async fn assert_inactive_restore_retains_identity(marker: &str, reason: &str) {
         let temp = tempfile::tempdir().unwrap();
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
@@ -9149,9 +9260,20 @@ mod tests {
         )
         .await
         .unwrap();
-        write_sandbox_image_metadata(&state_dir, "unused-image", "sha256:original-image")
-            .await
-            .unwrap();
+        write_sandbox_image_metadata(
+            &state_dir,
+            "unused-image",
+            "sha256:original-image",
+            "sha256:bootstrap-image",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(state_dir.join(image_cache_admin::BOOTSTRAP_IDENTITY_FILE))
+                .await
+                .unwrap(),
+            "sha256:bootstrap-image\n"
+        );
         tokio::fs::write(state_dir.join(marker), b"inactive\n")
             .await
             .unwrap();
