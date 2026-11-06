@@ -638,6 +638,51 @@ jobs:
           echo "$changed"
           exit 1
 
+  python-sdk-freeze:
+    # The Python SDK moved to ai-openshell/sdk-python (#5287), which imported it
+    # at v0.1.7. Its files stay only until core removes them, so PRs must not
+    # add or change them. Deleting files is allowed (the removal PR). The paths
+    # are the ones the import moved; core-only tests under python/ and the
+    # shared root pyproject.toml and uv.lock stay editable.
+    # Merge queue runs skip this job; the PR already passed it on its mirror.
+    name: Python SDK Freeze
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reject changes to the Python SDK
+        env:
+          BASE_SHA: ${{ needs.pr_metadata.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- \
+            python/openshell \
+            ':!python/openshell/release_formula_test.py' \
+            ':!python/openshell/rpm_gateway_config_migration_test.py' \
+            ':!python/openshell/gateway_config_fixture_test.py' \
+            ':!python/openshell/gateway_schema_v2_*_test.py' \
+            python/credential_driver_proto_test.py \
+            python/generate_python_proto_test.py \
+            python/grpc_transport_test.py \
+            python/grpc_typing_test.py \
+            python/wheel_verifier_test.py \
+            tasks/scripts/generate_python_proto.py \
+            tasks/scripts/verify-python-wheel.py)
+          if [ -z "$changed" ]; then
+            echo "No added or changed Python SDK files."
+            exit 0
+          fi
+          echo "::error title=Python SDK moved::The Python SDK moved to https://github.com/ai-openshell/sdk-python. Drop the Python SDK changes from this PR and open SDK changes there. Regenerated bindings are not needed here; sdk-python regenerates them from core releases."
+          echo "Changed Python SDK files:"
+          echo "$changed"
+          exit 1
+
   markdown:
     name: Markdown
     needs: pr_metadata

@@ -61,7 +61,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |
 | `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
 | `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
-| `python/openshell/` | Python SDK | Python bindings and CLI packaging |
+| `python/openshell/` | Python SDK (frozen) | Moved to ai-openshell/sdk-python; kept until removal |
 | `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `tests/testkit/` | E2E testkit | Support library and `#[testkit::test]` attribute for SDK-driven E2E suites |
@@ -196,6 +196,11 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 
 - The Go SDK moved to [ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go) (module `github.com/ai-openshell/sdk-go`). Open SDK changes there.
 - `sdk/go/` is frozen until it is removed; Branch Checks fails PRs that change it. Proto changes do not need regenerated Go bindings.
+
+## Python SDK (`python/openshell/`)
+
+- The Python SDK moved to [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python), which publishes `openshell` to PyPI. Open SDK changes there.
+- The SDK files are frozen until core removes them; Branch Checks fails PRs that change them. Core-only tests under `python/` stay editable.
 
 ## TypeScript SDK (`sdk/typescript/`)
 
