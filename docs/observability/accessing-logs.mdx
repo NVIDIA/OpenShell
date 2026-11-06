@@ -78,13 +78,13 @@ The gateway merges the log and platform event sources before emitting, so events
 
 ## Direct Filesystem Access
 
-The supervisor writes shorthand logs to `/var/log/openshell.YYYY-MM-DD.log` and, when enabled, OCSF JSONL to `/var/log/openshell-ocsf.YYYY-MM-DD.jsonl` in its own filesystem. `openshell sandbox exec` runs in the workload and does not give access to the supervisor's files.
+The supervisor writes shorthand logs to `openshell.YYYY-MM-DD.log` and, when enabled, OCSF JSONL to `openshell-ocsf.YYYY-MM-DD.jsonl` in its log directory, `/var/log` unless the driver sets another. `openshell sandbox exec` runs in the workload and does not give access to the supervisor's files.
 
 | Compute driver | Supervisor log location | Local storage lifetime |
 |---|---|---|
 | Kubernetes | `/var/log` in the separate supervisor pod's `supervisor` container | An `emptyDir` volume, removed with the pod. |
 | Docker / Podman | `/var/log` in the separate supervisor container | A tmpfs mount, lost when the container stops. |
-| VM | `/var/log` on the host running the supervisor, if writable | Host-managed storage. The driver also captures stderr in `supervisor.err.log` in the sandbox's driver state directory. |
+| VM | `logs/` in the sandbox's driver state directory on the host | Removed with the sandbox. The driver also captures stderr in `supervisor.err.log` beside it. |
 | Windows MXC | Gateway-local JSONL output | See [Windows MXC gateways](/observability/ocsf-json-export#windows-mxc-gateways). |
 
 Use platform tooling with access to the supervisor resources. For Podman, copy the current supervisor files to a local directory while the container is running:
@@ -108,7 +108,7 @@ Shorthand and diagnostics follow the supervisor's diagnostic log filter. With `o
 
 The default supervisor image has no shell or `tar`, so shell-based `kubectl exec` and `kubectl cp` examples do not work with that image. Reading Kubernetes supervisor files requires operator-managed access to its log volume, such as cluster debugging tooling. OpenShell does not configure a file collector for you.
 
-Ship files before rotation or resource teardown and configure your collector to handle daily rotation. Local file writers are non-blocking and can also drop events under pressure. If the supervisor cannot open `/var/log`, it falls back to stderr-only logging and does not produce these files, even when `ocsf_json_enabled` is true. Neither the local files nor the gateway stream guarantees complete audit history.
+Ship files before rotation or resource teardown and configure your collector to handle daily rotation. Local file writers are non-blocking and can also drop events under pressure. If the supervisor cannot open its log directory, it falls back to stderr-only logging and does not produce these files, even when `ocsf_json_enabled` is true. Neither the local files nor the gateway stream guarantees complete audit history.
 
 ## Filtering by Event Type
 

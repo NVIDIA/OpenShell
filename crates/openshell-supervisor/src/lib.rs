@@ -977,19 +977,23 @@ pub struct SandboxInstanceBindings {
 
 impl SandboxInstanceBindings {
     /// Bindings of a process dedicated to the instance `config` launches. Its
-    /// process-wide log push and shorthand log files serve the instance.
+    /// process-wide log push and the shorthand log files in `log_dir` serve
+    /// the instance.
     #[must_use]
     pub fn dedicated(
         config: &SandboxInstanceConfig,
         gateway_credentials: openshell_core::grpc_client::GatewayCredentials,
         ocsf_json: openshell_ocsf::OcsfJsonSettings,
+        log_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             gateway_credentials,
             event_context: Arc::new(config.event_context()),
             ocsf_json,
             log_sink: None,
-            denial_log: openshell_supervisor_network::policy_local::DenialLogSource::default(),
+            denial_log: openshell_supervisor_network::policy_local::DenialLogSource::ShorthandFiles(
+                log_dir,
+            ),
         }
     }
 }
@@ -4720,6 +4724,7 @@ mod tests {
             openshell_core::grpc_client::GatewayCredentials::from_auth_bundle(&config.auth_bundle)
                 .expect("credentials"),
             openshell_ocsf::OcsfJsonSettings::default(),
+            std::path::PathBuf::from(openshell_core::sandbox_env::DEFAULT_LOG_DIR),
         );
         let image = bindings.event_context.container().unwrap().image.unwrap();
         assert_eq!(image.uid, "sha256:workload");
