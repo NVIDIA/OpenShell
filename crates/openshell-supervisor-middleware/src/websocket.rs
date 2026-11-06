@@ -42,6 +42,8 @@ pub struct WebSocketPreflightInput {
     pub sandbox_id: String,
     pub sandbox_name: String,
     pub workspace: String,
+    /// Identity resolved when the connection was admitted, if available.
+    pub originating_process: Option<openshell_core::proto::Process>,
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -954,13 +956,16 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
     let preflight = WebSocketPreflight {
         session_id: input.session_id,
         phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-        context: Some(RequestContext {
-            request_id: input.request_id,
-            sandbox_id: input.sandbox_id,
-            sandbox: input.sandbox_name,
-            workspace: input.workspace,
-            originating_process: None,
-        }),
+        context: Some(crate::request_context_with_process(
+            RequestContext {
+                request_id: input.request_id,
+                sandbox_id: input.sandbox_id,
+                sandbox: input.sandbox_name,
+                workspace: input.workspace,
+                originating_process: None,
+            },
+            input.originating_process,
+        )),
         target: Some(HttpRequestTarget {
             scheme: input.scheme,
             host: input.host,

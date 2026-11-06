@@ -8,6 +8,17 @@ stdin. Re-executing the test binary checks multiple holders with the same binary
 identity; executing a different binary checks ambiguous shared-socket identity.
 The fixture kills and reaps the child when the parent test ends.
 
+## Middleware caller context
+
+The L7 relay retains the process identity resolved at connection admission and
+passes its binary path, PID, and nearest-first executable ancestors to request,
+response preflight, and WebSocket preflight middleware contexts. The middleware
+runtime trims distant ancestors to keep the encoded context within 4 KiB. If
+attribution is unavailable, a path cannot be represented as UTF-8, or the
+binary cannot fit, the process field is absent. When multiple same-identity
+processes hold the socket, the process field retains their common binary and
+ancestry but reports PID zero because the sender cannot be identified.
+
 The manual proxy performance baseline still counts allocations. Its test-only
 global allocator uses `openshell-driver-vm::allocation_tracking`; the unsafe
 allocator implementation belongs to the VM crate. The VM dependency disables
