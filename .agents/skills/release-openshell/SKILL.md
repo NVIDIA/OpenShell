@@ -33,8 +33,8 @@ Release creates `vX.Y.Z` at that exact commit, then rebuilds and publishes all
 stable artifacts without rerunning qualification. Embedded versions change, so
 stable artifacts are not byte-identical to the qualified prerelease. An existing
 stable tag may be retried only if it already points to the selected commit. A retry
-publishes only missing artifacts; published images, charts, release assets, npm,
-and PyPI versions are kept, while the snap is uploaded again.
+publishes only missing artifacts; published images, charts, release assets, and
+npm versions are kept, while the snap is uploaded again.
 Stable images are saved as OCI archives during the build and pushed under the
 stable version tags during publication. Their SBOMs are verified before updating
 `latest`; the qualified prerelease's commit-SHA image tags remain unchanged.
@@ -84,17 +84,6 @@ immutable version and advance latest only for a newer version.
 
 Watch the stable release run and report its result.
 
-## PyPI publishing
+## Python SDK
 
-Stable releases publish the Python wheel to PyPI from `wheel-publish.yml`, which the `publish-pypi` job in `release-publish.yml` calls after the GitHub Release is created. The workflow downloads the wheel from the stable GitHub Release, not a run's build artifact, and checks the stable tag's source commit and the wheel's release checksum. It uses Trusted Publishing with the `pypi` GitHub environment. PyPI matches the workflow file that contains the publishing job, so configure the `openshell` PyPI project's GitHub publisher with owner `NVIDIA`, repository `OpenShell`, workflow `wheel-publish.yml`, and environment `pypi`. No PyPI API token or GitLab trigger credentials are required.
-
-The environment must allow the branch used to dispatch Release or `wheel-publish.yml`. For a support release, explicitly allow its support branch before dispatching. Required reviewers, if configured, must approve the PyPI job. An existing wheel on PyPI is skipped; PyPI does not allow replacing a published wheel.
-
-If a stable release did not reach PyPI, publish the wheel without rerunning Release:
-
-```shell
-gh workflow run wheel-publish.yml -R NVIDIA/OpenShell --ref main \
-  -f release-tag=vX.Y.Z -f source-sha=<tag commit> -f python-version=X.Y.Z
-```
-
-Development and prerelease wheels remain GitHub Release assets and do not publish to PyPI.
+Core no longer builds or publishes the Python SDK for releases. Stable and prerelease GitHub Releases carry no wheel, and nothing in core publishes to PyPI. `openshell` `0.1.7` is the last core-built wheel. From `0.1.8` on, [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python) publishes `openshell` on the same day as each stable core release, once its update PR for the core tag merges. The rolling `dev` release still attaches a development wheel until the SDK sources leave core (NVIDIA/OpenShell#5287).
