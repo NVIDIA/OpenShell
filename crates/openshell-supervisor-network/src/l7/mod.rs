@@ -462,6 +462,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 
 pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str, surface: &str) {
     let event = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .action(openshell_ocsf::ActionId::Denied)
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
             "openshell.credentials.traffic_uninspectable",

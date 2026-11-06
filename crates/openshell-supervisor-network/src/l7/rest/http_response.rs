@@ -1034,6 +1034,7 @@ fn http_response_middleware_block_finding_event(
     }
     Some(
         openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
+            .action(openshell_ocsf::ActionId::Denied)
             .severity(openshell_ocsf::SeverityId::Medium)
             .finding_info(openshell_ocsf::FindingInfo::new(
                 "openshell.middleware.http_response_blocked",
@@ -2239,6 +2240,14 @@ mod tests {
             // A blocking invocation adds its own block finding.
             assert_eq!(events.len(), if denied { 3 } else { 2 });
             if denied {
+                let blocked = events
+                    .iter()
+                    .find(|event| {
+                        event["finding_info"]["uid"] == "openshell.middleware.http_response_blocked"
+                    })
+                    .expect("blocked delivery emits its refusal finding");
+                assert_eq!(blocked["action_id"], 2);
+                assert_eq!(blocked["action"], "Denied");
                 assert_eq!(received.spans.len(), 1);
                 assert_deny_resolves(&events, &received, true);
             } else {

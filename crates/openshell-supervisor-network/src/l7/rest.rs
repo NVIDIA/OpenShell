@@ -1536,6 +1536,7 @@ fn emit_uninspected_body_credential_denial(
         .build();
     crate::telemetry::egress_emit!(event);
     let finding = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .action(openshell_ocsf::ActionId::Denied)
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
             "openshell.credentials.traffic_uninspectable",
@@ -6978,6 +6979,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_refusal_findings_record_denial_without_http_spans() {
+        let request = L7Request {
+            action: "POST".into(),
+            target: "/api".into(),
+            query_params: HashMap::new(),
+            raw_header: vec![],
+            body_length: BodyLength::None,
+        };
+        let (events, received) = crate::telemetry::tests::exported("warn", || {
+            crate::l7::emit_uninspected_credential_finding("example.test", "p", "test");
+            emit_uninspected_body_credential_denial(
+                &request,
+                &RelayRequestOptions {
+                    host: "example.test",
+                    port: 443,
+                    ..Default::default()
+                },
+                BodyCredentialError::KnownUnavailable,
+            );
+        })
+        .await;
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["class_uid"] == 2004)
+                .count(),
+            2
+        );
+        for event in &events {
+            assert_eq!(event["action_id"], 2);
+            assert_eq!(event["action"], "Denied");
+        }
+        crate::telemetry::tests::assert_no_deny(&events, &received);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn response_trace_upstream_io_failure_is_not_an_enforced_denial() {
         struct FailedReader;
         impl AsyncRead for FailedReader {
@@ -7024,8 +7062,14 @@ mod tests {
                 });
             })
             .await;
-            assert!(events.iter().any(|event| event["finding_info"]["uid"]
-                == "openshell.middleware.http_response_failure"));
+            let finding = events
+                .iter()
+                .find(|event| {
+                    event["finding_info"]["uid"] == "openshell.middleware.http_response_failure"
+                })
+                .expect("upstream I/O failure retains its diagnostic finding");
+            assert!(finding.get("action_id").is_none());
+            assert!(finding.get("action").is_none());
             crate::telemetry::tests::assert_no_deny(&events, &received);
         }
     }
@@ -7085,10 +7129,14 @@ mod tests {
             });
         })
         .await;
-        assert!(
-            events.iter().any(|event| event["finding_info"]["uid"]
-                == "openshell.middleware.http_response_failure")
-        );
+        let finding = events
+            .iter()
+            .find(|event| {
+                event["finding_info"]["uid"] == "openshell.middleware.http_response_failure"
+            })
+            .expect("downstream I/O failure retains its diagnostic finding");
+        assert!(finding.get("action_id").is_none());
+        assert!(finding.get("action").is_none());
         crate::telemetry::tests::assert_no_deny(&events, &received);
     }
 

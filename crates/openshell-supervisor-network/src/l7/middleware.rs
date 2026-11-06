@@ -147,7 +147,7 @@ pub fn uninspectable_traffic_gate(
 /// Emit the detection finding for traffic a matching middleware chain cannot
 /// inspect: denied under a fail-closed chain, bypassed under fail-open.
 pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: bool) {
-    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+    let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(if denied {
             SeverityId::High
         } else {
@@ -167,9 +167,11 @@ pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: 
             "Uninspectable traffic to host with required middleware; denied"
         } else {
             "Uninspectable traffic bypassed middleware (fail_open)"
-        })
-        .build();
-    egress_emit!(event);
+        });
+    if denied {
+        event = event.action(ActionId::Denied);
+    }
+    egress_emit!(event.build());
 }
 
 pub fn emit_websocket_preflight_events(
@@ -185,7 +187,7 @@ pub fn emit_websocket_preflight_events(
         emit_websocket_saturation(ctx);
     }
     if outcome.session_capacity_exhausted {
-        emit_middleware_session_capacity_exhausted(ctx);
+        emit_middleware_session_capacity_exhausted(ctx, !outcome.allowed);
     }
 }
 
@@ -454,8 +456,8 @@ fn emit_websocket_saturation(ctx: &L7EvalContext) {
     egress_emit!(event);
 }
 
-fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext) {
-    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext, denied: bool) {
+    let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
             "openshell.middleware.session_capacity_exhausted",
@@ -466,13 +468,16 @@ fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext) {
             ("host", ctx.host.as_str()),
             ("operation", "websocket_message"),
         ])
-        .message("Persistent middleware session admission was refused at process capacity")
-        .build();
-    egress_emit!(event);
+        .message("Persistent middleware session admission was refused at process capacity");
+    if denied {
+        event = event.action(ActionId::Denied);
+    }
+    egress_emit!(event.build());
 }
 
 fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
     DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .action(ActionId::Denied)
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
             "openshell.middleware.admission_exhausted",
@@ -796,7 +801,7 @@ pub(super) fn resolve_unbuffered_body(
 }
 
 fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
-    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+    let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(if denied {
             SeverityId::High
         } else {
@@ -815,9 +820,11 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
             "Request body exceeded middleware inspection cap; denied"
         } else {
             "Request body exceeded middleware inspection cap; passed through (fail_open)"
-        })
-        .build();
-    egress_emit!(event);
+        });
+    if denied {
+        event = event.action(ActionId::Denied);
+    }
+    egress_emit!(event.build());
 }
 
 /// Parse the raw header block into middleware-visible headers, preserving
@@ -1110,6 +1117,71 @@ mod trace_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inspection_refusals_record_denial_but_fail_open_findings_do_not() {
+        for denied in [false, true] {
+            let (events, received) = exported("warn", || {
+                let ctx = L7EvalContext::default();
+                emit_middleware_uninspectable(&ctx, "unknown protocol", denied);
+                emit_middleware_body_unavailable(&ctx, denied);
+            })
+            .await;
+            assert_eq!(events.len(), 2);
+            for (event, uid) in events.iter().zip([
+                "openshell.middleware.traffic_uninspectable",
+                "openshell.middleware.body_unavailable",
+            ]) {
+                assert_eq!(event["finding_info"]["uid"], uid);
+                assert_eq!(event["class_uid"], 2004);
+                assert_eq!(event["action_id"].as_u64(), denied.then_some(2));
+                assert_eq!(event["action"].as_str(), denied.then_some("Denied"));
+                if !denied {
+                    assert!(event.get("action_id").is_none());
+                    assert!(event.get("action").is_none());
+                }
+            }
+            // A finding-only refusal still creates no HTTP deny span.
+            assert_no_deny(&events, &received);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_capacity_findings_follow_the_preflight_outcome() {
+        for allowed in [true, false] {
+            let (events, received) = exported("warn", || {
+                emit_websocket_preflight_events(
+                    &L7EvalContext::default(),
+                    &openshell_supervisor_middleware::WebSocketPreflightResult {
+                        allowed,
+                        terminal_reason: None,
+                        reason: "middleware_session_capacity_exhausted".into(),
+                        denial: None,
+                        session: None,
+                        findings: vec![],
+                        metadata: std::collections::BTreeMap::new(),
+                        invocations: vec![],
+                        coverage: vec![],
+                        saturated: false,
+                        session_capacity_exhausted: true,
+                    },
+                );
+            })
+            .await;
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0]["finding_info"]["uid"],
+                "openshell.middleware.session_capacity_exhausted"
+            );
+            assert_eq!(events[0]["action_id"].as_u64(), (!allowed).then_some(2));
+            assert_eq!(events[0]["action"].as_str(), (!allowed).then_some("Denied"));
+            if allowed {
+                assert!(events[0].get("action_id").is_none());
+                assert!(events[0].get("action").is_none());
+            }
+            assert_no_deny(&events, &received);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http_chain_outcomes_group_findings_and_preserve_allowed_controls() {
         for allowed in [true, false] {
             let (events, received) = exported("warn", || {
@@ -1169,6 +1241,10 @@ mod tests {
 
         let serialized = serde_json::to_string(&middleware_admission_exhausted_event(&ctx))
             .expect("serialize admission event");
+        let event: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(event["class_uid"], 2004);
+        assert_eq!(event["action_id"], 2);
+        assert_eq!(event["action"], "Denied");
         assert!(serialized.contains("openshell.middleware.admission_exhausted"));
         assert!(serialized.contains("api-policy"));
         assert!(serialized.contains("api.example.test"));

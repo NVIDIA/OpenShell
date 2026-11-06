@@ -103,6 +103,9 @@ fn deny_span(event: &HttpActivityEvent, parent: Option<&tracing::Span>) -> Optio
 const DENY_SPAN_BURST: u32 = 10;
 const DENY_SPAN_REFILL: Duration = Duration::from_secs(1);
 const DENY_SPAN_DESTINATIONS: usize = 1024;
+/// Bound aggregate span creation even when a workload rotates destinations.
+const DENY_SPAN_GLOBAL_BURST: u32 = 100;
+const DENY_SPAN_GLOBAL_REFILL: Duration = Duration::from_millis(10);
 
 static LIMITER: LazyLock<Mutex<DenySpanLimiter>> = LazyLock::new(|| Mutex::new(default_limiter()));
 
@@ -117,13 +120,16 @@ fn reset_deny_span_limiter() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = default_limiter();
 }
 
-/// Per-destination token bucket bounding how many deny spans one workload can
-/// export. OCSF records are unaffected; a limited decision just has no span.
+/// Per-destination and process-wide token buckets bounding deny-span work.
+/// OCSF records are unaffected; a limited decision creates no additional span.
 struct DenySpanLimiter {
     burst: u32,
     refill: Duration,
     capacity: usize,
     buckets: HashMap<String, Bucket>,
+    global_burst: u32,
+    global_refill: Duration,
+    global: Option<Bucket>,
 }
 
 struct Bucket {
@@ -133,15 +139,42 @@ struct Bucket {
 
 impl DenySpanLimiter {
     fn new(burst: u32, refill: Duration, capacity: usize) -> Self {
+        Self::with_global_limit(
+            burst,
+            refill,
+            capacity,
+            DENY_SPAN_GLOBAL_BURST,
+            DENY_SPAN_GLOBAL_REFILL,
+        )
+    }
+
+    fn with_global_limit(
+        burst: u32,
+        refill: Duration,
+        capacity: usize,
+        global_burst: u32,
+        global_refill: Duration,
+    ) -> Self {
         Self {
             burst,
             refill,
             capacity,
             buckets: HashMap::new(),
+            global_burst,
+            global_refill,
+            global: None,
         }
     }
 
     fn allow(&mut self, destination: &str, now: Instant) -> bool {
+        let global = self.global.get_or_insert(Bucket {
+            tokens: self.global_burst,
+            refilled: now,
+        });
+        global.refill(self.global_burst, self.global_refill, now);
+        if global.tokens == 0 {
+            return false;
+        }
         if !self.buckets.contains_key(destination) && self.buckets.len() >= self.capacity {
             for bucket in self.buckets.values_mut() {
                 bucket.refill(self.burst, self.refill, now);
@@ -161,7 +194,10 @@ impl DenySpanLimiter {
             });
         bucket.refill(self.burst, self.refill, now);
         let allowed = bucket.tokens > 0;
-        bucket.tokens = bucket.tokens.saturating_sub(1);
+        if allowed {
+            bucket.tokens -= 1;
+            global.tokens -= 1;
+        }
         allowed
     }
 }

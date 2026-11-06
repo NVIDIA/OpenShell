@@ -460,6 +460,115 @@ fn deny_span_limiter_bounds_tracked_destinations() {
     assert!(limiter.allow("c", start + Duration::from_secs(1)));
 }
 
+#[test]
+fn deny_span_limiter_bounds_aggregate_bursts_and_refills() {
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let mut limiter = super::DenySpanLimiter::with_global_limit(
+        1,
+        Duration::from_secs(1),
+        8,
+        2,
+        Duration::from_millis(100),
+    );
+    assert!(limiter.allow("a", start));
+    assert!(
+        !limiter.allow("a", start),
+        "a destination rejection spends no global token"
+    );
+    assert!(limiter.allow("b", start));
+    assert!(
+        !limiter.allow("c", start),
+        "rotating destinations cannot exceed the global burst"
+    );
+    assert!(!limiter.allow("c", start + Duration::from_millis(99)));
+    assert!(limiter.allow("c", start + Duration::from_millis(100)));
+    assert!(!limiter.allow("d", start + Duration::from_millis(100)));
+    let later = start + Duration::from_secs(10);
+    assert!(limiter.allow("a", later));
+    assert!(limiter.allow("b", later));
+    assert!(
+        !limiter.allow("c", later),
+        "global refill stops at its burst"
+    );
+}
+
+#[test]
+fn destination_capacity_rejections_spend_no_global_tokens() {
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let mut limiter = super::DenySpanLimiter::with_global_limit(
+        10,
+        Duration::from_secs(1),
+        1,
+        2,
+        Duration::from_secs(1),
+    );
+    assert!(limiter.allow("a", start));
+    assert!(!limiter.allow("b", start));
+    assert!(limiter.allow("a", start));
+    assert!(!limiter.allow("a", start));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aggregate_deny_limit_preserves_every_audit_record() {
+    let (events, received) = exported("warn", || {
+        *super::LIMITER.lock().unwrap() = super::DenySpanLimiter::with_global_limit(
+            10,
+            std::time::Duration::from_secs(1),
+            1024,
+            3,
+            std::time::Duration::MAX,
+        );
+        for index in 0..12 {
+            super::egress_emit!(http_deny(&format!("host-{index}.example"), "denied"));
+        }
+    })
+    .await;
+    assert_eq!(
+        events.len(),
+        12,
+        "the span budget never suppresses audit records"
+    );
+    assert!(events.iter().all(|event| event["action_id"] == 2));
+    assert_eq!(deny_spans(&received).len(), 3);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.get("trace").is_some())
+            .count(),
+        3
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limited_denial_keeps_an_active_sampled_connect_trace() {
+    let (events, received) = exported("debug", || {
+        *super::LIMITER.lock().unwrap() = super::DenySpanLimiter::with_global_limit(
+            1,
+            std::time::Duration::MAX,
+            1024,
+            100,
+            std::time::Duration::MAX,
+        );
+        tracing::debug_span!("supervisor.egress.connect").in_scope(|| {
+            super::egress_emit!(http_deny("blocked.example", "first"));
+            super::egress_emit!(http_deny("blocked.example", "limited"));
+        });
+    })
+    .await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(deny_spans(&received).len(), 1);
+    let connect = received
+        .spans
+        .iter()
+        .find(|span| span.name == "supervisor.egress.connect")
+        .unwrap();
+    assert_eq!(events[1]["trace"]["uid"], hex::encode(&connect.trace_id));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_denials_to_one_destination_export_bounded_spans() {
     let (events, received) = exported("warn", || {
@@ -489,4 +598,5 @@ async fn disabled_deny_spans_spend_no_tokens() {
         super::egress_emit!(http_deny("quiet.example", "denied"));
     });
     assert!(super::LIMITER.lock().unwrap().buckets.is_empty());
+    assert!(super::LIMITER.lock().unwrap().global.is_none());
 }
