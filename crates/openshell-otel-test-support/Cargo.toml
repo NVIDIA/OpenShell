@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-otel-test-support"
-description = "Shared OTLP collector fixture for OpenShell tracing tests"
+description = "Shared OTLP collector fixture for OpenShell telemetry tests"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,7 +18,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 openshell-crypto = { workspace = true }
 openshell-otel = { path = "../openshell-otel" }
-opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "logs", "trace"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace"] }
 prost = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }

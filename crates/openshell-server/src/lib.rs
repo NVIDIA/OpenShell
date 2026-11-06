@@ -744,6 +744,7 @@ pub(crate) async fn run_server(
     startup: ServerStartupConfig,
     tracing_log_bus: TracingLogBus,
     compute_drivers: ComputeDriverRegistry,
+    meter_provider: Option<openshell_otel::SdkMeterProvider>,
 ) -> Result<()> {
     let ServerStartupConfig {
         config,
@@ -1110,20 +1111,16 @@ pub(crate) async fn run_server(
 
     let state = Arc::new(state);
 
-    // Install the recorder before the endpoint-status startup reconciliation so
+    // Install the recorders before the endpoint-status startup reconciliation so
     // the lock waits and timeouts recorded there are exported. Its listener
     // binds with the others.
-    let metrics_endpoint = config
-        .metrics_bind_address
-        .map(|metrics_bind_address| {
-            gateway_metrics::install_global_recorder(
-                supervisor_session::RELAY_CAPACITY,
-                store.mutation_lock_connections(),
-            )
-            .map(|prometheus_handle| (metrics_bind_address, prometheus_handle))
-        })
-        .transpose()
-        .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+    let prometheus_handle = gateway_metrics::install_global_recorder(
+        supervisor_session::RELAY_CAPACITY,
+        store.mutation_lock_connections(),
+        config.metrics_bind_address.is_some(),
+        meter_provider.as_ref(),
+    )
+    .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
 
     grpc::policy::backfill_legacy_policy_history(&state)
         .await
@@ -1163,7 +1160,9 @@ pub(crate) async fn run_server(
     health_listener.serve(store.clone()).await?;
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
-    if let Some((metrics_bind_address, prometheus_handle)) = metrics_endpoint {
+    if let (Some(metrics_bind_address), Some(prometheus_handle)) =
+        (config.metrics_bind_address, prometheus_handle)
+    {
         if let Some(metrics_tls) = &config.metrics_tls {
             if let Some(metrics_tls_acceptor) = metrics_tls_acceptor_or_disable(metrics_tls) {
                 let metrics_listener =

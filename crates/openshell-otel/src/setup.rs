@@ -14,6 +14,7 @@ use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracer;
+pub use opentelemetry_sdk::metrics::SdkMeterProvider;
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
 use tracing_opentelemetry::OpenTelemetryLayer;
@@ -731,6 +732,10 @@ mod tests {
             ));
             assert!(matches!(
                 target("http://collector:4317").log_exporter(),
+                Err(SetupError::TlsWithoutHttps { .. })
+            ));
+            assert!(matches!(
+                target("http://collector:4317").meter_provider(),
                 Err(SetupError::TlsWithoutHttps { .. })
             ));
             assert!(target("https://collector:4317").tracer_provider().is_ok());

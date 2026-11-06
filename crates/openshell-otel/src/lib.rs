@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared OpenTelemetry trace and log export support for `OpenShell` services.
+//! Shared OpenTelemetry trace, log, and metric export support for `OpenShell` services.
 //!
 //! The crate has two tiers:
 //!
@@ -35,6 +35,8 @@ mod headers;
 #[cfg(feature = "export")]
 mod logs;
 #[cfg(feature = "export")]
+mod meter;
+#[cfg(feature = "export")]
 mod ocsf;
 #[cfg(feature = "export")]
 mod setup;
@@ -63,6 +65,8 @@ pub use grpc::{
 };
 #[cfg(feature = "export")]
 pub use headers::{encode_otlp_headers, merge_otlp_headers, parse_otlp_headers};
+#[cfg(feature = "export")]
+pub use meter::MetricsBridge;
 #[cfg(feature = "export")]
 pub use ocsf::{OcsfOtlp, OcsfOtlpLayer};
 #[cfg(feature = "export")]

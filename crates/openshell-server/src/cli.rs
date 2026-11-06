@@ -913,6 +913,8 @@ async fn run_from_args(
                 .map(|_| tracing::field::display(otlp.traces_protocol())),
             ocsf_endpoint = otlp.ocsf_endpoint().map(tracing::field::display),
             ocsf_protocol = otlp.ocsf_protocol().map(tracing::field::display),
+            metrics_endpoint = otlp.metrics_endpoint().map(tracing::field::display),
+            metrics_protocol = otlp.metrics_protocol().map(tracing::field::display),
             agent_endpoint = otlp.agent_endpoint().map(tracing::field::display),
             agent_protocol = otlp.agent_protocol().map(tracing::field::display),
             "OTLP exporting enabled"
@@ -926,7 +928,17 @@ async fn run_from_args(
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
 
-    let result = Box::pin(run_server(prepared, tracing_log_bus, compute_drivers)).await;
+    let meter_provider = otlp_export
+        .as_ref()
+        .and_then(crate::otel_tracing::OtlpExport::meter_provider)
+        .cloned();
+    let result = Box::pin(run_server(
+        prepared,
+        tracing_log_bus,
+        compute_drivers,
+        meter_provider,
+    ))
+    .await;
 
     tracing_handle.shutdown();
 
