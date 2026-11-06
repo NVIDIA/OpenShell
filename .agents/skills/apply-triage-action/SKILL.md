@@ -23,11 +23,11 @@ For **reject** or **defer**, require the engineer to give a reason. Record the l
 - **Reject** is terminal locally. Do not recommend the item again unless material new evidence changes the case.
 - **Defer** is non-terminal. Preserve its original priority and carry it into the next review's carried **Needs your decision** section.
 
-For shareable deferrals, draft a GitHub issue comment with reason, public links, and next step, or link existing waiting context. Use the confirmation rule below; declined posting leaves a local-only deferral. Keep private reasons out of external payloads and committable files. For missing reporter evidence, also propose the awaiting-information assessment state using `triage-issue`; unrelated dependency waits do not change lifecycle labels.
+For shareable deferrals, draft a GitHub issue comment with reason, public links, and next step, or link existing waiting context. Use the confirmation rule below; declined posting leaves a local-only deferral. Keep private reasons out of external payloads and committable files. For missing reporter evidence, also propose the awaiting-information assessment state using `triage-validate-issue`; unrelated dependency waits do not change lifecycle labels.
 
 ## Apply
 
-Before any external write, re-read the target and determine whether it materially changed. Follow [Label Discovery](../../../CONTRIBUTING.md#label-discovery), retrieving all pages of current definitions before proposing a label change; use [`triage-issue`](../triage-issue/SKILL.md) for assessment states and maintainer authority.
+Before any external write, re-read the target and determine whether it materially changed. Follow [Label Discovery](../../../CONTRIBUTING.md#label-discovery), retrieving all pages of current definitions before proposing a label change; use [`triage-validate-issue`](../triage-validate-issue/SKILL.md) for assessment states and maintainer authority.
 
 - If the action is already complete or would be a harmless no-op, make no external write and record the reason.
 - If new information makes the action unsafe or substantially different, stop and request a fresh review/selection.
