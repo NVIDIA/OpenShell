@@ -210,8 +210,12 @@ A proposal with any prover finding or flagged destination needs your review,
 even in automatic mode. When you reject a proposal, the agent receives the
 findings with your reason, so it can narrow its next attempt.
 
-If either policy cannot be analyzed, the proposal shows `validation unavailable`
-and cannot be approved until validation succeeds.
+The prover does not model MCP tool permissions. If either policy contains MCP
+rules, the proposal reports `prover: unsupported MCP rules; manual review required`
+and waits for human approval, even in automatic mode.
+
+Other analysis failures show `validation unavailable` and block approval until
+validation succeeds.
 
 ## What Agents Can Propose
 
