@@ -220,7 +220,17 @@ OpenShell rejects an endpoint that breaks these rules:
   such as `path`, `enforcement`, `access`, `rules`, credential rewriting or
   signing, or protocol options.
 - Endpoints whose hosts can match the same name on the same port, including
-  through wildcards, must use the same `tls` and `allowed_ips` values.
+  through wildcards, must use the same `tls` and `allowed_ips` values. An
+  endpoint that names a host takes precedence over an endpoint without `host`
+  and must be at least as restrictive: its `allowed_ips` must fall within the
+  other endpoint's list, and it must not drop TLS termination, inspection, or
+  enforcement. A more specific path must likewise preserve the restrictions of
+  every broader path it overlaps. Inspected overrides must keep the same parser,
+  MCP versions, persisted-query configuration, and GraphQL-over-WebSocket
+  classification; they may tighten enforcement and body limits. Signing and
+  credential rewrite settings must agree on overlapping endpoints, and an
+  override cannot enable `allow_uninspected_credentials` if the broader endpoint
+  disables it. Local-file loads and reloads enforce the same checks.
   Inspected endpoints that can match the same request must also agree on
   `protocol`, `enforcement`, and credential settings.
 

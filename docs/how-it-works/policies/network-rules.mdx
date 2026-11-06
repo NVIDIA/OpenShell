@@ -147,8 +147,41 @@ connection or request, and every matching rule adds the access it allows. A
 matching deny rule takes precedence over any allow, regardless of where either
 appears in the file. If one matching rule inspects requests and another does
 not, OpenShell inspects the connection, and the rule without `protocol` adds no
-request access. Endpoints that can match the same host and port must also agree
-on settings such as `tls` and `allowed_ips`, or OpenShell rejects the policy.
+request access.
+
+Settings such as `tls`, `allowed_ips`, `protocol`, and credentials come from the
+most specific endpoint that matches the connection or request, including its
+binary. An endpoint that names a host takes precedence over an endpoint without
+`host`. This happens at connection time, before path selection: a host endpoint
+with `path: /v1/**` shadows the hostless configuration for the entire connection.
+Requests outside `/v1/**` fail unless another hosted endpoint covers them.
+Among the remaining endpoints, a more specific `path` takes precedence. Equally
+specific endpoints that can match the same host and port must agree on these
+settings, or OpenShell rejects the policy.
+
+A more selective endpoint must be at least as restrictive as every broader
+endpoint it overrides. This applies to both host and path precedence, regardless
+of binary selectors. OpenShell rejects the policy if the more selective endpoint:
+
+- Omits `allowed_ips` when the broader endpoint sets it, or lists addresses
+  outside the broader endpoint's `allowed_ips`.
+- Sets `tls: skip` or `protocol: tcp` when the other endpoint does not.
+- Omits or changes `protocol` when the broader endpoint inspects requests,
+  including replacing inspection with SQL passthrough.
+- Uses `enforcement: audit` when the broader endpoint enforces.
+- Relaxes encoded-slash handling, body limits, MCP tool-name validation, or the
+  guard against uninspected credential traffic.
+
+Overlapping endpoints must keep signing and credential rewrite settings equal.
+When both inspect requests, they must also agree on MCP versions, persisted-query
+settings and registries, and GraphQL-over-WebSocket classification. These checks
+also apply to local-file policies and reloads.
+
+For example, a rule without `host` that allows public addresses on port 443 can
+coexist with a provider rule that pins `api.example.com` to one address inside
+that range. Requests from the provider's binaries to `api.example.com` use the
+pinned address and the provider's credentials. Other hosts and other binaries
+use the rule without `host`.
 
 For example, suppose one rule allows `GET /repos/**` on a host and another rule
 for the same host, port, and binary denies `GET /repos/private/**`. OpenShell
@@ -400,7 +433,9 @@ internal_api:
 When an endpoint sets `allowed_ips`, every address its hostname resolves to must
 fall within the list, including public addresses. Account for DNS rotation and
 service failover before pinning addresses. All endpoints that share a host and
-port must use the same `allowed_ips` list.
+port must use the same `allowed_ips` list. An endpoint that names a host may
+narrow the `allowed_ips` of an endpoint without `host`. Refer to
+[Overlapping Rules](#overlapping-rules).
 
 Verify that a request to the service succeeds. If it is denied, the sandbox log
 shows the resolved address and reason. Review both the hostname and the address
@@ -457,14 +492,16 @@ Use `protocol: graphql` to allow or deny GraphQL operations. APIs such as
 GitHub serve REST and GraphQL on the same host. A REST rule sees every GraphQL
 request as `POST /graphql`, so it cannot tell a query from a mutation. Give each
 API its own endpoint in one rule, and use the endpoint `path` field to send
-`/graphql` requests to the GraphQL rules. This rule allows read-only REST
-requests, GraphQL queries, and the `createIssue` mutation:
+`/graphql` requests to the GraphQL rules. Use disjoint paths for different
+protocols so neither endpoint overrides the other's parser. This rule allows
+read-only repository REST requests, GraphQL queries, and the `createIssue` mutation:
 
 ```yaml
 github_api:
   endpoints:
     - host: api.github.com
       port: 443
+      path: /repos/**
       protocol: rest
       enforcement: enforce
       access: read-only
@@ -484,9 +521,10 @@ github_api:
 ```
 
 OpenShell selects the endpoint whose `path` most specifically matches the
-request, so requests to `/graphql` use the GraphQL rules and all other paths use
-the REST rules. An endpoint without `path` matches all paths. Endpoints that
-share a host and port must agree on `tls` and `allowed_ips`.
+request. Here `/graphql` uses the GraphQL rules, `/repos/**` uses the REST
+rules, and other paths are denied. An endpoint without `path` matches all paths;
+it cannot overlap an endpoint with a different protocol. Endpoints that share a
+host and port must agree on `tls` and `allowed_ips`.
 
 For allow rules, every top-level field in an operation must match. A malformed
 or disallowed operation denies an entire batched request. GraphQL field names

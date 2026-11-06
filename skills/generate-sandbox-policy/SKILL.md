@@ -358,6 +358,8 @@ Use `allowed_ips` to pin the addresses an endpoint may reach. When it is set, ev
 - **Host + allowlist**: `host` + `allowed_ips` — domain must resolve to an IP in the allowlist
 - **Hostless allowlist**: `allowed_ips` only (no `host`) — any domain on the port is allowed if it resolves to an IP in the allowlist
 
+When a host endpoint overlaps a hostless allowlist, pin its `allowed_ips` within the hostless list and preserve the broader endpoint's restrictions. More specific paths must also preserve overlapping broader restrictions. Keep the same inspection protocol and protocol options on overrides, and keep signing and credential rewrite settings equal. Use disjoint paths for different protocols. Host precedence applies before path selection; an uncovered path on a hosted connection is denied. See [network rules](https://docs.nvidia.com/openshell/latest/how-it-works/policies/network-rules).
+
 The supervisor resolver is authoritative for hostname-only authorization. When a Linux explicit-proxy deployment exposes the workload process namespace to the supervisor, a sandbox `/etc/hosts` entry such as a Kubernetes `hostAliases` mapping is honored for an ordinary endpoint only if it sets `allowed_ips` to the exact IP or a narrow CIDR. OpenShell's driver-managed host-gateway aliases use a separate trusted IP pin.
 
 Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are **always blocked** as upstream destinations regardless of `allowed_ips`.

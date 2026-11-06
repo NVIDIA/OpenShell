@@ -19,6 +19,15 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::TcpStream;
 
+/// Parse a policy IP literal or CIDR with consistent whitespace handling.
+/// Bare addresses become /32 or /128 networks.
+pub fn parse_ip_net(entry: &str) -> Result<IpNet, ipnet::AddrParseError> {
+    let entry = entry.trim();
+    entry.parse::<IpNet>().or_else(|error| {
+        entry.parse::<IpAddr>().map(IpNet::from).map_err(|_| error)
+    })
+}
+
 /// Check if a hostname is a known cloud metadata hostname that resolves to an
 /// always-blocked metadata service.
 ///
@@ -311,6 +320,21 @@ mod tests {
     use super::*;
 
     // -- is_known_metadata_hostname --
+
+    #[test]
+    fn policy_ip_network_parser_handles_literals_cidrs_and_whitespace() {
+        for (entry, canonical) in [
+            (" 8.8.8.8 ", "8.8.8.8/32"),
+            (" 8.0.0.0/8 ", "8.0.0.0/8"),
+            (" 2001:4860::8888 ", "2001:4860::8888/128"),
+            (" 2001:4860::/32 ", "2001:4860::/32"),
+        ] {
+            assert_eq!(parse_ip_net(entry).unwrap().to_string(), canonical);
+        }
+        for invalid in ["", " ", "example.com", "8.8.8.8/99", "8.8.8.8 garbage"] {
+            assert!(parse_ip_net(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn test_known_metadata_hostname_accepts_gcp_variants() {
