@@ -7,37 +7,30 @@ description: "Authenticate with Google Cloud APIs and Vertex AI inside OpenShell
 keywords: "Generative AI, Google Cloud, Vertex AI, GCP, OAuth2, Credentials, Sandbox"
 ---
 
-The `google-cloud` provider gives sandboxes native GCP credentials so
-any Google Cloud SDK works out of the box — Cloud Storage, BigQuery, Drive,
-Maps, Discovery Engine, or any other GCP API. A GCE metadata server emulator
-on loopback provides credential placeholders that the
-sandbox proxy resolves to real tokens at request time. The sandbox process
-never holds a real GCP credential.
+Google provider profiles declare credential refresh, environment defaults, and
+local discovery behavior. The Google Cloud profile supports SDK metadata
+discovery; the Vertex AI profile supports native API requests with
+gateway-refreshed bearer tokens.
 
-## Quick Start
+## Google Cloud Metadata
 
-Import the `google-cloud` profile first; a gateway serves only the profiles you
-imported:
+The `google-cloud` example declares the `gcp-metadata` platform adapter and
+the SDK environment variables that use it. The sandbox relays metadata requests
+to the supervisor on Linux sandboxes using Docker, Podman, Kubernetes, or VM.
+Windows/MXC does not provide this adapter.
 
-```shell
-openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-cloud.yaml --global
-```
-
-If you already have `gcloud` configured with Application Default Credentials,
-create a provider with automatic credential refresh in one command:
+Import the profile before creating a provider. This example has no API
+endpoints, so bind the provider to each Google API host in sandbox policy as
+shown below.
 
 ```shell
-openshell provider create \
-  --name my-gcp \
-  --type google-cloud \
-  --from-gcloud-adc \
-  --config project_id="$(gcloud config get-value project)" \
-  --config region=global
+curl -fsSLo google-cloud.yaml https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-cloud.yaml
+openshell profile import -f google-cloud.yaml --global
 ```
 
-`--from-gcloud-adc` reads your ADC file, configures OAuth2 refresh on the
-gateway, and mints the first access token before the command returns. The
-gateway rotates the token automatically — no manual refresh needed.
+The profile's `environment` declarations provide the non-secret metadata and
+project values listed below. A copy imported under another ID keeps those
+declarations and the same adapter requirement.
 
 ## Authentication Flows
 
@@ -52,6 +45,7 @@ exchanges the refresh token for short-lived access tokens automatically.
 openshell provider create \
   --name my-gcp \
   --type google-cloud \
+  --global-profile \
   --config project_id=my-project \
   --config region=us-central1 \
   --credential GCP_ADC_ACCESS_TOKEN=placeholder
@@ -90,6 +84,7 @@ strategy.
 openshell provider create \
   --name my-gcp \
   --type google-cloud \
+  --global-profile \
   --config project_id=my-project \
   --config region=us-central1 \
   --credential GCP_SA_ACCESS_TOKEN=placeholder
@@ -223,6 +218,14 @@ endpoints by default. You must add endpoint rules to your sandbox policy
 for each GCP API the sandbox needs to reach. See "Using with GCP APIs"
 above for an example.
 
+For a client that accepts bearer-token authentication directly, you can author
+a [provider profile](/how-it-works/providers/profiles) with the needed Google
+API endpoints, client `binaries`, project and region defaults, and an ADC or
+service-account refresh strategy. Configure refresh on the provider and send
+the token placeholder in an `Authorization: Bearer` header. If the profile has
+no endpoints, bind the attached provider to each allowed host in the
+[sandbox policy](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding).
+
 ## Vertex AI
 
 The `google-vertex-ai` provider gives selected sandboxes access to native
@@ -242,21 +245,42 @@ native Vertex endpoint and request format for its selected model.
 
 ### Create a Vertex AI Provider
 
-Import the `google-vertex-ai` profile first:
+Copy the example profile and set its top-level `binaries` to the absolute paths
+of the clients that will call Vertex AI from your sandbox image. The example
+declares no binaries, so importing it unchanged does not authorize a client.
+For a native Claude Code installation, use the resolved executable path inside
+the image; `command -v claude` may return a symlink to a versioned binary. For
+an npm or other script installation, use the resolved Node.js interpreter path
+instead. OpenShell authorizes the executable and its trusted executable
+ancestors, not the script path from the process command line. Include the path
+to `curl` if you plan to use the native API example below.
 
 ```shell
-openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-vertex-ai.yaml --global
+curl -fsSLo google-vertex-ai.yaml https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-vertex-ai.yaml
+# Edit google-vertex-ai.yaml and add, for example:
+# Native Claude Code:
+# binaries: [/usr/bin/curl, /path/to/resolved/claude]
+# npm-installed Claude Code:
+# binaries: [/usr/bin/curl, /path/to/resolved/node]
+openshell profile lint -f google-vertex-ai.yaml
+openshell profile import -f google-vertex-ai.yaml --global
 ```
+
+For a native installation, find the resolved path with
+`readlink -f "$(command -v claude)"`. For an npm installation, find the Node.js
+interpreter with `readlink -f "$(command -v node)"`. Run the applicable command
+inside the image.
 
 #### Service Account Key
 
-Create the provider with the JSON key as gateway-only bootstrap material:
+Create the provider for runtime credentials:
 
 ```shell
 openshell provider create \
   --name vertex-prod \
   --type google-vertex-ai \
-  --credential GOOGLE_SERVICE_ACCOUNT_KEY="$(cat /path/to/key.json)" \
+  --global-profile \
+  --runtime-credentials \
   --config VERTEX_AI_PROJECT_ID=my-gcp-project \
   --config VERTEX_AI_REGION=us-central1
 ```
@@ -275,6 +299,16 @@ openshell provider refresh configure vertex-prod \
 The private key remains in the gateway credential store. Sandboxes receive
 only an opaque placeholder for the short-lived access token.
 
+The profile's `environment` and `discovery.config_env_vars` declarations supply
+SDK configuration and local discovery behavior. A copy imported under another
+ID keeps those effects. Do not store `GOOGLE_SERVICE_ACCOUNT_KEY` as a provider
+credential or non-secret environment default; supply the private key through
+refresh configuration. If an older provider record still holds that key after
+the profile declaration is removed, the gateway omits it and continues to
+provide the access token and SDK configuration. Two Vertex providers can share
+the same non-secret SDK defaults when their values match and their credential
+environment keys differ.
+
 #### gcloud Application Default Credentials
 
 For local development:
@@ -285,6 +319,7 @@ gcloud auth application-default login
 openshell provider create \
   --name vertex-local \
   --type google-vertex-ai \
+  --global-profile \
   --from-gcloud-adc \
   --config VERTEX_AI_PROJECT_ID=my-gcp-project \
   --config VERTEX_AI_REGION=us-central1
@@ -299,7 +334,7 @@ file and refresh token do not enter the sandbox.
 | Key | Required | Default | Description |
 |---|---|---|---|
 | `VERTEX_AI_PROJECT_ID` | Yes | — | GCP project ID exposed as non-secret workload configuration. |
-| `VERTEX_AI_REGION` | No | `us-central1` | Vertex location exposed as non-secret workload configuration. |
+| `VERTEX_AI_REGION` | Client dependent | — | Vertex location exposed as non-secret workload configuration. Set it explicitly for regional endpoints. |
 
 When the provider is attached, OpenShell also projects standard project and
 location aliases such as `GOOGLE_CLOUD_PROJECT`, `ANTHROPIC_VERTEX_PROJECT_ID`,
@@ -325,6 +360,36 @@ openshell sandbox provider attach vertex-agent vertex-local
 Launch a new process after runtime attachment so it receives the provider
 environment. Existing processes do not gain newly attached environment
 variables.
+
+### Run Claude Code with Vertex AI
+
+Use an image with Claude Code installed. In the imported profile's `binaries`,
+include the resolved Claude executable for a native installation or the
+resolved Node.js interpreter for an npm installation. After attaching the
+provider, start an interactive shell:
+
+```shell
+openshell sandbox connect vertex-agent
+```
+
+Then start Claude Code inside the sandbox:
+
+```shell
+vertex_token=${GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN:-${GOOGLE_VERTEX_AI_TOKEN:-}}
+test -n "$vertex_token" || { echo "Vertex token unavailable" >&2; exit 1; }
+ANTHROPIC_AUTH_TOKEN="$vertex_token" \
+  CLAUDE_CODE_USE_VERTEX=1 \
+  CLAUDE_CODE_SKIP_VERTEX_AUTH=1 \
+  claude
+```
+
+Run these commands in the sandbox shell so the token comes from the attached
+provider. The project and region variables come from the profile. Claude Code
+uses `ANTHROPIC_AUTH_TOKEN` for the bearer Authorization header and
+`CLAUDE_CODE_SKIP_VERTEX_AUTH=1` to skip its own Google credential lookup.
+OpenShell replaces the token placeholder on authorized Vertex requests. See
+[Claude Code's gateway authentication settings](https://docs.anthropic.com/en/docs/claude-code/llm-gateway)
+for the client environment variables.
 
 ### Call the Native Vertex API
 
@@ -375,8 +440,13 @@ Common failures:
   provider profile's endpoint binding.
 - A Vertex 400 or 404 usually means the model, location, publisher path, or
   request body does not match the native API.
-- A Vertex 401 or 403 can indicate an expired refresh grant or missing GCP IAM
-  permission. Check `provider refresh status` and the Vertex AI User role.
+- A Vertex 401 with `CREDENTIALS_MISSING` means the request reached Google
+  without a usable Authorization header. For Claude Code, pass the provider
+  token through `ANTHROPIC_AUTH_TOKEN` as shown above; setting only
+  `CLAUDE_CODE_SKIP_VERTEX_AUTH=1` leaves the request unauthenticated.
+- Other 401 responses can indicate an expired refresh grant. Check
+  `provider refresh status`. A 403 can indicate missing GCP IAM permission or
+  model access; check the Vertex AI User role and access to the selected model.
 
 Provider creation does not verify model access. The native request is the
 end-to-end check.

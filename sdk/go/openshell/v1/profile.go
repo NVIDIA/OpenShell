@@ -27,6 +27,9 @@ type NetworkBinary = types.NetworkBinary
 // ProfileDiscovery holds local discovery configuration for a profile.
 type ProfileDiscovery = types.ProfileDiscovery
 
+// ProfileEnvironment declares non-secret workload environment defaults.
+type ProfileEnvironment = types.ProfileEnvironment
+
 // ProfileImportItem is an item submitted for profile import or lint validation.
 type ProfileImportItem = types.ProfileImportItem
 
