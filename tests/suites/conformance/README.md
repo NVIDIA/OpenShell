@@ -23,7 +23,7 @@ tmachine environment on CI. The other suites are ports of the old
 tests, so a test environment needs it installed
 (`tests/tmachine/ansible/playbooks/test-tools.yaml` does that for the tmachine
 environments). `credential-gating`, ported from NVIDIA/OpenShell#5264, starts
-servers on the machine that runs the tests and reaches them from sandboxes
+servers (`tests/support/host-server`) on the machine that runs the tests and reaches them from sandboxes
 created from `testkit::python_image()` through `host.openshell.internal`, so
 it fails against a gateway whose sandboxes can't reach that machine, such as
 a remote Kubernetes cluster.
