@@ -1373,7 +1373,7 @@ mod tests {
             async move {
                 let _ssh = runtime
                     .store
-                    .acquire_ssh_identity_mutation_guard()
+                    .acquire_ssh_identity_mutation_guard("f")
                     .await
                     .unwrap();
                 drop(
@@ -1397,7 +1397,7 @@ mod tests {
                 drop(
                     runtime
                         .store
-                        .acquire_ssh_identity_mutation_guard()
+                        .acquire_ssh_identity_mutation_guard("g")
                         .await
                         .unwrap(),
                 );
