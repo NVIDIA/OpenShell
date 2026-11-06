@@ -8242,6 +8242,73 @@ mod tests {
     }
 
     #[test]
+    fn provisioning_timeout_prefers_failed_scheduling_over_ready_placeholder() {
+        let ready = SandboxCondition {
+            r#type: "Ready".into(),
+            status: "False".into(),
+            reason: "ConfigurationPending".into(),
+            message: "Waiting for effective configuration validation before workload activation"
+                .into(),
+            transition_time: None,
+        };
+        let scheduled = SandboxCondition {
+            r#type: "PodScheduled".into(),
+            status: "false".into(),
+            reason: "Unschedulable".into(),
+            message: "0/5 nodes are available: 1 Too many pods".into(),
+            transition_time: None,
+        };
+        for conditions in [
+            vec![ready.clone(), scheduled.clone()],
+            vec![scheduled.clone(), ready],
+            vec![scheduled],
+        ] {
+            let status = SandboxStatus {
+                conditions,
+                ..Default::default()
+            };
+            let detail = ready_false_condition_message(Some(&status));
+            assert_eq!(
+                detail.as_deref(),
+                Some("Unschedulable: 0/5 nodes are available: 1 Too many pods")
+            );
+            assert_eq!(
+                provisioning_timeout_message(300, None, detail.as_deref()),
+                "sandbox provisioning timed out after 300s. Last reported status: Unschedulable: 0/5 nodes are available: 1 Too many pods"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_false_condition_message_falls_back_when_scheduling_has_not_failed() {
+        for scheduled_status in ["True", "Unknown", ""] {
+            let status = SandboxStatus {
+                conditions: vec![
+                    SandboxCondition {
+                        r#type: "PodScheduled".into(),
+                        status: scheduled_status.into(),
+                        reason: "SchedulingStatus".into(),
+                        message: "Scheduling observation".into(),
+                        transition_time: None,
+                    },
+                    SandboxCondition {
+                        r#type: "Ready".into(),
+                        status: "False".into(),
+                        reason: "ConfigurationPending".into(),
+                        message: "Waiting for configuration".into(),
+                        transition_time: None,
+                    },
+                ],
+                ..Default::default()
+            };
+            assert_eq!(
+                ready_false_condition_message(Some(&status)).as_deref(),
+                Some("ConfigurationPending: Waiting for configuration")
+            );
+        }
+    }
+
+    #[test]
     fn ready_false_condition_message_ignores_non_ready_conditions() {
         let status = SandboxStatus {
             agent_pod: "gpu-pod".to_string(),
