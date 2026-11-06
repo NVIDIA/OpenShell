@@ -702,7 +702,8 @@ mod tests {
 
     fn executor_with_relay(otlp_relay_active: bool) -> LocalBoundaryExec {
         let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start test workload launcher");
+            crate::linux::workload_launcher::start(&crate::network_broker::DENIED_SOCKET_OPTIONS)
+                .expect("start test workload launcher");
         std::thread::spawn(move || {
             while let Ok(notification) = listener.receive() {
                 let syscall = i64::from(notification.syscall);

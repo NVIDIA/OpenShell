@@ -3,10 +3,13 @@
 
 //! Minimal, typed wrappers for Linux seccomp user notification.
 //!
-//! The wrappers validate notification IDs around every operation and keep raw
-//! UAPI structures private. Production policy and queueing belong to the
-//! sandbox crate; this module owns only the kernel ABI and active conformance
-//! probe.
+//! The wrappers keep raw UAPI structures private. Response operations resolve
+//! the notification ID atomically in the kernel and fail with `ENOENT` when
+//! the target was interrupted or terminated, so they need no userspace
+//! `SECCOMP_IOCTL_NOTIF_ID_VALID` pre-check; callers validate an ID explicitly
+//! only where an effect must be authorized before it is applied. Production
+//! policy and queueing belong to the sandbox crate; this module owns only the
+//! kernel ABI and active conformance probe.
 
 #![allow(unsafe_code)]
 
@@ -24,6 +27,7 @@ const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
@@ -171,9 +175,12 @@ impl NotificationProbeReport {
 ///
 /// The listener is installed without `WAIT_KILLABLE_RECV`, so mediation is the
 /// same on every kernel. A signal can interrupt a notified syscall, which the
-/// kernel then restarts or fails with `EINTR`; broker handlers check the
-/// notification is still live before acting and answer a repeated operation
-/// as the kernel would.
+/// kernel then restarts or fails with `EINTR`. Sending a response needs no
+/// prior ID check: the kernel looks up the ID under its notification lock and
+/// reports `ENOENT` when the target was interrupted or terminated. No live
+/// path answers the same notification twice, and a second response would only
+/// report `EINPROGRESS` instead of `ENOENT`, which callers treat as the same
+/// `io::Error`.
 pub struct NotificationListener {
     fd: OwnedFd,
 }
@@ -214,7 +221,6 @@ impl NotificationListener {
 
     /// Return a successful scalar result to the notifying syscall.
     pub fn respond_value(&self, id: u64, value: i64) -> io::Result<()> {
-        self.validate_id(id)?;
         let mut response = RawResponse {
             id,
             val: value,
@@ -237,7 +243,6 @@ impl NotificationListener {
                 "seccomp response errno must be positive",
             ));
         }
-        self.validate_id(id)?;
         let mut response = RawResponse {
             id,
             val: 0,
@@ -254,10 +259,12 @@ impl NotificationListener {
 
     /// Continue a verified local-kernel operation in the notifying task.
     ///
+    /// The kernel resolves the notification ID under its notification lock and
+    /// fails with `ENOENT` once the target was interrupted or terminated, so
+    /// it never continues a syscall whose notification is no longer live.
     /// Callers must not use this for an external INET operation or where a
     /// mutable workload pointer is part of the authorization decision.
     pub fn respond_continue(&self, id: u64) -> io::Result<()> {
-        self.validate_id(id)?;
         let mut response = RawResponse {
             id,
             val: 0,
@@ -280,7 +287,6 @@ impl NotificationListener {
         source: RawFd,
         close_on_exec: bool,
     ) -> io::Result<RawFd> {
-        self.validate_id(notification_id)?;
         let srcfd = u32::try_from(source)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source FD is negative"))?;
         let mut addfd = RawAddFd {
@@ -310,6 +316,13 @@ impl NotificationListener {
 /// Only the named syscalls notify. Unexpected architectures are killed, x32
 /// syscalls are killed on x86-64, and all other native syscalls are allowed.
 pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
+    install_filter(syscalls, &[])
+}
+
+fn install_filter(
+    syscalls: &[i64],
+    denied_socket_options: &[(i32, i32)],
+) -> io::Result<NotificationListener> {
     if syscalls.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -319,18 +332,32 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
     verify_notification_sizes()?;
     set_no_new_privileges()?;
 
-    install_notification_filter(syscalls)
+    install_notification_filter(syscalls, denied_socket_options)
 }
 
 /// Install the capability-free workload networking listener on the calling
 /// launcher thread.
 ///
 /// The filter mediates every syscall that can create, select, or materially
-/// reconfigure an INET endpoint. Connected `send()`/null-destination
-/// `sendto()` retains the audited cBPF fast path. `accept`/`accept4` run
-/// natively: the broker binds every INET socket to loopback before injecting
-/// it, and accepted sockets inherit their listener's binding.
-pub fn install_workload_listener() -> io::Result<NotificationListener> {
+/// reconfigure an INET endpoint. `denied_socket_options` pairs are answered
+/// with `EPERM` in the kernel rather than notified, so a confined option never
+/// costs a broker round trip. Connected `send()`/null-destination `sendto()`
+/// retains the audited cBPF fast path. `accept`/`accept4` run natively: the
+/// broker binds every INET socket to loopback before injecting it, and
+/// accepted sockets inherit their listener's binding.
+///
+/// The table must not be empty: with no pairs the filter neither denies nor
+/// notifies `setsockopt`, which would silently drop the interface-selection
+/// confinement. Callers that want no option policy use [`install_listener`].
+pub fn install_workload_listener(
+    denied_socket_options: &[(i32, i32)],
+) -> io::Result<NotificationListener> {
+    if denied_socket_options.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one denied socket option is required",
+        ));
+    }
     #[allow(unused_mut)] // SYS_open is unavailable on some architectures.
     let mut syscalls = vec![
         libc::SYS_socket,
@@ -340,7 +367,6 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_sendto,
         libc::SYS_sendmsg,
         libc::SYS_sendmmsg,
-        libc::SYS_setsockopt,
         libc::SYS_kill,
         libc::SYS_tkill,
         libc::SYS_tgkill,
@@ -351,7 +377,7 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
     ];
     #[cfg(target_arch = "x86_64")]
     syscalls.push(libc::SYS_open);
-    install_listener(&syscalls)
+    install_filter(&syscalls, denied_socket_options)
 }
 
 /// Run a no-capability conformance probe.
@@ -394,6 +420,9 @@ fn probe_scalar_round_trip() -> io::Result<()> {
     if i64::from(notification.syscall) != libc::SYS_getppid {
         return Err(io::Error::other("unexpected scalar probe syscall"));
     }
+    // Exercise ID validation explicitly: the response wrappers no longer do,
+    // and `SeccompEvidence.id_validation` still reports this probe.
+    listener.validate_id(notification.id)?;
     listener.respond_value(notification.id, PROBE_VALUE)?;
     let observed = launcher
         .join()
@@ -633,8 +662,11 @@ fn receive_probe_notification(listener: &NotificationListener) -> io::Result<Not
     listener.receive()
 }
 
-fn install_notification_filter(syscalls: &[i64]) -> io::Result<NotificationListener> {
-    let mut program = build_filter(syscalls)?;
+fn install_notification_filter(
+    syscalls: &[i64],
+    denied_socket_options: &[(i32, i32)],
+) -> io::Result<NotificationListener> {
+    let mut program = build_filter(syscalls, denied_socket_options)?;
     let length = u16::try_from(program.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seccomp filter is too large"))?;
     let mut fprog = libc::sock_fprog {
@@ -662,7 +694,10 @@ fn install_notification_filter(syscalls: &[i64]) -> io::Result<NotificationListe
     Ok(NotificationListener { fd })
 }
 
-fn build_filter(syscalls: &[i64]) -> io::Result<Vec<libc::sock_filter>> {
+fn build_filter(
+    syscalls: &[i64],
+    denied_socket_options: &[(i32, i32)],
+) -> io::Result<Vec<libc::sock_filter>> {
     let mut program = vec![
         stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
         jump(BPF_JMP_JEQ_K, native_audit_arch(), 1, 0),
@@ -675,6 +710,10 @@ fn build_filter(syscalls: &[i64]) -> io::Result<Vec<libc::sock_filter>> {
         jump(BPF_JMP_JSET_K, X32_SYSCALL_BIT, 0, 1),
         stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
     ]);
+
+    if !denied_socket_options.is_empty() {
+        append_setsockopt_filter(&mut program, denied_socket_options)?;
+    }
 
     let mut syscalls = syscalls.to_vec();
     syscalls.sort_unstable();
@@ -723,6 +762,64 @@ fn append_sendto_filter(program: &mut Vec<libc::sock_filter>) -> io::Result<()> 
         stmt(BPF_ALU_AND_K, !CONNECTED_SEND_FLAGS),
         jump(BPF_JMP_JEQ_K, 0, 1, 0),
         stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
+        stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+    ]);
+    Ok(())
+}
+
+/// Refuse the `setsockopt(2)` level/option pairs denied by policy, in the
+/// kernel, without a broker round trip.
+///
+/// The kernel truncates `level` and `optname` to `int`, so the arms compare
+/// only the low 32-bit word of each argument: a junk-extended encoding of a
+/// denied pair would otherwise reach the kernel and apply the denied option.
+/// Arguments whose high word is nonzero, once no denied pair matched, return
+/// `EINVAL` as the broker did; everything else falls through to the kernel.
+fn append_setsockopt_filter(
+    program: &mut Vec<libc::sock_filter>,
+    denied_socket_options: &[(i32, i32)],
+) -> io::Result<()> {
+    // Five instructions per pair, six for the two high-word guards, and one
+    // trailing allow.
+    let skipped = denied_socket_options
+        .len()
+        .checked_mul(5)
+        .and_then(|length| length.checked_add(7))
+        .and_then(|length| u8::try_from(length).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "setsockopt filter is too large",
+            )
+        })?;
+    let syscall = u32::try_from(libc::SYS_setsockopt)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative setsockopt syscall"))?;
+    program.push(jump(BPF_JMP_JEQ_K, syscall, 0, skipped));
+
+    let denied = SECCOMP_RET_ERRNO | libc::EPERM.unsigned_abs();
+    for (level, option) in denied_socket_options {
+        program.extend([
+            stmt(BPF_LD_W_ABS, argument_word_offset(1, 0)),
+            jump(BPF_JMP_JEQ_K, u32::from_ne_bytes(level.to_ne_bytes()), 0, 3),
+            stmt(BPF_LD_W_ABS, argument_word_offset(2, 0)),
+            jump(
+                BPF_JMP_JEQ_K,
+                u32::from_ne_bytes(option.to_ne_bytes()),
+                0,
+                1,
+            ),
+            stmt(BPF_RET_K, denied),
+        ]);
+    }
+
+    let invalid = SECCOMP_RET_ERRNO | libc::EINVAL.unsigned_abs();
+    program.extend([
+        stmt(BPF_LD_W_ABS, argument_word_offset(1, 1)),
+        jump(BPF_JMP_JEQ_K, 0, 1, 0),
+        stmt(BPF_RET_K, invalid),
+        stmt(BPF_LD_W_ABS, argument_word_offset(2, 1)),
+        jump(BPF_JMP_JEQ_K, 0, 1, 0),
+        stmt(BPF_RET_K, invalid),
         stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
     ]);
     Ok(())
@@ -945,7 +1042,6 @@ mod tests {
     /// notification size query keeps working, so `install_listener` fails the
     /// way a restrictive host does.
     fn install_set_mode_filter_eperm_filter() -> io::Result<()> {
-        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
         let seccomp_number = u32::try_from(libc::SYS_seccomp)
             .map_err(|_| io::Error::other("syscall number does not fit u32"))?;
         let mut instructions = [
@@ -981,7 +1077,6 @@ mod tests {
     }
 
     fn install_process_vm_enosys_filter() -> io::Result<()> {
-        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
         let syscall_number = |number: libc::c_long| {
             u32::try_from(number).map_err(|_| io::Error::other("syscall number does not fit u32"))
         };
@@ -1037,5 +1132,68 @@ mod tests {
             .respond_errno(1, 0)
             .expect_err("zero errno must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn response_wrappers_report_kernel_enoent_for_a_dead_notification() {
+        // The wrappers issue no SECCOMP_IOCTL_NOTIF_ID_VALID pre-check, so a
+        // response to a notification whose target is gone has to surface the
+        // kernel's own ENOENT from NOTIF_SEND or ADDFD-SEND. A notification
+        // that was answered and whose target then returned is no longer live,
+        // which gives every wrapper a dead ID without racing a signal.
+        const PROBE_VALUE: libc::c_long = 0x0bad_c0de;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let launcher = thread::spawn(move || -> io::Result<libc::c_long> {
+            let listener = install_listener(&[libc::SYS_getppid])?;
+            sender
+                .send(listener)
+                .map_err(|_| io::Error::other("notification broker disappeared"))?;
+            // SAFETY: getppid has no pointer arguments. The installed filter
+            // blocks here until the broker answers the notification.
+            Ok(unsafe { libc::syscall(libc::SYS_getppid) })
+        });
+
+        let Ok(listener) = receiver.recv() else {
+            panic!("{}", launcher_failure(launcher, "dead notification"));
+        };
+        let notification =
+            receive_probe_notification(&listener).expect("receive probe notification");
+        assert_eq!(i64::from(notification.syscall), libc::SYS_getppid);
+        listener
+            .respond_value(notification.id, PROBE_VALUE)
+            .expect("answer the live notification");
+        let observed = launcher
+            .join()
+            .expect("notification launcher exits")
+            .expect("notification response is delivered");
+        assert_eq!(observed, PROBE_VALUE, "response value was not delivered");
+
+        // The target returned from the notified syscall, so the kernel dropped
+        // the notification. Every wrapper must now refuse the stale ID.
+        let source = rustix::event::eventfd(1, rustix::event::EventfdFlags::CLOEXEC)
+            .expect("create ADDFD source");
+        let dead_id = notification.id;
+        let outcomes = [
+            ("respond_value", listener.respond_value(dead_id, 0)),
+            (
+                "respond_errno",
+                listener.respond_errno(dead_id, libc::EPERM),
+            ),
+            ("respond_continue", listener.respond_continue(dead_id)),
+            (
+                "add_fd_and_send",
+                listener
+                    .add_fd_and_send(dead_id, source.as_raw_fd(), true)
+                    .map(|_| ()),
+            ),
+        ];
+        for (wrapper, outcome) in outcomes {
+            let error = outcome.expect_err("a dead notification accepted a response");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ENOENT),
+                "{wrapper} did not surface the kernel ENOENT for a dead notification"
+            );
+        }
     }
 }
