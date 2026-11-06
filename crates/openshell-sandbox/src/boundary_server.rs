@@ -3111,10 +3111,13 @@ mod linux {
                     | RuntimeState::Ready(_) => None,
                 }
             };
-            if matches!(*connection, SupervisorConnectionState::Frozen { .. })
+            if let SupervisorConnectionState::Frozen { recovery_id } = *connection
                 && let Some(process) = process
             {
-                if !process.boundary_runtime.resume() {
+                if !process
+                    .boundary_runtime
+                    .resume(&self.process_runtime, recovery_id)
+                {
                     return Err((
                         BoundaryErrorKind::Process,
                         "frozen workload could not be resumed".to_string(),
@@ -3212,11 +3215,15 @@ mod linux {
                         | RuntimeState::Ready(_) => None,
                     }
                 };
+                // The recovery identity is allocated before the freeze so a
+                // failed deferred sweep can name it.
+                let recovery_id = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
                 if let Some(process) = &process {
                     self.network_broker.set_workload_frozen(true);
-                    let _ = process.boundary_runtime.freeze();
+                    let _ = process
+                        .boundary_runtime
+                        .freeze(&self.process_runtime, recovery_id);
                 }
-                let recovery_id = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
                 *connection = SupervisorConnectionState::Frozen { recovery_id };
                 recovery_id
             };
@@ -5332,6 +5339,10 @@ mod linux {
         use openshell_sandbox_backend::protobuf::WireMessage as _;
         use openshell_sandbox_backend::runtime_routed::{RuntimeRouter, new_route_handle};
         use rcgen::PKCS_ED25519;
+
+        use crate::boundary_io::test_proc_stat::{
+            ProcessGroupKillGuard, process_group_of, process_parent, process_stopped,
+        };
 
         struct FailedWaitProcess;
 
@@ -9318,17 +9329,6 @@ mod linux {
             }
         }
 
-        /// Whether the process is stopped, as a frozen workload is.
-        fn process_stopped(pid: u32) -> bool {
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|stat| {
-                    stat.rsplit_once(") ")
-                        .map(|(_, fields)| fields.starts_with('T'))
-                })
-                .unwrap_or(false)
-        }
-
         /// An owner operation holds the ownership guard across `block_on`, a
         /// promotion waits for it, and a DNS answer waits behind the
         /// promotion, on a runtime with a single worker. The answer waits
@@ -9535,6 +9535,342 @@ mod linux {
                 .expect("a replay does not wait for owner operations")
                 .expect("replay");
             drop(in_progress);
+        }
+
+        /// Many idle piped execs must leave the control plane responsive:
+        /// the blocking pool they share with the gRPC exchange, exec
+        /// spawn/reap, and `AcceptNetwork` must not fill with threads parked
+        /// on idle exec pipes.
+        ///
+        /// The pool is capped at 16 rather than 4 for a reason worth keeping
+        /// in sync with the implementation: before the readiness-based exec
+        /// streams, every idle piped exec parked three blocking threads
+        /// (reaper waitid, stdout read, stderr read through
+        /// `tokio::fs::File`), so 12 execs demanded 36 threads and the pool
+        /// saturated around the sixth exec. After it, only the per-exec
+        /// reaper still parks one thread: 12 reapers plus the fresh exec's
+        /// spawn transient is 13 of 16, leaving three spare threads for
+        /// control traffic. A cap of 4 could not host 12 idle execs even
+        /// after the fix, so the test would fail on both sides.
+        ///
+        /// Every step runs on its own thread with a channel deadline
+        /// because `start_exec` blocks on the process runtime and
+        /// `serve_request` blocks on its socket pair; an in-thread timeout
+        /// can preempt neither. A stalled step fails its receive instead of
+        /// hanging the suite.
+        #[test]
+        fn many_idle_execs_leave_the_control_plane_responsive() {
+            const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_IDLE_EXEC_CHILD";
+            const SANDBOX: &str = "sandbox-idle-exec";
+            const GENERATION: &str = "generation-idle-exec";
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                run_isolated(
+                    "boundary_server::linux::tests::many_idle_execs_leave_the_control_plane_responsive",
+                    CHILD_MARKER,
+                    Duration::from_mins(1),
+                );
+                return;
+            }
+
+            let gateway = TestGateway::new();
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .max_blocking_threads(16)
+                .enable_all()
+                .build()
+                .expect("bounded blocking-pool process runtime");
+            let _entered = process_runtime.enter();
+            let boundary = takeover_test_runtime(&gateway, SANDBOX, GENERATION, &process_runtime);
+            let owner = boundary
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &gateway.token(SANDBOX, GENERATION, 1)).metadata(),
+                )
+                .expect("owner principal");
+            assert!(matches!(
+                boundary.attach(takeover_test_policy(), false),
+                Response::Attached { .. }
+            ));
+            boundary
+                .commit_attach(&owner, test_supervisor_instance_id(), None, None)
+                .expect("attach owner");
+            assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+            boundary.commit_confirm(&owner).expect("confirm owner");
+            let Response::Started { process_id, .. } = boundary.start_agent(
+                SANDBOX.to_string(),
+                AgentSpecWire {
+                    program: "/bin/sleep".to_string(),
+                    args: vec!["60".to_string()],
+                    workdir: None,
+                    timeout_secs: 120,
+                    interactive: false,
+                    otlp_relay_active: false,
+                },
+                None,
+                None,
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ) else {
+                panic!("owner could not start the workload");
+            };
+
+            let start_exec_on_thread = |spec: ExecSpecWire| {
+                let boundary = boundary.clone();
+                let (done, result) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let request = RequestEnvelope::new(Request::Exec { spec: spec.clone() })
+                        .expect("build exec request");
+                    let _ = done.send(
+                        boundary
+                            .start_exec(
+                                &request.request_id,
+                                &request.payload_digest,
+                                request.exec_admission_deadline_unix_ms,
+                                spec,
+                            )
+                            .map(|started| started.process_id)
+                            .map_err(|error| format!("{error:?}")),
+                    );
+                });
+                result.recv_timeout(Duration::from_secs(10))
+            };
+            let idle_spec = || ExecSpecWire {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "sleep 30".to_string()],
+                shell: None,
+                runtime_helper: None,
+                env: Vec::new(),
+                workdir: None,
+                pty: false,
+            };
+            let mut exec_ids = Vec::new();
+            for index in 0..12 {
+                let exec_id = start_exec_on_thread(idle_spec())
+                    .unwrap_or_else(|_| panic!("idle exec {index} did not start within 10s"))
+                    .expect("idle exec starts");
+                exec_ids.push(exec_id);
+            }
+
+            exec_ids.push(
+                start_exec_on_thread(ExecSpecWire {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), "exit 0".to_string()],
+                    shell: None,
+                    runtime_helper: None,
+                    env: Vec::new(),
+                    workdir: None,
+                    pty: false,
+                })
+                .expect("fresh exec did not start within 10s")
+                .expect("fresh exec starts while idle execs occupy the pool"),
+            );
+
+            let control_boundary = boundary.clone();
+            let (control_done, control_result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = control_done.send(serve_request(
+                    &control_boundary,
+                    &owner,
+                    Request::DiscoverPolicy,
+                ));
+            });
+            assert!(matches!(
+                control_result
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("control request is served within 10s"),
+                Response::ImagePolicy { .. }
+            ));
+
+            // Cleanup: end every exec and the workload inside the isolated
+            // limit so no `sleep 30` child outlives the test binary.
+            for exec_id in &exec_ids {
+                let _ = boundary.signal(exec_id, SignalWire::Kill);
+            }
+            for exec_id in &exec_ids {
+                assert!(
+                    matches!(boundary.wait(exec_id), Response::Exited { .. }),
+                    "exec {exec_id} must be reaped"
+                );
+            }
+            assert_eq!(boundary.terminate(&process_id), Response::Terminated);
+            let workload = boundary.running_process(&process_id).expect("workload");
+            let terminated_by = std::time::Instant::now() + Duration::from_secs(10);
+            while !workload.has_exited() && std::time::Instant::now() < terminated_by {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(workload.has_exited(), "workload did not exit");
+        }
+
+        /// The deferred descendant sweeps of a freeze and its recovery must
+        /// both be delivered. The disconnect suite only asserts the workload
+        /// root stops, which the synchronous killpg covers regardless of the
+        /// deferral, so this test proves the deferred SIGSTOP reaches a
+        /// descendant outside every registered process group — and the
+        /// deferred SIGCONT continues it after recovery. Without it, an
+        /// implementation that never delivers a batch passes the suite while
+        /// the freeze contract silently weakens.
+        #[test]
+        fn deferred_descendant_sweeps_deliver_across_disconnect_and_recovery() {
+            const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_DEFERRED_SWEEP_CHILD";
+            const SANDBOX: &str = "sandbox-deferred-sweep";
+            const GENERATION: &str = "generation-deferred-sweep";
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                run_isolated(
+                    "boundary_server::linux::tests::deferred_descendant_sweeps_deliver_across_disconnect_and_recovery",
+                    CHILD_MARKER,
+                    Duration::from_mins(1),
+                );
+                return;
+            }
+
+            let gateway = TestGateway::new();
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let _entered = process_runtime.enter();
+            // A generous recovery deadline so a loaded CI runner cannot expire
+            // the freeze mid-test; the sweeps themselves take milliseconds.
+            let boundary = takeover_test_runtime_with_recovery(
+                &gateway,
+                SANDBOX,
+                GENERATION,
+                &process_runtime,
+                Some(Duration::from_mins(1)),
+            );
+            let supervisor_instance_id = test_supervisor_instance_id();
+            let owner = boundary
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &gateway.token(SANDBOX, GENERATION, 1)).metadata(),
+                )
+                .expect("owner principal");
+            assert!(matches!(
+                boundary.attach(takeover_test_policy(), false),
+                Response::Attached { .. }
+            ));
+            boundary
+                .commit_attach(&owner, supervisor_instance_id, None, None)
+                .expect("attach owner");
+            assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+            boundary.commit_confirm(&owner).expect("confirm owner");
+
+            // The workload's descendant leaves the root's process group via
+            // setsid, so only the deferred sweep — not the synchronous
+            // killpg — can stop it.
+            let Response::Started { process_id, .. } = boundary.start_agent(
+                SANDBOX.to_string(),
+                AgentSpecWire {
+                    program: "/bin/sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        "/usr/bin/setsid /bin/sleep 600 & wait".to_string(),
+                    ],
+                    workdir: None,
+                    timeout_secs: 120,
+                    interactive: false,
+                    otlp_relay_active: false,
+                },
+                None,
+                None,
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ) else {
+                panic!("owner could not start the workload");
+            };
+            let workload = boundary.running_process(&process_id).expect("workload");
+            let root_pid = workload.signaler.pid();
+            // A failed assertion must not orphan the fixtures: each guard
+            // kills its whole group on drop unless disarmed for the normal
+            // cleanup below. The workload root leads the group it was
+            // registered under, and the setsid descendant leads its own.
+            let mut workload_guard = ProcessGroupKillGuard::new(root_pid);
+            let descendant_pid = {
+                let found_by = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let found = std::fs::read_dir("/proc")
+                        .expect("read /proc")
+                        .flatten()
+                        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+                        .find(|pid| process_parent(*pid) == Some(root_pid));
+                    if let Some(pid) = found {
+                        break pid;
+                    }
+                    assert!(
+                        std::time::Instant::now() < found_by,
+                        "the workload never spawned its out-of-group descendant"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+            let mut descendant_guard = ProcessGroupKillGuard::new(descendant_pid);
+            // The descendant separates asynchronously: `setsid` runs after
+            // the fork, so wait for the split before disconnecting.
+            let separated_by = std::time::Instant::now() + Duration::from_secs(5);
+            while process_group_of(descendant_pid) == process_group_of(root_pid) {
+                assert!(
+                    std::time::Instant::now() < separated_by,
+                    "the fixture must keep the descendant off the workload's process group"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // Losing the supervisor freezes the workload: the root group
+            // stops synchronously, and the deferred sweep must stop the
+            // descendant too.
+            boundary.transport_disconnected(owner.connection_id());
+            assert!(matches!(
+                *lock(&boundary.supervisor_connection),
+                SupervisorConnectionState::Frozen { .. }
+            ));
+            let stopped_by = std::time::Instant::now() + Duration::from_secs(5);
+            while !process_stopped(descendant_pid) {
+                assert!(
+                    std::time::Instant::now() < stopped_by,
+                    "the deferred freeze sweep never stopped the out-of-group descendant"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // Recovery resumes it: the roots synchronously, the descendant
+            // through the deferred sweep.
+            let replacement = boundary
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &gateway.token(SANDBOX, GENERATION, 1)).metadata(),
+                )
+                .expect("replacement principal");
+            boundary
+                .commit_attach(&replacement, supervisor_instance_id, None, None)
+                .expect("reattach replacement");
+            boundary
+                .commit_confirm(&replacement)
+                .expect("reconfirm replacement");
+            let running_by = std::time::Instant::now() + Duration::from_secs(5);
+            while process_stopped(descendant_pid) {
+                assert!(
+                    std::time::Instant::now() < running_by,
+                    "the deferred resume sweep never continued the out-of-group descendant"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // Cleanup: kill the out-of-group descendant explicitly, then end
+            // the workload inside the isolated limit.
+            descendant_guard.disarm();
+            workload_guard.disarm();
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(descendant_pid).unwrap()),
+                nix::sys::signal::SIGKILL,
+            );
+            assert_eq!(boundary.terminate(&process_id), Response::Terminated);
+            let terminated_by = std::time::Instant::now() + Duration::from_secs(10);
+            while !workload.has_exited() && std::time::Instant::now() < terminated_by {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(workload.has_exited(), "workload did not exit");
         }
 
         /// A replacement whose connection is lost while it is promoted is the
