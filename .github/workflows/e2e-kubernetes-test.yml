@@ -179,6 +179,14 @@ jobs:
           OPENSHELL_E2E_APP_TAKEOVER: ${{ inputs.listener-takeover }}
         run: mise run --no-deps --skip-deps "$E2E_TASK"
 
+      - name: Upload Kubernetes trace receipt evidence
+        if: always() && inputs.e2e-task == 'e2e:kubernetes:tracing'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kubernetes-trace-receipt
+          path: results/kubernetes-tracing/
+          if-no-files-found: warn
+
       - name: Upload listener test evidence
         if: always() && inputs.e2e-task == 'e2e:kubernetes:app-listener'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

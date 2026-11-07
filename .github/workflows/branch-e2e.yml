@@ -501,6 +501,11 @@ jobs:
             agent_sandbox_version: v0.5.0
             job_name: Kubernetes E2E (additional destination CA, Agent Sandbox v1beta1)
             test_name: additional_ca
+          - agent_sandbox_api: v1beta1
+            agent_sandbox_version: v1.0.3
+            job_name: Kubernetes E2E (OTLP trace receipt)
+            test_name: ""
+            e2e_task: e2e:kubernetes:tracing
     permissions:
       actions: read
       contents: read
@@ -512,6 +517,7 @@ jobs:
       job-name: ${{ matrix.job_name }}
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
       test-name: ${{ matrix.test_name }}
+      e2e-task: ${{ matrix.e2e_task || 'e2e:kubernetes' }}
 
   kubernetes-app-listener-e2e:
     needs: [pr_metadata, build-binaries, build-conformance, build-images]

@@ -190,6 +190,13 @@ The GitHub ruleset should require the `OpenShell / ...` statuses published by
 `Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
 push-triggered workflow jobs themselves.
 
+The standard Kubernetes E2E matrix also includes an explicit OTLP trace-receipt
+lane. It starts a real collector before enabling export and requires gateway and
+Kubernetes compute-driver spans, their resource attributes, and shared validation
+context. Missing receipts fail the lane; ordinary lanes keep export disabled.
+Its collector logs and receipt evidence are uploaded as
+`kubernetes-trace-receipt`. See [Testing](TESTING.md#kubernetes-e2e-e2eruste2e-kubernetessh).
+
 ### K3s conformance version baseline
 
 The `ubuntu-k3s` conformance lanes pin Agent Sandbox v0.5.0 as the

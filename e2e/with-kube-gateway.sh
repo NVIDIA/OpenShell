@@ -187,7 +187,7 @@ verify_gateway_config_rollout() {
     "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
     "${helm_extra_args[@]}" \
-    "${helm_post_renderer_args[@]}" \
+    ${helm_post_renderer_args[@]+"${helm_post_renderer_args[@]}"} \
     --set-string 'gatewayConfig.openshell\.gateway.log_level=debug' \
     --wait --timeout 5m
 
@@ -671,6 +671,8 @@ cleanup() {
   rm -rf "${WORKDIR}" 2>/dev/null || true
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --- DB-scenario helpers (used only when OPENSHELL_E2E_KUBE_DB_SCENARIOS=1) ---
 
@@ -734,7 +736,7 @@ run_scenario() {
     "${GATEWAY_HELM_IMAGE_ARGS[@]}" \
     "${SUPERVISOR_HELM_IMAGE_ARGS[@]}" \
     "${SANDBOX_RUNTIME_HELM_IMAGE_ARGS[@]}" \
-    "${helm_post_renderer_args[@]}" \
+    ${helm_post_renderer_args[@]+"${helm_post_renderer_args[@]}"} \
     "$@" \
     --wait --timeout 5m
   HELM_INSTALLED=1
@@ -1542,7 +1544,7 @@ else
     "${SUPERVISOR_HELM_IMAGE_ARGS[@]}" \
     "${SANDBOX_RUNTIME_HELM_IMAGE_ARGS[@]}" \
     "${helm_extra_args[@]}" \
-    "${helm_post_renderer_args[@]}" \
+    ${helm_post_renderer_args[@]+"${helm_post_renderer_args[@]}"} \
     --wait --timeout 5m
   HELM_INSTALLED=1
 
