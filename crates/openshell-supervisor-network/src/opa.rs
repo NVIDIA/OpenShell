@@ -33,6 +33,9 @@ use tokio::sync::watch;
 use tracing::info;
 
 mod raw_schema;
+mod revalidation;
+
+pub use revalidation::{AuthorizedConnection, ConnectionPolicyContract, PolicyRevalidator};
 
 /// Baked-in rego rules for OPA policy evaluation.
 /// These rules define the network access decision logic and static config
@@ -85,7 +88,7 @@ pub enum NetworkAction {
 }
 
 /// Endpoint identity and metadata captured with one policy generation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MatchedEndpoint {
     pub policy_name: String,
     pub endpoint_index: usize,
@@ -115,6 +118,7 @@ pub struct EgressAuthorization {
 }
 
 /// Input for a network access policy evaluation.
+#[derive(Debug, Clone)]
 pub struct NetworkInput {
     pub host: String,
     pub port: u16,
@@ -183,6 +187,12 @@ pub struct OpaEngine {
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
     generation_tx: watch::Sender<u64>,
     fail_closed_reason: RwLock<Option<String>>,
+    /// Generation published by the most recent fail-closed quarantine, or 0.
+    /// Written under the engine lock.
+    last_fail_closed_generation: AtomicU64,
+    /// Incremented whenever the middleware runner's registry is replaced.
+    /// Written under the engine lock.
+    middleware_registry_epoch: AtomicU64,
 }
 
 #[cfg(test)]
@@ -204,24 +214,68 @@ pub(crate) fn test_opa_query_count() -> u64 {
 }
 
 /// Generation guard captured when an HTTP tunnel or request path starts.
+///
+/// A plain guard is stale as soon as the policy generation moves. A guard
+/// with a [`PolicyRevalidator`] (see [`Self::with_revalidator`]) instead
+/// re-checks the connection it protects and re-pins to the new generation
+/// when the policy change does not affect that connection.
+///
+/// Clones share one pin, so every clone held by a relay observes a re-pin
+/// performed through any of them.
 #[derive(Clone, Debug)]
 pub struct PolicyGenerationGuard {
-    captured_generation: u64,
+    captured_generation: Arc<AtomicU64>,
     current_generation: Arc<AtomicU64>,
     generation_rx: watch::Receiver<u64>,
+    revalidator: Option<Arc<PolicyRevalidator>>,
 }
 
 impl PolicyGenerationGuard {
+    fn pinned(
+        generation: u64,
+        current_generation: &Arc<AtomicU64>,
+        generation_tx: &watch::Sender<u64>,
+    ) -> Self {
+        Self {
+            captured_generation: Arc::new(AtomicU64::new(generation)),
+            current_generation: Arc::clone(current_generation),
+            generation_rx: generation_tx.subscribe(),
+            revalidator: None,
+        }
+    }
+
+    /// Let this guard follow policy changes that leave its connection's
+    /// contract unchanged. `None` keeps the strict close-on-change behavior.
+    #[must_use]
+    pub fn with_revalidator(mut self, revalidator: Option<Arc<PolicyRevalidator>>) -> Self {
+        self.revalidator = revalidator;
+        self
+    }
+
     pub fn captured_generation(&self) -> u64 {
-        self.captured_generation
+        self.captured_generation.load(Ordering::Acquire)
     }
 
     pub fn current_generation(&self) -> u64 {
         self.current_generation.load(Ordering::Acquire)
     }
 
+    /// Whether the policy that authorized this connection no longer applies.
+    ///
+    /// With a revalidator, a generation change triggers one re-evaluation of
+    /// the connection (a short, synchronous OPA query under the engine lock).
+    /// Callers must not hold the OPA engine lock.
     pub fn is_stale(&self) -> bool {
-        self.current_generation() != self.captured_generation
+        let Some(revalidator) = &self.revalidator else {
+            return self.current_generation() != self.captured_generation();
+        };
+        if revalidator.is_invalidated() {
+            return true;
+        }
+        if self.current_generation() == self.captured_generation() {
+            return false;
+        }
+        !revalidator.follow(&self.captured_generation, &self.current_generation)
     }
 
     pub fn ensure_current(&self) -> Result<()> {
@@ -235,10 +289,12 @@ impl PolicyGenerationGuard {
         Ok(())
     }
 
-    /// Wait until the policy generation changes.
+    /// Wait until the policy that authorized this connection no longer applies.
     ///
     /// Relay boundaries use this to close even an idle or raw stream as soon
-    /// as a new generation (including fail-closed quarantine) is published.
+    /// as a relevant generation (always including fail-closed quarantine) is
+    /// published. A revalidating guard re-pins through unrelated changes and
+    /// keeps waiting.
     pub async fn wait_until_stale(&self) {
         let mut receiver = self.generation_rx.clone();
         while !self.is_stale() {
@@ -259,6 +315,18 @@ pub struct TunnelPolicyEngine {
 }
 
 impl TunnelPolicyEngine {
+    /// Let this tunnel survive policy changes that leave its connection's
+    /// contract unchanged.
+    ///
+    /// The cloned evaluator is kept as-is after a re-pin. That is sound
+    /// because the contract includes every endpoint per-request rules read;
+    /// see [`ConnectionPolicyContract`].
+    #[must_use]
+    pub fn with_revalidator(mut self, revalidator: Option<Arc<PolicyRevalidator>>) -> Self {
+        self.generation_guard = self.generation_guard.with_revalidator(revalidator);
+        self
+    }
+
     pub fn captured_generation(&self) -> u64 {
         self.generation_guard.captured_generation()
     }
@@ -317,7 +385,14 @@ impl OpaEngine {
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
             fail_closed_reason: RwLock::new(None),
+            last_fail_closed_generation: AtomicU64::new(0),
+            middleware_registry_epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Whether a fail-closed quarantine was published after `generation`.
+    pub(crate) fn fail_closed_after(&self, generation: u64) -> bool {
+        self.last_fail_closed_generation.load(Ordering::Acquire) > generation
     }
 
     /// Whether network authorization requires a workload binary identity.
@@ -607,12 +682,69 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let input_json = network_input_json(input);
-
         let mut engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        self.authorize_egress_locked(&mut engine, input)
+    }
+
+    /// Re-evaluate the contract of an established connection.
+    ///
+    /// Authorization and middleware selection run under one engine lock, so
+    /// the contract and the returned generation describe the same policy.
+    pub fn connection_policy_contract(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<(ConnectionPolicyContract, u64)> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let authorization = self.authorize_egress_locked(&mut engine, input)?;
+        let middleware_chain = if matches!(authorization.action, NetworkAction::Allow { .. }) {
+            query_middleware_chain_locked(&mut engine, input)?
+        } else {
+            Vec::new()
+        };
+        let contract = ConnectionPolicyContract::new(
+            &AuthorizedConnection {
+                action: &authorization.action,
+                endpoint_configs: &authorization.endpoint_configs,
+                matched_endpoints: &authorization.matched_endpoints,
+                exact_declared_endpoint_host: authorization.exact_declared_endpoint_host,
+            },
+            middleware_chain,
+            self.middleware_registry_epoch.load(Ordering::Acquire),
+        );
+        Ok((contract, authorization.generation))
+    }
+
+    /// Middleware chain and registry epoch for `input`, if `expected_generation`
+    /// is still current. Used to complete a connection's baseline contract.
+    pub(crate) fn middleware_selection_at(
+        &self,
+        input: &NetworkInput,
+        expected_generation: u64,
+    ) -> Result<Option<(Vec<ChainEntry>, u64)>> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        if self.current_generation() != expected_generation {
+            return Ok(None);
+        }
+        let chain = query_middleware_chain_locked(&mut engine, input)?;
+        let epoch = self.middleware_registry_epoch.load(Ordering::Acquire);
+        Ok(Some((chain, epoch)))
+    }
+
+    fn authorize_egress_locked(
+        &self,
+        engine: &mut regorus::Engine,
+        input: &NetworkInput,
+    ) -> Result<EgressAuthorization> {
+        let input_json = network_input_json(input);
         let generation = self.current_generation();
 
         let fail_closed_reason = self
@@ -630,7 +762,7 @@ impl OpaEngine {
             });
         }
 
-        set_regorus_input(&mut engine, input_json)?;
+        set_regorus_input(engine, input_json)?;
 
         let result = engine
             .eval_rule("data.openshell.sandbox.egress_authorization".into())
@@ -810,6 +942,7 @@ impl OpaEngine {
         *engine = new_engine;
         if let Some(new_runner) = new_runner {
             *runner = new_runner;
+            self.middleware_registry_epoch.fetch_add(1, Ordering::AcqRel);
         }
         *fail_closed_reason = None;
         self.generation_guard(generation)
@@ -821,7 +954,9 @@ impl OpaEngine {
     /// The existing compiled engine remains available for an explicit
     /// `retain_last_valid` posture or a later valid reload, but all new network
     /// decisions deny with `reason` while the quarantine is active. Advancing
-    /// the generation invalidates and wakes every pinned relay.
+    /// the generation invalidates and wakes every pinned relay, including
+    /// revalidating relays: a quarantine is never re-pinned through, even if
+    /// the previous policy is restored before a relay observes it.
     pub fn enter_fail_closed(&self, reason: impl Into<String>) -> Result<u64> {
         let _engine = self
             .engine
@@ -832,7 +967,9 @@ impl OpaEngine {
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? =
             Some(reason.into());
-        Ok(self.advance_generation())
+        let generation = self.advance_generation();
+        self.last_fail_closed_generation.store(generation, Ordering::Release);
+        Ok(generation)
     }
 
     pub fn fail_closed_reason(&self) -> Option<String> {
@@ -904,6 +1041,7 @@ impl OpaEngine {
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
         *runner = runner.with_replacement_registry(registry);
+        self.middleware_registry_epoch.fetch_add(1, Ordering::AcqRel);
         self.advance_generation();
         Ok(())
     }
@@ -934,11 +1072,11 @@ impl OpaEngine {
                 "policy changed before HTTP relay started [expected_generation:{expected_generation} current_generation:{generation}]"
             ));
         }
-        Ok(PolicyGenerationGuard {
-            captured_generation: generation,
-            current_generation: Arc::clone(&self.generation),
-            generation_rx: self.generation_tx.subscribe(),
-        })
+        Ok(PolicyGenerationGuard::pinned(
+            generation,
+            &self.generation,
+            &self.generation_tx,
+        ))
     }
 
     /// Query static sandbox configuration from the OPA data module.
@@ -1130,11 +1268,11 @@ impl OpaEngine {
         }
         Ok(TunnelPolicyEngine {
             engine: Mutex::new(engine.clone()),
-            generation_guard: PolicyGenerationGuard {
-                captured_generation: generation,
-                current_generation: Arc::clone(&self.generation),
-                generation_rx: self.generation_tx.subscribe(),
-            },
+            generation_guard: PolicyGenerationGuard::pinned(
+                generation,
+                &self.generation,
+                &self.generation_tx,
+            ),
             middleware_runner: self.middleware_runner()?,
             websocket_assembly_budget: self.websocket_assembly_budget(),
         })
@@ -12590,5 +12728,289 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
         }
+    }
+
+    // --- Connection revalidation across policy generations ---
+
+    fn claude_input(host: &str) -> NetworkInput {
+        NetworkInput {
+            host: host.into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        }
+    }
+
+    /// Pin a revalidating guard the way the proxy does after authorization.
+    fn revalidating_guard(engine: &Arc<OpaEngine>, input: &NetworkInput) -> PolicyGenerationGuard {
+        let authorization = engine.authorize_egress(input).unwrap();
+        assert!(
+            matches!(authorization.action, NetworkAction::Allow { .. }),
+            "fixture must authorize {}",
+            input.host
+        );
+        let revalidator = PolicyRevalidator::capture(
+            engine,
+            input.clone(),
+            &AuthorizedConnection {
+                action: &authorization.action,
+                endpoint_configs: &authorization.endpoint_configs,
+                matched_endpoints: &authorization.matched_endpoints,
+                exact_declared_endpoint_host: authorization.exact_declared_endpoint_host,
+            },
+            authorization.generation,
+            None,
+        );
+        assert!(revalidator.is_some(), "an allow must capture a contract");
+        engine
+            .generation_guard(authorization.generation)
+            .unwrap()
+            .with_revalidator(revalidator)
+    }
+
+    fn proto_endpoint(host: &str) -> NetworkEndpoint {
+        NetworkEndpoint {
+            host: host.to_string(),
+            port: 443,
+            ..Default::default()
+        }
+    }
+
+    fn rest_endpoint(host: &str, path: &str) -> NetworkEndpoint {
+        NetworkEndpoint {
+            host: host.to_string(),
+            port: 443,
+            protocol: "rest".to_string(),
+            enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+            rules: vec![L7Rule {
+                allow: Some(L7Allow {
+                    method: "GET".to_string(),
+                    path: path.to_string(),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn policy_mut<'a>(proto: &'a mut ProtoSandboxPolicy, name: &str) -> &'a mut NetworkPolicyRule {
+        proto.network_policies.get_mut(name).expect("fixture policy")
+    }
+
+    #[test]
+    fn revalidating_guard_follows_reload_that_adds_an_unrelated_endpoint() {
+        let mut proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let input = claude_input("api.anthropic.com");
+        let guard = revalidating_guard(&engine, &input);
+        let strict = engine.generation_guard(guard.captured_generation()).unwrap();
+
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        engine.reload_from_proto(&proto).unwrap();
+
+        assert!(strict.is_stale(), "a plain guard still closes on any change");
+        assert!(!guard.is_stale(), "an unrelated endpoint must not close the connection");
+        assert_eq!(guard.captured_generation(), engine.current_generation());
+        assert!(guard.ensure_current().is_ok());
+    }
+
+    #[test]
+    fn revalidating_guard_ignores_endpoint_index_shifts_in_its_own_policy() {
+        let mut proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        policy_mut(&mut proto, "claude_code")
+            .endpoints
+            .insert(0, proto_endpoint("console.anthropic.com"));
+        engine.reload_from_proto(&proto).unwrap();
+
+        assert!(!guard.is_stale());
+    }
+
+    #[test]
+    fn revalidating_guard_closes_when_its_endpoint_changes_and_stays_closed() {
+        let original = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&original).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        let mut narrowed = original.clone();
+        policy_mut(&mut narrowed, "claude_code").endpoints[0] =
+            rest_endpoint("api.anthropic.com", "/v1/messages");
+        engine.reload_from_proto(&narrowed).unwrap();
+        assert!(guard.is_stale(), "an L7 rule on this endpoint changes the contract");
+
+        engine.reload_from_proto(&original).unwrap();
+        assert!(
+            guard.is_stale(),
+            "restoring the policy must not revive a connection already found stale"
+        );
+    }
+
+    #[test]
+    fn revalidating_guard_closes_when_l7_rules_of_its_endpoint_change() {
+        let mut proto = test_proto();
+        policy_mut(&mut proto, "claude_code").endpoints[0] =
+            rest_endpoint("api.anthropic.com", "/v1/messages");
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let input = claude_input("api.anthropic.com");
+        let guard = revalidating_guard(&engine, &input);
+
+        // Every reload restamps policy_hash on every endpoint; that alone
+        // must not count as a change.
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        engine.reload_from_proto(&proto).unwrap();
+        assert!(!guard.is_stale(), "policy_hash restamping is not a contract change");
+
+        policy_mut(&mut proto, "claude_code").endpoints[0] =
+            rest_endpoint("api.anthropic.com", "/v1/**");
+        engine.reload_from_proto(&proto).unwrap();
+        assert!(guard.is_stale(), "per-request rules for this endpoint changed");
+    }
+
+    #[test]
+    fn revalidating_guard_closes_when_its_binary_loses_access() {
+        let mut proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        policy_mut(&mut proto, "claude_code").binaries = vec![NetworkBinary {
+            path: "/usr/bin/other".to_string(),
+        }];
+        engine.reload_from_proto(&proto).unwrap();
+
+        assert!(guard.is_stale());
+    }
+
+    #[test]
+    fn revalidating_guard_closes_when_a_new_policy_matches_its_connection() {
+        let mut proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        // A second policy admitting the same binary and host changes the set
+        // of endpoints per-request rules consult, even if it only widens.
+        proto.network_policies.insert(
+            "another".to_string(),
+            NetworkPolicyRule {
+                name: "another".to_string(),
+                endpoints: vec![proto_endpoint("api.anthropic.com")],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/local/bin/claude".to_string(),
+                }],
+            },
+        );
+        engine.reload_from_proto(&proto).unwrap();
+
+        assert!(guard.is_stale());
+    }
+
+    #[test]
+    fn revalidating_guard_never_follows_a_fail_closed_quarantine() {
+        let proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        engine.enter_fail_closed("candidate rejected").unwrap();
+        engine.exit_fail_closed().unwrap();
+
+        assert!(
+            guard.is_stale(),
+            "quarantine is a hard stop even when the previous policy returns"
+        );
+    }
+
+    #[test]
+    fn revalidating_guard_clones_share_one_pin() {
+        let mut proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+        let clone = guard.clone();
+
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        engine.reload_from_proto(&proto).unwrap();
+
+        assert!(!guard.is_stale());
+        assert_eq!(clone.captured_generation(), engine.current_generation());
+    }
+
+    #[tokio::test]
+    async fn revalidating_guard_waits_through_unrelated_reloads() {
+        let mut proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+        let waiter = tokio::spawn({
+            let guard = guard.clone();
+            async move { guard.wait_until_stale().await }
+        });
+        tokio::task::yield_now().await;
+
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        engine.reload_from_proto(&proto).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "an unrelated reload must not wake the relay closed");
+
+        policy_mut(&mut proto, "claude_code").binaries.clear();
+        engine.reload_from_proto(&proto).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("a relevant reload must end the wait")
+            .expect("waiter must not panic");
+    }
+
+    #[test]
+    fn connection_contract_excludes_policy_hash_metadata() {
+        let mut proto = test_proto();
+        policy_mut(&mut proto, "claude_code").endpoints[0] =
+            rest_endpoint("api.anthropic.com", "/v1/messages");
+        let before = OpaEngine::from_proto(&proto).unwrap();
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        let after = OpaEngine::from_proto(&proto).unwrap();
+        let input = claude_input("api.anthropic.com");
+
+        let before_configs = before.authorize_egress(&input).unwrap().endpoint_configs;
+        let after_configs = after.authorize_egress(&input).unwrap().endpoint_configs;
+        assert_ne!(
+            before_configs, after_configs,
+            "fixture must exercise the per-reload policy_hash stamp"
+        );
+        assert_eq!(
+            before.connection_policy_contract(&input).unwrap().0,
+            after.connection_policy_contract(&input).unwrap().0
+        );
+    }
+
+    #[test]
+    fn denied_connection_captures_no_revalidator() {
+        let engine = Arc::new(OpaEngine::from_proto(&test_proto()).unwrap());
+        let input = claude_input("not-allowed.example.com");
+        let authorization = engine.authorize_egress(&input).unwrap();
+        assert!(matches!(authorization.action, NetworkAction::Deny { .. }));
+
+        let revalidator = PolicyRevalidator::capture(
+            &engine,
+            input,
+            &AuthorizedConnection {
+                action: &authorization.action,
+                endpoint_configs: &authorization.endpoint_configs,
+                matched_endpoints: &authorization.matched_endpoints,
+                exact_declared_endpoint_host: authorization.exact_declared_endpoint_host,
+            },
+            authorization.generation,
+            None,
+        );
+        assert!(revalidator.is_none());
     }
 }

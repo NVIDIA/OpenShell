@@ -364,7 +364,7 @@ impl OnError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChainEntry {
     pub name: String,
     pub implementation: String,
