@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import uuid
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -116,11 +117,25 @@ def _actions_stale_closure(repository, issue, event, actor, api):
             or (event.get('actor') or {}).get('login', '').lower() != login):
         return False
     comments = api(f'repos/{repository}/issues/{issue["number"]}/comments?per_page=100', pages=True)
-    return any(comment.get('body') == STALE_CLOSE_MESSAGE
-        and (comment.get('user') or {}).get('login', '').lower() == login
-        and (comment.get('user') or {}).get('type') == 'Bot'
-        and comment.get('created_at') == closed_at
-        and comment.get('updated_at', closed_at) == closed_at for comment in comments)
+    if not comments:
+        return False
+    # REST issue comments are paginated oldest first. A later comment makes
+    # this narrow automation inference uncertain, including a same-second one.
+    comment = comments[-1]
+    created_at = comment.get('created_at')
+    if (comment.get('body') != STALE_CLOSE_MESSAGE
+            or (comment.get('user') or {}).get('login', '').lower() != login
+            or (comment.get('user') or {}).get('type') != 'Bot'
+            or not created_at or comment.get('updated_at', created_at) != created_at):
+        return False
+    try:
+        elapsed = (datetime.fromisoformat(closed_at.replace('Z', '+00:00'))
+                   - datetime.fromisoformat(created_at.replace('Z', '+00:00'))).total_seconds()
+    except (ValueError, TypeError):
+        return False
+    # Comment creation and closure are separate requests; recognize a bounded
+    # literal protocol window, without claiming proof of workflow identity.
+    return 0 <= elapsed <= 60
 
 
 def preflight(repository: str, number: int, *, api, force: bool = False) -> dict:
