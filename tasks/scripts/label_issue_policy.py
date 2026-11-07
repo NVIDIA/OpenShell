@@ -10,6 +10,8 @@ must support its chosen replacements with inspected substantive evidence.
 
 Trusted label definitions may mark assessment labels with ``assessment: true``;
 only that prepared subset is available to a separately authorized triage caller.
+Explicit removals require membership in the trusted snapshot
+``malformed_classification_labels`` allowlist, never a classifier-supplied list.
 """
 
 from __future__ import annotations
@@ -138,10 +140,11 @@ def validate_result(snapshot: dict, result: dict) -> dict:
         if (set(removal) != {'label', 'evidence', 'reason'}
                 or not isinstance(label, str) or label in seen
                 or label not in snapshot.get('existing_labels', [])
+                or label not in snapshot.get('malformed_classification_labels', [])
                 or label in desired or label.startswith(PROTECTED_PREFIXES)
                 or not isinstance(removal.get('reason'), str) or not removal['reason'].strip()
                 or not _references(snapshot, removal.get('evidence'), observation=True)):
-            errors.append('Removal must cite observed association and content, preserving workflow labels')
+            errors.append('Removal requires a trusted malformed classification candidate, observed association and content, preserving workflow labels')
         if isinstance(label, str):
             seen.add(label)
     ambiguity = result.get('ambiguity')
