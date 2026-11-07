@@ -563,6 +563,29 @@ class EvidenceTests(unittest.TestCase):
                 self.assertFalse(is_inspected_source(snapshot['evidence_index'][identity]))
 
 
+    def test_authoritative_comment_preparation_batches_persistence_and_authority(self):
+        from unittest import mock
+        import label_issue_evidence as module
+        self.api.item['user']={'login':'reader'}
+        self.api.collections['comments']=[{'id':i,'body':'author detail','user':{'login':'reader','type':'User'}} for i in range(80)]
+        with mock.patch.object(module,'_persist',wraps=module._persist) as persist:
+            self.prepare()
+        self.assertEqual(persist.call_count,1)
+        self.assertEqual(len([path for path,_ in self.api.calls if '/collaborators/reader/permission' in path]),1)
+
+
+    def test_refresh_actor_cache_is_per_refresh_and_observes_permission_revocation(self):
+        self.api.collections['comments']=[{'id':i,'body':'reviewed intent','user':{'login':'writer','type':'User'},'author_association':'COLLABORATOR'} for i in range(30)]
+        snapshot=self.prepare()
+        before=len([path for path,_ in self.api.calls if '/collaborators/writer/permission' in path])
+        self.api.permissions['writer']='read'
+        expand_evidence(snapshot,['comments'],api=self.api)
+        after=len([path for path,_ in self.api.calls if '/collaborators/writer/permission' in path])
+        self.assertEqual(after-before,1)
+        self.assertFalse(snapshot['lifecycle_evidence'])
+        self.assertTrue(all(snapshot['evidence_index'][f'comment:{i}']['actor_authority']['permission']=='read' for i in range(30)))
+
+
 
 if __name__ == '__main__':
     unittest.main()

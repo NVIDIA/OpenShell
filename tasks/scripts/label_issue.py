@@ -5,9 +5,11 @@
 
 One coordinated manual executor per item is required. POSIX flock serializes local
 processes only; optimistic material/event checks detect other writers, without
-claiming cross-host locking or atomic GitHub transactions. Mutations use one HTTP request with serial top-level GraphQL aliases, one label
-per alias. Alias order establishes the event transcript without assuming order
-inside a label array. The mutations remain separate, non-atomic operations.
+claiming cross-host locking or atomic GitHub transactions. Mutations batch
+one-label serial aliases by phase. Additions and their
+independent live-label/event/material verification precede the removals request.
+Approved temporary precleanup can precede additions inside the first phase.
+The mutations remain separate, non-atomic operations.
 """
 from __future__ import annotations
 import argparse
@@ -17,15 +19,16 @@ import hashlib
 import json
 import os
 import tempfile
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 import label_issue_checkpoint as checkpoint
 import label_issue_evidence as evidence
 from label_issue_github import GitHubClient
-from label_issue_policy import is_inspected_source, plan_labels
+from label_issue_policy import format_report, is_inspected_source, plan_labels
 # Bump for classifier/skill/migration semantic changes; trusted document hashes
 # are bound separately, without binding unrelated repository HEAD changes.
-POLICY_VERSION = 'openshell-labeler-policy-v2'
+POLICY_VERSION = 'openshell-labeler-policy-v3'
 DEFAULT_BOOKKEEPING_LABEL = 'meta:labeler-checkpoint'
 # Configuration selects this reviewed authority; alternate names need code review.
 APPROVED_BOOKKEEPING_LABELS = frozenset({DEFAULT_BOOKKEEPING_LABEL})
@@ -43,6 +46,23 @@ def _report(source, status, message=None):
     report.update(status=status, add=[], remove=[], preserve=sorted(source.get('existing_labels', [])), bookkeeping=[], ambiguity=None, missing_prerequisites=[], diagnostics=[], ordered_writes=[], checkpoint_verified=False, classifier_required=False)
     if message:
         report['diagnostics'].append(message)
+    return report
+
+
+def _failure(report, exc, api):
+    """Preserve actionable failure fields at every public dictionary boundary."""
+    message = getattr(exc, 'message', None) or getattr(exc, 'stderr', None) or str(exc)
+    error = {'type': type(exc).__name__, 'message': str(message),
+             'status': getattr(exc, 'status', None),
+             'retryable': bool(getattr(exc, 'retryable', False)),
+             'retry_at': getattr(exc, 'retry_at', None),
+             'uncertain_write': bool(getattr(exc, 'uncertain_write', False))}
+    if 'error' not in report:
+        report['error'] = error
+    else:
+        report.setdefault('additional_errors', []).append(error)
+    report['diagnostics'].append(error['message'])
+    report['telemetry'] = getattr(api, 'diagnostics', {})
     return report
 
 
@@ -110,7 +130,7 @@ def _hydrate(snapshot, api, template=None):
         if authority.get('verified') is True and authority.get('login', '').casefold() == login:
             authorities[login] = copy.deepcopy(authority)
     author = (snapshot['item_material'].get('user') or {}).get('login', '')
-    for source in snapshot['evidence_index'].values():
+    for identity, source in snapshot['evidence_index'].items():
         if source.get('kind') not in {'comment', 'review', 'review_comment'}:
             continue
         user = source.get('source_user') or {}
@@ -119,6 +139,12 @@ def _hydrate(snapshot, api, template=None):
             authorities[login] = evidence._authority(snapshot['repository'], user, author,
                 set(snapshot['trusted_maintainers']), api)
         source['actor_authority'] = copy.deepcopy(authorities[login])
+        if user.get('type') != 'Bot' and authorities[login]['role'] in {'author', 'maintainer'}:
+            if identity not in snapshot['lifecycle_evidence']:
+                snapshot['lifecycle_evidence'].append(identity)
+            # This only nominates required content for final delivery. No
+            # source-bound inspection credit exists until that delivery/ack.
+            source['inspected'] = True
     if template:
         for identity, previous in template['evidence_index'].items():
             current = snapshot['evidence_index'].get(identity)
@@ -164,7 +190,7 @@ def prepare(repository: str, number: int, directory: Path, *, api, force: bool=F
         _hydrate(snapshot, api)
         if not assessment_only:
             material = _material(snapshot)
-            if discovery['status'] == 'found':
+            if discovery['status'] == 'found' and not (APPROVED_BOOKKEEPING_LABELS & set(snapshot['existing_labels'])):
                 candidate = discovery['checkpoint']
                 if candidate.get('version') == 2:
                     events = checkpoint.collect_label_events(snapshot['item_id'], candidate['boundary_id'], api=api)
@@ -184,7 +210,7 @@ def prepare(repository: str, number: int, directory: Path, *, api, force: bool=F
         report.update(snapshot=snapshot, snapshot_path=str(Path(snapshot['_directory']) / 'manifest.json'), checkpoint_lookup=discovery, telemetry=getattr(api, 'diagnostics', {}))
         return report
     except Exception as exc:
-        return _report(facts, 'error', str(exc))
+        return _failure(_report(facts, 'error'), exc, api)
 
 @contextmanager
 def _fresh(snapshot, api):
@@ -227,7 +253,7 @@ def _mutation(snapshot, action, label, label_id, *, rationale=None, bookkeeping=
 def _batch(operations):
     variables, declarations, fields = ({}, [], [])
     for position, operation in enumerate(operations):
-        alias = f'op{position}'
+        alias = operation.get('alias', f'op{position}')
         operation['alias'] = alias
         addition = operation['action'] == 'add'
         kind = 'AddLabelsToLabelableInput' if addition else 'RemoveLabelsFromLabelableInput'
@@ -274,11 +300,11 @@ def _plan(snapshot, result, api, assessment, bookkeeping_label, executor):
         operations.append(_mutation(snapshot, action, label, label_id, bookkeeping=bookkeeping))
     existing = set(snapshot['existing_labels'])
     final = set(report['final_labels'])
-    if not assessment_only and bookkeeping_label and (bookkeeping_label in existing):
-        if not bookkeeping_label.startswith('meta:'):
-            return _report(snapshot, 'held', 'Bookkeeping must use an explicitly configured dedicated meta: label')
-        add('remove', bookkeeping_label, True)
-        final.discard(bookkeeping_label)
+    leftovers = sorted(APPROVED_BOOKKEEPING_LABELS & existing) if not assessment_only else []
+    report['preserve'] = [label for label in report['preserve'] if label not in leftovers]
+    for leftover in leftovers:
+        add('remove', leftover, True)
+        final.discard(leftover)
     for label in report['add']:
         add('add', label)
     if not assessment_only and (not report['add']):
@@ -287,7 +313,7 @@ def _plan(snapshot, result, api, assessment, bookkeeping_label, executor):
         else:
             add('add', bookkeeping_label, True)
     for label in report['remove']:
-        if not (not assessment_only and label == bookkeeping_label and (label in existing)):
+        if label not in leftovers:
             add('remove', label)
     if not assessment_only and (not report['add']) and bookkeeping_label:
         add('remove', bookkeeping_label, True)
@@ -305,7 +331,14 @@ def _plan(snapshot, result, api, assessment, bookkeeping_label, executor):
     report['final_labels'] = sorted(final)
     report['ordered_writes'] = operations
     if operations:
-        report['mutation_request'] = _batch(operations)
+        for position, operation in enumerate(operations):
+            operation['alias'] = f'op{position}'
+        split = max((position + 1 for position, operation in enumerate(operations) if operation['action'] == 'add'), default=0)
+        report['mutation_requests'] = []
+        if split:
+            report['mutation_requests'].append({'phase': 'additions', 'stop': split, **_batch(operations[:split])})
+        if split < len(operations):
+            report['mutation_requests'].append({'phase': 'removals', 'stop': len(operations), **_batch(operations[split:])})
     report['bookkeeping'] = [f"{operation['action']} {operation['label']}" for operation in operations if operation['bookkeeping']]
     return report
 
@@ -327,19 +360,29 @@ def _preview(snapshot, result, api, assessment, bookkeeping_label, executor):
         boundary = checkpoint.latest_label_event(snapshot['item_id'], api=api)['boundary_id']
         if boundary != snapshot.get('label_event_boundary'):
             return _report(snapshot, 'stale', 'External label events changed since preparation')
+        missing = [identity for identity in current['lifecycle_evidence']
+                   if current['evidence_index'][identity].get('kind') in {'comment', 'review', 'review_comment'}
+                   and (not is_inspected_source(current['evidence_index'][identity])
+                        or current['evidence_index'][identity].get('coverage') != 'complete')]
+        if missing:
+            report = _report(snapshot, 'held', 'Required human lifecycle evidence must be delivered or explicitly acknowledged')
+            report['required_evidence'] = missing
+            return report
         return _plan(snapshot, result, api, assessment, bookkeeping_label, executor)
 
 
 def preview(snapshot: dict, result: dict, *, api, assessment: dict | None=None, bookkeeping_label: str | None=DEFAULT_BOOKKEEPING_LABEL, executor: str | None=None) -> dict:
     """Show exact ordered request payloads without any external mutation."""
     try:
-        return _preview(snapshot, result, api, assessment, bookkeeping_label, executor)
+        report = _preview(snapshot, result, api, assessment, bookkeeping_label, executor)
+        report['telemetry'] = getattr(api, 'diagnostics', {})
+        return report
     except checkpoint.IncompleteMaterial as exc:
         report = _report(snapshot, 'prerequisite', str(exc))
         report['missing_prerequisites'] = [str(exc)]
         return report
     except Exception as exc:
-        return _report(snapshot, 'error', str(exc))
+        return _failure(_report(snapshot, 'error'), exc, api)
 
 
 def _lock_path(repository, number):
@@ -363,6 +406,33 @@ def _live_labels(snapshot, api):
     return sorted((entry['name'] for entry in api(f"repos/{snapshot['repository']}/issues/{snapshot['number']}/labels?per_page=100", pages=True)))
 
 
+def _prefix_verified(snapshot, report, prefix, api):
+    """Gate destructive phases on actual prior events, labels, and source facts."""
+    labels = set(snapshot['existing_labels'])
+    for operation in prefix:
+        if operation['action'] == 'add':
+            labels.add(operation['label'])
+        else:
+            labels.discard(operation['label'])
+    if set(_live_labels(snapshot, api)) != labels:
+        return False
+    proof = checkpoint.collect_label_events(snapshot['item_id'], snapshot['label_event_boundary'], api=api)
+    if proof['status'] != 'complete' or len(proof['events']) != len(prefix):
+        return False
+    for event, operation in zip(proof['events'], prefix):
+        expected_type = 'LabeledEvent' if operation['action'] == 'add' else 'UnlabeledEvent'
+        if (event.get('__typename') != expected_type
+                or (event.get('actor') or {}).get('login', '').casefold() != report['executor']
+                or (event.get('label') or {}).get('id') != operation['label_id']):
+            return False
+        if operation['action'] == 'add':
+            rationale = operation['data']['variables']['input']['labels'][0].get('rationale')
+            if rationale is not None and (event.get('intent') or {}).get('rationale') != rationale:
+                return False
+    with _fresh(snapshot, api) as current:
+        return _same_material(snapshot, current, set(report['final_labels']))
+
+
 def apply(snapshot: dict, result: dict, *, api, trusted_actors: set[str], bookkeeping_label: str | None=DEFAULT_BOOKKEEPING_LABEL, assessment: dict | None=None, expected_preview: dict | None=None, executor: str | None=None) -> dict:
     """Recheck under a local lock, write once, then separately verify live facts."""
     report = _report(snapshot, 'error')
@@ -376,7 +446,7 @@ def apply(snapshot: dict, result: dict, *, api, trusted_actors: set[str], bookke
             if expected_preview is not None:
                 if not isinstance(expected_preview, dict) or expected_preview.get('status') != 'preview':
                     return _report(snapshot, 'held', 'Expected preview must be the separately confirmed preview report')
-                confirmed = ('mutation_request', 'ordered_writes')
+                confirmed = ('mutation_requests', 'ordered_writes', 'executor')
                 if any((expected_preview.get(key) != report.get(key) for key in confirmed)):
                     return _report(snapshot, 'stale', 'The current exact mutation payload differs from the confirmed preview')
             if report['executor'] not in actors:
@@ -385,14 +455,29 @@ def apply(snapshot: dict, result: dict, *, api, trusted_actors: set[str], bookke
                 report['status'] = 'no-op'
                 return report
             failure = None
-            request = report['mutation_request']
-            attempted = True
-            try:
-                payload = api(request['path'], method=request['method'], data=request['data'])
-                if not isinstance(payload, dict) or payload.get('errors') or (not isinstance(payload.get('data'), dict)) or any((not isinstance(payload['data'].get(operation['alias']), dict) for operation in report['ordered_writes'])):
-                    raise ValueError('GraphQL mutation returned errors or incomplete aliases')
-            except Exception as exc:
-                failure = exc
+            prefix = []
+            for request in report['mutation_requests']:
+                if request['phase'] == 'removals':
+                    try:
+                        if not _prefix_verified(snapshot, report, prefix, api):
+                            raise ValueError('Replacement additions/event prefix or substantive facts were not verified; removals withheld')
+                    except Exception as exc:
+                        failure = exc
+                        _failure(report, exc, api)
+                        break
+                attempted = True
+                try:
+                    payload = api(request['path'], method=request['method'], data=request['data'])
+                    phase_operations = report['ordered_writes'][len(prefix):request['stop']]
+                    if (not isinstance(payload, dict) or payload.get('errors')
+                            or not isinstance(payload.get('data'), dict)
+                            or any(not isinstance(payload['data'].get(operation['alias']), dict) for operation in phase_operations)):
+                        raise ValueError('GraphQL mutation returned errors or incomplete aliases')
+                    prefix = report['ordered_writes'][:request['stop']]
+                except Exception as exc:
+                    failure = exc
+                    _failure(report, exc, api)
+                    break
             # Recovery labels do not depend on unrelated source hydration.
             report['observed_labels'] = _live_labels(snapshot, api)
             with _fresh(snapshot, api) as current:
@@ -417,7 +502,7 @@ def apply(snapshot: dict, result: dict, *, api, trusted_actors: set[str], bookke
                     report['checkpoint_verified'] = bool(verified)
                 report['status'] = 'applied' if verified else 'partial'
                 if failure:
-                    report['diagnostics'].append(f'Write failed/uncertain; fresh state read, no replay: {failure}')
+                    report['diagnostics'].append('Write failed/uncertain; fresh state read, no replay')
                 if not verified:
                     report['diagnostics'].append('Completion was not verified; reprepare and reconcile live state')
                 report['telemetry'] = getattr(api, 'diagnostics', {})
@@ -426,8 +511,7 @@ def apply(snapshot: dict, result: dict, *, api, trusted_actors: set[str], bookke
         return _report(snapshot, 'held', 'Another local executor holds this item lock; coordinate one executor per item')
     except Exception as exc:
         report.update(status='partial' if attempted else 'error', checkpoint_verified=False)
-        report['diagnostics'].append(str(exc))
-        return report
+        return _failure(report, exc, api)
 
 
 def main(argv=None, *, api=None):
@@ -436,6 +520,7 @@ def main(argv=None, *, api=None):
     for command in ('prepare', 'expand', 'preview', 'apply'):
         sub = commands.add_parser(command)
         sub.add_argument('--output', type=Path)
+        sub.add_argument('--human', action='store_true', help='Also print a concise summary to stderr; stdout remains JSON')
         if command == 'prepare':
             sub.add_argument('--repo', required=True)
             sub.add_argument('--item', required=True, type=int)
@@ -486,10 +571,15 @@ def main(argv=None, *, api=None):
         if args.output and args.command != 'prepare':
             args.output.write_text(json.dumps(printable, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
         print(json.dumps(printable, ensure_ascii=False))
+        if args.human:
+            print(format_report(printable), file=sys.stderr)
         status = report['status']
         return 0 if status in {'ready', 'preview', 'applied', 'no-op', 'unchanged', 'skipped'} else 2 if status in {'held', 'prerequisite', 'stale'} else 1
     except Exception as exc:
-        print(json.dumps({'status': 'error', 'diagnostics': [str(exc)]}))
+        report = _failure(_report({}, 'error'), exc, api)
+        print(json.dumps(report, ensure_ascii=False))
+        if args.human:
+            print(format_report(report), file=sys.stderr)
         return 1
 if __name__ == '__main__':
     raise SystemExit(main())
