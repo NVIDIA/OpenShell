@@ -5103,7 +5103,7 @@ pub(super) async fn handle_report_sandbox_configuration(
         &state.store,
         &mut sandbox,
         current_time_ms(),
-        state.config.provisioning_repair_window_ms,
+        state.config.provisioning_repair_window_seconds * 1000,
     )
     .await
     .map_err(Status::internal)?;
@@ -5200,14 +5200,14 @@ pub(super) async fn handle_report_sandbox_configuration(
         crate::compute::provisioning_deadline::record_admission_start(
             record,
             now_ms,
-            state.config.provisioning_repair_window_ms,
+            state.config.provisioning_repair_window_seconds * 1000,
         )
         .map_err(Status::internal)?;
         if reported == ConfigurationAdmissionState::Rejected {
             crate::compute::provisioning_deadline::record_rejection(
                 record,
                 now_ms,
-                state.config.provisioning_repair_window_ms,
+                state.config.provisioning_repair_window_seconds * 1000,
             )
             .map_err(Status::internal)?;
         }

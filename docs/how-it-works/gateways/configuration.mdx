@@ -57,19 +57,19 @@ preflight and gateway startup.
 ### Slow sandbox startup
 
 Slow isolation backends may need longer startup windows. These settings default
-to `300000` milliseconds (5 minutes); allowed values are `1000` through
-`86400000`. Environment variables override TOML values.
+to `300` seconds (5 minutes); allowed values are `1` through
+`86400`. Environment variables override TOML values.
 
 | Setting | Scope | Environment variable |
 |---|---|---|
-| `provisioning_repair_window_ms` | `[openshell.gateway]`: configuration repair after admission starts | `OPENSHELL_PROVISIONING_REPAIR_WINDOW_MS` |
-| `runtime_bootstrap_grace_ms` | `[openshell.drivers.kubernetes]`: sandbox startup | `OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_MS` |
-| `sandbox_attach_request_timeout_ms` | `[openshell.drivers.kubernetes]`: dedicated supervisor startup | `OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS` |
+| `provisioning_repair_window_seconds` | `[openshell.gateway]`: configuration repair after admission starts | `OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS` |
+| `runtime_bootstrap_grace_seconds` | `[openshell.drivers.kubernetes]`: sandbox startup | `OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_SECONDS` |
+| `sandbox_attach_request_timeout_seconds` | `[openshell.drivers.kubernetes]`: dedicated supervisor startup | `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS` |
 
-For a 15-minute Kubernetes startup window, set both driver settings to `900000`.
-For shared supervisors, set `OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS=900000` on each
+For a 15-minute Kubernetes startup window, set both driver settings to `900`.
+For shared supervisors, set `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS=900` on each
 shared host's deployment; the driver setting does not change those deployments.
-A directly launched supervisor also accepts `--attach-request-timeout-ms`.
+A directly launched supervisor also accepts `--attach-request-timeout-seconds`.
 
 Restart the affected gateway and supervisors for new settings to take effect.
 Existing admission deadlines are preserved. After a sandbox times out, wait for
@@ -304,8 +304,8 @@ ssh_session_ttl_secs  = 3600
 # Applies to new attempts only; allowed values are 1 through 86400 seconds.
 image_preparation_timeout_seconds = 1800
 
-# Admission repair window in milliseconds; existing deadlines are preserved.
-provisioning_repair_window_ms = 300000
+# Admission repair window in seconds; existing deadlines are preserved.
+provisioning_repair_window_seconds = 300
 
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.
@@ -1301,9 +1301,9 @@ service_account_name           = "openshell-sandbox"
 default_image                  = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy              = "if_not_present"
 image_pull_secrets             = ["regcred"]
-# Startup windows in milliseconds; defaults are 300000.
-# runtime_bootstrap_grace_ms = 900000
-# sandbox_attach_request_timeout_ms = 900000
+# Startup windows in seconds; defaults are 300.
+# runtime_bootstrap_grace_seconds = 900
+# sandbox_attach_request_timeout_seconds = 900
 # Defaults to the gateway version; override to pin a specific build.
 # sandbox_runtime_image        = "ghcr.io/nvidia/openshell/sandbox:<version>"
 sandbox_runtime_image_pull_policy = "if_not_present"

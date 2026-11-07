@@ -3579,7 +3579,7 @@ impl KubernetesComputeDriver {
                         .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
                     owner,
                     &self.supervisor_otlp_environment(),
-                    self.config.sandbox_attach_request_timeout_ms,
+                    self.config.sandbox_attach_request_timeout_seconds,
                 )
                 .map_err(KubernetesDriverError::Message)?,
                 &self.config.sandbox_runtime.app_listener,
@@ -4099,7 +4099,7 @@ impl KubernetesComputeDriver {
             sandbox_api.api.clone(),
             cr_name.to_string(),
             Some(cr_uid.to_string()),
-            Duration::from_millis(self.config.runtime_bootstrap_grace_ms),
+            Duration::from_secs(self.config.runtime_bootstrap_grace_seconds),
         );
         Ok(())
     }
@@ -5541,7 +5541,7 @@ impl KubernetesComputeDriver {
         if !sandbox_runtime_bootstrap_is_stale(
             object,
             SystemTime::now(),
-            Duration::from_millis(self.config.runtime_bootstrap_grace_ms),
+            Duration::from_secs(self.config.runtime_bootstrap_grace_seconds),
         ) {
             return;
         }

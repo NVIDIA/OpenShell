@@ -263,11 +263,11 @@ fails discovery within its control-request deadline. Permanent
 gateway errors and exhausted transient retries terminate startup; inspect those
 errors as connectivity, authorization, or lifecycle failures.
 
-For slow Kubernetes isolation backends, increase `runtime_bootstrap_grace_ms`
-and the dedicated supervisor's `sandbox_attach_request_timeout_ms` together.
-Shared supervisor deployments instead need `OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS`
-on each shared host. The default is 300000 ms; allowed values are 1000 through
-86400000. Restart affected components and explicitly start a timed-out sandbox
+For slow Kubernetes isolation backends, increase `runtime_bootstrap_grace_seconds`
+and the dedicated supervisor's `sandbox_attach_request_timeout_seconds` together.
+Shared supervisor deployments instead need `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS`
+on each shared host. The default is 300 seconds; allowed values are 1 through
+86400. Restart affected components and explicitly start a timed-out sandbox
 after cleanup; changing settings does not reset a persisted admission deadline.
 See [gateway configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#slow-sandbox-startup).
 

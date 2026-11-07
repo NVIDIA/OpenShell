@@ -353,7 +353,7 @@ pub fn supervisor_pod(
     network_additional_ca: Option<(&str, &str)>,
     owner: OwnerReference,
     tracing_environment: &[(&str, String)],
-    attach_request_timeout_ms: Option<u64>,
+    attach_request_timeout_seconds: Option<u64>,
 ) -> Result<Pod, String> {
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
@@ -395,10 +395,10 @@ pub fn supervisor_pod(
             .iter()
             .map(|(name, value)| env_var(name, value)),
     );
-    if let Some(timeout_ms) = attach_request_timeout_ms {
+    if let Some(timeout_seconds) = attach_request_timeout_seconds {
         environment.push(env_var(
-            "OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS",
-            &timeout_ms.to_string(),
+            "OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS",
+            &timeout_seconds.to_string(),
         ));
     }
     if let Some(server_name) = gateway_tls_server_name(grpc_endpoint) {
@@ -1179,10 +1179,10 @@ mod tests {
                 .map(|variable| (variable.name, variable.value.unwrap_or_default()))
                 .collect::<BTreeMap<_, _>>()
         };
-        assert!(!env(None).contains_key("OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS"));
+        assert!(!env(None).contains_key("OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS"));
         assert_eq!(
-            env(Some(900_000))["OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS"],
-            "900000"
+            env(Some(900))["OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS"],
+            "900"
         );
     }
 

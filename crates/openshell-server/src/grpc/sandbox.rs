@@ -741,14 +741,14 @@ async fn handle_create_sandbox_inner(
         crate::compute::provisioning_deadline::new_preparation_record(
             now_ms,
             state.config.image_preparation_timeout_seconds,
-            state.config.provisioning_repair_window_ms,
+            state.config.provisioning_repair_window_seconds * 1000,
         ),
     );
     crate::compute::provisioning_deadline::refresh_configuration(
         &state.store,
         &mut sandbox,
         now_ms,
-        state.config.provisioning_repair_window_ms,
+        state.config.provisioning_repair_window_seconds * 1000,
     )
     .await
     .map_err(Status::internal)?;

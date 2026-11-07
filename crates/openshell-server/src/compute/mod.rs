@@ -1347,14 +1347,14 @@ impl ComputeRuntime {
     /// Validate the repair window once at startup. Persisted attempts keep
     /// their original deadline even if the operator changes this value on
     /// restart.
-    pub(crate) fn with_provisioning_repair_window_ms(
+    pub(crate) fn with_provisioning_repair_window_seconds(
         mut self,
         window: i64,
     ) -> Result<Self, String> {
-        if !(1_000..=86_400_000).contains(&window) {
-            return Err("provisioning_repair_window_ms must be between 1000 and 86400000".into());
+        if !(1..=86_400).contains(&window) {
+            return Err("provisioning_repair_window_seconds must be between 1 and 86400".into());
         }
-        self.provisioning_repair_window_ms = window;
+        self.provisioning_repair_window_ms = window * 1000;
         Ok(self)
     }
 
@@ -20992,7 +20992,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone())
             .await
-            .with_provisioning_repair_window_ms(900_000)
+            .with_provisioning_repair_window_seconds(900)
             .unwrap();
         let sandbox = seed_provisioning_attempt(&runtime).await;
         let gate = runtime.lifecycle_gates.lock_for("sb-ttl").await;

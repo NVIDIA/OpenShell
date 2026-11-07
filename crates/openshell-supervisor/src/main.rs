@@ -239,16 +239,16 @@ struct Args {
     #[arg(long, hide = true)]
     parent_liveness_stdin: bool,
 
-    /// Attach and policy-discover request timeout, in milliseconds. Slow
+    /// Attach and policy-discover request timeout, in seconds. Slow
     /// VM-backed runtimes (CoCo/peer-pods) need longer than the default for
     /// the remote boundary to boot before the supervisor gives up.
     #[arg(
         long,
-        env = "OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS",
-        default_value = "300000",
-        value_parser = clap::value_parser!(u64).range(1000..=86_400_000)
+        env = "OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS",
+        default_value = "300",
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
     )]
-    attach_request_timeout_ms: u64,
+    attach_request_timeout_seconds: u64,
 }
 
 #[cfg(unix)]
@@ -668,8 +668,8 @@ fn main() -> Result<()> {
                     auth_bundle,
                     admitted_isolation_backend: Some(admitted_backend),
                     main_exit_marker: args.main_exit_marker,
-                    attach_request_timeout: std::time::Duration::from_millis(
-                        args.attach_request_timeout_ms,
+                    attach_request_timeout: std::time::Duration::from_secs(
+                        args.attach_request_timeout_seconds,
                     ),
                     trace_context: openshell_supervisor::trace_context_from_environment(),
                     provider_workload_api_socket: std::env::var_os(
@@ -896,24 +896,32 @@ fn supervisor_exit(result: Result<i32>) -> Result<i32> {
 mod tests {
     #[test]
     fn bootstrap_timeout_arguments_reject_invalid_values() {
-        for value in ["0", "999", "86400001", "invalid"] {
+        assert_eq!(
+            Args::try_parse_from(["openshell-supervisor"])
+                .unwrap()
+                .attach_request_timeout_seconds,
+            300
+        );
+        for value in ["0", "86401", "invalid"] {
             assert!(
                 Args::try_parse_from([
                     "openshell-supervisor",
-                    "--attach-request-timeout-ms",
+                    "--attach-request-timeout-seconds",
                     value
                 ])
                 .is_err()
             );
         }
-        for value in ["1000", "900000", "86400000"] {
-            assert!(
-                Args::try_parse_from([
-                    "openshell-supervisor",
-                    "--attach-request-timeout-ms",
-                    value
-                ])
-                .is_ok()
+        for value in ["1", "900", "86400"] {
+            let args = Args::try_parse_from([
+                "openshell-supervisor",
+                "--attach-request-timeout-seconds",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(
+                args.attach_request_timeout_seconds,
+                value.parse::<u64>().unwrap()
             );
         }
     }
