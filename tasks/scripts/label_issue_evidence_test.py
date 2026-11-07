@@ -165,6 +165,22 @@ class EvidenceTests(unittest.TestCase):
         api = self.github_actions_stale_fixture()
         self.assertEqual(preflight(REPO, 4300, api=api)['eligibility']['lifecycle'], 'eligible')
 
+    def test_current_stale_protocol_allows_one_second_request_skew(self):
+        api = self.github_actions_stale_fixture()
+        self.api.collections['comments'][0].update(created_at='2026-11-06T08:22:29Z', updated_at='2026-11-06T08:22:29Z')
+        self.assertEqual(preflight(REPO, 4300, api=api)['eligibility']['lifecycle'], 'eligible')
+
+    def test_stale_protocol_rejects_intervening_comment_or_more_than_sixty_seconds(self):
+        for changed in ('intervening', 'expired'):
+            with self.subTest(changed=changed):
+                api = self.github_actions_stale_fixture()
+                if changed == 'intervening':
+                    self.api.collections['comments'].append({'id': 430002, 'body': 'Another decision.',
+                        'user': {'login': 'reader', 'type': 'User'}, 'created_at': '2026-11-06T08:22:30Z'})
+                else:
+                    self.api.collections['comments'][0].update(created_at='2026-11-06T08:21:29Z', updated_at='2026-11-06T08:21:29Z')
+                self.assertEqual(preflight(REPO, 4300, api=api)['eligibility']['lifecycle'], 'hold')
+
     def test_github_actions_unknown_old_or_misattributed_closures_hold(self):
         for changed in ('unrelated', 'old_comment', 'different_comment_actor', 'different_event_actor', 'edited_comment', 'wrong_reason', 'not_bot'):
             with self.subTest(changed=changed):
