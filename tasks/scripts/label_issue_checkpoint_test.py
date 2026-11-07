@@ -5,6 +5,8 @@
 import copy
 import hashlib
 import json
+import tempfile
+from pathlib import Path
 import unittest
 
 from label_issue_checkpoint import (
@@ -98,7 +100,7 @@ def proof_fixture():
 class CheckpointTests(unittest.TestCase):
     def test_v1_round_trip_is_audit_only(self):
         digest = 'a' * 64
-        rationale = encode_checkpoint(digest)
+        rationale = 'openshell-labeler:v1:' + digest
         self.assertEqual(rationale, 'openshell-labeler:v1:' + digest)
         self.assertEqual(decode_checkpoint(rationale), {'version': 1, 'fingerprint': digest})
         self.assertFalse(checkpoint_matches(decode_checkpoint(rationale), material(), {'area:runtime'}, 'policy1'))
@@ -119,7 +121,7 @@ class CheckpointTests(unittest.TestCase):
             self.assertIsNone(decode_checkpoint(value))
         for kwargs in [dict(boundary_id='B'), dict(boundary_id='B', operations_digest='b' * 64, event_count=0),
                        dict(boundary_id='B', operations_digest='b' * 64, event_count=True)]:
-            with self.assertRaises(ValueError):
+            with self.assertRaises((TypeError, ValueError)):
                 encode_checkpoint('a' * 64, **kwargs)
 
     def test_operation_digest_is_canonical_ordered_and_casefolds_actor(self):
@@ -134,7 +136,11 @@ class CheckpointTests(unittest.TestCase):
         second['evidence_index']['comment:1'].pop('content')
         second['evidence_index']['comment:1'].update(inspected=False, artifact_path='/tmp/different')
         second['evidence_index']['comments']['inspected'] = False
-        second['evidence_index']['text:any'] = source('text_slice', 'Real', parent_id='comment:1')
+        parent_digest = second['evidence_index']['comment:1']['source_digest']
+        text_id = f'text:comment:1:{parent_digest}:0:4'
+        second['evidence_index'][text_id] = source('text_slice', 'Real',
+            parent_id='comment:1', parent_digest=parent_digest, start=0, end=4)
+        second['evidence_index'][text_id]['coverage'] = 'slice'
         second['existing_labels'] = ['area:runtime']
         second['malformed_classification_labels'] = ['areaa:runtime']
         second['evidence_index']['labels'] = source('reconciliation', ['area:runtime'])
@@ -206,7 +212,7 @@ class CheckpointTests(unittest.TestCase):
         self.assertFalse(state['evidence_index']['comment:1']['inspected'])
 
     def test_discovery_paginates_backwards_finds_removed_label_and_trusted_actor_only(self):
-        rationale = encode_checkpoint('a' * 64)
+        rationale = 'openshell-labeler:v1:' + 'a' * 64
         api = FakeGitHub([response([event('untrusted', actor='stranger', rationale=rationale)], previous=True, cursor='cursor1'),
                           response([event('found', label='removed-label', actor='LABELER', rationale=rationale)])])
         result = find_checkpoint('I_12', api=api, trusted_actors={'labeler'})
@@ -219,14 +225,14 @@ class CheckpointTests(unittest.TestCase):
         self.assertNotIn('UNLABELED_EVENT', api.calls[0][2]['query'])
 
     def test_discovery_chooses_newest_valid_event_and_trust_has_no_default(self):
-        rationale = encode_checkpoint('a' * 64)
+        rationale = 'openshell-labeler:v1:' + 'a' * 64
         api = FakeGitHub([response([event('old', rationale=rationale), event('new', rationale=rationale)])])
         self.assertEqual(find_checkpoint('I_12', api=api, trusted_actors={'labeler'})['checkpoint']['event_id'], 'new')
         api = FakeGitHub([response([event('new', rationale=rationale)])])
         self.assertEqual(find_checkpoint('I_12', api=api, trusted_actors=set())['status'], 'not_found')
 
     def test_nullable_deleted_actor_or_label_cannot_hide_older_valid_checkpoint(self):
-        rationale = encode_checkpoint('a' * 64)
+        rationale = 'openshell-labeler:v1:' + 'a' * 64
         api = FakeGitHub([response([event('valid', rationale=rationale),
             event('deleted-actor', rationale=rationale) | {'actor': None},
             event('deleted-label', rationale=rationale) | {'label': None}])])
@@ -313,6 +319,62 @@ class CheckpointTests(unittest.TestCase):
         candidate, state, final, proof = proof_fixture()
         state['evidence_index']['comment:1'] = source('comment', {'body': 'Concurrent evidence'})
         self.assertFalse(checkpoint_matches(candidate, state, final, 'policy1', label_events=proof))
+
+    def test_encoder_requires_all_v2_fields_instead_of_emitting_unmatchable_v1(self):
+        with self.assertRaises(TypeError):
+            encode_checkpoint('a' * 64)
+
+    def test_parent_id_cannot_bypass_required_body_or_collection_member_coverage(self):
+        for identity in ['body', 'comments', 'comment:1']:
+            with self.subTest(identity=identity):
+                state = material()
+                state['evidence_index'][identity].update(parent_id='something', coverage='partial')
+                with self.assertRaises(IncompleteMaterial):
+                    fingerprint(state, {'area:runtime'}, 'policy1')
+
+    def test_edited_required_member_with_parent_id_still_changes_fingerprint(self):
+        before, after = material(), material()
+        before['evidence_index']['comment:1']['parent_id'] = 'body'
+        after['evidence_index']['comment:1'] = source('comment', {'body': 'Changed evidence'}, parent_id='body')
+        self.assertNotEqual(fingerprint(before, {'area:runtime'}, 'policy1'),
+                            fingerprint(after, {'area:runtime'}, 'policy1'))
+
+    def test_arbitrary_parent_id_or_derivative_prefix_cannot_hide_source_facts(self):
+        before, after = material(), material()
+        before['evidence_index']['text:fake'] = source('comment', {'body': 'First'}, parent_id='body')
+        after['evidence_index']['text:fake'] = source('comment', {'body': 'Edited'}, parent_id='body')
+        self.assertNotEqual(fingerprint(before, {'area:runtime'}, 'policy1'),
+                            fingerprint(after, {'area:runtime'}, 'policy1'))
+
+    def test_actual_evidence_producer_satisfies_hydrated_child_contract(self):
+        from label_issue_evidence import expand_evidence, material_state, prepare_snapshot
+        from label_issue_evidence_test import API
+
+        for pull in [False, True]:
+            with self.subTest(pull=pull), tempfile.TemporaryDirectory() as directory:
+                api = API(pull=pull)
+                api.collections['comments'] = [dict(id=7, body='Policy context', user={'login': 'reader'})]
+                if pull:
+                    api.collections['files'] = [dict(filename='src/a', status='modified',
+                        additions=1, deletions=1, patch='@@ -1 +1 @@\n-old\n+new')]
+                    api.collections['reviews'] = [dict(id=8, body='Policy review', user={'login': 'reader'})]
+                    api.collections['review_comments'] = [dict(id=9, body='Inline context', user={'login': 'reader'})]
+                snapshot = prepare_snapshot('Owner/Repo', 3, Path(directory), api=api)
+                hydration = ['comments'] + (['files', 'reviews', 'review_comments'] if pull else [])
+                expand_evidence(snapshot, hydration, api=api)
+                current = material_state(snapshot)
+                with self.assertRaises(IncompleteMaterial):
+                    fingerprint(current, {'area:platform'}, snapshot['policy_version'])
+                # Task 6 supplies this separately fetched complete filtered lifecycle envelope.
+                current['relevant_timeline'] = source('relevant_timeline', api.lifecycle_events)
+                before = fingerprint(current, {'area:platform'}, snapshot['policy_version'])
+                self.assertEqual(len(before), 64)
+                self.assertIn('comment:7', current['evidence_index']['comments']['members'])
+                api.collections['comments'][0]['body'] = 'Edited old policy context'
+                expand_evidence(snapshot, ['comments'], api=api)
+                changed = material_state(snapshot)
+                changed['relevant_timeline'] = current['relevant_timeline']
+                self.assertNotEqual(before, fingerprint(changed, {'area:platform'}, snapshot['policy_version']))
 
     def test_fingerprint_canonicalizes_mapping_order_without_mutating_inputs(self):
         state = material()
