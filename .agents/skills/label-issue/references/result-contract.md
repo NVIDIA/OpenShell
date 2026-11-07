@@ -10,7 +10,7 @@ uv run --no-project python tasks/scripts/label_issue.py prepare \
   --repo "$repo" --item "$item" --trusted-actor "$label_actor" --output "$packet_dir"
 ```
 
-For classification, continue only for `status: ready` with `classifier_required: true`. For separately authorized assessment-only preparation, continue for `status: ready` with `classifier_required: false` using the assessment path below. Read `packet.json`; use `manifest.json` for snapshot identity, `taxonomy.definitions`, `malformed_classification_labels` and relevant artifact metadata. Read `lifecycle_evidence` and its actual recorded facts. An unchanged outcome is a deterministic no-model, no-write skip.
+For classification, continue only for `status: ready` with `classifier_required: true`. For separately authorized assessment-only preparation, continue for `status: ready` with `classifier_required: false` using the assessment path below. Read `packet.json`; use `manifest.json` for snapshot identity, `taxonomy.definitions`, `malformed_classification_labels` and relevant artifact metadata. Read `lifecycle_evidence` and its actual recorded facts, including verified human dispositions recorded in reviews and review comments. Preview holds if a freshly required source lacks current delivery/expansion provenance; merely hashing or enumerating it does not satisfy this requirement. An unchanged outcome is a deterministic no-model, no-write skip.
 
 ```shell
 uv run --no-project python tasks/scripts/label_issue.py expand \
@@ -24,10 +24,10 @@ Write `result.json` using the contract below, then:
 ```shell
 uv run --no-project python tasks/scripts/label_issue.py preview \
   --snapshot "$packet_dir/manifest.json" --result "$packet_dir/result.json" \
-  --executor "$label_actor" --output "$packet_dir/preview.json"
+  --executor "$label_actor" --human --output "$packet_dir/preview.json"
 ```
 
-Review `status`, `add`, `remove`, `preserve`, `ambiguity`, `missing_prerequisites`, `bookkeeping`, and `ordered_writes`. `mutation_request` contains the exact ordered GraphQL payload. Application adds replacements before removing obsolete classification. A new examination with no additions can still need bookkeeping events. The approved dedicated default `meta:labeler-checkpoint` must already exist; this helper never provisions it. Missing prerequisites block application. Do not cycle acceptance, workflow or area/topic labels as substitutes.
+Review `status`, `add`, `remove`, `preserve`, `ambiguity`, `missing_prerequisites`, `bookkeeping`, and `ordered_writes`. `mutation_requests` contains the exact ordered HTTP request payloads, one per verified phase. Application sends the additions phase first, verifies actual replacement labels, the exact event prefix and current material independently, then sends the removals phase. A failed or uncertain addition cannot authorize later removals. Approved temporary precleanup can precede additions in the first phase. Confirm every HTTP request listed in `mutation_requests`; `--expected-preview` binds the full list, ordered alias inputs and executor identity, including assessment-only writes. A new examination with no additions can still need bookkeeping events. The approved dedicated default `meta:labeler-checkpoint` must already exist; this helper never provisions it. Missing prerequisites block application. Approved temporary leftovers are cleaned independently of whether a new bookkeeping cycle is configured and cannot authorize an unchanged skip. Do not cycle acceptance, workflow or area/topic labels as substitutes.
 
 For an authorized one-item application:
 
@@ -35,12 +35,14 @@ For an authorized one-item application:
 uv run --no-project python tasks/scripts/label_issue.py apply \
   --snapshot "$packet_dir/manifest.json" --result "$packet_dir/result.json" \
   --trusted-actor "$label_actor" --executor "$label_actor" \
-  --expected-preview "$packet_dir/preview.json" --output "$packet_dir/applied.json"
+  --expected-preview "$packet_dir/preview.json" --human --output "$packet_dir/applied.json"
 ```
 
 `--executor` is separately trusted caller configuration, useful when a token cannot use GET /user; actual event actors must match. It does not confer authority from classifier output. `--expected-preview` rejects a changed exact payload. Reprepare/reclassify after stale inputs; keep partial/error outcomes explicit. A candidate checkpoint written before removals is not successful completion: the helper verifies final labels, event proof and current material separately.
 
 This helper supports POSIX hosts only; its local lock uses `fcntl.flock`. Use one coordinated executor per item. The local process lock does not serialize separate machines; GitHub operations are non-atomic and may affect notification streams. No automatic dispatch or backlog execution is part of this skill.
+
+`--human` writes the concise summary and normalized ambiguity sentence to stderr; stdout remains one parseable JSON report. Reports preserve actionable error message, HTTP status, retryable/retry_at, write uncertainty and telemetry. Honor a reported earliest retry time; uncertain writes require fresh reconciliation, never blind replay.
 
 Exit codes: 0 for ready/preview/applied/no-op/unchanged/skipped, 2 for held/prerequisite/stale, 1 for error/partial. `--force` belongs to prepare and only bypasses unchanged detection. Use subcommand `--help` for flags.
 

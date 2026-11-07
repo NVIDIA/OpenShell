@@ -25,6 +25,7 @@ class LiveAPI(API):
         self.after_write = None
         self.fail_write = False
         self.partial_alias = False
+        self.failed_additions_continue = False
         self.actor = 'maintainer'
 
     def __call__(self, path, **kwargs):
@@ -37,9 +38,14 @@ class LiveAPI(API):
                 variables = kwargs['data']['variables']
                 inputs = [('apply', variables['input'])] if 'input' in variables else list(variables.items())
                 returned = {}
+                errors = []
                 for alias, data in inputs:
                     addition = 'labels' in data
                     entry = data['labels'][0] if addition else {'labelId': data['labelIds'][0]}
+                    if addition and self.failed_additions_continue:
+                        returned[alias] = None
+                        errors.append({'message':'addition rejected','path':[alias]})
+                        continue
                     label_id = entry['labelId']
                     label = next((definition for definition in self.definitions if definition['node_id'] == label_id))
                     if addition:
@@ -61,7 +67,7 @@ class LiveAPI(API):
                     returned[alias] = {'labelable': {'labels': {'nodes': [{'name': 'WRONG-NESTED-STATE'}]}}}
                     if self.partial_alias:
                         return {'data': returned, 'errors': [{'message': 'later alias failed', 'path': ['op1']}]}
-                return {'data': returned}
+                return {'data': returned, **({'errors':errors} if errors else {})}
             if 'LABELED_EVENT' in query:
                 events = self.events
                 if 'UNLABELED_EVENT' not in query:
@@ -111,7 +117,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(report['ordered_writes'][0]['data']['variables']['input']['labels'][0]['labelId'], 'LA')
         applied = self.apply(snapshot)
         self.assertEqual(applied['status'], 'applied')
-        self.assertEqual([report['mutation_request']['data']], self.api.writes)
+        self.assertEqual([request['data'] for request in report['mutation_requests']], self.api.writes)
 
     def test_nochange_examination_cycles_bookkeeping_then_unchanged_prepare_writes_nothing(self):
         self.api.labels = ['state:accepted', 'area:platform']
@@ -300,14 +306,15 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(report['status'], 'ready')
         self.assertEqual(len(self.api.writes), before)
 
-    def test_ordered_one_label_aliases_share_one_request(self):
+    def test_ordered_one_label_aliases_use_verified_add_and_remove_requests(self):
         snapshot = self.prepared()
         report = self.apply(snapshot)
         self.assertEqual(report['status'], 'applied')
-        self.assertEqual(len(self.api.writes), 1)
+        self.assertEqual(len(self.api.writes), 2)
         self.assertIn('op0: addLabelsToLabelable', self.api.writes[0]['query'])
-        self.assertIn('op1: removeLabelsFromLabelable', self.api.writes[0]['query'])
-        self.assertEqual(list(self.api.writes[0]['variables']), ['op0', 'op1'])
+        self.assertIn('op1: removeLabelsFromLabelable', self.api.writes[1]['query'])
+        self.assertEqual(list(self.api.writes[0]['variables']), ['op0'])
+        self.assertEqual(list(self.api.writes[1]['variables']), ['op1'])
 
     def test_partial_alias_success_is_read_back_and_never_blindly_replayed(self):
         snapshot = self.prepared()
@@ -322,7 +329,7 @@ class BoundaryTests(unittest.TestCase):
     def test_expected_preview_payload_mismatch_blocks_before_any_write(self):
         snapshot = self.prepared()
         confirmed = preview(snapshot, self.result(snapshot), api=self.api)
-        confirmed['mutation_request']['data']['variables']['op0']['labels'][0]['rationale'] = 'different confirmed payload'
+        confirmed['mutation_requests'][0]['data']['variables']['op0']['labels'][0]['rationale'] = 'different confirmed payload'
         report = self.apply(snapshot, expected_preview=confirmed)
         self.assertEqual(report['status'], 'stale')
         self.assertEqual(self.api.writes, [])
@@ -495,6 +502,115 @@ class BoundaryTests(unittest.TestCase):
         report=self.apply(snapshot)
         self.assertEqual(report['status'],'partial')
         self.assertIn('area:platform',report.get('observed_labels',[]))
+        self.assertFalse(report['checkpoint_verified'])
+
+    def test_failed_addition_never_executes_a_removal_phase(self):
+        snapshot=self.prepared(); self.api.failed_additions_continue=True
+        report=self.apply(snapshot)
+        self.assertEqual(report['status'],'partial')
+        self.assertIn('area:old',self.api.labels)
+        self.assertFalse(any(event['__typename']=='UnlabeledEvent' for event in self.api.events))
+
+    def test_substantive_drift_after_additions_preserves_old_classification(self):
+        snapshot=self.prepared()
+        self.api.after_write=lambda api: api.collections['comments'].append({'id':7,'body':'unseen','user':{'login':'reader'}})
+        report=self.apply(snapshot)
+        self.assertEqual(report['status'],'partial')
+        self.assertIn('area:old',self.api.labels)
+        self.assertIn('area:platform',self.api.labels)
+
+    def test_reviews_and_review_comments_are_required_human_lifecycle_sources(self):
+        for collection,identity in [('reviews','review:8'),('review_comments','review-comment:8')]:
+            with self.subTest(collection=collection):
+                self.api=LiveAPI(); self.api.item['pull_request']={'url':'pull'}; self.api.pull['changed_files']=0
+                self.api.collections[collection]=[{'id':8,'body':'We will not pursue this work.','user':{'login':'maintainer','type':'User'}}]
+                snapshot=self.prepared()
+                self.assertIn(identity,snapshot['lifecycle_evidence'])
+                result=self.result(snapshot); result['lifecycle']={'disposition':'excluded','evidence':[identity],'reason':'Recorded maintainer disposition.'}
+                self.assertEqual(self.apply(snapshot,result)['status'],'skipped')
+                self.assertEqual(self.api.writes,[])
+
+    def test_old_manifest_cannot_omit_fresh_required_review_reading(self):
+        self.api.item['pull_request']={'url':'pull'}; self.api.pull['changed_files']=0
+        self.api.collections['reviews']=[{'id':8,'body':'Recorded rejection','user':{'login':'maintainer','type':'User'}}]
+        snapshot=self.prepared()
+        snapshot['lifecycle_evidence']=[]
+        snapshot['evidence_index']['review:8']['inspected']=False
+        snapshot['evidence_index']['review:8'].pop('inspection',None)
+        self.assertEqual(self.apply(snapshot)['status'],'held')
+        self.assertEqual(self.api.writes,[])
+
+    def test_transport_fields_and_diagnostics_survive_public_prepare(self):
+        def limited_api(path,**kwargs):
+            raise GitHubError('API rate limit exceeded; deadline cannot fit wait',status=429,retryable=True,retry_at=1060,payload={'message':'API rate limit exceeded'})
+        limited_api.diagnostics={'requests':1,'elapsed_seconds':2}
+        report=prepare(REPO,3,Path(self.temp.name),api=limited_api,trusted_actors=self.trusted)
+        self.assertEqual(report['status'],'error')
+        self.assertEqual(report.get('error',{}).get('status'),429)
+        self.assertEqual(report['error']['retry_at'],1060)
+        self.assertTrue(report['error']['retryable'])
+        self.assertIn('API rate limit exceeded',report['error']['message'])
+        self.assertEqual(report['telemetry']['requests'],1)
+
+    def test_none_bookkeeping_selection_still_removes_approved_leftover(self):
+        self.api.labels.append('meta:labeler-checkpoint')
+        snapshot=self.prepared()
+        report=self.apply(snapshot,bookkeeping_label=None)
+        self.assertEqual(report['status'],'applied')
+        self.assertNotIn('meta:labeler-checkpoint',self.api.labels)
+        self.assertNotIn('meta:labeler-checkpoint',report['preserve'])
+
+    def test_assessment_confirmation_binds_executor_even_without_rationale(self):
+        snapshot=self.prepared(assessment_only=True,assessment_labels={'state:needs-info'})
+        outcome={'authorized':True,'reviewed_labels':['state:needs-info'],'desired_labels':['state:needs-info']}
+        confirmed=preview(snapshot,{},api=self.api,assessment=outcome,executor='maintainer')
+        self.trusted.add('other'); self.api.actor='other'
+        report=self.apply(snapshot,{},assessment=outcome,executor='other',expected_preview=confirmed)
+        self.assertEqual(report['status'],'stale')
+        self.assertEqual(self.api.writes,[])
+
+    def test_cli_human_summary_keeps_stdout_as_json(self):
+        snapshot=self.prepared(); result=self.result(snapshot)
+        result['ambiguity']={'boundary':'Scope','chosen':{'labels':['area:platform'],'confidence':'medium'},
+            'alternative':{'labels':['topic:sdk'],'confidence':'low'},'evidence':['body']}
+        path=Path(self.temp.name)/'result.json'; path.write_text(json.dumps(result))
+        out,err=io.StringIO(),io.StringIO()
+        with mock.patch('sys.stdout',out),mock.patch('sys.stderr',err):
+            code=main(['preview','--snapshot',str(Path(self.temp.name)/'manifest.json'),'--result',str(path),'--human'],api=self.api)
+        self.assertEqual(code,0)
+        self.assertEqual(json.loads(out.getvalue())['status'],'preview')
+        self.assertIn('Ambiguity: chose area:platform (med conf) over topic:sdk (low conf)',err.getvalue())
+
+    def test_deadline_429_transport_fields_survive_actual_client_to_prepare(self):
+        from label_issue_github import GitHubClient
+        from label_issue_github_test import Clock, Runner, response
+        clock=Clock()
+        client=GitHubClient(runner=Runner(response({'message':'quota exhausted'},429,{'Retry-After':'60'})),
+            monotonic=lambda:clock.now,wall_clock=lambda:1000+clock.now,sleeper=clock.sleep,jitter=lambda:0,invocation_timeout=20)
+        report=prepare(REPO,3,Path(self.temp.name),api=client,trusted_actors=self.trusted)
+        self.assertEqual(report['error']['status'],429)
+        self.assertEqual(report['error']['retry_at'],1060)
+        self.assertTrue(report['error']['retryable'])
+        self.assertIn('quota exhausted',report['error']['message'])
+        self.assertEqual(report['telemetry']['requests'],1)
+
+    def test_prepare_never_skips_valid_candidate_with_approved_temporary_leftover(self):
+        import label_issue_checkpoint as cp
+        import label_issue as core
+        self.api.labels.append('meta:labeler-checkpoint')
+        snapshot=self.prepared()
+        self.api.labels.append('area:platform')
+        fp=cp.fingerprint(core._material(snapshot),set(self.api.labels),core._version(snapshot))
+        operations=[{'actor':'maintainer','action':'add','label_id':'LA'}]
+        rationale=cp.encode_checkpoint(fp,boundary_id='',operations_digest=cp.operation_digest(operations),event_count=1)
+        self.api.events.append({'__typename':'LabeledEvent','id':'legacy-candidate','createdAt':'2026-11-07T00:00:00Z',
+            'actor':{'login':'maintainer'},'label':{'id':'LA','name':'area:platform'},'intent':{'rationale':rationale}})
+        proof=cp.collect_label_events('node','',api=self.api)
+        found=cp.find_checkpoint('node',api=self.api,trusted_actors=self.trusted)
+        material=core._material(snapshot); material['existing_labels']=list(self.api.labels)
+        self.assertTrue(cp.checkpoint_matches(found['checkpoint'],material,set(self.api.labels),core._version(snapshot),label_events=proof))
+        report=prepare(REPO,3,Path(self.temp.name)/'leftover',api=self.api,trusted_actors=self.trusted)
+        self.assertEqual(report['status'],'ready')
         self.assertFalse(report['checkpoint_verified'])
 
     @mock.patch('sys.stdout', new_callable=io.StringIO)
