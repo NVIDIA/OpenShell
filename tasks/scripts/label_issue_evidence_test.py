@@ -146,6 +146,44 @@ class EvidenceTests(unittest.TestCase):
         self.api.item.update(state='closed', state_reason='not_planned', closed_by={'login': 'stale[bot]', 'type': 'Bot'})
         self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'eligible')
 
+    def github_actions_stale_fixture(self):
+        # Read-only observed NVIDIA/OpenShell#4300, closed 2026-11-06.
+        timestamp = '2026-11-06T08:22:30Z'
+        actor = {'login': 'github-actions[bot]', 'type': 'Bot'}
+        self.api.item.update(number=4300, state='closed', state_reason='not_planned',
+                             closed_at=timestamp, closed_by=actor)
+        self.api.lifecycle_events = [{'__typename': 'ClosedEvent', 'id': 'closed-4300',
+            'actor': {'login': actor['login']}, 'createdAt': timestamp, 'closer': None}]
+        self.api.collections['comments'] = [{'id': 430001, 'user': actor,
+            'body': 'Closing this issue after 14 days with no activity since it was marked stale. Reopen it if the work is still relevant.',
+            'created_at': timestamp, 'updated_at': timestamp}]
+        def api(path, **kwargs):
+            return self.api(path.replace('/issues/4300', '/issues/3'), **kwargs)
+        return api
+
+    def test_current_github_actions_stale_protocol_4300_remains_eligible(self):
+        api = self.github_actions_stale_fixture()
+        self.assertEqual(preflight(REPO, 4300, api=api)['eligibility']['lifecycle'], 'eligible')
+
+    def test_github_actions_unknown_old_or_misattributed_closures_hold(self):
+        for changed in ('unrelated', 'old_comment', 'different_comment_actor', 'different_event_actor', 'edited_comment', 'wrong_reason', 'not_bot'):
+            with self.subTest(changed=changed):
+                api = self.github_actions_stale_fixture()
+                comment = self.api.collections['comments'][0]
+                if changed == 'unrelated': comment['body'] = 'Closing after another workflow decision.'
+                if changed == 'old_comment': comment['created_at'] = '2026-10-01T00:00:00Z'
+                if changed == 'different_comment_actor': comment['user'] = {'login': 'other[bot]', 'type': 'Bot'}
+                if changed == 'different_event_actor': self.api.lifecycle_events[0]['actor']['login'] = 'other[bot]'
+                if changed == 'edited_comment': comment['updated_at'] = '2026-11-07T00:00:00Z'
+                if changed == 'wrong_reason': self.api.item['state_reason'] = 'duplicate'
+                if changed == 'not_bot': self.api.item['closed_by'] = {'login': 'github-actions[bot]', 'type': 'User'}
+                self.assertEqual(preflight(REPO, 4300, api=api)['eligibility']['lifecycle'], 'hold')
+
+    def test_unrelated_bot_with_write_permission_is_not_human_rejection(self):
+        self.api.item.update(state='closed', state_reason='not_planned', closed_by={'login': 'other-bot', 'type': 'Bot'})
+        self.api.permissions['other-bot'] = 'write'
+        self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'hold')
+
     def test_merged_closing_pr_is_resolution_even_with_ambiguous_state_reason(self):
         self.api.item.update(state='closed', state_reason='not_planned')
         self.api.lifecycle_events = [{'__typename': 'ClosedEvent', 'id': 'closed-1', 'actor': {'login': 'reader'},
