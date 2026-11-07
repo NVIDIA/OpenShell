@@ -18,6 +18,9 @@ from check_maintainer_approval import parse_maintainers
 from label_issue_policy import load_taxonomy
 
 LIMIT = 2 * 1024 * 1024
+# Literal close-issue-message from .github/workflows/stale.yml (actions/stale).
+STALE_CLOSE_MESSAGE = ('Closing this issue after 14 days with no activity since it was marked stale. '
+                       'Reopen it if the work is still relevant.')
 CLOSED_EVENTS_QUERY = '''query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
  repository(owner: $owner, name: $repo) { issue(number: $number) {
   timelineItems(itemTypes: [CLOSED_EVENT, REOPENED_EVENT], last: 100, before: $cursor) {
@@ -102,6 +105,24 @@ def _closed_event(repository, number, api):
     raise ValueError('Closure-event page budget exhausted')
 
 
+def _actions_stale_closure(repository, issue, event, actor, api):
+    """Recognize the maintained automation protocol, never arbitrary bot intent."""
+    login = actor.get('login', '').lower()
+    closed_at = issue.get('closed_at')
+    if (actor.get('type') != 'Bot' or login != 'github-actions[bot]'
+            or issue.get('state_reason') != 'not_planned' or not closed_at
+            or not event or event.get('__typename') != 'ClosedEvent'
+            or event.get('createdAt') != closed_at
+            or (event.get('actor') or {}).get('login', '').lower() != login):
+        return False
+    comments = api(f'repos/{repository}/issues/{issue["number"]}/comments?per_page=100', pages=True)
+    return any(comment.get('body') == STALE_CLOSE_MESSAGE
+        and (comment.get('user') or {}).get('login', '').lower() == login
+        and (comment.get('user') or {}).get('type') == 'Bot'
+        and comment.get('created_at') == closed_at
+        and comment.get('updated_at', closed_at) == closed_at for comment in comments)
+
+
 def preflight(repository: str, number: int, *, api, force: bool = False) -> dict:
     """Fresh acceptance/lifecycle facts; force never relaxes either boundary."""
     repository, number = _identity(repository, number)
@@ -131,9 +152,11 @@ def preflight(repository: str, number: int, *, api, force: bool = False) -> dict
                 actor = issue.get('closed_by') or (event or {}).get('actor') or {}
                 author = (issue.get('user') or {}).get('login', '')
                 authority = _authority(repository, actor, author, maintainers, api)
-                if issue.get('state_reason') in {'not_planned', 'duplicate'} and authority['role'] == 'maintainer':
+                if (issue.get('state_reason') in {'not_planned', 'duplicate'}
+                        and actor.get('type') != 'Bot' and authority['role'] == 'maintainer'):
                     lifecycle, reason = 'excluded', 'Deliberate maintainer closure'
-                elif actor.get('type') == 'Bot' and actor.get('login', '').lower() == 'stale[bot]':
+                elif ((actor.get('type') == 'Bot' and actor.get('login', '').lower() == 'stale[bot]')
+                        or _actions_stale_closure(repository, issue, event, actor, api)):
                     lifecycle, reason = 'eligible', 'Verified stale-bot closure alone is not resolution'
     return {'repository': repository, 'number': number, 'kind': kind,
             'item_id': issue['node_id'], 'revision': revision, 'item': item, 'issue': issue,
