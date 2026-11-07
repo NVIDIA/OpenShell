@@ -12900,7 +12900,7 @@ network_policies:
         proto
     }
 
-    /// Unchanged: a guard pinned with `generation_guard` stays strict and goes
+    /// A guard pinned with `generation_guard` stays strict and goes
     /// stale on any reload; only relay guards re-check their connection.
     #[test]
     fn generation_guard_goes_stale_on_unrelated_reload() {
@@ -12919,7 +12919,7 @@ network_policies:
         );
     }
 
-    /// Unchanged: a tunnel evaluator from `clone_engine_for_tunnel` stays strict.
+    /// A tunnel evaluator from `clone_engine_for_tunnel` stays strict.
     #[test]
     fn tunnel_engine_goes_stale_on_unrelated_reload() {
         let engine = OpaEngine::from_proto(&test_proto()).unwrap();
@@ -12934,7 +12934,7 @@ network_policies:
         assert!(tunnel.is_stale());
     }
 
-    /// Unchanged: proto conversion stamps the hash of the complete policy into
+    /// Proto conversion stamps the hash of the complete policy into
     /// every endpoint, so endpoints differ after any reload. Revalidation has to
     /// ignore that stamp.
     #[test]

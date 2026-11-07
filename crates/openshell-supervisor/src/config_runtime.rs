@@ -4230,14 +4230,11 @@ mod tests {
         assert!(ctx.extension_credentials.get("removed-guard").is_none());
     }
 
-    /// Changed: revoking provider credentials publishes a policy generation,
+    /// Revoking provider credentials publishes a policy generation,
     /// so open connections wake and re-check the credentials they sent. Covers
     /// each revocation path: an unavailable environment, bindings that fail
-    /// validation, and a snapshot for another revision. Today credentials are
-    /// revoked without a new generation, so a connection that authenticated
-    /// once with a revoked credential, such as an upgraded WebSocket, stays
-    /// open. (Successful installs already publish one; see
-    /// `stream_provider_rotation_rebinds_policy_generation`.)
+    /// validation, and a snapshot for another revision. Successful installs
+    /// publish one too; see `stream_provider_rotation_rebinds_policy_generation`.
     #[tokio::test]
     async fn provider_credential_revocation_publishes_a_policy_generation() {
         use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
@@ -4310,7 +4307,7 @@ mod tests {
         }
     }
 
-    /// Unchanged: a revocation that finds no credential left to revoke, as
+    /// A revocation that finds no credential left to revoke, as
     /// when the same failed provider refresh repeats on every poll, publishes
     /// no generation, so open connections are not re-checked each time.
     #[tokio::test]

@@ -399,8 +399,6 @@ fn emit_stale_relay_close(request: &L7EvalContext, guard: &PolicyGenerationGuard
 mod tests {
     use super::super::{EgressIntent, EndpointDecision, ProcessIdentityEvidence};
     use super::*;
-    use openshell_core::provider_credentials::ProviderCredentialState;
-
     const POLICY_REGO: &str = include_str!("../../data/sandbox-policy.rego");
     const EMPTY_POLICY_DATA: &str = "network_policies: {}\n";
 
@@ -787,30 +785,29 @@ network_policies:
 
     /// Authorize curl to example.com:80 the way the CONNECT adapter does.
     fn authorized_decision(engine: &OpaEngine) -> EgressDecision {
-        let input = crate::opa::NetworkInput {
-            host: "example.com".to_string(),
-            port: 80,
-            binary_path: std::path::PathBuf::from("/usr/bin/curl"),
-            binary_sha256: String::new(),
+        let mut decision = EgressDecision {
+            intent: EgressIntent::connect("example.com".to_string(), 80),
+            action: NetworkAction::Deny {
+                reason: String::new(),
+            },
+            policy_generation: 0,
+            identity: ProcessIdentityEvidence::Available,
+            endpoint: EndpointDecision::default(),
+            binary: Some(std::path::PathBuf::from("/usr/bin/curl")),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
         };
-        let authorization = engine.authorize_egress(&input).unwrap();
+        // Authorize with the input revalidation re-evaluates.
+        let authorization = engine.authorize_egress(&decision.policy_input()).unwrap();
         assert!(
             matches!(authorization.action, NetworkAction::Allow { .. }),
             "fixture must authorize example.com:80"
         );
-        EgressDecision {
-            intent: EgressIntent::connect("example.com".to_string(), 80),
-            action: authorization.action.clone(),
-            policy_generation: authorization.generation,
-            identity: ProcessIdentityEvidence::Available,
-            endpoint: EndpointDecision::from_authorization(&authorization),
-            binary: Some(input.binary_path),
-            binary_pid: None,
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        }
+        decision.action = authorization.action.clone();
+        decision.policy_generation = authorization.generation;
+        decision.endpoint = EndpointDecision::from_authorization(&authorization);
+        decision
     }
 
     /// The L7 route the CONNECT adapter hydrates from `decision`.
@@ -857,8 +854,7 @@ network_policies:
         true
     }
 
-    /// Changed: approving an endpoint for another host leaves a raw relay open.
-    /// Today it closes.
+    /// Approving an endpoint for another host leaves a raw relay open.
     #[tokio::test]
     async fn raw_relay_survives_when_an_unrelated_endpoint_is_approved() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -879,8 +875,8 @@ network_policies:
         assert!(!closed, "approving another host must not close this relay");
     }
 
-    /// Changed: a raw relay keeps moving bytes after an unrelated reload, and
-    /// still closes when its own endpoint is revoked. Today the reload closes it.
+    /// A raw relay keeps moving bytes after an unrelated reload, and
+    /// still closes when its own endpoint is revoked.
     #[tokio::test]
     async fn raw_relay_keeps_relaying_bytes_after_an_unrelated_reload() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -918,7 +914,7 @@ network_policies:
             .expect("stale relay closure should be clean");
     }
 
-    /// Unchanged: revoking the connection's endpoint closes a raw relay.
+    /// Revoking the connection's endpoint closes a raw relay.
     #[tokio::test]
     async fn raw_relay_closes_when_its_endpoint_is_revoked() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -935,7 +931,7 @@ network_policies:
         assert!(closed, "revoking the endpoint must close the relay");
     }
 
-    /// Unchanged: a raw relay that was let through a fail-open chain closes
+    /// A raw relay that was let through a fail-open chain closes
     /// when the chain becomes fail-closed, which would now refuse it.
     #[tokio::test]
     async fn raw_relay_closes_when_its_middleware_becomes_fail_closed() {
@@ -962,8 +958,8 @@ network_policies:
         );
     }
 
-    /// Changed: approving an endpoint for another host leaves an HTTP
-    /// passthrough relay current, re-pinned to the new generation. Today it goes stale.
+    /// Approving an endpoint for another host leaves an HTTP
+    /// passthrough relay current, re-pinned to the new generation.
     #[test]
     fn http_passthrough_relay_stays_current_when_an_unrelated_endpoint_is_approved() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -979,8 +975,8 @@ network_policies:
         assert_eq!(generation_guard.captured_generation(), engine.current_generation());
     }
 
-    /// Changed: approving an endpoint for another host leaves an inspected (L7)
-    /// tunnel current. Today it goes stale.
+    /// Approving an endpoint for another host leaves an inspected (L7)
+    /// tunnel current.
     #[test]
     fn inspected_relay_stays_current_when_an_unrelated_endpoint_is_approved() {
         let engine =
@@ -1003,7 +999,7 @@ network_policies:
         );
     }
 
-    /// Unchanged: narrowing the L7 rules of the connection's endpoint makes its
+    /// Narrowing the L7 rules of the connection's endpoint makes its
     /// tunnel stale.
     #[test]
     fn inspected_relay_goes_stale_when_its_rules_change() {
@@ -1024,7 +1020,7 @@ network_policies:
         assert!(evaluator.is_stale(), "narrowed rules must close the tunnel");
     }
 
-    /// Unchanged: a relay whose credential handle cannot report use goes stale
+    /// A relay whose credential handle cannot report use goes stale
     /// when provider credentials change.
     #[test]
     fn http_relay_goes_stale_when_provider_credentials_change() {
@@ -1124,10 +1120,18 @@ network_policies:
             .resolver_for_endpoint("example.com", 80, "/")
             .expect("unbound credentials resolve on any endpoint");
         assert!(resolver.resolve_placeholder(&placeholder).is_some());
+        assert!(
+            credentials
+                .credential_uses()
+                .expect("http_context tracks credential use")
+                .static_versions
+                .contains_key(env_key),
+            "the injection must be recorded on the connection"
+        );
     }
 
-    /// Changed: a connection that never had a credential injected cannot hold
-    /// a stale one, so it survives credential changes. Today it closes.
+    /// A connection that never had a credential injected cannot hold
+    /// a stale one, so it survives credential changes.
     #[test]
     fn http_relay_that_never_injected_survives_a_credential_change() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1142,9 +1146,11 @@ network_policies:
             !guard.is_stale(),
             "a connection that never carried credentials cannot hold a stale one"
         );
+        let uses = request.provider_credentials.as_ref().unwrap().credential_uses();
+        assert!(uses.expect("http_context tracks credential use").is_empty());
     }
 
-    /// Unchanged: rotating a credential the connection sent closes it; an
+    /// Rotating a credential the connection sent closes it; an
     /// upstream session may hold the old credential.
     #[test]
     fn http_relay_closes_when_a_credential_it_injected_rotates() {
@@ -1160,8 +1166,8 @@ network_policies:
         assert!(guard.is_stale(), "the upstream session may hold the old credential");
     }
 
-    /// Changed: rotating another provider's credential, or attaching a new
-    /// provider, leaves open a connection that never sent them. Today it closes.
+    /// Rotating another provider's credential, or attaching a new
+    /// provider, leaves open a connection that never sent them.
     #[test]
     fn http_relay_survives_changes_to_credentials_it_did_not_inject() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1188,9 +1194,9 @@ network_policies:
         assert!(!guard.is_stale());
     }
 
-    /// Changed: a connection that first injects a credential after its provider
+    /// A connection that first injects a credential after its provider
     /// was attached survives unrelated reloads, and closes when that credential
-    /// rotates. Today the attach closes it.
+    /// rotates.
     #[test]
     fn http_relay_pins_credentials_it_first_injects_after_an_attach() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1216,7 +1222,7 @@ network_policies:
         assert!(guard.is_stale());
     }
 
-    /// Unchanged: a reload between authorization and relay setup refuses the
+    /// A reload between authorization and relay setup refuses the
     /// relay, whatever the reload changed.
     #[test]
     fn reload_between_authorization_and_pin_refuses_the_relay() {
@@ -1340,8 +1346,8 @@ network_policies:
         forwarded
     }
 
-    /// Changed: a kept-alive passthrough connection that runs middleware
-    /// serves its next request after an unrelated reload. Today it drops it.
+    /// A kept-alive passthrough connection that runs middleware
+    /// serves its next request after an unrelated reload.
     #[tokio::test]
     async fn passthrough_middleware_connection_serves_next_request_after_unrelated_reload() {
         let reload = regex_middleware_policy("fail_closed", OTHER_POLICY);
@@ -1352,7 +1358,7 @@ network_policies:
         );
     }
 
-    /// Unchanged: a changed middleware chain does not apply to a kept-alive
+    /// A changed middleware chain does not apply to a kept-alive
     /// connection; its next request is dropped.
     #[tokio::test]
     async fn passthrough_middleware_connection_drops_next_request_after_its_chain_changes() {
@@ -1543,8 +1549,8 @@ network_policies:
         proto_policy_with(inspected_proto_endpoint("mcp", "/mcp", allow), other_hosts)
     }
 
-    /// Changed: an endpoint inserted before the connection's own, in the same
-    /// policy, shifts its index but not its rules. Today the relay closes.
+    /// An endpoint inserted before the connection's own, in the same
+    /// policy, shifts its index but not its rules.
     #[tokio::test]
     async fn raw_relay_survives_an_endpoint_inserted_before_its_own() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1565,9 +1571,9 @@ network_policies:
         assert!(!closed);
     }
 
-    /// Changed: in a gateway-delivered policy every reload restamps every
+    /// In a gateway-delivered policy every reload restamps every
     /// endpoint with the new policy hash. That stamp alone must not close an
-    /// inspected tunnel. Today it closes.
+    /// inspected tunnel.
     #[test]
     fn inspected_relay_from_a_proto_policy_stays_current_when_another_policy_changes() {
         let engine = Arc::new(OpaEngine::from_proto(&example_proto_policy("/**", &[])).unwrap());
@@ -1582,7 +1588,7 @@ network_policies:
         assert!(!evaluator.is_stale());
     }
 
-    /// Unchanged: narrowing the rules of a gateway-delivered endpoint closes
+    /// Narrowing the rules of a gateway-delivered endpoint closes
     /// its inspected tunnel.
     #[test]
     fn inspected_relay_from_a_proto_policy_goes_stale_when_its_rules_change() {
@@ -1598,8 +1604,8 @@ network_policies:
         assert!(evaluator.is_stale());
     }
 
-    /// Changed: middleware selected for another host does not affect this
-    /// connection. Today the relay closes.
+    /// Middleware selected for another host does not affect this
+    /// connection.
     #[tokio::test]
     async fn raw_relay_survives_middleware_added_for_another_host() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1617,7 +1623,7 @@ network_policies:
         assert!(!closed);
     }
 
-    /// Unchanged: middleware newly selected for this host closes the relay,
+    /// Middleware newly selected for this host closes the relay,
     /// which cannot be inspected retroactively.
     #[tokio::test]
     async fn raw_relay_closes_when_middleware_is_added_for_its_host() {
@@ -1636,8 +1642,8 @@ network_policies:
         assert!(closed);
     }
 
-    /// Changed: replacing the middleware registry cannot affect a connection
-    /// that runs no middleware. Today the relay closes.
+    /// Replacing the middleware registry cannot affect a connection
+    /// that runs no middleware.
     #[tokio::test]
     async fn raw_relay_without_middleware_survives_a_registry_replacement() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1660,7 +1666,7 @@ network_policies:
         assert!(!closed);
     }
 
-    /// Unchanged: replacing the middleware registry closes a connection that
+    /// Replacing the middleware registry closes a connection that
     /// runs middleware, because its tunnel holds the old runner. A reload
     /// lands before the connection checks, as reloads often coalesce.
     #[test]
@@ -1681,8 +1687,8 @@ network_policies:
         assert!(guard.is_stale());
     }
 
-    /// Changed: several unrelated reloads can land before a connection next
-    /// checks. It re-pins through all of them. Today it goes stale.
+    /// Several unrelated reloads can land before a connection next
+    /// checks. It re-pins through all of them.
     #[test]
     fn http_relay_stays_current_through_several_unchecked_unrelated_reloads() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1700,8 +1706,8 @@ network_policies:
         assert_eq!(guard.captured_generation(), engine.current_generation());
     }
 
-    /// Changed: a connection checked between reloads stays open however many
-    /// unrelated reloads there are. Today it goes stale at the first.
+    /// A connection checked between reloads stays open however many
+    /// unrelated reloads there are.
     #[test]
     fn http_relay_checked_between_unrelated_reloads_stays_current_indefinitely() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1717,7 +1723,7 @@ network_policies:
         }
     }
 
-    /// Unchanged: a connection that sleeps through a very long run of reloads
+    /// A connection that sleeps through a very long run of reloads
     /// closes, because it can no longer be checked against each of them.
     #[test]
     fn http_relay_goes_stale_after_a_long_run_of_unchecked_reloads() {
@@ -1735,7 +1741,7 @@ network_policies:
         assert!(guard.is_stale());
     }
 
-    /// Unchanged: a reload that revoked the connection closes it even if the
+    /// A reload that revoked the connection closes it even if the
     /// next reload restored access before the connection checked.
     #[test]
     fn http_relay_goes_stale_when_a_coalesced_reload_revoked_it() {
@@ -1750,7 +1756,7 @@ network_policies:
         assert!(guard.is_stale());
     }
 
-    /// Unchanged: a reload that changed the connection's rules closes it even
+    /// A reload that changed the connection's rules closes it even
     /// if an unrelated reload followed before the connection checked.
     #[test]
     fn inspected_relay_goes_stale_when_a_coalesced_reload_changed_its_rules() {
@@ -1770,7 +1776,7 @@ network_policies:
         assert!(evaluator.is_stale());
     }
 
-    /// Unchanged: once a connection has been found stale it stays stale, even
+    /// Once a connection has been found stale it stays stale, even
     /// after its policy is restored.
     #[test]
     fn inspected_relay_stays_stale_after_its_policy_is_restored() {
@@ -1791,8 +1797,8 @@ network_policies:
 
     // --- Credential changes: install paths and placeholder generations ---
 
-    /// Changed: `install_prepared`, the path runtime reloads use, rotates a
-    /// credential this connection never sent. Today the relay closes.
+    /// `install_prepared`, the path runtime reloads use, rotates a
+    /// credential this connection never sent.
     #[test]
     fn http_relay_survives_install_prepared_rotating_a_credential_it_did_not_inject() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1811,7 +1817,7 @@ network_policies:
         assert!(!guard.is_stale());
     }
 
-    /// Unchanged: `install_prepared` rotating a credential this connection
+    /// `install_prepared` rotating a credential this connection
     /// sent closes the relay.
     #[test]
     fn http_relay_closes_when_install_prepared_rotates_a_credential_it_injected() {
@@ -1828,8 +1834,8 @@ network_policies:
         assert!(guard.is_stale());
     }
 
-    /// Changed: reinstalling identical credentials changes nothing a
-    /// connection holds. Today the relay closes.
+    /// Reinstalling identical credentials changes nothing a
+    /// connection holds.
     #[test]
     fn http_relay_survives_a_reinstall_of_identical_credentials() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1844,8 +1850,8 @@ network_policies:
         assert!(!guard.is_stale());
     }
 
-    /// Changed: hiding a credential from future child processes does not
-    /// revoke it; the proxy still resolves it. Today the relay closes.
+    /// Hiding a credential from future child processes does not
+    /// revoke it; the proxy still resolves it.
     #[test]
     fn http_relay_survives_suppression_of_a_credential_it_injected() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1861,9 +1867,9 @@ network_policies:
         assert!(!guard.is_stale());
     }
 
-    /// Changed: a long-running process may still hold a placeholder from a
+    /// A long-running process may still hold a placeholder from a
     /// generation that has aged out; it falls back to the current value, so
-    /// the connection holds the current credential. Today the relay closes.
+    /// the connection holds the current credential.
     #[test]
     fn http_relay_survives_after_an_aged_out_placeholder_falls_back_to_the_current_value() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -1892,7 +1898,7 @@ network_policies:
         assert!(!guard.is_stale());
     }
 
-    /// Unchanged: a connection that sent a credential closes when it rotates,
+    /// A connection that sent a credential closes when it rotates,
     /// even if it rotated twice before the connection checked.
     #[test]
     fn http_relay_closes_after_coalesced_rotations_of_a_credential_it_injected() {
@@ -1909,7 +1915,7 @@ network_policies:
         assert!(guard.is_stale());
     }
 
-    /// Unchanged: detaching the provider of a credential this connection sent
+    /// Detaching the provider of a credential this connection sent
     /// closes the relay.
     #[test]
     fn http_relay_closes_when_the_provider_of_a_credential_it_injected_is_detached() {
@@ -2097,10 +2103,9 @@ network_policies:
         outcome
     }
 
-    /// Changed: after an unrelated reload, and once the supervisor publishes
-    /// the new policy's endpoint inventory, a kept-alive MCP tunnel keeps
-    /// reporting its exchanges, against the new policy. Today the reload
-    /// closes the tunnel, so nothing more is exchanged or reported.
+    /// After an unrelated reload, and once the supervisor publishes the new
+    /// policy's endpoint inventory, a kept-alive MCP tunnel keeps reporting its
+    /// exchanges, against the new policy.
     #[tokio::test]
     async fn mcp_tunnel_keeps_reporting_endpoint_status_after_an_unrelated_reload() {
         let reloaded = example_mcp_proto_policy("initialize", &["other.example.net"]);
@@ -2116,7 +2121,7 @@ network_policies:
         );
     }
 
-    /// Unchanged: until the supervisor publishes the reloaded policy's
+    /// Until the supervisor publishes the reloaded policy's
     /// inventory, results cannot be attributed to the inventory of the policy
     /// that was replaced, so the exchange after the reload is not reported.
     #[tokio::test]
@@ -2128,7 +2133,7 @@ network_policies:
         assert_eq!(outcome.second_reported, None);
     }
 
-    /// Unchanged: an inventory published ahead of the runtime, for a policy
+    /// An inventory published ahead of the runtime, for a policy
     /// the tunnel is not running under, receives none of its results.
     #[tokio::test]
     async fn mcp_tunnel_reports_nothing_against_an_inventory_published_ahead_of_its_policy() {
@@ -2140,7 +2145,7 @@ network_policies:
         assert_eq!(outcome.second_reported, None);
     }
 
-    /// Unchanged: a reload that changes the MCP endpoint's rules closes the
+    /// A reload that changes the MCP endpoint's rules closes the
     /// tunnel, so nothing more is exchanged or reported on it.
     #[tokio::test]
     async fn mcp_tunnel_closes_and_reports_nothing_when_its_rules_change() {
@@ -2235,9 +2240,9 @@ network_policies:
         assert!(rewritten.is_some());
     }
 
-    /// Changed: a connection that sent a credential through its stable-handle
+    /// A connection that sent a credential through its stable-handle
     /// placeholder survives a rotation of another credential, and keeps its
-    /// placeholder. Today the relay closes.
+    /// placeholder.
     #[test]
     fn http_relay_that_injected_through_a_stable_handle_survives_an_unrelated_rotation() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -2254,7 +2259,7 @@ network_policies:
         assert!(!guard.is_stale());
     }
 
-    /// Unchanged: a connection that sent a credential through its stable-handle
+    /// A connection that sent a credential through its stable-handle
     /// placeholder closes when the value behind the handle rotates, even
     /// though the placeholder itself is unchanged.
     #[test]
@@ -2275,10 +2280,9 @@ network_policies:
 
     // --- Credentials injected through other placeholder forms ---
 
-    /// Changed: a connection that sent a credential through its canonical
+    /// A connection that sent a credential through its canonical
     /// placeholder (`openshell:resolve:env:KEY`, the documented form) sent the
-    /// current value, so it survives a rotation of another credential. Today
-    /// the relay closes.
+    /// current value, so it survives a rotation of another credential.
     #[test]
     fn http_relay_that_injected_through_a_canonical_placeholder_survives_an_unrelated_rotation() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
@@ -2309,7 +2313,7 @@ network_policies:
         assert!(!guard.is_stale());
     }
 
-    /// Unchanged: a connection that sent a credential through a placeholder
+    /// A connection that sent a credential through a placeholder
     /// from an older, still-retained revision sent a value that is no longer
     /// current, so it closes on the next reload.
     #[test]
@@ -2334,11 +2338,11 @@ network_policies:
         assert!(guard.is_stale());
     }
 
-    /// Changed: provider revisions are sandbox-wide, so rotating another
+    /// Provider revisions are sandbox-wide, so rotating another
     /// credential reissues every placeholder at the new revision. A process
     /// still holding the previous revision's placeholder for an unchanged
     /// credential sends the current value, so its connection survives the next
-    /// reload. Today the relay closes.
+    /// reload.
     #[test]
     fn http_relay_survives_after_injecting_an_unchanged_credential_through_an_older_revision() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
