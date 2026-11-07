@@ -143,6 +143,7 @@ def preflight(repository: str, number: int, *, api, force: bool = False) -> dict
 
 
 def _artifact(kind, content, *, inspected=True, coverage='complete', **extra):
+    raw_text = content.get('body') if isinstance(content, dict) else None
     encoded = json.dumps(content, ensure_ascii=False, sort_keys=True).encode('utf-8')
     digest = hashlib.sha256(encoded).hexdigest()
     if len(encoded) > LIMIT - 4096:
@@ -157,25 +158,104 @@ def _artifact(kind, content, *, inspected=True, coverage='complete', **extra):
                 high = middle - 1
         content, coverage = text[:low], 'truncated'
     return {'kind': kind, 'content': content, 'inspected': inspected, 'coverage': coverage,
-            'source_digest': digest, 'source_bytes': len(encoded), **extra}
+            'source_digest': digest, 'source_bytes': len(encoded),
+            **({'_raw_text': raw_text} if isinstance(raw_text, str) else {}), **extra}
 
 
-def _persist(snapshot):
+def _json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+
+
+def _text_parts(directory, prefix, text):
+    """Local content chunks have valid UTF-8 and individually bounded delivery."""
+    raw = text.encode('utf-8')
+    paths, offset = [], 0
+    while offset < len(raw):
+        end = min(offset + LIMIT, len(raw))
+        while end < len(raw) and raw[end] & 0xC0 == 0x80:
+            end -= 1
+        path = directory / f'{prefix}-{len(paths)}.txt'
+        path.write_bytes(raw[offset:end])
+        paths.append(str(path))
+        offset = end
+    return paths
+
+
+def _write_packet(snapshot, preferred_ids):
+    directory, index = Path(snapshot['_directory']), snapshot['evidence_index']
+    packet = {key: snapshot[key] for key in (
+        'schema_version', 'repository', 'number', 'kind', 'snapshot_id', 'item_id', 'eligibility')}
+    sections = {key: snapshot[key] for key in ('existing_labels', 'head', 'changed_paths', 'lifecycle_evidence')}
+    sections['scopes'] = {key: snapshot['taxonomy'][key] for key in ('areas', 'topics')}
+    for key, value in sections.items():
+        if len(_json_bytes({**packet, key: value})) < LIMIT // 2:
+            packet[key] = value
+        else:
+            encoded = _json_bytes(value)
+            packet[key + '_ref'] = {'parts': _text_parts(directory, 'packet-' + key, encoded.decode()),
+                                    'digest': hashlib.sha256(encoded).hexdigest(), 'coverage': 'deferred'}
+    metadata = {artifact_id: {**{key: value for key, value in entry.items() if key != 'content'},
+                              **({'content_deferred': True} if entry['inspected'] else {})}
+                for artifact_id, entry in index.items()}
+    if len(_json_bytes({**packet, 'evidence_index': metadata})) <= LIMIT // 2:
+        packet['evidence_index'] = metadata
+        packet['index_coverage'] = 'complete'
+    else:
+        # Only the index is paged. The main packet lists every bounded page;
+        # explicit expansions are delivered separately below.
+        pages, page, page_bytes = [], {}, 2
+        for artifact_id, entry in metadata.items():
+            entry_bytes = len(_json_bytes(artifact_id)) + 1 + len(_json_bytes(entry))
+            if entry_bytes + 2 > LIMIT:
+                raise ValueError('Evidence metadata entry exceeds packet bound')
+            if page_bytes + entry_bytes + bool(page) > LIMIT:
+                path = directory / f'packet-index-{len(pages)}.json'
+                path.write_bytes(_json_bytes(page))
+                pages.append(str(path))
+                page, page_bytes = {}, 2
+            page_bytes += entry_bytes + bool(page)
+            page[artifact_id] = entry
+        if page:
+            path = directory / f'packet-index-{len(pages)}.json'
+            path.write_bytes(_json_bytes(page))
+            pages.append(str(path))
+        packet.update(evidence_index={}, index_pages=pages, index_coverage='paged')
+    ordered = list(dict.fromkeys([*preferred_ids, 'body', *index]))
+    for artifact_id in ordered:
+        entry = index.get(artifact_id)
+        if not entry or not entry['inspected']:
+            continue
+        target = packet['evidence_index'] if artifact_id in packet['evidence_index'] else packet.setdefault('expanded_evidence', {})
+        prior = target.get(artifact_id)
+        delivered = {**metadata[artifact_id], 'content': entry['content']}
+        delivered.pop('content_deferred', None)
+        target[artifact_id] = delivered
+        if len(_json_bytes(packet)) > LIMIT:
+            if prior is None:
+                target.pop(artifact_id)
+            else:
+                target[artifact_id] = prior
+    encoded = _json_bytes(packet)
+    if len(encoded) > LIMIT:
+        raise ValueError('Packet reference metadata exceeds delivery bound')
+    Path(snapshot['packet_path']).write_bytes(encoded)
+
+
+def _persist(snapshot, preferred_ids=()):
     directory = Path(snapshot['_directory'])
     artifacts = directory / 'artifacts'
     artifacts.mkdir(exist_ok=True)
     for artifact_id, entry in snapshot['evidence_index'].items():
+        raw_text = entry.pop('_raw_text', None)
+        if raw_text is not None:
+            entry['text_source'] = {'characters': len(raw_text),
+                'text_digest': hashlib.sha256(raw_text.encode()).hexdigest(),
+                'parts': _text_parts(artifacts, entry['source_digest'], raw_text)}
         path = artifacts / (hashlib.sha256(artifact_id.encode()).hexdigest() + '.json')
         entry['artifact_path'] = str(path)
-        path.write_text(json.dumps(entry['content'], ensure_ascii=False), encoding='utf-8')
+        path.write_bytes(_json_bytes(entry['content']))
     snapshot['packet_path'] = str(directory / 'packet.json')
-    packet = {key: copy.deepcopy(snapshot[key]) for key in (
-        'schema_version', 'repository', 'number', 'kind', 'snapshot_id', 'item_id',
-        'eligibility', 'existing_labels', 'head', 'changed_paths', 'lifecycle_evidence')}
-    packet['scopes'] = {key: snapshot['taxonomy'][key] for key in ('areas', 'topics')}
-    packet['evidence_index'] = {artifact_id: {key: value for key, value in entry.items()
-        if key != 'content' or entry['inspected']} for artifact_id, entry in snapshot['evidence_index'].items()}
-    (directory / 'packet.json').write_text(json.dumps(packet, indent=2, ensure_ascii=False), encoding='utf-8')
+    _write_packet(snapshot, preferred_ids)
     (directory / 'manifest.json').write_text(json.dumps(snapshot, indent=2, ensure_ascii=False), encoding='utf-8')
 
 
@@ -301,7 +381,8 @@ def prepare_snapshot(repository: str, number: int, directory: Path, *, api,
         if (login == author or login in facts['maintainers']
                 or entry.get('source_association') in {'OWNER', 'MEMBER', 'COLLABORATOR'}):
             expand_evidence(snapshot, [artifact_id], api=api)
-            if entry['actor_authority']['role'] in {'author', 'maintainer'}:
+            if (entry['actor_authority']['role'] in {'author', 'maintainer'}
+                    and artifact_id not in snapshot['lifecycle_evidence']):
                 snapshot['lifecycle_evidence'].append(artifact_id)
     if facts['kind'] == 'pull_request':
         expand_evidence(snapshot, ['files'], api=api)
@@ -348,56 +429,120 @@ def _source_slice(snapshot, artifact_id, api):
     return _artifact('source', content, coverage='slice', path=path, start=start, end=end, revision=snapshot['head'])
 
 
+def _text_slice(snapshot, artifact_id):
+    match = re.fullmatch(r'text:(.+):([0-9a-f]{64}):(\d+):(\d+)', artifact_id)
+    if not match:
+        raise ValueError('Invalid text slice request')
+    source_id, digest, start, end = match[1], match[2], int(match[3]), int(match[4])
+    source = snapshot['evidence_index'].get(source_id)
+    if not source or source['source_digest'] != digest or 'text_source' not in source:
+        raise ValueError('Text source identity/digest changed or is unavailable')
+    metadata = source['text_source']
+    if not 0 <= start < end <= metadata['characters']:
+        raise ValueError('Text slice range is outside the source')
+    text = ''.join(Path(path).read_bytes().decode('utf-8') for path in metadata['parts'])
+    if hashlib.sha256(text.encode()).hexdigest() != metadata['text_digest']:
+        raise ValueError('Local text source digest mismatch')
+    return _artifact('text_slice', text[start:end], coverage='slice',
+                     parent_id=source_id, parent_digest=digest, start=start, end=end)
+
+
+def _verify_head(snapshot, api):
+    current = api(f'repos/{snapshot["repository"]}/pulls/{snapshot["number"]}')
+    if ((current.get('head') or {}).get('sha') != snapshot['head']
+            or (current.get('base') or {}).get('sha') != snapshot['item_material'].get('base', {}).get('sha')):
+        snapshot['stale'] = True
+        raise ValueError('PR head/base moved; rebuild the evidence snapshot')
+
+
+def _refresh_collection(snapshot, artifact_id, api):
+    index = snapshot['evidence_index']
+    artifact = index[artifact_id]
+    endpoint = artifact['endpoint']
+    if artifact_id == 'files':
+        _verify_head(snapshot, api)
+    content = api(endpoint, pages=True)
+    if artifact_id == 'files':
+        _verify_head(snapshot, api)
+    if not isinstance(content, list):
+        raise ValueError('Collection must be a paginated list')
+    coverage, replacements = 'complete', {}
+    prefixes = {'comments': ('comment', 'comment'), 'reviews': ('review', 'review'),
+                'review_comments': ('review-comment', 'review_comment'), 'timeline': ('event', 'timeline_event')}
+    for entry in content:
+        if artifact_id == 'files':
+            source_id, kind = 'patch:' + entry['filename'], 'patch'
+            source_coverage = _patch_coverage(entry)
+        else:
+            prefix, kind = prefixes[artifact_id]
+            if entry.get('id') is None:
+                raise ValueError('Evidence source lacks stable identity')
+            source_id, source_coverage = f'{prefix}:{entry["id"]}', 'complete'
+        if source_id in replacements:
+            raise ValueError('Duplicate evidence source identity')
+        candidate = _artifact(kind, entry, inspected=(kind == 'timeline_event'), coverage=source_coverage,
+            source_user={key: value for key, value in (entry.get('user') or {}).items() if key in {'login', 'type'}},
+            source_association=entry.get('author_association'))
+        previous = index.get(source_id)
+        if previous and previous['source_digest'] == candidate['source_digest']:
+            candidate = copy.deepcopy(previous)
+            if candidate.get('actor_authority'):
+                author = (snapshot['item_material'].get('user') or {}).get('login', '')
+                candidate['actor_authority'] = _authority(snapshot['repository'], candidate.get('source_user'), author,
+                                                         set(snapshot['trusted_maintainers']), api)
+        replacements[source_id] = candidate
+        if candidate['coverage'] != 'complete':
+            coverage = 'partial'
+    old_members = set(artifact.get('members', artifact['content'] or []))
+    invalidated = {source_id for source_id in old_members
+        if source_id not in replacements or index[source_id]['source_digest'] != replacements[source_id]['source_digest']}
+    for source_id in old_members - replacements.keys():
+        index.pop(source_id, None)
+    for source_id, entry in list(index.items()):
+        if entry.get('parent_id') in invalidated:
+            index.pop(source_id)
+    index.update(replacements)
+    snapshot['lifecycle_evidence'] = [source_id for source_id in snapshot['lifecycle_evidence']
+        if source_id not in invalidated and (source_id not in replacements
+            or replacements[source_id].get('actor_authority', {}).get('role') in {'author', 'maintainer'})]
+    if artifact_id == 'files':
+        snapshot['changed_paths'] = [entry['filename'] for entry in content]
+        if len(content) != snapshot['item_material'].get('changed_files'):
+            coverage = 'incomplete'
+    members = list(replacements)
+    artifact.update(_artifact(artifact['kind'], members, coverage=coverage, endpoint=endpoint, members=members))
+
+
 def expand_evidence(snapshot: dict, evidence_ids: list[str], *, api) -> dict:
-    """Expand collections into stable source IDs, then inspect selected sources."""
+    """Expand stable sources or bounded digest-bound text/source slices."""
     index = snapshot['evidence_index']
     for artifact_id in evidence_ids:
+        if artifact_id.startswith('text:'):
+            index[artifact_id] = _text_slice(snapshot, artifact_id)
+            continue
         if artifact_id.startswith('source:'):
             index[artifact_id] = _source_slice(snapshot, artifact_id, api)
             continue
         if artifact_id not in index:
             raise ValueError(f'Unknown evidence ID: {artifact_id}')
         artifact = index[artifact_id]
-        endpoint = artifact.get('endpoint')
-        if not endpoint:
+        if not artifact.get('endpoint'):
             artifact['inspected'] = True
             if artifact.get('kind') in {'comment', 'review', 'review_comment'}:
                 author = (snapshot['item_material'].get('user') or {}).get('login', '')
-                artifact['actor_authority'] = _authority(snapshot['repository'], artifact.get('source_user'), author,
-                                                       set(snapshot['trusted_maintainers']), api)
+                authority = _authority(snapshot['repository'], artifact.get('source_user'), author,
+                                       set(snapshot['trusted_maintainers']), api)
+                artifact['actor_authority'] = authority
+                if authority['role'] in {'author', 'maintainer'} and artifact_id not in snapshot['lifecycle_evidence']:
+                    snapshot['lifecycle_evidence'].append(artifact_id)
             continue
         try:
-            content = api(endpoint, pages=True)
-            if not isinstance(content, list):
-                raise ValueError('Collection must be a paginated list')
+            _refresh_collection(snapshot, artifact_id, api)
         except Exception:
             artifact.update(inspected=False, coverage='incomplete')
             _persist(snapshot)
             raise
-        coverage, source_ids = 'complete', []
-        prefixes = {'comments': ('comment', 'comment'), 'reviews': ('review', 'review'),
-                    'review_comments': ('review-comment', 'review_comment'), 'timeline': ('event', 'timeline_event')}
-        for entry in content:
-            if artifact_id == 'files':
-                source_id, kind = 'patch:' + entry['filename'], 'patch'
-                source_coverage = _patch_coverage(entry)
-                if source_coverage != 'complete':
-                    coverage = 'partial'
-            else:
-                prefix, kind = prefixes[artifact_id]
-                if entry.get('id') is None:
-                    raise ValueError('Evidence source lacks stable identity')
-                source_id, source_coverage = f'{prefix}:{entry["id"]}', 'complete'
-            index[source_id] = _artifact(kind, entry, inspected=(kind == 'timeline_event'), coverage=source_coverage,
-                                         source_user={key: value for key, value in (entry.get('user') or {}).items() if key in {'login', 'type'}},
-                                         source_association=entry.get('author_association'))
-            source_ids.append(source_id)
-        if artifact_id == 'files':
-            snapshot['changed_paths'] = [entry['filename'] for entry in content]
-            if len(content) != snapshot['item_material'].get('changed_files'):
-                coverage = 'incomplete'
-        artifact.update(_artifact(artifact['kind'], source_ids, coverage=coverage, endpoint=endpoint))
-    _persist(snapshot)
+    _persist(snapshot, evidence_ids)
     return snapshot
 
 
@@ -410,10 +555,12 @@ def material_state(snapshot: dict) -> dict:
     """
     keys = ('repository', 'number', 'kind', 'item_id', 'policy_version', 'taxonomy',
             'existing_labels', 'eligibility', 'head', 'changed_paths', 'item_material',
-            'linked_closing_issues', 'lifecycle_facts', 'malformed_classification_labels')
+            'linked_closing_issues', 'lifecycle_facts', 'malformed_classification_labels', 'stale')
     result = copy.deepcopy({key: snapshot[key] for key in keys if key in snapshot})
     result['evidence_index'] = {}
     for artifact_id, entry in snapshot.get('evidence_index', {}).items():
         result['evidence_index'][artifact_id] = {key: copy.deepcopy(value) for key, value in entry.items()
-            if key not in {'artifact_path', 'endpoint'} and (key != 'content' or entry.get('inspected'))}
+            if key not in {'artifact_path', 'endpoint', 'text_source'} and (key != 'content' or entry.get('inspected'))}
+        if 'text_source' in entry:
+            result['evidence_index'][artifact_id]['text_source'] = {key: value for key, value in entry['text_source'].items() if key != 'parts'}
     return result
