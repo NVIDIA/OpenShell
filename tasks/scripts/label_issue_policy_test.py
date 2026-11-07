@@ -138,6 +138,7 @@ class PolicyTests(unittest.TestCase):
     def test_malformed_names_need_explicit_observed_evidenced_removals(self):
         snap = snapshot()
         snap['existing_labels'] += ['areaa:runtime', 'state:area-review']
+        snap['malformed_classification_labels'] = ['areaa:runtime']
         self.assertIn('areaa:runtime', plan_labels(snap, result())['preserve'])
         decision = result()
         decision['removals'] = [dict(label='areaa:runtime', evidence=['labels', 'body'], reason='Misspelled classification association.')]
@@ -148,6 +149,39 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(validate_result(snap, decision)['valid'])
         decision['removals'][0]['label'] = 'state:accepted'
         self.assertFalse(validate_result(snap, decision)['valid'])
+
+    def test_explicit_removals_reject_unrelated_labels_even_with_content_evidence(self):
+        for label in ['bug', 'help wanted', 'priority:high', 'areaa:runtime']:
+            with self.subTest(label=label):
+                snap, decision = snapshot(), result()
+                snap['existing_labels'].append(label)
+                decision['removals'] = [dict(label=label, evidence=['labels', 'body'],
+                    reason='Classifier claims this is malformed classification.')]
+                self.assertFalse(validate_result(snap, decision)['valid'])
+                report = plan_labels(snap, decision)
+                self.assertEqual(report['status'], 'held')
+                self.assertEqual(report['remove'], [])
+                self.assertIn(label, report['preserve'])
+
+    def test_classifier_cannot_supply_its_own_malformed_candidate_allowlist(self):
+        snap, decision = snapshot(), result()
+        snap['existing_labels'].append('priority:high')
+        decision['malformed_classification_labels'] = ['priority:high']
+        decision['removals'] = [dict(label='priority:high', evidence=['labels', 'body'],
+            reason='Classifier claims classification.')]
+        self.assertFalse(validate_result(snap, decision)['valid'])
+
+    def test_trusted_malformed_candidates_still_require_observation_and_evidence(self):
+        for label, evidence in [('areaa:runtime', ['labels']),
+                                ('not-observed', ['labels', 'body']),
+                                ('state:accepted', ['labels', 'body'])]:
+            with self.subTest(label=label, evidence=evidence):
+                snap, decision = snapshot(), result()
+                snap['existing_labels'].append('areaa:runtime')
+                snap['malformed_classification_labels'] = [label]
+                decision['removals'] = [dict(label=label, evidence=evidence,
+                    reason='Explicit candidate.')]
+                self.assertFalse(validate_result(snap, decision)['valid'])
 
     def test_medium_confidence_formats_locally_without_holding(self):
         decision = result()
