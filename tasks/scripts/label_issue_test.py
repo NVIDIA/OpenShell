@@ -498,6 +498,19 @@ class BoundaryTests(unittest.TestCase):
         self.assertFalse(report['checkpoint_verified'])
 
     @mock.patch('sys.stdout', new_callable=io.StringIO)
+    def test_successful_cli_preview_returns_zero_without_mutating(self, _stdout):
+        snapshot = self.prepared()
+        root = Path(self.temp.name)
+        result_path = root / 'classification.json'
+        result_path.write_text(json.dumps(self.result(snapshot)))
+        report_path = root / 'preview.json'
+        code = main(['preview', '--snapshot', str(root / 'manifest.json'),
+                     '--result', str(result_path), '--output', str(report_path)], api=self.api)
+        self.assertEqual(json.loads(report_path.read_text())['status'], 'preview')
+        self.assertEqual(code, 0)
+        self.assertEqual(self.api.writes, [])
+
+    @mock.patch('sys.stdout', new_callable=io.StringIO)
     def test_cli_assessment_path_and_exit_status(self, _stdout):
         self.api.item['user'] = {'login': 'reader'}
         self.api.labels = ['state:needs-info']
