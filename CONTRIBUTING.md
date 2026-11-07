@@ -112,7 +112,8 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Maintenance     | `release-openshell`       | Pick the latest qualified prerelease and tag its commit as stable                                   |
-| Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
+| Triage          | `triage-issue`            | Assess and route community-filed issues; delegate label reconciliation                                                  |
+| Triage          | `label-issue`             | Classify accepted issues and PRs, correct labels, and migrate legacy associations                   |
 | Triage          | `review-triage-queue`     | Create a local, read-only queue report from GitHub intake                                           |
 | Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
@@ -140,7 +141,7 @@ A PR represents accepted work when either:
 - Its author is a maintainer or has repository write access as described above.
 - It closes at least one issue in this repository that has `state:accepted`, and the PR author is that issue's submitter or a current assignee.
 
-Use GitHub closing references such as `Closes #123` or `Fixes #123`. Merely mentioning an accepted issue does not qualify. Acceptance and the author relationship must hold on the same issue. The PR author determines eligibility, not the person triggering a workflow. Other tools and contributor skills use this shared definition; the importable `tasks/scripts/accepted_work.py` library implements the PR check.
+Use GitHub closing references such as `Closes #123` or `Fixes #123`. Merely mentioning an accepted issue does not qualify. Acceptance and the author relationship must hold on the same issue. The PR author determines eligibility, not the person triggering a workflow. Other tools and contributor skills use this shared definition; the importable `tasks/scripts/accepted_work.py` library implements the shared issue and PR checks.
 
 Acceptance classifies work, not implementation quality or approval to merge. Existing issue-linking rules, the separate `PR Issue Acceptance` check (which requires every linked issue to be accepted for community authors), and maintainer/code-owner approvals still apply. Acceptance does not certify that the diff implements the issue, and the existing Dependabot gate exemption does not automatically qualify a PR as accepted work.
 
@@ -148,7 +149,7 @@ Acceptance classifies work, not implementation quality or approval to merge. Exi
 
 Labels drive notification streams as well as classification. Contributors use the GitHub app in Slack, and other integrations, to follow issues and PRs filtered by area or topic. Applying those labels can notify subscribers immediately, before they have chosen to follow the individual item.
 
-Apply `area:` and `topic:` classification labels only after the issue or PR meets the shared [accepted-work definition](#accepted-work). Once accepted, apply the relevant classification labels so subscribers can find the work.
+Apply `area:` and `topic:` classification labels only after the issue or PR meets the shared [accepted-work definition](#accepted-work). Once accepted, apply exactly one primary `area:` label to both issues and PRs, plus the substantively supported `topic:` labels. Use the contributor [label-issue skill](.agents/skills/label-issue/SKILL.md) to preview and reconcile classifications, including inaccurate or obsolete associations. Its ambiguity report stays local; classification posts no ticket comment.
 
 Do not classify an issue merely because it was filed or its subject is clear. Waiting until acceptance keeps label-filtered streams focused on work the project intends to pursue and avoids sending unaccepted intake to subscribers. Workflow labels such as `state:triage-needed` still record intake status; they do not establish acceptance.
 
