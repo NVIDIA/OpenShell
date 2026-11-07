@@ -177,8 +177,10 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // Workload compatibility adds one diagnostic-only public message. Startup
+    // snapshots are not persisted; the durable and overlap inventories stay fixed.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3b4c2af6cf22e7ed1d84279ff865acb0db7199717bee9bc041caef791334104d";
+        "b3dea2db5539a655b8af3dd0ea2d7e6566644b4dec9e72fb7c53a5332b623438";
     const DURABLE_SCHEMA_SHA256: &str =
         "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -723,7 +725,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (337, 31),
+                (338, 31),
                 (100, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

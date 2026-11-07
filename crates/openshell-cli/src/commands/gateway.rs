@@ -46,6 +46,7 @@ struct ComputeDriverInfoView {
 struct ComputeDriverCapabilitiesView {
     driver_name: String,
     driver_version: String,
+    workload_compatibility: Option<openshell_core::proto::WorkloadCompatibility>,
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +418,7 @@ pub async fn gateway_info(
                     capabilities: ComputeDriverCapabilitiesView {
                         driver_name: capabilities.driver_name,
                         driver_version: capabilities.driver_version,
+                        workload_compatibility: capabilities.workload_compatibility,
                     },
                 }
             })
@@ -514,7 +516,47 @@ fn print_compute_driver_info(drivers: &[ComputeDriverInfoView]) {
             "Driver version:".dimmed(),
             driver.capabilities.driver_version
         );
+        for line in
+            workload_compatibility_lines(driver.capabilities.workload_compatibility.as_ref())
+        {
+            println!("      {line}");
+        }
     }
+}
+
+fn workload_compatibility_lines(
+    workload: Option<&openshell_core::proto::WorkloadCompatibility>,
+) -> Vec<String> {
+    let reported = |value: &str| {
+        if value.is_empty() {
+            "unreported".to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    let Some(workload) = workload else {
+        return vec![
+            "Workload platform: unreported".into(),
+            "Execution restrictions: unreported".into(),
+        ];
+    };
+    let mut lines = vec![format!(
+        "Workload platform: {} / {}",
+        reported(&workload.operating_system),
+        reported(&workload.architecture)
+    )];
+    if workload.execution_restrictions.is_empty() {
+        lines.push("Execution restrictions: unreported".into());
+    } else {
+        lines.push("Execution restrictions (reported):".into());
+        lines.extend(
+            workload
+                .execution_restrictions
+                .iter()
+                .map(|restriction| format!("  {restriction}")),
+        );
+    }
+    lines
 }
 
 fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
@@ -532,6 +574,11 @@ fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
                 "capabilities": {
                     "driver_name": &driver.capabilities.driver_name,
                     "driver_version": &driver.capabilities.driver_version,
+                    "workload_compatibility": driver.capabilities.workload_compatibility.as_ref().map(|workload| serde_json::json!({
+                        "operating_system": &workload.operating_system,
+                        "architecture": &workload.architecture,
+                        "execution_restrictions": &workload.execution_restrictions,
+                    })),
                 },
             }))
             .collect::<Vec<_>>(),
@@ -1590,7 +1637,7 @@ mod tests {
         gateway_env_override_warning, gateway_info_to_json, gateway_remote_label,
         gateway_select_with, gateway_to_json, gateway_type_label, http_health_check,
         import_local_package_mtls_bundle, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
-        plaintext_gateway_is_remote,
+        plaintext_gateway_is_remote, workload_compatibility_lines,
     };
     use crate::TEST_ENV_LOCK;
     use crate::test_utils::{Environment, with_tmp_xdg, with_tmp_xdg_env};
@@ -1894,7 +1941,7 @@ mod tests {
 
     #[test]
     fn gateway_info_json_includes_compute_drivers_when_available() {
-        let view = GatewayInfoView {
+        let mut view = GatewayInfoView {
             gateway: "openshell".to_string(),
             server: "https://127.0.0.1:17670".to_string(),
             auth: Some("bearer"),
@@ -1905,6 +1952,7 @@ mod tests {
                 capabilities: ComputeDriverCapabilitiesView {
                     driver_name: "podman".to_string(),
                     driver_version: "0.0.75".to_string(),
+                    workload_compatibility: None,
                 },
             }],
             extensions: vec![ExtensionInfoView {
@@ -1932,6 +1980,46 @@ mod tests {
         assert_eq!(
             json["compute_drivers"][0]["capabilities"]["driver_version"],
             "0.0.75"
+        );
+        assert!(json["compute_drivers"][0]["capabilities"]["workload_compatibility"].is_null());
+        assert_eq!(
+            workload_compatibility_lines(None),
+            [
+                "Workload platform: unreported",
+                "Execution restrictions: unreported"
+            ]
+        );
+
+        let workload = openshell_core::proto::WorkloadCompatibility {
+            operating_system: "macos".into(),
+            architecture: "arm64".into(),
+            execution_restrictions: vec!["Setuid executables cannot run in this runtime.".into()],
+        };
+        assert_eq!(
+            workload_compatibility_lines(Some(&workload)),
+            [
+                "Workload platform: macos / arm64",
+                "Execution restrictions (reported):",
+                "  Setuid executables cannot run in this runtime."
+            ]
+        );
+        view.compute_drivers[0].capabilities.workload_compatibility = Some(workload);
+        assert_eq!(
+            gateway_info_to_json(&view)["compute_drivers"][0]["capabilities"]["workload_compatibility"],
+            serde_json::json!({
+                "operating_system": "macos",
+                "architecture": "arm64",
+                "execution_restrictions": ["Setuid executables cannot run in this runtime."],
+            })
+        );
+        assert_eq!(
+            workload_compatibility_lines(Some(
+                &openshell_core::proto::WorkloadCompatibility::default()
+            )),
+            [
+                "Workload platform: unreported / unreported",
+                "Execution restrictions: unreported"
+            ]
         );
     }
 

@@ -1022,6 +1022,23 @@ message ComputeDriverCapabilities {
 
   // Static portable resource request forms reported by the driver.
   ResourceCapabilities resource_capabilities = 3;
+
+  // Diagnostic workload facts reported by this configured driver.
+  // Absence means unreported, not the gateway host's platform.
+  WorkloadCompatibility workload_compatibility = 4;
+}
+
+// Workload compatibility from the driver's startup capability snapshot.
+// This describes the runtime, not installation health or command admission.
+message WorkloadCompatibility {
+  // Workload OS, such as "linux", "windows", or "macos". Empty is unreported.
+  string operating_system = 1;
+  // Workload architecture in OCI form, such as "arm64" or "amd64".
+  // Empty is unreported, including when placement or the image determines it.
+  string architecture = 2;
+  // Known fixed execution restrictions, each a short plain-text explanation.
+  // An empty list does not establish that execution is unrestricted.
+  repeated string execution_restrictions = 3;
 }
 
 // Static portable resource request forms reported by a compute driver.
