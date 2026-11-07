@@ -284,6 +284,15 @@ class PolicyTests(unittest.TestCase):
         snap['evidence_index']['index']['content'] = ['patch:crates/runtime/src/proxy.rs']
         self.assertTrue(validate_result(snap, decision)['valid'])
 
+    def test_truncated_membership_indexes_do_not_gain_substantive_meaning(self):
+        for kind in ['comments', 'reviews', 'review_comments', 'timeline']:
+            snap, decision = snapshot(), result()
+            snap['evidence_index']['index'] = dict(kind=kind, content='["comment:1", ...',
+                coverage='truncated', members=['comment:1'], inspected=True, source_digest='c' * 64,
+                inspection={'source_digest': 'c' * 64, 'via': 'explicit_expansion'})
+            decision['reasons'][0]['evidence'] = ['index']
+            self.assertFalse(validate_result(snap, decision)['valid'])
+
     def test_validation_never_mutates_snapshot_or_result(self):
         snap, decision = snapshot(), result()
         before = copy.deepcopy((snap, decision))
