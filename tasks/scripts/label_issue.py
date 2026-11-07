@@ -85,6 +85,8 @@ def _relevant_timeline(item_id, api):
 
 
 def _hydrate(snapshot, api, template=None):
+    previous_inspection = {identity: (source.get('source_digest'), source.get('inspected', False))
+                           for identity, source in snapshot['evidence_index'].items()}
     collections = ['comments']
     if snapshot['kind'] == 'pull_request':
         collections += ['files', 'reviews', 'review_comments']
@@ -92,6 +94,11 @@ def _hydrate(snapshot, api, template=None):
         source = snapshot['evidence_index'][identity]
         if source.get('coverage') != 'complete' or 'members' not in source:
             evidence.expand_evidence(snapshot, [identity], api=api)
+    # Deterministic collection fetching is not a model read. Preserve only
+    # unchanged prior inspection, including the parent collection artifacts.
+    for identity, source in snapshot['evidence_index'].items():
+        digest, inspected = previous_inspection.get(identity, (None, False))
+        source['inspected'] = bool(inspected and digest == source.get('source_digest'))
     # Authority is a fetched fact, independent of which source the model reads.
     # Resolve each distinct actor once in this hydration pass; do not mark any
     # new source inspected merely because deterministic checks fetched its role.
@@ -118,6 +125,7 @@ def _hydrate(snapshot, api, template=None):
             if current and previous.get('inspected') and previous.get('source_digest') == current.get('source_digest'):
                 current['inspected'] = True
     snapshot['relevant_timeline'] = _relevant_timeline(snapshot['item_id'], api)
+    _persist(snapshot)
     return snapshot
 
 
@@ -128,7 +136,8 @@ def _material(snapshot):
 
 
 def _persist(snapshot):
-    (Path(snapshot['_directory']) / 'manifest.json').write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
+    # Keep delivery packets/inspection metadata consistent with the manifest.
+    evidence._persist(snapshot)
 
 
 def prepare(repository: str, number: int, directory: Path, *, api, force: bool=False, trusted_actors: set[str], assessment_only=False, assessment_labels=frozenset()) -> dict:
@@ -144,10 +153,15 @@ def prepare(repository: str, number: int, directory: Path, *, api, force: bool=F
             return _report(facts, 'skipped', 'Accepted work required for classification; assessment-only preparation is available')
         discovery = checkpoint.find_checkpoint(facts['item_id'], api=api, trusted_actors=actors) if not force and (not assessment_only) else {'status': 'bypassed'}
         snapshot = evidence.prepare_snapshot(facts['repository'], facts['number'], directory, api=api, assessment_labels=assessment_labels)
+        refreshed_eligibility = snapshot['eligibility']
+        if refreshed_eligibility['lifecycle'] != 'eligible':
+            return _report(snapshot, 'held' if refreshed_eligibility['lifecycle'] == 'hold' else 'skipped', refreshed_eligibility['reason'])
+        if not refreshed_eligibility['accepted'] and not assessment_only:
+            return _report(snapshot, 'skipped', 'Acceptance changed during preparation; classification is not authorized')
         snapshot['_assessment_labels'] = sorted(assessment_labels)
         snapshot['assessment_only'] = bool(assessment_only)
+        _hydrate(snapshot, api)
         if not assessment_only:
-            _hydrate(snapshot, api)
             material = _material(snapshot)
             if discovery['status'] == 'found':
                 candidate = discovery['checkpoint']
@@ -173,8 +187,7 @@ def _fresh(snapshot, api):
     with tempfile.TemporaryDirectory(prefix='openshell-label-refresh-') as directory:
         current = evidence.prepare_snapshot(snapshot['repository'], snapshot['number'], Path(directory), api=api, assessment_labels=set(snapshot.get('_assessment_labels', [])))
         current['assessment_only'] = snapshot.get('assessment_only', False)
-        if not current['assessment_only']:
-            _hydrate(current, api, template=snapshot)
+        _hydrate(current, api, template=snapshot)
         yield current
 
 
@@ -289,7 +302,7 @@ def _plan(snapshot, result, api, assessment, bookkeeping_label, executor):
     report['ordered_writes'] = operations
     if operations:
         report['mutation_request'] = _batch(operations)
-    report['bookkeeping'] = [f'{operation['action']} {operation['label']}' for operation in operations if operation['bookkeeping']]
+    report['bookkeeping'] = [f"{operation['action']} {operation['label']}" for operation in operations if operation['bookkeeping']]
     return report
 
 
@@ -303,22 +316,13 @@ def _preview(snapshot, result, api, assessment, bookkeeping_label, executor):
     with _fresh(snapshot, api) as current:
         if current['eligibility']['lifecycle'] != 'eligible':
             return _report(snapshot, 'held' if current['eligibility']['lifecycle'] == 'hold' else 'skipped', current['eligibility']['reason'])
-        if snapshot.get('assessment_only'):
-            keys = ('eligibility', 'existing_labels', 'taxonomy', 'policy_version')
-            if any((snapshot[key] != current[key] for key in keys)):
-                return _report(snapshot, 'stale', 'Assessment inputs changed; prepare again')
-        else:
-            if set(snapshot['existing_labels']) != set(current['existing_labels']):
-                return _report(snapshot, 'stale', 'Live labels changed since preparation')
-            if not _same_material(snapshot, current, set(snapshot['existing_labels'])):
-                return _report(snapshot, 'stale', 'Material inputs changed; prepare and classify again')
-            boundary = checkpoint.latest_label_event(snapshot['item_id'], api=api)['boundary_id']
-            if boundary != snapshot.get('label_event_boundary'):
-                return _report(snapshot, 'stale', 'External label events changed since preparation')
-        if snapshot.get('assessment_only'):
-            boundary = checkpoint.latest_label_event(snapshot['item_id'], api=api)['boundary_id']
-            if boundary != snapshot.get('label_event_boundary'):
-                return _report(snapshot, 'stale', 'Assessment label events changed since preparation')
+        if set(snapshot['existing_labels']) != set(current['existing_labels']):
+            return _report(snapshot, 'stale', 'Live labels changed since preparation')
+        if not _same_material(snapshot, current, set(snapshot['existing_labels'])):
+            return _report(snapshot, 'stale', 'Prepared substantive inputs changed; prepare and review again')
+        boundary = checkpoint.latest_label_event(snapshot['item_id'], api=api)['boundary_id']
+        if boundary != snapshot.get('label_event_boundary'):
+            return _report(snapshot, 'stale', 'External label events changed since preparation')
         return _plan(snapshot, result, api, assessment, bookkeeping_label, executor)
 
 
@@ -352,7 +356,7 @@ def _item_lock(repository, number):
 
 
 def _live_labels(snapshot, api):
-    return sorted((entry['name'] for entry in api(f'repos/{snapshot['repository']}/issues/{snapshot['number']}/labels?per_page=100', pages=True)))
+    return sorted((entry['name'] for entry in api(f"repos/{snapshot['repository']}/issues/{snapshot['number']}/labels?per_page=100", pages=True)))
 
 
 def apply(snapshot: dict, result: dict, *, api, trusted_actors: set[str], bookkeeping_label: str | None=DEFAULT_BOOKKEEPING_LABEL, assessment: dict | None=None, expected_preview: dict | None=None, executor: str | None=None) -> dict:
@@ -385,6 +389,8 @@ def apply(snapshot: dict, result: dict, *, api, trusted_actors: set[str], bookke
                     raise ValueError('GraphQL mutation returned errors or incomplete aliases')
             except Exception as exc:
                 failure = exc
+            # Recovery labels do not depend on unrelated source hydration.
+            report['observed_labels'] = _live_labels(snapshot, api)
             with _fresh(snapshot, api) as current:
                 observed = _live_labels(snapshot, api)
                 report['observed_labels'] = observed
@@ -392,7 +398,7 @@ def apply(snapshot: dict, result: dict, *, api, trusted_actors: set[str], bookke
                     proof = checkpoint.collect_label_events(snapshot['item_id'], snapshot['label_event_boundary'], api=api)
                     actual = [{'actor': event['actor']['login'], 'action': 'add' if event['__typename'] == 'LabeledEvent' else 'remove', 'label_id': event['label']['id']} for event in proof.get('events', [])]
                     expected = [{'actor': report['executor'], 'action': operation['action'], 'label_id': operation['label_id']} for operation in report['ordered_writes']]
-                    stable = all((snapshot[key] == current[key] for key in ('eligibility', 'taxonomy', 'policy_version')))
+                    stable = _same_material(snapshot, current, set(report['final_labels']))
                     verified = failure is None and set(observed) == set(report['final_labels']) and stable and (proof['status'] == 'complete') and (checkpoint.operation_digest(actual) == checkpoint.operation_digest(expected))
                 else:
                     discovery = checkpoint.find_checkpoint(snapshot['item_id'], api=api, trusted_actors=actors)
