@@ -10,7 +10,7 @@ uv run --no-project python tasks/scripts/label_issue.py prepare \
   --repo "$repo" --item "$item" --trusted-actor "$label_actor" --output "$packet_dir"
 ```
 
-Continue only for `status: ready` with `classifier_required: true`. Read `packet.json`; use `manifest.json` for snapshot identity, `taxonomy.definitions`, `malformed_classification_labels` and relevant artifact metadata. Read `lifecycle_evidence` and its actual recorded facts. An unchanged outcome is a deterministic no-model, no-write skip.
+For classification, continue only for `status: ready` with `classifier_required: true`. For separately authorized assessment-only preparation, continue for `status: ready` with `classifier_required: false` using the assessment path below. Read `packet.json`; use `manifest.json` for snapshot identity, `taxonomy.definitions`, `malformed_classification_labels` and relevant artifact metadata. Read `lifecycle_evidence` and its actual recorded facts. An unchanged outcome is a deterministic no-model, no-write skip.
 
 ```shell
 uv run --no-project python tasks/scripts/label_issue.py expand \
