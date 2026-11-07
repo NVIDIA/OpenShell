@@ -198,6 +198,7 @@ func TestResolveActiveGateway_WhitespaceHandling(t *testing.T) {
 func TestResolveActiveGateway_FileMissing(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv(systemGatewayDirEnv, t.TempDir())
 	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "openshell"), 0o755))
 
 	_, err := resolveActiveGateway()
@@ -208,12 +209,80 @@ func TestResolveActiveGateway_FileMissing(t *testing.T) {
 func TestResolveActiveGateway_EmptyFile(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv(systemGatewayDirEnv, t.TempDir())
 	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "openshell"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(tmp, "openshell", "active_gateway"), []byte("   \n"), 0o644))
 
 	_, err := resolveActiveGateway()
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrNoActiveGateway)
+}
+
+// setActiveFiles points the user and system config dirs at temp dirs and
+// writes active_gateway files when the given content is non-empty.
+func setActiveFiles(t *testing.T, userContent, systemContent string) {
+	t.Helper()
+	user, system := t.TempDir(), t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", user)
+	t.Setenv(systemGatewayDirEnv, system)
+	if userContent != "" {
+		require.NoError(t, os.MkdirAll(filepath.Join(user, "openshell"), 0o755))
+		writeFile(t, filepath.Join(user, "openshell"), "active_gateway", userContent)
+	}
+	if systemContent != "" {
+		writeFile(t, system, "active_gateway", systemContent)
+	}
+}
+
+func TestResolveActiveGateway_FallsBackToSystem(t *testing.T) {
+	setActiveFiles(t, "", "corp\n")
+
+	name, err := resolveActiveGateway()
+	require.NoError(t, err)
+	assert.Equal(t, "corp", name)
+}
+
+func TestResolveActiveGateway_PrefersUser(t *testing.T) {
+	setActiveFiles(t, "mine", "corp")
+
+	name, err := resolveActiveGateway()
+	require.NoError(t, err)
+	assert.Equal(t, "mine", name)
+}
+
+func TestResolveActiveGateway_InvalidUserFallsBackToSystem(t *testing.T) {
+	setActiveFiles(t, "../escape", "corp")
+
+	name, err := resolveActiveGateway()
+	require.NoError(t, err)
+	assert.Equal(t, "corp", name)
+}
+
+func TestResolveActiveGateway_InvalidSystemIsIgnored(t *testing.T) {
+	setActiveFiles(t, "bad/user", "bad/system")
+
+	_, err := resolveActiveGateway()
+	require.ErrorIs(t, err, ErrNoActiveGateway)
+	assert.Contains(t, err.Error(), "bad/user")
+	assert.NotContains(t, err.Error(), "bad/system")
+}
+
+func TestResolveActiveGateway_UserDirErrorFallsBackToSystem(t *testing.T) {
+	setActiveFiles(t, "", "corp")
+	t.Setenv("XDG_CONFIG_HOME", "relative/path")
+
+	name, err := resolveActiveGateway()
+	require.NoError(t, err)
+	assert.Equal(t, "corp", name)
+}
+
+func TestResolveActiveGateway_UserDirErrorNoSystem(t *testing.T) {
+	setActiveFiles(t, "", "")
+	t.Setenv("XDG_CONFIG_HOME", "relative/path")
+
+	_, err := resolveActiveGateway()
+	require.ErrorIs(t, err, ErrNoActiveGateway)
+	assert.Contains(t, err.Error(), "cannot determine config directory")
 }
 
 func TestValidateGatewayName_SpecialCharacters(t *testing.T) {

@@ -83,13 +83,6 @@ func ComputeDriverInfoFromProto(d *pb.ComputeDriverInfo) types.ComputeDriverInfo
 	if caps := d.GetCapabilities(); caps != nil {
 		result.DriverName = caps.GetDriverName()
 		result.DriverVersion = caps.GetDriverVersion()
-		if workload := caps.GetWorkloadCompatibility(); workload != nil {
-			result.WorkloadCompatibility = &types.WorkloadCompatibility{
-				OperatingSystem:       workload.GetOperatingSystem(),
-				Architecture:          workload.GetArchitecture(),
-				ExecutionRestrictions: CopyStringSlice(workload.GetExecutionRestrictions()),
-			}
-		}
 	}
 	return result
 }

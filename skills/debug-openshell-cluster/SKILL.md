@@ -229,6 +229,13 @@ rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
 The published supervisor image uses a shell-free distroless Debian 13 base.
+For Docker and Podman, supervisor OCSF `device.container.image.uid` identifies
+the workload image fixed at launch, and `image.name` carries its requested
+reference. Compare the UID with engine inspection of the workload container;
+the supervisor companion uses a separate image. An absent image object means
+the driver did not supply an immutable image ID; Kubernetes currently omits it.
+When no image UID is available, `unmapped.container_image` preserves any known
+workload image reference, including for VM and shared-supervisor records.
 For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
 runtime libraries, CA certificates, and inherited user and working directory.
 Use container logs, engine inspection and the configured exec health probe for
@@ -522,6 +529,14 @@ kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
 
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
+
+Gateway pod scheduling accepts top-level `nodeSelector`, `affinity`,
+`tolerations`, `priorityClassName`, and `topologySpreadConstraints` values for
+both StatefulSet and Deployment workloads. The last two default to unset.
+If a gateway pod stays Pending, inspect its scheduling events, confirm the
+named PriorityClass exists (`kubectl get priorityclass`), and check that topology
+spread selectors match the gateway pod labels and that eligible nodes have the
+required topology labels. These values apply only to gateway pods.
 
 #### Additional destination CA ConfigMap
 
@@ -935,6 +950,41 @@ client CA matches the CA that signed the client certificate:
 kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec.volumes[?(@.name=="tls-client-ca")]}' | jq .
 # Should show items filter for ca.crt from openshell-server-tls
 ```
+
+#### Secure metrics TLS
+
+When `metrics.tls.enabled=true`, the dedicated metrics listener uses its own
+TLS configuration and, when requested, an independent scraper client CA. Do
+not use the gateway client CA: sandbox workloads receive gateway client
+credentials, so trusting that CA here would grant them metrics access. The
+chart fails rendering when `metrics.tls.clientCaSecretName` matches
+`server.tls.clientCaSecretName` or `server.tls.clientTlsSecretName`; that
+check is by name only. Inspect
+the rendered configuration and the read-only Secret mounts before debugging the
+scraper:
+
+```bash
+kubectl -n openshell get configmap openshell-config \
+  -o jsonpath='{.data.gateway\.toml}' | grep -A6 '^\[openshell\.gateway\.metrics_tls\]'
+kubectl -n openshell get statefulset openshell \
+  -o jsonpath='{.spec.template.spec.volumes[?(@.name=="metrics-tls-cert")]}{"\n"}{.spec.template.spec.volumes[?(@.name=="metrics-tls-client-ca")]}' | jq .
+kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200 | grep -E 'metrics.*TLS|listener=metrics'
+```
+
+`metrics-tls-cert` must reference a Secret with `tls.crt` and `tls.key`; when
+mTLS is enabled, `metrics-tls-client-ca` must reference a Secret with `ca.crt`.
+An absent mount means the release was rendered without metrics TLS. A failed
+certificate reload retains the previous working listener; correct the Secret
+contents rather than disabling verification. Configure the scraper with the
+metrics server CA and, for mTLS, its dedicated client certificate and key. Do
+not use `insecureSkipVerify`.
+
+A Secret that exists with malformed contents leaves the metrics listener
+disabled while the gateway remains available; it never falls back to
+plaintext. A missing Secret, or a client CA Secret without a `ca.crt` key,
+never reaches the gateway: kubelet fails the non-optional volume mounts and
+the pod does not start (`FailedMount`). Correct the Secret and restart the
+gateway before retrying the scrape.
 
 If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
 is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
@@ -1540,7 +1590,7 @@ credential failures.
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Collector receives no OCSF log records, or `openshell.ocsf.gap` records | `[openshell.gateway.otlp.ocsf]` missing or without `enabled = true`, an unreachable endpoint or one that does not speak the table's `protocol`, or export failures and queue pressure | Check `[openshell.gateway.otlp.ocsf]` for `enabled = true` and the endpoint it resolves to, the gateway's `OTLP exporting enabled` startup log for `ocsf_endpoint` and `ocsf_protocol`, export warnings, and `openshell_ocsf_otlp_*` metrics. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
 | Gateway OCSF JSONL stops growing, has gaps, or is rejected by a SIEM | File errors, queue pressure, or shipper falling behind retention | Inspect gateway warnings and `openshell_ocsf_log_*` metrics; check `[openshell.gateway.ocsf_log]`, directory permissions, free space, per-replica paths, and shipper rotation checkpoints. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
-| `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
+| `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with `OPENSHELL_DEV_OTLP_ENDPOINT` set but no collector is listening, for example because `helm:k3s:forward` stopped | Start the collector forwarding again, or restart the gateway task without `OPENSHELL_DEV_OTLP_ENDPOINT`; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Sandbox log shows `OTLP agent trace relay inactive: not enabled by the gateway` at startup, then `agent OTLP export attempted but the agent trace relay is not enabled` when the agent exports | The gateway does not enable `[openshell.gateway.otlp.agent]`, so the supervisor refuses the workload's OTLP relay address | Set `enabled = true` in `[openshell.gateway.otlp.agent]` (Helm: `gatewayConfig."openshell.gateway.otlp.agent".enabled`) with an endpoint from that table or `[openshell.gateway.otlp]`, and recreate the sandbox; `openshell logs <sandbox> --source sandbox` then shows `OTLP agent trace relay enabled` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Docker or Podman sandbox never registers | Wrong gateway endpoint, unavailable host networking, or supervisor startup failure | Gateway logs and supervisor container logs |
@@ -1551,6 +1601,8 @@ credential failures.
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
 | Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full lock pool on one replica (4 connections unless `database_lock_max_connections` is set), a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, `openshell_server_mutation_lock_connections_in_use` against its capacity, the `detail` field of `mutation lock acquisition timed out` in gateway logs, `mutation lock held longer than the lock wait timeout` warnings and `openshell_server_mutation_lock_hold_seconds`, the `pg_locks` query in Step 6 |
+| RPCs fail after about 5 seconds with `UNAVAILABLE` `DATABASE_UNAVAILABLE` or "database unavailable: pool timed out" | PostgreSQL unreachable or not answering, or every data-pool connection busy | `database health check` warnings and `/readyz` on the gateway, PostgreSQL logs, `database_max_connections` and the connection sizing in the High Availability guide |
+| Kubernetes gateway pod Running but never Ready, logging `database unreachable; retrying` | The gateway started while PostgreSQL was unreachable and waits for it | PostgreSQL pod and Service endpoints, the host and port in the database URL, network policy between the gateway and PostgreSQL |
 | Mutating RPCs return `INTERNAL` with "could not open a mutation lock connection" | PostgreSQL out of connection slots, restarting, or unreachable | `openshell_server_mutation_lock_errors_total`, PostgreSQL logs, `SELECT count(*) FROM pg_stat_activity` against `max_connections`, `database_max_connections` and `database_lock_max_connections`, the connection sizing in the High Availability guide |
 | `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
 | HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
@@ -1648,3 +1700,22 @@ even if the configured interval is longer; failed polls do not renew the lease.
 App traffic uses application/edge authentication independently of gateway
 user authentication. This listener stage does not add service discovery or
 change the public URLs printed by the CLI.
+
+When enabled application routes are not published, check the authenticated
+supervisor session and installed configuration before checking ingress. The
+gateway requests installation evidence every five seconds with a fifteen-second
+lease measured from challenge issuance. Instances report only when their serving
+freshness covers that lease. Replayed, late, stale-configuration, and replaced
+session reports cannot renew evidence. Endpoint resolution comes from the
+compute driver once per challenge/report exchange, with fresh resolution for the
+next challenge. Acceptance still checks durable ownership and shared member
+readiness; ambiguous shared ownership must not publish an address.
+
+For shared pools, compare the discovered endpoint to the
+acknowledged owner's Pod IP and configured app port, not its runtime port or a
+load-balanced supervisor Service. Publication requires a current ownership term,
+live member, and acknowledged ready report. During takeover old streams may close;
+verify workload identity/memory survives and new connections reach the replacement.
+Shared serving leases last at most fifteen seconds from issuance, independently
+of configuration renewal; include membership failure detection when measuring a
+partition's stale-owner interval. Storage failures prevent renewal.

@@ -665,6 +665,7 @@ async fn handle_create_sandbox_inner(
     .await?;
     validate_provider_environment_keys_unique_with_catalog(
         state.store.as_ref(),
+        crate::provider_refresh::RefreshStateReader::Runtime(&state.refresh),
         &provider_profile_catalog,
         &workspace,
         &spec.providers,
@@ -1552,6 +1553,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     .await?;
     validate_provider_environment_keys_unique_with_catalog(
         state.store.as_ref(),
+        crate::provider_refresh::RefreshStateReader::Runtime(&state.refresh),
         &provider_profile_catalog,
         &workspace,
         &candidate_spec.providers,
@@ -1564,11 +1566,13 @@ pub(super) async fn handle_attach_sandbox_provider(
         &candidate_spec.providers,
     )
     .await?;
+    let current_policy =
+        super::policy::current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
     super::policy::validate_candidate_sandbox_credential_policy(
         state,
         &workspace,
         &candidate_spec.providers,
-        candidate_spec.policy.as_ref(),
+        Some(&current_policy),
     )
     .await?;
 

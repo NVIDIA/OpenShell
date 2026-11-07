@@ -180,7 +180,7 @@ mod tests {
     // Workload compatibility adds one diagnostic-only public message. Startup
     // snapshots are not persisted; the durable and overlap inventories stay fixed.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "56e810fac2b973157527701c5058828fff973b2648150a1f6db679a150453eac";
+        "b3dea2db5539a655b8af3dd0ea2d7e6566644b4dec9e72fb7c53a5332b623438";
     const DURABLE_SCHEMA_SHA256: &str =
         "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -654,7 +654,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            109 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -725,7 +725,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (336, 31),
+                (338, 31),
                 (100, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

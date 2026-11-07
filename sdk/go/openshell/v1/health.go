@@ -18,9 +18,6 @@ type GatewayInfo = types.GatewayInfo
 // ComputeDriverInfo describes a compute backend available on the gateway.
 type ComputeDriverInfo = types.ComputeDriverInfo
 
-// WorkloadCompatibility describes the workload platform and reported execution restrictions.
-type WorkloadCompatibility = types.WorkloadCompatibility
-
 // ExtensionInfo describes one successful gateway/extension negotiation.
 type ExtensionInfo = types.ExtensionInfo
 

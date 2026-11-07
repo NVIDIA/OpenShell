@@ -22,9 +22,6 @@ func TestGatewayInfoFromProto(t *testing.T) {
 				Capabilities: &pb.ComputeDriverCapabilities{
 					DriverName:    "kubernetes",
 					DriverVersion: "2.1.0",
-					WorkloadCompatibility: &pb.WorkloadCompatibility{
-						OperatingSystem: "linux",
-					},
 				},
 			},
 			{
@@ -59,10 +56,6 @@ func TestGatewayInfoFromProto(t *testing.T) {
 	assert.Equal(t, "2.1.0", info.ComputeDrivers[0].DriverVersion)
 	assert.Equal(t, "docker", info.ComputeDrivers[1].Name)
 	assert.Equal(t, "docker-engine", info.ComputeDrivers[1].DriverName)
-	require.NotNil(t, info.ComputeDrivers[0].WorkloadCompatibility)
-	assert.Equal(t, "linux", info.ComputeDrivers[0].WorkloadCompatibility.OperatingSystem)
-	assert.Empty(t, info.ComputeDrivers[0].WorkloadCompatibility.Architecture)
-	assert.Nil(t, info.ComputeDrivers[1].WorkloadCompatibility)
 	require.Len(t, info.Extensions, 1)
 	assert.Equal(t, v1.ExtensionKindComputeDriver, info.Extensions[0].Kind)
 	assert.Equal(t, "openshell/kubernetes", info.Extensions[0].ImplementationName)
@@ -92,14 +85,7 @@ func TestGatewayInfoFromProto_DeepCopy(t *testing.T) {
 		Status:         pb.ServiceStatus_SERVICE_STATUS_HEALTHY,
 		GatewayVersion: "1.0.0",
 		ComputeDrivers: []*pb.ComputeDriverInfo{
-			{Name: "native", Capabilities: &pb.ComputeDriverCapabilities{
-				DriverName: "native",
-				WorkloadCompatibility: &pb.WorkloadCompatibility{
-					OperatingSystem:       "macos",
-					Architecture:          "arm64",
-					ExecutionRestrictions: []string{"Setuid executables cannot run in this runtime."},
-				},
-			}},
+			{Name: "k8s", Capabilities: &pb.ComputeDriverCapabilities{DriverName: "kubernetes"}},
 		},
 		Extensions: []*pb.NegotiatedExtensionInfo{{
 			ConfiguredName:        "k8s",
@@ -109,15 +95,10 @@ func TestGatewayInfoFromProto_DeepCopy(t *testing.T) {
 
 	info := GatewayInfoFromProto(proto)
 	proto.ComputeDrivers[0].Name = "mutated"
-	proto.ComputeDrivers[0].Capabilities.WorkloadCompatibility.OperatingSystem = "mutated"
-	proto.ComputeDrivers[0].Capabilities.WorkloadCompatibility.ExecutionRestrictions[0] = "mutated"
 	proto.Extensions[0].ConfiguredName = "mutated"
 	proto.Extensions[0].SupportedCapabilities[0] = "mutated"
 
-	assert.Equal(t, "native", info.ComputeDrivers[0].Name)
-	assert.Equal(t, "macos", info.ComputeDrivers[0].WorkloadCompatibility.OperatingSystem)
-	assert.Equal(t, "arm64", info.ComputeDrivers[0].WorkloadCompatibility.Architecture)
-	assert.Equal(t, "Setuid executables cannot run in this runtime.", info.ComputeDrivers[0].WorkloadCompatibility.ExecutionRestrictions[0])
+	assert.Equal(t, "k8s", info.ComputeDrivers[0].Name)
 	assert.Equal(t, "k8s", info.Extensions[0].ConfiguredName)
 	assert.Equal(t, "openshell.compute.contract", info.Extensions[0].SupportedCapabilities[0])
 }

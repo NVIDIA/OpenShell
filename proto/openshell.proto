@@ -3219,6 +3219,7 @@ message SupervisorMessage {
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
     ConfigUpdateResult config_update_result = 5;
+    SupervisorServiceAdvertisement service_advertisement = 6;
   }
 }
 
@@ -3232,6 +3233,7 @@ message GatewayMessage {
     RelayClose relay_close = 5;
     SessionRedirect session_redirect = 6;
     ConfigUpdate config_update = 7;
+    ServiceRouteLease service_route_lease = 8;
   }
 }
 
@@ -3246,10 +3248,11 @@ message SupervisorHello {
   uint64 connection_epoch = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
-  // Set when this connection is the result of following a SessionRedirect. The
-  // receiving gateway serves a redirected hello locally instead of redirecting
-  // again, so a disagreement about membership cannot bounce the supervisor
-  // between replicas. A gateway that is shutting down may still redirect it.
+  // Set when this connection follows a SessionRedirect, or dials the replica
+  // serving the sandbox's shared supervisor. The receiving gateway serves a
+  // redirected hello locally instead of redirecting again, so a disagreement
+  // about membership cannot bounce the supervisor between replicas. A gateway
+  // that is shutting down may still redirect it.
   bool redirected = 5;
   // The supervisor understands SessionRedirect. Gateways never redirect a
   // supervisor that does not set this.
@@ -3259,6 +3262,7 @@ message SupervisorHello {
   // ConfigUpdate payloads, and answers each with its result and admission.
   // Gateways push configuration only to supervisors that set this.
   bool supports_config_push = 7;
+  bool supports_service_advertisements = 8;
 }
 
 // Gateway accepts the supervisor session.
@@ -4235,4 +4239,26 @@ message EndpointFailure {
   // Supervisor-minted UUID of the refused exchange. The workload receives the
   // same value in the x-openshell-request-id response header.
   string request_id = 8;
+}
+
+// Gateway lease challenge on an authenticated sandbox supervisor session.
+// Expiry is measured from gateway issuance, never report receipt.
+message ServiceRouteLease {
+  uint64 sequence = 1;
+  google.protobuf.Duration duration = 2;
+  // Absolute deadline prevents a queued challenge extending serving authority
+  // after takeover. Hosts cap this by duration and require synchronized clocks.
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+// Complete installed-route replacement for a live lease challenge. The
+// supervisor reports only if its remaining serving freshness covers duration.
+// No address is accepted from the supervisor; the compute driver supplies it.
+message SupervisorServiceAdvertisement {
+  uint64 lease_sequence = 1;
+  string configuration_instance_id = 2;
+  uint64 config_revision = 3;
+  repeated openshell.sandbox.v1.SandboxServiceRoute routes = 4;
+  // Domain actually installed by the process listener, not the gateway URL.
+  string service_domain = 5;
 }

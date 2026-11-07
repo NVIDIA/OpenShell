@@ -30,6 +30,10 @@ mod linux {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use crate::accept_errors::{
+        RESOURCE_ERROR_BACKOFF, ResourceBackoffLogger, is_peer_reset, is_pending_network_error,
+        is_transient_resource_error,
+    };
     use crate::boundary_io::BoundaryRuntimeState;
     use crate::delegated::{AgentSignaler, spawn_workload};
     use crate::main_session::{MainOutput, MainSession};
@@ -93,6 +97,10 @@ mod linux {
     /// Bound the wait for a flush before acknowledging termination. A timed-out
     /// blocking task cannot be cancelled and may outlive the acknowledgement.
     const FILESYSTEM_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
+    /// Bound the process runtime's shutdown after the boundary stops serving.
+    /// A blocking task such as a supervisor's agent `Wait` can outlive the
+    /// termination that would end it, and the shutdown cannot cancel it.
+    const PROCESS_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const MAX_CONTROL_CONNECTIONS: usize = 128;
     /// Bounds one runtime-initiated dial, including finding the supervisor
@@ -293,7 +301,17 @@ mod linux {
             launcher,
             qualification,
         )?);
-        serve(&config.listener, runtime)
+        serve_then_stop(process_runtime, &config.listener, runtime)
+    }
+
+    fn serve_then_stop(
+        process_runtime: tokio::runtime::Runtime,
+        config: &BoundaryListenerConfig,
+        runtime: Arc<BoundaryRuntime>,
+    ) -> Result<(), String> {
+        let result = serve(config, runtime);
+        process_runtime.shutdown_timeout(PROCESS_RUNTIME_SHUTDOWN_TIMEOUT);
+        result
     }
 
     fn make_boundary_nondumpable() -> Result<(), String> {
@@ -603,6 +621,36 @@ mod linux {
         Some(Ok(()))
     }
 
+    /// What the boundary control accept loop does with an accept error.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ControlAcceptErrorAction {
+        /// Keep polling the listener immediately. A refused or already-dead
+        /// peer must not stop the listener.
+        Continue,
+        /// Retry after a short backoff: transient resource exhaustion.
+        Backoff,
+        /// Unrecoverable: end the boundary.
+        Fatal,
+    }
+
+    fn control_accept_error_action(error: &io::Error) -> ControlAcceptErrorAction {
+        if is_peer_reset(error)
+            || is_pending_network_error(error)
+            || matches!(
+                error.kind(),
+                // PermissionDenied is this listener's own local-peer
+                // rejection (an injected EACCES), not an accept failure.
+                io::ErrorKind::Interrupted | io::ErrorKind::PermissionDenied
+            )
+        {
+            ControlAcceptErrorAction::Continue
+        } else if is_transient_resource_error(error) {
+            ControlAcceptErrorAction::Backoff
+        } else {
+            ControlAcceptErrorAction::Fatal
+        }
+    }
+
     fn serve(config: &BoundaryListenerConfig, runtime: Arc<BoundaryRuntime>) -> Result<(), String> {
         let dial_tls = match config {
             BoundaryListenerConfig::RuntimeInitiatedTlsTcp { tls, .. }
@@ -618,12 +666,16 @@ mod linux {
         let active_connections = Arc::new(AtomicUsize::new(0));
         let pending_handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         tracing::info!(?config, "Boundary control listener ready");
+        // Warn once per exhaustion episode plus a bounded re-warn cadence,
+        // not on every backoff retry.
+        let mut resource_backoff_log = ResourceBackoffLogger::new();
         loop {
             if let Some(result) = take_termination(&runtime) {
                 return result;
             }
             match listener.accept() {
                 Ok(stream) => {
+                    resource_backoff_log.reset();
                     // Unauthenticated sockets use only a bounded async TLS
                     // task, never an OS thread or an authenticated session slot.
                     let Ok(pending) = pending_handshakes.clone().try_acquire_owned() else {
@@ -647,20 +699,24 @@ mod linux {
                         }
                     });
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                // A refused or already-dead peer must not stop the listener.
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::PermissionDenied
-                            | io::ErrorKind::NotConnected
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::ConnectionAborted
-                    ) => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                Err(error) => return Err(format!("accept boundary control connection: {error}")),
+                Err(error) => match control_accept_error_action(&error) {
+                    ControlAcceptErrorAction::Continue => {}
+                    ControlAcceptErrorAction::Backoff => {
+                        if resource_backoff_log.should_log(&error) {
+                            tracing::warn!(
+                                %error,
+                                "Boundary control accept hit a transient resource limit; retrying"
+                            );
+                        }
+                        std::thread::sleep(RESOURCE_ERROR_BACKOFF);
+                    }
+                    ControlAcceptErrorAction::Fatal => {
+                        return Err(format!("accept boundary control connection: {error}"));
+                    }
+                },
             }
         }
     }
@@ -6190,6 +6246,242 @@ mod linux {
             );
         }
 
+        /// Send one logical request on its own exchange and return the reply.
+        async fn exchange_request(
+            channel: tonic::transport::Channel,
+            handle: &str,
+            request: Request,
+            token: &str,
+        ) -> Response {
+            let request = RequestEnvelope::new(request).expect("encode request");
+            let frames = tokio_stream::iter([
+                openshell_sandbox_backend::isolation_protocol::exchange_frame(handle),
+                openshell_sandbox_backend::isolation_protocol::request_chunk(&request)
+                    .expect("typed logical request"),
+            ]);
+            let mut body = SandboxProtocolClient::new(channel)
+                .exchange(bearer_request(frames, token))
+                .await
+                .expect("exchange logical request")
+                .into_inner();
+            let mut frame = Vec::new();
+            while let Some(chunk) = body.message().await.expect("read gRPC response") {
+                frame.extend_from_slice(&chunk_data(chunk).unwrap());
+            }
+            openshell_sandbox_backend::boundary_protocol::decode_frame::<ResponseEnvelope>(&frame)
+                .expect("decode logical response")
+                .response
+        }
+
+        /// A shared supervisor outlives the sandboxes it serves and keeps
+        /// their exchanges open, so SIGTERM must end the process without
+        /// waiting for the supervisor to close them.
+        #[test]
+        fn sigterm_exits_while_the_supervisor_holds_an_exchange_open() {
+            const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_SIGTERM_CHILD";
+            const EXIT_BUDGET: Duration = Duration::from_secs(10);
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                run_isolated(
+                    "boundary_server::linux::tests::sigterm_exits_while_the_supervisor_holds_an_exchange_open",
+                    CHILD_MARKER,
+                    Duration::from_mins(1),
+                );
+                return;
+            }
+
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (server_tls, client_tls) = stage_test_tls(directory.path(), "sigterm");
+            let socket_path = directory.path().join("supervisor.sock");
+            let listener = BoundaryListenerConfig::RuntimeInitiatedUnix {
+                socket_path: socket_path.clone(),
+                tls: server_tls,
+            };
+            let supervisor_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("supervisor runtime");
+            let supervisor_listener = {
+                let _entered = supervisor_runtime.enter();
+                tokio::net::UnixListener::bind(&socket_path).expect("bind supervisor socket")
+            };
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let (network_broker, workload_launcher) = test_network_broker();
+            let (verification_key, token) = test_auth_material("sigterm");
+            let boundary = {
+                let _entered = process_runtime.enter();
+                Arc::new(
+                    BoundaryRuntime::new(
+                        BoundaryConfig {
+                            boundary_id: "sigterm".to_string(),
+                            generation: "generation-1".to_string(),
+                            session_id: test_session_id(),
+                            session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                                .expect("session rotation"),
+                            auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                            gateway_id: "test-gateway".to_string(),
+                            verification_keys: vec![verification_key],
+                            listener: listener.clone(),
+                            resource_claims: std::collections::BTreeMap::new(),
+                            resource_claim_files: std::collections::BTreeMap::new(),
+                            workload_identity: test_workload_identity(),
+                            provisioning_evidence: test_provisioning_evidence(),
+                            child_env: std::collections::HashMap::new(),
+                        },
+                        process_runtime.handle().clone(),
+                        network_broker,
+                        workload_launcher,
+                        test_runtime_qualification(),
+                    )
+                    .expect("test boundary runtime"),
+                )
+            };
+            let opening = test_open_request(&boundary.config);
+            let (signalled_sender, signalled) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let supervisor = std::panic::AssertUnwindSafe(|| {
+                    supervisor_runtime.block_on(async move {
+                        let (stream, _) = supervisor_listener.accept().await.expect("runtime dial");
+                        let server_name =
+                            rustls::pki_types::ServerName::try_from(client_tls.server_name.clone())
+                                .expect("valid server name");
+                        let stream = tokio_rustls::TlsConnector::from(Arc::new(
+                            test_client_config(&client_tls),
+                        ))
+                        .connect(server_name, stream)
+                        .await
+                        .expect("verify runtime TLS");
+                        let mut stream = Some(stream);
+                        let channel = tonic::transport::Endpoint::from_static(
+                            "http://boundary.openshell.internal",
+                        )
+                        .connect_with_connector(tower::service_fn(
+                            move |_: tonic::transport::Uri| {
+                                let stream = stream.take();
+                                async move {
+                                    stream.map(hyper_util::rt::TokioIo::new).ok_or_else(|| {
+                                        io::Error::other("the runtime connection is in use")
+                                    })
+                                }
+                            },
+                        ))
+                        .await
+                        .expect("gRPC over the runtime connection");
+                        let handle = test_open_boundary(channel.clone(), opening, &token).await;
+                        let attach = Request::Attach {
+                            supervisor_instance_id: test_supervisor_instance_id(),
+                            policy: Box::new(takeover_test_policy()),
+                            supervisor_takeover: None,
+                            supervisor_recovery_timeout_secs: None,
+                        };
+                        assert!(matches!(
+                            exchange_request(channel.clone(), &handle, attach, &token).await,
+                            Response::Attached { .. }
+                        ));
+                        assert!(matches!(
+                            exchange_request(channel.clone(), &handle, Request::Confirm, &token)
+                                .await,
+                            Response::Confirmed { .. }
+                        ));
+                        let start = Request::StartAgent {
+                            sandbox_id: "sigterm".to_string(),
+                            spec: AgentSpecWire {
+                                program: "/bin/sleep".to_string(),
+                                args: vec!["300".to_string()],
+                                workdir: None,
+                                timeout_secs: 0,
+                                interactive: false,
+                                otlp_relay_active: false,
+                            },
+                            ca_cert: None,
+                            ca_bundle: None,
+                            provider_env_revision: 0,
+                            provider_env: std::collections::HashMap::new(),
+                            provider_files: std::collections::HashMap::new(),
+                        };
+                        let process_id =
+                            match exchange_request(channel.clone(), &handle, start, &token).await {
+                                Response::Started { process_id, .. } => process_id,
+                                response => panic!("the agent did not start: {response:?}"),
+                            };
+                        // The supervisor waits for the agent and for workload
+                        // connections for as long as the sandbox runs.
+                        let mut parked = Vec::new();
+                        for request in [Request::Wait { process_id }, Request::AcceptNetwork] {
+                            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+                            sender
+                                .send(
+                                    openshell_sandbox_backend::isolation_protocol::exchange_frame(
+                                        &handle,
+                                    ),
+                                )
+                                .await
+                                .expect("bind exchange");
+                            sender
+                                .send(
+                                    openshell_sandbox_backend::isolation_protocol::request_chunk(
+                                        &RequestEnvelope::new(request).expect("encode request"),
+                                    )
+                                    .expect("typed request"),
+                                )
+                                .await
+                                .expect("send request");
+                            let pending = SandboxProtocolClient::new(channel.clone())
+                                .exchange(bearer_request(ReceiverStream::new(receiver), &token))
+                                .await
+                                .expect("open exchange")
+                                .into_inner();
+                            parked.push((sender, pending));
+                        }
+                        for (_, pending) in &mut parked {
+                            assert!(
+                                tokio::time::timeout(Duration::from_millis(500), pending.message())
+                                    .await
+                                    .is_err(),
+                                "a parked exchange answered before termination"
+                            );
+                        }
+                        signalled_sender
+                            .send(std::time::Instant::now())
+                            .expect("report SIGTERM time");
+                        nix::sys::signal::kill(
+                            nix::unistd::Pid::this(),
+                            nix::sys::signal::Signal::SIGTERM,
+                        )
+                        .expect("send SIGTERM");
+                        std::future::pending::<()>().await;
+                        drop(parked);
+                    });
+                });
+                if std::panic::catch_unwind(supervisor).is_err() {
+                    std::process::exit(1);
+                }
+            });
+
+            // The parked `Wait` blocks shutdown only when the shutdown cancels
+            // the agent's reaper before it records the exit, so a task that
+            // never ends stands in for that loss.
+            process_runtime.spawn_blocking(|| {
+                loop {
+                    std::thread::park();
+                }
+            });
+            install_boundary_signal_handlers().expect("install termination handlers");
+            serve_then_stop(process_runtime, &listener, boundary)
+                .expect("terminate after supervisor confirmation");
+            let elapsed = signalled
+                .recv()
+                .expect("the supervisor sent SIGTERM")
+                .elapsed();
+            assert!(
+                elapsed < EXIT_BUDGET,
+                "the boundary took {elapsed:?} to stop after SIGTERM"
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn grpc_blackhole_expires_connection_and_releases_mediation_lease() {
             let (runtime, token) = availability_test_runtime();
@@ -10048,6 +10340,244 @@ mod linux {
                 process_runtime.block_on(session.process.wait()),
                 Ok(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(0))
             ));
+        }
+
+        #[test]
+        fn transient_accept_resource_errors_back_off_instead_of_ending_the_boundary() {
+            for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+                assert_eq!(
+                    control_accept_error_action(&io::Error::from_raw_os_error(code)),
+                    ControlAcceptErrorAction::Backoff,
+                    "errno {code} should back off and retry"
+                );
+            }
+        }
+
+        #[test]
+        fn dead_peers_do_not_end_the_boundary_control_listener() {
+            for error in [
+                io::Error::new(io::ErrorKind::Interrupted, "interrupted"),
+                io::Error::from_raw_os_error(libc::EACCES),
+                io::Error::new(io::ErrorKind::NotConnected, "not connected"),
+                io::Error::new(io::ErrorKind::ConnectionReset, "reset"),
+                io::Error::new(io::ErrorKind::ConnectionAborted, "aborted"),
+                // Linux reports already-pending network errors of a queued
+                // connection from accept; the man page says to retry them.
+                io::Error::from_raw_os_error(libc::ENETDOWN),
+                io::Error::from_raw_os_error(libc::EPROTO),
+                io::Error::from_raw_os_error(libc::EHOSTUNREACH),
+                io::Error::from_raw_os_error(libc::ENETUNREACH),
+            ] {
+                assert_eq!(
+                    control_accept_error_action(&error),
+                    ControlAcceptErrorAction::Continue
+                );
+            }
+        }
+
+        #[test]
+        fn unrecoverable_accept_errors_end_the_boundary_control_listener() {
+            for error in [
+                io::Error::from_raw_os_error(libc::EBADF),
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid"),
+            ] {
+                assert_eq!(
+                    control_accept_error_action(&error),
+                    ControlAcceptErrorAction::Fatal
+                );
+            }
+        }
+
+        /// Drive `serve` through a real EMFILE: exhaust the descriptor table
+        /// while a control connection is queued, require the accept loop to
+        /// keep retrying, then free a descriptor and require the loop to
+        /// still serve and shut down cleanly.
+        ///
+        /// The descriptor table is process-global, so the EMFILE window runs
+        /// in an isolated child of this test binary, like the reaper test in
+        /// `managed_children`.
+        #[test]
+        fn serve_keeps_serving_through_transient_resource_errors() {
+            const HELPER_ENV: &str = "OPENSHELL_BOUNDARY_SERVE_EMFILE_HELPER";
+
+            /// Read until the control listener closes the connection. It may
+            /// answer garbage with a TLS alert record before it closes.
+            fn drain_until_closed(socket: &socket2::Socket) {
+                let mut buffer = [std::mem::MaybeUninit::new(0_u8); 8];
+                while socket.recv(&mut buffer).expect("control connection answer") > 0 {}
+            }
+            if std::env::var_os(HELPER_ENV).is_none() {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "boundary_server::linux::tests::serve_keeps_serving_through_transient_resource_errors",
+                        "--nocapture",
+                    ])
+                    .env(HELPER_ENV, "1")
+                    .output()
+                    .expect("start isolated boundary serve test process");
+                assert!(
+                    output.status.success(),
+                    "boundary serve test failed:\n{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                return;
+            }
+
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (server_tls, _client_tls) = stage_test_tls(directory.path(), "serve-emfile");
+            let socket_path = directory.path().join("control.sock");
+            let (broker, launcher) = test_network_broker();
+            let (verification_key, _token) = test_auth_material("serve-emfile");
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let runtime = Arc::new(
+                BoundaryRuntime::new(
+                    BoundaryConfig {
+                        boundary_id: "serve-emfile".to_string(),
+                        generation: "generation-1".to_string(),
+                        session_id: test_session_id(),
+                        session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                            .expect("session rotation"),
+                        auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                        gateway_id: "test-gateway".to_string(),
+                        verification_keys: vec![verification_key],
+                        listener: BoundaryListenerConfig::Unix {
+                            socket_path: socket_path.clone(),
+                            tls: server_tls.clone(),
+                        },
+                        resource_claims: std::collections::BTreeMap::new(),
+                        resource_claim_files: std::collections::BTreeMap::new(),
+                        workload_identity: test_workload_identity(),
+                        provisioning_evidence: test_provisioning_evidence(),
+                        child_env: std::collections::HashMap::new(),
+                    },
+                    process_runtime.handle().clone(),
+                    broker,
+                    launcher,
+                    test_runtime_qualification(),
+                )
+                .expect("test boundary runtime"),
+            );
+            let config = BoundaryListenerConfig::Unix {
+                socket_path: socket_path.clone(),
+                tls: server_tls,
+            };
+            let server = std::thread::spawn(move || serve(&config, runtime));
+
+            // The client socket is allocated before the descriptor table
+            // fills, so queueing the connection later needs no descriptor.
+            let client = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+                .expect("client socket");
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("client read timeout");
+            let peer = socket2::SockAddr::unix(&socket_path).expect("client address");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !socket_path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                socket_path.exists(),
+                "boundary control listener was not bound"
+            );
+
+            // Readiness probe: a garbage connection that the server accepts
+            // and then closes proves serve finished loading its TLS identity
+            // (bind completed) and is polling accept, so filling the
+            // descriptor table cannot race the identity load.
+            let probe = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+                .expect("probe socket");
+            probe
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("probe read timeout");
+            probe.connect(&peer).expect("connect probe");
+            probe
+                .send(&[0_u8; 16])
+                .expect("send garbage to the control listener");
+            drain_until_closed(&probe);
+            drop(probe);
+            assert!(
+                !server.is_finished(),
+                "serve ended before the descriptor table was filled"
+            );
+
+            // Lower the soft limit to just above the current descriptor use
+            // and fill every slot below it, so the next accept that needs a
+            // descriptor fails with EMFILE. The hard limit caps the target so
+            // setrlimit cannot fail on a tight container limit.
+            let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+            let open = u64::try_from(
+                std::fs::read_dir("/proc/self/fd")
+                    .expect("count open descriptors")
+                    .count(),
+            )
+            .expect("descriptor count");
+            let soft_target = nofile
+                .maximum
+                .map_or_else(|| open + 16, |max| (open + 16).min(max));
+            rustix::process::setrlimit(
+                rustix::process::Resource::Nofile,
+                rustix::process::Rlimit {
+                    current: Some(soft_target),
+                    maximum: nofile.maximum,
+                },
+            )
+            .expect("lower descriptor soft limit");
+            // An empty fill list means the table was already at the limit,
+            // which still gives accept its EMFILE.
+            let mut fillers = Vec::new();
+            while let Ok(file) = File::open("/dev/null") {
+                fillers.push(file);
+            }
+
+            // Queue the control connection: the accept loop now hits EMFILE
+            // with a pending peer and must back off and retry for as long as
+            // the table stays full.
+            client.connect(&peer).expect("queue control connection");
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !server.is_finished(),
+                "serve ended on a transient EMFILE accept error"
+            );
+
+            // Freeing one descriptor lets the loop accept the queued
+            // connection: the garbage bytes are consumed, the listener
+            // answers with a TLS alert, and the connection closes, which
+            // only happens if accept recovered.
+            drop(fillers.pop().expect("a filler descriptor to free"));
+            client
+                .send(&[0_u8; 16])
+                .expect("send garbage after recovery");
+            drain_until_closed(&client);
+            assert!(
+                !server.is_finished(),
+                "serve ended after the descriptor table recovered"
+            );
+
+            // End the loop the way production does and require a termination
+            // result, not an accept failure.
+            request_boundary_termination(libc::SIGTERM);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !server.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                server.is_finished(),
+                "serve ignored the termination request"
+            );
+            let message = server
+                .join()
+                .expect("serve thread panicked")
+                .expect_err("serve returned success without a supervisor");
+            assert!(
+                message.contains("SIGTERM")
+                    && !message.contains("accept boundary control connection"),
+                "serve ended with an unexpected error: {message}"
+            );
         }
     }
 }

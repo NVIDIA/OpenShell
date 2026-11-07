@@ -59,7 +59,16 @@ impl SupervisorHost for SupervisorHostService {
                 Status::failed_precondition("this gateway does not host a shared supervisor")
             })?
             .clone();
+        // A stopping replica sheds its hosts so they reattach to a live one
+        // before their sandbox sessions follow them there.
+        let mut shutdown = self.state.supervisor_sessions.subscribe_shutdown();
+        if *shutdown.borrow() {
+            return Err(Status::unavailable("gateway is shutting down"));
+        }
         let outbound = controller.attach(identity, request.into_inner()).await?;
+        let outbound = futures::StreamExt::take_until(outbound, async move {
+            let _ = shutdown.wait_for(|shutdown| *shutdown).await;
+        });
         Ok(Response::new(Box::pin(outbound)))
     }
 }
