@@ -606,6 +606,7 @@ fn summarize_draft_chunk_rule(chunk: &DraftChunkRecord) -> Result<String, Status
 /// The string is the entire output — no taxonomy, no greppable prefixes; the
 /// reviewer reads it like an OCSF shorthand line. One of:
 ///
+/// - `prover: unsupported MCP rules; manual review required`
 /// - `prover: no new findings`
 /// - `prover: N new finding(s)` followed by one `  <category>: <detail>`
 ///   line per finding path (categorical shorthand from `openshell-prover`)
@@ -635,37 +636,7 @@ fn validation_result_for_agent_proposal(
         return format!("policy invalid: {}", one_line(&error.to_string()));
     }
 
-    let merged_findings = match run_prover_findings(&merged, credentials) {
-        Ok(findings) => findings,
-        Err(error) => {
-            warn!(error = %error, "prover validation unavailable for merged policy");
-            return "validation unavailable".to_string();
-        }
-    };
-    // A delta requires conclusive results for both policies.
-    let base_findings = match run_prover_findings(&current_policy, credentials) {
-        Ok(findings) => findings,
-        Err(error) => {
-            warn!(error = %error, "prover validation unavailable for baseline policy");
-            return "validation unavailable".to_string();
-        }
-    };
-
-    let new_findings = finding_delta(&base_findings, &merged_findings);
-    if new_findings.is_empty() {
-        return "prover: no new findings".to_string();
-    }
-    let count = new_findings.len();
-    let mut out = format!(
-        "prover: {} new finding{}",
-        count,
-        if count == 1 { "" } else { "s" }
-    );
-    for finding in &new_findings {
-        out.push_str("\n  ");
-        out.push_str(&finding_shorthand(finding));
-    }
-    out
+    proposal_prover_result(&current_policy, &merged, credentials)
 }
 
 #[derive(Debug)]
@@ -697,6 +668,14 @@ fn proposal_prover_result(
     candidate_effective_policy: &ProtoSandboxPolicy,
     credentials: &CredentialSet,
 ) -> String {
+    if [current_effective_policy, candidate_effective_policy]
+        .into_iter()
+        .flat_map(|policy| policy.network_policies.values())
+        .flat_map(|rule| &rule.endpoints)
+        .any(|endpoint| endpoint.protocol.eq_ignore_ascii_case("mcp"))
+    {
+        return "prover: unsupported MCP rules; manual review required".to_string();
+    }
     let candidate_findings = match run_prover_findings(candidate_effective_policy, credentials) {
         Ok(findings) => findings,
         Err(error) => {
@@ -735,7 +714,7 @@ fn compute_proposal_review_token(
     credentials: &CredentialSet,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-proposal-evaluator-v3\0");
+    hasher.update(b"openshell-proposal-evaluator-v4\0");
     hasher.update(rule_name.as_bytes());
     hasher.update(canonical_rule_bytes(rule));
     hasher.update(deterministic_policy_hash(current_effective_policy).as_bytes());
@@ -773,7 +752,7 @@ fn compute_failed_proposal_evaluation_hash(
     application_error: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-proposal-evaluator-v3-failed\0");
+    hasher.update(b"openshell-proposal-evaluator-v4-failed\0");
     hasher.update(rule_name.as_bytes());
     hasher.update(canonical_rule_bytes(rule));
     hasher.update(deterministic_policy_hash(current_effective_policy).as_bytes());
@@ -1848,7 +1827,7 @@ async fn auto_approve_chunk(
             validation_result = %validation_result,
             source = %context.source,
             resolved_from = %context.resolved_from,
-            "Auto-approval skipped: current stored rule has prover findings"
+            "Auto-approval skipped: current stored rule requires human review"
         );
         return Ok(());
     }
@@ -19114,6 +19093,171 @@ mod tests {
                 "validation unavailable"
             );
         }
+    }
+
+    #[test]
+    fn proposal_prover_mcp_rules_require_manual_review_on_either_side() {
+        let mcp = openshell_policy::parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  mcp:
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_public
+    binaries:
+      - path: /usr/bin/curl
+",
+        )
+        .unwrap();
+        let empty = ProtoSandboxPolicy::default();
+        for (base, candidate) in [(&empty, &mcp), (&mcp, &empty), (&mcp, &mcp)] {
+            assert_eq!(
+                proposal_prover_result(base, candidate, &CredentialSet::default()),
+                "prover: unsupported MCP rules; manual review required"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_proposals_refresh_legacy_clean_verdict_and_require_manual_approval() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox(
+            "sb-mcp-review",
+            "mcp-review",
+            ProtoSandboxPolicy::default(),
+            vec![],
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_approval_mode(&state, "mcp-review", "auto").await;
+        let policy = openshell_policy::parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  mcp:
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_public
+    binaries:
+      - path: /usr/bin/curl
+",
+        )
+        .unwrap();
+        let response = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "mcp-review".to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "mcp".to_string(),
+                    proposed_rule: Some(policy.network_policies["mcp"].clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = &response.accepted_chunk_ids[0];
+        let mut chunk = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.status, "pending");
+        assert_eq!(
+            chunk.validation_result,
+            "prover: unsupported MCP rules; manual review required"
+        );
+        assert!(chunk.application_error.is_empty());
+        let evaluation =
+            evaluate_stored_chunk_against_live_inputs(&state, "default", &sandbox, &chunk, None)
+                .await
+                .unwrap();
+        let mut legacy = Sha256::new();
+        legacy.update(b"openshell-proposal-evaluator-v3\0");
+        legacy.update(evaluation.rule_name.as_bytes());
+        legacy.update(canonical_rule_bytes(&evaluation.rule));
+        legacy.update(evaluation.current_hash().as_bytes());
+        legacy.update(evaluation.candidate_hash().as_bytes());
+        chunk.review_token = hex::encode(legacy.finalize());
+        chunk.validation_result = "prover: no new findings".to_string();
+        assert!(
+            state
+                .store
+                .update_draft_chunk_evaluation(&chunk)
+                .await
+                .unwrap()
+        );
+        let error = auto_approve_chunk(
+            &state,
+            chunk_id,
+            AutoApproveChunkContext {
+                sandbox: &sandbox,
+                workspace: "default",
+                source: "agent_authored",
+                resolved_from: "sandbox",
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        let refreshed = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(refreshed.review_token, chunk.review_token);
+        assert_eq!(refreshed.status, "pending");
+        assert_eq!(
+            refreshed.validation_result,
+            "prover: unsupported MCP rules; manual review required"
+        );
+        assert!(
+            current_base_policy_for_sandbox(state.store.as_ref(), &sandbox)
+                .await
+                .unwrap()
+                .network_policies
+                .is_empty()
+        );
+        handle_approve_draft_chunk(
+            &state,
+            with_user(Request::new(ApproveDraftChunkRequest {
+                sandbox: "mcp-review".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id: chunk_id.clone(),
+                review_token: refreshed.review_token,
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        let approved = current_base_policy_for_sandbox(state.store.as_ref(), &sandbox)
+            .await
+            .unwrap();
+        assert_eq!(
+            approved.network_policies["mcp"].endpoints[0].rules[0]
+                .allow
+                .as_ref()
+                .unwrap()
+                .params["name"]
+                .glob,
+            "read_public"
+        );
     }
 
     /// `protocol: rest, access: full` on a host where the binary had no
