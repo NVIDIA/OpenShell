@@ -236,6 +236,8 @@ def native_endpoint_server() -> Iterator[int]:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded)))
+                separator = "&" if "?" in self.path else "?"
+                self.send_header("Link", f"<{self.path}{separator}page=2>; rel=next")
                 self.end_headers()
                 self.wfile.write(encoded)
 
@@ -723,6 +725,163 @@ def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
                     assert payload["path"] == "/v1/chat/completions"
                     assert payload["authorization"] == f"Bearer {secret}"
                     assert body["model"] == "fixture-openai-model"
+
+
+@pytest.mark.parametrize(
+    "placement",
+    ["authorization", "missing", "header", "query", "path", "unused-fields"],
+)
+def test_static_header_credentials_reject_reflective_request_locations(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+    placement: str,
+) -> None:
+    """Missing metadata restricts substitution to Authorization and explicit body rewriting."""
+    stub = sandbox_client._stub
+    profile_id = f"e2e-placement-{time.time_ns()}"
+    secret = "synthetic-placement-secret"
+    profile = _native_inference_profile(
+        profile_id=profile_id,
+        env_var="API_TOKEN",
+        port=0,
+        rules=[sandbox_pb2.L7Rule(allow=sandbox_pb2.L7Allow(method="*", path="/**"))],
+    )
+    credential = profile.credentials[0]
+    if placement == "missing":
+        credential.auth_style = ""
+        credential.header_name = ""
+    elif placement == "unused-fields":
+        credential.auth_style = "bearer"
+        credential.header_name = "Authorization"
+        credential.query_param = "api_key"
+        credential.path_template = "/v1/{credential}/resources"
+    elif placement in {"header", "query", "path"}:
+        credential.auth_style = placement
+        credential.header_name = "x-api-key" if placement == "header" else ""
+        credential.query_param = "api_key" if placement == "query" else ""
+        credential.path_template = (
+            "/credential/{credential}/search" if placement == "path" else ""
+        )
+    profile.endpoints[0].request_body_credential_rewrite = True
+
+    def probe_locations(host: str, port: int, placement: str) -> str:
+        import json
+        import os
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        token = os.environ["API_TOKEN"]
+        root = f"http://{host}:{port}"
+        query_key = "api_key" if placement == "unused-fields" else "probe"
+        encoded_token = urllib.parse.quote(token, safe="")
+        token_path = (
+            f"/v1/{encoded_token}/resources"
+            if placement == "unused-fields"
+            else f"/{encoded_token}/search"
+        )
+        requests = [
+            urllib.request.Request(
+                root
+                + "/search?"
+                + urllib.parse.urlencode(
+                    {"q": "rust", "per_page": "1", query_key: token}
+                )
+            ),
+            urllib.request.Request(
+                root + "/search", headers={"X-Other-Credential": token}
+            ),
+            urllib.request.Request(root + token_path),
+            urllib.request.Request(
+                root + "/search",
+                data=urllib.parse.urlencode({"token": token}).encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            ),
+        ]
+        results = []
+        for request in requests:
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    results.append(
+                        {
+                            "status": response.status,
+                            "body": response.read().decode(),
+                            "link": response.headers.get("Link"),
+                        }
+                    )
+            except urllib.error.HTTPError as error:
+                results.append(
+                    {
+                        "status": error.code,
+                        "body": error.read().decode(),
+                        "link": error.headers.get("Link"),
+                    }
+                )
+        target = "/search?q=rust&per_page=1"
+        headers = {"Authorization": f"token {token}"}
+        if placement == "header":
+            headers = {"x-api-key": token}
+        elif placement == "query":
+            target += "&" + urllib.parse.urlencode({"api_key": token})
+            headers = {}
+        elif placement == "path":
+            target = (
+                "/credential/"
+                + urllib.parse.quote(token, safe="")
+                + "/search?q=rust&per_page=1"
+            )
+            headers = {}
+        request = urllib.request.Request(root + target, headers=headers)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            valid = {
+                "body": json.loads(response.read()),
+                "link": response.headers.get("Link"),
+            }
+        return json.dumps({"denied": results, "valid": valid})
+
+    with native_endpoint_server() as port:
+        profile.endpoints[0].port = port
+        with (
+            imported_provider_profile(
+                stub, profile=profile, source=f"{profile_id}.yaml"
+            ),
+            provider(
+                stub,
+                name=f"{profile_id}-provider",
+                provider_type=profile_id,
+                credentials={"API_TOKEN": secret},
+                profile_workspace="default",
+            ) as attached_provider,
+        ):
+            spec = datamodel_pb2.SandboxSpec(
+                policy=_default_policy(), providers=[attached_provider]
+            )
+            with sandbox(spec=spec, delete_on_exit=True) as sb:
+                result = sb.exec_python(
+                    probe_locations,
+                    args=("host.openshell.internal", port, placement),
+                    timeout_seconds=180,
+                )
+                assert result.exit_code == 0, result.stderr
+                payload = json.loads(result.stdout)
+                for result in payload["denied"][:3]:
+                    assert result["status"] == 403, result
+                    assert "credential_placement_mismatch" in result["body"]
+                    assert secret not in result["body"]
+                    assert result["link"] is None
+                body_result = payload["denied"][3]
+                assert body_result["status"] == 200, body_result
+                assert secret in body_result["body"]
+                valid = payload["valid"]
+                if placement in {"authorization", "missing", "unused-fields"}:
+                    assert valid["body"]["authorization"] == f"token {secret}"
+                elif placement == "header":
+                    assert valid["body"]["x_api_key"] == secret
+                else:
+                    assert secret in valid["body"]["path"]
+                assert "page=2" in valid["link"]
+                if placement in {"authorization", "missing", "header", "unused-fields"}:
+                    assert secret not in valid["link"]
 
 
 def test_imported_anthropic_profile_allows_native_endpoint_with_attached_provider(

@@ -686,6 +686,7 @@ pub async fn run_network_proxy(
         sandbox_id: String::new(),
         sandbox_name: "network-proxy".to_string(),
         container_image: String::new(),
+        container_image_uid: None,
         hostname,
         product_version: openshell_core::VERSION.to_string(),
         proxy_ip: listen.ip(),
@@ -859,6 +860,7 @@ pub fn sandbox_instance_event_context(
         sandbox_id: sandbox_id.unwrap_or_default().to_string(),
         sandbox_name: sandbox.unwrap_or_default().to_string(),
         container_image,
+        container_image_uid: None,
         hostname,
         product_version: openshell_core::VERSION.to_string(),
         proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
@@ -900,7 +902,13 @@ pub struct SandboxInstanceConfig {
     pub sandbox: Option<String>,
     /// Workload image recorded in this instance's OCSF events.
     pub container_image: String,
+    /// Immutable workload image ID resolved by the driver, when available.
+    pub container_image_uid: Option<String>,
     pub openshell_endpoint: Option<String>,
+    /// Peer endpoint of the gateway replica serving the shared host, which
+    /// the session dials instead of `openshell_endpoint` when set and
+    /// nonempty.
+    pub gateway_home: Option<tokio::sync::watch::Receiver<Option<String>>>,
     pub policy_rules: Option<String>,
     pub policy_data: Option<String>,
     pub ssh_socket_path: Option<String>,
@@ -935,11 +943,15 @@ impl SandboxInstanceConfig {
     /// OCSF identity of this sandbox instance.
     #[must_use]
     pub fn event_context(&self) -> EventContext {
-        sandbox_instance_event_context(
+        let mut context = sandbox_instance_event_context(
             self.sandbox_id.as_deref(),
             self.sandbox.as_deref(),
             self.container_image.clone(),
-        )
+        );
+        context
+            .container_image_uid
+            .clone_from(&self.container_image_uid);
+        context
     }
 }
 
@@ -1067,7 +1079,9 @@ pub async fn run_sandbox_instance(
         sandbox_id,
         sandbox,
         container_image: _,
+        container_image_uid: _,
         openshell_endpoint,
+        gateway_home,
         policy_rules,
         policy_data,
         ssh_socket_path,
@@ -1741,6 +1755,10 @@ pub async fn run_sandbox_instance(
             config_apply_tx,
             config_push_updates,
             ssh_host_key,
+            gateway_home,
+            app_routes
+                .as_ref()
+                .map(app_listener::Routes::installation_source),
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
         .await?;
@@ -4671,8 +4689,10 @@ mod tests {
             await_main_process_attachment: false,
             sandbox_id: Some("sandbox-1".to_string()),
             sandbox: None,
-            container_image: String::new(),
+            container_image: "registry.example/agent:latest".into(),
+            container_image_uid: Some("sha256:workload".into()),
             openshell_endpoint: None,
+            gateway_home: None,
             policy_rules: None,
             policy_data: None,
             ssh_socket_path: None,
@@ -4701,6 +4721,9 @@ mod tests {
                 .expect("credentials"),
             openshell_ocsf::OcsfJsonSettings::default(),
         );
+        let image = bindings.event_context.container().unwrap().image.unwrap();
+        assert_eq!(image.uid, "sha256:workload");
+        assert_eq!(image.name.as_deref(), Some("registry.example/agent:latest"));
         let error = run_sandbox_with_backend(
             &backend_setup::OpenShellBackendSetup,
             config,

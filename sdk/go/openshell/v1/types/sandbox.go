@@ -27,11 +27,10 @@ type Sandbox struct {
 
 // SandboxSpec holds the desired state of a sandbox.
 type SandboxSpec struct {
-	SampledBudget *SampledResourceBudget
-	LogLevel      string
-	Environment   map[string]string
-	Template      *SandboxTemplate
-	Providers     []string
+	LogLevel    string
+	Environment map[string]string
+	Template    *SandboxTemplate
+	Providers   []string
 	// GPU requests GPU resources using the active driver's default GPU assignment
 	// when GPUCount is nil. GPUCount implies GPU for backward compatibility.
 	GPU      bool
@@ -85,9 +84,8 @@ type SandboxWorkloadConfig struct {
 
 // SandboxResources defines portable sandbox resource requirements.
 type SandboxResources struct {
-	SampledBudget *SampledResourceBudget
-	CPU           string
-	Memory        string
+	CPU    string
+	Memory string
 	// GPU requests GPU resources for template-backed sandboxes. A non-nil GPU
 	// with nil Count requests the active driver's default GPU assignment.
 	GPU *SandboxGPURequirements
@@ -277,17 +275,4 @@ type AttachProviderResult struct {
 type DetachProviderResult struct {
 	Sandbox  *Sandbox
 	Detached bool
-}
-
-// ResourceDuration preserves protobuf duration precision and range.
-type ResourceDuration struct {
-	Seconds int64
-	Nanos   int32
-}
-
-// SampledResourceBudget requests account-wide sampled observations followed by
-// termination on excess. It does not request CPU-rate or hard memory limits.
-type SampledResourceBudget struct {
-	CPUTime       *ResourceDuration
-	ResidentBytes *uint64
 }

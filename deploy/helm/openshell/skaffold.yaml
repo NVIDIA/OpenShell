@@ -124,6 +124,7 @@ deploy:
         valuesFiles:
           - values.yaml
           - ci/values-skaffold.yaml
+          - ci/values-local-tracing.yaml
           # Add ci/values-cert-manager.yaml here (and uncomment the cert-manager
           # release above) to switch TLS generation to cert-manager.
           #- ci/values-cert-manager.yaml

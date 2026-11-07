@@ -116,10 +116,11 @@ impl<S: Subscriber> Layer<S> for OcsfOtlpLayer {
         let Some(event) = clone_current_event() else {
             return;
         };
-        let Ok(record) = log_record(&self.logger, &event, SystemTime::now()) else {
+        let Ok(mut record) = log_record(&self.logger, &event, SystemTime::now()) else {
             self.gap.record_loss("serialization", 1);
             return;
         };
+        set_trace_context(&mut record);
         let bytes = record_bytes(&record);
         if bytes > BATCH_MAX_BYTES {
             self.gap.record_loss("oversized", 1);
@@ -390,18 +391,25 @@ fn log_record(
     if let Some(uid) = &base.metadata.uid {
         record.add_attribute("ocsf.metadata.uid", uid.clone());
     }
-    if let Some(sandbox_id) = base
-        .container
-        .as_ref()
-        .and_then(|container| container.uid.clone())
-        .filter(|id| !id.is_empty())
-    {
-        record.add_attribute("openshell.sandbox.id", sandbox_id);
+    if let Some(sandbox_id) = event.sandbox_id() {
+        record.add_attribute("openshell.sandbox.id", sandbox_id.to_string());
     }
 
     let body = serde_json::to_string(event)?;
     record.set_body(AnyValue::String(body.into()));
     Ok(record)
+}
+
+/// Link the record to the active sampled span through the OTLP record's own
+/// trace fields, for every OCSF class.
+fn set_trace_context(record: &mut SdkLogRecord) {
+    if let Some(span_context) = crate::correlation::sampled_span_context() {
+        record.set_trace_context(
+            span_context.trace_id(),
+            span_context.span_id(),
+            Some(span_context.trace_flags()),
+        );
+    }
 }
 
 /// Map an OCSF severity onto an OTLP severity.
@@ -423,7 +431,10 @@ fn severity(severity: SeverityId) -> Severity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_ocsf::{ConfigStateChangeBuilder, EventContext, EventOrigin, ocsf_emit};
+    use openshell_ocsf::{
+        ConfigStateChangeBuilder, EventContext, EventOrigin, HttpActivityBuilder, HttpRequest, Url,
+        ocsf_emit,
+    };
     use opentelemetry::Key;
     use opentelemetry::logs::{AnyValue, Severity};
     use opentelemetry_sdk::Resource;
@@ -445,6 +456,7 @@ mod tests {
             sandbox_id: sandbox_id.to_string(),
             sandbox_name: "sandbox-name".to_string(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "host".to_string(),
             product_version: "0.0.0".to_string(),
             proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -481,6 +493,41 @@ mod tests {
     fn body_is_the_native_ocsf_json_record() {
         let event = event("sandbox-1", SeverityId::Informational);
         assert_eq!(body(&record(&event)), native(&event));
+    }
+
+    #[test]
+    fn trace_body_preserves_native_correlation() {
+        let mut correlated = native(
+            &HttpActivityBuilder::new(&event_context("sandbox-1"))
+                .http_request(HttpRequest::new(
+                    "GET",
+                    Url::new("https", "example.com", "/", 443),
+                ))
+                .build(),
+        );
+        correlated["trace"] = serde_json::json!({"uid": "0af7651916cd43dd8448eb211c80319c"});
+        correlated["metadata"]["profiles"]
+            .as_array_mut()
+            .unwrap()
+            .push("trace".into());
+        let event: OcsfEvent = serde_json::from_value(correlated).unwrap();
+        let native_body = body(&record(&event));
+        assert_eq!(native_body, native(&event));
+        assert_eq!(
+            native_body["trace"]["uid"],
+            "0af7651916cd43dd8448eb211c80319c"
+        );
+        assert!(
+            native_body["metadata"]["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|profile| profile == "trace")
+        );
+        assert_eq!(
+            native_body["metadata"]["version"],
+            openshell_ocsf::OCSF_VERSION
+        );
     }
 
     #[test]
@@ -543,6 +590,43 @@ mod tests {
             attribute(&record, "openshell.sandbox.id"),
             Some(AnyValue::String("sandbox-1".into()))
         );
+    }
+
+    #[test]
+    fn gateway_context_attribution_reaches_otlp() {
+        use openshell_ocsf::{ApiActivityBuilder, DetectionFindingBuilder, EventOrigin};
+        let mut ctx = event_context("sandbox-1");
+        ctx.origin = EventOrigin::Gateway {
+            name: "gateway".into(),
+        };
+        for event in [
+            ApiActivityBuilder::new(&ctx, "GetSandbox").build(),
+            DetectionFindingBuilder::new(&ctx).build(),
+            ConfigStateChangeBuilder::new(&ctx).build(),
+        ] {
+            let record = record(&event);
+            assert_eq!(
+                attribute(&record, "openshell.sandbox.id"),
+                Some(AnyValue::String("sandbox-1".into()))
+            );
+            assert_eq!(body(&record), native(&event));
+        }
+    }
+
+    #[test]
+    fn requested_sandbox_resource_does_not_become_otlp_identity() {
+        use openshell_ocsf::{ApiActivityBuilder, EventOrigin, ResourceDetails};
+        let mut ctx = event_context("");
+        ctx.origin = EventOrigin::Gateway {
+            name: "gateway".into(),
+        };
+        let event = ApiActivityBuilder::new(&ctx, "GetSandbox")
+            .resource(ResourceDetails::new("sandbox", "requested-sandbox"))
+            .build();
+        let record = record(&event);
+        assert!(attribute(&record, "openshell.sandbox.id").is_none());
+        assert_eq!(body(&record), native(&event));
+        assert_eq!(native(&event)["resources"][0]["uid"], "requested-sandbox");
     }
 
     #[test]
@@ -684,6 +768,42 @@ mod tests {
         assert_eq!(body(&records[0].record), expected);
         assert_eq!(records[0].scope, SCOPE);
         assert_eq!(exporter.service_name().as_deref(), Some("openshell-test"));
+    }
+
+    #[tokio::test]
+    async fn records_carry_the_sampled_span_context_for_every_class() {
+        use opentelemetry::trace::TraceContextExt as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+        for sampler in [Sampler::AlwaysOn, Sampler::AlwaysOff] {
+            let exporter = RecordingExporter::default();
+            let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource());
+            let tracer = SdkTracerProvider::builder()
+                .with_sampler(sampler)
+                .with_simple_exporter(InMemorySpanExporter::default())
+                .build();
+            let subscriber = tracing_subscriber::registry()
+                .with(crate::layer(&tracer, "ocsf-test"))
+                .with(otlp.layer());
+            let span_context = tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!("decision");
+                span.in_scope(|| ocsf_emit!(event("sandbox-1", SeverityId::Medium)));
+                span.context().span().span_context().clone()
+            });
+            otlp.shutdown().await;
+
+            let records = exporter.exported();
+            let trace = records[0].record.trace_context();
+            if span_context.is_sampled() {
+                let trace = trace.expect("sampled span context is attached");
+                assert_eq!(trace.trace_id, span_context.trace_id());
+                assert_eq!(trace.span_id, span_context.span_id());
+                assert_eq!(trace.trace_flags, Some(span_context.trace_flags()));
+            } else {
+                assert!(trace.is_none());
+            }
+        }
     }
 
     #[tokio::test]

@@ -8,10 +8,8 @@ import (
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
-	sb "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 func TestGatewayInfoFromProto(t *testing.T) {
@@ -24,14 +22,6 @@ func TestGatewayInfoFromProto(t *testing.T) {
 				Capabilities: &pb.ComputeDriverCapabilities{
 					DriverName:    "kubernetes",
 					DriverVersion: "2.1.0",
-					ResourceCapabilities: &pb.ResourceCapabilities{
-						Cpu:    &pb.CpuResourceCapabilities{LimitSupported: true, LimitEnforcement: &sb.ResourceEnforcement{Kind: 2, Scope: 2}},
-						Memory: &pb.MemoryResourceCapabilities{LimitSupported: true, RequestEnforcement: &sb.ResourceEnforcement{Kind: 3, Scope: 2}},
-						Gpu:    &pb.GpuResourceCapabilities{CountSelectionSupported: true},
-						SampledBudget: &sb.SampledResourceBudgetCapabilities{CpuTimeSupported: true, ResidentBytesSupported: true, Scope: 3,
-							SamplingInterval: &durationpb.Duration{Nanos: 100000000}, TerminateOnExcess: true,
-							CpuTimeResolution: &durationpb.Duration{Nanos: 1000000}, PerProcessCpuLimit: true},
-					},
 				},
 			},
 			{
@@ -70,22 +60,6 @@ func TestGatewayInfoFromProto(t *testing.T) {
 	assert.Equal(t, v1.ExtensionKindComputeDriver, info.Extensions[0].Kind)
 	assert.Equal(t, "openshell/kubernetes", info.Extensions[0].ImplementationName)
 	assert.Equal(t, uint32(1), info.Extensions[0].ProtocolMajor)
-	resources := info.ComputeDrivers[0].Resources
-	require.NotNil(t, resources)
-	assert.Equal(t, "KernelLimit", resources.CPU.LimitEnforcement.Kind)
-	assert.Equal(t, "Container", resources.CPU.LimitEnforcement.Scope)
-	assert.Equal(t, "SchedulerRequest", resources.Memory.RequestEnforcement.Kind)
-	assert.True(t, resources.GPU.CountSelectionSupported)
-	assert.Equal(t, int32(100000000), resources.SampledBudget.SamplingInterval.Nanos)
-	assert.Equal(t, int32(1000000), resources.SampledBudget.CPUTimeResolution.Nanos)
-	assert.True(t, resources.SampledBudget.TerminateOnExcess)
-	assert.True(t, resources.SampledBudget.PerProcessCPULimit)
-	proto.ComputeDrivers[0].Capabilities.ResourceCapabilities.SampledBudget.SamplingInterval.Nanos = 1
-	assert.Equal(t, int32(100000000), resources.SampledBudget.SamplingInterval.Nanos)
-	unknown := resourceEnforcement(&sb.ResourceEnforcement{Kind: 99, Scope: 99})
-	assert.Equal(t, "Unknown", unknown.Kind)
-	assert.Equal(t, "Unknown", unknown.Scope)
-
 }
 
 func TestGatewayInfoFromProto_NoDrivers(t *testing.T) {

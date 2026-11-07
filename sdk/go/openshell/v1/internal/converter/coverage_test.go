@@ -89,10 +89,9 @@ func TestConverterCoversAllProtoFields_SandboxWorkloadConfig(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxResources(t *testing.T) {
 	handled := fieldSet{
-		"cpu":            true,
-		"memory":         true,
-		"gpu":            true,
-		"sampled_budget": true,
+		"cpu":    true,
+		"memory": true,
+		"gpu":    true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxResources{}).ProtoReflect().Descriptor(), handled, nil)
@@ -461,24 +460,5 @@ func assertAllFieldsCovered(
 				name, desc.FullName(),
 			)
 		}
-	}
-}
-
-// Resource descriptors are public operator data; no fields are intentionally skipped.
-func TestConverterCoversResourceContracts(t *testing.T) {
-	for _, entry := range []struct {
-		message protoreflect.MessageDescriptor
-		fields  fieldSet
-	}{
-		{(&pb.ComputeDriverCapabilities{}).ProtoReflect().Descriptor(), fieldSet{"driver_name": true, "driver_version": true, "resource_capabilities": true}},
-		{(&pb.ResourceCapabilities{}).ProtoReflect().Descriptor(), fieldSet{"cpu": true, "memory": true, "gpu": true, "sampled_budget": true}},
-		{(&pb.CpuResourceCapabilities{}).ProtoReflect().Descriptor(), fieldSet{"limit_supported": true, "limit_enforcement": true, "request_enforcement": true}},
-		{(&pb.MemoryResourceCapabilities{}).ProtoReflect().Descriptor(), fieldSet{"limit_supported": true, "limit_enforcement": true, "request_enforcement": true}},
-		{(&sandboxpb.ResourceEnforcement{}).ProtoReflect().Descriptor(), fieldSet{"kind": true, "scope": true}},
-		{(&sandboxpb.SampledResourceBudgetCapabilities{}).ProtoReflect().Descriptor(), fieldSet{"cpu_time_supported": true, "resident_bytes_supported": true, "scope": true, "sampling_interval": true, "terminate_on_excess": true, "cpu_time_resolution": true, "per_process_cpu_limit": true}},
-		{(&sandboxpb.SampledResourceBudget{}).ProtoReflect().Descriptor(), fieldSet{"cpu_time": true, "resident_bytes": true}},
-		{(&pb.ResourceRequirements{}).ProtoReflect().Descriptor(), fieldSet{"gpu": true, "sampled_budget": true}},
-	} {
-		assertAllFieldsCovered(t, entry.message, entry.fields, nil)
 	}
 }

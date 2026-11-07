@@ -44,12 +44,6 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 		WorkspaceScope:   namedWorkspaceScope(workspace),
 		ServiceExposures: serviceExposuresToProto(cfg.ServiceExposures()),
 	}
-	if req.GetSpec().GetResourceRequirements().GetSampledBudget() != nil {
-		if err := requireSampledBudgetSupport(ctx, s.client); err != nil {
-			return nil, err
-		}
-	}
-
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -116,7 +110,7 @@ func validateTemplateCreateSpec(spec *SandboxSpec) error {
 	if spec == nil {
 		return nil
 	}
-	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPU || spec.GPUCount != nil || spec.SampledBudget != nil {
+	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPU || spec.GPUCount != nil {
 		return &StatusError{Code: ErrorInvalidArgument, Message: "template creates only allow policy, providers, command, and tty in spec"}
 	}
 	return nil
