@@ -4226,4 +4226,504 @@ mod tests {
             None
         );
     }
+
+    // --- Credential use tracking ---
+
+    fn token_state(revision: u64, tokens: &[(&str, &str)]) -> ProviderCredentialState {
+        ProviderCredentialState::from_environment(
+            revision,
+            tokens
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+    }
+
+    fn reinstall_tokens(state: &ProviderCredentialState, revision: u64, tokens: &[(&str, &str)]) {
+        state.install_environment(
+            revision,
+            tokens
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+    }
+
+    /// Resolve `env_key` through a resolver built from `state`, as a request
+    /// rewrite does, and return the secret it handed out.
+    fn inject_static(state: &ProviderCredentialState, env_key: &str) -> String {
+        let placeholder = state.snapshot().child_env[env_key].clone();
+        state
+            .resolver_for_endpoint("api.github.com", 443, "/")
+            .expect("unbound credentials resolve on any endpoint")
+            .resolve_placeholder(&placeholder)
+            .expect("configured secret")
+            .to_string()
+    }
+
+    #[test]
+    fn tracked_resolver_records_the_key_and_version_of_each_secret_sent() {
+        let tracked = token_state(10, &[("GITHUB_TOKEN", "secret")]).with_use_tracking();
+        assert!(tracked.credential_uses().unwrap().is_empty(), "nothing injected yet");
+
+        assert_eq!(inject_static(&tracked, "GITHUB_TOKEN"), "secret");
+
+        let uses = tracked.credential_uses().unwrap();
+        assert_eq!(
+            uses.static_versions.get("GITHUB_TOKEN").copied(),
+            tracked.static_credential_version("GITHUB_TOKEN")
+        );
+        assert!(uses.grant_versions.is_empty());
+    }
+
+    #[test]
+    fn current_env_key_lookups_record_use() {
+        // SigV4 and similar transforms select keys directly.
+        let tracked = token_state(10, &[("GITHUB_TOKEN", "secret")]).with_use_tracking();
+        let resolver = tracked
+            .resolver_for_endpoint("api.github.com", 443, "/")
+            .unwrap();
+
+        assert_eq!(
+            resolver
+                .resolve_current_env_key_checked("GITHUB_TOKEN", "test")
+                .unwrap(),
+            Some("secret")
+        );
+        assert!(
+            tracked
+                .credential_uses()
+                .unwrap()
+                .static_versions
+                .contains_key("GITHUB_TOKEN")
+        );
+    }
+
+    #[test]
+    fn uses_stay_current_until_a_credential_the_connection_used_changes() {
+        let tracked = token_state(10, &[("GITHUB_TOKEN", "a"), ("OTHER_TOKEN", "b")])
+            .with_use_tracking();
+        inject_static(&tracked, "GITHUB_TOKEN");
+        assert!(tracked.credential_uses_current());
+
+        // Another provider's credential rotates; this connection never sent it.
+        reinstall_tokens(&tracked, 11, &[("GITHUB_TOKEN", "a"), ("OTHER_TOKEN", "b2")]);
+        assert!(tracked.credential_uses_current(), "unused credentials don't matter");
+
+        // The credential it sent rotates.
+        reinstall_tokens(&tracked, 12, &[("GITHUB_TOKEN", "a2"), ("OTHER_TOKEN", "b2")]);
+        assert!(!tracked.credential_uses_current());
+    }
+
+    #[test]
+    fn removing_a_used_credential_is_a_change() {
+        let tracked = token_state(10, &[("GITHUB_TOKEN", "a"), ("OTHER_TOKEN", "b")])
+            .with_use_tracking();
+        inject_static(&tracked, "GITHUB_TOKEN");
+
+        // Its provider is detached.
+        reinstall_tokens(&tracked, 11, &[("OTHER_TOKEN", "b")]);
+
+        assert!(!tracked.credential_uses_current());
+    }
+
+    #[test]
+    fn a_connection_that_injected_nothing_is_always_current() {
+        let tracked = token_state(10, &[("GITHUB_TOKEN", "a")]).with_use_tracking();
+
+        reinstall_tokens(&tracked, 11, &[("GITHUB_TOKEN", "a2")]);
+
+        assert!(tracked.credential_uses_current());
+    }
+
+    #[test]
+    fn an_unattributable_use_is_recorded_as_stale() {
+        let tracked = token_state(10, &[("GITHUB_TOKEN", "a")]).with_use_tracking();
+        // A grant key with too many fields has no provider:credential identity.
+        let malformed = "a\tb\tc\td\te\tf\tg\th";
+
+        tracked.record_grant_use(malformed);
+
+        assert_eq!(
+            tracked.credential_uses().unwrap().grant_versions.get(malformed),
+            Some(&STALE_CREDENTIAL_VERSION)
+        );
+        assert!(
+            !tracked.credential_uses_current(),
+            "a use that cannot be attributed closes rather than staying open"
+        );
+    }
+
+    fn grant_credential(token_endpoint: &str) -> crate::proto::ProviderProfileCredential {
+        crate::proto::ProviderProfileCredential {
+            name: "access_token".to_string(),
+            auth_style: "bearer".to_string(),
+            header_name: "Authorization".to_string(),
+            token_grant: Some(crate::proto::ProviderCredentialTokenGrant {
+                token_endpoint: token_endpoint.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn grant_state(credentials: &[(&str, &str)]) -> ProviderCredentialState {
+        ProviderCredentialState::from_environment(
+            10,
+            HashMap::new(),
+            HashMap::new(),
+            credentials
+                .iter()
+                .map(|(key, endpoint)| ((*key).to_string(), grant_credential(endpoint)))
+                .collect(),
+        )
+    }
+
+    const API_GRANT: &str = "api.example.com\t443\t/v1/**\tapi:access_token";
+    const OTHER_GRANT: &str = "other.example.com\t443\t/**\tother:access_token";
+
+    #[test]
+    fn grant_uses_stay_current_until_that_grant_changes() {
+        let tracked = grant_state(&[
+            (API_GRANT, "https://idp.example.com/token"),
+            (OTHER_GRANT, "https://idp.example.com/token"),
+        ])
+        .with_use_tracking();
+
+        tracked.record_grant_use(API_GRANT);
+        let uses = tracked.credential_uses().unwrap();
+        assert_eq!(
+            uses.grant_versions.keys().collect::<Vec<_>>(),
+            ["api:access_token"]
+        );
+        assert!(tracked.credential_uses_current());
+
+        // The other provider's grant changes.
+        tracked.install_environment(
+            11,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (API_GRANT.to_string(), grant_credential("https://idp.example.com/token")),
+                (OTHER_GRANT.to_string(), grant_credential("https://other-idp.example.com/token")),
+            ]),
+        );
+        assert!(tracked.credential_uses_current(), "only the used grant matters");
+
+        // The used grant changes.
+        tracked.install_environment(
+            12,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                API_GRANT.to_string(),
+                grant_credential("https://new-idp.example.com/token"),
+            )]),
+        );
+        assert!(!tracked.credential_uses_current());
+    }
+
+    #[test]
+    fn untracked_handles_and_failed_lookups_record_nothing() {
+        let shared = token_state(10, &[("GITHUB_TOKEN", "secret")]);
+        let tracked = shared.with_use_tracking();
+        assert!(tracked.tracks_use());
+        assert!(!shared.tracks_use());
+
+        // Another handle on the same state reports to no connection.
+        inject_static(&shared, "GITHUB_TOKEN");
+        assert_eq!(shared.credential_uses().map(|uses| uses.is_empty()), None);
+        assert!(
+            !shared.credential_uses_current(),
+            "an untracked handle cannot vouch for its connection"
+        );
+
+        // A lookup that hands out no secret is not a use.
+        let resolver = tracked
+            .resolver_for_endpoint("api.github.com", 443, "/")
+            .unwrap();
+        assert!(
+            resolver
+                .resolve_placeholder("openshell:resolve:env:v10_NOT_CONFIGURED")
+                .is_none()
+        );
+
+        assert!(tracked.credential_uses().unwrap().is_empty());
+    }
+
+    #[test]
+    fn use_tracking_is_idempotent_and_shared_by_clones() {
+        let tracked = token_state(10, &[("GITHUB_TOKEN", "secret")]).with_use_tracking();
+        let retracked = tracked.with_use_tracking();
+        let cloned = tracked.clone();
+
+        inject_static(&retracked, "GITHUB_TOKEN");
+
+        for handle in [&tracked, &cloned] {
+            assert!(
+                handle
+                    .credential_uses()
+                    .unwrap()
+                    .static_versions
+                    .contains_key("GITHUB_TOKEN")
+            );
+        }
+    }
+
+    // --- Central credential versions ---
+
+    #[test]
+    fn a_credential_keeps_its_version_until_its_content_changes() {
+        let state = token_state(10, &[("GITHUB_TOKEN", "a"), ("OTHER_TOKEN", "b")]);
+        let github = state.static_credential_version("GITHUB_TOKEN").unwrap();
+        let other = state.static_credential_version("OTHER_TOKEN").unwrap();
+        assert_ne!(github, other, "versions come from one counter");
+
+        reinstall_tokens(&state, 11, &[("GITHUB_TOKEN", "a"), ("OTHER_TOKEN", "b2")]);
+        assert_eq!(state.static_credential_version("GITHUB_TOKEN"), Some(github));
+        let other_rotated = state.static_credential_version("OTHER_TOKEN").unwrap();
+        assert!(other_rotated > other, "a changed value gets a newer version");
+
+        // Reinstalling identical content changes no version.
+        reinstall_tokens(&state, 12, &[("GITHUB_TOKEN", "a"), ("OTHER_TOKEN", "b2")]);
+        assert_eq!(state.static_credential_version("GITHUB_TOKEN"), Some(github));
+        assert_eq!(state.static_credential_version("OTHER_TOKEN"), Some(other_rotated));
+    }
+
+    #[test]
+    fn a_removed_credential_added_back_gets_a_new_version() {
+        let tracked = token_state(10, &[("GITHUB_TOKEN", "a")]).with_use_tracking();
+        let original = tracked.static_credential_version("GITHUB_TOKEN").unwrap();
+        inject_static(&tracked, "GITHUB_TOKEN");
+
+        reinstall_tokens(&tracked, 11, &[]);
+        assert_eq!(tracked.static_credential_version("GITHUB_TOKEN"), None);
+        // The same value comes back; versions are never reused.
+        reinstall_tokens(&tracked, 12, &[("GITHUB_TOKEN", "a")]);
+        let restored = tracked.static_credential_version("GITHUB_TOKEN").unwrap();
+
+        assert!(restored > original);
+        assert!(
+            !tracked.credential_uses_current(),
+            "a connection cannot tell the gap apart from a rotation"
+        );
+    }
+
+    #[test]
+    fn a_value_from_an_older_generation_is_recorded_as_stale() {
+        let tracked = token_state(10, &[("GITHUB_TOKEN", "old")]).with_use_tracking();
+        let old_placeholder = tracked.snapshot().child_env["GITHUB_TOKEN"].clone();
+        reinstall_tokens(&tracked, 11, &[("GITHUB_TOKEN", "new")]);
+
+        // A long-running process still holds the revision-10 placeholder.
+        let resolver = tracked
+            .resolver_for_endpoint("api.github.com", 443, "/")
+            .unwrap();
+        assert_eq!(resolver.resolve_placeholder(&old_placeholder), Some("old"));
+
+        assert_eq!(
+            tracked
+                .credential_uses()
+                .unwrap()
+                .static_versions
+                .get("GITHUB_TOKEN"),
+            Some(&STALE_CREDENTIAL_VERSION)
+        );
+        assert!(!tracked.credential_uses_current());
+    }
+
+    #[test]
+    fn an_older_revision_with_the_current_value_is_recorded_current() {
+        // Revisions are sandbox-wide: another credential changing moves every
+        // placeholder to the new revision, but this one still sends the
+        // current value.
+        let tracked = token_state(10, &[("GITHUB_TOKEN", "same"), ("OTHER_TOKEN", "a")])
+            .with_use_tracking();
+        let old_placeholder = tracked.snapshot().child_env["GITHUB_TOKEN"].clone();
+        reinstall_tokens(&tracked, 11, &[("GITHUB_TOKEN", "same"), ("OTHER_TOKEN", "b")]);
+        assert_ne!(tracked.snapshot().child_env["GITHUB_TOKEN"], old_placeholder);
+
+        let resolver = tracked
+            .resolver_for_endpoint("api.github.com", 443, "/")
+            .unwrap();
+        assert_eq!(resolver.resolve_placeholder(&old_placeholder), Some("same"));
+
+        assert_eq!(
+            tracked
+                .credential_uses()
+                .unwrap()
+                .static_versions
+                .get("GITHUB_TOKEN")
+                .copied(),
+            tracked.static_credential_version("GITHUB_TOKEN")
+        );
+        assert!(tracked.credential_uses_current());
+    }
+
+    #[test]
+    fn connections_record_the_shared_version_of_a_credential() {
+        let shared = token_state(10, &[("GITHUB_TOKEN", "a")]);
+        let first = shared.with_use_tracking();
+        let second = shared.with_use_tracking();
+
+        inject_static(&first, "GITHUB_TOKEN");
+        inject_static(&second, "GITHUB_TOKEN");
+
+        let version = shared.static_credential_version("GITHUB_TOKEN");
+        for connection in [&first, &second] {
+            assert_eq!(
+                connection
+                    .credential_uses()
+                    .unwrap()
+                    .static_versions
+                    .get("GITHUB_TOKEN")
+                    .copied(),
+                version
+            );
+        }
+    }
+
+    // --- Versions across every install path ---
+    //
+    // Versions are recomputed whenever the snapshot changes, so each install
+    // path must replace the snapshot and its resolver together. The relay
+    // tests cover install_prepared, remove_env_key and the aged-out fallback.
+
+    #[test]
+    fn child_env_only_installs_retire_resolvable_credentials() {
+        // These installs drop resolver material, so nothing a connection sent
+        // can still be current.
+        let installs: [fn(&ProviderCredentialState); 2] = [
+            |state| {
+                state.install_child_env_snapshot(11, HashMap::new());
+            },
+            |state| {
+                state
+                    .compare_and_install_child_env_snapshot(10, 11, HashMap::new())
+                    .unwrap();
+            },
+        ];
+        for install in installs {
+            let tracked = token_state(10, &[("GITHUB_TOKEN", "a")]).with_use_tracking();
+            inject_static(&tracked, "GITHUB_TOKEN");
+
+            install(&tracked);
+
+            assert_eq!(tracked.static_credential_version("GITHUB_TOKEN"), None);
+            assert!(!tracked.credential_uses_current());
+        }
+    }
+
+    #[test]
+    fn revoking_static_credentials_closes_connections_that_used_them() {
+        let tracked = token_state(10, &[("GITHUB_TOKEN", "a")]).with_use_tracking();
+        inject_static(&tracked, "GITHUB_TOKEN");
+
+        tracked.revoke_static_provider_environment(11);
+
+        assert!(!tracked.credential_uses_current());
+    }
+
+    #[test]
+    fn grant_versions_follow_their_configuration() {
+        let state = grant_state(&[(API_GRANT, "https://idp.example.com/token")]);
+        let version = state.grant_credential_version("api:access_token").unwrap();
+
+        state.install_environment(
+            11,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                API_GRANT.to_string(),
+                grant_credential("https://idp.example.com/token"),
+            )]),
+        );
+        assert_eq!(state.grant_credential_version("api:access_token"), Some(version));
+
+        state.install_environment(
+            12,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                API_GRANT.to_string(),
+                grant_credential("https://new-idp.example.com/token"),
+            )]),
+        );
+        assert_ne!(state.grant_credential_version("api:access_token"), Some(version));
+    }
+
+    // --- Installed credential versions ---
+
+    #[test]
+    fn installed_versions_change_only_when_a_credential_does() {
+        let state = token_state(10, &[("GITHUB_TOKEN", "a")]);
+        let installed = state.installed_credential_versions();
+
+        reinstall_tokens(&state, 11, &[("GITHUB_TOKEN", "a")]);
+        assert!(
+            state
+                .installed_credential_versions()
+                .same_credentials(&installed),
+            "an identical reinstall changes nothing"
+        );
+
+        reinstall_tokens(&state, 12, &[("GITHUB_TOKEN", "b")]);
+        assert!(
+            !state
+                .installed_credential_versions()
+                .same_credentials(&installed)
+        );
+    }
+
+    #[test]
+    fn installed_versions_change_when_a_credential_is_added_or_removed() {
+        let state = token_state(10, &[("GITHUB_TOKEN", "a")]);
+        let installed = state.installed_credential_versions();
+
+        reinstall_tokens(&state, 11, &[("GITHUB_TOKEN", "a"), ("OTHER_TOKEN", "b")]);
+        let added = state.installed_credential_versions();
+        assert!(!added.same_credentials(&installed));
+
+        reinstall_tokens(&state, 12, &[("GITHUB_TOKEN", "a")]);
+        assert!(!state.installed_credential_versions().same_credentials(&added));
+    }
+
+    #[test]
+    fn a_revocation_with_nothing_left_to_revoke_changes_nothing() {
+        let state = token_state(10, &[("GITHUB_TOKEN", "a")]);
+        let installed = state.installed_credential_versions();
+
+        state.revoke_static_provider_environment(11);
+        let revoked = state.installed_credential_versions();
+        assert!(!revoked.same_credentials(&installed));
+
+        state.revoke_static_provider_environment(12);
+        assert!(state.installed_credential_versions().same_credentials(&revoked));
+    }
+
+    #[test]
+    fn installed_versions_follow_grant_configuration() {
+        let state = grant_state(&[(API_GRANT, "https://idp.example.com/token")]);
+        let installed = state.installed_credential_versions();
+
+        state.install_environment(
+            11,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                API_GRANT.to_string(),
+                grant_credential("https://new-idp.example.com/token"),
+            )]),
+        );
+
+        assert!(
+            !state
+                .installed_credential_versions()
+                .same_credentials(&installed)
+        );
+    }
 }

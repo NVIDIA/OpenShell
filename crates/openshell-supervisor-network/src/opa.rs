@@ -12984,4 +12984,598 @@ network_policies:
             hash(&after.endpoint_configs)
         );
     }
+
+    // --- Connection revalidation across policy generations ---
+
+    fn claude_input(host: &str) -> NetworkInput {
+        NetworkInput {
+            host: host.into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        }
+    }
+
+    /// Pin a revalidating guard the way the proxy does after authorization.
+    fn revalidating_guard(engine: &Arc<OpaEngine>, input: &NetworkInput) -> PolicyGenerationGuard {
+        let authorization = engine.authorize_egress(input).unwrap();
+        assert!(
+            matches!(authorization.action, NetworkAction::Allow { .. }),
+            "fixture must authorize {}",
+            input.host
+        );
+        let generation = authorization.generation;
+        assert!(
+            PolicyRevalidator::capture(engine, input.clone(), generation, None).is_some(),
+            "an allow must capture a contract"
+        );
+        engine
+            .revalidating_generation_guard(input.clone(), generation, None)
+            .unwrap()
+    }
+
+    fn rest_endpoint(host: &str, path: &str) -> NetworkEndpoint {
+        NetworkEndpoint {
+            host: host.to_string(),
+            port: 443,
+            protocol: "rest".to_string(),
+            enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+            rules: vec![L7Rule {
+                allow: Some(L7Allow {
+                    method: "GET".to_string(),
+                    path: path.to_string(),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn revalidating_guard_follows_reload_that_adds_an_unrelated_endpoint() {
+        let mut proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let input = claude_input("api.anthropic.com");
+        let guard = revalidating_guard(&engine, &input);
+        let strict = engine
+            .generation_guard(guard.captured_generation())
+            .unwrap();
+
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        engine.reload_from_proto(&proto).unwrap();
+
+        assert!(
+            strict.is_stale(),
+            "a plain guard still closes on any change"
+        );
+        assert!(
+            !guard.is_stale(),
+            "an unrelated endpoint must not close the connection"
+        );
+        assert_eq!(guard.captured_generation(), engine.current_generation());
+        assert!(guard.ensure_current().is_ok());
+    }
+
+    #[test]
+    fn revalidating_guard_closes_when_its_endpoint_changes_and_stays_closed() {
+        let original = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&original).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        let mut narrowed = original.clone();
+        policy_mut(&mut narrowed, "claude_code").endpoints[0] =
+            rest_endpoint("api.anthropic.com", "/v1/messages");
+        engine.reload_from_proto(&narrowed).unwrap();
+        assert!(
+            guard.is_stale(),
+            "an L7 rule on this endpoint changes the contract"
+        );
+
+        engine.reload_from_proto(&original).unwrap();
+        assert!(
+            guard.is_stale(),
+            "restoring the policy must not revive a connection already found stale"
+        );
+    }
+
+    #[test]
+    fn revalidating_guard_closes_when_l7_rules_of_its_endpoint_change() {
+        let mut proto = test_proto();
+        policy_mut(&mut proto, "claude_code").endpoints[0] =
+            rest_endpoint("api.anthropic.com", "/v1/messages");
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let input = claude_input("api.anthropic.com");
+        let guard = revalidating_guard(&engine, &input);
+
+        // Every reload restamps policy_hash on every endpoint; that alone
+        // must not count as a change.
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        engine.reload_from_proto(&proto).unwrap();
+        assert!(
+            !guard.is_stale(),
+            "policy_hash restamping is not a contract change"
+        );
+
+        policy_mut(&mut proto, "claude_code").endpoints[0] =
+            rest_endpoint("api.anthropic.com", "/v1/**");
+        engine.reload_from_proto(&proto).unwrap();
+        assert!(
+            guard.is_stale(),
+            "per-request rules for this endpoint changed"
+        );
+    }
+
+    #[test]
+    fn revalidating_guard_closes_when_its_binary_loses_access() {
+        let mut proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        policy_mut(&mut proto, "claude_code").binaries = vec![NetworkBinary {
+            path: "/usr/bin/other".to_string(),
+        }];
+        engine.reload_from_proto(&proto).unwrap();
+
+        assert!(guard.is_stale());
+    }
+
+    #[test]
+    fn revalidating_guard_closes_when_a_new_policy_matches_its_connection() {
+        let mut proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        // A second policy admitting the same binary and host changes the set
+        // of endpoints per-request rules consult, even if it only widens.
+        proto.network_policies.insert(
+            "another".to_string(),
+            NetworkPolicyRule {
+                name: "another".to_string(),
+                endpoints: vec![proto_endpoint("api.anthropic.com")],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/local/bin/claude".to_string(),
+                }],
+            },
+        );
+        engine.reload_from_proto(&proto).unwrap();
+
+        assert!(guard.is_stale());
+    }
+
+    #[test]
+    fn revalidating_guard_never_follows_a_fail_closed_quarantine() {
+        let proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        engine.enter_fail_closed("candidate rejected").unwrap();
+        engine.exit_fail_closed().unwrap();
+
+        assert!(
+            guard.is_stale(),
+            "quarantine is a hard stop even when the previous policy returns"
+        );
+    }
+
+    #[test]
+    fn revalidating_guard_clones_share_one_pin() {
+        let mut proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+        let clone = guard.clone();
+
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        engine.reload_from_proto(&proto).unwrap();
+
+        assert!(!guard.is_stale());
+        assert_eq!(clone.captured_generation(), engine.current_generation());
+    }
+
+    #[tokio::test]
+    async fn revalidating_guard_waits_through_unrelated_reloads() {
+        let mut proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+        let waiter = tokio::spawn({
+            let guard = guard.clone();
+            async move { guard.wait_until_stale().await }
+        });
+        tokio::task::yield_now().await;
+
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        engine.reload_from_proto(&proto).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "an unrelated reload must not wake the relay closed"
+        );
+
+        policy_mut(&mut proto, "claude_code").binaries.clear();
+        engine.reload_from_proto(&proto).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("a relevant reload must end the wait")
+            .expect("waiter must not panic");
+    }
+
+    #[test]
+    fn connection_contract_excludes_policy_hash_metadata() {
+        let mut proto = test_proto();
+        policy_mut(&mut proto, "claude_code").endpoints[0] =
+            rest_endpoint("api.anthropic.com", "/v1/messages");
+        let before = OpaEngine::from_proto(&proto).unwrap();
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        let after = OpaEngine::from_proto(&proto).unwrap();
+        let input = claude_input("api.anthropic.com");
+
+        let before_configs = before.authorize_egress(&input).unwrap().endpoint_configs;
+        let after_configs = after.authorize_egress(&input).unwrap().endpoint_configs;
+        assert_ne!(
+            before_configs, after_configs,
+            "fixture must exercise the per-reload policy_hash stamp"
+        );
+        let (before_contract, _) = before.connection_policy_contract(&input).unwrap();
+        let (after_contract, _) = after.connection_policy_contract(&input).unwrap();
+        assert!(
+            before_contract.relays_identically_to(&after_contract),
+            "policy_hash must not distinguish contracts:\n{before_contract:#?}\n{after_contract:#?}"
+        );
+    }
+
+    #[test]
+    fn denied_connection_captures_no_revalidator() {
+        let engine = Arc::new(OpaEngine::from_proto(&test_proto()).unwrap());
+        let input = claude_input("not-allowed.example.com");
+        let authorization = engine.authorize_egress(&input).unwrap();
+        assert!(matches!(authorization.action, NetworkAction::Deny { .. }));
+
+        let revalidator =
+            PolicyRevalidator::capture(&engine, input, authorization.generation, None);
+        assert!(revalidator.is_none());
+    }
+
+    #[test]
+    fn credential_change_publication_wakes_guards_without_changing_the_policy() {
+        let proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let input = claude_input("api.anthropic.com");
+        let guard = revalidating_guard(&engine, &input);
+        let strict = engine
+            .generation_guard(guard.captured_generation())
+            .unwrap();
+        let before = engine.current_generation();
+
+        let published = engine.publish_credential_change().unwrap();
+
+        assert_eq!(published, before + 1);
+        assert_eq!(engine.current_generation(), published);
+        assert!(strict.is_stale(), "a plain guard closes on any generation");
+        assert!(
+            !guard.is_stale(),
+            "a connection that sent no credential re-pins through an unchanged policy"
+        );
+        assert_eq!(guard.captured_generation(), published);
+    }
+
+    #[test]
+    fn credential_change_publication_keeps_a_quarantine() {
+        let proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let input = claude_input("api.anthropic.com");
+        engine.enter_fail_closed("candidate rejected").unwrap();
+
+        engine.publish_credential_change().unwrap();
+
+        assert_eq!(
+            engine.fail_closed_reason().as_deref(),
+            Some("candidate rejected")
+        );
+        assert!(!matches!(
+            engine.authorize_egress(&input).unwrap().action,
+            NetworkAction::Allow { .. }
+        ));
+    }
+
+    /// The contract does not compare `endpoint_configs` because Rego derives
+    /// them from the matched endpoints. Pin that: the configs are exactly the
+    /// matched endpoints that carry extended configuration, in the same order.
+    #[test]
+    fn endpoint_configs_are_the_matched_endpoints_with_extended_config() {
+        let mut proto = test_proto();
+        for (name, endpoint) in [
+            ("inspected", rest_endpoint("api.anthropic.com", "/v1/**")),
+            ("another", proto_endpoint("api.anthropic.com")),
+        ] {
+            proto.network_policies.insert(
+                name.to_string(),
+                NetworkPolicyRule {
+                    name: name.to_string(),
+                    endpoints: vec![endpoint],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/local/bin/claude".to_string(),
+                    }],
+                },
+            );
+        }
+        let engine = OpaEngine::from_proto(&proto).unwrap();
+
+        let authorization = engine
+            .authorize_egress(&claude_input("api.anthropic.com"))
+            .unwrap();
+
+        assert_eq!(authorization.matched_endpoints.len(), 3);
+        let extended: Vec<&regorus::Value> = authorization
+            .matched_endpoints
+            .iter()
+            .map(|matched| &matched.endpoint)
+            .filter(|endpoint| {
+                matches!(
+                    &endpoint["protocol"],
+                    regorus::Value::String(protocol) if protocol.as_ref() == "rest"
+                )
+            })
+            .collect();
+        assert_eq!(
+            authorization.endpoint_configs.iter().collect::<Vec<_>>(),
+            extended,
+            "only the inspected endpoint carries extended configuration"
+        );
+    }
+
+    // --- Middleware parts of the connection contract ---
+
+    /// Policy data with `middlewares` (a YAML `network_middlewares` body, or
+    /// empty for none) and fixed claude/gitlab network policies.
+    fn middleware_data(middlewares: &str) -> String {
+        let middlewares = if middlewares.is_empty() {
+            String::new()
+        } else {
+            format!("network_middlewares:\n{middlewares}")
+        };
+        format!(
+            r"{middlewares}
+network_policies:
+  claude_code:
+    name: claude_code
+    endpoints:
+      - {{ host: api.anthropic.com, port: 443 }}
+    binaries:
+      - {{ path: /usr/local/bin/claude }}
+  gitlab:
+    name: gitlab
+    endpoints:
+      - {{ host: gitlab.com, port: 443 }}
+    binaries:
+      - {{ path: /usr/bin/glab }}
+"
+        )
+    }
+
+    /// One middleware stage selecting `host`.
+    fn middleware_stage(host: &str, on_error: &str, order: i32, mode: &str) -> String {
+        format!(
+            r#"  scan:
+    middleware: test/scan
+    on_error: {on_error}
+    order: {order}
+    config: {{ mode: {mode} }}
+    endpoints:
+      include: ["{host}"]
+"#
+        )
+    }
+
+    fn middleware_engine(middlewares: &str) -> Arc<OpaEngine> {
+        Arc::new(OpaEngine::from_strings(TEST_POLICY, &middleware_data(middlewares)).unwrap())
+    }
+
+    #[test]
+    fn revalidating_guard_closes_when_any_field_of_its_chain_changes() {
+        let original = middleware_stage("api.anthropic.com", "fail_closed", 10, "redact");
+        for changed in [
+            middleware_stage("api.anthropic.com", "fail_open", 10, "redact"),
+            middleware_stage("api.anthropic.com", "fail_closed", 20, "redact"),
+            middleware_stage("api.anthropic.com", "fail_closed", 10, "mask"),
+        ] {
+            let engine = middleware_engine(&original);
+            let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+            engine
+                .reload(TEST_POLICY, &middleware_data(&changed))
+                .unwrap();
+
+            assert!(guard.is_stale(), "chain change must close: {changed}");
+        }
+    }
+
+    #[test]
+    fn revalidating_guard_survives_reload_with_an_identical_chain() {
+        let stage = middleware_stage("api.anthropic.com", "fail_closed", 10, "redact");
+        let engine = middleware_engine(&stage);
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        // Middleware orders must be unique across the policy.
+        let other = middleware_stage("gitlab.com", "fail_closed", 20, "redact")
+            .replace("  scan:", "  other_scan:");
+        engine
+            .reload(TEST_POLICY, &middleware_data(&format!("{stage}{other}")))
+            .unwrap();
+
+        assert!(
+            !guard.is_stale(),
+            "an unchanged chain for this host must survive"
+        );
+    }
+
+    fn regex_middleware_for(host: &str) -> NetworkMiddlewareConfig {
+        NetworkMiddlewareConfig {
+            middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+            on_error: "fail_closed".into(),
+            endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
+                include: vec![host.into()],
+                exclude: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn only_reloads_that_replace_the_registry_close_middleware_connections() {
+        let mut proto = test_proto();
+        proto
+            .network_middlewares
+            .insert("redactor".into(), regex_middleware_for("api.anthropic.com"));
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        engine.reload_from_proto(&proto).unwrap();
+        assert!(
+            !guard.is_stale(),
+            "a policy-only reload keeps the installed registry"
+        );
+
+        let builtins = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&proto, 0, builtins)
+            .unwrap();
+        assert!(
+            guard.is_stale(),
+            "a combined reload installs a new registry"
+        );
+    }
+
+    #[test]
+    fn capture_uses_the_authorizing_generation_from_the_history() {
+        let engine = Arc::new(OpaEngine::from_proto(&test_proto()).unwrap());
+        let input = claude_input("api.anthropic.com");
+        let authorized = engine.authorize_egress(&input).unwrap().generation;
+
+        // Revoke the connection's access; its authorizing generation is still
+        // recorded, so its baseline is that generation's contract.
+        let mut revoked = test_proto();
+        policy_mut(&mut revoked, "claude_code").binaries.clear();
+        engine.reload_from_proto(&revoked).unwrap();
+
+        assert!(PolicyRevalidator::capture(&engine, input, authorized, None).is_some());
+    }
+
+    #[test]
+    fn capture_refuses_a_generation_that_left_the_history() {
+        let engine = Arc::new(OpaEngine::from_proto(&test_proto()).unwrap());
+        let input = claude_input("api.anthropic.com");
+        let authorized = engine.authorize_egress(&input).unwrap().generation;
+
+        let proto = proto_with_unrelated_endpoint();
+        for _ in 0..=GENERATION_HISTORY {
+            engine.reload_from_proto(&proto).unwrap();
+        }
+
+        assert!(PolicyRevalidator::capture(&engine, input, authorized, None).is_none());
+    }
+
+    // --- Policy hash for endpoint status after a re-pin ---
+
+    fn stamped_hash_for(engine: &OpaEngine, input: &NetworkInput) -> String {
+        let authorization = engine.authorize_egress(input).unwrap();
+        match &authorization.matched_endpoints[0].endpoint["policy_hash"] {
+            regorus::Value::String(hash) => hash.to_string(),
+            other => panic!("proto endpoints carry a policy hash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pinned_policy_hash_starts_at_the_authorizing_generation() {
+        let engine = Arc::new(OpaEngine::from_proto(&test_proto()).unwrap());
+        let input = claude_input("api.anthropic.com");
+        let guard = revalidating_guard(&engine, &input);
+
+        assert_eq!(
+            guard.pinned_policy_hash(),
+            Some(stamped_hash_for(&engine, &input))
+        );
+    }
+
+    #[test]
+    fn plain_guards_report_no_pinned_policy_hash() {
+        // A plain guard never moves, so its endpoint config's hash applies.
+        let engine = OpaEngine::from_proto(&test_proto()).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+
+        assert_eq!(guard.pinned_policy_hash(), None);
+    }
+
+    #[test]
+    fn pinned_policy_hash_follows_the_generation_the_guard_re_pinned_to() {
+        let engine = Arc::new(OpaEngine::from_proto(&test_proto()).unwrap());
+        let input = claude_input("api.anthropic.com");
+        let guard = revalidating_guard(&engine, &input);
+        let original = stamped_hash_for(&engine, &input);
+
+        engine
+            .reload_from_proto(&proto_with_unrelated_endpoint())
+            .unwrap();
+        assert!(!guard.is_stale());
+
+        let reloaded = stamped_hash_for(&engine, &input);
+        assert_ne!(reloaded, original);
+        assert_eq!(guard.pinned_policy_hash(), Some(reloaded));
+    }
+
+    #[test]
+    fn pinned_policy_hash_waits_for_the_guard_to_re_pin() {
+        let engine = Arc::new(OpaEngine::from_proto(&test_proto()).unwrap());
+        let input = claude_input("api.anthropic.com");
+        let guard = revalidating_guard(&engine, &input);
+        engine
+            .reload_from_proto(&proto_with_unrelated_endpoint())
+            .unwrap();
+        assert!(!guard.is_stale());
+
+        // A newer generation is live but the guard has not checked it yet:
+        // the hash it reports must still be that of the generation it holds.
+        let mut proto = proto_with_unrelated_endpoint();
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("pages.gitlab.com"));
+        let held = stamped_hash_for(&engine, &input);
+        engine.reload_from_proto(&proto).unwrap();
+
+        assert_eq!(guard.pinned_policy_hash(), Some(held));
+    }
+
+    #[test]
+    fn pinned_policy_hash_is_none_for_policies_without_a_stamp() {
+        let engine = Arc::new(OpaEngine::from_strings(TEST_POLICY, &middleware_data("")).unwrap());
+        let guard = revalidating_guard(&engine, &claude_input("api.anthropic.com"));
+
+        let other_host = middleware_stage("gitlab.com", "fail_closed", 10, "redact");
+        engine
+            .reload(TEST_POLICY, &middleware_data(&other_host))
+            .unwrap();
+        assert!(!guard.is_stale());
+
+        assert_eq!(guard.pinned_policy_hash(), None);
+    }
 }
