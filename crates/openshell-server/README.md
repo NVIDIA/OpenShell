@@ -18,6 +18,30 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+## Frozen sandbox policy
+
+`FrozenSandboxPolicies.CreateSandbox` chooses frozen mode atomically with
+creation, using a gateway-private `StoredFrozenSandboxPolicy` record keyed by
+sandbox ID. First unary configuration acceptance captures the policy and
+non-secret provider authorization in the same transaction as the sandbox CAS.
+Session admission cannot activate a pending freeze. Existing public sandbox
+messages and the `PolicySource` enum retain their source shape.
+
+Configuration, credential and token delivery share the captured policy and
+profile catalog. Reads spanning first capture reload that authority before
+returning. Credential values remain fresh; changed provider identity,
+configuration or refresh authorization withholds credentials. Policy writes
+are fenced again inside their storage transaction; sandbox deletion removes
+the private record atomically.
+
+The additive runtime configuration response carries requested and captured
+state together. A captured policy cannot gain implicit filesystem paths on
+restart. An incompatible runtime rejects launch with recreation guidance;
+initial frozen global policies must already contain required proxy paths.
+All gateways sharing the store must support freezing before use. Older binary
+versions do not enforce the private feature, so mixed-version fleets and
+subsequent downgrade are unsupported while frozen sandboxes exist.
+
 ## Shared supervisor pool
 
 The `SharedSupervision` the gateway hands a compute driver that asks for it

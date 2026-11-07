@@ -4,6 +4,7 @@
 //! gRPC service implementation.
 
 mod auth_rpc;
+mod frozen_policy;
 pub mod mutation_replay;
 pub mod policy;
 pub mod provider;

@@ -301,6 +301,63 @@ pub struct SandboxSpec {
     pub restart_policy: SandboxRestartPolicy,
 }
 
+/// Create a sandbox whose first accepted effective policy is retained for its lifetime.
+#[derive(Clone, Debug, Default)]
+pub struct FrozenSandboxCreateSpec {
+    pub sandbox: SandboxSpec,
+    /// Omit to discover the initial policy from the image.
+    pub policy: Option<proto::SandboxPolicy>,
+}
+
+/// Freeze request and accepted snapshot, queried independently of sandbox status.
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct FrozenPolicyState {
+    pub requested: bool,
+    /// Absent until initialization successfully accepts a configuration.
+    pub policy: Option<FrozenSandboxPolicy>,
+}
+
+/// Immutable accepted policy and its provenance. Provider authorization remains raw-only.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct FrozenSandboxPolicy {
+    pub policy: Option<proto::SandboxPolicy>,
+    pub version: u32,
+    pub policy_hash: String,
+    pub frozen_at_ms: Option<i64>,
+    pub policy_source: proto::PolicySource,
+    pub global_policy_version: u32,
+}
+
+impl From<proto::FrozenSandboxPolicyState> for FrozenPolicyState {
+    fn from(value: proto::FrozenSandboxPolicyState) -> Self {
+        Self {
+            requested: value.requested,
+            policy: value.policy.map(|policy| FrozenSandboxPolicy {
+                policy: policy.policy,
+                version: policy.version,
+                policy_hash: policy.policy_hash,
+                frozen_at_ms: policy
+                    .frozen_time
+                    .as_ref()
+                    .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok()),
+                policy_source: proto::PolicySource::try_from(policy.policy_source)
+                    .unwrap_or_default(),
+                global_policy_version: policy.global_policy_version,
+            }),
+        }
+    }
+}
+
+/// Global mutation result including sandboxes retaining their frozen policy.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct FrozenGlobalConfigUpdate {
+    pub update: proto::UpdateConfigResponse,
+    pub frozen_sandboxes: Vec<String>,
+}
+
 /// A loopback HTTP service to expose during sandbox creation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ServiceExposure {

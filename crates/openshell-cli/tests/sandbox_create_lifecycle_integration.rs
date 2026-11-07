@@ -1856,6 +1856,50 @@ async fn sandbox_create_tolerates_an_unreachable_profile_catalog() {
 }
 
 #[tokio::test]
+async fn sandbox_create_frozen_rejects_unsupported_gateway_before_creation() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            // This legacy gateway has no frozen-policy service. No ordinary
+            // create is allowed as a fallback for the explicit frozen request.
+            let error = run::sandbox_create_frozen(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("legacy-frozen"),
+                    command: &["/opt/agent".into()],
+                    ..test_config()
+                },
+                "default",
+                &test_tls(&server),
+            )
+            .await
+            .expect_err("an unsupported freeze must stop the client workflow");
+
+            let message = error.to_string();
+            assert!(
+                message.contains(tonic::Code::Unimplemented.description()),
+                "{message}"
+            );
+            assert!(create_requests(&server).await.is_empty());
+            assert_eq!(
+                server
+                    .openshell
+                    .state
+                    .ssh_session_requests
+                    .load(Ordering::SeqCst),
+                0
+            );
+            assert!(deleted_names(&server).await.is_empty());
+            assert_eq!(load_last_sandbox("openshell", "default"), None);
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn sandbox_create_keeps_command_sessions_by_default() {
     let server = run_server().await;
     let fake_ssh_dir = helpers::tempdir().unwrap();
