@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Behavioral tests for classification validation and bounded reconciliation."""
 import copy
@@ -37,9 +38,11 @@ def snapshot():
                 kind='issue', snapshot_id='snap-1', taxonomy=load_taxonomy(
                     ROSTER, [{'name': name, 'id': name, 'assessment': name in ['state:triage-needed', 'state:needs-info']} for name in NAMES]),
                 existing_labels=['area:gateway', 'state:accepted', 'human:priority'],
-                evidence_index={'body': {'inspected': True},
+                evidence_index={'body': {'kind': 'body', 'inspected': True, 'source_digest': 'a' * 64,
+                    'inspection': {'source_digest': 'a' * 64, 'via': 'packet'}},
                                 'comment:1': {'inspected': False},
-                                'labels': {'inspected': True}},
+                                'labels': {'kind': 'reconciliation', 'inspected': True, 'source_digest': 'd' * 64,
+                    'inspection': {'source_digest': 'd' * 64, 'via': 'packet'}}},
                 eligibility={'accepted': True, 'lifecycle': 'eligible'})
 
 
@@ -258,6 +261,28 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(set(report), {'schema_version', 'repository', 'number', 'kind',
                 'snapshot_id', 'status', 'add', 'remove', 'preserve', 'final_labels',
                 'bookkeeping', 'ambiguity', 'missing_prerequisites', 'diagnostics'})
+
+    def test_inspected_flag_without_current_source_provenance_cannot_justify_reasons(self):
+        for declaration in [None, {'source_digest': 'b' * 64, 'via': 'packet'},
+                            {'source_digest': 'a' * 64, 'via': 'fetched'}]:
+            snap = snapshot()
+            snap['evidence_index']['body']['source_digest'] = 'a' * 64
+            snap['evidence_index']['body'].pop('inspection', None)
+            if declaration is not None:
+                snap['evidence_index']['body']['inspection'] = declaration
+            self.assertFalse(validate_result(snap, result())['valid'])
+
+    def test_pure_membership_indexes_require_actual_substantive_child_or_paths(self):
+        for kind in ['comments', 'reviews', 'review_comments', 'timeline']:
+            snap, decision = snapshot(), result()
+            snap['evidence_index']['index'] = dict(kind=kind, content=['comment:1'],
+                members=['comment:1'], inspected=True, source_digest='c' * 64,
+                inspection={'source_digest': 'c' * 64, 'via': 'explicit_expansion'})
+            decision['reasons'][0]['evidence'] = ['index']
+            self.assertFalse(validate_result(snap, decision)['valid'])
+        snap['evidence_index']['index']['kind'] = 'files'
+        snap['evidence_index']['index']['content'] = ['patch:crates/runtime/src/proxy.rs']
+        self.assertTrue(validate_result(snap, decision)['valid'])
 
     def test_validation_never_mutates_snapshot_or_result(self):
         snap, decision = snapshot(), result()

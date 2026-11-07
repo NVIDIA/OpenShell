@@ -64,16 +64,34 @@ def _classification(name):
     return name.startswith(('area:', 'topic:', 'retired:area:', 'retired:topic:'))
 
 
+def is_inspected_source(artifact: dict) -> bool:
+    """Current content was delivered or explicitly acknowledged, not proof of attention."""
+    if not isinstance(artifact, dict) or artifact.get('inspected') is not True:
+        return False
+    digest, declaration = artifact.get('source_digest'), artifact.get('inspection')
+    return (isinstance(digest, str) and re.fullmatch(r'[0-9a-f]{64}', digest) is not None
+            and isinstance(declaration, dict) and declaration.get('source_digest') == digest
+            and declaration.get('via') in ('packet', 'explicit_expansion'))
+
+
+def _membership_only(artifact):
+    content = artifact.get('content')
+    return (artifact.get('kind') in {'comments', 'reviews', 'review_comments', 'timeline'}
+            and (content is None or isinstance(content, list)
+                 and all(isinstance(value, str) for value in content)))
+
+
 def _references(snapshot, refs, *, observation=False):
     if not _strings(refs) or not refs:
         return False
     index = snapshot.get('evidence_index', {})
     for ref in refs:
         artifact = index.get(ref)
-        if not isinstance(artifact, dict) or artifact.get('inspected') is not True:
+        if not is_inspected_source(artifact):
             return False
     substantive = [r for r in refs if r not in {'labels', 'existing_labels'}
-                   and index[r].get('kind') not in {'labels', 'reconciliation'}]
+                   and index[r].get('kind') not in {'labels', 'reconciliation'}
+                   and not _membership_only(index[r])]
     return bool(substantive) and (not observation or 'labels' in refs)
 
 

@@ -224,6 +224,15 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(self.apply(snapshot, result)['status'], 'skipped')
         self.assertEqual(self.api.writes, [])
 
+    def test_semantic_lifecycle_rejects_automatic_inspected_flag_without_source_provenance(self):
+        self.api.collections['comments'] = [{'id': 7, 'body': 'We will not pursue this.', 'user': {'login': 'maintainer', 'type': 'User'}}]
+        snapshot = self.prepared()
+        snapshot['evidence_index']['comment:7'].pop('inspection', None)
+        result = self.result(snapshot)
+        result['lifecycle'] = {'disposition': 'excluded', 'evidence': ['comment:7'], 'reason': 'Claimed rejection.'}
+        self.assertEqual(self.apply(snapshot, result)['status'], 'held')
+        self.assertEqual(self.api.writes, [])
+
     def test_untrusted_executor_cannot_write(self):
         snapshot = self.prepared()
         self.api.actor = 'reader'
