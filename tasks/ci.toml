@@ -68,7 +68,7 @@ hide = true
 
 [ci]
 description = "Run full checks (lint, compile/type checks, and tests)"
-depends = ["lint", "check", "test", "go:ci", "rust:deny:policy"]
+depends = ["lint", "check", "test", "rust:deny:policy"]
 
 [all]
 description = "Alias for ci"

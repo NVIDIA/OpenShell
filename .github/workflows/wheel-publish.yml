@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Publish Wheels
+name: Publish Wheel
 
+# PyPI Trusted Publishing matches the `job_workflow_ref` claim, which names this
+# file for both calls and dispatches. The `openshell` PyPI project trusts
+# workflow `wheel-publish.yml` with environment `pypi`.
 on:
   workflow_call:
     inputs:
@@ -15,18 +18,10 @@ on:
       python-version:
         required: true
         type: string
-      wheel-filenames:
-        required: true
-        type: string
-    secrets:
-      GITLAB_CI_TRIGGER_TOKEN:
-        required: false
-      GITLAB_CI_TRIGGER_URL:
-        required: false
   workflow_dispatch:
     inputs:
       release-tag:
-        description: Stable tag whose GitHub Release holds the wheels, e.g. v0.1.6
+        description: Stable tag whose GitHub Release holds the wheel, e.g. v0.1.7
         required: true
         type: string
       source-sha:
@@ -34,11 +29,7 @@ on:
         required: true
         type: string
       python-version:
-        description: Python package version, e.g. 0.1.6
-        required: true
-        type: string
-      wheel-filenames:
-        description: Wheel filenames attached to the GitHub Release
+        description: Python package version, e.g. 0.1.7
         required: true
         type: string
 
@@ -46,79 +37,56 @@ permissions:
   contents: read
 
 jobs:
-  # Dispatch inputs are free-form, so confirm they describe a published release.
-  verify:
-    name: Verify Release Inputs
+  publish:
+    name: Publish Python Wheel to PyPI
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/openshell/
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - name: Check tag, commit and wheels
+      # Publish the wheel attached to the GitHub Release rather than a run's
+      # build artifact, so a retry or dispatch publishes the same bytes.
+      - name: Download and verify the released wheel
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          COMMIT_SHA: ${{ inputs.source-sha }}
-          RELEASE_VERSION: ${{ inputs.python-version }}
           RELEASE_TAG: ${{ inputs.release-tag }}
-          WHEEL_FILENAMES: ${{ inputs.wheel-filenames }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
         run: |
           set -euo pipefail
           tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" --jq .sha)
-          if [[ "${tag_sha}" != "${COMMIT_SHA}" ]]; then
-            echo "${RELEASE_TAG} points to ${tag_sha}, not ${COMMIT_SHA}" >&2
+          if [[ "${tag_sha}" != "${SOURCE_SHA}" ]]; then
+            echo "${RELEASE_TAG} points to ${tag_sha}, not ${SOURCE_SHA}" >&2
             exit 1
           fi
-          assets=$(gh release view "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')
-          for wheel in ${WHEEL_FILENAMES//,/ }; do
-            if ! grep -qxF "${wheel}" <<<"${assets}"; then
-              echo "${wheel} is not attached to the ${RELEASE_TAG} release" >&2
-              exit 1
-            fi
-            if [[ "${wheel}" != *"-${RELEASE_VERSION}-"* ]]; then
-              echo "${wheel} is not version ${RELEASE_VERSION}" >&2
-              exit 1
-            fi
-          done
-
-  trigger:
-    name: Trigger Wheel Publish
-    needs: verify
-    runs-on: [self-hosted, nv]
-    timeout-minutes: 10
-    steps:
-      - name: Trigger GitLab CI
-        shell: bash
-        env:
-          GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
-          GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
-          COMMIT_SHA: ${{ inputs.source-sha }}
-          RELEASE_VERSION: ${{ inputs.python-version }}
-          RELEASE_TAG: ${{ inputs.release-tag }}
-          WHEEL_FILENAMES: ${{ inputs.wheel-filenames }}
-        run: |
-          set -euo pipefail
-          if [ -z "${WHEEL_FILENAMES}" ]; then
-            echo "No wheel filenames provided by build job" >&2
+          gh release download "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY}" \
+            --pattern '*.whl' --pattern openshell-checksums-sha256.txt --dir release
+          shopt -s nullglob
+          wheels=(release/*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one Python wheel on ${RELEASE_TAG}, found ${#wheels[@]}" >&2
             exit 1
           fi
-          if curl --fail --silent --output /dev/null "https://pypi.org/pypi/openshell/${RELEASE_VERSION}/json"; then
-            echo "openshell ${RELEASE_VERSION} is already on PyPI."
-            exit 0
+          wheel=$(basename "${wheels[0]}")
+          if [[ "${wheel}" != openshell-"${PYTHON_VERSION}"-*.whl ]]; then
+            echo "${wheel} is not an openshell ${PYTHON_VERSION} wheel" >&2
+            exit 1
           fi
+          checksum=$(awk -v wheel="${wheel}" '$2 == wheel { print $1 "  " $2 }' release/openshell-checksums-sha256.txt)
+          if [[ -z "${checksum}" ]]; then
+            echo "${wheel} is missing from the release checksums" >&2
+            exit 1
+          fi
+          (cd release && sha256sum -c - <<<"${checksum}")
+          mkdir dist
+          mv "release/${wheel}" dist/
 
-          response=$(curl -X POST \
-            --fail \
-            --silent \
-            --show-error \
-            -F "token=${GITLAB_CI_TRIGGER_TOKEN}" \
-            -F "ref=main" \
-            -F "variables[PIPELINE_ACTION]=publish_wheels" \
-            -F "variables[GITHUB_REPOSITORY]=${GITHUB_REPOSITORY}" \
-            -F "variables[COMMIT_SHA]=${COMMIT_SHA}" \
-            -F "variables[RELEASE_TAG]=${RELEASE_TAG}" \
-            -F "variables[RELEASE_VERSION]=${RELEASE_VERSION}" \
-            -F "variables[RELEASE_KIND]=stable" \
-            -F "variables[WHEEL_FILENAMES]=${WHEEL_FILENAMES}" \
-            "${GITLAB_CI_TRIGGER_URL}")
-          pipeline_id=$(printf '%s' "$response" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-          pipeline_status=$(printf '%s' "$response" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
-          echo "Triggered GitLab pipeline ${pipeline_id:-unknown} with status=${pipeline_status:-unknown}"
+      - name: Publish wheel to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true

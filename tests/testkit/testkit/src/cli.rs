@@ -21,7 +21,7 @@ use crate::gateway::{ENDPOINT_ENV, GATEWAY_ENV, Gateway, WORKSPACE_ENV};
 /// How long one CLI invocation may take.
 pub const CLI_TIMEOUT: Duration = Duration::from_mins(5);
 /// The CLI binary to run. Defaults to `openshell` on PATH.
-pub const BIN_ENV: &str = "OPENSHELL_BIN";
+pub(crate) const BIN_ENV: &str = "OPENSHELL_BIN";
 
 /// Runs the CLI against the gateway and workspace the tests use.
 #[derive(Clone, Debug)]

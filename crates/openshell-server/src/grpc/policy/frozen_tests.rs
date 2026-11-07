@@ -827,14 +827,29 @@ mod frozen_policy_tests {
             state.store.put_message(&sandbox).await.unwrap();
             let (accepted, _) = initialize(&state).await;
             let before = environment(&state).await;
-            assert_eq!(before.dynamic_credentials.len(), usize::from(dynamic));
+            assert_eq!(
+                before
+                    .dynamic_credentials
+                    .values()
+                    .filter(|credential| credential.token_grant.is_some())
+                    .count(),
+                usize::from(dynamic)
+            );
             if dynamic {
                 let mut rotated = provider.clone();
                 rotated
                     .credentials
                     .insert(TOKEN.to_string(), "rotated-token".to_string());
                 state.store.put_message(&rotated).await.unwrap();
-                assert_eq!(environment(&state).await.dynamic_credentials.len(), 1);
+                assert_eq!(
+                    environment(&state)
+                        .await
+                        .dynamic_credentials
+                        .values()
+                        .filter(|credential| credential.token_grant.is_some())
+                        .count(),
+                    1
+                );
                 state.store.put_message(&provider).await.unwrap();
             } else {
                 provider
@@ -915,7 +930,10 @@ mod frozen_policy_tests {
                     "{dynamic}/{change}"
                 );
                 assert!(
-                    withheld.dynamic_credentials.is_empty(),
+                    withheld
+                        .dynamic_credentials
+                        .values()
+                        .all(|credential| credential.token_grant.is_none()),
                     "{dynamic}/{change}"
                 );
                 assert_ne!(

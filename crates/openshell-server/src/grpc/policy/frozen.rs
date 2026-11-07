@@ -13,6 +13,7 @@ use super::{
 };
 use openshell_core::GetResourceVersion;
 use openshell_core::proto::{FrozenSandboxPolicy, FrozenSandboxProvider, ProviderProfile};
+use openshell_credential_issuer::refresh::CredentialRefresh;
 use std::collections::BTreeSet;
 
 pub(in crate::grpc) struct ProviderContext {
@@ -179,11 +180,13 @@ pub(in crate::grpc) async fn provider_context_from_snapshot(
         let same_identity = provider.object_id() == captured.provider_id;
         let resource_version = provider.get_resource_version();
         let mut refresh_states = if same_identity {
-            crate::provider_refresh::list_refresh_states_for_provider(
-                state.store.as_ref(),
-                provider.object_id(),
-            )
-            .await?
+            state
+                .refresh
+                .list(Some(provider.object_id()))
+                .await?
+                .iter()
+                .map(Into::into)
+                .collect::<Vec<StoredProviderCredentialRefreshState>>()
         } else {
             Vec::new()
         };
