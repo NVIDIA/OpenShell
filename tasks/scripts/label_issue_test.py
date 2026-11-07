@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 from label_issue import apply, main, prepare, preview, _lock_path
-from label_issue_evidence_test import API, REPO
+from label_issue_evidence_test import API, REPO, ROOT
 from label_issue_github import GitHubError
 
 
@@ -408,6 +408,67 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(snapshot['evidence_index']['reviews']['coverage'], 'complete')
         self.assertEqual(snapshot['evidence_index']['review_comments']['coverage'], 'complete')
         self.assertEqual(self.apply(snapshot)['status'], 'applied')
+
+    def test_deterministic_review_hydration_does_not_authorize_model_evidence(self):
+        self.api.item['pull_request']={'url':'pull'}
+        self.api.pull['changed_files']=0
+        self.api.collections['reviews']=[{'id':8,'body':'unread review','user':{'login':'reader'}}]
+        snapshot=self.prepared()
+        self.assertFalse(snapshot['evidence_index']['reviews']['inspected'])
+        self.assertFalse(snapshot['evidence_index']['review_comments']['inspected'])
+        packet=json.loads(Path(snapshot['packet_path']).read_text())
+        self.assertFalse(packet['evidence_index']['reviews']['inspected'])
+        result=self.result(snapshot); result['reasons'][0]['evidence']=['reviews','labels']
+        self.assertEqual(self.apply(snapshot,result)['status'],'held')
+        self.assertEqual(self.api.writes,[])
+
+    def test_assessment_only_body_and_discussion_drift_block_before_writes(self):
+        for accepted in (True,False):
+            for changed in ('body','discussion'):
+                with self.subTest(accepted=accepted,changed=changed):
+                    self.api=LiveAPI()
+                    self.api.item['user']={'login':'maintainer' if accepted else 'reader'}
+                    self.api.labels=['state:needs-info','area:old']
+                    snapshot=self.prepared(assessment_only=True,assessment_labels={'state:needs-info'})
+                    if changed=='body': self.api.item['body']='new unreviewed facts'
+                    else: self.api.collections['comments'].append({'id':7,'body':'new discussion facts','user':{'login':'reader'}})
+                    outcome={'authorized':True,'reviewed_labels':['state:needs-info'],'desired_labels':[]}
+                    self.assertEqual(self.apply(snapshot,{},assessment=outcome)['status'],'stale')
+                    self.assertEqual(self.api.writes,[])
+
+    def test_assessment_only_material_drift_after_write_prevents_success(self):
+        snapshot=self.prepared(assessment_only=True,assessment_labels={'state:needs-info'})
+        outcome={'authorized':True,'reviewed_labels':['state:needs-info'],'desired_labels':['state:needs-info']}
+        self.api.after_write=lambda api: api.collections['comments'].append({'id':7,'body':'new discussion','user':{'login':'reader'}})
+        self.assertEqual(self.apply(snapshot,{},assessment=outcome)['status'],'partial')
+
+    def test_prepare_rechecks_its_refreshed_snapshot_eligibility(self):
+        for changed in ('unaccepted','excluded'):
+            with self.subTest(changed=changed):
+                self.api=LiveAPI(); reads=0
+                def changing_api(path,**kwargs):
+                    nonlocal reads
+                    if path==ROOT+'/issues/3':
+                        reads+=1
+                        if reads==2:
+                            if changed=='unaccepted':
+                                self.api.item['user']={'login':'reader'}
+                                self.api.labels.remove('state:accepted')
+                            else: self.api.item.update(state='closed',state_reason='completed')
+                    return self.api(path,**kwargs)
+                report=prepare(REPO,3,Path(self.temp.name)/changed,api=changing_api,trusted_actors=self.trusted,force=True)
+                self.assertEqual(report['status'],'skipped')
+                self.assertFalse(report['classifier_required'])
+                self.assertNotIn('snapshot',report)
+
+    def test_uncertain_write_reads_labels_even_if_discussion_hydration_fails(self):
+        snapshot=self.prepared()
+        self.api.fail_write=True
+        self.api.after_write=lambda api: setattr(api,'fail','/comments?')
+        report=self.apply(snapshot)
+        self.assertEqual(report['status'],'partial')
+        self.assertIn('area:platform',report.get('observed_labels',[]))
+        self.assertFalse(report['checkpoint_verified'])
 
     @mock.patch('sys.stdout', new_callable=io.StringIO)
     def test_cli_assessment_path_and_exit_status(self, _stdout):
