@@ -78,6 +78,35 @@ def _source(entry):
         'source_user', 'source_association') if key in entry}
 
 
+def _verified_derivative(identity, entry, index, material):
+    """Recognize producer-bound excerpts, never arbitrary parent_id assertions."""
+    if entry.get('kind') == 'text_slice' and entry.get('coverage') == 'slice':
+        match = re.fullmatch(r'text:(.+):([0-9a-f]{64}):(\d+):(\d+)', identity)
+        if not match:
+            return False
+        parent, digest, start, end = match.groups()
+        if (entry.get('parent_id') != parent or entry.get('parent_digest') != digest
+                or entry.get('start') != int(start) or entry.get('end') != int(end)
+                or not 0 <= int(start) < int(end)):
+            return False
+        source = index.get(parent)
+        if not isinstance(source, dict) or source.get('source_digest') != digest:
+            return False
+        _source(source)
+        return True
+    if entry.get('kind') == 'source' and entry.get('coverage') == 'slice':
+        match = re.fullmatch(r'source:(.+):(\d+):(\d+)', identity)
+        if not match:
+            return False
+        path, start, end = match.groups()
+        return (entry.get('path') == path and entry.get('start') == int(start)
+                and entry.get('end') == int(end) and 1 <= int(start) <= int(end)
+                and isinstance(material.get('head'), str) and bool(material['head'])
+                and entry.get('revision') == material['head']
+                and path in material.get('changed_paths', []))
+    return False
+
+
 def _normalized(material, *, invocation_commands):
     if not isinstance(material, dict) or material.get('stale'):
         raise IncompleteMaterial('Material is missing or stale')
@@ -96,26 +125,46 @@ def _normalized(material, *, invocation_commands):
     if not isinstance(invocation_commands, (set, frozenset)) or not all(
             isinstance(command, str) and command for command in invocation_commands):
         raise ValueError('Invocation commands must be an exact trusted string set')
+    # Validate coverage of required sources and every fetched collection member
+    # independently of all reconciliation/derivative suppression below.
+    primary = set(required)
+    memberships = {}
+    for identity in COLLECTIONS & index.keys():
+        entry = index[identity]
+        _source(entry)
+        members = entry.get('members')
+        if (not isinstance(members, list) or not all(isinstance(member, str) for member in members)
+                or len(members) != len(set(members)) or not set(members) <= index.keys()):
+            raise IncompleteMaterial('Collection membership is unresolved')
+        memberships[identity] = members
+        primary.update(members)
+    for identity in primary:
+        _source(index[identity])
     ignored = {identity for identity, entry in index.items()
                if isinstance(entry, dict) and entry.get('kind') == 'comment'
-               and entry.get('_raw_text') in invocation_commands}
+               and isinstance(entry.get('_raw_text'), str)
+               and entry['_raw_text'] in invocation_commands}
+    raw_timeline = index.get('timeline', {})
+    timeline_members = raw_timeline.get('members', []) if isinstance(raw_timeline, dict) else []
     sources = {}
     for identity, entry in index.items():
-        if (identity in ignored or identity == 'labels' or identity == 'timeline'
-                or identity.startswith(('text:', 'source:', 'event:'))):
-            continue
         if not isinstance(entry, dict):
             raise IncompleteMaterial('Malformed source artifact')
-        if entry.get('parent_id'):
-            # Derived excerpts are already bound by their full source digest.
+        if identity not in primary:
+            if identity == 'labels' and entry.get('kind') == 'reconciliation':
+                continue
+            if identity == 'timeline' and entry.get('kind') == 'timeline':
+                continue
+            if (identity.startswith('event:') and entry.get('kind') == 'timeline_event'
+                    and isinstance(timeline_members, list) and identity in timeline_members):
+                continue
+            if _verified_derivative(identity, entry, index, material):
+                continue
+        if identity in ignored:
             continue
         normalized = _source(entry)
-        if identity in COLLECTIONS:
-            members = entry.get('members')
-            if (not isinstance(members, list) or not all(isinstance(member, str) for member in members)
-                    or len(members) != len(set(members)) or not set(members) <= index.keys()):
-                raise IncompleteMaterial('Collection membership is unresolved')
-            members = [member for member in members if member not in ignored]
+        if identity in memberships:
+            members = [member for member in memberships[identity] if member not in ignored]
             # Parent digest/count originally include invocation-only comments.
             # Rebuild only this membership envelope, retaining all child facts.
             normalized['members'] = members
@@ -146,14 +195,14 @@ def fingerprint(material: dict, final_labels: set[str], policy_version: str, *,
                     'material': _normalized(material, invocation_commands=invocation_commands)})
 
 
-def encode_checkpoint(fingerprint: str, *, boundary_id: str | None = None,
-                      operations_digest: str | None = None,
-                      event_count: int | None = None) -> str:
-    """Encode v1 audit metadata or a v2 operation proof in at most 280 ASCII bytes."""
+def encode_checkpoint(fingerprint: str, *, boundary_id: str,
+                      operations_digest: str, event_count: int) -> str:
+    """Encode a complete v2 operation proof in at most 280 ASCII bytes.
+
+    All proof fields are required. Legacy v1 metadata is decode-only for audit.
+    """
     if not _is_digest(fingerprint):
         raise ValueError('Checkpoint fingerprint must be a SHA-256 hex digest')
-    if boundary_id is None and operations_digest is None and event_count is None:
-        return f'{PREFIX}v1:{fingerprint}'
     if (not isinstance(boundary_id, str) or not _is_digest(operations_digest)
             or type(event_count) is not int or not 1 <= event_count <= PAGE_LIMIT * 100):
         raise ValueError('V2 requires a boundary, operations digest and bounded event count')
