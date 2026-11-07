@@ -21,6 +21,7 @@ class GitHubError(subprocess.CalledProcessError):
     def __init__(self, message, *, status=None, retryable=False, retry_at=None,
                  uncertain_write=False, payload=None):
         super().__init__(1, ["gh", "api"], stderr=f"{message} (HTTP {status})")
+        self.message = message
         self.status = status
         self.retryable = retryable
         self.retry_at = retry_at
@@ -123,12 +124,16 @@ class GitHubClient:
             return self.pages(path)
         return self.request(path, method=method, data=data)
 
-    def _wait(self, delay, *, uncertain_write=False):
+    def _wait(self, delay, *, uncertain_write=False, failure=None):
         delay = max(0, delay)
         if self.monotonic() + delay >= self.deadline:
-            raise GitHubError("Invocation deadline cannot accommodate wait",
+            message = "Invocation deadline cannot accommodate wait"
+            if failure is not None:
+                message = failure.message + "; " + message
+            raise GitHubError(message, status=failure.status if failure else None,
+                              payload=failure.payload if failure else None,
                               retryable=True, retry_at=self.wall_clock() + delay,
-                              uncertain_write=uncertain_write)
+                              uncertain_write=uncertain_write or bool(failure and failure.uncertain_write))
         if delay:
             self.sleeper(delay)
             self._diagnostics["sleep_seconds"] += delay
@@ -188,7 +193,7 @@ class GitHubClient:
                 return max(0, float(headers["x-ratelimit-reset"]) - self.wall_clock())
             except (KeyError, ValueError):
                 pass
-        return max(60 if secondary else 0, 2 ** attempt + min(1, max(0, self.jitter())))
+        return (60 * (2 ** attempt) if secondary else 2 ** attempt) + min(1, max(0, self.jitter()))
 
     def request(self, path: str, *, method: str = "GET", data: dict | None = None):
         return self._request(path, method=method, data=data)[0]
@@ -227,7 +232,7 @@ class GitHubClient:
                                       uncertain_write=write)
                 if write or attempt + 1 == self.max_attempts:
                     raise failure from exc
-                self._wait(self._retry_delay({}, attempt, False))
+                self._wait(self._retry_delay({}, attempt, False), failure=failure)
                 self._diagnostics["retries"] += 1
                 continue
             if result.returncode and not (result.stdout or "").startswith("HTTP/"):
@@ -235,7 +240,7 @@ class GitHubClient:
                                       retryable=True, uncertain_write=write)
                 if write or attempt + 1 == self.max_attempts:
                     raise failure
-                self._wait(self._retry_delay({}, attempt, False))
+                self._wait(self._retry_delay({}, attempt, False), failure=failure)
                 self._diagnostics["retries"] += 1
                 continue
             status, headers, payload = self._decode(result, write)
@@ -267,7 +272,7 @@ class GitHubClient:
                                   uncertain_write=write, payload=payload)
             if write or not retryable or attempt + 1 == self.max_attempts:
                 raise failure
-            self._wait(delay)
+            self._wait(delay, failure=failure)
             self._diagnostics["retries"] += 1
         raise AssertionError("unreachable")
 

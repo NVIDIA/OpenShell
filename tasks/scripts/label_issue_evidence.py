@@ -442,21 +442,27 @@ def prepare_snapshot(repository: str, number: int, directory: Path, *, api,
     # Classification preparation may read discussion metadata even on open
     # items: recorded author abandonment or maintainer rejection must remain
     # available for the caller's restricting lifecycle interpretation.
-    expand_evidence(snapshot, ['comments'], api=api)
+    _refresh_collection(snapshot, 'comments', api)
     index['comments']['inspected'] = False
     author = (facts['issue'].get('user') or {}).get('login', '').lower()
-    for artifact_id, entry in list(index.items()):
+    authorities = {}
+    for artifact_id, entry in index.items():
         if entry['kind'] != 'comment':
             continue
-        login = (entry.get('source_user') or {}).get('login', '').lower()
+        user = entry.get('source_user') or {}
+        login = user.get('login', '').lower()
         if (login == author or login in facts['maintainers']
                 or entry.get('source_association') in {'OWNER', 'MEMBER', 'COLLABORATOR'}):
-            expand_evidence(snapshot, [artifact_id], api=api)
-            if (entry['actor_authority']['role'] in {'author', 'maintainer'}
-                    and artifact_id not in snapshot['lifecycle_evidence']):
+            if login not in authorities:
+                authorities[login] = _authority(repository, user, author, set(facts['maintainers']), api)
+            entry['actor_authority'] = copy.deepcopy(authorities[login])
+            if user.get('type') != 'Bot' and entry['actor_authority']['role'] in {'author', 'maintainer'}:
+                # Candidate delivery is not inspection provenance. Only the
+                # final packet or explicit acknowledgement can establish it.
+                entry['inspected'] = True
                 snapshot['lifecycle_evidence'].append(artifact_id)
     if facts['kind'] == 'pull_request':
-        expand_evidence(snapshot, ['files'], api=api)
+        _refresh_collection(snapshot, 'files', api)
         index['files']['inspected'] = False
     if not defer_delivery:
         snapshot.pop('_preparing', None)
@@ -540,6 +546,7 @@ def _refresh_collection(snapshot, artifact_id, api):
     if not isinstance(content, list):
         raise ValueError('Collection must be a paginated list')
     coverage, replacements = 'complete', {}
+    authorities = {}
     prefixes = {'comments': ('comment', 'comment'), 'reviews': ('review', 'review'),
                 'review_comments': ('review-comment', 'review_comment'), 'timeline': ('event', 'timeline_event')}
     for entry in content:
@@ -561,8 +568,11 @@ def _refresh_collection(snapshot, artifact_id, api):
             candidate = copy.deepcopy(previous)
             if candidate.get('actor_authority'):
                 author = (snapshot['item_material'].get('user') or {}).get('login', '')
-                candidate['actor_authority'] = _authority(snapshot['repository'], candidate.get('source_user'), author,
-                                                         set(snapshot['trusted_maintainers']), api)
+                login = (candidate.get('source_user') or {}).get('login', '').casefold()
+                if login not in authorities:
+                    authorities[login] = _authority(snapshot['repository'], candidate.get('source_user'), author,
+                                                    set(snapshot['trusted_maintainers']), api)
+                candidate['actor_authority'] = copy.deepcopy(authorities[login])
         replacements[source_id] = candidate
         if candidate['coverage'] != 'complete':
             coverage = 'partial'
@@ -589,6 +599,7 @@ def _refresh_collection(snapshot, artifact_id, api):
 def expand_evidence(snapshot: dict, evidence_ids: list[str], *, api) -> dict:
     """Expand stable sources or bounded digest-bound text/source slices."""
     index = snapshot['evidence_index']
+    authorities = {}
     for artifact_id in evidence_ids:
         if artifact_id.startswith('text:'):
             index[artifact_id] = _text_slice(snapshot, artifact_id)
@@ -603,8 +614,11 @@ def expand_evidence(snapshot: dict, evidence_ids: list[str], *, api) -> dict:
             artifact['inspected'] = True
             if artifact.get('kind') in {'comment', 'review', 'review_comment'}:
                 author = (snapshot['item_material'].get('user') or {}).get('login', '')
-                authority = _authority(snapshot['repository'], artifact.get('source_user'), author,
-                                       set(snapshot['trusted_maintainers']), api)
+                login = (artifact.get('source_user') or {}).get('login', '').casefold()
+                if login not in authorities:
+                    authorities[login] = _authority(snapshot['repository'], artifact.get('source_user'), author,
+                                                    set(snapshot['trusted_maintainers']), api)
+                authority = copy.deepcopy(authorities[login])
                 artifact['actor_authority'] = authority
                 if authority['role'] in {'author', 'maintainer'} and artifact_id not in snapshot['lifecycle_evidence']:
                     snapshot['lifecycle_evidence'].append(artifact_id)

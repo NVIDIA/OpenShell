@@ -213,6 +213,20 @@ class TransportTests(unittest.TestCase):
             client.request("x")
         self.assertEqual(len(self.runner.calls), 1)
 
+    def test_secondary_limit_fallback_grows_between_read_attempts(self):
+        client=self.client(response({'message':'secondary rate limit'},403),response({'message':'secondary rate limit'},403),response({'ok':True}))
+        self.assertEqual(client.request('x'),{'ok':True})
+        self.assertEqual(self.clock.sleeps,[60,120])
+
+    def test_deadline_retains_original_throttling_status_and_payload(self):
+        client=self.client(response({'message':'quota exhausted'},429,{'Retry-After':'60'}),invocation_timeout=20)
+        with self.assertRaises(GitHubError) as caught:
+            client.request('x')
+        self.assertEqual(caught.exception.status,429)
+        self.assertEqual(caught.exception.payload,{'message':'quota exhausted'})
+        self.assertEqual(caught.exception.retry_at,1060)
+
+
 
 if __name__ == "__main__":
     unittest.main()
