@@ -18,6 +18,12 @@ pub async fn install_provider(
     profile: &str,
     credentials: &[(&str, &str)],
 ) -> Result {
+    crate::ensure!(
+        profile
+            .lines()
+            .any(|line| line.trim_end() == format!("id: {name}")),
+        "the profile for provider {name} must have `id: {name}`"
+    );
     // Both deletes succeed for a missing resource, so register them before
     // the creates. Hooks run last registered first.
     for kind in ["profile", "provider"] {

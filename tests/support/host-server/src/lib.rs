@@ -26,11 +26,20 @@ const WAIT_INTERVAL: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST: usize = 1024 * 1024;
 
+/// A request an [`HttpRecorder`] read.
+#[derive(Clone, Debug)]
+pub struct Request {
+    /// The request line and headers.
+    pub head: String,
+    pub body: String,
+}
+
 /// An HTTP server that answers every request with `200` and a fixed body,
-/// and records each request it read.
+/// and records each request it read. It reads a body by `Content-Length`
+/// only, not a chunked one.
 pub struct HttpRecorder {
     pub port: u16,
-    requests: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<Request>>>,
     task: JoinHandle<()>,
 }
 
@@ -56,9 +65,8 @@ impl HttpRecorder {
         })
     }
 
-    /// The requests the server has read, headers and body, once there are at
-    /// least `count`.
-    pub async fn wait_for_requests(&self, count: usize) -> Result<Vec<String>> {
+    /// The requests the server has read, once there are at least `count`.
+    pub async fn wait_for_requests(&self, count: usize) -> Result<Vec<Request>> {
         testkit::poll_until(
             &format!(
                 "{count} request(s) at the host server on port {}",
@@ -89,36 +97,32 @@ impl Drop for HttpRecorder {
     }
 }
 
-/// A WebSocket server that completes the handshake and records whether a
-/// binary frame followed.
+/// A WebSocket server that completes the handshake, then reads frames until
+/// the connection closes, and records whether any was a binary frame.
 pub struct WebSocketRecorder {
     pub port: u16,
-    handshake_seen: Arc<AtomicBool>,
-    binary_seen: Arc<AtomicBool>,
+    state: Arc<WebSocketState>,
     task: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct WebSocketState {
+    handshake_seen: AtomicBool,
+    binary_seen: AtomicBool,
+    finished: AtomicBool,
 }
 
 impl WebSocketRecorder {
     pub async fn start() -> Result<Self> {
         let (listener, port) = bind().await?;
-        let handshake_seen = Arc::new(AtomicBool::new(false));
-        let binary_seen = Arc::new(AtomicBool::new(false));
-        let (task_handshake, task_binary) = (Arc::clone(&handshake_seen), Arc::clone(&binary_seen));
+        let state = Arc::new(WebSocketState::default());
+        let task_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(accept_websocket(
-                    stream,
-                    Arc::clone(&task_handshake),
-                    Arc::clone(&task_binary),
-                ));
+                tokio::spawn(accept_websocket(stream, Arc::clone(&task_state)));
             }
         });
-        Ok(Self {
-            port,
-            handshake_seen,
-            binary_seen,
-            task,
-        })
+        Ok(Self { port, state, task })
     }
 
     /// Wait until a client completed the handshake.
@@ -131,7 +135,7 @@ impl WebSocketRecorder {
             WAIT_TIMEOUT,
             WAIT_INTERVAL,
             async || {
-                Ok(if self.handshake_seen.load(Ordering::Acquire) {
+                Ok(if self.state.handshake_seen.load(Ordering::Acquire) {
                     Poll::Ready(())
                 } else {
                     Poll::Pending("no handshake".to_string())
@@ -141,9 +145,26 @@ impl WebSocketRecorder {
         .await
     }
 
-    /// Whether a binary frame arrived after a handshake.
-    pub fn binary_seen(&self) -> bool {
-        self.binary_seen.load(Ordering::Acquire)
+    /// Wait until a connection that completed the handshake has ended, by a
+    /// close frame, the client closing it, or [`READ_TIMEOUT`] passing, and
+    /// return whether a binary frame arrived on it.
+    pub async fn wait_until_finished(&self) -> Result<bool> {
+        testkit::poll_until(
+            &format!(
+                "the WebSocket connection at the host server on port {} to end",
+                self.port
+            ),
+            READ_TIMEOUT + WAIT_TIMEOUT,
+            WAIT_INTERVAL,
+            async || {
+                Ok(if self.state.finished.load(Ordering::Acquire) {
+                    Poll::Ready(self.state.binary_seen.load(Ordering::Acquire))
+                } else {
+                    Poll::Pending("the connection is open".to_string())
+                })
+            },
+        )
+        .await
     }
 }
 
@@ -168,7 +189,7 @@ async fn bind() -> Result<(TcpListener, u16)> {
 
 /// Read one request, headers and `Content-Length` body, record it, and
 /// answer with `body`.
-async fn respond(mut stream: TcpStream, body: Arc<str>, requests: Arc<Mutex<Vec<String>>>) {
+async fn respond(mut stream: TcpStream, body: Arc<str>, requests: Arc<Mutex<Vec<Request>>>) {
     let _ = stream.set_nodelay(true);
     let Some(request) = read_request(&mut stream).await else {
         return;
@@ -176,7 +197,7 @@ async fn respond(mut stream: TcpStream, body: Arc<str>, requests: Arc<Mutex<Vec<
     requests
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .push(String::from_utf8_lossy(&request).into_owned());
+        .push(request);
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -185,16 +206,19 @@ async fn respond(mut stream: TcpStream, body: Arc<str>, requests: Arc<Mutex<Vec<
     let _ = stream.shutdown().await;
 }
 
-async fn read_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
+async fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
         if let Some(end) = find(&request, b"\r\n\r\n") {
-            let length = header(&String::from_utf8_lossy(&request[..end]), "content-length")
+            let head = String::from_utf8_lossy(&request[..end]).into_owned();
+            let length = header(&head, "content-length")
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(0);
             if request.len() >= end + 4 + length {
-                return Some(request);
+                let body =
+                    String::from_utf8_lossy(&request[end + 4..end + 4 + length]).into_owned();
+                return Some(Request { head, body });
             }
         }
         match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut buffer)).await {
@@ -206,19 +230,16 @@ async fn read_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
     }
 }
 
-async fn accept_websocket(
-    mut stream: TcpStream,
-    handshake_seen: Arc<AtomicBool>,
-    binary_seen: Arc<AtomicBool>,
-) {
+async fn accept_websocket(mut stream: TcpStream, state: Arc<WebSocketState>) {
     let _ = stream.set_nodelay(true);
     let Some(request) = read_request(&mut stream).await else {
         return;
     };
-    let Some(key) = header(&String::from_utf8_lossy(&request), "sec-websocket-key") else {
+    let Some(key) = header(&request.head, "sec-websocket-key") else {
         return;
     };
     // The supervisor checks Sec-WebSocket-Accept, so compute it properly.
+    // SHA-1 is what RFC 6455 specifies for it; it protects nothing here.
     let mut hasher = Sha1::new();
     hasher.update(key.as_bytes());
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
@@ -229,14 +250,39 @@ async fn accept_websocket(
     if stream.write_all(response.as_bytes()).await.is_err() {
         return;
     }
-    handshake_seen.store(true, Ordering::Release);
+    state.handshake_seen.store(true, Ordering::Release);
 
-    let mut frame_header = [0_u8; 2];
-    if let Ok(Ok(_)) =
-        tokio::time::timeout(READ_TIMEOUT, stream.read_exact(&mut frame_header)).await
-        && frame_header[0] & 0x0f == 0x02
-    {
-        binary_seen.store(true, Ordering::Release);
+    let _ = tokio::time::timeout(READ_TIMEOUT, read_frames(&mut stream, &state)).await;
+    state.finished.store(true, Ordering::Release);
+}
+
+/// Read frames until a close frame or the end of the stream, and record a
+/// binary frame.
+async fn read_frames(stream: &mut TcpStream, state: &WebSocketState) -> std::io::Result<()> {
+    loop {
+        let mut frame_header = [0_u8; 2];
+        stream.read_exact(&mut frame_header).await?;
+        let opcode = frame_header[0] & 0x0f;
+        let length = match frame_header[1] & 0x7f {
+            126 => u64::from(stream.read_u16().await?),
+            127 => stream.read_u64().await?,
+            length => u64::from(length),
+        };
+        if opcode == 0x02 {
+            state.binary_seen.store(true, Ordering::Release);
+        }
+        if opcode == 0x08 {
+            return Ok(());
+        }
+        let mask = if frame_header[1] & 0x80 == 0 { 0 } else { 4 };
+        let skipped = tokio::io::copy(
+            &mut (&mut *stream).take(mask + length),
+            &mut tokio::io::sink(),
+        )
+        .await?;
+        if skipped < mask + length {
+            return Ok(());
+        }
     }
 }
 

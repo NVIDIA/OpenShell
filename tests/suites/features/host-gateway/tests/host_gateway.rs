@@ -20,23 +20,13 @@ use testkit::{Context, PYTHON_BINARIES, Result, ResultExt as _, YamlFile};
 const PYTHON: &str = "python3";
 
 /// Requests `/` from `host.openshell.internal` on the port in `argv[1]` and
-/// prints the response. A failed connection is retried for 20 seconds, so a
-/// slow start doesn't fail the test, and reported on stderr.
+/// prints the response. The server listens before the sandbox is created,
+/// and a Ready sandbox's network is up, so the client doesn't retry.
 const CLIENT: &str = r#"
-import socket, sys, time
+import socket, sys
 
 host, port = "host.openshell.internal", int(sys.argv[1])
-deadline = time.monotonic() + 20
-while True:
-    try:
-        conn = socket.create_connection((host, port), timeout=10)
-        break
-    except OSError as error:
-        print(f"connect {host}:{port}: {error}", file=sys.stderr, flush=True)
-        if time.monotonic() > deadline:
-            sys.exit(1)
-        time.sleep(1)
-with conn:
+with socket.create_connection((host, port), timeout=10) as conn:
     conn.sendall(f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n".encode())
     response = b""
     while chunk := conn.recv(4096):

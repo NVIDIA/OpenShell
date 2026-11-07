@@ -16,9 +16,10 @@ cp "${plugin_dir}/kustomization.yaml" "${work_dir}/kustomization.yaml"
 cp "${plugin_dir}/workload-patch.yaml" "${work_dir}/workload-patch.yaml"
 tee "${work_dir}/rendered.yaml" >/dev/null
 
-# server.hostGatewayIP renders the gateway pod's hostAliases entry.
-if grep -q 'host\.openshell\.internal' "${work_dir}/rendered.yaml" \
-  && grep -q '^ *hostAliases:' "${work_dir}/rendered.yaml"; then
+# server.hostGatewayIP renders the gateway pod's only hostAliases entry
+# (deploy/helm/openshell/templates/_gateway-workload.tpl), which the
+# host-gateway component copies from hostAliases.0.ip.
+if grep -q '^ *hostAliases:' "${work_dir}/rendered.yaml"; then
   cp -R "${plugin_dir}/host-gateway" "${work_dir}/host-gateway"
   printf 'components:\n  - host-gateway\n' >>"${work_dir}/kustomization.yaml"
 fi

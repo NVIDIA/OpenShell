@@ -5,15 +5,17 @@
 //! what the supervisor forwards upstream in REST bodies and WebSocket frames.
 //!
 //! Ported from the e2e tests added in NVIDIA/OpenShell#5264. The upstream
-//! servers run on the test host ([`host_server_support`]), so a gateway on a
-//! remote cluster can't run this suite.
+//! servers run on the test host ([`host_server_support`]), so the suite
+//! requires sandboxes to reach the test host as `host.openshell.internal`.
 
 use std::time::Duration;
 
-use host_server_support::{HttpRecorder, WebSocketRecorder};
+use host_server_support::{HttpRecorder, Request, WebSocketRecorder};
 use testkit::policy::{self, Access, Endpoint as _};
 use testkit::sdk::raw::proto;
-use testkit::{Context, Error, PYTHON_BINARIES, Poll, Result, ResultExt as _, Sandbox, YamlFile};
+use testkit::{
+    Context, Error, GrpcCode, PYTHON_BINARIES, Poll, Result, ResultExt as _, Sandbox, YamlFile,
+};
 
 const TEST_HOST: &str = "host.openshell.internal";
 const TOKEN_ENV: &str = "E2E_GATING_TOKEN";
@@ -71,7 +73,7 @@ fi"#;
 async fn profile_rest_endpoint_keeps_body_placeholder(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::start("ok").await?;
     let websocket = WebSocketRecorder::start().await?;
-    let provider = install_provider(cx, Some((server.port, websocket.port))).await?;
+    let provider = install_gating_provider(cx, Some((server.port, websocket.port))).await?;
 
     let mut policy = policy::base();
     allow(&mut policy, server.port)
@@ -79,7 +81,7 @@ async fn profile_rest_endpoint_keeps_body_placeholder(cx: &mut Context) -> testk
         .request_body_credential_rewrite(false);
     let sandbox = create_sandbox(cx, "rest", policy, &provider).await?;
     run_python(&sandbox, BODY_CLIENT, server.port).await?;
-    expect_one_body(&server, PLACEHOLDER_PREFIX, TEST_SECRET).await
+    expect_placeholder_body(&server).await
 }
 
 /// A provider's WebSocket endpoint completes the handshake but doesn't
@@ -89,7 +91,7 @@ async fn profile_rest_endpoint_keeps_body_placeholder(cx: &mut Context) -> testk
 async fn profile_websocket_endpoint_denies_binary_frames(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::start("ok").await?;
     let websocket = WebSocketRecorder::start().await?;
-    let provider = install_provider(cx, Some((server.port, websocket.port))).await?;
+    let provider = install_gating_provider(cx, Some((server.port, websocket.port))).await?;
 
     let mut policy = policy::base();
     allow(&mut policy, websocket.port).websocket(Access::ReadWrite);
@@ -99,8 +101,9 @@ async fn profile_websocket_endpoint_denies_binary_frames(cx: &mut Context) -> te
         .wait_for_handshake()
         .await
         .context("upstream should receive the WebSocket handshake")?;
+    let binary_seen = websocket.wait_until_finished().await?;
     testkit::ensure!(
-        !websocket.binary_seen(),
+        !binary_seen,
         "credentialed WebSocket binary frame reached upstream"
     );
     Ok(())
@@ -112,10 +115,11 @@ async fn profile_websocket_endpoint_denies_binary_frames(cx: &mut Context) -> te
 #[testkit::test]
 async fn policy_binding_requires_inspection_or_opt_in(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::start("ok").await?;
-    let provider = install_provider(cx, None).await?;
+    let provider = install_gating_provider(cx, None).await?;
 
     let mut l4 = policy::base();
     allow(&mut l4, server.port).credential_binding(&provider);
+    // The wording checks follow the #5264 tests.
     let error = expect_rejected(cx, "l4", l4, &provider).await?;
     testkit::ensure!(error.contains("credentialed endpoint"), "{error}");
     testkit::ensure!(error.contains("L4-only"), "{error}");
@@ -145,7 +149,7 @@ async fn policy_binding_rest_body_keeps_placeholder_without_rewrite(
     cx: &mut Context,
 ) -> testkit::Result {
     let server = HttpRecorder::start("ok").await?;
-    let provider = install_provider(cx, None).await?;
+    let provider = install_gating_provider(cx, None).await?;
 
     let mut policy = policy::base();
     allow(&mut policy, server.port)
@@ -154,7 +158,7 @@ async fn policy_binding_rest_body_keeps_placeholder_without_rewrite(
         .credential_binding(&provider);
     let sandbox = create_sandbox(cx, "body", policy, &provider).await?;
     run_python(&sandbox, BODY_CLIENT, server.port).await?;
-    expect_one_body(&server, PLACEHOLDER_PREFIX, TEST_SECRET).await
+    expect_placeholder_body(&server).await
 }
 
 /// A policy binding with `request_body_credential_rewrite: true` replaces
@@ -164,7 +168,7 @@ async fn policy_binding_rest_body_rewrite_sends_secret_upstream(
     cx: &mut Context,
 ) -> testkit::Result {
     let server = HttpRecorder::start("ok").await?;
-    let provider = install_provider(cx, None).await?;
+    let provider = install_gating_provider(cx, None).await?;
 
     let mut policy = policy::base();
     allow(&mut policy, server.port)
@@ -173,7 +177,13 @@ async fn policy_binding_rest_body_rewrite_sends_secret_upstream(
         .credential_binding(&provider);
     let sandbox = create_sandbox(cx, "rw", policy, &provider).await?;
     run_python(&sandbox, BODY_CLIENT, server.port).await?;
-    expect_one_body(&server, TEST_SECRET, PLACEHOLDER_PREFIX).await
+    let request = one_request(&server).await?;
+    testkit::ensure!(
+        request.body == format!("prefix-{TEST_SECRET}-suffix"),
+        "expected the secret in the body upstream; got {}",
+        redact(&request)
+    );
+    Ok(())
 }
 
 /// Binding and unbinding a provider with `policy set --wait` adds and
@@ -181,7 +191,7 @@ async fn policy_binding_rest_body_rewrite_sends_secret_upstream(
 #[testkit::test]
 async fn policy_binding_updates_provider_environment_live(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::start("ok").await?;
-    let provider = install_provider(cx, None).await?;
+    let provider = install_gating_provider(cx, None).await?;
 
     let policy_binding = |bind: bool| {
         let mut policy = policy::base();
@@ -223,7 +233,7 @@ fn allow(policy: &mut proto::SandboxPolicy, port: u16) -> &mut proto::NetworkEnd
 /// Install a run-unique provider holding `TEST_SECRET` in `TOKEN_ENV`. With
 /// `endpoints`, its profile declares the REST and WebSocket ports as its
 /// endpoints; without, a policy must bind the provider explicitly.
-async fn install_provider(cx: &Context, endpoints: Option<(u16, u16)>) -> Result<String> {
+async fn install_gating_provider(cx: &Context, endpoints: Option<(u16, u16)>) -> Result<String> {
     let name = cx.name("cg");
     let endpoints = endpoints.map_or_else(String::new, |(rest, websocket)| {
         format!(
@@ -288,7 +298,8 @@ async fn create_sandbox(
     Ok(sandbox)
 }
 
-/// Fail unless the gateway rejects the sandbox, and return the rejection.
+/// Fail unless the gateway rejects the sandbox as a failed precondition, and
+/// return the rejection.
 async fn expect_rejected(
     cx: &Context,
     suffix: &str,
@@ -300,7 +311,10 @@ async fn expect_rejected(
             "the gateway accepted sandbox {}",
             sandbox.name()
         ))),
-        Err(error) => Ok(error.to_string()),
+        Err(error) if error.grpc_code() == Some(GrpcCode::FailedPrecondition) => {
+            Ok(error.to_string())
+        }
+        Err(error) => Err(error.context("expected a failed precondition")),
     }
 }
 
@@ -315,21 +329,37 @@ async fn run_python(sandbox: &Sandbox, script: &str, port: u16) -> Result {
     Ok(())
 }
 
-/// Fail unless `server` saw exactly one request, containing `present` and
-/// not `absent`.
-async fn expect_one_body(server: &HttpRecorder, present: &str, absent: &str) -> Result {
-    let requests = server.wait_for_requests(1).await?;
+/// The one request `server` saw.
+async fn one_request(server: &HttpRecorder) -> Result<Request> {
+    let mut requests = server.wait_for_requests(1).await?;
     testkit::ensure!(
         requests.len() == 1,
         "expected one request upstream; got {}",
         requests.len()
     );
-    let request = &requests[0];
+    Ok(requests.remove(0))
+}
+
+/// Fail unless `server` saw one request whose body has the credential
+/// placeholder in place of the token, and the secret appears nowhere in it.
+async fn expect_placeholder_body(server: &HttpRecorder) -> Result {
+    let request = one_request(server).await?;
     testkit::ensure!(
-        request.contains(present) && !request.contains(absent),
-        "expected {present:?} and not {absent:?} upstream"
+        request
+            .body
+            .starts_with(&format!("prefix-{PLACEHOLDER_PREFIX}"))
+            && request.body.ends_with("-suffix")
+            && !request.head.contains(TEST_SECRET)
+            && !request.body.contains(TEST_SECRET),
+        "expected the placeholder in the body upstream and no secret; got {}",
+        redact(&request)
     );
     Ok(())
+}
+
+/// `request` for a failure message, with the secret replaced.
+fn redact(request: &Request) -> String {
+    format!("{}\n\n{}", request.head, request.body).replace(TEST_SECRET, "<secret>")
 }
 
 /// Wait until new exec sessions report `expected` from [`TOKEN_PRESENCE`].

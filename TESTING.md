@@ -657,8 +657,8 @@ explains the isolation backend separation behind the capability-free runtime.
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
 on the sandbox-side `host.openshell.internal` alias reaching the machine running
 the tests, which is unreachable from pods on a remote cluster, so they fail.
-The conformance suite's `credential_gating` tests rely on the alias too and
-fail on a remote cluster; the feature selection doesn't skip them.
+The conformance suite requires the alias to reach that machine too, for its
+`credential_gating` tests; the feature selection doesn't skip them.
 Left enabled, the `host_gateway_alias` suite fails because
 `host.openshell.internal` does not resolve inside the pod, so the gateway
 SSRF-denies the request (`DNS resolution failed` / `ssrf_denied`) — a networking

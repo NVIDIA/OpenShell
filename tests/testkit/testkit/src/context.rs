@@ -367,7 +367,7 @@ impl SandboxBuilder {
                     .await?
                     .create_sandbox(request)
                     .await
-                    .map_err(|status| Error::from_error(&status))
+                    .map_err(|status| Error::from_status(&status))
                     .context(format!("create sandbox {name}"))?;
                 self.client
                     .get_sandbox(&name)
@@ -387,38 +387,45 @@ impl SandboxBuilder {
 }
 
 /// The gRPC request for a sandbox created from `spec` with `policy`, built
-/// as the SDK builds one from `spec` alone.
+/// as the SDK builds one from `spec` alone. The spec is destructured without
+/// `..`, so a field added to the SDK's spec fails to compile here instead of
+/// being dropped. [`SandboxBuilder::create`] rejects a GPU or service
+/// exposures before calling this.
 fn policy_create_request(
     spec: SandboxSpec,
     policy: proto::SandboxPolicy,
     workspace_scope: Option<proto::datamodel::v1::WorkspaceSelector>,
 ) -> proto::CreateSandboxRequest {
+    let SandboxSpec {
+        name,
+        image,
+        labels,
+        environment,
+        providers,
+        gpu: _,
+        command,
+        tty,
+        service_exposures: _,
+        restart_policy,
+    } = spec;
     proto::CreateSandboxRequest {
-        name: spec.name.unwrap_or_default(),
-        labels: spec.labels,
+        name: name.unwrap_or_default(),
+        labels,
         workspace_scope,
         spec: Some(proto::SandboxSpec {
-            environment: spec.environment,
-            template: spec.image.map(|image| proto::SandboxTemplate {
+            environment,
+            template: image.map(|image| proto::SandboxTemplate {
                 image,
                 ..proto::SandboxTemplate::default()
             }),
-            providers: spec.providers,
-            command: spec.command,
-            tty: spec.tty,
+            providers,
+            command,
+            tty,
             policy: Some(policy),
-            restart_policy: restart_policy(spec.restart_policy) as i32,
+            restart_policy: proto::SandboxRestartPolicy::from(restart_policy) as i32,
             ..proto::SandboxSpec::default()
         }),
         ..proto::CreateSandboxRequest::default()
-    }
-}
-
-const fn restart_policy(policy: SandboxRestartPolicy) -> proto::SandboxRestartPolicy {
-    match policy {
-        SandboxRestartPolicy::Never => proto::SandboxRestartPolicy::Never,
-        SandboxRestartPolicy::OnFailure => proto::SandboxRestartPolicy::OnFailure,
-        SandboxRestartPolicy::Always => proto::SandboxRestartPolicy::Always,
     }
 }
 

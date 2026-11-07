@@ -2285,6 +2285,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

@@ -58,6 +58,7 @@ pub use ready::check as check_ready;
 pub use registry::Test;
 pub use run::{TestInfo, run};
 pub use testkit_macros::test;
+pub use tonic::Code as GrpcCode;
 pub use yaml_file::YamlFile;
 
 #[doc(hidden)]

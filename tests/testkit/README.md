@@ -92,9 +92,12 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   `cx.sandbox(..).policy(policy)`, or `policy::to_yaml` for the CLI.
   `testkit::PYTHON_BINARIES` names `python3` in `python_image()` images.
 - `testkit::install_provider(cx, name, profile, credentials)` to import a
-  provider profile and create a provider of it, with cleanup for both.
+  provider profile, whose `id` must be `name`, and create a provider of it,
+  with cleanup for both.
 - `testkit::YamlFile` for YAML a CLI command reads from a file.
 - `cx.client()` for SDK calls testkit does not wrap.
+- `error.grpc_code()` for the gRPC status code (`testkit::GrpcCode`) of a
+  request the gateway refused, such as a sandbox create.
 - `poll_until` for waiting on other state.
 
 ## Running against a gateway

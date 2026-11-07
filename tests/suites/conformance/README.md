@@ -23,10 +23,9 @@ tmachine environment on CI. The other suites are ports of the old
 tests, so a test environment needs it installed
 (`tests/tmachine/ansible/playbooks/test-tools.yaml` does that for the tmachine
 environments). `credential-gating`, ported from NVIDIA/OpenShell#5264, starts
-servers (`tests/support/host-server`) on the machine that runs the tests and reaches them from sandboxes
-created from `testkit::python_image()` through `host.openshell.internal`, so
-it fails against a gateway whose sandboxes can't reach that machine, such as
-a remote Kubernetes cluster.
+servers (`tests/support/host-server`) on the machine that runs the tests and
+reaches them from sandboxes created from `testkit::python_image()` through
+`host.openshell.internal`.
 
 ## Running it
 
@@ -47,7 +46,9 @@ tests/suites/conformance/target/debug/openshell-conformance run --junit conforma
 ```
 
 The program runs only this suite: passing it means a gateway meets the
-conformance contract below. Feature and driver suites are not part of it. The
+conformance contract below. The machine that runs it must be reachable from
+sandboxes as `host.openshell.internal`, which rules out a gateway on a remote
+Kubernetes cluster. Feature and driver suites are not part of it. The
 [testkit README](../../testkit/README.md#test-programs) describes the commands
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
