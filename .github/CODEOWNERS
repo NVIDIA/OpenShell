@@ -40,5 +40,9 @@
 /tasks/scripts/check_issue_acceptance.cjs @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /tasks/scripts/check_issue_acceptance.test.cjs @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 
+# Accepted-work classification
+/tasks/scripts/accepted_work.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/accepted_work_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+
 # Auditable SBOM check
 /tasks/scripts/verify-image-sbom.sh @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr

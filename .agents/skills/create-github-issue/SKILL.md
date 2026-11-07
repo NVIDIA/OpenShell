@@ -135,7 +135,13 @@ EOF
 
 GitHub built-in issue types (`Bug`, `Feature`, `Task`) should come from the matching issue template when possible, or be set manually afterward. Do not try to emulate them through labels.
 
-Creating an issue does not accept it. Follow Label Discovery in `CONTRIBUTING.md` to retrieve every page of current `state:*` label definitions and resolve unclear meanings, then follow its triage → validation → human acceptance process. Agents may assess facts, but only humans decide whether to accept work or place it on the roadmap. A direct user request authorizes the requested planning or implementation phase without changing issue disposition.
+Use the canonical [accepted-work definition](../../../CONTRIBUTING.md#accepted-work) to determine eligibility; creating or labeling an issue does not override that policy. Follow Label Discovery in `CONTRIBUTING.md` for current state definitions. Agents may assess facts; roadmap and human disposition decisions remain with maintainers. A direct request authorizes the requested phase without changing recorded issue disposition.
+
+Follow [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications)
+for classification labels, and delegate reconciliation to
+[label-issue](../label-issue/SKILL.md) after shared eligibility is established.
+Intake workflow labels may still record triage status. Classification can trigger subscribers'
+GitHub app in Slack and other integration notifications.
 
 ## Useful Options
 
