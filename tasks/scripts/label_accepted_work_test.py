@@ -267,6 +267,48 @@ class GitHubAdapterTests(unittest.TestCase):
             else:
                 self.assertEqual(call.kwargs.get("method", "GET"), "GET")
 
+class IssueAdapterTests(unittest.TestCase):
+    def test_recorded_acceptance_uses_paginated_labels(self):
+        from accepted_work import check_issue_accepted_work
+        api = mock.Mock(return_value=[{'name': ACCEPTED_LABEL}])
+        self.assertTrue(check_issue_accepted_work(REPO, {'number': 9, 'user': {'login': 'x'}}, {'m'}, api=api))
+        api.assert_called_once_with(f'repos/{REPO}/issues/9/labels?per_page=100', pages=True)
+
+    def test_authority_and_errors(self):
+        from accepted_work import check_issue_accepted_work
+        item = {'number': 9, 'user': {'login': 'x'}}
+        api = mock.Mock(side_effect=[[], {'permission': 'write'}])
+        self.assertTrue(check_issue_accepted_work(REPO, item, {'m'}, api=api))
+        api = mock.Mock(side_effect=[[], {'permission': 'read'}])
+        self.assertFalse(check_issue_accepted_work(REPO, item, {'m'}, api=api))
+        api = mock.Mock(side_effect=RuntimeError('unavailable'))
+        with self.assertRaises(RuntimeError):
+            check_issue_accepted_work(REPO, item, {'m'}, api=api)
+
+    def test_issue_adapter_rejects_prs_instead_of_using_recorded_pr_label(self):
+        from accepted_work import check_issue_accepted_work
+        api = mock.Mock(return_value=[{'name': ACCEPTED_LABEL}])
+        with self.assertRaises(ValueError):
+            check_issue_accepted_work(REPO, {'number': 9, 'pull_request': {}, 'user': {'login': 'x'}}, {'m'}, api=api)
+
+    def test_maintainer_issue_needs_no_permission_lookup(self):
+        from accepted_work import check_issue_accepted_work
+        api = mock.Mock(return_value=[])
+        self.assertTrue(check_issue_accepted_work(REPO, {'number': 9, 'user': {'login': 'M'}}, {'m'}, api=api))
+        self.assertEqual(api.call_count, 1)
+
+    def test_noncollaborator_issue_404_is_unaccepted_other_errors_propagate(self):
+        from accepted_work import check_issue_accepted_work
+        item = {'number': 9, 'user': {'login': 'x'}}
+        for status in (404, 403, 429, 500):
+            with self.subTest(status=status):
+                api = mock.Mock(side_effect=[[], subprocess.CalledProcessError(1, 'gh', stderr=f'(HTTP {status})')])
+                if status == 404:
+                    self.assertFalse(check_issue_accepted_work(REPO, item, {'m'}, api=api))
+                else:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        check_issue_accepted_work(REPO, item, {'m'}, api=api)
+
 
 if __name__ == "__main__":
     unittest.main()
