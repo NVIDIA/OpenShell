@@ -487,7 +487,7 @@ def main(argv=None, *, api=None):
             args.output.write_text(json.dumps(printable, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
         print(json.dumps(printable, ensure_ascii=False))
         status = report['status']
-        return 0 if status in {'ready', 'applied', 'no-op', 'unchanged', 'skipped'} else 2 if status in {'held', 'prerequisite', 'stale'} else 1
+        return 0 if status in {'ready', 'preview', 'applied', 'no-op', 'unchanged', 'skipped'} else 2 if status in {'held', 'prerequisite', 'stale'} else 1
     except Exception as exc:
         print(json.dumps({'status': 'error', 'diagnostics': [str(exc)]}))
         return 1
