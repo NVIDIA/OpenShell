@@ -4201,4 +4201,144 @@ mod tests {
         assert!(runtime.middleware_services.is_empty());
         assert!(ctx.extension_credentials.get("removed-guard").is_none());
     }
+
+    /// Changed: revoking provider credentials publishes a policy generation,
+    /// so open connections wake and re-check the credentials they sent. Covers
+    /// each revocation path: an unavailable environment, bindings that fail
+    /// validation, and a snapshot for another revision. Today credentials are
+    /// revoked without a new generation, so a connection that authenticated
+    /// once with a revoked credential, such as an upgraded WebSocket, stays
+    /// open. (Successful installs already publish one; see
+    /// `stream_provider_rotation_rebinds_policy_generation`.)
+    #[tokio::test]
+    async fn provider_credential_revocation_publishes_a_policy_generation() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let mut ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = started_runtime(&ctx, &initial);
+        for (revision, snapshot_revision, readiness_reason, classification, expected_code) in [
+            (
+                2,
+                2,
+                ProviderReadinessReason::UnsupportedSupervisor,
+                openshell_core::proto::ProviderEnvironmentValueClassification::NonSecret,
+                "provider_environment_unavailable",
+            ),
+            (
+                3,
+                3,
+                ProviderReadinessReason::Unspecified,
+                openshell_core::proto::ProviderEnvironmentValueClassification::Unspecified,
+                "invalid_provider_environment",
+            ),
+            (
+                4,
+                5,
+                ProviderReadinessReason::Unspecified,
+                openshell_core::proto::ProviderEnvironmentValueClassification::NonSecret,
+                "provider_environment_mismatch",
+            ),
+        ] {
+            ctx.provider_credentials = initial_provider_credentials(
+                static_provider_environment(1, Some("initial")),
+                &ctx.provider_readiness,
+            );
+            let mut desired = initial.clone();
+            desired.provider_env_revision = revision;
+            let mut snapshot = provider_snapshot_for(&desired, "REGION", "west");
+            snapshot.provider_env_revision = snapshot_revision;
+            snapshot.readiness_reason = readiness_reason.into();
+            snapshot.values[0].classification = classification.into();
+            let before = ctx.opa_engine.current_generation();
+
+            let result = runtime
+                .apply_delivered_sandbox(&ctx, &client, desired, snapshot)
+                .await;
+
+            assert_eq!(
+                result.outcome,
+                ConfigApplyOutcome::FailedRetainedLastKnownGood
+            );
+            assert_eq!(result.failure.as_ref().unwrap().code, expected_code);
+            assert!(
+                ctx.provider_credentials.resolver().is_none(),
+                "{expected_code}: static credentials must be revoked"
+            );
+            assert!(
+                ctx.opa_engine.current_generation() > before,
+                "{expected_code}: revocation must publish a generation"
+            );
+        }
+    }
+
+    /// Unchanged: a revocation that finds no credential left to revoke, as
+    /// when the same failed provider refresh repeats on every poll, publishes
+    /// no generation, so open connections are not re-checked each time.
+    #[tokio::test]
+    async fn repeated_provider_credential_revocation_publishes_no_further_generation() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let mut ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.provider_credentials = initial_provider_credentials(
+            static_provider_environment(1, Some("initial")),
+            &ctx.provider_readiness,
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = started_runtime(&ctx, &initial);
+        let unavailable = |revision| {
+            let mut desired = initial.clone();
+            desired.provider_env_revision = revision;
+            let mut snapshot = provider_snapshot_for(&desired, "REGION", "west");
+            snapshot.readiness_reason = ProviderReadinessReason::UnsupportedSupervisor.into();
+            (desired, snapshot)
+        };
+        let (desired, snapshot) = unavailable(2);
+        let first = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired, snapshot)
+            .await;
+        assert_eq!(
+            first.outcome,
+            ConfigApplyOutcome::FailedRetainedLastKnownGood
+        );
+        assert!(ctx.provider_credentials.resolver().is_none());
+        let after_first = ctx.opa_engine.current_generation();
+
+        for revision in [3, 4] {
+            let (desired, snapshot) = unavailable(revision);
+            let result = runtime
+                .apply_delivered_sandbox(&ctx, &client, desired, snapshot)
+                .await;
+
+            assert_eq!(
+                result.outcome,
+                ConfigApplyOutcome::FailedRetainedLastKnownGood
+            );
+            assert_eq!(
+                result.failure.as_ref().unwrap().code,
+                "provider_environment_unavailable"
+            );
+            assert_eq!(ctx.opa_engine.current_generation(), after_first);
+        }
+    }
 }

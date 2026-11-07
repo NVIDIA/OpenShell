@@ -12591,4 +12591,115 @@ network_policies:
             cmdline_paths: vec![],
         }
     }
+
+    // --- Generation guards across policy reloads ---
+
+    fn proto_endpoint(host: &str) -> NetworkEndpoint {
+        NetworkEndpoint {
+            host: host.to_string(),
+            port: 443,
+            ..Default::default()
+        }
+    }
+
+    fn policy_mut<'a>(proto: &'a mut ProtoSandboxPolicy, name: &str) -> &'a mut NetworkPolicyRule {
+        proto
+            .network_policies
+            .get_mut(name)
+            .expect("fixture policy")
+    }
+
+    /// `test_proto` after approving an endpoint that no claude connection uses.
+    fn proto_with_unrelated_endpoint() -> ProtoSandboxPolicy {
+        let mut proto = test_proto();
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        proto
+    }
+
+    /// Unchanged: a guard pinned with `generation_guard` stays strict and goes
+    /// stale on any reload; only relay guards re-check their connection.
+    #[test]
+    fn generation_guard_goes_stale_on_unrelated_reload() {
+        let engine = OpaEngine::from_proto(&test_proto()).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+
+        engine
+            .reload_from_proto(&proto_with_unrelated_endpoint())
+            .unwrap();
+
+        assert!(
+            guard.is_stale(),
+            "a guard pinned with generation_guard closes on any reload"
+        );
+    }
+
+    /// Unchanged: a tunnel evaluator from `clone_engine_for_tunnel` stays strict.
+    #[test]
+    fn tunnel_engine_goes_stale_on_unrelated_reload() {
+        let engine = OpaEngine::from_proto(&test_proto()).unwrap();
+        let tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+
+        engine
+            .reload_from_proto(&proto_with_unrelated_endpoint())
+            .unwrap();
+
+        assert!(tunnel.is_stale());
+    }
+
+    /// Unchanged: proto conversion stamps the hash of the complete policy into
+    /// every endpoint, so endpoints differ after any reload. Revalidation has to
+    /// ignore that stamp.
+    #[test]
+    fn every_reload_restamps_policy_hash_on_unchanged_endpoints() {
+        let mut proto = test_proto();
+        policy_mut(&mut proto, "claude_code").endpoints[0] = NetworkEndpoint {
+            host: "api.anthropic.com".to_string(),
+            port: 443,
+            protocol: "rest".to_string(),
+            enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+            rules: vec![L7Rule {
+                allow: Some(L7Allow {
+                    method: "GET".to_string(),
+                    path: "/v1/messages".to_string(),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let before = OpaEngine::from_proto(&proto).unwrap();
+        policy_mut(&mut proto, "gitlab")
+            .endpoints
+            .push(proto_endpoint("registry.gitlab.com"));
+        let after = OpaEngine::from_proto(&proto).unwrap();
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let before = before.authorize_egress(&input).unwrap();
+        let after = after.authorize_egress(&input).unwrap();
+
+        assert_eq!(before.action, after.action);
+        assert_ne!(before.endpoint_configs, after.endpoint_configs);
+        let hash = |configs: &[regorus::Value]| {
+            configs
+                .iter()
+                .map(|config| config["policy_hash"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            hash(&before.endpoint_configs),
+            hash(&after.endpoint_configs)
+        );
+    }
 }
