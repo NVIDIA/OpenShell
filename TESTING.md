@@ -752,6 +752,7 @@ Available task variants:
 | Task | Purpose |
 |---|---|
 | `e2e:kubernetes` | Default Rust e2e against Helm-deployed gateway |
+| `e2e:kubernetes:tracing` | Gateway and Kubernetes driver trace receipt at a real OTLP collector; requires a disposable cluster context and a built CLI |
 | `e2e:kubernetes:db` | All database backend scenarios (SQLite + external PostgreSQL) |
 | `e2e:kubernetes:sidecar` | Supervisor sidecar topology overlay |
 | `e2e:kubernetes:credential-drivers` | Kubernetes Secrets and Vault credential storage |
@@ -762,6 +763,18 @@ Available task variants:
 | `e2e:kubernetes:shared-supervisor` | One-member shared supervisor pool for the gateway's sandboxes (gateway TLS through the port-forward) |
 | `e2e:kubernetes:shared-supervisor-ha` | Two-replica shared supervisor pool behind two gateway replicas on PostgreSQL: kills the member that owns a sandbox and checks the sandbox is adopted, not restarted; crashes and restarts gateways and checks each sandbox's session stays on its supervisor's gateway |
 | `e2e:kubernetes:shared-supervisor-scaling` | One-member shared supervisor pool: scales it to two members and back with `helm upgrade`, checking sandboxes stay running and the removed member hands its sandboxes off |
+
+Ordinary Kubernetes lanes do not configure OTLP export. The separate
+`e2e:kubernetes:tracing` lane installs a pinned OpenTelemetry Collector in its
+own temporary namespace before enabling gateway export. It creates and exercises
+a sandbox, then requires correctly attributed gateway and driver operations,
+valid trace IDs, and shared gateway-to-driver validation context within a bounded
+deadline. Missing spans fail the lane. Collector logs and receipt evidence are
+saved under `results/kubernetes-tracing/`, including on failure. This verifies
+collector receipt, not retention in a trace backend.
+
+See [the tracing fixture](e2e/kubernetes/tracing/README.md) for local commands,
+the disposable-cluster requirement, and the expected operations.
 
 Kubernetes e2e environment variables:
 
