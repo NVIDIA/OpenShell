@@ -367,6 +367,15 @@ config opt-in. Consult the published gateway configuration reference before
 changing admission settings; do not recommend disabling admission to bypass a
 denial. Put driver config on a template only when it should be reused.
 
+For a compute driver that advertises sampled account budgets, use
+`sandbox template create` with `--cpu-time-budget 30s` and
+`--resident-memory-budget-bytes 1073741824`, then create from that template.
+These explicit budgets terminate on observed excess; collection and sampling
+can overshoot. They are distinct from `--cpu` core-rate limits and `--memory`
+hard limits. Inspect `gateway info` for driver guarantees; ordinary workspace
+users do not need its administrator permission to use budgets. Budget requests
+fail before provisioning if the gateway or driver does not support them.
+
 ### Manage sandbox workload templates
 
 ```bash

@@ -480,12 +480,14 @@ impl MxcComputeBackend {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/mxc",
                 openshell_core::VERSION,
-                [],
+                [openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT.to_string()],
             )),
         }
     }
 
     fn validate_sandbox_fields(sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
+        openshell_core::resource_contract::validate_request(sandbox, None, true)
+            .map_err(tonic::Status::failed_precondition)?;
         if let Some(spec) = &sandbox.spec {
             if effective_driver_gpu_count(driver_gpu_requirements(
                 spec.resource_requirements.as_ref(),

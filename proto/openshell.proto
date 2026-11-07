@@ -936,6 +936,10 @@ message HealthResponse {
 
   // Service version.
   string version = 2;
+  // Gateway acknowledgement that sampled budget fields survive public writes
+  // and receive compute admission. This does not promise driver support.
+  // Budget-bearing clients must require true before writes to older gateways.
+  bool supports_sampled_resource_budget = 3;
 }
 
 // Current-user request. The identity comes from the authenticated request.
@@ -1030,16 +1034,23 @@ message ResourceCapabilities {
   CpuResourceCapabilities cpu = 1;
   MemoryResourceCapabilities memory = 2;
   GpuResourceCapabilities gpu = 3;
+  openshell.sandbox.v1.SampledResourceBudgetCapabilities sampled_budget = 4;
 }
 
 message CpuResourceCapabilities {
   // The driver accepts and enforces a portable CPU limit.
   bool limit_supported = 1;
+  // Required for a negotiated resource contract. Absence means unreported.
+  openshell.sandbox.v1.ResourceEnforcement limit_enforcement = 2;
+  openshell.sandbox.v1.ResourceEnforcement request_enforcement = 3;
 }
 
 message MemoryResourceCapabilities {
   // The driver accepts and enforces a portable memory limit.
   bool limit_supported = 1;
+  // Required for a negotiated resource contract. Absence means unreported.
+  openshell.sandbox.v1.ResourceEnforcement limit_enforcement = 2;
+  openshell.sandbox.v1.ResourceEnforcement request_enforcement = 3;
 }
 
 message GpuResourceCapabilities {
@@ -1115,6 +1126,8 @@ message SandboxSpec {
 message ResourceRequirements {
   // GPU requirements for the sandbox. Presence indicates a GPU request.
   GpuResourceRequirements gpu = 1;
+  // Explicit opt-in to weaker sampled budgets; never inferred from hard limits.
+  openshell.sandbox.v1.SampledResourceBudget sampled_budget = 4;
 }
 
 // Public GPU resource requirements.
@@ -1200,6 +1213,7 @@ message SandboxResources {
   // request. When count is omitted, the request uses the selected driver's
   // default GPU assignment behavior.
   GpuResourceRequirements gpu = 3;
+  openshell.sandbox.v1.SampledResourceBudget sampled_budget = 4;
 }
 
 message SandboxServiceLevel {

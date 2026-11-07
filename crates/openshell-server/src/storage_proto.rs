@@ -178,11 +178,11 @@ mod tests {
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3b4c2af6cf22e7ed1d84279ff865acb0db7199717bee9bc041caef791334104d";
+        "5ef822bc5817a921f3f006c8ff6ee30ceffdb81803f929c84ab11a1465fbf1dc";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "3716f9d2b96cdfc2dc92d6825a3729e3d695d7d7e1dd84733369b5c38dc91342";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
+        "a2ce7f9483846f81e024bdf31dc944bdd109aaaae294d8b3c58eac3ca5079f83";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -723,9 +723,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (337, 31),
-                (100, 22),
-                (86, 22),
+                (340, 33),
+                (101, 22),
+                (87, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -786,6 +786,11 @@ mod tests {
         assert!(!crate::policy_store::permits_initial_static_policy_repair(
             &sandbox
         ));
+        let resources = openshell_core::proto::ResourceRequirements::decode(&[10, 0][..]).unwrap();
+        assert!(resources.gpu.is_some());
+        assert!(resources.sampled_budget.is_none());
+        let health = openshell_core::proto::HealthResponse::decode(&[8, 1][..]).unwrap();
+        assert!(!health.supports_sampled_resource_budget);
         assert_eq!(sandbox.encode_to_vec(), bytes);
     }
 

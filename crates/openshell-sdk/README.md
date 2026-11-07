@@ -212,3 +212,11 @@ These helpers use the raw client's authentication slot. They do not perform OIDC
 - Async-only. Tonic is async-native; callers needing a blocking call can wrap
   with their own runtime.
 - The curated surface will grow as more RPCs graduate from `raw`.
+
+## Next minor API migration
+
+This source-breaking API change targets the next minor release and must not be backported into the `0.1.x` patch series.
+
+Raw `HealthResponse`, public and compute resource requirements, resource capabilities and workload-template resource messages gain acknowledgement, enforcement and sampled-budget fields. Complete generated Rust literals must initialize the new fields or use `..Default::default()`. Complete TypeScript Health responses need `supportsSampledResourceBudget: false` or a generated message builder.
+
+Legacy wire fields retain their identities and new optional fields remain absent on old payloads. Before sending a budget-bearing write, check the Health acknowledgement for field preservation. The selected driver's admission separately checks enforcement. Upgrade gateway writers together before persisting budgets because older writers can discard them.

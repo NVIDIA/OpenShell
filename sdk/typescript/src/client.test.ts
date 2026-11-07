@@ -761,22 +761,39 @@ describe('create', () => {
   });
 
   it('sends canonical main process fields', async () => {
-    let created: { spec?: { command?: string[]; tty?: boolean } } = {};
+    let created: {
+      spec?: {
+        command?: string[];
+        tty?: boolean;
+        resourceRequirements?: {
+          sampledBudget?: { residentBytes?: bigint; cpuTime?: { seconds?: bigint; nanos?: number } };
+        };
+      };
+    } = {};
+    let supportsSampledResourceBudget = false;
     const sandbox = client({
+      health: () => ({ supportsSampledResourceBudget }),
       createSandbox: (req) => {
         created = req;
         return readySandbox('sb', 'sb-id');
       },
     });
 
-    await sandbox.create({
+    const spec = {
       image: 'img',
       command: ['/opt/worker', '--serve'],
       tty: true,
-    });
+      sampledBudget: { cpuTime: { seconds: 2n, nanos: 0 }, residentBytes: 4096n },
+    };
+    await expect(sandbox.create(spec)).rejects.toMatchObject({ code: 'invalid_config' });
+    expect(created).toEqual({});
+    supportsSampledResourceBudget = true;
+    await sandbox.create(spec);
 
     expect(created.spec?.command).toEqual(['/opt/worker', '--serve']);
     expect(created.spec?.tty).toBe(true);
+    expect(created.spec?.resourceRequirements?.sampledBudget?.residentBytes).toBe(4096n);
+    expect(created.spec?.resourceRequirements?.sampledBudget?.cpuTime?.seconds).toBe(2n);
   });
 
   it('sends the restart policy', async () => {
@@ -1162,6 +1179,37 @@ describe('create', () => {
       name: 'gpu-kata',
       resourceVersion: '42',
     });
+  });
+});
+
+describe('sampled budget compatibility', () => {
+  it('blocks template and raw-spec writes until the gateway acknowledges the fields', async () => {
+    let supported = false;
+    let writes = 0;
+    const transport = createRouterTransport((router) => {
+      router.service(OpenShell, {
+        health: () => ({ supportsSampledResourceBudget: supported }),
+        createSandboxTemplate: (req) => {
+          writes++;
+          return { template: req.template };
+        },
+        createSandbox: () => {
+          writes++;
+          return readySandbox('budget', 'sb-id');
+        },
+      });
+    });
+    const templates = new SandboxTemplateClient(transport);
+    const sandbox = new SandboxClient(transport);
+    const template = { spec: { workload: { resources: { sampledBudget: { residentBytes: 4096n } } } } };
+    const spec = { rawSpec: { resourceRequirements: { sampledBudget: { residentBytes: 4096n } } } };
+    await expect(templates.create(template)).rejects.toMatchObject({ code: 'invalid_config' });
+    await expect(sandbox.create(spec)).rejects.toMatchObject({ code: 'invalid_config' });
+    expect(writes).toBe(0);
+    supported = true;
+    await templates.create(template);
+    await sandbox.create(spec);
+    expect(writes).toBe(2);
   });
 });
 

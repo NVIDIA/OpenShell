@@ -312,6 +312,15 @@ fn validate_main_process_command(command: &[String]) -> Result<(), Status> {
 }
 
 fn validate_gpu_request_fields(spec: &SandboxSpec) -> Result<(), Status> {
+    if let Some(budget) = spec
+        .resource_requirements
+        .as_ref()
+        .and_then(|r| r.sampled_budget.as_ref())
+    {
+        openshell_core::resource_contract::validate_sampled_budget(budget).map_err(|error| {
+            invalid_argument("spec.resource_requirements.sampled_budget", error)
+        })?;
+    }
     if openshell_core::gpu::sandbox_gpu_count(spec.resource_requirements.as_ref()) == Some(0) {
         return Err(invalid_argument(
             "spec.resource_requirements.gpu.count",
@@ -1242,6 +1251,7 @@ mod tests {
         let spec = SandboxSpec {
             resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                 gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1253,6 +1263,7 @@ mod tests {
         let spec = SandboxSpec {
             resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                 gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1264,6 +1275,7 @@ mod tests {
         let spec = SandboxSpec {
             resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                 gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(0) }),
+                ..Default::default()
             }),
             ..Default::default()
         };

@@ -398,7 +398,9 @@ impl ComputeRuntime {
                     // Each sandbox owns independent locks even though these
                     // futures are polled concurrently in the same Tokio task.
                     crate::persistence::lock_order::branch(async move {
-                        if let Err(error) = self.recover_one_sandbox_update(&id).await {
+                        // Resource input growth makes this recovery future exceed the
+                        // stack-size lint budget; keep the existing await on the heap.
+                        if let Err(error) = Box::pin(self.recover_one_sandbox_update(&id)).await {
                             tracing::warn!(sandbox_id = %id, %error,
                                 "Cannot read pending sandbox update for recovery");
                         }
@@ -970,15 +972,16 @@ mod tests {
             .get_sandbox_image_state(original.object_id())
             .await
             .unwrap();
-        runtime
-            .recover_one_sandbox_update(original.object_id())
+        Box::pin(runtime.recover_one_sandbox_update(original.object_id()))
             .await
             .unwrap();
-        runtime
-            .clone()
-            .recover_one_sandbox_update(original.object_id())
-            .await
-            .unwrap();
+        Box::pin(
+            runtime
+                .clone()
+                .recover_one_sandbox_update(original.object_id()),
+        )
+        .await
+        .unwrap();
         assert_eq!(image_calls(&driver).len(), 2);
         assert_eq!(
             runtime
@@ -994,8 +997,7 @@ mod tests {
         let mut restarted = runtime.clone();
         restarted.update_recovery_backoff = Arc::default();
         driver.set_image_update_error(None);
-        restarted
-            .recover_one_sandbox_update(original.object_id())
+        Box::pin(restarted.recover_one_sandbox_update(original.object_id()))
             .await
             .unwrap();
         assert_eq!(image_calls(&driver).len(), 3);
@@ -1018,8 +1020,7 @@ mod tests {
             .unwrap_err();
         // The original runtime still remembers the previous operation's delay,
         // but the new operation must be eligible immediately.
-        runtime
-            .recover_one_sandbox_update(original.object_id())
+        Box::pin(runtime.recover_one_sandbox_update(original.object_id()))
             .await
             .unwrap();
         assert_eq!(image_calls(&driver).len(), 5);
@@ -1029,8 +1030,7 @@ mod tests {
         );
 
         driver.set_image_update_error(None);
-        restarted
-            .recover_one_sandbox_update(original.object_id())
+        Box::pin(restarted.recover_one_sandbox_update(original.object_id()))
             .await
             .unwrap();
         runtime.recover_pending_sandbox_updates().await.unwrap();
