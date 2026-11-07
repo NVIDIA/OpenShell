@@ -69,9 +69,9 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique_with_catalog,
 };
 use super::validation::{
-    level_matches, source_matches, validate_and_canonicalize_policy, validate_dns1123_label,
-    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
+    level_matches, source_matches, validate_and_canonicalize_authored_policy,
+    validate_dns1123_label, validate_exec_request_fields, validate_policy_safety,
+    validate_sandbox_governance_spec, validate_sandbox_spec,
 };
 use super::{MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN};
 use crate::persistence::current_time_ms;
@@ -680,8 +680,7 @@ async fn handle_create_sandbox_inner(
 
     if let Some(ref mut policy) = spec.policy {
         super::policy::clear_provider_credentialed_markers(policy);
-        validate_no_reserved_provider_policy_keys(policy)?;
-        *policy = validate_and_canonicalize_policy(policy.clone())?;
+        *policy = validate_and_canonicalize_authored_policy(policy.clone())?;
     }
 
     // Process identity and MCP default materialization can increase the
@@ -4290,6 +4289,7 @@ mod tests {
         assert_redacted, audited,
     };
     use crate::compute::NoopTestDriver;
+    use crate::grpc::validation::validate_and_canonicalize_policy;
 
     #[test]
     fn exec_requires_ssh_channel_close_after_exit_status() {

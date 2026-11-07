@@ -2155,6 +2155,13 @@ enum DraftCommands {
 
 #[derive(Subcommand, Debug)]
 enum PolicyCommands {
+    /// Validate an authored policy file offline, without a gateway.
+    #[command(help_template = LEAF_HELP_TEMPLATE)]
+    Lint {
+        /// Path to the authored policy YAML file.
+        #[arg(value_hint = ValueHint::FilePath)]
+        policy: String,
+    },
     /// Update policy on a live sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
@@ -3063,12 +3070,16 @@ async fn run_async() -> Result<()> {
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
         Some(Commands::Policy {
+            command: Some(PolicyCommands::Lint { policy }),
+        }) => run::sandbox_policy_lint(&policy)?,
+        Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match policy_cmd {
+                PolicyCommands::Lint { .. } => unreachable!("offline lint is dispatched above"),
                 PolicyCommands::Set {
                     name,
                     policy,

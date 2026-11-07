@@ -174,7 +174,7 @@ const MAX_METADATA_ANNOTATIONS_ENTRIES: usize = 128;
 /// Maximum serialized size (bytes) for template Struct fields.
 const MAX_TEMPLATE_STRUCT_SIZE: usize = 65_536;
 /// Maximum serialized size (bytes) for the policy field.
-const MAX_POLICY_SIZE: usize = 262_144;
+const MAX_POLICY_SIZE: usize = openshell_policy::MAX_AUTHORED_POLICY_SIZE;
 /// Maximum length for a provider type slug.
 const MAX_PROVIDER_TYPE_LEN: usize = 64;
 /// Maximum number of entries in the provider `credentials` map.
