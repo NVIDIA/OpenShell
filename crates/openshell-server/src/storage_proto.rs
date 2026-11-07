@@ -180,7 +180,7 @@ mod tests {
     // ReportSandboxConfigurationRequest field 4 adds a public-only refusal
     // flag. Older supervisors omit it; durable schemas remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "71c803759900cef4bfaafc4a2bbc45521adf90bf1216eea56aebd7614036a8b8";
+        "94e2cdf1066c0af624af56ec3a7364499382931992d39bd34e0d5e019dff4dd4";
     const DURABLE_SCHEMA_SHA256: &str =
         "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -654,7 +654,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            109 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -725,7 +725,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (335, 31),
+                (337, 31),
                 (100, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

@@ -139,15 +139,6 @@ func (t *tcpClient) Listen(ctx context.Context, workspace, sandboxName string, r
 	return tl, nil
 }
 
-func (tl *tunnelListener) acceptLoop() {
-	defer tl.wg.Done()
-	for {
-		if err := tl.acceptAndBridge(); err != nil {
-			return
-		}
-	}
-}
-
 // tunnelListener implements net.Listener. It accepts local TCP connections
 // and bridges each one to a sandbox port via Forward (or Tunnel in SSH mode).
 type tunnelListener struct {
@@ -167,58 +158,64 @@ type tunnelListener struct {
 	closeErr    error
 }
 
-func (tl *tunnelListener) acceptAndBridge() error {
+// acceptLoop accepts local connections and hands each one to its own
+// goroutine, so a slow or hung tunnel setup never delays other clients.
+func (tl *tunnelListener) acceptLoop() {
+	defer tl.wg.Done()
 	for {
 		conn, err := tl.inner.Accept()
 		if err != nil {
-			return err
-		}
-
-		// Establish the tunnel to the sandbox.
-		var tunnel io.ReadWriteCloser
-		if tl.cfg.useSSHTunnel && tl.ssh != nil {
-			var tunnelOpts []TunnelOption
-			if tl.cfg.serviceID != "" {
-				tunnelOpts = append(tunnelOpts, WithTunnelServiceID(tl.cfg.serviceID))
-			}
-			tunnel, err = tl.ssh.Tunnel(tl.ctx, tl.workspace, tl.sandboxName, tl.remotePort, tunnelOpts...)
-		} else {
-			var fwdOpts []ForwardOption
-			if tl.cfg.serviceID != "" {
-				fwdOpts = append(fwdOpts, WithForwardServiceID(tl.cfg.serviceID))
-			}
-			tunnel, err = tl.tcp.Forward(tl.ctx, tl.workspace, tl.sandboxName, tl.remotePort, fwdOpts...)
-		}
-
-		if err != nil {
-			_ = conn.Close()
-			select {
-			case <-tl.ctx.Done():
-				return tl.ctx.Err()
-			default:
-				continue
-			}
+			return
 		}
 
 		tl.mu.Lock()
 		if tl.closing {
 			tl.mu.Unlock()
 			_ = conn.Close()
-			_ = tunnel.Close()
-			return net.ErrClosed
+			return
 		}
 		tl.wg.Add(1)
 		tl.mu.Unlock()
-		go tl.bridge(conn, tunnel)
-
-		return nil
+		go tl.serve(conn)
 	}
 }
 
-// bridge copies data bidirectionally between the local connection and the
-// tunnel. It runs in its own goroutine and decrements the WaitGroup on exit.
-func (tl *tunnelListener) bridge(local net.Conn, tunnel io.ReadWriteCloser) {
+// openTunnel establishes a tunnel to the sandbox port, over SSH or ForwardTcp.
+func (tl *tunnelListener) openTunnel() (io.ReadWriteCloser, error) {
+	if tl.cfg.useSSHTunnel && tl.ssh != nil {
+		var opts []TunnelOption
+		if tl.cfg.serviceID != "" {
+			opts = append(opts, WithTunnelServiceID(tl.cfg.serviceID))
+		}
+		return tl.ssh.Tunnel(tl.ctx, tl.workspace, tl.sandboxName, tl.remotePort, opts...)
+	}
+	var opts []ForwardOption
+	if tl.cfg.serviceID != "" {
+		opts = append(opts, WithForwardServiceID(tl.cfg.serviceID))
+	}
+	return tl.tcp.Forward(tl.ctx, tl.workspace, tl.sandboxName, tl.remotePort, opts...)
+}
+
+// serve sets up the tunnel for one local connection and bridges the two.
+// It runs in its own goroutine and decrements the WaitGroup on exit.
+func (tl *tunnelListener) serve(local net.Conn) {
 	defer tl.wg.Done()
+	tunnel, err := tl.openTunnel()
+	if err != nil {
+		_ = local.Close()
+		return
+	}
+	if tl.ctx.Err() != nil {
+		_ = local.Close()
+		_ = tunnel.Close()
+		return
+	}
+	tl.bridge(local, tunnel)
+}
+
+// bridge copies data bidirectionally between the local connection and the
+// tunnel until either side closes, then closes both.
+func (tl *tunnelListener) bridge(local net.Conn, tunnel io.ReadWriteCloser) {
 	defer func() { _ = local.Close() }()
 	defer func() { _ = tunnel.Close() }()
 

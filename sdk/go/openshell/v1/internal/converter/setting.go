@@ -325,11 +325,10 @@ func ConfigUpdateResultFromProto(resp *pb.UpdateConfigResponse) *v1.ConfigUpdate
 		return nil
 	}
 	return &v1.ConfigUpdateResult{
-		CreatedPolicyRevision: resp.GetCreatedPolicyRevision(),
-		Version:               resp.GetVersion(),
-		PolicyHash:            resp.GetPolicyHash(),
-		SettingsRevision:      resp.GetSettingsRevision(),
-		Deleted:               resp.GetDeleted(),
-		Annotations:           CopyStringMap(resp.GetAnnotations()),
+		Version:          resp.GetVersion(),
+		PolicyHash:       resp.GetPolicyHash(),
+		SettingsRevision: resp.GetSettingsRevision(),
+		Deleted:          resp.GetDeleted(),
+		Annotations:      CopyStringMap(resp.GetAnnotations()),
 	}
 }

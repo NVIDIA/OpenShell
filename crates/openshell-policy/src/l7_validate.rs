@@ -223,6 +223,9 @@ pub struct L7EndpointFields<'a> {
     /// `true` when the endpoint has a non-empty rules list.
     pub has_rules: bool,
 
+    /// Whether WebSocket credential rewriting was enabled.
+    pub websocket_credential_rewrite: bool,
+
     /// `true` when the endpoint has a non-empty `deny_rules` list.
     pub has_deny_rules: bool,
 
@@ -244,6 +247,9 @@ pub fn validate_l7_endpoint_semantics(ep: &L7EndpointFields<'_>) -> Vec<String> 
     let mut errors = Vec::new();
     let protocol = ep.protocol;
     let l7_protocol = L7Protocol::parse(protocol);
+    if matches!(l7_protocol, Some(L7Protocol::Rest)) && ep.websocket_credential_rewrite {
+        errors.push("websocket_credential_rewrite is not supported for protocol rest; use protocol: websocket with explicit message rules".to_string());
+    }
     let explicit_tcp = is_explicit_tcp_protocol(protocol);
     let jsonrpc_family = l7_protocol.is_some_and(L7Protocol::is_jsonrpc_family);
     let is_mcp = matches!(l7_protocol, Some(L7Protocol::Mcp));
@@ -335,12 +341,34 @@ mod tests {
 
     fn valid_rest_endpoint() -> L7EndpointFields<'static> {
         L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "rest",
             access: "read-only",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
             allow_all_known_mcp_methods: false,
+        }
+    }
+
+    #[test]
+    fn rest_rejects_websocket_credential_rewrite_with_migration_hint() {
+        let mut endpoint = valid_rest_endpoint();
+        endpoint.websocket_credential_rewrite = true;
+        for protocol in ["rest", "REST", "Rest"] {
+            endpoint.protocol = protocol;
+            let errors = validate_l7_endpoint_semantics(&endpoint);
+            assert!(
+                errors.iter().any(|e| e.contains("use protocol: websocket")),
+                "{protocol}: {errors:?}"
+            );
+        }
+        for protocol in ["websocket", "WEBSOCKET", "WebSocket"] {
+            endpoint.protocol = protocol;
+            assert!(
+                validate_l7_endpoint_semantics(&endpoint).is_empty(),
+                "{protocol}"
+            );
         }
     }
 
@@ -383,6 +411,7 @@ mod tests {
     #[test]
     fn rejects_unknown_protocol() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "ftp",
             access: "",
             has_rules: false,
@@ -397,6 +426,7 @@ mod tests {
     #[test]
     fn rejects_rules_and_access_together() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "rest",
             access: "full",
             has_rules: true,
@@ -411,6 +441,7 @@ mod tests {
     #[test]
     fn rejects_jsonrpc_with_access_presets() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "json-rpc",
             access: "full",
             has_rules: false,
@@ -429,6 +460,7 @@ mod tests {
     #[test]
     fn rejects_mcp_with_access_presets() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "mcp",
             access: "full",
             has_rules: false,
@@ -447,6 +479,7 @@ mod tests {
     #[test]
     fn rejects_jsonrpc_without_rules() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "json-rpc",
             access: "",
             has_rules: false,
@@ -461,6 +494,7 @@ mod tests {
     #[test]
     fn rejects_protocol_without_rules_or_access() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "rest",
             access: "",
             has_rules: false,
@@ -479,6 +513,7 @@ mod tests {
     #[test]
     fn rejects_mcp_without_rules_when_allow_all_false() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "mcp",
             access: "",
             has_rules: false,
@@ -493,6 +528,7 @@ mod tests {
     #[test]
     fn accepts_mcp_with_allow_all_true() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "mcp",
             access: "",
             has_rules: false,
@@ -507,6 +543,7 @@ mod tests {
     #[test]
     fn rejects_rules_that_deny_all() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "rest",
             access: "",
             has_rules: true,
@@ -521,6 +558,7 @@ mod tests {
     #[test]
     fn mcp_allow_all_with_empty_allow_not_rejected() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "mcp",
             access: "",
             has_rules: true,
@@ -538,6 +576,7 @@ mod tests {
     #[test]
     fn rejects_deny_rules_without_protocol() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "",
             access: "",
             has_rules: false,
@@ -556,6 +595,7 @@ mod tests {
     #[test]
     fn rejects_deny_rules_without_allow_base() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "rest",
             access: "",
             has_rules: false,
@@ -574,6 +614,7 @@ mod tests {
     #[test]
     fn no_protocol_no_errors() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "",
             access: "",
             has_rules: false,
@@ -588,6 +629,7 @@ mod tests {
     #[test]
     fn explicit_tcp_is_valid_without_l7_fields() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "tcp",
             access: "",
             has_rules: false,
@@ -604,6 +646,7 @@ mod tests {
     #[test]
     fn explicit_tcp_rejects_l7_fields() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "tcp",
             access: "full",
             has_rules: false,
@@ -648,6 +691,7 @@ mod tests {
     #[test]
     fn jsonrpc_with_access_emits_single_diagnostic() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "json-rpc",
             access: "full",
             has_rules: false,
@@ -669,6 +713,7 @@ mod tests {
     #[test]
     fn jsonrpc_without_rules_or_access_emits_single_diagnostic() {
         let ep = L7EndpointFields {
+            websocket_credential_rewrite: false,
             protocol: "json-rpc",
             access: "",
             has_rules: false,
