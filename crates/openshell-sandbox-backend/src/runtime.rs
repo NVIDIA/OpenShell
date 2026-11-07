@@ -958,6 +958,12 @@ impl RunningBoundary {
         expect_response(response, "boundary_terminated")
     }
 
+    /// Stop waiting for a lost boundary connection to recover. The owner is
+    /// stopping, and the boundary may be stopping with it.
+    pub fn begin_stop(&self) {
+        self.process.client.stopping.store(true, Ordering::Release);
+    }
+
     /// Whether the negotiated backend advertised suspend/resume support.
     pub fn supports_suspend(&self) -> bool {
         self.process
@@ -1601,6 +1607,9 @@ struct BoundaryClient {
     recovery_timeout_secs: Option<u32>,
     /// True once a connection of this client was confirmed.
     confirmed: tokio::sync::watch::Sender<bool>,
+    /// Set when the owner stops the boundary; a lost connection is then
+    /// reported instead of recovered.
+    stopping: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -1800,6 +1809,7 @@ impl BoundaryClient {
             requires_takeover: false,
             recovery_timeout_secs: None,
             confirmed: tokio::sync::watch::Sender::new(false),
+            stopping: AtomicBool::new(false),
         }
     }
 
@@ -2207,6 +2217,11 @@ impl BoundaryClient {
                 return Ok(());
             }
             cached.transport.abort();
+        }
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(BackendError::Unavailable(
+                "boundary connection lost while stopping".to_string(),
+            ));
         }
 
         *self.mediation.lock().await = None;
@@ -3968,6 +3983,72 @@ mod tests {
         assert_eq!(client.connection_generation().await, recovered_generation);
         assert_eq!(accepted.load(Ordering::Acquire), 2);
         assert_eq!(requests.load(Ordering::Acquire), 5);
+    }
+
+    #[tokio::test]
+    async fn stopping_client_reports_a_lost_boundary_without_recovery() {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_config = certificate.server_config.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = tokio_rustls::TlsAcceptor::from(server_config)
+                .accept(stream)
+                .await
+                .unwrap();
+            let service = TestGrpcBoundary {
+                wait_for_half_close: false,
+                expected_token: "a".repeat(32),
+                requests: Arc::default(),
+                mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                mediation_ready: false,
+                provider_environment_generation: 0,
+                confirmation: test_confirmation(),
+                attach_snapshots: Arc::default(),
+                received: Arc::default(),
+            };
+            tonic::transport::Server::builder()
+                .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                .add_service(SandboxProtocolServer::new(service))
+                .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
+                    Box::new(stream),
+                ))]))
+                .await
+                .unwrap();
+        });
+        let client = BoundaryClient::new(
+            tls_runtime_descriptor(address, certificate.client_tls),
+            test_bearer(&"a".repeat(32)),
+        );
+        let attach = Request::Attach {
+            supervisor_instance_id: client.supervisor_instance_id,
+            policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+            supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: None,
+        };
+        client.call_idempotent(attach).await.unwrap();
+        client.call_idempotent(Request::Confirm).await.unwrap();
+
+        // The boundary stops with its owner: no listener remains to reattach.
+        server.abort();
+        let _ = server.await;
+        client.stopping.store(true, Ordering::Release);
+        client
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .expect("cached channel")
+            .transport
+            .abort();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_idempotent(Request::TerminateBoundary),
+        )
+        .await
+        .expect("a stopping client must not wait for the boundary to recover");
+        assert!(matches!(result, Err(BackendError::Unavailable(_))));
     }
 
     #[test]
