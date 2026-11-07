@@ -234,7 +234,9 @@ pub(crate) async fn prepare_inspected_request(
             &owners,
             request_id,
             observation_context.filter(|context| {
-                context.matches_config(&config.policy_hash, Some(snapshot.revision))
+                let policy_hash =
+                    crate::l7::observation_policy_hash(config, Some(engine.generation_guard()));
+                context.matches_config(&policy_hash, Some(snapshot.revision))
             }),
             correlation,
         )
@@ -4658,7 +4660,20 @@ where
         let mut response_selection = None;
         let mut live_body = None;
         let req = if let Some((engine, selection)) = middleware_engine.zip(middleware_selection) {
-            let (chain, generation) = selection.map_err(&capture_error)?;
+            let (mut chain, mut generation) = selection.map_err(&capture_error)?;
+            // The chain was selected before the request was read. If the
+            // revalidating guard re-pinned through an unrelated reload in the
+            // meantime (close_if_stale above), re-select under the current
+            // policy instead of closing the connection.
+            if generation != generation_guard.captured_generation() {
+                (chain, generation) = engine
+                    .query_middleware_chain_with_generation(&middleware_network_input(ctx))
+                    .map_err(&capture_error)?;
+                // The request was already parsed for the old chain's mode.
+                if chain.is_empty() == inspected {
+                    return Ok(());
+                }
+            }
             if generation != generation_guard.captured_generation() {
                 return Ok(());
             }

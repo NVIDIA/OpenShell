@@ -5,10 +5,13 @@
 
 use super::{EgressDecision, L7RouteSnapshot, emit_l7_tunnel_close_after_policy_change};
 use crate::l7::relay::L7EvalContext;
-use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::opa::{
+    NetworkAction, OpaEngine, PolicyGenerationGuard, PolicyRevalidator, TunnelPolicyEngine,
+};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::ActivitySender;
 use openshell_core::endpoint_status::EndpointObservationSender;
+use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::SecretResolver;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -45,12 +48,18 @@ pub(super) struct RelaySignals {
 /// Build the request-processing context shared by CONNECT and forward HTTP.
 pub(super) fn http_context(
     decision: &EgressDecision,
-    provider_credentials: Option<openshell_core::provider_credentials::ProviderCredentialState>,
+    provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
     policy_local: Option<&crate::policy_local::PolicyLocalContext>,
     agent_proposals: openshell_core::proposals::AgentProposals,
     signals: RelaySignals,
 ) -> L7EvalContext {
+    // One use record per connection: every resolver and grant derived from
+    // this context reports to it, and the relay's credential pin reads it.
+    // Idempotent, so an adapter that already tracked the handle keeps it.
+    let provider_credentials = provider_credentials
+        .as_ref()
+        .map(ProviderCredentialState::with_use_tracking);
     // Provider-backed credentials must be acquired from the live state for
     // each request after middleware/token-grant awaits. Keep only the legacy
     // resolver fallback when no live provider state exists.
@@ -104,20 +113,43 @@ pub(super) fn http_context(
     }
 }
 
-/// Pin a generation for a relay or the forward HTTP single-request path.
+/// Pin the generation that authorized `decision` for a relay, CONNECT setup,
+/// or the forward HTTP single-request path.
+///
+/// The pin fails if the policy changed after authorization. Once pinned, the
+/// guard follows later changes that leave the connection's contract intact;
+/// see [`crate::opa::PolicyRevalidator`]. `credentials` is the connection's
+/// tracked provider handle when the guarded path may inject credentials, or
+/// `None` when it never does.
 pub(super) fn pin_policy_generation(
-    opa_engine: &OpaEngine,
-    expected_generation: u64,
+    opa_engine: &Arc<OpaEngine>,
+    decision: &EgressDecision,
+    credentials: Option<&ProviderCredentialState>,
 ) -> Result<PolicyGenerationGuard> {
-    opa_engine.generation_guard(expected_generation)
+    opa_engine.revalidating_generation_guard(
+        decision.policy_input(),
+        decision.policy_generation,
+        credentials,
+    )
 }
 
 /// Clone an L7 evaluator for a relay or the forward HTTP single-request path.
 pub(super) fn pin_l7_evaluator(
-    opa_engine: &OpaEngine,
+    opa_engine: &Arc<OpaEngine>,
+    decision: &EgressDecision,
     expected_generation: u64,
+    credentials: Option<&ProviderCredentialState>,
 ) -> Result<TunnelPolicyEngine> {
-    opa_engine.clone_engine_for_tunnel(expected_generation)
+    let evaluator = opa_engine.clone_engine_for_tunnel(expected_generation)?;
+    // The baseline must come from the generation the evaluator is pinned to,
+    // so that every later generation is checked.
+    let revalidator = PolicyRevalidator::capture(
+        opa_engine,
+        decision.policy_input(),
+        expected_generation,
+        credentials,
+    );
+    Ok(evaluator.with_revalidator(revalidator))
 }
 
 pub(super) fn validate_route_generation(
@@ -144,7 +176,7 @@ pub(super) fn validate_route_generation(
 /// attempting to write an HTTP response into it.
 pub(super) fn prepare_http_relay<'a>(
     route: Option<&L7RouteSnapshot>,
-    opa_engine: &'a OpaEngine,
+    opa_engine: &'a Arc<OpaEngine>,
     decision: &EgressDecision,
     request: &'a L7EvalContext,
 ) -> Option<RelayContext<'a>> {
@@ -157,8 +189,11 @@ pub(super) fn prepare_http_relay<'a>(
         return None;
     }
 
+    // HTTP relays can inject provider credentials, so they also pin them.
+    let credentials = request.provider_credentials.as_ref();
     let policy = if let Some(route) = route.filter(|route| !route.configs.is_empty()) {
-        let evaluator = match pin_l7_evaluator(opa_engine, decision.policy_generation) {
+        let generation = decision.policy_generation;
+        let evaluator = match pin_l7_evaluator(opa_engine, decision, generation, credentials) {
             Ok(evaluator) => evaluator,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
@@ -179,7 +214,7 @@ pub(super) fn prepare_http_relay<'a>(
             evaluator: Box::new(evaluator),
         }
     } else {
-        let generation_guard = match pin_policy_generation(opa_engine, decision.policy_generation) {
+        let generation_guard = match pin_policy_generation(opa_engine, decision, credentials) {
             Ok(guard) => guard,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
@@ -196,16 +231,18 @@ pub(super) fn prepare_http_relay<'a>(
     Some(RelayContext {
         request,
         policy,
-        middleware_engine: opa_engine,
+        middleware_engine: opa_engine.as_ref(),
     })
 }
 
-/// Pin the generation used by a raw relay so policy activation or quarantine
-/// closes streams that otherwise have no request boundary at which to notice
-/// a stale decision.
+/// Pin the generation used by a raw relay so a policy change that affects the
+/// connection, or any quarantine, closes streams that otherwise have no
+/// request boundary at which to notice a stale decision.
+///
+/// Raw relays never inject provider credentials, so they do not pin them.
 pub(super) fn prepare_raw_relay(
     route: Option<&L7RouteSnapshot>,
-    opa_engine: &OpaEngine,
+    opa_engine: &Arc<OpaEngine>,
     decision: &EgressDecision,
 ) -> Option<PolicyGenerationGuard> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
@@ -217,7 +254,7 @@ pub(super) fn prepare_raw_relay(
         return None;
     }
 
-    match pin_policy_generation(opa_engine, decision.policy_generation) {
+    match pin_policy_generation(opa_engine, decision, None) {
         Ok(guard) => Some(guard),
         Err(error) => {
             emit_l7_tunnel_close_after_policy_change(

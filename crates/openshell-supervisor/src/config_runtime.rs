@@ -797,6 +797,7 @@ impl ConfigRuntime {
         reason: ProviderReadinessReason,
         revision: u64,
     ) {
+        let before = ctx.provider_credentials.installed_credential_versions();
         ctx.provider_readiness.credentials_failed(identity, reason);
         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
             .severity(SeverityId::High)
@@ -806,6 +807,7 @@ impl ConfigRuntime {
             .build());
         ctx.provider_credentials
             .revoke_static_provider_environment(revision);
+        publish_credential_change(ctx, &before);
         endpoint_status::reset(
             ctx.endpoint_observation_tx.as_ref(),
             self.endpoint_policy.as_ref(),
@@ -831,6 +833,7 @@ impl ConfigRuntime {
             .build());
         ctx.provider_readiness
             .credentials_failed(identity, ProviderReadinessReason::CredentialInstallFailed);
+        let before = ctx.provider_credentials.installed_credential_versions();
         let revision = provider.provider_env_revision;
         // Repeat the rejected binding validation on the live state to
         // revoke static material and retain the fetched dynamic grants.
@@ -845,6 +848,7 @@ impl ConfigRuntime {
                 provider.non_secret_environment_keys,
                 provider.stable_placeholder_environment_keys,
             );
+        publish_credential_change(ctx, &before);
         endpoint_status::reset(
             ctx.endpoint_observation_tx.as_ref(),
             self.endpoint_policy.as_ref(),
@@ -1179,6 +1183,30 @@ pub async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     )
     .await?;
     run_policy_poll_loop_with_client(ctx, client).await
+}
+
+/// Provider credentials may have changed outside a policy reload. If any did
+/// since `before`, publish a generation of the unchanged policy, so open
+/// connections re-check the credentials they sent and those that sent a
+/// changed one close. A revocation that finds nothing left to revoke, as when
+/// a failed refresh repeats on every poll, publishes nothing.
+fn publish_credential_change(
+    ctx: &PolicyPollLoopContext,
+    before: &openshell_core::provider_credentials::InstalledCredentialVersions,
+) {
+    if ctx
+        .provider_credentials
+        .installed_credential_versions()
+        .same_credentials(before)
+    {
+        return;
+    }
+    if let Err(error) = ctx.opa_engine.publish_credential_change() {
+        warn!(
+            error = %error,
+            "Provider credentials changed but open connections were not notified"
+        );
+    }
 }
 
 async fn report_runtime_configuration(
