@@ -170,6 +170,25 @@ pub(super) struct EgressDecision {
     pub(super) cmdline_paths: Vec<PathBuf>,
 }
 
+impl EgressDecision {
+    /// The policy input this decision was evaluated with.
+    ///
+    /// Every adapter builds its OPA input from the intent destination and the
+    /// identity fields stored here (an absent binary is the empty path used by
+    /// endpoint-only mode). The binary digest is omitted because Rego never
+    /// reads it; integrity is enforced in Rust before authorization.
+    pub(super) fn policy_input(&self) -> crate::opa::NetworkInput {
+        crate::opa::NetworkInput {
+            host: self.intent.destination.host.clone(),
+            port: self.intent.destination.port,
+            binary_path: self.binary.clone().unwrap_or_default(),
+            binary_sha256: String::new(),
+            ancestors: self.ancestors.clone(),
+            cmdline_paths: self.cmdline_paths.clone(),
+        }
+    }
+}
+
 pub(super) fn connect_span(intent: &EgressIntent) -> tracing::Span {
     tracing::debug_span!(
         "supervisor.egress.connect",

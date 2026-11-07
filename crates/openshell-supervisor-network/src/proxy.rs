@@ -1288,9 +1288,7 @@ async fn handle_transparent_tcp_connection(
     // generation before correlating endpoint identity or constructing a
     // connector. This prevents combining an old DNS answer with a newer
     // policy decision (or vice versa).
-    let Ok(generation_guard) =
-        relay::pin_policy_generation(&opa_engine, decision.policy_generation)
-    else {
+    let Ok(generation_guard) = relay::pin_policy_generation(&opa_engine, &decision, None) else {
         emit_transparent_mapping_denial(
             workload_addr,
             original,
@@ -2929,21 +2927,17 @@ async fn handle_mediated_connection(
         return Ok(());
     }
 
-    let connect_generation_guard =
-        match relay::pin_policy_generation(&opa_engine, decision.policy_generation) {
-            Ok(guard) => guard,
-            Err(error) => {
-                reject_stale_connect_policy(
-                    &mut client,
-                    &host_lc,
-                    port,
-                    activity_tx.as_ref(),
-                    error,
-                )
+    // Setup only: the relay chosen below pins its own guard, and pins provider
+    // credentials if it can inject them.
+    let connect_pin = relay::pin_policy_generation(&opa_engine, &decision, None);
+    let connect_generation_guard = match connect_pin {
+        Ok(guard) => guard,
+        Err(error) => {
+            reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
                 .await?;
-                return Ok(());
-            }
-        };
+            return Ok(());
+        }
+    };
 
     // Resolve the route's TLS treatment up front. `query_tls_mode` reads only
     // the policy decision + host/port (no peeked bytes), so it is valid before
@@ -5763,10 +5757,14 @@ async fn handle_forward_proxy(
         "Forward proxy L4 policy decision"
     );
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
-    let forward_generation_guard = match relay::pin_policy_generation(
-        &opa_engine,
-        decision.policy_generation,
-    ) {
+    // Track before pinning so the guard and the request context share one
+    // credential use record (`http_context` keeps an existing marker).
+    let provider_credentials = provider_credentials
+        .as_ref()
+        .map(ProviderCredentialState::with_use_tracking);
+    let forward_credentials = provider_credentials.as_ref();
+    let forward_pin = relay::pin_policy_generation(&opa_engine, &decision, forward_credentials);
+    let forward_generation_guard = match forward_pin {
         Ok(guard) => guard,
         Err(e) => {
             warn!(
@@ -5909,7 +5907,13 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         }
-        let tunnel_engine = match relay::pin_l7_evaluator(&opa_engine, route.l7_policy_generation) {
+        let tunnel_pin = relay::pin_l7_evaluator(
+            &opa_engine,
+            &decision,
+            route.l7_policy_generation,
+            l7_ctx.provider_credentials.as_ref(),
+        );
+        let tunnel_engine = match tunnel_pin {
             Ok(engine) => engine,
             Err(e) => {
                 warn!(

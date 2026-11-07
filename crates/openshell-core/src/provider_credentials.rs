@@ -3,7 +3,10 @@
 
 //! Runtime provider credential snapshots.
 
-use crate::secrets::{CredentialPlacement, SecretResolver};
+use crate::secrets::{
+    CredentialPlacement, CredentialUseMarker, CredentialUses, STALE_CREDENTIAL_VERSION,
+    SecretResolver,
+};
 use crate::{
     endpoint_path::EndpointPathPattern,
     host_pattern::HostPattern,
@@ -57,6 +60,158 @@ struct ProviderCredentialStateInner {
     // Revocation must retain this requirement so retrying against a downgraded
     // gateway cannot silently publish revision-scoped replacements.
     requires_stable_placeholders: bool,
+    /// Per-credential versions, refreshed lazily from `current`; see
+    /// [`CredentialVersions`]. Locked only while the state lock is held.
+    credential_versions: std::sync::Mutex<CredentialVersions>,
+}
+
+/// One version per credential, owned by the credential state.
+///
+/// Versions come from a single counter that only increases, and a
+/// credential's version changes exactly when its content does: a static
+/// credential's current-generation value, or a token grant's configuration.
+/// A removed credential loses its version, and one added again later gets a
+/// new one, so a connection can never see an old version become current
+/// again.
+///
+/// Every change to credential material replaces `current` with a new
+/// snapshot, so versions are recomputed on the first read after `current`
+/// changes, not by each install path. The previous snapshot and resolver are
+/// held to compare against, which also keeps their allocations alive so a
+/// later snapshot can never reuse their addresses.
+#[derive(Default)]
+struct CredentialVersions {
+    observed: Option<Arc<ProviderCredentialSnapshot>>,
+    observed_resolver: Option<Arc<SecretResolver>>,
+    last_version: u64,
+    statics: Arc<HashMap<String, u64>>,
+    grants: HashMap<String, u64>,
+}
+
+impl fmt::Debug for CredentialVersions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CredentialVersions")
+            .field("last_version", &self.last_version)
+            .field("statics", &self.statics.len())
+            .field("grants", &self.grants.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The version of every credential installed at one moment; see
+/// [`ProviderCredentialState::installed_credential_versions`].
+#[derive(Debug, Clone)]
+pub struct InstalledCredentialVersions {
+    statics: Arc<HashMap<String, u64>>,
+    grants: HashMap<String, u64>,
+}
+
+impl InstalledCredentialVersions {
+    /// Whether both describe the same credentials at the same versions. A
+    /// version changes only when its credential's content does, and a removed
+    /// credential added back gets a new one, so this is false exactly when a
+    /// credential was added, changed or removed in between.
+    #[must_use]
+    pub fn same_credentials(&self, other: &Self) -> bool {
+        let Self { statics, grants } = self;
+        **statics == *other.statics && *grants == other.grants
+    }
+}
+
+
+/// Token-grant dynamic credentials sharing one `provider:credential`
+/// identity, keyed by their raw dynamic credential key and sorted.
+type GrantConfigs = Vec<(String, crate::proto::ProviderProfileCredential)>;
+
+/// Group a snapshot's token-grant credentials by identity.
+fn grants_by_identity(snapshot: &ProviderCredentialSnapshot) -> HashMap<&str, GrantConfigs> {
+    let mut grants: HashMap<&str, GrantConfigs> = HashMap::new();
+    for (key, credential) in &snapshot.dynamic_credentials {
+        if let Some(identity) = crate::dynamic_credential_key::credential_identity(key) {
+            grants
+                .entry(identity)
+                .or_default()
+                .push((key.clone(), credential.clone()));
+        }
+    }
+    for configs in grants.values_mut() {
+        configs.sort_by(|left, right| left.0.cmp(&right.0));
+    }
+    grants
+}
+
+impl CredentialVersions {
+    /// Bring versions up to date with `inner.current`.
+    fn refresh(&mut self, inner: &ProviderCredentialStateInner) {
+        if self
+            .observed
+            .as_ref()
+            .is_some_and(|observed| Arc::ptr_eq(observed, &inner.current))
+        {
+            return;
+        }
+        let previous_resolver = self.observed_resolver.take();
+        let previous_snapshot = self.observed.take();
+        let previous_statics = std::mem::take(&mut self.statics);
+        let previous_grants = std::mem::take(&mut self.grants);
+        let mut last_version = self.last_version;
+        let mut next_version = || {
+            last_version += 1;
+            last_version
+        };
+
+        let mut statics = HashMap::new();
+        for (key, value) in inner
+            .current_resolver
+            .iter()
+            .flat_map(|resolver| resolver.canonical_values())
+        {
+            let unchanged = previous_resolver
+                .as_deref()
+                .and_then(|previous| previous.canonical_value(key))
+                .is_some_and(|previous| previous == value);
+            let version = match previous_statics.get(key) {
+                Some(version) if unchanged => *version,
+                _ => next_version(),
+            };
+            statics.insert(key.to_owned(), version);
+        }
+
+        let previous_configs = previous_snapshot
+            .as_deref()
+            .map(grants_by_identity)
+            .unwrap_or_default();
+        let mut grants = HashMap::new();
+        for (identity, configs) in grants_by_identity(&inner.current) {
+            let unchanged = previous_configs.get(identity) == Some(&configs);
+            let version = match previous_grants.get(identity) {
+                Some(version) if unchanged => *version,
+                _ => next_version(),
+            };
+            grants.insert(identity.to_owned(), version);
+        }
+
+        self.last_version = last_version;
+        self.statics = Arc::new(statics);
+        self.grants = grants;
+        self.observed = Some(Arc::clone(&inner.current));
+        self.observed_resolver = inner.current_resolver.clone();
+    }
+}
+
+impl ProviderCredentialStateInner {
+    /// Credential versions for `self.current`, recomputed if it changed.
+    ///
+    /// Callers hold the state lock (read or write), which excludes installs
+    /// for the duration, so the versions describe exactly `self.current`.
+    fn refreshed_versions(&self) -> std::sync::MutexGuard<'_, CredentialVersions> {
+        let mut versions = self
+            .credential_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        versions.refresh(self);
+        versions
+    }
 }
 
 #[derive(Debug)]
@@ -83,6 +238,9 @@ struct CompiledStaticCredentialEndpointBinding {
 #[derive(Debug, Clone)]
 pub struct ProviderCredentialState {
     inner: Arc<RwLock<ProviderCredentialStateInner>>,
+    /// Per-connection record of credential use; see
+    /// [`Self::with_use_tracking`]. Clones of one connection's handle share it.
+    use_marker: Option<Arc<CredentialUseMarker>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +318,9 @@ impl ProviderCredentialState {
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
                 requires_stable_placeholders: false,
+                credential_versions: std::sync::Mutex::default(),
             })),
+            use_marker: None,
         }
     }
 
@@ -247,7 +407,9 @@ impl ProviderCredentialState {
                 known_static_credential_keys,
                 static_credential_identity_epochs,
                 requires_stable_placeholders: !stable_placeholder_environment_keys.is_empty(),
+                credential_versions: std::sync::Mutex::default(),
             })),
+            use_marker: None,
         })
     }
 
@@ -282,7 +444,9 @@ impl ProviderCredentialState {
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
                 requires_stable_placeholders: false,
+                credential_versions: std::sync::Mutex::default(),
             })),
+            use_marker: None,
         }
     }
 
@@ -331,6 +495,141 @@ impl ProviderCredentialState {
             .clone()
     }
 
+    /// A handle for one proxied connection that records when credential
+    /// material derived from it is used.
+    ///
+    /// Idempotent: a handle that already tracks use keeps its marker, so
+    /// adapters can call this at every entry point without splitting one
+    /// connection's record. The returned handle shares credential state with
+    /// `self`.
+    #[must_use]
+    pub fn with_use_tracking(&self) -> Self {
+        let mut tracked = self.clone();
+        tracked
+            .use_marker
+            .get_or_insert_with(|| Arc::new(CredentialUseMarker::default()));
+        tracked
+    }
+
+    /// Whether this handle records credential use (see [`Self::with_use_tracking`]).
+    #[must_use]
+    pub fn tracks_use(&self) -> bool {
+        self.use_marker.is_some()
+    }
+
+    /// Record that this connection injected the token grant whose dynamic
+    /// credential key is `key` (raw or revision-scoped), at its current
+    /// version. A key without a `provider:credential` identity is recorded
+    /// as stale under the key itself. A no-op for untracked handles.
+    pub fn record_grant_use(&self, key: &str) {
+        let Some(marker) = &self.use_marker else {
+            return;
+        };
+        let Some(identity) = crate::dynamic_credential_key::credential_identity(key) else {
+            marker.record_grant(key, STALE_CREDENTIAL_VERSION);
+            return;
+        };
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        // The live version matches the one the request pinned unless
+        // credentials changed in between; then the credential generation guard
+        // refuses the request before its upstream write.
+        let version = inner
+            .refreshed_versions()
+            .grants
+            .get(identity)
+            .copied()
+            .unwrap_or(STALE_CREDENTIAL_VERSION);
+        marker.record_grant(identity, version);
+    }
+
+    /// Which credentials this connection has injected, and at which
+    /// versions, or `None` for an untracked handle.
+    pub fn credential_uses(&self) -> Option<CredentialUses> {
+        self.use_marker.as_ref().map(|marker| marker.uses())
+    }
+
+    /// The current version of the static credential `env_key`, if configured.
+    pub fn static_credential_version(&self, env_key: &str) -> Option<u64> {
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        let versions = inner.refreshed_versions();
+        versions.statics.get(env_key).copied()
+    }
+
+    /// The current version of the token grant `identity`, if configured.
+    pub fn grant_credential_version(&self, identity: &str) -> Option<u64> {
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        let versions = inner.refreshed_versions();
+        versions.grants.get(identity).copied()
+    }
+
+    /// The version of every installed credential, to compare with
+    /// [`InstalledCredentialVersions::same_credentials`] across an operation
+    /// that may have changed them.
+    pub fn installed_credential_versions(&self) -> InstalledCredentialVersions {
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        let versions = inner.refreshed_versions();
+        InstalledCredentialVersions {
+            statics: Arc::clone(&versions.statics),
+            grants: versions.grants.clone(),
+        }
+    }
+
+
+    /// Whether every credential this connection injected is still at the
+    /// version it injected. True for a connection that injected nothing;
+    /// false for an untracked handle, which cannot tell.
+    pub fn credential_uses_current(&self) -> bool {
+        let Some(marker) = &self.use_marker else {
+            return false;
+        };
+        let uses = marker.uses();
+        if uses.is_empty() {
+            return true;
+        }
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        let versions = inner.refreshed_versions();
+        let at = |current: &HashMap<String, u64>, key: &String, version: &u64| {
+            current.get(key) == Some(version)
+        };
+        uses.static_versions
+            .iter()
+            .all(|(key, version)| at(versions.statics.as_ref(), key, version))
+            && uses
+                .grant_versions
+                .iter()
+                .all(|(key, version)| at(&versions.grants, key, version))
+    }
+
+    /// Link a resolver built from `inner.current` to this handle's use marker.
+    fn track_resolver(
+        &self,
+        resolver: SecretResolver,
+        inner: &ProviderCredentialStateInner,
+    ) -> SecretResolver {
+        match &self.use_marker {
+            Some(marker) => resolver.with_use_marker(
+                Arc::clone(marker),
+                Arc::clone(&inner.refreshed_versions().statics),
+            ),
+            None => resolver,
+        }
+    }
+
     pub fn resolver(&self) -> Option<Arc<SecretResolver>> {
         let inner = self
             .inner
@@ -338,12 +637,15 @@ impl ProviderCredentialState {
             .expect("provider credential state poisoned");
         inner.combined_resolver.as_ref().map(|resolver| {
             Arc::new(
-                resolver.as_ref().clone().with_placements(
-                    inner
-                        .static_credential_bindings
-                        .iter()
-                        .map(|(key, binding)| (key.clone(), binding.placement.clone()))
-                        .collect(),
+                self.track_resolver(
+                    resolver.as_ref().clone().with_placements(
+                        inner
+                            .static_credential_bindings
+                            .iter()
+                            .map(|(key, binding)| (key.clone(), binding.placement.clone()))
+                            .collect(),
+                    ),
+                    &inner,
                 ),
             )
         })
@@ -452,23 +754,23 @@ impl ProviderCredentialState {
                 })
                 .map(|(key, epoch)| (key.clone(), epoch.revisions.clone()))
                 .collect();
-            Arc::new(
-                resolver
-                    .as_ref()
-                    .clone()
-                    .with_placements(
-                        inner
-                            .static_credential_bindings
-                            .iter()
-                            .map(|(key, binding)| (key.clone(), binding.placement.clone()))
-                            .collect(),
-                    )
-                    .scoped_to_env_keys(
-                        &inner.known_static_credential_keys,
-                        &allowed,
-                        revision_fallback_allowed_revisions,
-                    ),
-            )
+            let scoped = resolver
+                .as_ref()
+                .clone()
+                .with_placements(
+                    inner
+                        .static_credential_bindings
+                        .iter()
+                        .map(|(key, binding)| (key.clone(), binding.placement.clone()))
+                        .collect(),
+                )
+                .scoped_to_env_keys(
+                    &inner.known_static_credential_keys,
+                    &allowed,
+                    revision_fallback_allowed_revisions,
+                );
+            // Attributed to the same snapshot as `revision` above.
+            Arc::new(self.track_resolver(scoped, &inner))
         });
         (resolver, classifier, revision)
     }

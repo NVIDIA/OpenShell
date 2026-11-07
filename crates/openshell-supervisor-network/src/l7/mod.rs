@@ -214,6 +214,22 @@ pub(crate) struct EndpointObserver {
     policy_generation: Option<PolicyGenerationGuard>,
 }
 
+/// The policy hash endpoint-status results for `config` belong to.
+///
+/// The policy a tunnel's guard is pinned to, which a revalidating guard
+/// records from the moment it authorizes the tunnel through every re-pin. A
+/// plain guard never moves from the policy the endpoint config was selected
+/// from, so that config's stamped hash is the same answer. The inventory check
+/// still rejects a result whenever the inventory describes a different policy.
+pub(crate) fn observation_policy_hash(
+    config: &L7EndpointConfig,
+    guard: Option<&PolicyGenerationGuard>,
+) -> String {
+    guard
+        .and_then(PolicyGenerationGuard::pinned_policy_hash)
+        .unwrap_or_else(|| config.policy_hash.clone())
+}
+
 impl EndpointObserver {
     /// Bind a selected endpoint to authority captured before request-state lookup.
     ///
@@ -239,11 +255,12 @@ impl EndpointObserver {
             // prevents an earlier selection from becoming current again.
             return None;
         }
+        let policy_hash = observation_policy_hash(config, guard);
         let sender = sender?.clone();
         let observation = sender.begin_captured(
             context?,
             config.endpoint_id.clone(),
-            &config.policy_hash,
+            &policy_hash,
             provider_revision,
         )?;
         Some(Self {

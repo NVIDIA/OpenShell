@@ -456,9 +456,12 @@ Set `allow_uninspected_credentials: true` to relay binary frames anyway. Set
 placeholders that must be resolved. This explicitly authorizes WebSocket text
 rewriting for ordinary static credentials, including credentials with HTTP placement metadata.
 
-When new network rules take effect, OpenShell closes open WebSocket connections,
-so the client must reconnect. The client might receive close code `1012`, or the
-connection might close without a close frame.
+When new network rules change how a WebSocket connection is treated, OpenShell
+closes it, so the client must reconnect. The client might receive close code
+`1012`, or the connection might close without a close frame. Connections the
+change does not affect stay open; see
+[How changes take effect](/how-it-works/policies/manage-policies#how-changes-take-effect)
+for which changes close a connection.
 
 ### Allow GraphQL Operations
 

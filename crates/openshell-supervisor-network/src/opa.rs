@@ -24,6 +24,7 @@ use openshell_policy_schema::{
     ProcessPolicy as AuthoredProcessPolicy,
 };
 use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, RwLock,
@@ -33,6 +34,9 @@ use tokio::sync::watch;
 use tracing::info;
 
 mod raw_schema;
+mod revalidation;
+
+pub use revalidation::{ConnectionPolicyContract, PolicyRevalidator};
 
 /// Baked-in rego rules for OPA policy evaluation.
 /// These rules define the network access decision logic and static config
@@ -115,6 +119,7 @@ pub struct EgressAuthorization {
 }
 
 /// Input for a network access policy evaluation.
+#[derive(Debug, Clone)]
 pub struct NetworkInput {
     pub host: String,
     pub port: u16,
@@ -183,6 +188,28 @@ pub struct OpaEngine {
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
     generation_tx: watch::Sender<u64>,
     fail_closed_reason: RwLock<Option<String>>,
+    /// Incremented whenever the middleware runner's registry is replaced.
+    /// Written under the engine lock.
+    middleware_registry_epoch: AtomicU64,
+    /// The most recent published generations, oldest first; see
+    /// [`PublishedGeneration`]. Locked only while the engine lock is held.
+    history: Mutex<VecDeque<PublishedGeneration>>,
+}
+
+/// How many recent generations revalidation can check a connection against.
+///
+/// A connection that sleeps through more reloads than this closes, because it
+/// can no longer be checked against every policy that was live meanwhile.
+const GENERATION_HISTORY: usize = 16;
+
+/// The policy state one generation published, kept so that a connection
+/// waking after several reloads is checked against each of them, not only the
+/// latest. Engine clones share compiled policy and are cheap.
+struct PublishedGeneration {
+    generation: u64,
+    engine: regorus::Engine,
+    fail_closed_reason: Option<String>,
+    middleware_registry_epoch: u64,
 }
 
 #[cfg(test)]
@@ -204,24 +231,82 @@ pub(crate) fn test_opa_query_count() -> u64 {
 }
 
 /// Generation guard captured when an HTTP tunnel or request path starts.
+///
+/// A plain guard is stale as soon as the policy generation moves, and checking
+/// it is a cheap comparison. A guard with a [`PolicyRevalidator`] instead
+/// re-checks the connection it protects and re-pins to the new generation
+/// when the policy change does not affect that connection; checking it may
+/// evaluate policy under the engine lock. Only this crate's relays create
+/// revalidating guards (`OpaEngine::revalidating_generation_guard`), so
+/// every guard another crate obtains from the engine is plain.
+///
+/// Clones share one pin, so every clone held by a relay observes a re-pin
+/// performed through any of them.
 #[derive(Clone, Debug)]
 pub struct PolicyGenerationGuard {
-    captured_generation: u64,
+    captured_generation: Arc<AtomicU64>,
     current_generation: Arc<AtomicU64>,
     generation_rx: watch::Receiver<u64>,
+    revalidator: Option<Arc<PolicyRevalidator>>,
 }
 
 impl PolicyGenerationGuard {
+    fn pinned(
+        generation: u64,
+        current_generation: &Arc<AtomicU64>,
+        generation_tx: &watch::Sender<u64>,
+    ) -> Self {
+        Self {
+            captured_generation: Arc::new(AtomicU64::new(generation)),
+            current_generation: Arc::clone(current_generation),
+            generation_rx: generation_tx.subscribe(),
+            revalidator: None,
+        }
+    }
+
+    /// Let this guard follow policy changes that leave its connection's
+    /// contract unchanged. `None` keeps the strict close-on-change behavior.
+    #[must_use]
+    pub(crate) fn with_revalidator(mut self, revalidator: Option<Arc<PolicyRevalidator>>) -> Self {
+        self.revalidator = revalidator;
+        self
+    }
+
+    /// The stamped policy hash of the generation a revalidating guard is pinned
+    /// to: the one that authorized its connection, or a later one it re-pinned
+    /// to. Endpoint-status observations of the connection belong to that
+    /// policy. `None` for a plain guard, which never moves from the generation
+    /// its endpoint config was selected from, and for policies without a hash.
+    pub fn pinned_policy_hash(&self) -> Option<String> {
+        self.revalidator
+            .as_ref()?
+            .pinned_policy_hash(self.captured_generation())
+    }
+
     pub fn captured_generation(&self) -> u64 {
-        self.captured_generation
+        self.captured_generation.load(Ordering::Acquire)
     }
 
     pub fn current_generation(&self) -> u64 {
         self.current_generation.load(Ordering::Acquire)
     }
 
+    /// Whether the policy that authorized this connection no longer applies.
+    ///
+    /// With a revalidator, a generation change triggers one re-evaluation of
+    /// the connection (a short, synchronous OPA query under the engine lock).
+    /// Callers must not hold the OPA engine lock.
     pub fn is_stale(&self) -> bool {
-        self.current_generation() != self.captured_generation
+        let Some(revalidator) = &self.revalidator else {
+            return self.current_generation() != self.captured_generation();
+        };
+        if revalidator.is_invalidated() {
+            return true;
+        }
+        if self.current_generation() == self.captured_generation() {
+            return false;
+        }
+        !revalidator.follow(&self.captured_generation, &self.current_generation)
     }
 
     pub fn ensure_current(&self) -> Result<()> {
@@ -235,10 +320,12 @@ impl PolicyGenerationGuard {
         Ok(())
     }
 
-    /// Wait until the policy generation changes.
+    /// Wait until the policy that authorized this connection no longer applies.
     ///
     /// Relay boundaries use this to close even an idle or raw stream as soon
-    /// as a new generation (including fail-closed quarantine) is published.
+    /// as a relevant generation (always including fail-closed quarantine) is
+    /// published. A revalidating guard re-pins through unrelated changes and
+    /// keeps waiting.
     pub async fn wait_until_stale(&self) {
         let mut receiver = self.generation_rx.clone();
         while !self.is_stale() {
@@ -259,6 +346,18 @@ pub struct TunnelPolicyEngine {
 }
 
 impl TunnelPolicyEngine {
+    /// Let this tunnel survive policy changes that leave its connection's
+    /// contract unchanged.
+    ///
+    /// The cloned evaluator is kept as-is after a re-pin. That is sound
+    /// because the contract includes every endpoint per-request rules read;
+    /// see [`ConnectionPolicyContract`].
+    #[must_use]
+    pub(crate) fn with_revalidator(mut self, revalidator: Option<Arc<PolicyRevalidator>>) -> Self {
+        self.generation_guard = self.generation_guard.with_revalidator(revalidator);
+        self
+    }
+
     pub fn captured_generation(&self) -> u64 {
         self.generation_guard.captured_generation()
     }
@@ -309,6 +408,12 @@ impl OpaEngine {
     fn with_engine(engine: regorus::Engine, binary_identity_required: bool) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_tx, _) = watch::channel(0);
+        let initial = PublishedGeneration {
+            generation: 0,
+            engine: engine.clone(),
+            fail_closed_reason: None,
+            middleware_registry_epoch: 0,
+        };
         Self {
             engine: Mutex::new(engine),
             binary_identity_required,
@@ -317,6 +422,33 @@ impl OpaEngine {
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
             fail_closed_reason: RwLock::new(None),
+            middleware_registry_epoch: AtomicU64::new(0),
+            history: Mutex::new(VecDeque::from([initial])),
+        }
+    }
+
+    /// Record the policy state `generation` published. Callers hold the
+    /// engine lock, so revalidation never sees a generation without its entry.
+    /// A generation that is somehow not recorded fails closed: connections
+    /// that need it cannot be checked and close.
+    fn record_generation(
+        &self,
+        generation: u64,
+        engine: &regorus::Engine,
+        fail_closed_reason: Option<String>,
+    ) {
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        history.push_back(PublishedGeneration {
+            generation,
+            engine: engine.clone(),
+            fail_closed_reason,
+            middleware_registry_epoch: self.middleware_registry_epoch.load(Ordering::Acquire),
+        });
+        while history.len() > GENERATION_HISTORY {
+            history.pop_front();
         }
     }
 
@@ -607,19 +739,138 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let input_json = network_input_json(input);
-
         let mut engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        let generation = self.current_generation();
+        self.authorize_egress_locked(&mut engine, input)
+    }
 
+    /// The contract of a connection with `input` under the current generation.
+    pub fn connection_policy_contract(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<(ConnectionPolicyContract, u64)> {
+        let _publication = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let current = self.current_generation();
+        let contract = self
+            .contract_at_locked(input, current)?
+            .ok_or_else(|| miette::miette!("current policy generation is not recorded"))?;
+        Ok((contract, current))
+    }
+
+    /// The contract of a connection with `input` under `generation`, or `None`
+    /// once that generation has left the history.
+    pub(crate) fn connection_contract_at(
+        &self,
+        input: &NetworkInput,
+        generation: u64,
+    ) -> Result<Option<ConnectionPolicyContract>> {
+        let _publication = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        self.contract_at_locked(input, generation)
+    }
+
+    /// The contract under every generation published after `captured`, up to
+    /// and including the current one, and that current generation.
+    ///
+    /// `None` when any of those generations has left the history: the
+    /// connection then cannot be shown to have been allowed throughout.
+    /// Holding the engine lock excludes publication while this runs.
+    pub(crate) fn connection_contracts_since(
+        &self,
+        input: &NetworkInput,
+        captured: u64,
+    ) -> Result<Option<(Vec<ConnectionPolicyContract>, u64)>> {
+        let _publication = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let current = self.current_generation();
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut contracts = Vec::new();
+        for generation in captured.saturating_add(1)..=current {
+            let Some(published) = history
+                .iter_mut()
+                .find(|published| published.generation == generation)
+            else {
+                return Ok(None);
+            };
+            contracts.push(Self::contract_of(published, input)?);
+        }
+        Ok(Some((contracts, current)))
+    }
+
+    fn contract_at_locked(
+        &self,
+        input: &NetworkInput,
+        generation: u64,
+    ) -> Result<Option<ConnectionPolicyContract>> {
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        history
+            .iter_mut()
+            .find(|published| published.generation == generation)
+            .map(|published| Self::contract_of(published, input))
+            .transpose()
+    }
+
+    /// Authorization and middleware selection for `input` under one published
+    /// generation, as a [`ConnectionPolicyContract`].
+    fn contract_of(
+        published: &mut PublishedGeneration,
+        input: &NetworkInput,
+    ) -> Result<ConnectionPolicyContract> {
+        let authorization = Self::authorize_on(
+            &mut published.engine,
+            input,
+            published.fail_closed_reason.clone(),
+            published.generation,
+        )?;
+        let middleware_chain = if matches!(authorization.action, NetworkAction::Allow { .. }) {
+            query_middleware_chain_locked(&mut published.engine, input)?
+        } else {
+            Vec::new()
+        };
+        Ok(ConnectionPolicyContract::new(
+            &authorization,
+            middleware_chain,
+            published.middleware_registry_epoch,
+        ))
+    }
+
+    fn authorize_egress_locked(
+        &self,
+        engine: &mut regorus::Engine,
+        input: &NetworkInput,
+    ) -> Result<EgressAuthorization> {
         let fail_closed_reason = self
             .fail_closed_reason
             .read()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
             .clone();
+        Self::authorize_on(engine, input, fail_closed_reason, self.current_generation())
+    }
+
+    /// Evaluate egress authorization on `engine`, as published for
+    /// `generation` with `fail_closed_reason`.
+    fn authorize_on(
+        engine: &mut regorus::Engine,
+        input: &NetworkInput,
+        fail_closed_reason: Option<String>,
+        generation: u64,
+    ) -> Result<EgressAuthorization> {
+        let input_json = network_input_json(input);
         if let Some(reason) = fail_closed_reason {
             return Ok(EgressAuthorization {
                 action: NetworkAction::Deny { reason },
@@ -630,7 +881,7 @@ impl OpaEngine {
             });
         }
 
-        set_regorus_input(&mut engine, input_json)?;
+        set_regorus_input(engine, input_json)?;
 
         let result = engine
             .eval_rule("data.openshell.sandbox.egress_authorization".into())
@@ -734,7 +985,8 @@ impl OpaEngine {
             .fail_closed_reason
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
-        self.advance_generation();
+        let generation = self.advance_generation();
+        self.record_generation(generation, &engine, None);
         Ok(())
     }
 
@@ -810,8 +1062,11 @@ impl OpaEngine {
         *engine = new_engine;
         if let Some(new_runner) = new_runner {
             *runner = new_runner;
+            self.middleware_registry_epoch
+                .fetch_add(1, Ordering::AcqRel);
         }
         *fail_closed_reason = None;
+        self.record_generation(generation, &engine, None);
         self.generation_guard(generation)
     }
 
@@ -821,18 +1076,23 @@ impl OpaEngine {
     /// The existing compiled engine remains available for an explicit
     /// `retain_last_valid` posture or a later valid reload, but all new network
     /// decisions deny with `reason` while the quarantine is active. Advancing
-    /// the generation invalidates and wakes every pinned relay.
+    /// the generation invalidates and wakes every pinned relay, including
+    /// revalidating relays: a quarantine is never re-pinned through, even if
+    /// the previous policy is restored before a relay observes it.
     pub fn enter_fail_closed(&self, reason: impl Into<String>) -> Result<u64> {
-        let _engine = self
+        let engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let reason = reason.into();
         *self
             .fail_closed_reason
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? =
-            Some(reason.into());
-        Ok(self.advance_generation())
+            Some(reason.clone());
+        let generation = self.advance_generation();
+        self.record_generation(generation, &engine, Some(reason));
+        Ok(generation)
     }
 
     pub fn fail_closed_reason(&self) -> Option<String> {
@@ -845,7 +1105,7 @@ impl OpaEngine {
     /// Reactivate the compiled last-known-good engine after an operator
     /// explicitly selects the availability-oriented retention posture.
     pub fn exit_fail_closed(&self) -> Result<u64> {
-        let _engine = self
+        let engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
@@ -856,7 +1116,9 @@ impl OpaEngine {
             .take()
             .is_some();
         if was_fail_closed {
-            Ok(self.advance_generation())
+            let generation = self.advance_generation();
+            self.record_generation(generation, &engine, None);
+            Ok(generation)
         } else {
             Ok(self.current_generation())
         }
@@ -895,7 +1157,7 @@ impl OpaEngine {
     pub fn replace_middleware_registry(&self, registry: MiddlewareRegistry) -> Result<()> {
         // Generation changes serialize through the engine lock so guarded
         // publication cannot overlap any runtime generation transition.
-        let _engine = self
+        let engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
@@ -904,8 +1166,28 @@ impl OpaEngine {
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
         *runner = runner.with_replacement_registry(registry);
-        self.advance_generation();
+        self.middleware_registry_epoch
+            .fetch_add(1, Ordering::AcqRel);
+        let generation = self.advance_generation();
+        self.record_generation(generation, &engine, self.fail_closed_reason());
         Ok(())
+    }
+
+    /// Publish a new generation of the unchanged policy, so pinned relays wake
+    /// and re-check what they hold. For provider credential changes made
+    /// outside a policy reload, such as a revocation: a revalidating relay
+    /// re-pins unless it injected a credential that changed, and any other
+    /// guard goes stale as on a reload. A quarantine stays in force.
+    pub fn publish_credential_change(&self) -> Result<u64> {
+        // Generation changes serialize through the engine lock, as in
+        // `replace_middleware_registry`.
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.advance_generation();
+        self.record_generation(generation, &engine, self.fail_closed_reason());
+        Ok(generation)
     }
 
     pub(crate) fn middleware_runner(&self) -> Result<ChainRunner> {
@@ -934,11 +1216,11 @@ impl OpaEngine {
                 "policy changed before HTTP relay started [expected_generation:{expected_generation} current_generation:{generation}]"
             ));
         }
-        Ok(PolicyGenerationGuard {
-            captured_generation: generation,
-            current_generation: Arc::clone(&self.generation),
-            generation_rx: self.generation_tx.subscribe(),
-        })
+        Ok(PolicyGenerationGuard::pinned(
+            generation,
+            &self.generation,
+            &self.generation_tx,
+        ))
     }
 
     /// Query static sandbox configuration from the OPA data module.
@@ -1130,11 +1412,11 @@ impl OpaEngine {
         }
         Ok(TunnelPolicyEngine {
             engine: Mutex::new(engine.clone()),
-            generation_guard: PolicyGenerationGuard {
-                captured_generation: generation,
-                current_generation: Arc::clone(&self.generation),
-                generation_rx: self.generation_tx.subscribe(),
-            },
+            generation_guard: PolicyGenerationGuard::pinned(
+                generation,
+                &self.generation,
+                &self.generation_tx,
+            ),
             middleware_runner: self.middleware_runner()?,
             websocket_assembly_budget: self.websocket_assembly_budget(),
         })

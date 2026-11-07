@@ -219,7 +219,9 @@ pub(crate) async fn prepare_inspected_request(
             &owners,
             request_id,
             observation_context.filter(|context| {
-                context.matches_config(&config.policy_hash, Some(snapshot.revision))
+                let policy_hash =
+                    crate::l7::observation_policy_hash(config, Some(engine.generation_guard()));
+                context.matches_config(&policy_hash, Some(snapshot.revision))
             }),
         )
         .await?
@@ -3629,6 +3631,11 @@ where
         let mut response_selection = None;
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
+            // Give a revalidating guard the chance to re-pin through an
+            // unrelated reload before comparing raw generation numbers.
+            if generation_guard.is_stale() {
+                return Ok(());
+            }
             let (chain, generation) = engine.query_middleware_chain_with_generation(&input)?;
             if generation != generation_guard.captured_generation() {
                 return Ok(());

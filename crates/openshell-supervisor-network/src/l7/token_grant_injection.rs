@@ -165,6 +165,17 @@ pub fn pin_live_credentials(ctx: &mut L7EvalContext) -> Option<Arc<ProviderCrede
     Some(snapshot)
 }
 
+/// Record on the connection which grants it is about to inject, so it closes
+/// when one of them, and only one of them, changes.
+fn record_credential_use(ctx: &L7EvalContext, selected: &[(String, ProviderProfileCredential)]) {
+    let Some(credentials) = ctx.provider_credentials.as_ref() else {
+        return;
+    };
+    for (key, _) in selected {
+        credentials.record_grant_use(key);
+    }
+}
+
 /// Inject the grants whose endpoint selectors match the request.
 ///
 /// L4-only forwarding uses this selector contract; it has no per-request L7
@@ -255,6 +266,12 @@ async fn inject_or_report(
     if selected.as_ref().is_ok_and(Vec::is_empty) {
         // Most requests need no grant; keep that path free of allocation.
         return Ok(req);
+    }
+    if let Ok(selected) = &selected {
+        // Record before injecting: a grant that reaches upstream must make the
+        // connection close when that grant changes. Recording a grant that
+        // then fails is harmless; it can only close more connections.
+        record_credential_use(ctx, selected);
     }
     let method = req.action.clone();
     let request_path = request_path(&req.target).to_string();
