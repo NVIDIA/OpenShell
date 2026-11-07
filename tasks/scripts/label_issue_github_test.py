@@ -4,6 +4,7 @@
 import json
 import subprocess
 import sys
+import time
 import unittest
 
 from label_issue_github import GitHubClient, GitHubError, _run_bounded
@@ -165,6 +166,38 @@ class TransportTests(unittest.TestCase):
             _run_bounded([sys.executable, "-c", "import sys; sys.stdout.write('x' * 1000000)"],
                          input=None, capture_output=True, text=True, timeout=5,
                          check=False, output_limit=100)
+
+    def test_descendant_held_pipe_cannot_extend_request_deadline(self):
+        program = (
+            "import subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1.5)']); "
+            "import time; time.sleep(1.5)"
+        )
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            _run_bounded([sys.executable, "-c", program], input=None,
+                         capture_output=True, text=True, timeout=0.1,
+                         check=False, output_limit=1000)
+        self.assertLess(time.monotonic() - started, 0.75)
+
+    def test_unquoted_next_relation_cannot_hide_another_page(self):
+        client = self.client(response([{"id": 1}], headers={
+            "Link": '<https://api.github.com/x?page=2>; rel=next',
+        }), response([{"id": 2}]))
+        self.assertEqual(client.pages("x"), [{"id": 1}, {"id": 2}])
+
+    def test_headerless_cli_failure_retries_reads_with_bounded_backoff(self):
+        client = self.client((1, "", "dial tcp: temporary network failure"), response({"ok": 1}))
+        self.assertEqual(client.request("x"), {"ok": 1})
+        self.assertEqual(self.clock.sleeps, [1])
+
+    def test_headerless_cli_failure_never_replays_a_write(self):
+        client = self.client((1, "", "connection reset by peer"))
+        with self.assertRaises(GitHubError) as caught:
+            client.request("x", method="POST", data={"labels": ["a"]})
+        self.assertTrue(caught.exception.uncertain_write)
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(len(self.runner.calls), 1)
 
     def test_graphql_nonobject_response_is_not_success(self):
         client = self.client(response([]))

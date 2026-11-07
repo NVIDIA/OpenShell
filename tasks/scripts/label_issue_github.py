@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import subprocess
-import threading
+import selectors
 import time
 from email.utils import parsedate_to_datetime
 from functools import partial
@@ -28,50 +29,62 @@ class GitHubError(subprocess.CalledProcessError):
 
 
 def _run_bounded(command, *, input, timeout, output_limit, **_options):
-    """Drain both pipes concurrently, killing gh as soon as either exceeds its cap."""
-    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE) as process:
-        chunks = {"stdout": bytearray(), "stderr": bytearray()}
-        overflow = threading.Event()
+    """Bound POSIX pipe I/O without depending on EOF from process descendants.
 
-        def drain(stream, key):
-            while block := stream.read1(min(65536, output_limit + 1)):
-                remaining = output_limit - len(chunks[key])
-                chunks[key].extend(block[:max(0, remaining)])
-                if len(block) > remaining:
-                    overflow.set()
-                    process.kill()
-                    return
-
-        def feed():
-            try:
-                if input is not None:
-                    process.stdin.write(input.encode("utf-8"))
-                    process.stdin.flush()
-            except BrokenPipeError:
-                pass
-            finally:
+    The request timeout covers draining and stdin delivery. Direct-process
+    cleanup has an additional bounded 100 ms reap allowance.
+    """
+    deadline = time.monotonic() + timeout
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, bufsize=0)
+    chunks = {"stdout": bytearray(), "stderr": bytearray()}
+    pending = memoryview(input.encode("utf-8") if input is not None else b"")
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream, key in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, key)
+            if pending:
+                os.set_blocking(process.stdin.fileno(), False)
+                selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+            else:
                 process.stdin.close()
-
-        workers = [threading.Thread(target=drain, args=(process.stdout, "stdout")),
-                   threading.Thread(target=drain, args=(process.stderr, "stderr")),
-                   threading.Thread(target=feed)]
-        for worker in workers:
-            worker.start()
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            raise
-        finally:
-            for worker in workers:
-                worker.join()
-        if overflow.is_set():
-            raise GitHubError("GitHub response exceeds size bound")
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                for event, _mask in selector.select(remaining):
+                    stream, key = event.fileobj, event.data
+                    if key == "stdin":
+                        try:
+                            pending = pending[os.write(stream.fileno(), pending[:65536]):]
+                        except BrokenPipeError:
+                            pending = memoryview(b"")
+                        if not pending:
+                            selector.unregister(stream)
+                            stream.close()
+                        continue
+                    block = os.read(stream.fileno(), min(65536, output_limit + 1))
+                    if not block:
+                        selector.unregister(stream)
+                        stream.close()
+                        continue
+                    if len(chunks[key]) + len(block) > output_limit:
+                        raise GitHubError("GitHub response exceeds size bound")
+                    chunks[key].extend(block)
+            process.wait(timeout=max(0, deadline - time.monotonic()))
         return subprocess.CompletedProcess(command, process.returncode,
                                            chunks["stdout"].decode("utf-8", errors="replace"),
                                            chunks["stderr"].decode("utf-8", errors="replace"))
+    finally:
+        if process.poll() is None:
+            process.kill()
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
 
 
 class GitHubClient:
@@ -217,6 +230,14 @@ class GitHubClient:
                 self._wait(self._retry_delay({}, attempt, False))
                 self._diagnostics["retries"] += 1
                 continue
+            if result.returncode and not (result.stdout or "").startswith("HTTP/"):
+                failure = GitHubError("GitHub CLI failed before an HTTP response",
+                                      retryable=True, uncertain_write=write)
+                if write or attempt + 1 == self.max_attempts:
+                    raise failure
+                self._wait(self._retry_delay({}, attempt, False))
+                self._diagnostics["retries"] += 1
+                continue
             status, headers, payload = self._decode(result, write)
             if path == "graphql" and not isinstance(payload, dict):
                 raise GitHubError("Malformed GraphQL response", status=status,
@@ -263,10 +284,20 @@ class GitHubClient:
                 raise GitHubError("GitHub pagination expected an array")
             result.extend(payload)
             link = headers.get("link", "")
-            next_links = re.findall(r'<([^>]*)>\s*;\s*rel="next"', link)
+            next_links = []
+            if link:
+                # Fail closed on any malformed entry, including an unrecognized
+                # continuation spelling, rather than claiming complete evidence.
+                for entry in re.split(r",(?=\s*<)", link):
+                    match = re.fullmatch(r'\s*<([^>]*)>((?:\s*;\s*[\w-]+\s*=\s*(?:"[^"\r\n]*"|[^;\s,]+))*)\s*', entry)
+                    if not match:
+                        raise GitHubError("Malformed GitHub pagination link")
+                    relations = re.findall(r';\s*rel\s*=\s*("[^"\r\n]*"|[^;\s,]+)', match[2], flags=re.IGNORECASE)
+                    if len(relations) != 1:
+                        raise GitHubError("Missing or ambiguous GitHub pagination relation")
+                    if "next" in relations[0].strip('"').split():
+                        next_links.append(match[1])
             if not next_links:
-                if 'rel="next"' in link:
-                    raise GitHubError("Malformed GitHub pagination link")
                 return result
             if len(next_links) != 1:
                 raise GitHubError("Ambiguous GitHub pagination link")
