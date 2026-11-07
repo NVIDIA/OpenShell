@@ -237,7 +237,7 @@ class EvidenceTests(unittest.TestCase):
     def test_open_author_intent_is_discoverable_without_inventing_disposition(self):
         self.api.collections['comments'] = [{'id': 7, 'body': 'I no longer plan to pursue this request.', 'user': {'login': 'maintainer'}}]
         snapshot = self.prepare()
-        self.assertIn('comment:7', snapshot['lifecycle_evidence'])
+        self.assertEqual(snapshot['lifecycle_evidence'].count('comment:7'), 1)
         self.assertEqual(snapshot['eligibility']['lifecycle'], 'eligible')
         self.assertTrue(snapshot['evidence_index']['comment:7']['actor_authority']['verified'])
 
@@ -285,6 +285,110 @@ class EvidenceTests(unittest.TestCase):
         snapshot = self.prepare()
         with self.assertRaises(ValueError):
             expand_evidence(snapshot, ['source:../secret:1:2'], api=self.api)
+
+    def test_files_reject_head_movement_during_retrieval(self):
+        self.api = API(pull=True)
+        original = self.api
+        def moving_api(path, **kwargs):
+            value = original(path, **kwargs)
+            if path.endswith('/files?per_page=100'):
+                original.pull['head']['sha'] = 'head-two'
+            return value
+        with self.assertRaisesRegex(ValueError, 'head'):
+            prepare_snapshot(REPO, 3, Path(self.directory.name), api=moving_api)
+
+    def test_later_file_expansion_rejects_a_new_head_before_fetch(self):
+        self.api = API(pull=True)
+        snapshot = self.prepare()
+        self.api.pull['head']['sha'] = 'head-two'
+        before = len([path for path, _ in self.api.calls if '/files?' in path])
+        with self.assertRaisesRegex(ValueError, 'head'):
+            expand_evidence(snapshot, ['files'], api=self.api)
+        self.assertEqual(before, len([path for path, _ in self.api.calls if '/files?' in path]))
+        self.assertEqual(snapshot['head'], 'head-one')
+
+    def test_refresh_preserves_only_unchanged_inspection_and_reconciles_lifecycle_refs(self):
+        self.api.collections['comments'] = [
+            {'id': 7, 'body': 'unchanged', 'user': {'login': 'maintainer'}},
+            {'id': 8, 'body': 'edited later', 'user': {'login': 'maintainer'}},
+            {'id': 9, 'body': 'deleted later', 'user': {'login': 'maintainer'}},
+        ]
+        snapshot = self.prepare()
+        self.api.collections['comments'] = [
+            {'id': 7, 'body': 'unchanged', 'user': {'login': 'maintainer'}},
+            {'id': 8, 'body': 'new intent', 'user': {'login': 'maintainer'}},
+        ]
+        expand_evidence(snapshot, ['comments'], api=self.api)
+        self.assertTrue(snapshot['evidence_index']['comment:7']['inspected'])
+        self.assertEqual(snapshot['evidence_index']['comment:7']['actor_authority']['role'], 'maintainer')
+        self.assertFalse(snapshot['evidence_index']['comment:8']['inspected'])
+        self.assertNotIn('comment:8', snapshot['lifecycle_evidence'])
+        self.assertNotIn('comment:9', snapshot['evidence_index'])
+        self.assertNotIn('comment:9', snapshot['lifecycle_evidence'])
+
+    def test_truncated_body_comment_and_review_support_digest_bound_text_slices(self):
+        self.api = API(pull=True)
+        text = 'x' * 2200000 + 'THE END'
+        self.api.pull['body'] = text
+        self.api.collections['comments'] = [{'id': 7, 'body': text, 'user': {'login': 'reader'}}]
+        self.api.collections['reviews'] = [{'id': 8, 'body': text, 'user': {'login': 'reader'}}]
+        snapshot = self.prepare()
+        expand_evidence(snapshot, ['reviews'], api=self.api)
+        for source_id in ('body', 'comment:7', 'review:8'):
+            entry = snapshot['evidence_index'][source_id]
+            digest = entry['source_digest']
+            request = f'text:{source_id}:{digest}:2200000:2200007'
+            expand_evidence(snapshot, [request], api=self.api)
+            self.assertEqual(snapshot['evidence_index'][request]['content'], 'THE END')
+            self.assertEqual(snapshot['evidence_index'][request]['coverage'], 'slice')
+            self.assertEqual(snapshot['evidence_index'][source_id]['coverage'], 'truncated')
+            with self.assertRaises(ValueError):
+                expand_evidence(snapshot, [f'text:{source_id}:{"0" * 64}:0:10'], api=self.api)
+
+    def test_packet_aggregate_is_bounded_and_omitted_sources_remain_addressable(self):
+        self.api.collections['comments'] = [
+            {'id': 7, 'body': 'a' * 1100000, 'user': {'login': 'maintainer'}},
+            {'id': 8, 'body': 'b' * 1100000, 'user': {'login': 'maintainer'}},
+        ]
+        snapshot = self.prepare()
+        self.assertLessEqual(Path(snapshot['packet_path']).stat().st_size, 2 * 1024 * 1024)
+        packet = json.loads(Path(snapshot['packet_path']).read_text())
+        deferred = [entry for entry in packet['evidence_index'].values() if entry.get('content_deferred')]
+        self.assertTrue(deferred)
+        self.assertTrue(all(Path(entry['artifact_path']).exists() for entry in deferred))
+
+    def test_material_state_is_independent_of_local_chunk_and_packet_paths(self):
+        self.api.collections['comments'] = [{'id': 7, 'body': 'original', 'user': {'login': 'maintainer'}}]
+        first = self.prepare()
+        with tempfile.TemporaryDirectory() as directory:
+            second = prepare_snapshot(REPO, 3, Path(directory), api=self.api)
+            self.assertEqual(material_state(first), material_state(second))
+
+    def test_text_slices_preserve_crlf_and_refuse_edited_parent_digests(self):
+        self.api.collections['comments'] = [{'id': 7, 'body': 'a\r\nb', 'user': {'login': 'reader'}}]
+        snapshot = self.prepare()
+        digest = snapshot['evidence_index']['comment:7']['source_digest']
+        request = f'text:comment:7:{digest}:1:4'
+        expand_evidence(snapshot, [request], api=self.api)
+        self.assertEqual(snapshot['evidence_index'][request]['content'], '\r\nb')
+        self.api.collections['comments'][0]['body'] = 'edited'
+        expand_evidence(snapshot, ['comments'], api=self.api)
+        self.assertNotIn(request, snapshot['evidence_index'])
+        with self.assertRaises(ValueError):
+            expand_evidence(snapshot, [request], api=self.api)
+
+    def test_large_index_is_paged_without_losing_addressable_sources(self):
+        self.api.collections['comments'] = [{'id': number, 'body': 'short', 'user': {'login': 'reader'}} for number in range(2000)]
+        snapshot = self.prepare()
+        packet = json.loads(Path(snapshot['packet_path']).read_text())
+        self.assertEqual(packet['index_coverage'], 'paged')
+        found = {}
+        for path in packet['index_pages']:
+            self.assertLessEqual(Path(path).stat().st_size, 2 * 1024 * 1024)
+            found.update(json.loads(Path(path).read_text()))
+        self.assertIn('comment:0', found)
+        self.assertIn('comment:1999', found)
+        self.assertLessEqual(Path(snapshot['packet_path']).stat().st_size, 2 * 1024 * 1024)
 
     def test_material_state_ignores_snapshot_identity_and_blanket_timestamp(self):
         snapshot = self.prepare()
