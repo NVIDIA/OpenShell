@@ -212,3 +212,11 @@ These helpers use the raw client's authentication slot. They do not perform OIDC
 - Async-only. Tonic is async-native; callers needing a blocking call can wrap
   with their own runtime.
 - The curated surface will grow as more RPCs graduate from `raw`.
+
+## Next minor API migration
+
+This source-breaking API change targets the next minor release and must not be backported into the `0.1.x` patch series.
+
+Raw `ReportSandboxConfigurationRequest` adds `refused_before_start`, and `UpdateConfigResponse` adds `created_policy_revision`. Complete generated Rust literals must initialize both fields to `false` or use `..Default::default()`. Complete raw TypeScript messages need the corresponding boolean defaults; generated message builders supply them.
+
+Legacy wire payloads decode both flags as false. A false or unacknowledged creation receipt does not establish startup ownership. Upgrade gateway replicas and supervisors together before relying on this metadata; older writers can discard it.

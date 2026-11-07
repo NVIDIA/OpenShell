@@ -940,6 +940,8 @@ mutation!(
             let _: Sandbox = live(store, &id).await?;
         }
         Ok(UpdateConfigResponse {
+            // Legacy durable replay outcomes do not attest which write created a policy.
+            created_policy_revision: false,
             version,
             policy_hash,
             settings_revision,
