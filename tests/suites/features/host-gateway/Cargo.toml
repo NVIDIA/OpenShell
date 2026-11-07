@@ -12,6 +12,5 @@ repository = "https://github.com/NVIDIA/OpenShell"
 publish = false
 
 [dependencies]
+host-server-support = { path = "../../../support/host-server" }
 openshell-testkit = { path = "../../../testkit/testkit" }
-tempfile = "3"
-tokio = { version = "1.43", features = ["io-util", "net", "rt"] }

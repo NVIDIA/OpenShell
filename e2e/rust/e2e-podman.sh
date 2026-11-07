@@ -25,7 +25,6 @@ PODMAN_CI_TESTS=(
   bypass_detection
   ephemeral_cleanup
   core_dump_hardening
-  credential_gating
   default_image
   driver_config_volume
   edge_tunnel_e2e

@@ -34,7 +34,7 @@
           src: "{{ openshell_sandbox_image }}"
         - name: supervisor
           src: "{{ openshell_supervisor_image }}"
-        # The testkit's python_image() sandbox workload.
+        # The e2e-python sandbox workload image some tests use.
         - name: e2e-python
           src: "{{ openshell_e2e_python_image }}"
 
