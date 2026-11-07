@@ -233,6 +233,24 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(self.apply(snapshot, result)['status'], 'held')
         self.assertEqual(self.api.writes, [])
 
+    def test_core_initial_delivery_waits_for_authority_metadata_and_final_packet(self):
+        from label_issue_evidence import prepare_snapshot
+        from label_issue_policy import is_inspected_source, validate_result
+        self.api.item['body'] = 'x' * 50000
+        self.api.collections['comments'] = [dict(id=i, body='context',
+            user={'login': 'reader', 'type': 'User'}) for i in range(20)]
+        with mock.patch('label_issue_evidence.LIMIT', 65536):
+            standalone = prepare_snapshot(REPO, 3, Path(self.temp.name) / 'standalone', api=self.api)
+            self.assertTrue(is_inspected_source(standalone['evidence_index']['body']))
+            snapshot = self.prepared()
+            packet = json.loads(Path(snapshot['packet_path']).read_text())
+            self.assertTrue(packet['evidence_index']['body']['content_deferred'])
+            self.assertFalse(is_inspected_source(snapshot['evidence_index']['body']))
+            self.assertNotIn('inspection', packet['evidence_index']['body'])
+            self.assertFalse(validate_result(snapshot, self.result(snapshot))['valid'])
+            self.assertNotIn('_preparing', snapshot)
+            self.assertLessEqual(Path(snapshot['packet_path']).stat().st_size, 65536)
+
     def test_untrusted_executor_cannot_write(self):
         snapshot = self.prepared()
         self.api.actor = 'reader'

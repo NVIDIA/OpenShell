@@ -75,10 +75,8 @@ def is_inspected_source(artifact: dict) -> bool:
 
 
 def _membership_only(artifact):
-    content = artifact.get('content')
-    return (artifact.get('kind') in {'comments', 'reviews', 'review_comments', 'timeline'}
-            and (content is None or isinstance(content, list)
-                 and all(isinstance(value, str) for value in content)))
+    # These producer kinds identify member indexes, including truncated views.
+    return artifact.get('kind') in {'comments', 'reviews', 'review_comments', 'timeline'}
 
 
 def _references(snapshot, refs, *, observation=False):

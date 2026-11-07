@@ -392,8 +392,12 @@ def _item_material(item):
 
 
 def prepare_snapshot(repository: str, number: int, directory: Path, *, api,
-                     assessment_labels=frozenset()) -> dict:
-    """Create a local packet. assessment_labels must come from a reviewed caller."""
+                     assessment_labels=frozenset(), defer_delivery: bool = False) -> dict:
+    """Create a local packet with a separately reviewed assessment allowlist.
+
+    Wrapping preparation may defer initial exposure until its final packet by
+    leaving _preparing set, then clearing it before its final persistence.
+    """
     facts = preflight(repository, number, api=api)
     repository, number = facts['repository'], facts['number']
     root = f'repos/{repository}'
@@ -454,7 +458,8 @@ def prepare_snapshot(repository: str, number: int, directory: Path, *, api,
     if facts['kind'] == 'pull_request':
         expand_evidence(snapshot, ['files'], api=api)
         index['files']['inspected'] = False
-    snapshot.pop('_preparing', None)
+    if not defer_delivery:
+        snapshot.pop('_preparing', None)
     _persist(snapshot)
     return snapshot
 

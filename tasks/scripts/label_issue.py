@@ -122,8 +122,9 @@ def _hydrate(snapshot, api, template=None):
     if template:
         for identity, previous in template['evidence_index'].items():
             current = snapshot['evidence_index'].get(identity)
-            if current and previous.get('inspected') and previous.get('source_digest') == current.get('source_digest'):
+            if current and is_inspected_source(previous) and previous.get('source_digest') == current.get('source_digest'):
                 current['inspected'] = True
+                current['inspection'] = copy.deepcopy(previous['inspection'])
     snapshot['relevant_timeline'] = _relevant_timeline(snapshot['item_id'], api)
     _persist(snapshot)
     return snapshot
@@ -152,7 +153,7 @@ def prepare(repository: str, number: int, directory: Path, *, api, force: bool=F
         if not eligibility['accepted'] and (not assessment_only):
             return _report(facts, 'skipped', 'Accepted work required for classification; assessment-only preparation is available')
         discovery = checkpoint.find_checkpoint(facts['item_id'], api=api, trusted_actors=actors) if not force and (not assessment_only) else {'status': 'bypassed'}
-        snapshot = evidence.prepare_snapshot(facts['repository'], facts['number'], directory, api=api, assessment_labels=assessment_labels)
+        snapshot = evidence.prepare_snapshot(facts['repository'], facts['number'], directory, api=api, assessment_labels=assessment_labels, defer_delivery=True)
         refreshed_eligibility = snapshot['eligibility']
         if refreshed_eligibility['lifecycle'] != 'eligible':
             return _report(snapshot, 'held' if refreshed_eligibility['lifecycle'] == 'hold' else 'skipped', refreshed_eligibility['reason'])
@@ -174,6 +175,9 @@ def prepare(repository: str, number: int, directory: Path, *, api, force: bool=F
             snapshot['label_event_boundary'] = checkpoint.latest_label_event(snapshot['item_id'], api=api)['boundary_id']
         if assessment_only:
             snapshot['label_event_boundary'] = checkpoint.latest_label_event(snapshot['item_id'], api=api)['boundary_id']
+        # Initial exposure is finalized only after all hydration metadata and
+        # boundary facts are present in the packet actually returned.
+        snapshot.pop('_preparing', None)
         _persist(snapshot)
         report = _report(snapshot, 'ready')
         report['classifier_required'] = not assessment_only
@@ -185,7 +189,7 @@ def prepare(repository: str, number: int, directory: Path, *, api, force: bool=F
 @contextmanager
 def _fresh(snapshot, api):
     with tempfile.TemporaryDirectory(prefix='openshell-label-refresh-') as directory:
-        current = evidence.prepare_snapshot(snapshot['repository'], snapshot['number'], Path(directory), api=api, assessment_labels=set(snapshot.get('_assessment_labels', [])))
+        current = evidence.prepare_snapshot(snapshot['repository'], snapshot['number'], Path(directory), api=api, assessment_labels=set(snapshot.get('_assessment_labels', [])), defer_delivery=True)
         current['assessment_only'] = snapshot.get('assessment_only', False)
         _hydrate(current, api, template=snapshot)
         yield current
