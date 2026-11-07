@@ -22,10 +22,10 @@ from pathlib import Path
 import label_issue_checkpoint as checkpoint
 import label_issue_evidence as evidence
 from label_issue_github import GitHubClient
-from label_issue_policy import plan_labels
+from label_issue_policy import is_inspected_source, plan_labels
 # Bump for classifier/skill/migration semantic changes; trusted document hashes
 # are bound separately, without binding unrelated repository HEAD changes.
-POLICY_VERSION = 'openshell-labeler-policy-v1'
+POLICY_VERSION = 'openshell-labeler-policy-v2'
 DEFAULT_BOOKKEEPING_LABEL = 'meta:labeler-checkpoint'
 # Configuration selects this reviewed authority; alternate names need code review.
 APPROVED_BOOKKEEPING_LABELS = frozenset({DEFAULT_BOOKKEEPING_LABEL})
@@ -201,7 +201,7 @@ def _lifecycle(snapshot, result):
     for identity in interpretation['evidence']:
         entry = snapshot['evidence_index'].get(identity, {}) if isinstance(identity, str) else {}
         authority = entry.get('actor_authority', {})
-        if not entry.get('inspected') or entry.get('kind') not in {'comment', 'review', 'review_comment'} or (entry.get('source_user') or {}).get('type') == 'Bot' or (authority.get('verified') is not True) or (authority.get('role') not in {'author', 'maintainer'}):
+        if not is_inspected_source(entry) or entry.get('kind') not in {'comment', 'review', 'review_comment'} or (entry.get('source_user') or {}).get('type') == 'Bot' or (authority.get('verified') is not True) or (authority.get('role') not in {'author', 'maintainer'}):
             return (result, _report(snapshot, 'held', 'Lifecycle interpretation requires inspected recorded human author/maintainer evidence'))
     mechanical = snapshot['eligibility']['lifecycle']
     status = 'skipped' if mechanical == 'excluded' or interpretation['disposition'] == 'excluded' else 'held'

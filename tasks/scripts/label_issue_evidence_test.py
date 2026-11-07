@@ -3,10 +3,12 @@
 """Offline evidence and lifecycle boundary tests."""
 import base64
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from label_issue_evidence import expand_evidence, material_state, preflight, prepare_snapshot
 
@@ -442,6 +444,10 @@ class EvidenceTests(unittest.TestCase):
             found.update(json.loads(Path(path).read_text()))
         self.assertIn('comment:0', found)
         self.assertIn('comment:1999', found)
+        for identity, metadata in found.items():
+            self.assertEqual(metadata.get('inspection'), snapshot['evidence_index'][identity].get('inspection'))
+        for identity, delivered in packet.get('expanded_evidence', {}).items():
+            self.assertEqual(delivered['inspection'], snapshot['evidence_index'][identity]['inspection'])
         self.assertLessEqual(Path(snapshot['packet_path']).stat().st_size, 2 * 1024 * 1024)
 
     def test_material_state_ignores_snapshot_identity_and_blanket_timestamp(self):
@@ -462,6 +468,100 @@ class EvidenceTests(unittest.TestCase):
         after = material_state(snapshot)
         self.assertNotEqual(before, after)
         self.assertIn('11', json.dumps(after))
+
+
+    def test_actual_id_only_collections_do_not_substantiate_classification(self):
+        from label_issue_policy import validate_result
+        self.api = API(pull=True)
+        self.api.collections['comments'] = [{'id': 7, 'body': 'SDK context', 'user': {'login': 'reader'}}]
+        snapshot = self.prepare()
+        expand_evidence(snapshot, ['comments'], api=self.api)
+        decision = self.classification(snapshot, ['comments'])
+        self.assertFalse(validate_result(snapshot, decision)['valid'])
+        expand_evidence(snapshot, ['comment:7'], api=self.api)
+        decision['reasons'][0]['evidence'] = ['comments', 'comment:7']
+        self.assertTrue(validate_result(snapshot, decision)['valid'])
+
+    @staticmethod
+    def classification(snapshot, refs):
+        return {**{key: snapshot[key] for key in ('schema_version', 'repository', 'number', 'kind', 'snapshot_id')},
+                'area': 'area:platform', 'topics': ['topic:sdk'], 'ambiguity': None,
+                'reasons': [{'labels': ['area:platform', 'topic:sdk'], 'evidence': refs, 'reason': 'SDK context.'}]}
+
+    def test_never_delivered_complete_body_requires_explicit_expansion(self):
+        from label_issue_policy import validate_result
+        with mock.patch('label_issue_evidence.LIMIT', 65536):
+            self.api.item['body'] = 'Large issue content. ' * 2800
+            self.api.collections['comments'] = [{'id': n, 'body': 'Other context', 'user': {'login': 'reader'}} for n in range(30)]
+            snapshot = self.prepare()
+            packet = json.loads(Path(snapshot['packet_path']).read_text())
+            self.assertTrue(packet['evidence_index']['body']['content_deferred'])
+            self.assertEqual(snapshot['evidence_index']['body']['coverage'], 'complete')
+            self.assertNotIn('inspection', snapshot['evidence_index']['body'])
+            self.assertFalse(validate_result(snapshot, self.classification(snapshot, ['body']))['valid'])
+            expand_evidence(snapshot, ['body'], api=self.api)
+            self.assertEqual(snapshot['evidence_index']['body']['inspection']['via'], 'explicit_expansion')
+            self.assertTrue(validate_result(snapshot, self.classification(snapshot, ['body']))['valid'])
+            self.assertLessEqual(Path(snapshot['packet_path']).stat().st_size, 65536)
+
+    def test_same_digest_prior_delivery_survives_later_packet_eviction(self):
+        from label_issue_policy import validate_result
+        with mock.patch('label_issue_evidence.LIMIT', 65536):
+            self.api.item['body'] = 'Large issue content. ' * 2800
+            snapshot = self.prepare()
+            prior = copy.deepcopy(snapshot['evidence_index']['body']['inspection'])
+            self.assertEqual(prior['via'], 'packet')
+            self.api.collections['comments'] = [{'id': n, 'body': 'Other context', 'user': {'login': 'reader'}} for n in range(30)]
+            expand_evidence(snapshot, ['comments'], api=self.api)
+            packet = json.loads(Path(snapshot['packet_path']).read_text())
+            self.assertTrue(packet['evidence_index']['body']['content_deferred'])
+            self.assertEqual(snapshot['evidence_index']['body']['inspection'], prior)
+            self.assertEqual(packet['evidence_index']['body']['inspection'], prior)
+            self.assertTrue(validate_result(snapshot, self.classification(snapshot, ['body']))['valid'])
+
+    def test_source_change_invalidates_inspection_until_current_content_expanded(self):
+        from label_issue_policy import validate_result
+        self.api.collections['comments'] = [{'id': 7, 'body': 'Initial', 'user': {'login': 'reader'}}]
+        snapshot = self.prepare()
+        expand_evidence(snapshot, ['comment:7'], api=self.api)
+        prior = snapshot['evidence_index']['comment:7']['inspection']
+        self.api.collections['comments'][0]['body'] = 'Changed source'
+        expand_evidence(snapshot, ['comments'], api=self.api)
+        self.assertNotEqual(snapshot['evidence_index']['comment:7']['source_digest'], prior['source_digest'])
+        self.assertNotIn('inspection', snapshot['evidence_index']['comment:7'])
+        self.assertFalse(validate_result(snapshot, self.classification(snapshot, ['comment:7']))['valid'])
+        expand_evidence(snapshot, ['comment:7'], api=self.api)
+        self.assertTrue(validate_result(snapshot, self.classification(snapshot, ['comment:7']))['valid'])
+
+
+    def test_inspection_declarations_do_not_change_actual_material_fingerprint(self):
+        from label_issue_checkpoint import fingerprint
+        snapshot = self.prepare()
+        before = material_state(snapshot)
+        before['relevant_timeline'] = {'coverage': 'complete', 'source_digest': hashlib.sha256(b'[]').hexdigest(), 'source_bytes': 2}
+        without_read_state = copy.deepcopy(before)
+        for artifact in without_read_state['evidence_index'].values():
+            artifact.pop('inspection', None)
+            artifact['inspected'] = False
+            artifact.pop('content', None)
+        self.assertEqual(fingerprint(before, {'area:platform'}, snapshot['policy_version']),
+                         fingerprint(without_read_state, {'area:platform'}, snapshot['policy_version']))
+
+    def test_preparation_does_not_mark_deferred_human_comment_as_explicit_expansion(self):
+        from label_issue_policy import is_inspected_source
+        with mock.patch('label_issue_evidence.LIMIT', 65536):
+            self.api.collections['comments'] = [
+                {'id': 7, 'body': 'a' * 40000, 'user': {'login': 'maintainer'}},
+                {'id': 8, 'body': 'b' * 40000, 'user': {'login': 'maintainer'}},
+            ]
+            snapshot = self.prepare()
+            packet = json.loads(Path(snapshot['packet_path']).read_text())
+            deferred = [identity for identity, entry in packet['evidence_index'].items()
+                        if entry.get('content_deferred') and entry['kind'] == 'comment']
+            self.assertTrue(deferred)
+            for identity in deferred:
+                self.assertFalse(is_inspected_source(snapshot['evidence_index'][identity]))
+
 
 
 if __name__ == '__main__':
