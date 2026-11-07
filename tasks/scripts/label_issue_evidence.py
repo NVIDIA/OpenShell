@@ -16,7 +16,7 @@ from urllib.parse import quote, urlsplit
 
 from accepted_work import CLOSING_ISSUES_QUERY, check_issue_accepted_work, check_pr_accepted_work
 from check_maintainer_approval import parse_maintainers
-from label_issue_policy import load_taxonomy
+from label_issue_policy import is_inspected_source, load_taxonomy
 
 LIMIT = 2 * 1024 * 1024
 # Literal close-issue-message from .github/workflows/stale.yml (actions/stale).
@@ -235,7 +235,14 @@ def _write_packet(snapshot, preferred_ids):
     metadata = {artifact_id: {**{key: value for key, value in entry.items() if key != 'content'},
                               **({'content_deferred': True} if entry['inspected'] else {})}
                 for artifact_id, entry in index.items()}
-    if len(_json_bytes({**packet, 'evidence_index': metadata})) <= LIMIT // 2:
+    # Reserve provenance overhead before paging/selection; newly delivered
+    # content may add this declaration to its metadata page after selection.
+    reserved = {identity: {**entry, **({'inspection': {
+        'source_digest': index[identity]['source_digest'], 'via': 'packet'}}
+        if index[identity]['inspected'] and not is_inspected_source(index[identity]) else {})}
+        for identity, entry in metadata.items()}
+    pending_pages = []
+    if len(_json_bytes({**packet, 'evidence_index': reserved})) <= LIMIT // 2:
         packet['evidence_index'] = metadata
         packet['index_coverage'] = 'complete'
     else:
@@ -243,21 +250,22 @@ def _write_packet(snapshot, preferred_ids):
         # explicit expansions are delivered separately below.
         pages, page, page_bytes = [], {}, 2
         for artifact_id, entry in metadata.items():
-            entry_bytes = len(_json_bytes(artifact_id)) + 1 + len(_json_bytes(entry))
+            entry_bytes = len(_json_bytes(artifact_id)) + 1 + len(_json_bytes(reserved[artifact_id]))
             if entry_bytes + 2 > LIMIT:
                 raise ValueError('Evidence metadata entry exceeds packet bound')
             if page_bytes + entry_bytes + bool(page) > LIMIT:
                 path = directory / f'packet-index-{len(pages)}.json'
-                path.write_bytes(_json_bytes(page))
+                pending_pages.append((path, page))
                 pages.append(str(path))
                 page, page_bytes = {}, 2
             page_bytes += entry_bytes + bool(page)
             page[artifact_id] = entry
         if page:
             path = directory / f'packet-index-{len(pages)}.json'
-            path.write_bytes(_json_bytes(page))
+            pending_pages.append((path, page))
             pages.append(str(path))
         packet.update(evidence_index={}, index_pages=pages, index_coverage='paged')
+    delivered_provenance = {}
     ordered = list(dict.fromkeys([*preferred_ids, 'body', *index]))
     for artifact_id in ordered:
         entry = index.get(artifact_id)
@@ -267,16 +275,32 @@ def _write_packet(snapshot, preferred_ids):
         prior = target.get(artifact_id)
         delivered = {**metadata[artifact_id], 'content': entry['content']}
         delivered.pop('content_deferred', None)
+        declaration = None
+        if not snapshot.get('_preparing'):
+            declaration = entry['inspection'] if is_inspected_source(entry) else {
+                'source_digest': entry['source_digest'], 'via': 'packet'}
+            delivered['inspection'] = declaration
         target[artifact_id] = delivered
         if len(_json_bytes(packet)) > LIMIT:
             if prior is None:
                 target.pop(artifact_id)
             else:
                 target[artifact_id] = prior
+        elif declaration is not None:
+            delivered_provenance[artifact_id] = declaration
+    for identity, declaration in delivered_provenance.items():
+        metadata[identity]['inspection'] = declaration
     encoded = _json_bytes(packet)
     if len(encoded) > LIMIT:
         raise ValueError('Packet reference metadata exceeds delivery bound')
+    for path, page in pending_pages:
+        page_bytes = _json_bytes(page)
+        if len(page_bytes) > LIMIT:
+            raise ValueError('Evidence metadata page exceeds delivery bound')
+        path.write_bytes(page_bytes)
     Path(snapshot['packet_path']).write_bytes(encoded)
+    for identity, declaration in delivered_provenance.items():
+        index[identity]['inspection'] = declaration
 
 
 def _persist(snapshot, preferred_ids=()):
@@ -284,6 +308,11 @@ def _persist(snapshot, preferred_ids=()):
     artifacts = directory / 'artifacts'
     artifacts.mkdir(exist_ok=True)
     for artifact_id, entry in snapshot['evidence_index'].items():
+        declaration = entry.get('inspection')
+        if declaration is not None and (not isinstance(declaration, dict)
+                or declaration.get('source_digest') != entry.get('source_digest')
+                or declaration.get('via') not in ('packet', 'explicit_expansion')):
+            entry.pop('inspection', None)
         raw_text = entry.pop('_raw_text', None)
         if raw_text is not None:
             entry['text_source'] = {'characters': len(raw_text),
@@ -395,7 +424,7 @@ def prepare_snapshot(repository: str, number: int, directory: Path, *, api,
     policy_text = json.dumps({'protocol': 1, 'maintainers': facts['maintainers_text'],
                               'reviewers': roster, 'contribution_policy': contribution_policy}, sort_keys=True)
     snapshot = {'schema_version': 1, 'repository': repository, 'number': number, 'kind': facts['kind'],
-                'snapshot_id': str(uuid.uuid4()), 'item_id': facts['item_id'],
+                'snapshot_id': str(uuid.uuid4()), 'item_id': facts['item_id'], '_preparing': True,
                 'policy_revision': facts['revision'], 'policy_version': hashlib.sha256(policy_text.encode()).hexdigest(),
                 'taxonomy': taxonomy, 'existing_labels': labels, 'trusted_maintainers': facts['maintainers'],
                 'malformed_classification_labels': _malformed(labels, taxonomy), 'eligibility': facts['eligibility'],
@@ -425,6 +454,7 @@ def prepare_snapshot(repository: str, number: int, directory: Path, *, api,
     if facts['kind'] == 'pull_request':
         expand_evidence(snapshot, ['files'], api=api)
         index['files']['inspected'] = False
+    snapshot.pop('_preparing', None)
     _persist(snapshot)
     return snapshot
 
@@ -580,6 +610,11 @@ def expand_evidence(snapshot: dict, evidence_ids: list[str], *, api) -> dict:
             artifact.update(inspected=False, coverage='incomplete')
             _persist(snapshot)
             raise
+    if not snapshot.get('_preparing'):
+        for artifact_id in evidence_ids:
+            entry = index[artifact_id]
+            entry['inspection'] = {'source_digest': entry['source_digest'],
+                                   'via': 'explicit_expansion'}
     _persist(snapshot, evidence_ids)
     return snapshot
 
