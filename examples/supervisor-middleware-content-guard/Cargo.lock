@@ -2077,6 +2077,7 @@ dependencies = [
  "miette",
  "openshell-core",
  "openshell-policy-schema",
+ "prost",
  "prost-types",
  "serde",
  "serde_json",

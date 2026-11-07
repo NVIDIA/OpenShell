@@ -1052,18 +1052,6 @@ pub(super) fn validate_and_canonicalize_policy(
     })
 }
 
-/// Validate file-only authored policy rules before applying gateway context.
-pub(super) fn validate_and_canonicalize_authored_policy(
-    policy: ProtoSandboxPolicy,
-) -> Result<ProtoSandboxPolicy, Status> {
-    openshell_policy::validate_and_canonicalize_authored_policy(policy).map_err(|error| {
-        Status::invalid_argument(format!(
-            "policy contains unsafe content: {}",
-            error.join("; ")
-        ))
-    })
-}
-
 /// Validate that authored rules do not use provider-derived keys.
 pub(super) fn validate_no_reserved_provider_policy_keys(
     policy: &ProtoSandboxPolicy,
