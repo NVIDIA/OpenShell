@@ -1895,21 +1895,19 @@ pub(super) async fn handle_watch_sandbox(
             } else {
                 None
             };
-            let mut log_rx = if follow_logs {
-                Some(state.tracing_log_bus.subscribe(&sandbox_id))
-            } else {
-                None
-            };
-            let mut platform_rx = if follow_events {
-                Some(
-                    state
-                        .tracing_log_bus
-                        .platform_event_bus
-                        .subscribe(&sandbox_id),
-                )
-            } else {
-                None
-            };
+            //
+            // The resumable sources subscribe together with a high-water mark
+            // taken under the cursor-space lock, so the snapshot below can
+            // tell history (at or below the mark, buffered only) from events
+            // published while the stream opens (above it, buffered *and*
+            // queued on these receivers).
+            let crate::tracing_bus::ResumableSubscription {
+                mut log_rx,
+                mut platform_rx,
+                subscribed_at,
+            } = state
+                .tracing_log_bus
+                .subscribe_resumable(&sandbox_id, follow_logs, follow_events);
 
             // Re-read the snapshot now that we have subscriptions active.
             match state.store.get_message::<Sandbox>(&sandbox_id).await {
@@ -1949,26 +1947,26 @@ pub(super) async fn handle_watch_sandbox(
 
             // Highest seq the tail/replay phase already handled, tracked per
             // source. The broadcast receivers were subscribed before replay ran,
-            // so an event published during initialization can sit in both the
-            // replay buffer and a live receiver; the live loop suppresses events
-            // at or below its source's mark so each is delivered exactly once.
+            // so an event published during initialization (above
+            // `subscribed_at`) sits in both the replay buffer and a live
+            // receiver; the live loop suppresses events at or below its
+            // source's mark so each is delivered exactly once.
             //
             // Both reads happen under one cursor-space lock hold, so every
             // event at or below the snapshot's high-water mark was buffered
             // when they ran. A resume replays everything after the cursor from
             // each followed source, so each source's mark is the last seq its
             // own replay returned. The initial tail is depth-bounded, so both
-            // marks move to the snapshot's high-water mark instead: anything at
-            // or below it was either in the batch or deliberately left out as
-            // pre-snapshot history, and its live copy must not arrive after a
-            // higher cursor from the batch.
+            // marks move to the snapshot's high-water mark instead. That is
+            // safe only because the depth bound never applies above
+            // `subscribed_at`: every event published while the stream opened
+            // is in the batch (or, if its buffer already evicted it, reported),
+            // and everything else at or below the mark is history the live
+            // receivers never saw.
             //
-            // No gateway-level test reaches the window between the subscribe
-            // above and the snapshot below: the producer crosses it with no
-            // await a test can wedge open. The bus-level
-            // `snapshot_tail_blocks_while_cursor_space_is_locked` and
-            // `snapshot_after_blocks_while_cursor_space_is_locked` pin the
-            // atomicity this relies on.
+            // Tests force both windows through the bus's test-only snapshot
+            // hooks: one publishes after subscribe and before the snapshot, the
+            // other publishes between the snapshot's two reads.
             let resume_seq = resume_after.map_or(0, |resume| resume.seq);
             let mut log_cutoff: u64 = resume_seq;
             let mut platform_cutoff: u64 = resume_seq;
@@ -2126,17 +2124,32 @@ pub(super) async fn handle_watch_sandbox(
                 // log published after the log read and a platform event
                 // published after it could let the platform window hand out
                 // the higher cursor while the log arrives live afterwards.
+                //
+                // Depths bound history only. Events published after the
+                // receivers subscribed are always in their source's window, so
+                // the batch can exceed `log_tail_lines`/`event_tail` by them.
+                // Each floor therefore stays at or below `subscribed_at`, and
+                // none of those events is ever withheld by a sibling's floor.
                 let crate::tracing_bus::TailSnapshot {
-                    mut logs,
-                    log_floor,
-                    mut events,
-                    platform_floor,
+                    log,
+                    platform,
                     highest_seq,
                 } = state.tracing_log_bus.snapshot_tail(
                     &sandbox_id,
                     follow_logs.then_some(log_tail as usize),
                     follow_events.then_some(event_tail as usize),
+                    subscribed_at,
                 );
+                let crate::tracing_bus::SourceTail {
+                    events: mut logs,
+                    floor: log_floor,
+                    evicted_while_opening: logs_evicted,
+                } = log;
+                let crate::tracing_bus::SourceTail {
+                    mut events,
+                    floor: platform_floor,
+                    evicted_while_opening: events_evicted,
+                } = platform;
 
                 // 0 means "nothing excluded" for a source, so a fully-covered
                 // source never raises the maximum.
@@ -2151,11 +2164,12 @@ pub(super) async fn handle_watch_sandbox(
 
                 // Both cutoffs move to the snapshot's high-water mark. The
                 // receivers were subscribed before the snapshot, so an event
-                // published in between is both buffered and queued live. At
-                // or below the mark, it was either delivered above or left
-                // out of this batch as pre-snapshot history; delivering its
-                // live copy would emit a lower cursor after a higher one
-                // from the batch. Above the mark, it can only arrive live.
+                // published in between is both buffered and queued live; the
+                // snapshot kept it in the batch, so its live copy is a
+                // duplicate, and delivering it would emit a lower cursor after
+                // a higher one from the batch. Events at or below
+                // `subscribed_at` were never queued live. Above the mark, an
+                // event can only arrive live.
                 log_cutoff = log_cutoff.max(highest_seq);
                 platform_cutoff = platform_cutoff.max(highest_seq);
 
@@ -2178,6 +2192,18 @@ pub(super) async fn handle_watch_sandbox(
                     let warning = crate::sandbox_watch::coverage_gap_warning_event(
                         log_withheld,
                         platform_withheld,
+                    );
+                    if tx.send(Ok(warning)).await.is_err() {
+                        return;
+                    }
+                }
+                // An event published while the stream opened, then trimmed
+                // from its buffer before the snapshot read it, is in neither
+                // the batch nor (past the cutoff) the live stream.
+                if logs_evicted || events_evicted {
+                    let warning = crate::sandbox_watch::opening_eviction_warning_event(
+                        logs_evicted,
+                        events_evicted,
                     );
                     if tx.send(Ok(warning)).await.is_err() {
                         return;
@@ -5124,6 +5150,179 @@ mod tests {
 
         let (warning, delivered) = initial_tail_following_both(&state, &sandbox, 1, 1).await;
         assert_eq!(warning, None);
+        assert_eq!(delivered, vec![3, 4]);
+    }
+
+    /// Open a watch following both sources and return the stream after its
+    /// status snapshot.
+    async fn watch_both(
+        state: &Arc<ServerState>,
+        sandbox: &Sandbox,
+        event_tail: u32,
+        resume_after_cursor: String,
+    ) -> WatchSandboxStream {
+        use tokio_stream::StreamExt as _;
+
+        let response = handle_watch_sandbox(
+            state,
+            authed_request(WatchSandboxRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                follow_logs: true,
+                follow_events: true,
+                event_tail,
+                resume_after_cursor,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty(), "first item is the status snapshot");
+        stream
+    }
+
+    /// Collect what a stream yields until it goes quiet: warning messages and
+    /// resumable cursors, each in arrival order.
+    async fn drain_until_quiet(stream: &mut WatchSandboxStream) -> (Vec<String>, Vec<u64>) {
+        use openshell_core::proto::sandbox_stream_event::Payload;
+        use tokio_stream::StreamExt as _;
+
+        let mut warnings = Vec::new();
+        let mut seqs = Vec::new();
+        while let Ok(Some(item)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await
+        {
+            let event = item.unwrap();
+            match event.payload {
+                Some(Payload::Warning(w)) => warnings.push(w.message),
+                _ => seqs.push(seq_of(&event)),
+            }
+        }
+        (warnings, seqs)
+    }
+
+    /// The reviewer's example on #3613. Both sources followed at default
+    /// depths; after the watch subscribes and before its snapshot, platform
+    /// event 1 and then log 2 are published. Both are queued live and the
+    /// snapshot's cutoff suppresses those copies, so the batch is their only
+    /// delivery: it must carry both, even though `event_tail` asked for no
+    /// platform history. Previously the depth bound left event 1 out and the
+    /// cutoff swallowed its live copy, with no warning, and a resume after 2
+    /// could never recover it.
+    #[tokio::test]
+    async fn initial_tail_delivers_events_published_while_the_stream_opens() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("opening", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        let hook_state = Arc::clone(&state);
+        let hook_id = id.clone();
+        let mut fired = false;
+        state.tracing_log_bus.set_snapshot_hook(move |point| {
+            if point == crate::tracing_bus::SnapshotPoint::AfterSubscribe && !fired {
+                fired = true;
+                seed_platform_event(&hook_state, &hook_id, "e1"); // cursor 1
+                seed_log_lines(&hook_state, &hook_id, 1); // cursor 2
+            }
+        });
+
+        let mut stream = watch_both(&state, &sandbox, 0, String::new()).await;
+        let (warnings, delivered) = drain_until_quiet(&mut stream).await;
+        assert_eq!(delivered, vec![1, 2]);
+        assert!(warnings.is_empty(), "nothing was withheld: {warnings:?}");
+
+        // Live delivery continues past the batch.
+        seed_log_lines(&state, &id, 1); // cursor 3
+        let (warnings, delivered) = drain_until_quiet(&mut stream).await;
+        assert_eq!(delivered, vec![3]);
+        assert!(warnings.is_empty());
+
+        // A reconnect from the highest cursor the batch handed out misses
+        // nothing that was retained below it.
+        let mut resumed = watch_both(&state, &sandbox, 0, cursor_token(&state, &id, 2)).await;
+        let (warnings, delivered) = drain_until_quiet(&mut resumed).await;
+        assert_eq!(delivered, vec![3]);
+        assert!(warnings.is_empty());
+    }
+
+    /// A publish forced between the initial snapshot's log read and platform
+    /// read. The snapshot holds the cursor-space lock across both, so the
+    /// publisher waits: the batch is exactly the seeded history, the raced
+    /// log and platform event arrive live in cursor order once each, and a
+    /// resume from the batch's highest cursor replays both. With separate
+    /// reads the batch would carry the raced platform event (4) without the
+    /// log published before it (3), which would then arrive after 4 or, after
+    /// a reconnect from 4, never.
+    #[tokio::test]
+    async fn initial_tail_publish_between_snapshot_reads_arrives_live_in_order() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("racetail", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 1); // cursor 1
+        seed_platform_event(&state, &id, "e2"); // cursor 2
+        let probe = crate::tracing_bus::race_publish_between_reads(&state.tracing_log_bus, &id);
+
+        let mut stream = watch_both(&state, &sandbox, 10, String::new()).await;
+        let (warnings, delivered) = drain_until_quiet(&mut stream).await;
+        {
+            let mut probe = probe.lock().unwrap();
+            probe.join_publisher();
+            assert!(probe.fired, "the hook must run between the two reads");
+            assert!(probe.lock_held_between_reads, "lock released between reads");
+            assert!(
+                !probe.publisher_finished_between_reads,
+                "a publish landed between the log read and the platform read"
+            );
+        }
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(delivered, vec![1, 2, 3, 4], "batch, then 3 and 4 live");
+
+        let mut resumed = watch_both(&state, &sandbox, 10, cursor_token(&state, &id, 2)).await;
+        let (warnings, delivered) = drain_until_quiet(&mut resumed).await;
+        assert!(warnings.is_empty());
+        assert_eq!(delivered, vec![3, 4]);
+    }
+
+    /// The same forced interleaving on the resume path. The replay after
+    /// cursor 1 holds platform event 2 only; the raced log (3) and platform
+    /// event (4) arrive live, in order, after it. With separate reads the
+    /// replay would carry 4 ahead of 3, and a client that disconnected after 4
+    /// would resume past 3 forever.
+    #[tokio::test]
+    async fn resume_publish_between_snapshot_reads_arrives_live_in_order() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("raceresume", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 1); // cursor 1
+        seed_platform_event(&state, &id, "e2"); // cursor 2
+        let probe = crate::tracing_bus::race_publish_between_reads(&state.tracing_log_bus, &id);
+
+        let mut stream = watch_both(&state, &sandbox, 0, cursor_token(&state, &id, 1)).await;
+        let (warnings, delivered) = drain_until_quiet(&mut stream).await;
+        {
+            let mut probe = probe.lock().unwrap();
+            probe.join_publisher();
+            assert!(probe.fired, "the hook must run between the two reads");
+            assert!(probe.lock_held_between_reads, "lock released between reads");
+            assert!(
+                !probe.publisher_finished_between_reads,
+                "a publish landed between the log read and the platform read"
+            );
+        }
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(delivered, vec![2, 3, 4], "replay, then 3 and 4 live");
+
+        // Reconnecting from the replay's only cursor recovers both.
+        let mut resumed = watch_both(&state, &sandbox, 0, cursor_token(&state, &id, 2)).await;
+        let (warnings, delivered) = drain_until_quiet(&mut resumed).await;
+        assert!(warnings.is_empty());
         assert_eq!(delivered, vec![3, 4]);
     }
 

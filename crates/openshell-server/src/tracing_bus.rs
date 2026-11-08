@@ -22,6 +22,8 @@ pub struct TracingLogBus {
     inner: Arc<Mutex<Inner>>,
     pub(crate) platform_event_bus: PlatformEventBus,
     seq: SeqAllocator,
+    #[cfg(test)]
+    hooks: SnapshotHooks,
 }
 
 #[derive(Debug, Clone)]
@@ -206,8 +208,22 @@ fn tail_after_impl(
 /// resume from," which `tail_after`'s eviction-only gap check can't: a
 /// shallow request and a bus eviction both withhold events, but only the
 /// eviction leaves a trace in `last_trimmed_seq`.
-fn tail_with_floor_impl(tail: &VecDeque<CursoredEvent>, max: usize) -> (Vec<CursoredEvent>, u64) {
-    let excluded = tail.len().saturating_sub(max);
+///
+/// `keep_after` exempts the newest events from `max`: every retained event
+/// with a seq above it is returned regardless of depth. The watch handler
+/// passes the high-water mark it recorded when it subscribed, so an event
+/// published while the stream was opening -- one that is also queued on the
+/// live receiver, where the snapshot's cutoff will suppress it -- is always
+/// delivered in the batch rather than trimmed as history. The returned set is
+/// still a suffix of the tail, so the floor keeps its meaning, and it never
+/// exceeds `keep_after`.
+fn tail_with_floor_impl(
+    tail: &VecDeque<CursoredEvent>,
+    max: usize,
+    keep_after: u64,
+) -> (Vec<CursoredEvent>, u64) {
+    let first_unseen = tail.partition_point(|cursored| cursored.seq <= keep_after);
+    let excluded = tail.len().saturating_sub(max).min(first_unseen);
     let floor = excluded
         .checked_sub(1)
         .and_then(|newest_excluded| tail.get(newest_excluded))
@@ -234,6 +250,8 @@ impl TracingLogBus {
             })),
             platform_event_bus: PlatformEventBus::new(seq.clone()),
             seq,
+            #[cfg(test)]
+            hooks: SnapshotHooks::default(),
         }
     }
 
@@ -397,6 +415,8 @@ impl TracingLogBus {
                 |per| tail_after_impl(&per.tail, per.last_trimmed_seq, log_after),
             )
         });
+        #[cfg(test)]
+        self.hooks.run(SnapshotPoint::BetweenReads);
         let platform = want_platform.then(|| {
             let inner = self
                 .platform_event_bus
@@ -422,6 +442,15 @@ impl TracingLogBus {
     /// tails were read, so the caller can suppress live copies at or below it
     /// without dropping anything the tails could not have covered.
     ///
+    /// `subscribed_at` is the mark [`Self::subscribe_resumable`] recorded.
+    /// Events above it were published after the caller's live receivers
+    /// existed, so they are queued live as well as buffered here; the caller
+    /// suppresses those live copies, which means this batch is their only
+    /// delivery. Each source therefore returns all of them regardless of its
+    /// depth (see `tail_with_floor_impl`), and reports whether its buffer
+    /// already evicted any of them before the read, in which case they are
+    /// lost from both paths and the caller must say so.
+    ///
     /// Reads never mint a space: with none, both tails are empty and
     /// `highest_seq` is `0`.
     pub(crate) fn snapshot_tail(
@@ -429,56 +458,260 @@ impl TracingLogBus {
         sandbox_id: &str,
         log_max: Option<usize>,
         platform_max: Option<usize>,
+        subscribed_at: u64,
     ) -> TailSnapshot {
         let spaces = self.seq.lock();
         let highest_seq = spaces
             .get(sandbox_id)
             .map_or(0, |space| space.next.saturating_sub(1));
 
-        let (logs, log_floor) = log_max.map_or_else(
-            || (Vec::new(), 0),
-            |max| {
-                let inner = self.inner.lock().expect("tracing bus lock poisoned");
-                inner.per_id.get(sandbox_id).map_or_else(
-                    || (Vec::new(), 0),
-                    |per| tail_with_floor_impl(&per.tail, max),
-                )
-            },
-        );
-        let (events, platform_floor) = platform_max.map_or_else(
-            || (Vec::new(), 0),
-            |max| {
-                let inner = self
-                    .platform_event_bus
-                    .inner
-                    .lock()
-                    .expect("platform event bus lock poisoned");
-                inner.per_id.get(sandbox_id).map_or_else(
-                    || (Vec::new(), 0),
-                    |per| tail_with_floor_impl(&per.tail, max),
-                )
-            },
-        );
+        let read = |per: Option<&PerSandbox>, max: usize| {
+            per.map_or_else(SourceTail::default, |per| {
+                let (events, floor) = tail_with_floor_impl(&per.tail, max, subscribed_at);
+                SourceTail {
+                    events,
+                    floor,
+                    evicted_while_opening: per.last_trimmed_seq > subscribed_at,
+                }
+            })
+        };
+
+        let log = log_max.map_or_else(SourceTail::default, |max| {
+            let inner = self.inner.lock().expect("tracing bus lock poisoned");
+            read(inner.per_id.get(sandbox_id), max)
+        });
+        #[cfg(test)]
+        self.hooks.run(SnapshotPoint::BetweenReads);
+        let platform = platform_max.map_or_else(SourceTail::default, |max| {
+            let inner = self
+                .platform_event_bus
+                .inner
+                .lock()
+                .expect("platform event bus lock poisoned");
+            read(inner.per_id.get(sandbox_id), max)
+        });
         drop(spaces);
 
         TailSnapshot {
-            logs,
-            log_floor,
-            events,
-            platform_floor,
+            log,
+            platform,
             highest_seq,
+        }
+    }
+
+    /// Subscribe live receivers for the resumable sources and record the
+    /// space's high-water mark, all under one cursor-space lock hold.
+    ///
+    /// Every publish holds this lock across its broadcast send, so the mark
+    /// splits the space exactly: an event at or below it was sent before
+    /// these receivers existed and can only be found in a buffer, and one
+    /// above it is queued on them. [`Self::snapshot_tail`] uses the mark to
+    /// keep every queued-and-buffered event in the initial batch.
+    ///
+    /// The lock order is allocator -> bus map, the same as publish. Never
+    /// mints a space: with none, the mark is `0`.
+    pub(crate) fn subscribe_resumable(
+        &self,
+        sandbox_id: &str,
+        want_log: bool,
+        want_platform: bool,
+    ) -> ResumableSubscription {
+        let spaces = self.seq.lock();
+        let subscription = ResumableSubscription {
+            log_rx: want_log.then(|| self.subscribe(sandbox_id)),
+            platform_rx: want_platform.then(|| self.platform_event_bus.subscribe(sandbox_id)),
+            subscribed_at: spaces
+                .get(sandbox_id)
+                .map_or(0, |space| space.next.saturating_sub(1)),
+        };
+        drop(spaces);
+        #[cfg(test)]
+        self.hooks.run(SnapshotPoint::AfterSubscribe);
+        subscription
+    }
+
+    /// Install a hook that runs at each [`SnapshotPoint`], replacing any
+    /// previous one. Shared by every clone of this bus.
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_hook(&self, hook: impl FnMut(SnapshotPoint) + Send + 'static) {
+        *self.hooks.0.lock().expect("snapshot hook lock poisoned") = Some(Box::new(hook));
+    }
+
+    /// Whether the cursor-space lock is held right now, by anyone.
+    #[cfg(test)]
+    pub(crate) fn cursor_space_locked(&self) -> bool {
+        matches!(
+            self.seq.inner.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+}
+
+/// Receivers from [`TracingLogBus::subscribe_resumable`] and the mark that
+/// separates buffered-only history from events queued on them.
+pub(crate) struct ResumableSubscription {
+    pub(crate) log_rx: Option<broadcast::Receiver<CursoredEvent>>,
+    pub(crate) platform_rx: Option<broadcast::Receiver<CursoredEvent>>,
+    /// Highest seq the space had issued when the receivers subscribed; `0`
+    /// with no space.
+    pub(crate) subscribed_at: u64,
+}
+
+/// Points inside the snapshot paths where a test hook runs.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotPoint {
+    /// After `subscribe_resumable` subscribed and released the lock.
+    AfterSubscribe,
+    /// Inside `snapshot_tail` or `snapshot_after`, after the log read and
+    /// before the platform read, with the cursor-space lock still held.
+    BetweenReads,
+}
+
+/// Test-only hook slot. Production builds carry no field at all.
+#[cfg(test)]
+#[derive(Clone, Default)]
+#[allow(clippy::type_complexity)]
+struct SnapshotHooks(Arc<Mutex<Option<Box<dyn FnMut(SnapshotPoint) + Send>>>>);
+
+#[cfg(test)]
+impl SnapshotHooks {
+    fn run(&self, point: SnapshotPoint) {
+        if let Some(hook) = self.0.lock().expect("snapshot hook lock poisoned").as_mut() {
+            hook(point);
         }
     }
 }
 
-/// Outcome of [`TracingLogBus::snapshot_tail`]. Each floor is the one
-/// `tail_with_floor_impl` reports for that source; an unread source has no
-/// events and a floor of `0`.
-pub(crate) struct TailSnapshot {
-    pub(crate) logs: Vec<CursoredEvent>,
-    pub(crate) log_floor: u64,
+#[cfg(test)]
+impl std::fmt::Debug for SnapshotHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SnapshotHooks")
+    }
+}
+
+/// One source's part of a [`TailSnapshot`]. An unread source has no events,
+/// a floor of `0`, and nothing evicted.
+#[derive(Debug, Default)]
+pub(crate) struct SourceTail {
     pub(crate) events: Vec<CursoredEvent>,
-    pub(crate) platform_floor: u64,
+    /// What `tail_with_floor_impl` reports for this source.
+    pub(crate) floor: u64,
+    /// The buffer trimmed at least one event published after the receivers
+    /// subscribed, before the snapshot could read it. Its live copy is
+    /// suppressed with the rest of the batch's range, so it is lost.
+    pub(crate) evicted_while_opening: bool,
+}
+
+/// What [`race_publish_between_reads`] observed from inside the snapshot.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct RaceProbe {
+    /// The hook ran at all, i.e. a snapshot reached its second read.
+    pub(crate) fired: bool,
+    /// The cursor-space lock was held between the two reads.
+    pub(crate) lock_held_between_reads: bool,
+    /// The competing publisher completed while the snapshot sat between its
+    /// reads. With both reads under one lock hold it cannot.
+    pub(crate) publisher_finished_between_reads: bool,
+    publisher: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl RaceProbe {
+    /// Wait for the competing publisher to finish both publishes.
+    pub(crate) fn join_publisher(&mut self) {
+        if let Some(handle) = self.publisher.take() {
+            handle.join().expect("publisher thread panicked");
+        }
+    }
+}
+
+/// Force the interleaving a snapshot must be atomic against: when the next
+/// snapshot on `bus` sits between its log read and its platform read, start a
+/// publisher that publishes one log line and then one platform event for
+/// `sandbox_id`, and give it time to finish before letting the snapshot read
+/// the platform bus.
+///
+/// With separate reads, the publisher completes in that pause and the platform
+/// read picks up its event while the log read missed the log line published
+/// just before it. With one lock hold, the publisher blocks until the snapshot
+/// is done, and both events land after it. The hook records what it saw
+/// rather than asserting, because it may run inside a gateway producer task
+/// where a panic would surface only as a truncated stream.
+///
+/// The hook fires once.
+#[cfg(test)]
+pub(crate) fn race_publish_between_reads(
+    bus: &TracingLogBus,
+    sandbox_id: &str,
+) -> Arc<Mutex<RaceProbe>> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let probe = Arc::new(Mutex::new(RaceProbe::default()));
+    let hook_probe = Arc::clone(&probe);
+    let publisher_bus = bus.clone();
+    let lock_bus = bus.clone();
+    let sandbox_id = sandbox_id.to_string();
+    // Closure state, not the probe, decides whether the hook already fired:
+    // a later snapshot must not touch the probe, which the test may be
+    // holding while it inspects the result.
+    let mut fired = false;
+    bus.set_snapshot_hook(move |point| {
+        if point != SnapshotPoint::BetweenReads || fired {
+            return;
+        }
+        fired = true;
+        let mut probe = hook_probe.lock().expect("race probe lock poisoned");
+        probe.fired = true;
+        probe.lock_held_between_reads = lock_bus.cursor_space_locked();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let bus = publisher_bus.clone();
+        let id = sandbox_id.clone();
+        probe.publisher = Some(std::thread::spawn(move || {
+            started_tx.send(()).expect("hook waits for start");
+            bus.publish_external(SandboxLogLine {
+                sandbox_id: id.clone(),
+                level: "INFO".to_string(),
+                target: "race".to_string(),
+                message: "raced log".to_string(),
+                source: "gateway".to_string(),
+                ..Default::default()
+            });
+            bus.platform_event_bus.publish(
+                &id,
+                SandboxStreamEvent {
+                    payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Event(
+                        openshell_core::proto::PlatformEvent {
+                            source: "race".to_string(),
+                            r#type: "Normal".to_string(),
+                            reason: "raced".to_string(),
+                            message: "raced event".to_string(),
+                            ..Default::default()
+                        },
+                    )),
+                    cursor: String::new(),
+                },
+            );
+            let _ = done_tx.send(());
+        }));
+        started_rx.recv().expect("publisher thread starts");
+        // Long enough for an unblocked publisher to finish two publishes many
+        // times over. A blocked one never does, so the correct implementation
+        // always pays the full wait; a broken one fails reliably.
+        probe.publisher_finished_between_reads =
+            done_rx.recv_timeout(Duration::from_millis(300)).is_ok();
+    });
+    probe
+}
+
+/// Outcome of [`TracingLogBus::snapshot_tail`].
+pub(crate) struct TailSnapshot {
+    pub(crate) log: SourceTail,
+    pub(crate) platform: SourceTail,
     /// Highest seq the space had issued at the lock hold; `0` with no space.
     pub(crate) highest_seq: u64,
 }
@@ -714,7 +947,7 @@ mod tests {
     #[test]
     fn tail_with_floor_impl_empty_tail_returns_zero_floor() {
         let tail = VecDeque::new();
-        let (events, floor) = tail_with_floor_impl(&tail, 10);
+        let (events, floor) = tail_with_floor_impl(&tail, 10, u64::MAX);
         assert!(events.is_empty());
         assert_eq!(floor, 0);
     }
@@ -722,12 +955,12 @@ mod tests {
     #[test]
     fn tail_with_floor_impl_max_covers_everything_returns_zero_floor() {
         let tail = tail_of(1, 5);
-        let (events, floor) = tail_with_floor_impl(&tail, 5);
+        let (events, floor) = tail_with_floor_impl(&tail, 5, u64::MAX);
         assert_eq!(cursors(&events), vec![1, 2, 3, 4, 5]);
         assert_eq!(floor, 0);
 
         // Asking for more than exists is the same as asking for everything.
-        let (events, floor) = tail_with_floor_impl(&tail, 99);
+        let (events, floor) = tail_with_floor_impl(&tail, 99, u64::MAX);
         assert_eq!(cursors(&events), vec![1, 2, 3, 4, 5]);
         assert_eq!(floor, 0);
     }
@@ -738,7 +971,7 @@ mod tests {
         // Newest 2 returned (4, 5); 1..=3 excluded, newest of those is 3.
         // Every returned event sits above the floor, so a bus never
         // withholds its own delivered window.
-        let (events, floor) = tail_with_floor_impl(&tail, 2);
+        let (events, floor) = tail_with_floor_impl(&tail, 2, u64::MAX);
         assert_eq!(cursors(&events), vec![4, 5]);
         assert_eq!(floor, 3);
         assert!(events.iter().all(|cursored| cursored.seq > floor));
@@ -749,46 +982,188 @@ mod tests {
         let tail = tail_of(1, 5);
         // Nothing returned; every event is excluded, so the floor is the
         // newest of them, 5.
-        let (events, floor) = tail_with_floor_impl(&tail, 0);
+        let (events, floor) = tail_with_floor_impl(&tail, 0, u64::MAX);
         assert!(events.is_empty());
         assert_eq!(floor, 5);
     }
 
-    /// `snapshot_after` must take the same lock `publish` holds across its own
-    /// tail insert, so a publish can never land between the log read and the
-    /// platform read. Proving this directly (rather than racing threads and
-    /// hoping to catch a bad interleaving) is what makes this test reliable:
-    /// hold the lock ourselves and show `snapshot_after` cannot proceed until
-    /// it is released.
+    /// The resume read is atomic against a publish on either bus. The forced
+    /// interleaving publishes a log line and then a platform event while
+    /// `snapshot_after` sits between its two reads. If the reads were
+    /// separate, the platform read would return the event while the log read
+    /// had already missed the line before it: a client handed that event's
+    /// cursor would resume past the line forever. Under one lock hold the
+    /// publisher waits, the replay holds neither, and both arrive live in
+    /// cursor order and are replayable from the replay's last cursor.
     #[test]
-    fn snapshot_after_blocks_while_cursor_space_is_locked() {
+    fn snapshot_after_holds_the_lock_across_a_publish_between_reads() {
         let bus = TracingLogBus::new();
-        let sandbox_id = "sb-lock";
-        bus.publish_external(make_log_event(sandbox_id, "line"));
+        let sandbox_id = "sb-race-resume";
+        bus.publish_external(make_log_event(sandbox_id, "l1")); // seq 1
+        bus.platform_event_bus.publish(sandbox_id, stream_event(0)); // seq 2
         let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+        let sub = bus.subscribe_resumable(sandbox_id, true, true);
+        let (mut log_rx, mut platform_rx) = (sub.log_rx.unwrap(), sub.platform_rx.unwrap());
 
-        let guard = bus.seq.lock();
+        let probe = race_publish_between_reads(&bus, sandbox_id);
+        let ResumeSnapshot::Read(log, platform) =
+            bus.snapshot_after(sandbox_id, epoch, 0, 0, true, true)
+        else {
+            panic!("expected a successful read");
+        };
+        {
+            let mut probe = probe.lock().unwrap();
+            probe.join_publisher();
+            assert!(probe.fired, "the hook must run between the two reads");
+            assert!(probe.lock_held_between_reads, "lock released between reads");
+            assert!(
+                !probe.publisher_finished_between_reads,
+                "a publish landed between the log read and the platform read"
+            );
+        }
 
-        let bus2 = bus.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            bus2.snapshot_after(sandbox_id, epoch, 0, 0, true, true);
-            done_tx.send(()).unwrap();
-        });
+        let log = log.expect("followed").expect("no gap");
+        let platform = platform.expect("followed").expect("no gap");
+        assert_eq!(cursors(&log), vec![1]);
+        assert_eq!(cursors(&platform), vec![2]);
 
-        // Give the worker time to reach (and block on) the lock.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(
-            done_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty),
-            "snapshot_after returned without waiting for the cursor-space lock"
+        // The raced events come live, in order, above the replay.
+        assert_eq!(log_rx.try_recv().expect("raced log is live").seq, 3);
+        assert_eq!(platform_rx.try_recv().expect("raced event is live").seq, 4);
+
+        // Resuming from the replay's highest cursor recovers both.
+        let ResumeSnapshot::Read(log, platform) =
+            bus.snapshot_after(sandbox_id, epoch, 2, 2, true, true)
+        else {
+            panic!("expected a successful read");
+        };
+        assert_eq!(cursors(&log.unwrap().unwrap()), vec![3]);
+        assert_eq!(cursors(&platform.unwrap().unwrap()), vec![4]);
+    }
+
+    /// The same forced interleaving on the initial path. Under one lock hold
+    /// the raced events are newer than the snapshot's high-water mark, so the
+    /// caller's cutoff lets their live copies through, in order.
+    #[test]
+    fn snapshot_tail_holds_the_lock_across_a_publish_between_reads() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-race-tail";
+        bus.publish_external(make_log_event(sandbox_id, "l1")); // seq 1
+        bus.platform_event_bus.publish(sandbox_id, stream_event(0)); // seq 2
+        let sub = bus.subscribe_resumable(sandbox_id, true, true);
+        let (mut log_rx, mut platform_rx) = (sub.log_rx.unwrap(), sub.platform_rx.unwrap());
+
+        let probe = race_publish_between_reads(&bus, sandbox_id);
+        let snap = bus.snapshot_tail(sandbox_id, Some(10), Some(10), sub.subscribed_at);
+        let mut probe = probe.lock().unwrap();
+        probe.join_publisher();
+        assert!(probe.fired, "the hook must run between the two reads");
+        assert!(probe.lock_held_between_reads, "lock released between reads");
+        assert!(
+            !probe.publisher_finished_between_reads,
+            "a publish landed between the log read and the platform read"
         );
 
-        drop(guard);
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("snapshot_after should complete once the lock is released");
-        handle.join().unwrap();
+        assert_eq!(cursors(&snap.log.events), vec![1]);
+        assert_eq!(cursors(&snap.platform.events), vec![2]);
+        assert_eq!(snap.highest_seq, 2);
+
+        let live_log = log_rx.try_recv().expect("raced log is live");
+        let live_event = platform_rx.try_recv().expect("raced event is live");
+        assert_eq!((live_log.seq, live_event.seq), (3, 4));
+        assert!(live_log.seq > snap.highest_seq && live_event.seq > snap.highest_seq);
+    }
+
+    /// `subscribe_resumable` records the mark under the lock every publish
+    /// holds across its send, so an event at or below it is never queued on
+    /// the new receivers and one above it always is.
+    #[test]
+    fn subscribe_resumable_splits_buffered_history_from_queued_events() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-sub";
+        assert_eq!(
+            bus.subscribe_resumable(sandbox_id, true, true)
+                .subscribed_at,
+            0
+        );
+        assert_eq!(bus.cursor_space(sandbox_id), None, "must not mint a space");
+
+        bus.publish_external(make_log_event(sandbox_id, "l1")); // seq 1
+        let sub = bus.subscribe_resumable(sandbox_id, true, false);
+        assert_eq!(sub.subscribed_at, 1);
+        assert!(sub.platform_rx.is_none());
+        let mut log_rx = sub.log_rx.unwrap();
+        assert!(log_rx.try_recv().is_err(), "history is not queued live");
+
+        bus.publish_external(make_log_event(sandbox_id, "l2")); // seq 2
+        assert_eq!(log_rx.try_recv().unwrap().seq, 2);
+    }
+
+    /// The reviewer's example at bus level: subscribe, then platform event 1
+    /// and log 2 are published before the snapshot. Both are queued live, and
+    /// the caller will suppress those copies, so the snapshot must return both
+    /// even though `event_tail` asked for no platform history -- and with
+    /// nothing excluded, neither source reports a floor.
+    #[test]
+    fn snapshot_tail_keeps_events_published_after_subscribe_regardless_of_depth() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-opening";
+        let sub = bus.subscribe_resumable(sandbox_id, true, true);
+        bus.platform_event_bus.publish(sandbox_id, stream_event(0)); // seq 1
+        bus.publish_external(make_log_event(sandbox_id, "l2")); // seq 2
+
+        let snap = bus.snapshot_tail(sandbox_id, Some(200), Some(0), sub.subscribed_at);
+        assert_eq!(cursors(&snap.log.events), vec![2]);
+        assert_eq!(cursors(&snap.platform.events), vec![1]);
+        assert_eq!((snap.log.floor, snap.platform.floor), (0, 0));
+        assert!(!snap.log.evicted_while_opening && !snap.platform.evicted_while_opening);
+        assert_eq!(snap.highest_seq, 2);
+    }
+
+    /// The exemption covers only events after the mark: older history is
+    /// still bounded by depth and still reports its floor.
+    #[test]
+    fn tail_with_floor_impl_exempts_only_events_after_keep_after() {
+        let tail = tail_of(1, 6);
+        // Depth 1 would return just 6; everything after 3 is exempt.
+        let (events, floor) = tail_with_floor_impl(&tail, 1, 3);
+        assert_eq!(cursors(&events), vec![4, 5, 6]);
+        assert_eq!(floor, 3);
+
+        // A depth deeper than the exempt run still reaches into history.
+        let (events, floor) = tail_with_floor_impl(&tail, 4, 5);
+        assert_eq!(cursors(&events), vec![3, 4, 5, 6]);
+        assert_eq!(floor, 2);
+
+        // Nothing after the mark: plain depth bound.
+        let (events, floor) = tail_with_floor_impl(&tail, 0, 6);
+        assert!(events.is_empty());
+        assert_eq!(floor, 6);
+    }
+
+    /// If the buffer trimmed an event published after subscribe before the
+    /// snapshot read it, that event is gone from both paths; the source says
+    /// so for the caller to report.
+    #[test]
+    fn snapshot_tail_reports_eviction_of_events_published_after_subscribe() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-opening-evict";
+        bus.platform_event_bus.publish(sandbox_id, stream_event(0)); // seq 1
+        let sub = bus.subscribe_resumable(sandbox_id, true, true);
+        for _ in 0..=PlatformEventBus::DEFAULT_TAIL {
+            bus.platform_event_bus.publish(sandbox_id, stream_event(0));
+        }
+
+        let snap = bus.snapshot_tail(sandbox_id, Some(10), Some(0), sub.subscribed_at);
+        assert!(snap.platform.evicted_while_opening);
+        assert!(!snap.log.evicted_while_opening);
+        assert_eq!(snap.platform.events.len(), PlatformEventBus::DEFAULT_TAIL);
+
+        // History trimmed before subscribe is ordinary truncation.
+        let late = bus.subscribe_resumable(sandbox_id, true, true);
+        let snap = bus.snapshot_tail(sandbox_id, Some(10), Some(0), late.subscribed_at);
+        assert!(!snap.platform.evicted_while_opening);
+        assert!(snap.platform.events.is_empty());
     }
 
     /// Baseline correctness: interleaved log/platform publishes draw from the
@@ -985,14 +1360,14 @@ mod tests {
         for _ in 0..5 {
             bus.publish_external(make_log_event(sandbox_id, "line"));
         }
-        let snap = bus.snapshot_tail(sandbox_id, Some(2), None);
-        assert_eq!(cursors(&snap.logs), vec![4, 5]);
-        assert_eq!(snap.log_floor, 3);
+        let snap = bus.snapshot_tail(sandbox_id, Some(2), None, u64::MAX);
+        assert_eq!(cursors(&snap.log.events), vec![4, 5]);
+        assert_eq!(snap.log.floor, 3);
 
         // Wide enough to cover everything: no floor.
-        let snap = bus.snapshot_tail(sandbox_id, Some(10), None);
-        assert_eq!(cursors(&snap.logs), vec![1, 2, 3, 4, 5]);
-        assert_eq!(snap.log_floor, 0);
+        let snap = bus.snapshot_tail(sandbox_id, Some(10), None, u64::MAX);
+        assert_eq!(cursors(&snap.log.events), vec![1, 2, 3, 4, 5]);
+        assert_eq!(snap.log.floor, 0);
     }
 
     /// `highest_seq` is the space's high-water mark at the lock hold, not the
@@ -1007,11 +1382,11 @@ mod tests {
         bus.publish_external(make_log_event(sandbox_id, "l2")); // seq 2
         bus.platform_event_bus.publish(sandbox_id, stream_event(0)); // seq 3
 
-        let snap = bus.snapshot_tail(sandbox_id, Some(10), Some(0));
-        assert_eq!(cursors(&snap.logs), vec![1, 2]);
-        assert_eq!(snap.log_floor, 0);
-        assert!(snap.events.is_empty());
-        assert_eq!(snap.platform_floor, 3);
+        let snap = bus.snapshot_tail(sandbox_id, Some(10), Some(0), u64::MAX);
+        assert_eq!(cursors(&snap.log.events), vec![1, 2]);
+        assert_eq!(snap.log.floor, 0);
+        assert!(snap.platform.events.is_empty());
+        assert_eq!(snap.platform.floor, 3);
         assert_eq!(snap.highest_seq, 3);
     }
 
@@ -1024,50 +1399,16 @@ mod tests {
         bus.publish_external(make_log_event(sandbox_id, "l1"));
         bus.platform_event_bus.publish(sandbox_id, stream_event(0));
 
-        let snap = bus.snapshot_tail(sandbox_id, Some(10), None);
-        assert_eq!(cursors(&snap.logs), vec![1]);
-        assert!(snap.events.is_empty());
-        assert_eq!(snap.platform_floor, 0);
+        let snap = bus.snapshot_tail(sandbox_id, Some(10), None, u64::MAX);
+        assert_eq!(cursors(&snap.log.events), vec![1]);
+        assert!(snap.platform.events.is_empty());
+        assert_eq!(snap.platform.floor, 0);
         assert_eq!(snap.highest_seq, 2);
 
-        let snap = bus.snapshot_tail("nope", Some(10), Some(10));
-        assert!(snap.logs.is_empty() && snap.events.is_empty());
+        let snap = bus.snapshot_tail("nope", Some(10), Some(10), u64::MAX);
+        assert!(snap.log.events.is_empty() && snap.platform.events.is_empty());
         assert_eq!(snap.highest_seq, 0);
         assert_eq!(bus.cursor_space("nope"), None);
-    }
-
-    /// Same guarantee as `snapshot_after_blocks_while_cursor_space_is_locked`
-    /// for the initial read: `snapshot_tail` takes the lock every publish holds
-    /// across its tail insert and broadcast send, so no publish can land
-    /// between the log read and the platform read.
-    #[test]
-    fn snapshot_tail_blocks_while_cursor_space_is_locked() {
-        let bus = TracingLogBus::new();
-        let sandbox_id = "sb-tail-lock";
-        bus.publish_external(make_log_event(sandbox_id, "line"));
-
-        let guard = bus.seq.lock();
-
-        let bus2 = bus.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            bus2.snapshot_tail(sandbox_id, Some(10), Some(10));
-            done_tx.send(()).unwrap();
-        });
-
-        // Give the worker time to reach (and block on) the lock.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(
-            done_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty),
-            "snapshot_tail returned without waiting for the cursor-space lock"
-        );
-
-        drop(guard);
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("snapshot_tail should complete once the lock is released");
-        handle.join().unwrap();
     }
 
     #[test]
@@ -1479,7 +1820,7 @@ impl PlatformEventBus {
         let inner = self.inner.lock().expect("platform event bus lock poisoned");
         inner.per_id.get(sandbox_id).map_or_else(
             || (Vec::new(), 0),
-            |per| tail_with_floor_impl(&per.tail, max),
+            |per| tail_with_floor_impl(&per.tail, max, u64::MAX),
         )
     }
 

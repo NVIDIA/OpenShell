@@ -2024,10 +2024,13 @@ message WatchSandboxRequest {
   // When following both sources, the replay can return fewer lines: events
   // older than one the other source's replay left out are withheld and
   // reported with a warning, even if both depths are equal.
+  //
+  // The depth bounds history only. Events published while the stream is
+  // opening are always included, so the replay can return more than N.
   uint32 log_tail_lines = 5;
 
   // Replay the last N platform events (best-effort) before following.
-  // Defaults to 0. Can return fewer events; see log_tail_lines.
+  // Defaults to 0. Can return fewer or more events; see log_tail_lines.
   uint32 event_tail = 6;
 
   // Stop streaming once the sandbox reaches READY or a terminal result phase

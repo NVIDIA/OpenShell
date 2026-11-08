@@ -191,6 +191,44 @@ pub fn coverage_gap_warning_event(
     }
 }
 
+/// Build the warning payload emitted when a bus evicted events published
+/// while the watch was opening, before the initial snapshot could read them.
+///
+/// Those events were queued on the live receivers too, but the snapshot's
+/// cutoff suppresses live copies at or below its high-water mark, so they are
+/// in neither the batch nor the live stream. The bus cannot say how many were
+/// lost -- its seqs interleave with the sibling source's -- only which source.
+pub fn opening_eviction_warning(logs: bool, platform_events: bool) -> SandboxStreamWarning {
+    let what = match (logs, platform_events) {
+        (true, true) => "log lines and platform events",
+        (true, false) => "log lines",
+        _ => "platform events",
+    };
+    SandboxStreamWarning {
+        message: format!(
+            "some {what} published while this watch was opening were evicted from the \
+             gateway buffer before they could be sent; they are not recoverable from any \
+             cursor this stream hands out."
+        ),
+    }
+}
+
+/// Wrap [`opening_eviction_warning`] in a `SandboxStreamEvent` ready to send.
+pub fn opening_eviction_warning_event(
+    logs: bool,
+    platform_events: bool,
+) -> openshell_core::proto::SandboxStreamEvent {
+    use openshell_core::proto::sandbox_stream_event::Payload;
+    openshell_core::proto::SandboxStreamEvent {
+        payload: Some(Payload::Warning(opening_eviction_warning(
+            logs,
+            platform_events,
+        ))),
+        // Warnings are not part of the resumable log/platform sequence.
+        cursor: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +313,30 @@ mod tests {
             warning.message.contains('1'),
             "message: {}",
             warning.message
+        );
+    }
+
+    #[test]
+    fn opening_eviction_warning_names_the_affected_sources() {
+        assert!(
+            opening_eviction_warning(true, false)
+                .message
+                .contains("some log lines ")
+        );
+        assert!(
+            opening_eviction_warning(false, true)
+                .message
+                .contains("some platform events ")
+        );
+        assert!(
+            opening_eviction_warning(true, true)
+                .message
+                .contains("log lines and platform events")
+        );
+        assert!(
+            opening_eviction_warning_event(true, false)
+                .cursor
+                .is_empty()
         );
     }
 

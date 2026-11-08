@@ -60,6 +60,8 @@ The gateway merges the log and platform event sources before emitting, so events
 
 A cursor is one position shared by the log and platform sources; you track a single highest value, not one per source. If you request both logs and platform events, either source can deliver fewer events on connect than its replay depth asked for. This happens when the other source's replay leaves out an event that is newer than part of this source's history, even when both depths are equal. The gateway withholds those events rather than hand out a cursor that one of the two sources cannot fully vouch for, and reports what it withheld with a warning event rather than dropping it silently. Watches that follow only logs, such as `openshell logs`, are not affected.
 
+Replay depths bound history only. An event published while the stream is opening is always part of the initial batch, so the batch can hold more events than requested. If the gateway's buffer evicts such an event before the batch is read, the stream reports it with a warning instead.
+
 ## Direct Filesystem Access
 
 Start an independent shell with `sandbox exec` to read log files directly:
