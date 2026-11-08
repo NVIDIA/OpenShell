@@ -2775,7 +2775,12 @@ async fn run_async() -> Result<()> {
         // Top-level status
         // -----------------------------------------------------------
         Some(Commands::Status { output }) => {
-            if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+            // A gateway named on the command line must be registered.
+            let resolved = match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                Err(err) if cli.gateway.is_some() => return Err(err),
+                resolved => resolved,
+            };
+            if let Ok(ctx) = resolved {
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
                 run::gateway_status(

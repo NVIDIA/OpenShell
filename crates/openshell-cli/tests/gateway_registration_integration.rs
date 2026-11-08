@@ -94,6 +94,17 @@ fn status_without_gateway_prints_registration_hint() {
 }
 
 #[test]
+fn status_with_unregistered_named_gateway_fails() {
+    let output = run_isolated(&["--gateway", "org-a", "status"]);
+    assert_ne!(output.code, 0, "{}", output.combined);
+    assert!(
+        output.combined.contains("Unknown gateway 'org-a'"),
+        "{}",
+        output.combined
+    );
+}
+
+#[test]
 fn gateway_list_table_shows_user_and_system_sources() {
     let config_dir = tempfile::tempdir().expect("create user config dir");
     let system_dir = tempfile::tempdir().expect("create system config dir");
