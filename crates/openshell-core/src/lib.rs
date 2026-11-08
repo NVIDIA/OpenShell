@@ -76,8 +76,7 @@ pub use config::{
     GatewayAuthConfig, GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy,
     GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig,
     GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig,
-    MtlsAuthConfig,
-    OidcConfig, PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
+    MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};
