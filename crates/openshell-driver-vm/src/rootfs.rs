@@ -1357,6 +1357,93 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn guest_init_creates_fd_links_and_preserves_existing_aliases() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dev = tempfile::tempdir().expect("temporary guest dev");
+        let run = || run_guest_setup_fd_links(dev.path());
+        let output = run();
+        assert!(output.status.success(), "{output:?}");
+        let aliases = [
+            ("fd", "/proc/self/fd"),
+            ("stdin", "/proc/self/fd/0"),
+            ("stdout", "/proc/self/fd/1"),
+            ("stderr", "/proc/self/fd/2"),
+        ];
+        let mut inodes = Vec::new();
+        for (name, target) in aliases {
+            let path = dev.path().join(name);
+            assert_eq!(fs::read_link(&path).expect("read alias"), Path::new(target));
+            inodes.push(fs::symlink_metadata(path).expect("stat alias").ino());
+        }
+        let output = run();
+        assert!(output.status.success(), "{output:?}");
+        for ((name, _), inode) in aliases.into_iter().zip(inodes) {
+            assert_eq!(
+                fs::symlink_metadata(dev.path().join(name))
+                    .expect("stat retained alias")
+                    .ino(),
+                inode,
+                "existing {name} alias stays intact"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let stdin = dev.path().join("stdin");
+            fs::remove_file(&stdin).expect("replace fixture alias");
+            std::os::unix::fs::symlink("fd/0", &stdin).expect("equivalent relative alias");
+            let output = run();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                fs::read_link(stdin).expect("retained relative alias"),
+                Path::new("fd/0")
+            );
+        }
+    }
+
+    #[test]
+    fn guest_init_rejects_conflicting_fd_entries_without_replacing_them() {
+        let dev = tempfile::tempdir().expect("temporary guest dev");
+        let fd = dev.path().join("fd");
+        fs::write(&fd, b"keep this entry").expect("conflicting file");
+        let output = run_guest_setup_fd_links(dev.path());
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("must refer to /proc/self/fd"));
+        assert_eq!(fs::read(&fd).expect("retained file"), b"keep this entry");
+
+        fs::remove_file(&fd).expect("remove fixture file");
+        std::os::unix::fs::symlink("missing-target", &fd).expect("dangling link");
+        let output = run_guest_setup_fd_links(dev.path());
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("must refer to /proc/self/fd"));
+        assert_eq!(
+            fs::read_link(fd).expect("retained link"),
+            Path::new("missing-target")
+        );
+    }
+
+    fn run_guest_setup_fd_links(dev: &Path) -> std::process::Output {
+        let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
+        let start = script
+            .find("setup_fd_links() {\n")
+            .expect("fd setup function");
+        let tail = &script[start..];
+        let end = tail.find("\n}\n").expect("fd setup function end") + "\n}\n".len();
+        Command::new("bash")
+            .args([
+                "-c",
+                &format!(
+                    "set -euo pipefail\n{}\nsetup_fd_links \"$1\"\n",
+                    &tail[..end]
+                ),
+                "test",
+            ])
+            .arg(dev)
+            .output()
+            .expect("run shipped fd setup")
+    }
+
     /// Runs the shipped guest init's `configure_hosts` against `root`.
     ///
     /// The function is cut out of the real script so the test exercises the
