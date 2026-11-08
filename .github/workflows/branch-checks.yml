@@ -598,8 +598,8 @@ jobs:
       - name: Test
         run: mise run test:python
 
-      - name: Test core Python tooling
-        run: mise run test:core-python
+      - name: Test Python scripts
+        run: mise run test:python-scripts
 
       - name: Test local gateway configuration helpers
         run: |

@@ -8,7 +8,7 @@ description = "Run all tests (Rust + Python + TypeScript SDK)"
 depends = [
   "test:rust",
   "test:python",
-  "test:core-python",
+  "test:python-scripts",
   "sdk:ts:test",
   "test:sbom",
   "test:install-sh",
@@ -157,7 +157,7 @@ run = "tasks/scripts/test-postgres-test-runner.sh"
 run_windows = "echo Skipping test:postgres-runner: the Unix PostgreSQL test runner does not apply on Windows."
 hide = true
 
-["test:core-python"]
+["test:python-scripts"]
 description = "Test the release, RPM, and E2E gateway config tooling"
 run = "uv run --no-project --with pytest --with pyyaml pytest -o \"python_files=*_test.py\" tasks/scripts/release_formula_test.py tasks/scripts/release_tooling_test.py deploy/rpm/ e2e/configs/gateway/"
 hide = true
