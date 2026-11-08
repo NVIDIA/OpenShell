@@ -3039,59 +3039,129 @@ mod tests {
         assert_eq!(nonblocking_result, Some(libc::EINPROGRESS));
     }
 
-    #[test]
-    fn nonblocking_loopback_connect_completes_after_in_progress() {
-        // A nonblocking loopback connect reports progress, then completes on the
-        // workload's own socket: it becomes writable, SO_ERROR is clear, a repeat
-        // reports EISCONN, and data reaches the peer.
-        let server = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = server.local_addr().unwrap();
-        let peer = std::thread::spawn(move || {
-            let (mut stream, _) = server.accept().unwrap();
-            let mut received = [0_u8; 4];
-            stream.read_exact(&mut received).unwrap();
-            received
-        });
+    const DENIAL_WARNING: &str = "sandbox network notification denied";
+
+    /// Process-wide capture of the broker dispatcher's denial warnings.
+    ///
+    /// The dispatcher logs on the broker thread, which a thread-local
+    /// subscriber cannot observe, so the capture is installed globally once and
+    /// each test scopes its assertions to its own workload thread ID.
+    #[derive(Clone, Default)]
+    struct DenialCapture(Arc<Mutex<Vec<(u64, String)>>>);
+
+    #[derive(Default)]
+    struct DenialVisitor {
+        tid: Option<u64>,
+        message: String,
+    }
+
+    impl tracing::field::Visit for DenialVisitor {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "tid" {
+                self.tid = Some(value);
+            }
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            if field.name() == "tid" {
+                self.tid = u64::try_from(value).ok();
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DenialCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = DenialVisitor::default();
+            event.record(&mut visitor);
+            if let Some(tid) = visitor.tid
+                && visitor.message.starts_with(DENIAL_WARNING)
+            {
+                lock(&self.0).push((tid, visitor.message));
+            }
+        }
+    }
+
+    fn denial_capture() -> &'static DenialCapture {
+        static CAPTURE: std::sync::OnceLock<DenialCapture> = std::sync::OnceLock::new();
+        CAPTURE.get_or_init(|| {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let capture = DenialCapture::default();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            )
+            .expect("install global denial capture");
+            capture
+        })
+    }
+
+    fn denial_warnings_for(tid: u32) -> Vec<String> {
+        lock(&denial_capture().0)
+            .iter()
+            .filter(|(captured, _)| *captured == u64::from(tid))
+            .map(|(_, message)| message.clone())
+            .collect()
+    }
+
+    /// Issue one nonblocking connect from a fresh workload thread and return
+    /// that thread's ID with the errno the workload observed.
+    fn nonblocking_workload_connect(address: SocketAddr) -> (u32, Option<i32>) {
+        denial_capture();
         let (launcher, listener) =
             crate::linux::workload_launcher::start().expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
-        let (first, ready, socket_error, repeated) = launcher
+        launcher
             .execute(move || {
+                // SAFETY: gettid has no preconditions.
+                let tid = u32::try_from(unsafe { libc::gettid() }).expect("positive tid");
                 let socket = socket2::Socket::new(
                     socket2::Domain::IPV4,
                     socket2::Type::STREAM.nonblocking(),
                     None,
                 )
                 .unwrap();
-                let first = socket
+                let errno = socket
                     .connect(&address.into())
                     .err()
                     .and_then(|error| error.raw_os_error());
-                let mut poll = libc::pollfd {
-                    fd: socket.as_raw_fd(),
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-                // SAFETY: poll points to one live pollfd.
-                let ready = unsafe { libc::poll(&raw mut poll, 1, 5_000) };
-                let socket_error = socket
-                    .take_error()
-                    .unwrap()
-                    .and_then(|error| error.raw_os_error());
-                let repeated = socket
-                    .connect(&address.into())
-                    .err()
-                    .and_then(|error| error.raw_os_error());
-                socket.set_nonblocking(false).unwrap();
-                (&socket).write_all(b"ping").unwrap();
-                (first, ready, socket_error, repeated)
+                (tid, errno)
             })
-            .expect("launcher result");
-        assert_eq!(first, Some(libc::EINPROGRESS));
-        assert_eq!(ready, 1, "socket never became writable");
-        assert_eq!(socket_error, None);
-        assert_eq!(repeated, Some(libc::EISCONN));
-        assert_eq!(&peer.join().unwrap(), b"ping");
+            .expect("launcher result")
+    }
+
+    #[test]
+    fn nonblocking_loopback_in_progress_connect_is_not_logged_as_denied() {
+        // A nonblocking loopback connect that is still in progress is the
+        // normal outcome, not a denial: the workload gets EINPROGRESS and the
+        // dispatcher must not emit its denial warning.
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (tid, errno) = nonblocking_workload_connect(server.local_addr().unwrap());
+        assert_eq!(errno, Some(libc::EINPROGRESS));
+        assert_eq!(denial_warnings_for(tid), Vec::<String>::new());
+    }
+
+    #[test]
+    fn nonblocking_loopback_connect_failure_is_logged_as_denied() {
+        // A real loopback connect failure still takes the dispatcher's
+        // warning and errno-response path.
+        let (tid, errno) =
+            nonblocking_workload_connect(SocketAddr::from(([127, 255, 255, 255], 80)));
+        assert_eq!(errno, Some(libc::ENETUNREACH));
+        let warnings = denial_warnings_for(tid);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(&format!("tid={tid}")), "{warnings:?}");
     }
 
     #[test]
