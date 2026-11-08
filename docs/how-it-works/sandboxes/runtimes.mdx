@@ -214,6 +214,12 @@ Podman also supports `image` mounts, which mount a container image read-only at 
 
 The MicroVM driver runs each sandbox in its own lightweight VM. It requires host virtualization: Apple Hypervisor on macOS or KVM on Linux.
 
+CPU-only VMs use libkrun by default. On Linux x86_64 hosts with KVM,
+operator-installed lifecycle extensions can select QEMU when they need an
+external x86_64 kernel, without requesting a GPU.
+QEMU VM launches don't support virtiofs mounts. Kernel selection remains under
+operator control; the guest must still pass authenticated runtime admission.
+
 The VM driver is opt-in. Enable it in the gateway TOML file:
 
 ```toml

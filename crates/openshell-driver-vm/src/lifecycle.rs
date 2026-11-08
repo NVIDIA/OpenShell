@@ -82,20 +82,9 @@ pub type LifecycleResult<T> = Result<T, LifecycleError>;
 ///
 /// Extensions declare features they need (e.g. PCI passthrough or an
 /// external kernel image) and the VM driver resolves a concrete
-/// [`VmBackend`] that can satisfy them. The mapping from feature to
-/// backend lives in [`BackendFeature::requires_qemu`] for now; once a
-/// third backend exists this should evolve into a per-backend capability
-/// table that the resolver intersects against feature requirements.
-///
-/// # Current limitations
-///
-/// Until the non-GPU QEMU launch path (PCI device transport / VFIO root
-/// port wiring) lands, the driver still rejects launches where the
-/// resolved backend is QEMU but the sandbox has no GPU. As a result,
-/// declaring [`Self::PciPassthrough`] or [`Self::ExternalKernelImage`] on
-/// a non-GPU sandbox is accepted by [`LifecycleExtensionRegistry::validate`]
-/// at registration time but will fail provisioning with a
-/// `FailedPrecondition` status.
+/// [`VmBackend`] that can satisfy them. [`Self::is_supported_by`] describes
+/// each backend independently. Explicit backend requirements are preserved;
+/// an unsupported feature fails before the launcher starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendFeature {
     /// Extension supplies its own kernel image via
@@ -105,8 +94,8 @@ pub enum BackendFeature {
     /// [`LaunchPlan::guest_init_dropins`]. Supported by all backends.
     GuestInitDropins,
     /// Extension needs PCI device passthrough on the guest. Currently
-    /// QEMU-only and currently rejected for non-GPU sandboxes pending the
-    /// non-GPU QEMU launch path landing.
+    /// QEMU-only. The current device model requires an assigned GPU BDF;
+    /// arbitrary PCI device descriptors are not supported.
     PciPassthrough,
 }
 
@@ -120,13 +109,15 @@ impl BackendFeature {
         }
     }
 
-    /// Returns true when satisfying this feature requires the QEMU backend
-    /// today. This is the simplest possible resolver and is expected to be
-    /// replaced with a per-backend capability table once a third backend
-    /// exists.
+    /// Whether the backend implements this feature. Device assignment and
+    /// kernel compatibility are validated separately for the concrete plan.
     #[must_use]
-    pub fn requires_qemu(self) -> bool {
-        matches!(self, Self::ExternalKernelImage | Self::PciPassthrough)
+    pub fn is_supported_by(self, backend: &VmBackend) -> bool {
+        match (backend, self) {
+            (VmBackend::Libkrun, Self::ExternalKernelImage | Self::PciPassthrough) => false,
+            (VmBackend::Libkrun | VmBackend::Qemu, Self::GuestInitDropins)
+            | (VmBackend::Qemu, Self::ExternalKernelImage | Self::PciPassthrough) => true,
+        }
     }
 }
 
@@ -349,8 +340,11 @@ pub trait LifecycleExtension: std::fmt::Debug + Send + Sync {
     /// inject additional guest environment variables, and MAY return an
     /// error to abort the launch. Implementations MUST NOT change
     /// [`LaunchPlan::backend`], [`LaunchPlan::required_backends`], or
-    /// [`LaunchPlan::required_backend_features`]; those changes are
-    /// ignored by the driver once `before_launch` is reached.
+    /// [`LaunchPlan::required_backend_features`]; the driver has already
+    /// resolved and validated them and does not repeat those steps after
+    /// this hook.
+    /// The driver-owned [`LaunchPlan::gpu_bdf`] must remain unchanged;
+    /// the registry rejects hooks that clear or replace that assignment.
     ///
     /// If this hook performs allocations that must be released on failure
     /// or delete, implement
@@ -604,8 +598,15 @@ impl LifecycleExtensionRegistry {
         plan: &mut LaunchPlan,
     ) -> LifecycleResult<()> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let assigned_gpu = plan.gpu_bdf.clone();
         for ext in self.active_for(sandbox) {
             ext.before_launch(sandbox, state_dir, plan).await?;
+            if plan.gpu_bdf != assigned_gpu {
+                return Err(LifecycleError::new(format!(
+                    "extension '{}' changed the assigned GPU device in before_launch",
+                    ext.name()
+                )));
+            }
         }
         span_status.finish(Ok(()))
     }
@@ -976,6 +977,41 @@ mod tests {
         T: LifecycleExtension + 'static,
     {
         extension.clone()
+    }
+
+    #[derive(Debug)]
+    struct GpuMutatingExtension(Option<String>);
+
+    #[tonic::async_trait]
+    impl LifecycleExtension for GpuMutatingExtension {
+        fn name(&self) -> &'static str {
+            "gpu-mutator"
+        }
+
+        async fn before_launch(
+            &self,
+            _sandbox: &Sandbox,
+            _state_dir: &Path,
+            plan: &mut LaunchPlan,
+        ) -> LifecycleResult<()> {
+            plan.gpu_bdf.clone_from(&self.0);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn before_launch_rejects_clearing_or_replacing_the_assigned_gpu() {
+        for replacement in [None, Some("0000:02:00.0".to_string())] {
+            let registry =
+                LifecycleExtensionRegistry::with(vec![Arc::new(GpuMutatingExtension(replacement))]);
+            let mut plan = sample_plan(VmBackend::Qemu);
+            plan.gpu_bdf = Some("0000:01:00.0".to_string());
+            let error = registry
+                .before_launch(&sample_sandbox(), Path::new("/tmp/state"), &mut plan)
+                .await
+                .expect_err("a requested GPU must retain its assignment after hooks");
+            assert!(error.message().contains("changed the assigned GPU device"));
+        }
     }
 
     #[tokio::test]

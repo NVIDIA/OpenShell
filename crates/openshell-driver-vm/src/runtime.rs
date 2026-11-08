@@ -4,6 +4,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::CString;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::ptr;
@@ -23,6 +24,82 @@ static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 pub enum VmBackend {
     Libkrun,
     Qemu,
+}
+
+impl VmBackend {
+    pub(crate) fn validate_host(&self) -> Result<(), String> {
+        match self {
+            Self::Libkrun => Ok(()),
+            Self::Qemu if cfg!(all(target_os = "linux", target_arch = "x86_64")) => Ok(()),
+            Self::Qemu => Err("QEMU requires a Linux x86_64 host with KVM".to_string()),
+        }
+    }
+
+    pub(crate) fn validate_kernel_image(&self, path: &Path) -> Result<(), String> {
+        match self {
+            Self::Libkrun => Err(format!(
+                "libkrun does not support external kernel images: {}",
+                path.display()
+            )),
+            Self::Qemu => validate_qemu_kernel_image(path),
+        }
+    }
+}
+
+/// Preflight the formats accepted by the `x86_64` QEMU launcher. The VMM still
+/// validates the complete image; runtime admission confirms enforcement.
+fn validate_qemu_kernel_image(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err(format!(
+            "selected kernel image is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let file = std::fs::File::open(path).map_err(|error| {
+        format!(
+            "cannot open selected kernel image {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut header = Vec::new();
+    file.take(0x238).read_to_end(&mut header).map_err(|error| {
+        format!(
+            "cannot read selected kernel image {}: {error}",
+            path.display()
+        )
+    })?;
+    if header.starts_with(b"\x7fELF") {
+        // ELFCLASS64, ELFDATA2LSB and EM_X86_64.
+        if header.len() >= 64
+            && header[4] == 2
+            && header[5] == 1
+            && u16::from_le_bytes([header[18], header[19]]) == 62
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "QEMU kernel must be a 64-bit little-endian x86_64 ELF image: {}",
+            path.display()
+        ));
+    }
+    // Linux/x86 boot protocol: boot_flag, HdrS, version and XLF_KERNEL_64.
+    // https://www.kernel.org/doc/html/latest/arch/x86/boot.html
+    if header.len() == 0x238
+        && header[0x1fe..0x200] == [0x55, 0xaa]
+        && &header[0x202..0x206] == b"HdrS"
+    {
+        if u16::from_le_bytes([header[0x206], header[0x207]]) >= 0x020c && header[0x236] & 1 != 0 {
+            return Ok(());
+        }
+        return Err(format!(
+            "QEMU kernel bzImage must target x86_64: {}",
+            path.display()
+        ));
+    }
+    Err(format!(
+        "unsupported QEMU kernel format in {}; expected x86_64 ELF or bzImage",
+        path.display()
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +138,11 @@ pub struct VmLaunchConfig {
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
+    // Both workload and image-preparation launchers enter here. Reject
+    // incompatible external kernels before touching disks or starting the VMM.
+    if let Some(kernel_image) = &config.kernel_image {
+        config.backend.validate_kernel_image(kernel_image)?;
+    }
     match config.backend {
         VmBackend::Qemu => run_qemu_vm(config),
         VmBackend::Libkrun => run_libkrun_vm(config),
@@ -71,13 +153,12 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     if !config.mounts.is_empty() {
         return Err("virtiofs mounts are not yet supported with the QEMU backend".to_string());
     }
-    let gpu_bdf = config
-        .gpu_bdf
-        .as_deref()
-        .ok_or("gpu_bdf is required for QEMU backend")?;
-    let vsock_cid = config
-        .vsock_cid
-        .ok_or("vsock_cid is required for QEMU backend")?;
+    if config.vsock_port_map.is_some() {
+        return Err(
+            "QEMU uses host AF_VSOCK; Unix-socket vsock port maps require libkrun".to_string(),
+        );
+    }
+    VmBackend::Qemu.validate_host()?;
 
     if !config.root_disk.is_file() {
         return Err(format!(
@@ -97,6 +178,17 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         return Err(format!("image disk not found: {}", image_disk.display()));
     }
 
+    let vmlinux = if let Some(kernel_image) = &config.kernel_image {
+        kernel_image.clone()
+    } else {
+        qemu_runtime_dir()?.join("vmlinux")
+    };
+    if !vmlinux.is_file() {
+        return Err(format!("VM kernel not found: {}", vmlinux.display()));
+    }
+    validate_qemu_kernel_image(&vmlinux)?;
+    let mut qemu_cmd = qemu_command(config, &vmlinux)?;
+
     if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
         return Err(format!("procguard arm failed: {err}"));
     }
@@ -106,52 +198,6 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
     let guest_env = qemu_guest_env_vars(config);
     write_guest_env_file(&config.overlay_disk, &guest_env)?;
-
-    let vmlinux = if let Some(kernel_image) = &config.kernel_image {
-        kernel_image.clone()
-    } else {
-        qemu_runtime_dir()?.join("vmlinux")
-    };
-    if !vmlinux.is_file() {
-        return Err(format!("VM kernel not found: {}", vmlinux.display()));
-    }
-
-    let kernel_cmdline = build_kernel_cmdline(config);
-
-    let mut qemu_cmd = StdCommand::new("qemu-system-x86_64");
-    qemu_cmd
-        .arg("-machine")
-        .arg("q35,accel=kvm")
-        .arg("-cpu")
-        .arg("host")
-        .arg("-smp")
-        .arg(config.vcpus.to_string())
-        .arg("-m")
-        .arg(format!("{}M", config.mem_mib))
-        .arg("-nographic")
-        .arg("-no-reboot")
-        .args(qemu_network_args())
-        .arg("-kernel")
-        .arg(&vmlinux)
-        .arg("-append")
-        .arg(&kernel_cmdline)
-        .args(qemu_disk_args(config))
-        .arg("-device")
-        .arg("pcie-root-port,id=vsock_root,slot=1")
-        .arg("-device")
-        .arg(format!(
-            "vhost-vsock-pci,guest-cid={vsock_cid},bus=vsock_root"
-        ))
-        .arg("-device")
-        .arg("pcie-root-port,id=gpu_root,slot=2")
-        .arg("-device")
-        .arg(format!("vfio-pci,host={gpu_bdf},bus=gpu_root"))
-        .arg("-serial")
-        .arg(format!("file:{}", config.console_output.display()));
-
-    qemu_cmd.stdin(Stdio::null());
-    qemu_cmd.stdout(Stdio::inherit());
-    qemu_cmd.stderr(Stdio::inherit());
 
     #[cfg(target_os = "linux")]
     {
@@ -183,6 +229,55 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     } else {
         Err(format!("QEMU exited with status {status}"))
     }
+}
+
+fn qemu_command(config: &VmLaunchConfig, kernel: &Path) -> Result<StdCommand, String> {
+    let vsock_cid = config
+        .vsock_cid
+        .ok_or("vsock_cid is required for QEMU backend")?;
+    if vsock_cid < 3 {
+        return Err("QEMU guest vsock CID must be at least 3".to_string());
+    }
+    let mut qemu_cmd = StdCommand::new("qemu-system-x86_64");
+    qemu_cmd
+        .arg("-machine")
+        .arg("q35,accel=kvm")
+        .arg("-cpu")
+        .arg("host")
+        .arg("-smp")
+        .arg(config.vcpus.to_string())
+        .arg("-m")
+        .arg(format!("{}M", config.mem_mib))
+        .arg("-nographic")
+        .arg("-no-reboot")
+        .args(qemu_network_args())
+        .arg("-kernel")
+        .arg(kernel)
+        .arg("-append")
+        .arg(build_kernel_cmdline(config))
+        .args(qemu_disk_args(config))
+        .arg("-device")
+        .arg("pcie-root-port,id=vsock_root,slot=1")
+        .arg("-device")
+        .arg(format!(
+            "vhost-vsock-pci,guest-cid={vsock_cid},bus=vsock_root"
+        ))
+        .arg("-serial")
+        .arg(format!("file:{}", config.console_output.display()));
+
+    if let Some(gpu_bdf) = &config.gpu_bdf {
+        qemu_cmd
+            .arg("-device")
+            .arg("pcie-root-port,id=gpu_root,slot=2")
+            .arg("-device")
+            .arg(format!("vfio-pci,host={gpu_bdf},bus=gpu_root"));
+    }
+
+    qemu_cmd.stdin(Stdio::null());
+    qemu_cmd.stdout(Stdio::inherit());
+    qemu_cmd.stderr(Stdio::inherit());
+
+    Ok(qemu_cmd)
 }
 
 fn qemu_network_args() -> [&'static str; 2] {
@@ -823,6 +918,129 @@ mod tests {
             vsock_port_map: None,
             mounts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn qemu_command_keeps_vsock_and_only_adds_vfio_for_an_assigned_gpu() {
+        let mut config = qemu_config();
+        for gpu in [None, Some("0000:01:00.0".to_string())] {
+            config.gpu_bdf = gpu.clone();
+            let command = qemu_command(&config, Path::new("/vmlinux")).expect("QEMU command");
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy())
+                .collect();
+            assert!(
+                args.iter()
+                    .any(|arg| arg == "vhost-vsock-pci,guest-cid=4,bus=vsock_root")
+            );
+            assert!(args.windows(2).any(|pair| pair == ["-nic", "none"]));
+            assert_eq!(
+                args.iter().any(|arg| arg.starts_with("vfio-pci,")),
+                gpu.is_some()
+            );
+            assert_eq!(
+                args.iter().any(|arg| arg.contains("gpu_root,slot=2")),
+                gpu.is_some()
+            );
+            assert_eq!(
+                qemu_guest_env_vars(&config)
+                    .iter()
+                    .any(|env| env == "GPU_ENABLED=true"),
+                gpu.is_some()
+            );
+        }
+        for cid in [None, Some(2)] {
+            config.vsock_cid = cid;
+            assert!(qemu_command(&config, Path::new("/vmlinux")).is_err());
+        }
+    }
+
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    #[test]
+    fn qemu_rejects_unsupported_hosts_before_disk_setup() {
+        let mut config = qemu_config();
+        config.gpu_bdf = None;
+        assert_eq!(
+            run_vm(&config).unwrap_err(),
+            "QEMU requires a Linux x86_64 host with KVM"
+        );
+    }
+
+    #[test]
+    fn kernel_preflight_checks_format_and_guest_architecture() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut elf = vec![0u8; 64];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[18] = 62; // EM_X86_64.
+        std::fs::write(file.path(), &elf).unwrap();
+        VmBackend::Qemu
+            .validate_kernel_image(file.path())
+            .expect("x86_64 ELF header");
+        elf[18] = 183; // EM_AARCH64.
+        std::fs::write(file.path(), &elf).unwrap();
+        assert!(
+            VmBackend::Qemu
+                .validate_kernel_image(file.path())
+                .unwrap_err()
+                .contains("x86_64 ELF")
+        );
+
+        let mut bzimage = vec![0u8; 0x238];
+        bzimage[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+        bzimage[0x202..0x206].copy_from_slice(b"HdrS");
+        bzimage[0x206..0x208].copy_from_slice(&0x020cu16.to_le_bytes());
+        bzimage[0x236] = 1;
+        std::fs::write(file.path(), &bzimage).unwrap();
+        VmBackend::Qemu
+            .validate_kernel_image(file.path())
+            .expect("x86_64 bzImage header");
+        bzimage[0x236] = 0;
+        std::fs::write(file.path(), &bzimage).unwrap();
+        assert!(
+            VmBackend::Qemu
+                .validate_kernel_image(file.path())
+                .unwrap_err()
+                .contains("bzImage must target x86_64")
+        );
+        for invalid in [b"".as_slice(), b"\x7fELF", b"not a kernel"] {
+            std::fs::write(file.path(), invalid).unwrap();
+            assert!(VmBackend::Qemu.validate_kernel_image(file.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn workload_and_preparation_entry_reject_incompatible_kernels_before_disk_setup() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"not a kernel").unwrap();
+        for mode in ["sandbox", "image-prep"] {
+            let mut config = qemu_config();
+            config.kernel_image = Some(file.path().to_path_buf());
+            config.gpu_bdf = None;
+            config.env = vec![format!("OPENSHELL_VM_INIT_MODE={mode}")];
+            assert!(
+                run_vm(&config)
+                    .unwrap_err()
+                    .contains("unsupported QEMU kernel format")
+            );
+            config.backend = VmBackend::Libkrun;
+            assert!(
+                run_vm(&config)
+                    .unwrap_err()
+                    .contains("libkrun does not support external kernel images")
+            );
+        }
+        let mut config = qemu_config();
+        config.vsock_port_map = Some(VsockPortMap {
+            guest_port: 1234,
+            host_socket: "/tmp/unused.sock".into(),
+            host_initiated: false,
+        });
+        assert!(
+            run_vm(&config)
+                .unwrap_err()
+                .contains("Unix-socket vsock port maps require libkrun")
+        );
     }
 
     #[test]
