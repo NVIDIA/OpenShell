@@ -598,6 +598,9 @@ jobs:
       - name: Test
         run: mise run test:python
 
+      - name: Test core Python tooling
+        run: mise run test:core-python
+
       - name: Test local gateway configuration helpers
         run: |
           bash tasks/scripts/test-gateway-pull-policy.sh
@@ -642,8 +645,8 @@ jobs:
     # The Python SDK moved to ai-openshell/sdk-python (#5287), which imported it
     # at v0.1.7. Its files stay only until core removes them, so PRs must not
     # add or change them. Deleting files is allowed (the removal PR). The paths
-    # are the ones the import moved; core-only tests under python/ and the
-    # shared root pyproject.toml and uv.lock stay editable.
+    # are the ones the import moved: all of python/ plus the two SDK build
+    # scripts. The shared root pyproject.toml and uv.lock stay editable.
     # Merge queue runs skip this job; the PR already passed it on its mirror.
     name: Python SDK Freeze
     needs: pr_metadata
@@ -662,16 +665,7 @@ jobs:
         run: |
           set -euo pipefail
           changed=$(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- \
-            python/openshell \
-            ':!python/openshell/release_formula_test.py' \
-            ':!python/openshell/rpm_gateway_config_migration_test.py' \
-            ':!python/openshell/gateway_config_fixture_test.py' \
-            ':!python/openshell/gateway_schema_v2_*_test.py' \
-            python/credential_driver_proto_test.py \
-            python/generate_python_proto_test.py \
-            python/grpc_transport_test.py \
-            python/grpc_typing_test.py \
-            python/wheel_verifier_test.py \
+            python \
             tasks/scripts/generate_python_proto.py \
             tasks/scripts/verify-python-wheel.py)
           if [ -z "$changed" ]; then

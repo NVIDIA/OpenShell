@@ -200,7 +200,7 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 ## Python SDK (`python/openshell/`)
 
 - The Python SDK moved to [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python), which publishes `openshell` to PyPI. Open SDK changes there.
-- The SDK files are frozen until core removes them; Branch Checks fails PRs that change them. Core-only tests under `python/` stay editable.
+- `python/` and the SDK build scripts `tasks/scripts/generate_python_proto.py` and `tasks/scripts/verify-python-wheel.py` are frozen until core removes them; Branch Checks fails PRs that change them. Put new core Python tests next to the code they test, not under `python/`.
 
 ## TypeScript SDK (`sdk/typescript/`)
 
