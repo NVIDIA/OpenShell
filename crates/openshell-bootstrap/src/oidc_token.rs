@@ -143,28 +143,19 @@ pub fn is_token_actually_expired(bundle: &OidcTokenBundle) -> bool {
 mod tests {
     use super::*;
 
-    #[allow(unsafe_code)]
-    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp);
-        }
-        f();
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+    fn with_tmp_xdg(tmp: &std::path::Path, f: impl FnOnce(&std::path::Path)) {
+        crate::test_environment::Environment::new()
+            .set("XDG_CONFIG_HOME", tmp)
+            .run(|| {
+                let root = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+                f(&root);
+            });
     }
 
     #[test]
     fn oidc_token_paths_reject_multi_component_gateway_names() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             let bundle = OidcTokenBundle {
                 access_token: "token".to_string(),
                 refresh_token: None,
@@ -203,9 +194,20 @@ mod tests {
     }
 
     #[test]
+    fn conformance_fixture_matches_cli_serialization() {
+        const FIXTURE: &str = include_str!("../../../sdk/conformance/oidc-token-bundle.json");
+        let bundle: OidcTokenBundle = serde_json::from_str(FIXTURE).unwrap();
+        assert!(bundle.refresh_token.is_some() && bundle.expires_at.is_some());
+        assert_eq!(
+            serde_json::to_value(&bundle).unwrap(),
+            serde_json::from_str::<serde_json::Value>(FIXTURE).unwrap()
+        );
+    }
+
+    #[test]
     fn oidc_login_prompt_marker_is_per_gateway() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             assert!(!oidc_login_prompt_required("alpha"));
             assert!(!oidc_login_prompt_required("beta"));
 

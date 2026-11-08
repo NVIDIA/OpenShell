@@ -91,6 +91,17 @@ The mediated channel to the **supervisor** is the workload's only allowed egress
 path. The outer fence denies everything else, so the agent can't reach a
 service, the gateway, DNS, or another private address directly.
 
+### Agent traces
+
+When an operator enables the
+[agent trace relay](/how-it-works/gateways/configuration#agent-trace-relay),
+the **sandbox** points the agent's OpenTelemetry SDK at the reserved address
+`192.0.0.8:4318`. Connections to it take the same mediated channel, but the
+**supervisor** answers them itself instead of opening an upstream connection.
+It tags each trace batch with the sandbox ID and forwards it to the operator's
+collector. The agent never learns the collector's address and needs no egress
+rule to reach it.
+
 ## How Each Runtime Builds the Boundary
 
 Every runtime follows the same contract, but each one uses the tools it already
@@ -125,6 +136,10 @@ that signs credentials, and every credential names exactly one sandbox.
 | **Supervisor** to gateway | The **supervisor** dials out to the gateway. | A gateway JWT, over TLS when the gateway has TLS enabled. |
 | **Supervisor** to **sandbox** | The **supervisor** dials into the workload over the driver's private channel. | Mutual TLS, plus a sandbox JWT. |
 | Agent to **supervisor** | The agent never connects directly. The **sandbox** relays its traffic over the connection above. | Covered by the supervisor-to-sandbox channel. |
+
+The **supervisor** verifies the gateway's TLS certificate with its CA. User
+client certificates and private keys stay outside both the **supervisor** and
+workload; the gateway JWT authenticates supervisor RPCs.
 
 ### Getting the first credential
 

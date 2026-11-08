@@ -227,7 +227,7 @@ jobs:
 
             if [ -n "$required_job_name" ]; then
               local jobs required_job job_status job_conclusion
-              jobs=$(gh api "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=100" --jq '.jobs')
+              jobs=$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=10" | jq -s '[.[].jobs[]]')
               required_job=$(jq -c --arg name "$required_job_name" '[.[] | select(.name == $name)] | .[0] // empty' <<< "$jobs")
 
               if [ -z "$required_job" ]; then
@@ -262,8 +262,8 @@ jobs:
               return 0
             fi
 
-            real_success=$(gh api "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=100" \
-              --jq '[.jobs[] | select(.conclusion == "success" and .name != "Resolve PR metadata")] | length')
+            real_success=$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=10" \
+              | jq -s '[.[].jobs[] | select(.conclusion == "success" and .name != "Resolve PR metadata")] | length')
 
             if [ "$real_success" -lt 1 ]; then
               post_status "$context" failure "No real CI jobs ran" "$run_url"
@@ -276,6 +276,12 @@ jobs:
           resolve_context
 
           evaluate_workflow "OpenShell / Branch Checks" "branch-checks.yml" "Branch Checks"
-          evaluate_workflow "OpenShell / E2E" "branch-e2e.yml" "Branch E2E Checks" "test:e2e" "Core E2E result"
-          evaluate_workflow "OpenShell / GPU E2E" "branch-e2e.yml" "Branch E2E Checks" "test:e2e-gpu" "GPU E2E result"
+          # E2E is opt-in on PRs and does not run for merge groups.
+          if [ "$CONTEXT_KIND" != "merge_group" ]; then
+            evaluate_workflow "OpenShell / E2E" "branch-e2e.yml" "Branch E2E Checks" "test:e2e" "Core E2E result"
+            evaluate_workflow "OpenShell / GPU E2E" "branch-e2e.yml" "Branch E2E Checks" "test:e2e-gpu" "GPU E2E result"
+          else
+            post_status "OpenShell / E2E" success "Not applicable: E2E runs only on PRs" "$STATUS_TARGET_URL"
+            post_status "OpenShell / GPU E2E" success "Not applicable: GPU E2E runs only on PRs" "$STATUS_TARGET_URL"
+          fi
           evaluate_workflow "OpenShell / Helm Lint" "helm-lint.yml" "Helm Lint"

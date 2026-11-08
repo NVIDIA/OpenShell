@@ -39,6 +39,7 @@ jobs:
           - arch: aarch64
             triple: aarch64-apple-darwin
             runner: macos-15-xlarge
+            entitlements-file: crates/openshell-driver-vm/entitlements.plist
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     defaults:
@@ -52,6 +53,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Download openshell-sandbox
@@ -81,7 +83,9 @@ jobs:
           path: vm-init
 
       - name: Build VM runtime
-        run: nix build .#vm-runtime
+        run: |
+          # HTTP 416 is not retried by Nix; restart the build once on failure.
+          nix build .#vm-runtime || nix build .#vm-runtime
 
       - name: Assemble compressed VM runtime
         run: |
@@ -106,3 +110,4 @@ jobs:
           triple: ${{ matrix.triple }}
           cargo-version: ${{ inputs['cargo-version'] }}
           supervisor-image-tag: ${{ inputs['supervisor-image-tag'] }}
+          entitlements-file: ${{ matrix.entitlements-file }}

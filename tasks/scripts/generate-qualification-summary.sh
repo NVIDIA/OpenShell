@@ -26,9 +26,10 @@ current_profile_passed=true
 require_env \
   RELEASE_TAG SOURCE_SHA IS_PRERELEASE GITHUB_RUN_ID GITHUB_RUN_ATTEMPT \
   GITHUB_SERVER_URL GITHUB_REPOSITORY SECURITY_RESULT CONFORMANCE_RESULT \
-  FEATURE_INTEGRATION_RESULT DOCKER_E2E_RESULT VM_E2E_RESULT
+  FEATURE_INTEGRATION_RESULT DOCKER_E2E_RESULT VM_E2E_RESULT PROTO_COMPATIBILITY_RESULT
 
 for result in \
+  "${PROTO_COMPATIBILITY_RESULT}" \
   "${SECURITY_RESULT}" \
   "${CONFORMANCE_RESULT}" \
   "${FEATURE_INTEGRATION_RESULT}" \
@@ -51,6 +52,7 @@ jq -n \
   --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
   --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg security "${SECURITY_RESULT}" \
+  --arg protobuf_compatibility "${PROTO_COMPATIBILITY_RESULT}" \
   --arg conformance "${CONFORMANCE_RESULT}" \
   --arg feature_integration "${FEATURE_INTEGRATION_RESULT}" \
   --arg docker_e2e "${DOCKER_E2E_RESULT}" \
@@ -65,7 +67,7 @@ jq -n \
       rfc_0014_complete: false,
       missing_suites: [
         "upgrade",
-        "breaking API change review",
+        "SDK/configuration compatibility and migration review",
         "remaining RFC conformance configurations"
       ]
     },
@@ -76,7 +78,16 @@ jq -n \
       url: $run_url
     },
     generated_at: $generated_at,
+    advisory_reviews: {
+      compatibility: {
+        required: false,
+        status: "reported_separately",
+        artifact_name: ("compatibility-review-run-" + $run_id + "-attempt-" + $run_attempt),
+        run_url: $run_url
+      }
+    },
     suites: {
+      protobuf_compatibility: $protobuf_compatibility,
       security: $security,
       conformance_integration: $conformance,
       feature_integration: $feature_integration,

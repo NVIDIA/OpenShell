@@ -13,12 +13,21 @@
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::path::{Path, PathBuf};
 
+/// Treat an empty XDG base-directory value as unset.
+///
+/// The XDG base directory specification says an empty value must be handled
+/// like an unset one. Joining onto an empty base would otherwise produce a
+/// relative path that depends on the current working directory.
+fn non_empty_xdg_base(value: Option<String>) -> Option<PathBuf> {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
 /// Resolve the XDG config base directory.
 ///
-/// Returns `$XDG_CONFIG_HOME` if set, otherwise `$HOME/.config`.
+/// Returns `$XDG_CONFIG_HOME` if set and non-empty, otherwise `$HOME/.config`.
 pub fn xdg_config_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
+    if let Some(path) = non_empty_xdg_base(std::env::var("XDG_CONFIG_HOME").ok()) {
+        return Ok(path);
     }
     #[cfg(target_os = "windows")]
     if let Ok(path) = std::env::var("APPDATA") {
@@ -55,6 +64,24 @@ pub fn xdg_state_dir() -> Result<PathBuf> {
 /// The top-level `OpenShell` state directory: `$XDG_STATE_HOME/openshell/`.
 pub fn openshell_state_dir() -> Result<PathBuf> {
     Ok(xdg_state_dir()?.join("openshell"))
+}
+
+/// Platform default for gateway audit files. Sink configuration and writing
+/// remain portable; only the directory convention depends on the host.
+pub fn gateway_audit_log_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(directory) = std::env::var_os("ProgramData") {
+            return PathBuf::from(directory).join("OpenShell").join("logs");
+        }
+        std::env::temp_dir().join("openshell").join("logs")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        openshell_state_dir()
+            .unwrap_or_else(|_| std::env::temp_dir().join("openshell"))
+            .join("logs")
+    }
 }
 
 /// Resolve the XDG data base directory.
@@ -140,6 +167,11 @@ pub fn is_file_permissions_too_open(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
 }
 
+/// Whether `path` is absolute under POSIX rules, whatever the host platform.
+pub fn is_posix_absolute(path: &Path) -> bool {
+    path.to_str().is_some_and(|path| path.starts_with('/'))
+}
+
 /// Compatibility re-export; authored policy path normalization is owned by
 /// `openshell-policy-schema`.
 pub use openshell_policy_schema::normalize_path;
@@ -149,12 +181,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn is_posix_absolute_ignores_host_path_syntax() {
+        assert!(is_posix_absolute(Path::new("/run/backend.sock")));
+        assert!(is_posix_absolute(Path::new("/")));
+        for path in ["", "relative", "./run", r"\run", r"C:\run", "C:/run"] {
+            assert!(!is_posix_absolute(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
     fn xdg_config_dir_respects_env() {
         // This test checks the logic — actual env var mutation is unsafe so
         // we rely on the integration tests in openshell-bootstrap for full
         // round-trip testing.
         let result = xdg_config_dir();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn non_empty_xdg_base_treats_empty_as_unset() {
+        assert_eq!(non_empty_xdg_base(None), None);
+        assert_eq!(non_empty_xdg_base(Some(String::new())), None);
+        assert_eq!(
+            non_empty_xdg_base(Some("/tmp/xdg".to_string())),
+            Some(PathBuf::from("/tmp/xdg"))
+        );
+    }
+
+    #[test]
+    fn non_empty_xdg_base_keeps_spaces() {
+        assert_eq!(
+            non_empty_xdg_base(Some("/tmp/xdg config".to_string())),
+            Some(PathBuf::from("/tmp/xdg config"))
+        );
     }
 
     #[test]

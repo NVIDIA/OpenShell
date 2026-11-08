@@ -31,7 +31,37 @@ to each driver crate:
 | Kubernetes | [`openshell-driver-kubernetes`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-kubernetes/README.md) |
 | Windows MXC | [`openshell-driver-mxc`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-mxc/README.md) |
 
-External compute drivers implement [`compute_driver.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/compute_driver.proto).
+### Using an External Compute Driver
+
+External compute drivers must implement [`compute_driver.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/compute_driver.proto).
+Refer to [Protocol Negotiation](/extensibility/overview#protocol-negotiation) for the metadata and capability requirements, and
+[Isolation Backends](/extensibility/isolation-backends) for the workload runtime
+contract. Your driver must also acknowledge the gateway's
+[resource admission policy](/how-it-works/gateways/configuration#external-resource-admission).
+
+Run your driver as a separate service listening on a Unix domain socket. The
+gateway does not start or supervise it. Restrict socket access to the gateway
+user and make the socket accessible from the gateway's host or container.
+
+Select a name that is not reserved by a built-in driver, then add it and the
+socket path to your existing `gateway.toml`:
+
+```toml
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "example-compute"
+
+[openshell.drivers.example-compute]
+socket_path = "/run/openshell/example-compute.sock"
+```
+
+Start the driver, then start or restart the gateway with this configuration. Use
+`openshell gateway info` from a CLI connected to that gateway to verify the
+active driver and negotiated capabilities. See the
+[Extension Driver configuration reference](/how-it-works/gateways/configuration#extension-driver)
+for configuration details.
 
 ## Credential Drivers
 

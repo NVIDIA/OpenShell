@@ -283,6 +283,7 @@ impl BinaryIdentityCache {
 mod tests {
     use super::*;
     use crate::procfs;
+    use crate::test_support::executable_path;
     use openshell_isolation_interface::contract::{
         BinaryIdentity, ExecutableIdentity, Sha256Digest,
     };
@@ -294,19 +295,19 @@ mod tests {
     }
 
     fn supplied_identity(
-        executable_path: &str,
+        path: &str,
         executable_digest: Option<&str>,
         ancestors: &[(&str, Option<&str>)],
     ) -> BinaryIdentity {
         BinaryIdentity {
             executable: ExecutableIdentity {
-                path: PathBuf::from(executable_path),
+                path: executable_path(path),
                 digest: executable_digest.map(digest),
             },
             ancestors: ancestors
                 .iter()
                 .map(|(path, digest_value)| ExecutableIdentity {
-                    path: PathBuf::from(path),
+                    path: executable_path(path),
                     digest: digest_value.map(digest),
                 })
                 .collect(),
@@ -383,9 +384,22 @@ mod tests {
     #[test]
     fn supplied_identity_rejects_non_absolute_or_empty_paths() {
         let cache = BinaryIdentityCache::new();
-        for path in ["", "sandbox/tool"] {
+        #[cfg(not(target_os = "windows"))]
+        let paths = ["", "sandbox/tool"];
+        #[cfg(target_os = "windows")]
+        let paths = [
+            "",
+            "sandbox/tool",
+            "C:sandbox/tool",
+            "/sandbox/tool",
+            r"\sandbox\tool",
+        ];
+        for path in paths {
+            let mut identity = supplied_identity(path, Some("11"), &[]);
+            // Exercise the raw invalid path, without adapting the fixture.
+            identity.executable.path = PathBuf::from(path);
             let error = cache
-                .verify_or_cache_supplied_identity(&supplied_identity(path, Some("11"), &[]))
+                .verify_or_cache_supplied_identity(&identity)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("must be absolute"));
@@ -450,7 +464,7 @@ mod tests {
                 .hashes
                 .lock()
                 .unwrap()
-                .contains_key(Path::new("/sandbox/other"))
+                .contains_key(&executable_path("/sandbox/other"))
         );
     }
 
@@ -480,8 +494,8 @@ mod tests {
         assert!(error.contains("capacity"));
         let hashes = cache.hashes.lock().unwrap();
         assert_eq!(hashes.len(), 4095);
-        assert!(!hashes.contains_key(Path::new("/sandbox/new-leaf")));
-        assert!(!hashes.contains_key(Path::new("/sandbox/new-ancestor")));
+        assert!(!hashes.contains_key(&executable_path("/sandbox/new-leaf")));
+        assert!(!hashes.contains_key(&executable_path("/sandbox/new-ancestor")));
     }
 
     #[test]
@@ -491,7 +505,7 @@ mod tests {
         for index in 0..4096 {
             cache
                 .verify_or_cache_with_paths(
-                    &PathBuf::from(format!("/sandbox/pinned-{index}")),
+                    &executable_path(&format!("/sandbox/pinned-{index}")),
                     executable.path(),
                     |_| Ok("11".repeat(32)),
                 )
@@ -499,9 +513,11 @@ mod tests {
         }
 
         let error = cache
-            .verify_or_cache_with_paths(Path::new("/sandbox/overflow"), executable.path(), |_| {
-                Ok("11".repeat(32))
-            })
+            .verify_or_cache_with_paths(
+                &executable_path("/sandbox/overflow"),
+                executable.path(),
+                |_| Ok("11".repeat(32)),
+            )
             .unwrap_err()
             .to_string();
 

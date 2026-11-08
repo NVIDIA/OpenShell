@@ -21,7 +21,7 @@ of release jobs.
 | Platform | Installation methods | Requirements |
 | --- | --- | --- |
 | macOS (Apple Silicon) | Homebrew | macOS 13.3 or later |
-| Linux (x86_64, arm64) | APT/DEB, RPM, Snap | glibc 2.28 or later |
+| Linux (x86_64, arm64) | APT/DEB, RPM, snap | glibc 2.28 or later |
 | Windows (x86_64, arm64) | MSI, WinGet | Documented minimum Windows version and MSVC toolchain |
 
 Package installers include the CLI, TUI, gateway, and supported local drivers.

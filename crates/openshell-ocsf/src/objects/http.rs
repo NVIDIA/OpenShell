@@ -57,6 +57,17 @@ impl Url {
         }
     }
 
+    /// A URL with only a path, for requests whose authority is implicit.
+    #[must_use]
+    pub fn from_path(path: &str) -> Self {
+        Self {
+            scheme: None,
+            hostname: None,
+            path: Some(path.to_string()),
+            port: None,
+        }
+    }
+
     /// Format as a display string.
     ///
     /// Includes the port when it is present and differs from the scheme default

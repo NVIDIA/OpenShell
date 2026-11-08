@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -10,7 +9,7 @@ use blake3::Hasher;
 use crate::config::{Environment, Machine};
 
 use super::ansible_hash::hash_sources;
-use super::layer::{cached_layer, hash_file, hash_files};
+use super::layer::{cached_layer, hash_file, hash_files, hash_inputs};
 
 const SETUP_CACHE_VERSION: &[u8] = b"tmachine-disk-blake3-v1";
 
@@ -25,7 +24,7 @@ pub async fn setup(machine: &Machine, environment: &Environment) -> Result<PathB
         &hash,
         environment.setup.use_galaxy,
         &environment.setup.playbooks,
-        &BTreeMap::new(),
+        &environment.setup.inputs,
     )
     .await
 }
@@ -39,5 +38,9 @@ fn setup_hash(machine: &Machine, environment: &Environment) -> Result<String> {
     hash_sources(&mut hasher).context("failed to hash Ansible sources")?;
     hash_files(&mut hasher, &environment.setup.playbooks)
         .context("failed to hash setup playbooks")?;
+    // Skipped when empty so environments without inputs keep their cache keys.
+    if !environment.setup.inputs.is_empty() {
+        hash_inputs(&mut hasher, &environment.setup.inputs)?;
+    }
     Ok(hasher.finalize().to_hex().to_string())
 }

@@ -549,6 +549,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             // Provider credential provenance is derived by the
                             // gateway and cannot be authored in policy YAML.
                             provider_credentialed: false,
+                            token_grant_owner: String::new(),
                             // Advisor provenance is internal runtime state, not
                             // a user-authored policy schema field.
                             advisor_proposed: false,
@@ -1561,6 +1562,7 @@ fn validate_sandbox_policy_with_mcp_presence(
                     })
                 });
             let fields = L7EndpointFields {
+                websocket_credential_rewrite: ep.websocket_credential_rewrite,
                 protocol: &ep.protocol,
                 access,
                 has_rules: !ep.rules.is_empty(),
@@ -4786,6 +4788,18 @@ network_policies:
     }
 
     #[test]
+    fn validate_rest_rejects_websocket_credential_rewrite() {
+        for protocol in ["rest", "REST", "Rest"] {
+            let yaml = "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, access: read-only, websocket_credential_rewrite: true }\n";
+            let yaml = yaml.replace("protocol: rest", &format!("protocol: {protocol}"));
+            let policy = parse_sandbox_policy(&yaml).unwrap();
+            let errors = validate_sandbox_policy(&policy)
+                .expect_err("REST cannot rewrite WebSocket messages");
+            assert!(format!("{errors:?}").contains("use protocol: websocket"));
+        }
+    }
+
+    #[test]
     fn round_trip_preserves_websocket_credential_rewrite() {
         let yaml = r"
 version: 1
@@ -4795,7 +4809,7 @@ network_policies:
     endpoints:
       - host: gateway.example.com
         port: 443
-        protocol: rest
+        protocol: websocket
         enforcement: enforce
         access: full
         websocket_credential_rewrite: true
@@ -4807,7 +4821,7 @@ network_policies:
         let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
 
         let ep = &proto2.network_policies["discord_gateway"].endpoints[0];
-        assert_eq!(ep.protocol, "rest");
+        assert_eq!(ep.protocol, "websocket");
         assert!(ep.websocket_credential_rewrite);
         assert!(yaml_out.contains("websocket_credential_rewrite: true"));
     }

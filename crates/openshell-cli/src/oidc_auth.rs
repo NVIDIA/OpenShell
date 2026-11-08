@@ -93,7 +93,7 @@ async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
 }
 
 fn http_client(insecure: bool) -> reqwest::Client {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     let mut builder = reqwest::ClientBuilder::new().redirect(reqwest::redirect::Policy::none());
     if insecure {
         builder = builder.danger_accept_invalid_certs(true);
@@ -171,6 +171,20 @@ fn device_token_form(
     ]
 }
 
+/// Build the OIDC redirect URI for a bound callback listener.
+///
+/// The URI derives from the listener's bound address (see
+/// [`crate::callback::callback_host`]): IPv4 binds and the default bind use
+/// `http://127.0.0.1:<port>/callback`, while IPv6 binds use the bracketed
+/// literal (`http://[::1]:<port>/callback`), matching RFC 8252 loopback
+/// redirects. Identity providers that allowlist `http://127.0.0.1:*` for
+/// native apps should also allowlist `http://[::1]:*`.
+fn callback_redirect_uri(listener: &TcpListener) -> Result<String> {
+    let local_addr = listener.local_addr().into_diagnostic()?;
+    let host = crate::callback::callback_host(local_addr);
+    Ok(format!("http://{host}:{}/callback", local_addr.port()))
+}
+
 /// Run the OIDC Authorization Code + PKCE browser flow.
 ///
 /// Opens the user's browser to the Keycloak login page and waits for
@@ -185,9 +199,8 @@ pub async fn oidc_browser_auth_flow(
 ) -> Result<OidcTokenBundle> {
     let discovery = discover(issuer, insecure).await?;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.into_diagnostic()?;
-    let port = listener.local_addr().into_diagnostic()?.port();
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+    let listener = crate::callback::bind_callback_listener().await?;
+    let redirect_uri = callback_redirect_uri(&listener)?;
 
     let client = BasicClient::new(ClientId::new(client_id.to_string()))
         .set_auth_uri(AuthUrl::new(discovery.authorization_endpoint).into_diagnostic()?)
@@ -1033,5 +1046,123 @@ mod tests {
         let result =
             bundle_from_device_token_response(&response, "https://issuer.example", "test-client");
         assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // Browser-flow callback listener binding
+    // ---------------------------------------------------------------
+
+    use crate::callback::{CALLBACK_BIND_ADDRESS_ENV, CALLBACK_PORT_ENV};
+    use crate::test_utils::Environment;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// Bind an ephemeral loopback listener, return its (now freed) port.
+    async fn free_loopback_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("probe bind");
+        listener.local_addr().expect("probe addr").port()
+    }
+
+    /// Read the fixed port under test back from the environment (the
+    /// `Environment` harness re-enters the test in a child process with the
+    /// variables applied).
+    fn expected_fixed_port() -> u16 {
+        std::env::var(CALLBACK_PORT_ENV)
+            .expect("callback port env")
+            .parse()
+            .expect("callback port env parses")
+    }
+
+    #[tokio::test]
+    async fn browser_flow_binds_ephemeral_loopback_by_default() {
+        Environment::new()
+            .remove(CALLBACK_PORT_ENV)
+            .remove(CALLBACK_BIND_ADDRESS_ENV)
+            .run_async(async {
+                let listener = crate::callback::bind_callback_listener()
+                    .await
+                    .expect("default bind");
+                let addr = listener.local_addr().expect("local addr");
+
+                assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+                assert_ne!(addr.port(), 0);
+                let uri = callback_redirect_uri(&listener).expect("redirect uri");
+                assert_eq!(uri, format!("http://127.0.0.1:{}/callback", addr.port()));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn browser_flow_honors_fixed_port_and_wildcard_bind() {
+        let port = free_loopback_port().await;
+        Environment::new()
+            .set(CALLBACK_PORT_ENV, port.to_string())
+            .set(CALLBACK_BIND_ADDRESS_ENV, "0.0.0.0")
+            .run_async(async {
+                let expected = expected_fixed_port();
+                let listener = crate::callback::bind_callback_listener()
+                    .await
+                    .expect("fixed-port bind");
+                let addr = listener.local_addr().expect("local addr");
+
+                assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+                assert_eq!(addr.port(), expected);
+                // The redirect URI stays on 127.0.0.1 for an IPv4 wildcard
+                // bind so the identity-provider allowlist keeps matching.
+                let uri = callback_redirect_uri(&listener).expect("redirect uri");
+                assert_eq!(uri, format!("http://127.0.0.1:{expected}/callback"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn browser_flow_redirect_uri_follows_ipv6_bind() {
+        Environment::new()
+            .remove(CALLBACK_PORT_ENV)
+            .set(CALLBACK_BIND_ADDRESS_ENV, "::1")
+            .run_async(async {
+                let listener = crate::callback::bind_callback_listener()
+                    .await
+                    .expect("ipv6 bind");
+                let addr = listener.local_addr().expect("local addr");
+
+                assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+                // RFC 8252 loopback redirect with the bracketed IPv6 literal,
+                // so the browser actually reaches the ::1-bound listener.
+                let uri = callback_redirect_uri(&listener).expect("redirect uri");
+                assert_eq!(uri, format!("http://[::1]:{}/callback", addr.port()));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn browser_flow_redirect_uri_uses_ipv6_loopback_for_wildcard_v6_bind() {
+        Environment::new()
+            .remove(CALLBACK_PORT_ENV)
+            .set(CALLBACK_BIND_ADDRESS_ENV, "::")
+            .run_async(async {
+                let listener = crate::callback::bind_callback_listener()
+                    .await
+                    .expect("wildcard ipv6 bind");
+                let addr = listener.local_addr().expect("local addr");
+
+                assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+                let uri = callback_redirect_uri(&listener).expect("redirect uri");
+                assert_eq!(uri, format!("http://[::1]:{}/callback", addr.port()));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn browser_flow_rejects_invalid_callback_port() {
+        Environment::new()
+            .set(CALLBACK_PORT_ENV, "99999")
+            .run_async(async {
+                let err = crate::callback::bind_callback_listener()
+                    .await
+                    .expect_err("invalid port must fail");
+                let msg = format!("{err:#}");
+                assert!(msg.contains(CALLBACK_PORT_ENV), "message: {msg}");
+            })
+            .await;
     }
 }

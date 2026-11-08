@@ -116,6 +116,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
         let (mut app, mut proxy) = tcp_pair().await;
         deny_forward_destination(
             &mut proxy,
+            &tracing::Span::none(),
             &denial,
             peer,
             "POST",
@@ -548,7 +549,6 @@ network_policies:
                             None,
                             None,
                             None,
-                            None,
                         ))
                         .await
                         .unwrap();
@@ -576,8 +576,15 @@ network_policies:
                 let elapsed = started.elapsed();
                 let queries = crate::opa::test_opa_query_count();
                 let (allocations, allocated_bytes) = crate::test_alloc::snapshot();
-                let expected_queries = 4;
+                // One endpoint-policy query precedes the loopback-address
+                // rejection; this denied path never reaches upstream stages.
+                let expected_queries = 1;
                 assert_eq!(queries, expected_queries * iterations);
+                assert!(allocations > 0, "allocation instrumentation is inactive");
+                assert!(
+                    allocated_bytes > 0,
+                    "allocated-byte instrumentation is inactive"
+                );
                 results.insert(
                     name.to_string(),
                     serde_json::json!({

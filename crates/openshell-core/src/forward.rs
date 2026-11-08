@@ -826,50 +826,64 @@ fn lsof_listeners(port: u16) -> Option<String> {
 // SSH utility functions (shared between CLI and TUI)
 // ---------------------------------------------------------------------------
 
-/// Resolve the SSH gateway host and port for a sandbox connection.
+/// Resolve the SSH gateway scheme, host, and port for a sandbox connection.
 ///
 /// If the server-provided gateway host is a loopback address, use the host
 /// and port from the cluster endpoint instead so the client connects to the
-/// right machine. The server returns its internal bind address (e.g. 0.0.0.0:8080)
-/// which may not be reachable from outside — the cluster URL has the actual
-/// Docker-mapped or tunnel port.
+/// right machine. The server returns its internal bind address (e.g.
+/// `http://0.0.0.0:8080`) which may not be reachable from outside — the
+/// cluster URL has the actual scheme and Docker-mapped or tunnel authority.
 pub fn resolve_ssh_gateway(
+    gateway_scheme: &str,
     gateway_host: &str,
     gateway_port: u16,
     cluster_url: &str,
-) -> (String, u16) {
+) -> (String, String, u16) {
     let is_loopback = gateway_host == "127.0.0.1"
         || gateway_host == "0.0.0.0"
         || gateway_host == "localhost"
+        || gateway_host == "::"
         || gateway_host == "::1";
 
     if !is_loopback {
-        return (gateway_host.to_string(), gateway_port);
+        return (
+            gateway_scheme.to_string(),
+            gateway_host.to_string(),
+            gateway_port,
+        );
     }
 
-    // Extract host and port from the cluster URL. The cluster URL represents
-    // the externally reachable endpoint (e.g. Docker port-mapped address).
+    // Extract the scheme, host, and port from the cluster URL. The cluster URL
+    // represents the externally reachable endpoint (e.g. a TLS-terminating
+    // proxy or Docker port-mapped address).
     if let Ok(url) = url::Url::parse(cluster_url)
+        && matches!(url.scheme(), "http" | "https")
         && let Some(host) = url.host_str()
     {
+        let cluster_scheme = url.scheme().to_string();
         let cluster_port = url.port_or_known_default().unwrap_or(gateway_port);
         let cluster_is_loopback =
             host == "127.0.0.1" || host == "0.0.0.0" || host == "localhost" || host == "::1";
         if !cluster_is_loopback {
-            // Remote cluster: use the remote host but keep the cluster URL port.
-            return (host.to_string(), cluster_port);
+            // Remote cluster: use the complete externally reachable endpoint.
+            return (cluster_scheme, host.to_string(), cluster_port);
         }
         // Unspecified addresses are bind-only, and tonic cannot use an IPv6
         // literal as a TLS DNS name. In those cases, keep the cluster URL's
         // already-reachable authority. Other loopback addresses retain the
-        // gateway-reported host.
+        // gateway-reported host, but use the cluster scheme and port because
+        // those describe the externally reachable listener.
         if matches!(gateway_host, "0.0.0.0" | "::" | "::1") {
-            return (host.to_string(), cluster_port);
+            return (cluster_scheme, host.to_string(), cluster_port);
         }
-        return (gateway_host.to_string(), cluster_port);
+        return (cluster_scheme, gateway_host.to_string(), cluster_port);
     }
 
-    (gateway_host.to_string(), gateway_port)
+    (
+        gateway_scheme.to_string(),
+        gateway_host.to_string(),
+        gateway_port,
+    )
 }
 
 /// Bracket a bare IPv6 literal (e.g. `::1` → `[::1]`) so it can be embedded in
@@ -931,6 +945,27 @@ pub fn build_proxy_command(
         shell_escape(token),
         shell_escape(gateway_name),
     )
+}
+
+/// Build the `ssh` options shared by every sandbox session.
+///
+/// Every sandbox is addressed as the host `sandbox`, so a user's `ControlMaster`
+/// or `ControlPath` would reuse one sandbox's connection for another. Command
+/// line options beat `ssh_config`, so connection sharing is turned off here.
+pub fn sandbox_ssh_args(proxy_command: &str, log_level: &str) -> Vec<String> {
+    [
+        format!("ProxyCommand={proxy_command}"),
+        "StrictHostKeyChecking=no".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "GlobalKnownHostsFile=/dev/null".to_string(),
+        format!("LogLevel={log_level}"),
+        "ControlMaster=no".to_string(),
+        "ControlPath=none".to_string(),
+        "ControlPersist=no".to_string(),
+    ]
+    .into_iter()
+    .flat_map(|option| ["-o".to_string(), option])
+    .collect()
 }
 
 /// Error returned when a `CreateSshSessionResponse` fails validation.
@@ -1072,85 +1107,63 @@ pub fn build_sandbox_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        #[allow(unsafe_code)] // Tests serialize process-wide environment changes with ENV_LOCK.
-        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    #[allow(unsafe_code)] // Tests serialize process-wide environment changes with ENV_LOCK.
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
+    use crate::test_environment::Environment;
 
     #[test]
     fn resolve_ssh_gateway_keeps_non_loopback() {
-        let (host, port) = resolve_ssh_gateway("10.0.0.5", 8080, "https://spark.local");
-        assert_eq!(host, "10.0.0.5");
-        assert_eq!(port, 8080);
+        let resolved = resolve_ssh_gateway("http", "10.0.0.5", 8080, "https://spark.local");
+        assert_eq!(resolved, ("http".to_string(), "10.0.0.5".to_string(), 8080));
     }
 
     #[test]
     fn resolve_ssh_gateway_overrides_loopback_with_cluster_host() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://spark.local");
-        assert_eq!(host, "spark.local");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "127.0.0.1", 8080, "https://spark.local");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "spark.local".to_string(), 443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_overrides_zeros_with_cluster_host() {
-        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://10.0.0.5:443");
-        assert_eq!(host, "10.0.0.5");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "0.0.0.0", 8080, "https://10.0.0.5:443");
+        assert_eq!(resolved, ("https".to_string(), "10.0.0.5".to_string(), 443));
     }
 
     #[test]
     fn resolve_ssh_gateway_uses_known_default_http_port() {
-        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "http://gateway.example.test");
-        assert_eq!(host, "gateway.example.test");
-        assert_eq!(port, 80);
+        let resolved = resolve_ssh_gateway("https", "0.0.0.0", 8080, "http://gateway.example.test");
+        assert_eq!(
+            resolved,
+            ("http".to_string(), "gateway.example.test".to_string(), 80)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_overrides_localhost() {
-        let (host, port) = resolve_ssh_gateway("localhost", 8080, "https://remote-host:443");
-        assert_eq!(host, "remote-host");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "localhost", 8080, "https://remote-host:443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "remote-host".to_string(), 443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_no_override_when_cluster_is_also_loopback() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://127.0.0.1:443");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "127.0.0.1", 8080, "https://127.0.0.1:443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_preserves_loopback_tls_authority() {
-        let (host, port) = resolve_ssh_gateway("::1", 8080, "https://localhost:8443");
-        assert_eq!(host, "localhost");
-        assert_eq!(port, 8443);
+        let resolved = resolve_ssh_gateway("http", "::1", 8080, "https://localhost:8443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "localhost".to_string(), 8443)
+        );
     }
 
     #[test]
@@ -1158,16 +1171,38 @@ mod tests {
         // The gateway binds 0.0.0.0 but advertises that bind address via the
         // SSH session response. 0.0.0.0 is not a valid connect target and is
         // not in any TLS cert SAN; fall through to the cluster URL's host.
-        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://127.0.0.1:9000");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 9000);
+        let resolved = resolve_ssh_gateway("http", "0.0.0.0", 8080, "https://127.0.0.1:9000");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 9000)
+        );
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_swaps_unspecified_ipv6_for_cluster_host() {
+        let resolved = resolve_ssh_gateway("http", "::", 8080, "https://localhost:18443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "localhost".to_string(), 18443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_handles_invalid_cluster_url() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "not-a-url");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 8080);
+        let resolved = resolve_ssh_gateway("https", "127.0.0.1", 8080, "not-a-url");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_ignores_non_http_cluster_url() {
+        let resolved = resolve_ssh_gateway("https", "127.0.0.1", 8080, "ssh://remote-host:22");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 8080)
+        );
     }
 
     #[test]
@@ -1357,6 +1392,23 @@ mod tests {
             cmd,
             "/usr/local/bin/openshell ssh-proxy --gateway gw --sandbox sb-123 --workspace workspace-1 --token tok.456 --gateway-name name_1"
         );
+    }
+
+    #[test]
+    fn sandbox_ssh_args_disable_connection_sharing() {
+        let args = sandbox_ssh_args("openshell ssh-proxy", "DEBUG");
+        let options: Vec<&str> = args
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "-o");
+                pair[1].as_str()
+            })
+            .collect();
+        assert!(options.contains(&"ProxyCommand=openshell ssh-proxy"));
+        assert!(options.contains(&"LogLevel=DEBUG"));
+        for option in ["ControlMaster=no", "ControlPath=none", "ControlPersist=no"] {
+            assert!(options.contains(&option), "missing {option}");
+        }
     }
 
     /// Helper: return the concatenation of characters that appear outside
@@ -1903,16 +1955,17 @@ mod tests {
 
     #[test]
     fn stop_forward_removes_legacy_pid_file_without_signaling() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run(|| {
+                let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
+                std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+                std::fs::write(&pid_path, "12345").unwrap();
 
-        let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
-        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        std::fs::write(&pid_path, "12345").unwrap();
-
-        assert!(!stop_forward("default", "sbx-1", 80).unwrap());
-        assert!(!pid_path.exists());
+                assert!(!stop_forward("default", "sbx-1", 80).unwrap());
+                assert!(!pid_path.exists());
+            });
     }
 
     #[test]
@@ -1927,33 +1980,35 @@ mod tests {
 
     #[test]
     fn list_forwards_marks_legacy_pid_records_not_alive() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run(|| {
+                let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
+                std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+                std::fs::write(&pid_path, "12345").unwrap();
 
-        let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
-        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        std::fs::write(&pid_path, "12345").unwrap();
-
-        let forwards = list_forwards().unwrap();
-        assert_eq!(forwards.len(), 1);
-        assert_eq!(forwards[0].workspace, "default");
-        assert_eq!(forwards[0].sandbox_name, "sbx-1");
-        assert_eq!(forwards[0].port, 80);
-        assert!(!forwards[0].validated_alive);
+                let forwards = list_forwards().unwrap();
+                assert_eq!(forwards.len(), 1);
+                assert_eq!(forwards[0].workspace, "default");
+                assert_eq!(forwards[0].sandbox_name, "sbx-1");
+                assert_eq!(forwards[0].port, 80);
+                assert!(!forwards[0].validated_alive);
+            });
     }
 
     #[test]
     fn find_forward_by_port_ignores_legacy_pid_records() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run(|| {
+                let pid_path = forward_pid_path("default", "old", 80).unwrap();
+                std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+                std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
 
-        let pid_path = forward_pid_path("default", "old", 80).unwrap();
-        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
-
-        assert_eq!(find_forward_by_port(80).unwrap(), None);
+                assert_eq!(find_forward_by_port(80).unwrap(), None);
+            });
     }
 
     #[test]

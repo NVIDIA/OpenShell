@@ -18,6 +18,7 @@
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:docker
 #   OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/... mise run gateway:docker
 #   OPENSHELL_SANDBOX_RUNTIME_IMAGE=ghcr.io/... mise run gateway:docker
+#   OPENSHELL_DEV_OTLP_ENDPOINT=http://127.0.0.1:4317 mise run gateway:docker
 #
 # After the gateway is running, point the CLI at it with either:
 #   openshell --gateway docker-dev <command>
@@ -30,6 +31,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/tasks/scripts/gateway-toml.sh"
 # shellcheck source=tasks/scripts/gateway-pull-policy.sh
 source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
+# shellcheck source=tasks/scripts/build-env.sh
+source "${ROOT}/tasks/scripts/build-env.sh"
+ensure_build_nofile_limit
 PORT="${OPENSHELL_SERVER_PORT:-18080}"
 GATEWAY_NAME="${OPENSHELL_DOCKER_GATEWAY_NAME:-docker-dev}"
 STATE_DIR="${OPENSHELL_DOCKER_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-docker}"
@@ -78,21 +82,6 @@ ensure_docker_runtime_image() {
     echo "ERROR: expected ${role} image '${image}' after build" >&2
     exit 1
   fi
-}
-
-append_local_otlp_config_if_available() {
-  local config_path=$1
-  if ! port_is_in_use 4317; then
-    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
-    return
-  fi
-
-  cat >>"${config_path}" <<'EOF'
-
-[openshell.gateway.otlp]
-endpoint = "http://127.0.0.1:4317"
-EOF
-  echo "OTLP trace export enabled for http://127.0.0.1:4317."
 }
 
 register_gateway_metadata() {
@@ -146,8 +135,6 @@ ensure_docker_runtime_image \
   sandbox \
   "sandbox runtime"
 
-GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://127.0.0.1:${PORT}}"
-
 CARGO_BUILD_JOBS_ARG=()
 if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
@@ -191,11 +178,14 @@ supervisor_image = "${SUPERVISOR_IMAGE}"
 sandbox_runtime_image = "${SANDBOX_RUNTIME_IMAGE}"
 image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
 sandbox_label = "${SANDBOX_NAMESPACE}"
-grpc_endpoint = "${GRPC_ENDPOINT}"
 # Explicit supervisor-compatible default. Set RuntimeDefault or
 # Localhost/<profile> only on a Docker host with AppArmor enabled.
 app_armor_profile = "Unconfined"
 EOF
+
+if [[ -n "${OPENSHELL_GRPC_ENDPOINT:-}" ]]; then
+  printf 'grpc_endpoint = "%s"\n' "$(toml_escape "${OPENSHELL_GRPC_ENDPOINT}")" >>"${CONFIG_PATH}"
+fi
 
 # Keep the local task's proxy inputs aligned with [openshell.drivers.docker].
 # Credentials stay in the referenced root-owned file; do not echo their value.
@@ -221,7 +211,7 @@ if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET+x}" ]]; then
   printf 'provider_spiffe_workload_api_socket = "%s"\n' "$(toml_escape "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET}")" >>"${CONFIG_PATH}"
 fi
 
-append_local_otlp_config_if_available "${CONFIG_PATH}"
+append_dev_otlp_config "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"

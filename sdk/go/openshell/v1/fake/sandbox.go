@@ -237,8 +237,26 @@ func copySandboxStatus(s types.SandboxStatus) types.SandboxStatus {
 	s.EndpointStatuses = slices.Clone(s.EndpointStatuses)
 	for i := range s.EndpointStatuses {
 		s.EndpointStatuses[i].Ports = slices.Clone(s.EndpointStatuses[i].Ports)
+		s.EndpointStatuses[i].LastFailure = copyEndpointFailure(s.EndpointStatuses[i].LastFailure)
+	}
+	if s.LastTokenGrantFailure != nil {
+		observation := *s.LastTokenGrantFailure
+		observation.Failure = copyEndpointFailure(observation.Failure)
+		s.LastTokenGrantFailure = &observation
 	}
 	return s
+}
+
+func copyEndpointFailure(f *types.EndpointFailure) *types.EndpointFailure {
+	if f == nil {
+		return nil
+	}
+	cp := *f
+	if f.UpstreamHTTPStatus != nil {
+		status := *f.UpstreamHTTPStatus
+		cp.UpstreamHTTPStatus = &status
+	}
+	return &cp
 }
 
 // copyStringMap returns a shallow copy of a string-to-string map.
@@ -274,6 +292,7 @@ type fakeSandboxClient struct {
 
 var _ v1.SandboxInterface = (*fakeSandboxClient)(nil)
 var _ v1.SandboxTemplateCreateInterface = (*fakeSandboxClient)(nil)
+var _ v1.SandboxSuspendResumeInterface = (*fakeSandboxClient)(nil)
 
 // newFakeSandboxClient creates a new fakeSandboxClient.
 func newFakeSandboxClient(
@@ -291,7 +310,7 @@ func newFakeSandboxClient(
 }
 
 // Create creates a new sandbox with Provisioning phase.
-func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, spec *types.SandboxSpec, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, spec *types.SandboxSpec, opts ...types.CreateOption) (*types.Sandbox, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
@@ -300,17 +319,14 @@ func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, sp
 		spec = &types.SandboxSpec{}
 	}
 
-	var annotations map[string]string
-	if len(opts) > 0 {
-		annotations = copyStringMap(opts[0].Annotations)
-	}
+	cfg := types.ApplyCreateOptions(opts)
 
 	sb := &types.Sandbox{
 		Name:            name,
 		Workspace:       workspace,
 		CreatedAt:       time.Now(),
-		Labels:          copyStringMap(labels),
-		Annotations:     annotations,
+		Labels:          copyStringMap(cfg.Labels()),
+		Annotations:     copyStringMap(cfg.Annotations()),
 		ResourceVersion: 1,
 		Spec:            copySandboxSpec(*spec),
 		Status: types.SandboxStatus{
@@ -332,7 +348,7 @@ func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, sp
 }
 
 // CreateFromTemplate creates a new sandbox from a named template with Provisioning phase.
-func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, name, templateName string, spec *types.SandboxSpec, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, name, templateName string, spec *types.SandboxSpec, opts ...types.CreateOption) (*types.Sandbox, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
@@ -350,10 +366,7 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 		spec = &types.SandboxSpec{}
 	}
 
-	var annotations map[string]string
-	if len(opts) > 0 {
-		annotations = copyStringMap(opts[0].Annotations)
-	}
+	cfg := types.ApplyCreateOptions(opts)
 
 	resolvedSpec := sandboxSpecFromWorkloadTemplate(template)
 	resolvedSpec.Providers = copyStringSlice(spec.Providers)
@@ -365,8 +378,8 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 		Name:            name,
 		Workspace:       workspace,
 		CreatedAt:       time.Now(),
-		Labels:          copyStringMap(labels),
-		Annotations:     annotations,
+		Labels:          copyStringMap(cfg.Labels()),
+		Annotations:     copyStringMap(cfg.Annotations()),
 		ResourceVersion: 1,
 		Spec:            resolvedSpec,
 		CreatedFromWorkloadTemplate: &types.SandboxWorkloadTemplateProvenance{
@@ -512,6 +525,78 @@ func (c *fakeSandboxClient) Start(_ context.Context, workspace, name string) (*t
 	}
 
 	sb.Status.Phase = types.SandboxReady
+	sb.ResourceVersion++
+
+	updated, err := c.store.Update(workspace, sb)
+	if err != nil {
+		return nil, err
+	}
+
+	c.broadcaster.Broadcast(types.Event[*types.Sandbox]{
+		Type:   types.EventModified,
+		Object: copySandbox(updated),
+	}, name)
+
+	return updated, nil
+}
+
+// Suspend transitions a Ready sandbox to the Suspended phase.
+func (c *fakeSandboxClient) Suspend(_ context.Context, workspace, name string) (*types.Sandbox, error) {
+	return c.transitionFrom(workspace, name, types.SandboxSuspended, types.SandboxReady, types.SandboxSuspending, types.SandboxSuspended)
+}
+
+// Resume transitions a Suspended sandbox back to the Ready phase.
+func (c *fakeSandboxClient) Resume(_ context.Context, workspace, name string, _ ...v1.ResumeOptions) (*types.Sandbox, error) {
+	return c.transitionFrom(workspace, name, types.SandboxReady, types.SandboxSuspended)
+}
+
+// WaitSuspended returns the sandbox once it is in the Suspended phase. In the
+// fake implementation Suspend completes synchronously, so any other phase is
+// reported as an error.
+func (c *fakeSandboxClient) WaitSuspended(ctx context.Context, workspace, name string, _ ...v1.WaitOptions) (*types.Sandbox, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	if err := ctx.Err(); err != nil {
+		code := types.ErrorInternal
+		switch err {
+		case context.DeadlineExceeded:
+			code = types.ErrorDeadlineExceeded
+		case context.Canceled:
+			code = types.ErrorCancelled
+		}
+		return nil, &types.StatusError{Code: code, Message: err.Error(), Cause: err}
+	}
+
+	sb, err := c.store.Get(workspace, name)
+	if err != nil {
+		return nil, err
+	}
+	if sb.Status.Phase != types.SandboxSuspended {
+		return nil, &types.StatusError{Code: types.ErrorInternal, Message: fmt.Sprintf("sandbox %q is %s, not Suspended", name, sb.Status.Phase)}
+	}
+	return sb, nil
+}
+
+// transitionFrom moves a sandbox to target when its current phase is one of
+// allowed, mirroring the gateway's FAILED_PRECONDITION for other phases.
+func (c *fakeSandboxClient) transitionFrom(workspace, name string, target types.SandboxPhase, allowed ...types.SandboxPhase) (*types.Sandbox, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+
+	sb, err := c.store.Get(workspace, name)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Contains(allowed, sb.Status.Phase) {
+		return nil, &types.StatusError{Code: types.ErrorConflict, Message: fmt.Sprintf("sandbox %q cannot move from %s to %s", name, sb.Status.Phase, target)}
+	}
+	if sb.Status.Phase == target {
+		return sb, nil
+	}
+
+	sb.Status.Phase = target
 	sb.ResourceVersion++
 
 	updated, err := c.store.Update(workspace, sb)

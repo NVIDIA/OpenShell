@@ -99,10 +99,12 @@ struct AuthorizationBarrier {
     resume: tokio::sync::Notify,
 }
 
-#[tonic::async_trait]
 pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
     type Output: Send + 'static;
     const METHOD: &'static str;
+    /// Preserve legacy replay keys while allowing independent services to use
+    /// fully qualified identities for newly introduced methods.
+    const REPLAY_METHOD: &'static str = Self::METHOD;
     const PROTECTED: bool = false;
     // Streaming producers, not returned stream handles, confirm completion.
     const DEFERRED: bool = false;
@@ -115,13 +117,20 @@ pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
     fn canonical_message(&self) -> Result<DynamicMessage, Status> {
         decode_request_message(&format!("{}Request", Self::METHOD), self)
     }
-    async fn authorize(&self, state: &ServerState, principal: &Principal) -> Result<Scope, Status>;
-    async fn execute(
+    fn authorize(
+        &self,
+        state: &ServerState,
+        principal: &Principal,
+    ) -> impl Future<Output = Result<Scope, Status>> + Send;
+    fn execute(
         state: &Arc<ServerState>,
         request: Request<Self>,
-    ) -> Result<Response<Self::Output>, Status>;
+    ) -> impl Future<Output = Result<Response<Self::Output>, Status>> + Send;
     fn capture(response: &Response<Self::Output>) -> Result<Success, Status>;
-    async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status>;
+    fn restore(
+        store: &Store,
+        success: Success,
+    ) -> impl Future<Output = Result<Self::Output, Status>> + Send;
 }
 
 /// Empty IDs preserve the existing RPC contract, including cancellation.
@@ -150,8 +159,10 @@ pub(super) async fn run<M: Mutation>(
     }
     let request_id = validate_request_id(request.get_ref().request_id())?;
     let principal = super::extract_principal(&request)?;
-    let Principal::User(user) = &principal else {
-        return Err(Status::permission_denied(
+    let Some(identity) = principal.user_identity() else {
+        return Err(crate::auth::audit::deny(
+            &principal,
+            crate::auth::audit::AuthzDenial::MethodNotPermitted,
             "request admission requires a user principal",
         ));
     };
@@ -183,7 +194,7 @@ pub(super) async fn run<M: Mutation>(
     } else {
         (fingerprint(original)?, None)
     };
-    let (provider, issuer) = match user.identity.provider {
+    let (provider, issuer) = match identity.provider {
         IdentityProvider::Oidc => (
             "oidc",
             state
@@ -192,21 +203,24 @@ pub(super) async fn run<M: Mutation>(
                 .as_ref()
                 .map_or("", |config| config.issuer.as_str()),
         ),
-        IdentityProvider::Mtls => ("mtls", ""),
+        IdentityProvider::Mtls => (
+            if matches!(principal, Principal::Operator(_)) {
+                "mtls-operator"
+            } else {
+                "mtls"
+            },
+            "",
+        ),
         IdentityProvider::CloudflareAccess => ("cloudflare_access", ""),
         IdentityProvider::LocalDev => ("local_dev", ""),
     };
-    let caller = hash_json(&serde_json::json!([
-        provider,
-        issuer,
-        user.identity.subject,
-    ]))?;
+    let caller = hash_json(&serde_json::json!([provider, issuer, identity.subject,]))?;
     // Not a valid user workspace name; ordinary workspace cleanup cannot touch
     // these records. The bucket supports an atomic per-caller storage quota.
     let bucket = format!("_mutation/{caller}");
     let key = hash_json(&serde_json::json!([
         caller,
-        M::METHOD,
+        M::REPLAY_METHOD,
         scope.name,
         request_id
     ]))?;
@@ -218,7 +232,7 @@ pub(super) async fn run<M: Mutation>(
     let state = Arc::clone(state);
     // Spawn BEFORE attempting MustCreate. Cancellation during the database write
     // must not drop the owner between durable admission and execution.
-    tokio::spawn(async move {
+    tokio::spawn(crate::auth::audit::in_current_request(async move {
         let _permit = permit;
         execute_owned(
             &state,
@@ -230,7 +244,7 @@ pub(super) async fn run<M: Mutation>(
             scope,
         )
         .await
-    })
+    }))
     .await
     .map_err(|_| uncertain())?
 }
@@ -633,7 +647,7 @@ async fn member_scope(
     )
     .await?;
     if let Some(role) = role {
-        workspace::authorize_member_role(role, authz.grant)?;
+        workspace::authorize_member_role(role, authz.grant, principal)?;
     }
     named_scope(state, &authz.workspace).await
 }
@@ -670,7 +684,6 @@ async fn restore_resource<
 
 macro_rules! resource_mutation {
     ($req:ty, $resp:ident, $method:literal, $handler:path, $field:ident, $auth:expr) => {
-        #[tonic::async_trait]
         impl Mutation for $req {
             type Output = $resp;
             const METHOD: &'static str = $method;
@@ -704,7 +717,6 @@ macro_rules! resource_mutation {
 
 macro_rules! deletion_mutation {
     ($req:ty, $resp:ident, $method:literal, $handler:path, $auth:expr) => {
-        #[tonic::async_trait]
         impl Mutation for $req {
             type Output = $resp;
             const METHOD: &'static str = $method;

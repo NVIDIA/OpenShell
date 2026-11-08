@@ -11,6 +11,8 @@ use openshell_core::policy::SandboxPolicy;
 use std::path::PathBuf;
 use std::sync::Once;
 
+pub use landlock::require_abi as require_landlock_abi;
+
 /// Opaque handle to a prepared-but-not-yet-enforced sandbox.
 /// Holds the Landlock ruleset with `PathFds` opened before child exec.
 pub struct PreparedSandbox {
@@ -18,10 +20,11 @@ pub struct PreparedSandbox {
     policy: SandboxPolicy,
 }
 
-/// Phase 1: Prepare sandbox restrictions **as root** (before `drop_privileges`).
+/// Phase 1: Prepare sandbox restrictions with strict path opening.
 ///
-/// Opens Landlock `PathFds` while the process still has root privileges,
-/// ensuring paths like mode-700 directories are accessible.
+/// Opens configured paths as the calling identity and handles failures according
+/// to the policy's Landlock compatibility mode.
+/// The capability-free launch path uses [`prepare_capability_free`] instead.
 pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<PreparedSandbox> {
     let landlock = landlock::prepare(policy, workdir)?;
     Ok(PreparedSandbox {
@@ -66,7 +69,7 @@ pub fn prepare_capability_free(
     })
 }
 
-/// Phase 2: Enforce prepared sandbox restrictions (after `drop_privileges`).
+/// Phase 2: Enforce prepared sandbox restrictions in the child before exec.
 ///
 /// Calls `restrict_self()` for Landlock and applies seccomp filters.
 /// Neither operation requires root privileges.
@@ -85,7 +88,7 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
 /// installation, so this order is mandatory for capability-free children.
 pub fn enforce_capability_free(
     prepared: PreparedSandbox,
-    child_hardening: &mut openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    child_hardening: &mut crate::linux::child_seccomp::ChildHardeningProgram,
 ) -> Result<()> {
     for ruleset in prepared.landlock {
         landlock::enforce(ruleset)?;

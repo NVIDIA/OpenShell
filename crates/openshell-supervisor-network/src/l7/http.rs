@@ -9,6 +9,88 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 const READ_BUF_SIZE: usize = 8192;
 
+pub fn parse_chunk_size_line(line: &[u8]) -> Result<usize> {
+    let line =
+        std::str::from_utf8(line).map_err(|_| miette!("Invalid UTF-8 in HTTP chunk-size line"))?;
+    if line
+        .bytes()
+        .any(|byte| matches!(byte, b'\r' | b'\n' | 0x7f) || (byte < b' ' && byte != b'\t'))
+    {
+        return Err(miette!(
+            "Invalid HTTP chunk-size line: contains a control byte"
+        ));
+    }
+
+    // RFC 9112 permits bad whitespace immediately before a chunk-extension
+    // semicolon. Normalize only that suffix: leading whitespace, whitespace
+    // inside the size, and trailing whitespace without an extension remain
+    // invalid at this trust boundary.
+    let size_token = line
+        .split_once(';')
+        .map_or(line, |(size, _)| size.trim_end_matches([' ', '\t']));
+    if size_token.is_empty() || !size_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(miette!("Invalid HTTP chunk size token"));
+    }
+
+    usize::from_str_radix(size_token, 16)
+        .map_err(|_| miette!("HTTP chunk size exceeds platform limit"))
+}
+
+pub fn validate_chunk_trailer_line(line: &[u8]) -> Result<()> {
+    if line.is_empty() {
+        return Ok(());
+    }
+    if line
+        .iter()
+        .any(|byte| matches!(*byte, b'\r' | b'\n' | 0x7f))
+    {
+        return Err(miette!(
+            "Invalid HTTP chunk trailer: contains a control byte"
+        ));
+    }
+
+    let colon = line
+        .iter()
+        .position(|byte| *byte == b':')
+        .ok_or_else(|| miette!("Invalid HTTP chunk trailer: missing colon"))?;
+    let (name, value) = line.split_at(colon);
+    if name.is_empty() || !name.iter().all(|byte| is_http_token_byte(*byte)) {
+        return Err(miette!("Invalid HTTP chunk trailer field name"));
+    }
+    if !value[1..]
+        .iter()
+        .all(|byte| is_http_field_value_byte(*byte))
+    {
+        return Err(miette!("Invalid HTTP chunk trailer field value"));
+    }
+    Ok(())
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_http_field_value_byte(byte: u8) -> bool {
+    byte == b'\t' || (b' '..=b'~').contains(&byte) || byte >= 0x80
+}
+
 pub async fn read_body_for_inspection<C: AsyncRead + Unpin>(
     client: &mut C,
     request: &mut L7Request,
@@ -113,17 +195,7 @@ async fn read_chunked_body_for_inspection<C: AsyncRead + Unpin>(
 
     loop {
         let size_line_end = read_chunked_line(client, &mut raw, pos, max_body_bytes).await?;
-        let size_line = std::str::from_utf8(&raw[pos..size_line_end])
-            .into_diagnostic()
-            .map_err(|_| miette!("Invalid UTF-8 in HTTP chunk-size line"))?;
-        let size_token = size_line
-            .split(';')
-            .next()
-            .map(str::trim)
-            .unwrap_or_default();
-        let chunk_size = usize::from_str_radix(size_token, 16)
-            .into_diagnostic()
-            .map_err(|_| miette!("Invalid HTTP chunk size token: {size_token:?}"))?;
+        let chunk_size = parse_chunk_size_line(&raw[pos..size_line_end])?;
         pos = size_line_end + 2;
 
         if decoded.len().saturating_add(chunk_size) > max_body_bytes {
@@ -136,6 +208,7 @@ async fn read_chunked_body_for_inspection<C: AsyncRead + Unpin>(
             loop {
                 let trailer_end = read_chunked_line(client, &mut raw, pos, max_body_bytes).await?;
                 let trailer_line = &raw[pos..trailer_end];
+                validate_chunk_trailer_line(trailer_line)?;
                 pos = trailer_end + 2;
                 if trailer_line.is_empty() {
                     request.raw_header.truncate(header_end);
@@ -230,6 +303,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chunk_framing_helpers_reject_ambiguous_lines() {
+        assert_eq!(parse_chunk_size_line(b"a;ext=value").unwrap(), 10);
+        for line in [
+            b"".as_slice(),
+            b"+0",
+            b"+0 ;ext=value",
+            b" 0",
+            b" 0;ext=value",
+            b"\t0;ext=value",
+            b"0 ",
+            b"0\t",
+            b"0 \t1;ext=value",
+            b"0\n",
+            b"0\rX",
+            b"0;ext=bad\nvalue",
+        ] {
+            assert!(parse_chunk_size_line(line).is_err(), "accepted {line:?}");
+        }
+
+        for line in [
+            b"Malformed-Trailer".as_slice(),
+            b"Bad Name: value",
+            b"X-Test: value\nGET /hidden",
+            b"X-Test: value\0",
+        ] {
+            assert!(
+                validate_chunk_trailer_line(line).is_err(),
+                "accepted {line:?}"
+            );
+        }
+        validate_chunk_trailer_line(b"").unwrap();
+        validate_chunk_trailer_line(b"X-Test: value").unwrap();
+    }
+
+    #[test]
+    fn chunk_size_allows_bws_before_extension() {
+        for line in [b"a ;ext=value".as_slice(), b"a\t;ext=value"] {
+            assert_eq!(parse_chunk_size_line(line).unwrap(), 10, "line {line:?}");
+        }
+    }
+
     #[tokio::test]
     async fn chunked_inspection_preserves_pipelined_request() {
         let next = b"DELETE /next HTTP/1.1\r\nHost: example.test\r\n\r\n";
@@ -300,9 +415,16 @@ mod tests {
         for (encoded, expected) in [
             (b"z\r\n".as_slice(), "Invalid HTTP chunk size token"),
             (b"\xff\r\n", "Invalid UTF-8 in HTTP chunk-size line"),
+            (b"0\n\r\n\r\n", "chunk-size line"),
+            (b"+0\r\n\r\n", "chunk size token"),
             (b"1\r\nx!!", "HTTP chunk payload missing terminating CRLF"),
             (b"1\r", "HTTP chunked body ended before terminator"),
             (b"5\r\nhe", "HTTP chunked body ended before terminator"),
+            (
+                b"0\r\nA: b\n\r\nGET /hidden HTTP/1.1\r\nHost: hidden.example\r\n\r\n",
+                "chunk trailer",
+            ),
+            (b"0\r\nMalformed-Trailer\r\n\r\n", "chunk trailer"),
             (
                 b"0\r\nX-Trailer: unfinished",
                 "HTTP chunked body ended before terminator",

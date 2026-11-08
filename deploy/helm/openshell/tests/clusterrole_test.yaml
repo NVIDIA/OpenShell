@@ -79,6 +79,21 @@ tests:
             resources: ["networkpolicies"]
             verbs: ["get", "create", "patch", "update"]
 
+  - it: gives schema-v2 managed SSH ingress precedence over the legacy alias
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      networkPolicy.enabled: true
+      gatewayConfig:
+        openshell.drivers.kubernetes.managed_ssh_ingress:
+          enabled: false
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["get", "create", "patch", "update"]
+
   - it: omits credential Secret access in managed mode
     set:
       server.drivers.kubernetes.workspaceMode: managed
@@ -126,7 +141,9 @@ tests:
 
   - it: grants managed sandbox-runtime companion permissions
     set:
-      server.drivers.kubernetes.workspaceMode: managed
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: managed
     asserts:
       - contains:
           path: rules
@@ -149,7 +166,9 @@ tests:
 
   - it: grants operator sandbox-runtime companion permissions
     set:
-      server.drivers.kubernetes.workspaceMode: operator
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: operator
     asserts:
       - contains:
           path: rules

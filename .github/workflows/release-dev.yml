@@ -22,7 +22,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -102,7 +102,7 @@ jobs:
       checkout-ref: ${{ github.sha }}
 
   prepare-integration:
-    needs: [build-binaries, build-deb, build-images]
+    needs: [build-binaries, build-deb, build-images, build-rpm]
     permissions:
       actions: read
       contents: read
@@ -110,6 +110,7 @@ jobs:
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
       deb-artifact-name: deb-linux-amd64
+      rpm-artifact-name: rpm-linux-x86_64
 
   conformance-integration:
     needs: prepare-integration
@@ -117,11 +118,13 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: ./.github/workflows/e2e-suites.yml
     with:
-      category: conformance
+      family: conformance
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   feature-specific-integration:
     needs: prepare-integration
@@ -129,16 +132,13 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: ./.github/workflows/e2e-suites.yml
     with:
-      category: feature-specific
+      family: features
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-      test-matrix: >-
-        [
-          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"provider-refresh"}
-        ]
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   docker-e2e:
     needs: [build-binaries, build-images]
@@ -151,7 +151,6 @@ jobs:
       image-tag: ${{ github.sha }}
       checkout-ref: ${{ github.sha }}
       runner: linux-arm64-cpu8
-      conformance-artifact-prefix: openshell-conformance
 
   vm-e2e:
     needs: [build-binaries, build-vm-driver]
@@ -162,7 +161,6 @@ jobs:
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
       checkout-ref: ${{ github.sha }}
-      conformance-artifact-prefix: openshell-conformance
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
@@ -193,7 +191,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -236,15 +234,11 @@ jobs:
       checkout-ref: ${{ github.sha }}
 
   build-snap:
-    name: Build Snap
+    name: Build snap
     needs: [compute-versions, build-binaries]
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ github.sha }}
-      upload-channel: latest/edge
-      github-environment: latest/edge
-    secrets:
-      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   build-rpm:
     name: Build RPM Packages
@@ -255,6 +249,19 @@ jobs:
       rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
       rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+
+  publish-snap:
+    name: Publish snap
+    needs: build-snap
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/snap-publish.yml
+    with:
+      upload-channel: latest/edge
+      github-environment: latest/edge
+    secrets:
+      SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   # ---------------------------------------------------------------------------
   # Create / update the dev GitHub Release with CLI, gateway, driver, and wheels
@@ -279,8 +286,6 @@ jobs:
       id-token: write
       attestations: write
       artifact-metadata: write
-    outputs:
-      wheel_filenames: ${{ steps.wheel_filenames.outputs.wheel_filenames }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -384,8 +389,7 @@ jobs:
 
           ls -la release/
 
-      - name: Capture wheel filenames
-        id: wheel_filenames
+      - name: Verify wheel count
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -394,8 +398,6 @@ jobs:
             echo "expected exactly one Python wheel, found ${#wheels[@]}" >&2
             exit 1
           fi
-          wheel_filename=$(basename "${wheels[0]}")
-          echo "wheel_filenames=${wheel_filename}" >> "$GITHUB_OUTPUT"
 
       - name: Generate checksums
         run: |
@@ -436,7 +438,7 @@ jobs:
           cat release/openshell.rb
 
       - name: Attest VM driver artifacts
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
@@ -567,7 +569,7 @@ jobs:
 
   publish-fern-docs:
     name: Sync and Publish Fern Docs
-    needs: [compute-versions, release-dev, release-helm, trigger-wheel-publish]
+    needs: [compute-versions, release-dev, release-helm]
     permissions:
       contents: write
     uses: ./.github/workflows/sync-docs.yml
@@ -580,40 +582,3 @@ jobs:
       publish: true
     secrets:
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
-
-  trigger-wheel-publish:
-    name: Trigger Wheel Publish
-    needs: [compute-versions, release-dev]
-    runs-on: [self-hosted, nv]
-    timeout-minutes: 10
-    steps:
-      - name: Trigger GitLab CI
-        env:
-          GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
-          GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
-          RELEASE_VERSION: ${{ needs.compute-versions.outputs.python_version }}
-          WHEEL_FILENAMES: ${{ needs.release-dev.outputs.wheel_filenames }}
-        run: |
-          set -euo pipefail
-          if [ -z "${WHEEL_FILENAMES}" ]; then
-            echo "No wheel filenames provided by build job" >&2
-            exit 1
-          fi
-
-          response=$(curl -X POST \
-            --fail \
-            --silent \
-            --show-error \
-            -F "token=${GITLAB_CI_TRIGGER_TOKEN}" \
-            -F "ref=main" \
-            -F "variables[PIPELINE_ACTION]=publish_wheels" \
-            -F "variables[GITHUB_REPOSITORY]=${GITHUB_REPOSITORY}" \
-            -F "variables[COMMIT_SHA]=${GITHUB_SHA}" \
-            -F "variables[RELEASE_TAG]=dev" \
-            -F "variables[RELEASE_VERSION]=${RELEASE_VERSION}" \
-            -F "variables[RELEASE_KIND]=dev" \
-            -F "variables[WHEEL_FILENAMES]=${WHEEL_FILENAMES}" \
-            "${GITLAB_CI_TRIGGER_URL}")
-          pipeline_id=$(printf '%s' "$response" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-          pipeline_status=$(printf '%s' "$response" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
-          echo "Triggered GitLab pipeline ${pipeline_id:-unknown} with status=${pipeline_status:-unknown}"

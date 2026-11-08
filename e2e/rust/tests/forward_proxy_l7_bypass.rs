@@ -19,6 +19,13 @@ async fn start_test_server(alias: &str) -> Result<ContainerHttpServer, String> {
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.headers.get("Upgrade"):
+            self.send_response(101)
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+            self.end_headers()
+            return
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b'{"ok":true}')
@@ -109,24 +116,15 @@ async fn forward_proxy_allows_l7_permitted_request() {
 
     let script = format!(
         r#"
-import urllib.request, urllib.error, json, sys, time
+import urllib.request, urllib.error, json, sys
 url = "http://{host}:{port}/allowed"
-# Retry expected-allowed requests across the startup symlink-resolution reload,
-# which can transiently surface as a stale-policy 403 in the forward proxy.
-last = {{"status": -1, "error": "not attempted"}}
-for attempt in range(6):
-    try:
-        resp = urllib.request.urlopen(url, timeout=15)
-        last = {{"status": resp.status, "error": None, "attempt": attempt + 1}}
-        break
-    except urllib.error.HTTPError as e:
-        last = {{"status": e.code, "error": str(e), "attempt": attempt + 1}}
-        if e.code != 403:
-            break
-        time.sleep(0.3)
-    except Exception as e:
-        last = {{"status": -1, "error": str(e), "attempt": attempt + 1}}
-        break
+try:
+    resp = urllib.request.urlopen(url, timeout=15)
+    last = {{"status": resp.status, "error": None}}
+except urllib.error.HTTPError as e:
+    last = {{"status": e.code, "error": str(e)}}
+except Exception as e:
+    last = {{"status": -1, "error": str(e)}}
 print(json.dumps(last))
 "#,
         host = server.host,
@@ -186,4 +184,56 @@ except Exception as e:
         "expected 403 for L7-denied POST, got:\n{}",
         guard.create_output
     );
+}
+
+/// A permitted GET cannot switch a REST endpoint into an uninspected tunnel.
+#[tokio::test]
+async fn rest_upgrade_is_refused_in_enforce_and_audit_modes() {
+    let server = start_test_server("rest-upgrade.openshell.test")
+        .await
+        .expect("start backend");
+    for enforcement in ["enforce", "audit"] {
+        let source = write_policy_with_l7_rules(&server.host, server.port).unwrap();
+        let policy = std::fs::read_to_string(source.path()).unwrap().replace(
+            "enforcement: enforce",
+            &format!("enforcement: {enforcement}"),
+        );
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(policy.as_bytes()).unwrap();
+        file.flush().unwrap();
+        let policy_path = file.path().to_str().unwrap();
+        let script = format!(
+            r#"
+import socket
+for target in ["/allowed", "http://{host}:{port}/allowed"]:
+    s = socket.create_connection(("{host}", {port}), timeout=15)
+    request = ("GET " + target + " HTTP/1.1\r\nHost: {host}:{port}\r\n"
+               "Connection: Upgrade\r\nUpgrade: websocket\r\n"
+               "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    s.sendall(request.encode())
+    response = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+    s.close()
+    assert response.startswith(b"HTTP/1.1 403"), response
+    assert b"unsupported_l7_protocol" in response, response
+    assert b"REST endpoints" in response, response
+print("REST_UPGRADE_REFUSED")
+"#,
+            host = server.host,
+            port = server.port
+        );
+        let guard =
+            SandboxGuard::create(&["--policy", policy_path, "--", "python3", "-c", &script])
+                .await
+                .expect("sandbox create");
+        assert!(
+            guard.create_output.contains("REST_UPGRADE_REFUSED"),
+            "{enforcement}: {}",
+            guard.create_output
+        );
+    }
 }

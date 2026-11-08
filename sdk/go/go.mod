@@ -1,3 +1,4 @@
+// Deprecated: this module moved to github.com/ai-openshell/sdk-go.
 module github.com/NVIDIA/OpenShell/sdk/go
 
 go 1.25.13

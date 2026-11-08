@@ -9,7 +9,9 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
+  {{- if ne (include "openshell.autoscalingEnabled" .) "true" }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "openshell.selectorLabels" . | nindent 6 }}

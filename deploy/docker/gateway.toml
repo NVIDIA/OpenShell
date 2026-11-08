@@ -14,12 +14,8 @@
 #   clearing the CMD first.
 #
 # grpc_endpoint note:
-#   host.docker.internal is automatically resolvable from containers on
-#   Docker Desktop (Windows / macOS).  On Linux, add extra_hosts to the
-#   gateway service:
-#     extra_hosts:
-#       - "host.docker.internal:host-gateway"
-#       - "host.openshell.internal:host-gateway"
+#   Omitted on purpose.  The supervisor uses host networking and reaches the
+#   published port at http://127.0.0.1:8080 (keep OPENSHELL_PORT at 8080).
 
 [openshell]
 version = 2
@@ -33,6 +29,18 @@ log_level           = "info"
 compute_driver      = "docker"
 disable_tls         = true
 
+# No TLS and loopback only: user calls are unauthenticated.
+# Supervisors still authenticate with the JWT keys below.
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+
+# Written by the compose init service.
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/var/lib/openshell/tls/jwt/signing.pem"
+public_key_path  = "/var/lib/openshell/tls/jwt/public.pem"
+kid_path         = "/var/lib/openshell/tls/jwt/kid"
+gateway_id       = "openshell-docker"
+
 [openshell.drivers.docker]
 # Default image pulled for `openshell sandbox create` without --from.
 default_image     = "nvcr.io/nvidia/base/ubuntu:24.04"
@@ -44,12 +52,6 @@ supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
 image_pull_policy = "if_not_present"
 # Value assigned to the openshell.sandbox_namespace label on sandbox containers.
 sandbox_label     = "openshell"
-# Address sandbox containers use to call back to the gateway.
-# The Docker driver replaces the host with host.openshell.internal and the
-# port with the gateway's own bind port (8080).  Only the scheme survives.
-# The gateway must be published on port 8080 on the Docker host so that
-# host.openshell.internal:8080 resolves to the gateway container.
-grpc_endpoint     = "http://host.openshell.internal:8080"
 # Explicit supervisor-compatible Docker default. Set RuntimeDefault or
 # Localhost/<profile> only when the daemon host has AppArmor available.
 app_armor_profile = "Unconfined"

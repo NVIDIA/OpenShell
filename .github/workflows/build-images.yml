@@ -14,6 +14,11 @@ on:
         required: false
         type: string
         default: ""
+      push-images:
+        description: Push images to GHCR during the build
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -39,6 +44,7 @@ jobs:
           binary: ${{ env.BINARY }}
           target-suffix: ${{ env.TARGET_SUFFIX }}
           image-tag: ${{ inputs.image-tag || github.sha }}
+          push: ${{ inputs.push-images }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
   sandbox:

@@ -107,6 +107,23 @@ async fn provider_file_open_update_and_detach() -> Result<(), String> {
     if !before.contains("project = \"production\"") {
         return Err(format!("initial provider file content missing:\n{before}"));
     }
+    let permissions = sandbox
+        .exec(&[
+            "sh",
+            "-c",
+            &format!(
+                "set -eu; exec 3<{path}; test \"$(stat -Lc %a /proc/self/fd/3)\" = 600; \
+                 test \"$(stat -Lc %F /proc/self/fd/3)\" = 'regular file'; \
+                 if (printf x >&3) 2>/dev/null; then exit 1; fi; \
+                 echo provider-file-permissions-ok"
+            ),
+        ])
+        .await?;
+    if !permissions.contains("provider-file-permissions-ok") {
+        return Err(format!(
+            "provider file permission assertion did not complete:\n{permissions}"
+        ));
+    }
 
     cli_ok(&[
         "provider",

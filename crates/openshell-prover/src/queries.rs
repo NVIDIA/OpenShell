@@ -34,7 +34,6 @@
 //! one `credential_reach_expansion` finding rather than that plus N
 //! capability findings. See `crates/openshell-server/src/grpc/policy.rs`.
 
-use std::collections::HashSet;
 use std::net::IpAddr;
 
 use z3::SatResult;
@@ -73,7 +72,10 @@ fn is_link_local_or_metadata_host(host: &str) -> bool {
 /// We deliberately do NOT gate on `filesystem_policy.readable_paths()`
 /// being non-empty: the credential itself is the lever for the tracked
 /// risks, not anything in `/etc/`.
-pub fn check_credential_safety(model: &ReachabilityModel) -> Vec<Finding> {
+///
+/// Returns an error if the base model is invalid or a query is inconclusive.
+pub fn check_credential_safety(model: &ReachabilityModel) -> miette::Result<Vec<Finding>> {
+    model.validate()?;
     let mut reach_paths: Vec<ExfilPath> = Vec::new();
     let mut capability_paths: Vec<ExfilPath> = Vec::new();
     let mut bypass_paths: Vec<ExfilPath> = Vec::new();
@@ -87,8 +89,10 @@ pub fn check_credential_safety(model: &ReachabilityModel) -> Vec<Finding> {
 
         for eid in &model.endpoints {
             let expr = model.can_exfil_via_endpoint(bpath, eid);
-            if model.check_sat(&expr) != SatResult::Sat {
-                continue;
+            match model.check_sat(&expr) {
+                SatResult::Sat => {}
+                SatResult::Unsat => continue,
+                SatResult::Unknown => miette::bail!("reachability query inconclusive"),
             }
 
             let host_is_link_local = is_link_local_or_metadata_host(&eid.host);
@@ -157,12 +161,9 @@ pub fn check_credential_safety(model: &ReachabilityModel) -> Vec<Finding> {
 
             // One capability_expansion path per allowed method on this
             // (binary, host:port) under this specific rule.
-            let methods = endpoint_allowed_methods_in_rule(
-                &model.policy,
-                &eid.policy_name,
-                &eid.host,
-                eid.port,
-            );
+            let methods = model.policy.network_policies[&eid.policy_name].endpoints
+                [eid.endpoint_index]
+                .allowed_methods();
             for method in methods {
                 capability_paths.push(ExfilPath {
                     binary: bpath.clone(),
@@ -243,7 +244,7 @@ pub fn check_credential_safety(model: &ReachabilityModel) -> Vec<Finding> {
             ],
         ));
     }
-    findings
+    Ok(findings)
 }
 
 fn build_finding(
@@ -268,32 +269,8 @@ fn build_finding(
 }
 
 /// Run all queries (single entry point for end-to-end callers).
-pub fn run_all_queries(model: &ReachabilityModel) -> Vec<Finding> {
+pub fn run_all_queries(model: &ReachabilityModel) -> miette::Result<Vec<Finding>> {
     check_credential_safety(model)
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Allowed HTTP methods for the endpoint in `policy.network_policies[policy_name]`
-/// matching `(host, port)`. Returns empty when the rule or endpoint is not
-/// found (e.g. SAT path threaded through a stale model).
-fn endpoint_allowed_methods_in_rule(
-    policy: &crate::policy::PolicyModel,
-    policy_name: &str,
-    host: &str,
-    port: u16,
-) -> HashSet<String> {
-    let Some(rule) = policy.network_policies.get(policy_name) else {
-        return HashSet::new();
-    };
-    for ep in &rule.endpoints {
-        if ep.host.eq_ignore_ascii_case(host) && ep.effective_ports().contains(&port) {
-            return ep.allowed_methods();
-        }
-    }
-    HashSet::new()
 }
 
 // ---------------------------------------------------------------------------

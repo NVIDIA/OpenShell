@@ -5,11 +5,11 @@
 
 use crate::l7::relay::L7EvalContext;
 use crate::opa::PolicyGenerationGuard;
+use crate::telemetry::egress_emit;
 use miette::{Result, miette};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
-    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
-    ocsf_emit,
+    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId,
 };
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -147,7 +147,7 @@ pub fn uninspectable_traffic_gate(
 /// Emit the detection finding for traffic a matching middleware chain cannot
 /// inspect: denied under a fail-closed chain, bypassed under fail-open.
 pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: bool) {
-    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+    let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(if denied {
             SeverityId::High
         } else {
@@ -167,9 +167,11 @@ pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: 
             "Uninspectable traffic to host with required middleware; denied"
         } else {
             "Uninspectable traffic bypassed middleware (fail_open)"
-        })
-        .build();
-    ocsf_emit!(event);
+        });
+    if denied {
+        event = event.action(ActionId::Denied);
+    }
+    egress_emit!(event.build());
 }
 
 pub fn emit_websocket_preflight_events(
@@ -179,13 +181,13 @@ pub fn emit_websocket_preflight_events(
     emit_websocket_invocations(ctx, &outcome.invocations);
     emit_websocket_coverage(ctx, &outcome.coverage);
     for event in websocket_preflight_finding_events(outcome) {
-        ocsf_emit!(event);
+        egress_emit!(event);
     }
     if outcome.saturated {
         emit_websocket_saturation(ctx);
     }
     if outcome.session_capacity_exhausted {
-        emit_middleware_session_capacity_exhausted(ctx);
+        emit_middleware_session_capacity_exhausted(ctx, !outcome.allowed);
     }
 }
 
@@ -194,7 +196,7 @@ pub(super) fn emit_websocket_coverage(
     coverage: &[openshell_supervisor_middleware::WebSocketCoverage],
 ) {
     for event in websocket_coverage_events(ctx, coverage) {
-        ocsf_emit!(event);
+        egress_emit!(event);
     }
 }
 
@@ -264,7 +266,7 @@ pub(super) fn emit_websocket_message_events(
         emit_websocket_saturation(ctx);
     }
     for event in websocket_message_finding_events(outcome) {
-        ocsf_emit!(event);
+        egress_emit!(event);
     }
 }
 
@@ -386,10 +388,15 @@ fn emit_websocket_invocations(
                 invocation.transformed,
             ))
             .build();
-        ocsf_emit!(event);
+        egress_emit!(event);
         if invocation.failed {
-            let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-                .severity(if invocation.outcome == Outcome::FailClosed {
+            let fail_closed = invocation.outcome == Outcome::FailClosed;
+            let mut finding = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx());
+            if fail_closed {
+                finding = finding.action(ActionId::Denied);
+            }
+            let event = finding
+                .severity(if fail_closed {
                     SeverityId::High
                 } else {
                     SeverityId::Medium
@@ -407,7 +414,7 @@ fn emit_websocket_invocations(
                 ])
                 .message("WebSocket middleware stage failed")
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
         if invocation.stage_disabled {
             let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -427,7 +434,7 @@ fn emit_websocket_invocations(
                     "WebSocket middleware stage stream became unusable and was disabled for this session",
                 )
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
     }
 }
@@ -446,11 +453,11 @@ fn emit_websocket_saturation(ctx: &L7EvalContext) {
         ])
         .message("WebSocket middleware work waited for admission capacity")
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
 }
 
-fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext) {
-    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext, denied: bool) {
+    let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
             "openshell.middleware.session_capacity_exhausted",
@@ -461,13 +468,16 @@ fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext) {
             ("host", ctx.host.as_str()),
             ("operation", "websocket_message"),
         ])
-        .message("Persistent middleware session admission was refused at process capacity")
-        .build();
-    ocsf_emit!(event);
+        .message("Persistent middleware session admission was refused at process capacity");
+    if denied {
+        event = event.action(ActionId::Denied);
+    }
+    egress_emit!(event.build());
 }
 
 fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
     DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .action(ActionId::Denied)
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
             "openshell.middleware.admission_exhausted",
@@ -484,7 +494,7 @@ fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::
 }
 
 fn emit_middleware_admission_exhausted(ctx: &L7EvalContext) {
-    ocsf_emit!(middleware_admission_exhausted_event(ctx));
+    egress_emit!(middleware_admission_exhausted_event(ctx));
 }
 
 /// Largest body-buffering limit across the entries that actually resolved to a
@@ -521,7 +531,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
         req,
         client,
         ctx,
-        "https",
+        ctx.request_scheme(),
         chain,
         runner,
         generation_guard,
@@ -569,7 +579,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
         // unresolved binding is handled before the body is read) and forward
         // the original request unchanged if the chain allows.
         let input = middleware_request_input_with_id(
-            openshell_ocsf::ctx::ctx(),
+            &openshell_ocsf::ctx::ctx(),
             scheme,
             &req,
             ctx,
@@ -616,7 +626,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
     let input = middleware_request_input_with_id(
-        openshell_ocsf::ctx::ctx(),
+        &openshell_ocsf::ctx::ctx(),
         scheme,
         &req,
         ctx,
@@ -791,7 +801,7 @@ pub(super) fn resolve_unbuffered_body(
 }
 
 fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
-    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+    let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(if denied {
             SeverityId::High
         } else {
@@ -810,9 +820,11 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
             "Request body exceeded middleware inspection cap; denied"
         } else {
             "Request body exceeded middleware inspection cap; passed through (fail_open)"
-        })
-        .build();
-    ocsf_emit!(event);
+        });
+    if denied {
+        event = event.action(ActionId::Denied);
+    }
+    egress_emit!(event.build());
 }
 
 /// Parse the raw header block into middleware-visible headers, preserving
@@ -915,10 +927,7 @@ pub(super) fn middleware_events(
             } else {
                 SeverityId::Medium
             })
-            .http_request(HttpRequest::new(
-                &req.action,
-                OcsfUrl::new("http", &ctx.host, &req.target, ctx.port),
-            ))
+            .http_request(HttpRequest::new(&req.action, ctx.ocsf_url(&req.target)))
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
             .firewall_rule(&ctx.policy_name, "middleware")
             .unmapped("transformed", invocation.transformed)
@@ -966,6 +975,7 @@ pub(super) fn middleware_events(
                 "openshell.middleware.failure",
                 "Supervisor middleware failure",
             ))
+            .action(ActionId::Denied)
             .message("Required supervisor middleware failed closed")
             .build();
         events.push(event);
@@ -985,6 +995,7 @@ pub(super) fn middleware_events(
                 ("policy", ctx.policy_name.as_str()),
                 ("host", ctx.host.as_str()),
             ])
+            .action(ActionId::Denied)
             .message("Transformed request denied because policy evaluation failed")
             .build();
         events.push(event);
@@ -1003,8 +1014,208 @@ fn emit_middleware_events(
     req: &crate::l7::provider::L7Request,
     outcome: &openshell_supervisor_middleware::ChainOutcome,
 ) {
-    for event in middleware_events(ctx, req, outcome) {
-        ocsf_emit!(event);
+    crate::telemetry::emit_decision(middleware_events(ctx, req, outcome), None);
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::telemetry::tests::{assert_deny_resolves, assert_no_deny, deny_spans, exported};
+    use openshell_supervisor_middleware::{ChainOutcome, MiddlewareInvocation, NamespacedFinding};
+
+    fn finding() -> NamespacedFinding {
+        NamespacedFinding {
+            middleware: "guard".to_string(),
+            finding: openshell_core::proto::Finding {
+                r#type: "test.finding".to_string(),
+                label: "Test finding".to_string(),
+                count: 1,
+                severity: "high".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn outcome(
+        allowed: bool,
+        reason: &str,
+        applied: Vec<MiddlewareInvocation>,
+        findings: Vec<NamespacedFinding>,
+    ) -> ChainOutcome {
+        ChainOutcome {
+            allowed,
+            reason: reason.to_string(),
+            body: vec![],
+            header_mutations: vec![],
+            findings,
+            metadata: std::collections::BTreeMap::new(),
+            applied,
+            denial: None,
+        }
+    }
+
+    fn request() -> crate::l7::provider::L7Request {
+        crate::l7::provider::L7Request {
+            action: "POST".to_string(),
+            target: "/".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: vec![],
+            body_length: crate::l7::provider::BodyLength::None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_fail_closed_findings_record_the_denial() {
+        use openshell_supervisor_middleware::{
+            WebSocketInvocation, WebSocketInvocationOutcome as Outcome,
+        };
+        for (outcome, action_id) in [(Outcome::FailClosed, Some(2)), (Outcome::FailOpen, None)] {
+            let (events, _) = exported("warn", || {
+                emit_websocket_invocations(
+                    &L7EvalContext::default(),
+                    &[WebSocketInvocation {
+                        config_name: "guard".to_string(),
+                        implementation: "test/guard".to_string(),
+                        outcome,
+                        sequence: None,
+                        original_size: 0,
+                        replacement_size: None,
+                        transformed: false,
+                        failed: true,
+                        stage_disabled: false,
+                        reason_code: None,
+                    }],
+                );
+            })
+            .await;
+            let finding = events
+                .iter()
+                .find(|event| {
+                    event["finding_info"]["uid"] == "openshell.middleware.websocket_failure"
+                })
+                .unwrap();
+            assert_eq!(finding["action_id"].as_u64(), action_id, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn refusal_findings_record_the_denial() {
+        for reason in [
+            "middleware_failed: guard",
+            "transformed_body_policy_evaluation_failed: unavailable",
+        ] {
+            let events = middleware_events(
+                &L7EvalContext::default(),
+                &request(),
+                &outcome(false, reason, vec![], vec![]),
+            );
+            assert_eq!(events.len(), 1, "{reason}");
+            let finding = events[0].to_json().unwrap();
+            assert_eq!(finding["class_uid"], 2004);
+            assert_eq!(finding["action_id"], 2, "{reason}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inspection_refusals_record_denial_but_fail_open_findings_do_not() {
+        for denied in [false, true] {
+            let (events, received) = exported("warn", || {
+                let ctx = L7EvalContext::default();
+                emit_middleware_uninspectable(&ctx, "unknown protocol", denied);
+                emit_middleware_body_unavailable(&ctx, denied);
+            })
+            .await;
+            assert_eq!(events.len(), 2);
+            for (event, uid) in events.iter().zip([
+                "openshell.middleware.traffic_uninspectable",
+                "openshell.middleware.body_unavailable",
+            ]) {
+                assert_eq!(event["finding_info"]["uid"], uid);
+                assert_eq!(event["class_uid"], 2004);
+                assert_eq!(event["action_id"].as_u64(), denied.then_some(2));
+                assert_eq!(event["action"].as_str(), denied.then_some("Denied"));
+                if !denied {
+                    assert!(event.get("action_id").is_none());
+                    assert!(event.get("action").is_none());
+                }
+            }
+            // A finding-only refusal still creates no HTTP deny span.
+            assert_no_deny(&events, &received);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_capacity_findings_follow_the_preflight_outcome() {
+        for allowed in [true, false] {
+            let (events, received) = exported("warn", || {
+                emit_websocket_preflight_events(
+                    &L7EvalContext::default(),
+                    &openshell_supervisor_middleware::WebSocketPreflightResult {
+                        allowed,
+                        terminal_reason: None,
+                        reason: "middleware_session_capacity_exhausted".into(),
+                        denial: None,
+                        session: None,
+                        findings: vec![],
+                        metadata: std::collections::BTreeMap::new(),
+                        invocations: vec![],
+                        coverage: vec![],
+                        saturated: false,
+                        session_capacity_exhausted: true,
+                    },
+                );
+            })
+            .await;
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0]["finding_info"]["uid"],
+                "openshell.middleware.session_capacity_exhausted"
+            );
+            assert_eq!(events[0]["action_id"].as_u64(), (!allowed).then_some(2));
+            assert_eq!(events[0]["action"].as_str(), (!allowed).then_some("Denied"));
+            if allowed {
+                assert!(events[0].get("action_id").is_none());
+                assert!(events[0].get("action").is_none());
+            }
+            assert_no_deny(&events, &received);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_chain_outcomes_group_findings_and_preserve_allowed_controls() {
+        for allowed in [true, false] {
+            let (events, received) = exported("warn", || {
+                let invocation = MiddlewareInvocation {
+                    name: "guard".to_string(),
+                    implementation: "test/guard".to_string(),
+                    decision: if allowed {
+                        openshell_core::proto::Decision::Allow
+                    } else {
+                        openshell_core::proto::Decision::Deny
+                    },
+                    transformed: false,
+                    failed: false,
+                };
+                let reason = if allowed {
+                    "allowed"
+                } else {
+                    "middleware_failed: guard"
+                };
+                emit_middleware_events(
+                    &L7EvalContext::default(),
+                    &request(),
+                    &outcome(allowed, reason, vec![invocation], vec![finding()]),
+                );
+            })
+            .await;
+            assert!(events.len() >= 2);
+            if allowed {
+                assert_no_deny(&events, &received);
+            } else {
+                assert_eq!(deny_spans(&received).len(), 1);
+                assert_deny_resolves(&events, &received, true);
+            }
+        }
     }
 }
 
@@ -1030,6 +1241,10 @@ mod tests {
 
         let serialized = serde_json::to_string(&middleware_admission_exhausted_event(&ctx))
             .expect("serialize admission event");
+        let event: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(event["class_uid"], 2004);
+        assert_eq!(event["action_id"], 2);
+        assert_eq!(event["action"], "Denied");
         assert!(serialized.contains("openshell.middleware.admission_exhausted"));
         assert!(serialized.contains("api-policy"));
         assert!(serialized.contains("api.example.test"));
@@ -1209,6 +1424,7 @@ mod tests {
             sandbox_id: "sbx-123".into(),
             sandbox_name: "nightly-build".into(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "h".into(),
             product_version: "0".into(),
             proxy_ip: [127, 0, 0, 1].into(),

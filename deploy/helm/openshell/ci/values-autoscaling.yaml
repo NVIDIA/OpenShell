@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI overlay for rendering the optional gateway HorizontalPodAutoscaler. Like
+# values-high-availability.yaml, it expects a PostgreSQL Secret named
+# openshell-ha-pg. It is exercised by helm lint and helm-unittest only; kind
+# CI has no metrics-server, so HPA runtime behavior is not tested.
+workload:
+  kind: deployment
+
+server:
+  externalDbSecret: openshell-ha-pg
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 80
+  # Render-only placeholder: the gateway exports no metric by this name. It
+  # checks that the chart passes a Pods metric to the HPA unchanged. An HPA
+  # skips scale-down while any of its metrics is unavailable, so drop it for a
+  # runtime test with metrics-server only: --set autoscaling.metrics=null.
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: example_adapter_metric
+        target:
+          type: AverageValue
+          averageValue: "100"

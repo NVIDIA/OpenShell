@@ -110,6 +110,8 @@ jobs:
 
       - name: Set up Nix
         uses: ./.github/actions/setup-nix
+        with:
+          prepare-shell: "true"
 
       - name: Test report comparison
         run: tasks/scripts/trivy-scan-test.sh

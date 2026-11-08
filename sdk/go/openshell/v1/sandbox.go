@@ -42,6 +42,21 @@ const (
 	EndpointUpstreamRejected      = types.EndpointUpstreamRejected
 )
 
+// EndpointFailure explains a failed endpoint result with bounded values.
+type EndpointFailure = types.EndpointFailure
+
+// TokenGrantFailureObservation records a refused grant's destination and cause.
+type TokenGrantFailureObservation = types.TokenGrantFailureObservation
+
+// EndpointFailureDomain names the subsystem that explains an endpoint failure.
+type EndpointFailureDomain = types.EndpointFailureDomain
+
+// EndpointFailureDomain values select the closed set that Code and Stage come from.
+const (
+	EndpointFailureDomainUnspecified = types.EndpointFailureDomainUnspecified
+	EndpointFailureDomainTokenGrant  = types.EndpointFailureDomainTokenGrant
+)
+
 // AttachProviderResult holds the result of attaching a provider to a sandbox.
 type AttachProviderResult = types.AttachProviderResult
 
@@ -71,7 +86,7 @@ var WithLogMinLevel = types.WithLogMinLevel
 
 // SandboxInterface defines lifecycle operations on sandboxes.
 type SandboxInterface interface {
-	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error)
 	Get(ctx context.Context, workspace, name string) (*Sandbox, error)
 	List(workspace string, opts ...ListOptions) (*Pager[*Sandbox], error)
 	ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
@@ -93,5 +108,17 @@ type SandboxInterface interface {
 // SandboxTemplateCreateInterface defines additive sandbox creation from named
 // workload templates without widening SandboxInterface.
 type SandboxTemplateCreateInterface interface {
-	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error)
+}
+
+// SandboxSuspendResumeInterface defines sandbox suspend and resume without
+// widening SandboxInterface. Suspend and resume require a compute driver and
+// isolation backend that retain workload memory state.
+type SandboxSuspendResumeInterface interface {
+	// Suspend freezes a Ready sandbox and retains its memory state.
+	Suspend(ctx context.Context, workspace, name string) (*Sandbox, error)
+	// Resume restores a Suspended sandbox in a new runtime generation.
+	Resume(ctx context.Context, workspace, name string, opts ...ResumeOptions) (*Sandbox, error)
+	// WaitSuspended polls until the sandbox reaches the Suspended phase.
+	WaitSuspended(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 }

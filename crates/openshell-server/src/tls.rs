@@ -16,8 +16,7 @@ use notify::{Event, RecursiveMode, Watcher};
 use openshell_core::{Error, Result};
 use openshell_ocsf::{ConfigStateChangeBuilder, EventContext, SeverityId, StateId, StatusId};
 use rustls::ServerConfig;
-use rustls::crypto::aws_lc_rs::sign;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use tokio::sync::{mpsc, watch};
@@ -98,6 +97,10 @@ impl TlsAcceptor {
     /// Returns `Ok(())` when the new config was built and swapped successfully.
     /// Returns `Err(...)` if cert/key loading fails — the old config is preserved.
     pub fn reload(&self) -> Result<()> {
+        self.reload_for_listener("gateway")
+    }
+
+    fn reload_for_listener(&self, listener: &str) -> Result<()> {
         let new_config = build_server_config(
             &self.cert_path,
             &self.key_path,
@@ -113,7 +116,9 @@ impl TlsAcceptor {
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
             .state(StateId::Enabled, "reloaded")
-            .message("TLS certificate config reloaded successfully")
+            .message(format!(
+                "{listener} TLS certificate config reloaded successfully"
+            ))
             .build();
         openshell_ocsf::ocsf_emit!(event);
 
@@ -141,10 +146,25 @@ impl TlsAcceptor {
     /// tasks.
     pub fn spawn_reload_worker(
         &self,
+        shutdown: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        self.spawn_reload_worker_for_listener(shutdown, "gateway")
+    }
+
+    /// Spawn a certificate reload worker identified by the listener it serves.
+    ///
+    /// This is used when a process owns more than one TLS listener, so reload
+    /// logs and OCSF events identify the certificate trust boundary affected.
+    pub fn spawn_reload_worker_for_listener(
+        &self,
         mut shutdown: watch::Receiver<bool>,
+        listener: &'static str,
     ) -> tokio::task::JoinHandle<()> {
         if self.reload_spawned.swap(true, Ordering::Relaxed) {
-            warn!("TLS certificate reload worker already spawned, ignoring duplicate call");
+            warn!(
+                listener,
+                "TLS certificate reload worker already spawned, ignoring duplicate call"
+            );
             return tokio::spawn(async {});
         }
 
@@ -194,19 +214,19 @@ impl TlsAcceptor {
             ) {
                 Ok(w) => w,
                 Err(e) => {
-                    warn!(error = %e, "Failed to start TLS cert file watcher, hot-reload disabled");
+                    warn!(listener, error = %e, "Failed to start TLS cert file watcher, hot-reload disabled");
                     return;
                 }
             };
 
             for dir in &dirs {
                 if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
-                    warn!(error = %e, dir = %dir.display(), "Failed to watch TLS cert directory, hot-reload disabled");
+                    warn!(listener, error = %e, dir = %dir.display(), "Failed to watch TLS cert directory, hot-reload disabled");
                     return;
                 }
             }
 
-            info!(?dirs, "TLS certificate file watcher started");
+            info!(listener, ?dirs, "TLS certificate file watcher started");
 
             // Event loop with manual debounce.
             // When the watcher fires, we drain any follow-up events that
@@ -223,7 +243,10 @@ impl TlsAcceptor {
                 };
 
                 if !got_event {
-                    warn!("TLS cert file watcher disconnected, hot-reload stopping");
+                    warn!(
+                        listener,
+                        "TLS cert file watcher disconnected, hot-reload stopping"
+                    );
                     break 'outer;
                 }
 
@@ -232,17 +255,17 @@ impl TlsAcceptor {
                     tokio::select! {
                         () = tokio::time::sleep(debounce) => {
                             // Debounce window elapsed — reload now.
-                            if let Err(e) = this.reload() {
+                            if let Err(e) = this.reload_for_listener(listener) {
                                 let event = ConfigStateChangeBuilder::new(&tls_ocsf_ctx())
                                     .severity(SeverityId::Medium)
                                     .status(StatusId::Failure)
                                     .state(StateId::Enabled, "reload_failed")
                                     .message(format!(
-                                        "TLS certificate reload failed: {e}"
+                                        "{listener} TLS certificate reload failed: {e}"
                                     ))
                                     .build();
                                 openshell_ocsf::ocsf_emit!(event);
-                                warn!(error = %e, "TLS certificate reload failed, keeping existing config");
+                                warn!(listener, error = %e, "TLS certificate reload failed, keeping existing config");
                             }
                             break;
                         }
@@ -251,11 +274,11 @@ impl TlsAcceptor {
                                 // Another event arrived — reset debounce.
                                 continue;
                             }
-                            warn!("TLS cert file watcher disconnected, hot-reload stopping");
+                            warn!(listener, "TLS cert file watcher disconnected, hot-reload stopping");
                             break 'outer;
                         }
                         _ = shutdown.changed() => {
-                            debug!("TLS certificate reload worker stopped");
+                            debug!(listener, "TLS certificate reload worker stopped");
                             break 'outer;
                         }
                     }
@@ -314,7 +337,7 @@ impl std::fmt::Debug for DualCertResolver {
 fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let signing_key = sign::any_supported_type(&key)
+    let signing_key = openshell_crypto::tls::any_supported_signing_key(&key)
         .map_err(|e| Error::tls(format!("unsupported private key type: {e}")))?;
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
 }
@@ -377,7 +400,7 @@ fn build_server_config(
 
     // Validate the key type early — rustls defers this to handshake time,
     // which produces a cryptic error. A bad key type surfaces clearly here.
-    sign::any_supported_type(&key)
+    openshell_crypto::tls::any_supported_signing_key(&key)
         .map_err(|e| Error::tls(format!("unsupported private key type: {e}")))?;
 
     let resolver = build_cert_resolver(
@@ -397,7 +420,10 @@ fn build_server_config(
                 .map_err(|e| Error::tls(format!("failed to add CA certificate: {e}")))?;
         }
 
-        let verifier_builder = WebPkiClientVerifier::builder(Arc::new(root_store));
+        let verifier_builder = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(root_store),
+            openshell_crypto::tls::configuration_provider(),
+        );
         let verifier = if require_client_auth {
             verifier_builder
         } else {
@@ -406,7 +432,9 @@ fn build_server_config(
         .build()
         .map_err(|e| Error::tls(format!("failed to build client verifier: {e}")))?;
 
-        let builder = ServerConfig::builder().with_client_cert_verifier(verifier);
+        let builder = openshell_crypto::tls::try_server_builder()
+            .map_err(|e| Error::tls(format!("configure gateway TLS server: {e}")))?
+            .with_client_cert_verifier(verifier);
         if let Some(resolver) = resolver {
             builder.with_cert_resolver(resolver)
         } else {
@@ -415,7 +443,9 @@ fn build_server_config(
                 .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
         }
     } else {
-        let builder = ServerConfig::builder().with_no_client_auth();
+        let builder = openshell_crypto::tls::try_server_builder()
+            .map_err(|e| Error::tls(format!("configure gateway TLS server: {e}")))?
+            .with_no_client_auth();
         if let Some(resolver) = resolver {
             builder.with_cert_resolver(resolver)
         } else {
@@ -438,7 +468,7 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         File::open(path).map_err(|e| Error::tls(format!("failed to open cert file: {e}")))?;
     let mut reader = BufReader::new(file);
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+    let certs: Vec<_> = CertificateDer::pem_reader_iter(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::tls(format!("failed to parse certificates: {e}")))?;
 
@@ -454,20 +484,11 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(path).map_err(|e| Error::tls(format!("failed to open key file: {e}")))?;
     let mut reader = BufReader::new(file);
 
-    loop {
-        let item = rustls_pemfile::read_one(&mut reader)
-            .map_err(|e| Error::tls(format!("failed to parse key file: {e}")))?;
-
-        match item {
-            Some(rustls_pemfile::Item::Pkcs1Key(key)) => return Ok(key.into()),
-            Some(rustls_pemfile::Item::Pkcs8Key(key)) => return Ok(key.into()),
-            Some(rustls_pemfile::Item::Sec1Key(key)) => return Ok(key.into()),
-            None => break,
-            _ => {}
-        }
-    }
-
-    Err(Error::tls("no private key found in file"))
+    PrivateKeyDer::pem_reader_iter(&mut reader)
+        .next()
+        .transpose()
+        .map_err(|e| Error::tls(format!("failed to parse key file: {e}")))?
+        .ok_or_else(|| Error::tls("no private key found in file"))
 }
 
 /// Build an OCSF context for gateway-level (non-sandbox) events.
@@ -479,21 +500,31 @@ fn tls_ocsf_ctx() -> EventContext {
 mod tests {
     use super::*;
     use crate::tls_test_utils::{generate_test_certs_with_ca, write_test_file};
-    use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+    use openshell_crypto::pki::KeyPair;
+    use rcgen::{CertificateParams, IsCa, KeyUsagePurpose};
     use tokio::net::{TcpListener, TcpStream};
 
     /// Generate a new server cert + key in `dir`, signed by the given CA.
     /// Overwrites `server-cert.pem` and `server-key.pem`.
-    fn generate_server_cert(ca_cert: &rcgen::Certificate, ca_key: &KeyPair, dir: &Path) {
+    fn generate_server_cert(
+        ca_cert: &openshell_crypto::pki::Certificate,
+        ca_key: &KeyPair,
+        dir: &Path,
+    ) {
         let server_params = CertificateParams::new(vec!["localhost".to_string()])
             .expect("failed to create server params");
-        let server_key = KeyPair::generate().expect("failed to generate server key");
-        let server_cert = server_params
-            .signed_by(&server_key, ca_cert, ca_key)
-            .expect("failed to sign server cert");
+        let server_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate server key");
+        let server_cert =
+            openshell_crypto::pki::signed_by(server_params, &server_key, ca_cert, ca_key)
+                .expect("failed to sign server cert");
 
         write_test_file(dir, "server-cert.pem", server_cert.pem().as_bytes());
-        write_test_file(dir, "server-key.pem", server_key.serialize_pem().as_bytes());
+        write_test_file(
+            dir,
+            "server-key.pem",
+            server_key.serialize_pem().unwrap().as_bytes(),
+        );
     }
 
     fn build_test_client_config(ca_path: &Path) -> Arc<rustls::ClientConfig> {
@@ -505,7 +536,7 @@ mod tests {
                 .expect("failed to add CA to root store");
         }
         Arc::new(
-            rustls::ClientConfig::builder()
+            openshell_crypto::tls::client_builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
         )
@@ -900,9 +931,9 @@ mod tests {
         new_ca_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "new-ca");
-        let new_ca_key = KeyPair::generate().expect("failed to generate new CA key");
-        let new_ca_cert = new_ca_params
-            .self_signed(&new_ca_key)
+        let new_ca_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate new CA key");
+        let new_ca_cert = openshell_crypto::pki::self_signed(new_ca_params, &new_ca_key)
             .expect("failed to sign new CA cert");
         std::fs::write(dir.path().join("ca.pem"), new_ca_cert.pem().as_bytes())
             .expect("failed to write new CA");
@@ -914,7 +945,8 @@ mod tests {
             .expect("reload with new CA should succeed");
 
         // Generate client cert signed by new CA, write to files
-        let client_key = KeyPair::generate().expect("failed to generate client key");
+        let client_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate client key");
         let mut client_params =
             CertificateParams::new(Vec::<String>::new()).expect("failed to create client params");
         client_params
@@ -924,17 +956,20 @@ mod tests {
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
-        let client_cert = client_params
-            .signed_by(&client_key, &new_ca_cert, &new_ca_key)
-            .expect("failed to sign client cert");
+        let client_cert =
+            openshell_crypto::pki::signed_by(client_params, &client_key, &new_ca_cert, &new_ca_key)
+                .expect("failed to sign client cert");
 
         // Write client cert + key as PEM files and load via load_certs/load_key
         let client_cert_path = dir.path().join("client-cert.pem");
         let client_key_path = dir.path().join("client-key.pem");
         std::fs::write(&client_cert_path, client_cert.pem().as_bytes())
             .expect("failed to write client cert");
-        std::fs::write(&client_key_path, client_key.serialize_pem().as_bytes())
-            .expect("failed to write client key");
+        std::fs::write(
+            &client_key_path,
+            client_key.serialize_pem().unwrap().as_bytes(),
+        )
+        .expect("failed to write client key");
 
         let client_cert_chain = load_certs(&client_cert_path).expect("failed to load client cert");
         let client_private_key = load_key(&client_key_path).expect("failed to load client key");
@@ -944,7 +979,7 @@ mod tests {
             .add(CertificateDer::from(new_ca_cert.der().to_vec()))
             .expect("failed to add new CA to root store");
         let new_ca_client_config = Arc::new(
-            rustls::ClientConfig::builder()
+            openshell_crypto::tls::client_builder()
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(client_cert_chain, client_private_key)
                 .expect("failed to set client auth cert"),
@@ -981,7 +1016,8 @@ mod tests {
 
         // Verify old CA is no longer trusted: a client cert signed by the
         // initial CA should be rejected after rotation.
-        let old_client_key = KeyPair::generate().expect("failed to generate old client key");
+        let old_client_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate old client key");
         let mut old_client_params = CertificateParams::new(Vec::<String>::new())
             .expect("failed to create old client params");
         old_client_params
@@ -991,16 +1027,23 @@ mod tests {
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
-        let old_client_cert = old_client_params
-            .signed_by(&old_client_key, &initial_ca_cert, &initial_ca_key)
-            .expect("failed to sign old client cert");
+        let old_client_cert = openshell_crypto::pki::signed_by(
+            old_client_params,
+            &old_client_key,
+            &initial_ca_cert,
+            &initial_ca_key,
+        )
+        .expect("failed to sign old client cert");
 
         let old_cert_path = dir.path().join("old-client-cert.pem");
         let old_key_path = dir.path().join("old-client-key.pem");
         std::fs::write(&old_cert_path, old_client_cert.pem().as_bytes())
             .expect("failed to write old client cert");
-        std::fs::write(&old_key_path, old_client_key.serialize_pem().as_bytes())
-            .expect("failed to write old client key");
+        std::fs::write(
+            &old_key_path,
+            old_client_key.serialize_pem().unwrap().as_bytes(),
+        )
+        .expect("failed to write old client key");
 
         let old_cert_chain = load_certs(&old_cert_path).expect("failed to load old client cert");
         let old_key_der = load_key(&old_key_path).expect("failed to load old client key");
@@ -1010,7 +1053,7 @@ mod tests {
             .add(CertificateDer::from(new_ca_cert.der().to_vec()))
             .expect("failed to add new CA to root store");
         let old_ca_client_config = Arc::new(
-            rustls::ClientConfig::builder()
+            openshell_crypto::tls::client_builder()
                 .with_root_certificates(old_root_store)
                 .with_client_auth_cert(old_cert_chain, old_key_der)
                 .expect("failed to set old client auth cert"),
@@ -1047,7 +1090,7 @@ mod tests {
     /// Generate a cert+key pair with given SANs, signed by the provided CA,
     /// and write them to the specified files in `dir`.
     fn generate_named_cert(
-        ca_cert: &rcgen::Certificate,
+        ca_cert: &openshell_crypto::pki::Certificate,
         ca_key: &KeyPair,
         dir: &Path,
         cert_file: &str,
@@ -1056,12 +1099,11 @@ mod tests {
     ) {
         let params =
             CertificateParams::new(vec![san.to_string()]).expect("failed to create cert params");
-        let key = KeyPair::generate().expect("failed to generate key");
-        let cert = params
-            .signed_by(&key, ca_cert, ca_key)
+        let key = openshell_crypto::pki::generate_keypair().expect("failed to generate key");
+        let cert = openshell_crypto::pki::signed_by(params, &key, ca_cert, ca_key)
             .expect("failed to sign cert");
         write_test_file(dir, cert_file, cert.pem().as_bytes());
-        write_test_file(dir, key_file, key.serialize_pem().as_bytes());
+        write_test_file(dir, key_file, key.serialize_pem().unwrap().as_bytes());
     }
 
     #[test]

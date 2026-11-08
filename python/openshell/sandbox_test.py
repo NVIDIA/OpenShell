@@ -3,21 +3,25 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pickle
 import threading
 import time
+from concurrent import futures
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, Never, cast
 
+import grpc
 import pytest
+from google.protobuf.struct_pb2 import Struct
 
 import openshell.sandbox as sandbox_module
-from openshell._proto import openshell_pb2
+from openshell._proto import openshell_pb2, openshell_pb2_grpc
 from openshell.mutations import DeletionOutcome
 from openshell.sandbox import (
     _OIDC_TOKEN_EXPIRY_GRACE_SECONDS,
@@ -28,6 +32,7 @@ from openshell.sandbox import (
     Pager,
     Sandbox,
     SandboxClient,
+    SandboxConditionRef,
     SandboxError,
     SandboxRef,
     SandboxStatusRef,
@@ -41,10 +46,14 @@ from openshell.sandbox import (
     _make_cluster_bearer_provider,
     _normalize_bearer,
     _OidcRefresher,
+    _OwnerCache,
     _read_oidc_token_bundle,
     _sandbox_ref,
     _validate_oauth_url,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 
 def _request_workspace(request: Any) -> str | None:
@@ -410,6 +419,11 @@ def test_client_credentials_auth_does_not_use_stale_token_after_renewal_failure(
 
 
 class _FakeStub:
+    class GetSandbox:
+        @staticmethod
+        def with_call(*_args: object, **_kwargs: object) -> Never:
+            raise grpc.RpcError()
+
     def __init__(self) -> None:
         self.request: openshell_pb2.ExecSandboxRequest | None = None
 
@@ -426,14 +440,107 @@ class _FakeStub:
 
 
 def _client_with_fake_stub(stub: object) -> SandboxClient:
-    client = cast("SandboxClient", object.__new__(SandboxClient))
+    client = object.__new__(SandboxClient)
     client._timeout = 30.0
     client._stub = cast("Any", stub)
+    client._owners = _OwnerCache()
     return client
 
 
+class _RoutingGateway(openshell_pb2_grpc.OpenShellServicer):
+    """Gateway that reports an owner and, behind a replica route, can answer
+    like Envoy with a trailers-only UNAVAILABLE."""
+
+    def __init__(
+        self, owner: str, *, reject_routed: str | None = None, fail: str = ""
+    ) -> None:
+        self.owner = owner
+        self.reject_routed = reject_routed
+        self.fail = fail
+        self.wanted_owner: list[str] = []
+        self.routes: list[str] = []
+
+    def GetSandbox(self, request, context):
+        _ = request
+        headers = dict(context.invocation_metadata())
+        self.wanted_owner.append(headers.get("x-openshell-want-owner", ""))
+        if self.owner:
+            context.send_initial_metadata((("x-openshell-owner", self.owner),))
+        return openshell_pb2.SandboxResponse()
+
+    def ExecSandbox(self, request, context):
+        _ = request
+        route = dict(context.invocation_metadata()).get("x-openshell-replica", "")
+        self.routes.append(route)
+        if route and self.reject_routed is not None:
+            context.abort(grpc.StatusCode.UNAVAILABLE, self.reject_routed)
+        if self.fail:
+            context.abort(grpc.StatusCode.UNAVAILABLE, self.fail)
+        yield openshell_pb2.ExecSandboxEvent(
+            stdout=openshell_pb2.ExecSandboxStdout(data=b"ok")
+        )
+        yield openshell_pb2.ExecSandboxEvent(
+            exit=openshell_pb2.ExecSandboxExit(exit_code=0)
+        )
+
+
+@contextlib.contextmanager
+def _routing_client(gateway: _RoutingGateway) -> Generator[SandboxClient]:
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    openshell_pb2_grpc.add_OpenShellServicer_to_server(gateway, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    try:
+        with SandboxClient(f"127.0.0.1:{port}", timeout=5) as client:
+            yield client
+    finally:
+        server.stop(None)
+
+
+def test_exec_routes_to_reported_owner_and_caches_it() -> None:
+    gateway = _RoutingGateway("openshell-1")
+    with _routing_client(gateway) as client:
+        for _ in range(2):
+            result = client.exec("box", ["true"], workspace="default")
+            assert result.stdout == "ok"
+
+    assert gateway.wanted_owner == ["1"]
+    assert gateway.routes == ["openshell-1", "openshell-1"]
+
+
+def test_exec_without_owner_sends_no_hint() -> None:
+    gateway = _RoutingGateway("")
+    with _routing_client(gateway) as client:
+        assert client.exec("box", ["true"], workspace="default").exit_code == 0
+
+    assert gateway.routes == [""]
+
+
+@pytest.mark.parametrize("message", ["", "no healthy upstream"])
+def test_exec_retries_once_unrouted_when_owner_route_is_empty(message: str) -> None:
+    gateway = _RoutingGateway("openshell-1", reject_routed=message)
+    with _routing_client(gateway) as client:
+        for _ in range(2):
+            result = client.exec("box", ["true"], workspace="default")
+            assert result.stdout == "ok"
+
+    assert gateway.routes == ["openshell-1", "", "openshell-1", ""]
+    assert gateway.wanted_owner == ["1", "1"]
+
+
+def test_exec_does_not_retry_gateway_errors() -> None:
+    gateway = _RoutingGateway("openshell-1", fail="supervisor not connected")
+    with (
+        _routing_client(gateway) as client,
+        pytest.raises(grpc.RpcError, match="supervisor not connected"),
+    ):
+        client.exec("box", ["true"], workspace="default")
+
+    assert gateway.routes == ["openshell-1"]
+
+
 def _template_client_with_fake_stub(stub: object) -> SandboxTemplateClient:
-    client = cast("SandboxTemplateClient", object.__new__(SandboxTemplateClient))
+    client = object.__new__(SandboxTemplateClient)
     client._timeout = 30.0
     client._stub = cast("Any", stub)
     return client
@@ -1991,6 +2098,8 @@ class _FakeSandboxStub:
         self.delete_request: openshell_pb2.DeleteSandboxRequest | None = None
         self.stop_request: openshell_pb2.StopSandboxRequest | None = None
         self.start_request: openshell_pb2.StartSandboxRequest | None = None
+        self.suspend_request: openshell_pb2.SuspendSandboxRequest | None = None
+        self.resume_request: openshell_pb2.ResumeSandboxRequest | None = None
         self.create_template_request: (
             openshell_pb2.CreateSandboxTemplateRequest | None
         ) = None
@@ -2052,6 +2161,38 @@ class _FakeSandboxStub:
         timeout: float | None = None,
     ) -> Any:
         self.start_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                _request_sandbox(request),
+                phase=openshell_pb2.SANDBOX_PHASE_STARTING,
+                workspace=_request_workspace(request) or "default",
+            )
+        )
+
+    def SuspendSandbox(
+        self,
+        request: openshell_pb2.SuspendSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.suspend_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                _request_sandbox(request),
+                phase=openshell_pb2.SANDBOX_PHASE_SUSPENDING,
+                workspace=_request_workspace(request) or "default",
+            )
+        )
+
+    def ResumeSandbox(
+        self,
+        request: openshell_pb2.ResumeSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.resume_request = request
         _ = timeout
         return SimpleNamespace(
             sandbox=_make_sandbox_proto(
@@ -2312,7 +2453,9 @@ def test_sandbox_template_create_builds_template_from_public_fields() -> None:
     assert template.spec.workload.resources.cpu == "1"
     assert template.spec.workload.resources.memory == "512Mi"
     assert template.spec.workload.resources.gpu.count == 2
-    assert template.spec.driver_config["kubernetes"]["runtime_class_name"] == "kata"
+    config = template.spec.driver_config["kubernetes"]
+    assert isinstance(config, Struct)
+    assert config["runtime_class_name"] == "kata"
 
 
 def test_sandbox_template_create_materializes_default_workload() -> None:
@@ -2345,7 +2488,9 @@ def test_sandbox_template_create_materializes_workload_with_driver_config_only()
     assert template.HasField("spec")
     assert template.spec.HasField("workload")
     assert template.spec.workload.image == ""
-    assert template.spec.driver_config["kubernetes"]["runtime_class_name"] == "kata"
+    config = template.spec.driver_config["kubernetes"]
+    assert isinstance(config, Struct)
+    assert config["runtime_class_name"] == "kata"
 
 
 def test_sandbox_template_create_rejects_missing_public_name() -> None:
@@ -2451,12 +2596,9 @@ def test_sandbox_template_client_crud_forwards_requests() -> None:
         stub.create_template_request.template.spec.workload.image
         == "ghcr.io/test/gpu-kata:latest"
     )
-    assert (
-        stub.create_template_request.template.spec.driver_config["kubernetes"][
-            "runtime_class_name"
-        ]
-        == "kata"
-    )
+    config = stub.create_template_request.template.spec.driver_config["kubernetes"]
+    assert isinstance(config, Struct)
+    assert config["runtime_class_name"] == "kata"
 
     got = client.get("gpu-kata", workspace="default")
     assert got.metadata.name == "gpu-kata"
@@ -2510,6 +2652,51 @@ def test_stop_and_start_forward_workspace_and_return_phase() -> None:
     assert _request_sandbox(stub.start_request) == "job-1"
     assert _request_workspace(stub.start_request) == "team-a"
     assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
+
+
+def test_suspend_and_resume_forward_workspace_and_options() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    suspending = client.suspend("job-1", workspace="team-a")
+    assert stub.suspend_request is not None
+    assert _request_sandbox(stub.suspend_request) == "job-1"
+    assert _request_workspace(stub.suspend_request) == "team-a"
+    assert suspending.phase == openshell_pb2.SANDBOX_PHASE_SUSPENDING
+
+    resumed = client.resume("job-1", workspace="team-a", restart_if_restore_fails=True)
+    assert stub.resume_request is not None
+    assert _request_sandbox(stub.resume_request) == "job-1"
+    assert _request_workspace(stub.resume_request) == "team-a"
+    assert stub.resume_request.restart_if_restore_fails
+    assert resumed.phase == openshell_pb2.SANDBOX_PHASE_STARTING
+
+    client.resume("job-1", workspace="team-a")
+    assert not stub.resume_request.restart_if_restore_fails
+
+
+def test_wait_ready_fails_fast_when_suspended() -> None:
+    class SuspendedStub(_FakeSandboxStub):
+        def GetSandbox(
+            self,
+            request: openshell_pb2.GetSandboxRequest,
+            timeout: float | None = None,
+        ) -> Any:
+            _ = timeout
+            return SimpleNamespace(
+                sandbox=_make_sandbox_proto(
+                    "sandbox-1",
+                    _request_sandbox(request),
+                    phase=openshell_pb2.SANDBOX_PHASE_SUSPENDED,
+                    workspace=_request_workspace(request) or "default",
+                )
+            )
+
+    client = _client_with_fake_stub(SuspendedStub())
+    with pytest.raises(SandboxError, match="is suspended"):
+        client.wait_ready("job-1", workspace="default", timeout_seconds=30)
+    suspended = client.wait_suspended("job-1", workspace="default", timeout_seconds=1)
+    assert suspended.phase == openshell_pb2.SANDBOX_PHASE_SUSPENDED
 
 
 @pytest.mark.parametrize(
@@ -2728,6 +2915,13 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
     assert dict(ref.labels) == {"aiq": "deep-research", "env": "dev"}
 
 
+def test_sandbox_ref_exposes_host_identity_and_accepts_legacy_response() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+    assert _sandbox_ref(proto).host_key_fingerprint is None
+    proto.host_key_fingerprint = "SHA256:expected"
+    assert _sandbox_ref(proto).host_key_fingerprint == "SHA256:expected"
+
+
 def test_sandbox_ref_includes_main_process_result() -> None:
     proto = _make_sandbox_proto("sandbox-1", "job-1")
     proto.status.exit_code = 0
@@ -2743,12 +2937,69 @@ def test_sandbox_ref_includes_main_process_result() -> None:
     assert status.main_process_started_at_ms == 1_699_999_000_000
 
 
+def test_sandbox_ref_includes_conditions() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+
+    ready = proto.status.conditions.add()
+    ready.type = "Ready"
+    ready.status = "True"
+    ready.reason = "BackendReady"
+    ready.message = "Container is running"
+    ready.transition_time.FromMilliseconds(1_700_000_000_000)
+
+    failed = proto.status.conditions.add()
+    failed.type = "Ready"
+    failed.status = "Unknown"
+    failed.reason = "InspectFailed"
+    failed.message = "Container inspect failed: connection refused"
+
+    ref = _sandbox_ref(proto)
+
+    assert ref.status.conditions == (
+        SandboxConditionRef(
+            type="Ready",
+            status="True",
+            reason="BackendReady",
+            message="Container is running",
+            transition_time_ms=1_700_000_000_000,
+        ),
+        SandboxConditionRef(
+            type="Ready",
+            status="Unknown",
+            reason="InspectFailed",
+            message="Container inspect failed: connection refused",
+            transition_time_ms=None,
+        ),
+    )
+    # Surfaces the same conditions through SandboxRef directly.
+    assert ref.conditions == ref.status.conditions
+
+
+def test_sandbox_ref_conditions_default_to_empty() -> None:
+    ref = _sandbox_ref(_make_sandbox_proto("sandbox-1", "job-1"))
+
+    assert ref.status.conditions == ()
+    assert ref.conditions == ()
+
+
+def test_direct_sandbox_ref_construction_defaults_conditions() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="default",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+
+    assert ref.status.conditions == ()
+    assert ref.conditions == ()
+
+
 def test_returned_labels_are_immutable() -> None:
     proto = _make_sandbox_proto("sandbox-1", "job-1", {"aiq": "deep-research"})
     ref = _sandbox_ref(proto)
 
     with pytest.raises(TypeError):
-        ref.labels["mutated"] = "nope"  # type: ignore[index]
+        ref.labels["mutated"] = "nope"  # ty: ignore[invalid-assignment]
 
 
 def test_direct_sandbox_ref_construction_defaults_labels() -> None:
@@ -2809,7 +3060,7 @@ def test_direct_sandbox_ref_copies_and_freezes_labels() -> None:
 
     assert dict(ref.labels) == {"aiq": "deep-research"}
     with pytest.raises(TypeError):
-        ref.labels["mutated"] = "nope"  # type: ignore[index]
+        ref.labels["mutated"] = "nope"  # ty: ignore[invalid-assignment]
 
 
 def test_high_level_creation_forwards_name_and_labels(

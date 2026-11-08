@@ -8,6 +8,7 @@ use clap::Parser;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::SupervisorOtlpArgs;
 use openshell_driver_docker::{ComputeDriverService, DockerComputeConfig, DockerComputeDriver};
 use tracing::info;
 
@@ -25,6 +26,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DOCKER_DRIVER_CONFIG")]
     config: PathBuf,
 
+    /// OCI image containing the `openshell-sandbox` runtime binary.
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
+    sandbox_runtime_image: Option<String>,
+
+    /// OCI image containing the `openshell-supervisor` control binary.
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
+    supervisor_image: Option<String>,
+
     /// Gateway listener address used to derive the supervisor endpoint.
     #[arg(
         long,
@@ -36,8 +45,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
 
-    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
-    otlp_endpoint: Option<String>,
+    #[command(flatten)]
+    otlp: SupervisorOtlpArgs,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -49,13 +58,19 @@ async fn main() -> Result<()> {
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_docker::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {
-            endpoint: args.otlp_endpoint.as_deref(),
+            endpoint: args.otlp.endpoint.as_deref(),
+            protocol: args.otlp.protocol.into(),
+            ca_file: args.otlp.ca_file.as_deref(),
+            cert_file: args.otlp.cert_file.as_deref(),
+            key_file: args.otlp.key_file.as_deref(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
         },
     );
+    args.otlp.warn_deprecated();
 
+    let supervisor_otlp = args.otlp.supervisor_otlp();
     let config_source = std::fs::read_to_string(&args.config).into_diagnostic()?;
     let mut docker_config: DockerComputeConfig =
         toml::from_str(&config_source).into_diagnostic()?;
@@ -63,7 +78,15 @@ async fn main() -> Result<()> {
         docker_config.allow_driver_config = policy.allow_driver_config;
         docker_config.resource_admission = policy.resource_admission;
     }
-    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
+    if let Some(image) = args.sandbox_runtime_image {
+        docker_config.sandbox_runtime_image = Some(image);
+    }
+    if let Some(image) = args.supervisor_image {
+        docker_config.supervisor_image = Some(image);
+    }
+    docker_config.supervisor_otlp = supervisor_otlp;
+    docker_config.supervisor_gateway_name = args.gateway_name.clone();
+    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config, None)
         .await
         .into_diagnostic()?;
 

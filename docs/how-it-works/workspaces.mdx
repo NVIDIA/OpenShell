@@ -17,6 +17,9 @@ The CLI targets the `default` workspace unless you set `--workspace` or
 `OPENSHELL_WORKSPACE`. The logical OpenShell workspace described here is
 separate from the `/sandbox` filesystem directory inside a sandbox.
 
+For Kubernetes namespace mapping and managed per-workspace namespaces, see
+[Workspace on Kubernetes](/kubernetes/workspaces).
+
 ## Understand the Role Model
 
 OpenShell combines an identity-provider role with a membership record for each
@@ -132,6 +135,35 @@ continue. An empty result has an empty `members` collection.
 
 To change a member's role, remove the existing membership and add it again
 with the new role. A Platform Admin must perform any change to `admin`.
+
+## Label and List Workspaces
+
+Attach labels when you create a workspace to track environment or team ownership.
+Repeat `--label` for each key-value pair.
+
+```shell
+openshell workspace create --name team-research --label env=dev --label team=ml
+```
+
+List workspaces that match every key-value pair in a comma-separated selector.
+Filtering only returns workspaces you are authorized to view.
+
+```shell
+openshell workspace list --label-selector env=dev,team=ml
+```
+
+Inspect a workspace to see its labels, or use structured list output for
+automation.
+
+```shell
+openshell workspace get team-research
+openshell workspace list --label-selector env=dev --output json
+```
+
+API clients set `CreateWorkspaceRequest.labels` and filter with
+`ListWorkspacesRequest.label_selector`. Returned workspace labels are stored in
+`metadata.labels`. OpenShell does not provide a workspace update operation to
+change labels after creation.
 
 ## Target a Workspace
 

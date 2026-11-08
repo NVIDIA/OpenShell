@@ -51,6 +51,7 @@ jobs:
           ref: ${{ inputs.checkout-ref || github.sha }}
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: ./.github/actions/build-rust-binary
         with:
@@ -60,22 +61,6 @@ jobs:
           cargo-version: ${{ inputs.cargo-version }}
           supervisor-image-tag: ${{ inputs.supervisor-image-tag }}
           extra-cargo-flags: ${{ env.EXTRA_CARGO_FLAGS }}
-
-  conformance:
-    name: openshell-conformance (${{ matrix.triple }})
-    env:
-      PACKAGE: openshell-conformance-cli
-      BINARY: openshell-conformance
-    strategy:
-      matrix:
-        include:
-          - triple: x86_64-unknown-linux-musl
-            runner: linux-amd64-cpu8
-          - triple: aarch64-unknown-linux-musl
-            runner: linux-arm64-cpu8
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    steps: *build_steps
 
   prover:
     name: openshell-prover (${{ matrix.triple }})

@@ -1,0 +1,141 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Workspace on Kubernetes"
+sidebar-title: "Workspaces"
+description: "Configure how OpenShell workspaces map to Kubernetes namespaces, including managed per-workspace namespaces."
+keywords: "Kubernetes, Workspaces, Namespaces, Managed Mode, Helm, RBAC"
+position: 2
+---
+
+The Kubernetes compute driver maps each OpenShell workspace to a Kubernetes
+namespace. Choose the mapping when you configure the gateway. OpenShell
+workspace membership and roles are separate from Kubernetes namespace access;
+see [Workspaces](/how-it-works/workspaces) to create workspaces and assign members.
+
+| Mode | Namespace mapping | Namespace owner |
+|---|---|---|
+| `shared` (default) | All workspaces use one sandbox namespace. | The platform operator. |
+| `managed` | Each workspace uses `openshell-{gateway_id}-{workspace}`. | The OpenShell Kubernetes driver. |
+| `operator` | Each workspace maps to a pre-provisioned namespace on an operator allowlist. | The platform operator. |
+
+[RFC 0011](https://github.com/NVIDIA/OpenShell/tree/main/rfc/0011-multi-player-design#kubernetes-compute-driver-workspace-mapping)
+explains the workspace-to-namespace design. The table above reflects the current
+driver modes and default.
+
+## Configure Managed Workspaces
+
+Use managed mode when the gateway should create and delete a Kubernetes
+namespace for each OpenShell workspace. Start with a working
+[Kubernetes installation](/kubernetes/setup): the Agent Sandbox controller and
+CRDs must be installed, and the cluster CNI must enforce ingress and egress
+`NetworkPolicy` in every sandbox namespace.
+
+Set the Kubernetes driver mode in the Helm values file:
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    workspace_mode: managed
+```
+
+Install or upgrade the gateway with those values:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  -f my-values.yaml
+```
+
+Keep the chart-managed cluster RBAC enabled, or have a cluster administrator
+apply the rendered `ClusterRole` and `ClusterRoleBinding` before installing as
+a namespace administrator. Managed mode needs cluster-scoped permissions to
+create and delete namespaces and to manage sandbox resources in them. See
+[Installing without cluster-admin](/kubernetes/setup#installing-without-cluster-admin)
+for the separate RBAC procedure. The driver creates the sandbox
+`ServiceAccount` in each managed namespace; do not install the
+`openshell-workspace` chart there.
+
+<Note>
+If this gateway already runs sandboxes in `shared` mode, plan their removal or
+migration before changing `workspace_mode`. The new mode maps workspaces to
+different Kubernetes namespaces; it does not move existing sandbox resources.
+</Note>
+
+The chart uses its fullname as the default `gateway_id`. With the default
+fullname `openshell`, workspace `team-ml` uses namespace
+`openshell-openshell-team-ml`. Keep the gateway ID stable after creating
+workspaces because it is part of their namespace names. The gateway ID and
+resulting namespace name must satisfy the Kubernetes DNS-1123 label limit of
+63 characters. See the [gateway configuration reference](/how-it-works/gateways/configuration#kubernetes)
+for the driver fields.
+
+## Create and Verify a Workspace
+
+A Platform Admin creates the OpenShell workspace. Creating the workspace record
+alone does not create its Kubernetes namespace. The driver creates the namespace
+and sandbox `ServiceAccount` when an operation first needs them, such as
+provisioning a sandbox:
+
+```shell
+openshell workspace create --name team-ml
+openshell sandbox create --workspace team-ml
+```
+
+In an OIDC deployment, assign a Workspace Admin or Workspace User membership
+before that person uses the workspace. See
+[Create a Workspace and Add Members](/how-it-works/workspaces#create-a-workspace-and-add-members).
+
+Check the namespace after the sandbox is provisioned:
+
+```shell
+kubectl get namespace openshell-openshell-team-ml
+kubectl -n openshell-openshell-team-ml get serviceaccount openshell-sandbox
+```
+
+Replace the namespace name if you use another chart fullname or gateway ID.
+The gateway labels managed namespaces with `openshell.ai/managed-by=openshell`,
+`openshell.ai/gateway-id`, and `openshell.ai/sandbox-workspace`.
+
+### Pull Images from a Private Registry
+
+If the sandbox images require an image-pull Secret, create that Secret in the
+configured source namespace (`server.sandboxNamespace`, which defaults to the
+Helm release namespace) and list its name in the gateway values:
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    workspace_mode: managed
+    image_pull_secrets: [regcred]
+```
+
+The driver copies each configured Secret into a managed workspace namespace
+for each sandbox runtime generation. It removes the copy with that generation.
+See the [Kubernetes driver configuration](/how-it-works/gateways/configuration#kubernetes)
+for other image settings.
+
+## Remove a Managed Workspace
+
+Delete the workspace through OpenShell after removing its sandboxes and other
+workspace resources:
+
+```shell
+openshell workspace delete team-ml
+```
+
+The gateway asks the Kubernetes driver to delete the managed namespace during
+workspace deletion. Do not delete the namespace directly while the OpenShell
+workspace still exists. See [Delete a Workspace](/how-it-works/workspaces#delete-a-workspace)
+for the full list of resources that must be removed first.
+
+## Use Operator-Managed Namespaces
+
+If your platform provisions workspace namespaces, use `operator` mode instead.
+Configure either `operator_namespace_label` or `operator_namespace_file` in
+`gatewayConfig.openshell.drivers.kubernetes`, then install the
+`openshell-workspace` chart in each allowlisted namespace. The gateway does not
+create or delete those namespaces. See
+[Split gateway and workspace releases](/kubernetes/setup#split-gateway-and-workspace-releases).

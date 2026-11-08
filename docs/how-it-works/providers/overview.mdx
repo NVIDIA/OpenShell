@@ -141,6 +141,45 @@ does not activate static credentials from a profileless provider because it
 cannot determine which credential definition applies.
 </Warning>
 
+## Retrieve Runtime Credentials
+
+An [mTLS operator](/how-it-works/gateways/authentication#mtls-operators) can call
+`openshell.v1.OpenShell/GetProviderCredentials` through the
+[Python SDK](/sdk/python#retrieve-provider-credentials),
+[TypeScript SDK](/sdk/typescript#retrieve-provider-credentials), or a generated/raw
+gRPC client. Select one explicit workspace, one provider by canonical name, and
+between 1 and 32 runtime environment keys. For example, the request body for a
+GitHub provider is:
+
+```json
+{
+  "workspace_scope": { "workspace": "default" },
+  "name": "my-github",
+  "credential_keys": ["GITHUB_TOKEN"]
+}
+```
+
+The response maps each selected key to its `value` and optional
+`expiration_time`. The gateway returns all selected values or an error. It
+reuses sufficiently valid credentials and refreshes gateway-managed credentials
+when necessary. `minimum_remaining_lifetime` accepts a protobuf duration up to
+24 hours; omission or zero uses a five-minute safety margin. Non-expiring static
+credentials satisfy the lifetime requirement. A credential that cannot meet the
+requested lifetime causes the call to fail.
+
+OAuth refresh-managed credentials return access tokens, never gateway-only
+refresh tokens, client secrets, or signing material. Supervisor-side,
+endpoint-specific, and SPIFFE-bound dynamic grants return `FAILED_PRECONDITION`.
+Refresh effects can persist even if another selected key causes the request to
+fail. An uncertain rotating-token exchange requires reauthorization or refresh
+reconfiguration rather than an automatic retry.
+
+<Warning>
+Retrieval exports real credential values outside sandbox endpoint enforcement.
+Keep them out of logs, command history, and shared output. Ordinary users and
+OIDC admins cannot call this RPC. No dedicated CLI command is provided.
+</Warning>
+
 ## Manage Providers
 
 List, inspect, update, and delete providers from the active gateway.
@@ -200,6 +239,35 @@ openshell provider update my-graph \
 ```
 
 Use `0` as the timestamp to clear expiry for a credential key.
+
+## Label a Provider
+
+Attach labels when you create a provider to track environment or team ownership.
+Repeat `--label` for each key-value pair. This example uses the imported `pypi`
+profile, which requires no static credentials.
+
+```shell
+openshell provider create --name public-pypi --type pypi --label env=dev --label team=ml
+```
+
+List providers that match every key-value pair in a comma-separated selector.
+Filtering applies before pagination and only returns providers in the selected
+workspace. Platform Admins can filter across workspaces with `--all-workspaces`.
+
+```shell
+openshell provider list --label-selector env=dev,team=ml
+openshell provider list --all-workspaces --label-selector team=ml --output json
+openshell provider get public-pypi
+```
+
+`get` displays attached labels. JSON and YAML list output also include labels.
+When continuing a paginated list with `--page-token`, keep the selector and
+workspace scope unchanged.
+
+API clients set `CreateProviderRequest.provider.metadata.labels` and filter with
+`ListProvidersRequest.label_selector`. The gateway returns labels in
+`provider.metadata.labels`. Provider updates preserve existing labels and do
+not change them, so set labels during creation.
 
 ## Credential Refresh
 
@@ -341,6 +409,12 @@ and `openshell sandbox provider detach`. See
 
 </Info>
 
+Provider attachment checks credential inspection against the latest saved sandbox
+policy, falling back to the creation policy only when no revision exists. If a
+current rule permits uninspected traffic to a credentialed endpoint, configure
+L7 inspection or remove the rule before attaching the provider. Use
+`allow_uninspected_credentials: true` only for an intentional exception.
+
 ### Auto-Discovery Shortcut
 
 Name a provider with `--provider`. If no provider by that name exists and the
@@ -368,15 +442,19 @@ startup, OpenShell replaces each credential with an opaque placeholder token in
 the agent's environment. When the agent sends an HTTP request containing a
 placeholder, the proxy resolves it immediately before forwarding the request.
 
-Static credential resolution has two independent authorization boundaries:
+Static credential resolution has three independent authorization boundaries:
 
 1. Network policy must allow the calling binary and request destination.
 2. The credential binding must include the request host, port, and path. Profile
    endpoints provide the binding by default. An endpointless profile can use a
    sandbox policy endpoint that names the attached provider instance through
    `credential_binding.provider`.
+3. The request location must match the declared header, query parameter, or
+   path-template slot, or an explicitly enabled body/WebSocket rewrite policy.
+   Without placement metadata, static credentials resolve only in `Authorization`
+   or through those explicit rewrite policies.
 
-Both checks must pass. A provider profile endpoint does not grant network access
+All three checks must pass. A provider profile endpoint does not grant network access
 unless provider policy composition or the sandbox's own policy allows the
 request. A plain sandbox policy endpoint does not grant credential use unless
 the profile already covers it or the endpoint explicitly binds an endpointless
@@ -393,20 +471,47 @@ for endpoint matching and migration guidance.
 
 ### Supported injection locations
 
-The proxy resolves credential placeholders in the following parts of an HTTP request:
+The proxy automatically enforces declared placement when the gateway and
+supervisor support it. Moving a header credential into a query parameter, path,
+or unrelated header is denied before forwarding. A supporting supervisor defaults
+to `Authorization` when placement metadata is absent and rejects malformed
+metadata. Custom placements require a supporting gateway and an explicit profile
+declaration. Older supervisors keep their previous behavior.
 
 | Location | How the agent uses it | Example |
 |---|---|---|
-| Header value | Agent reads `$API_KEY` from env and places it in a header. | `Authorization: Bearer <placeholder>` |
+| Declared header value | Agent reads `$API_KEY` from env and places it in the declared header. | `Authorization: Bearer <placeholder>` |
 | Header value (Basic auth) | Agent base64-encodes `user:<placeholder>` in an `Authorization: Basic` header. The proxy decodes, resolves, and re-encodes. | `Authorization: Basic <base64>` |
-| Query parameter value | Agent places the placeholder in a URL query parameter. | `GET /api?key=<placeholder>` |
-| URL path segment | Agent builds a URL with the placeholder in the path. Supports concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
-| Supported request body | An inspected REST endpoint opts in with `request_body_credential_rewrite: true`. | `{"api_key":"<placeholder>"}` |
-| WebSocket text message | A REST or WebSocket endpoint opts in with `websocket_credential_rewrite: true`. | `{"token":"<placeholder>"}` |
+| Declared query parameter value | Agent uses the profile's `query_param`. | `GET /api?key=<placeholder>` |
+| Declared URL path slot | Agent uses the profile's `path_template`, including concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
 | AWS SigV4 signing | An endpoint configures `credential_signing`, and the proxy signs with the endpoint-bound AWS credentials. | `credential_signing: sigv4` |
 
 The proxy does not rewrite cookies, response content, unsupported request
 bodies, or WebSocket binary frames.
+
+Explicit endpoint policies can enable credential rewriting in request bodies
+or WebSocket text messages. WebSocket text message rewriting requires
+`protocol: websocket`. These flags do not authorize arbitrary query
+parameters, path slots, or unrelated headers. See [Profiles](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding)
+for placement configuration and upgrade requirements.
+
+### Clients that parse JWT claims
+
+A trusted launcher can wrap an issued placeholder in a JWT-shaped alias when a
+client needs local account metadata. Keep the original placeholder suffix in
+the signature segment:
+
+```text
+base64url(header).base64url(claims).OPENSHELL-RESOLVE-ENV-<issued-placeholder-suffix>
+```
+
+For example, a placeholder beginning `openshell:resolve:env:s` becomes a JWT
+whose signature begins `OPENSHELL-RESOLVE-ENV-s`, retaining the entire handle and
+environment key. Use the placeholder supplied to the running workload; do not
+substitute a bare environment key or manufacture a handle. OpenShell replaces
+the entire alias with the resolved credential and preserves its endpoint,
+authorization-epoch, and expiry checks. The claims supply local metadata only;
+the alias is not a signed identity token or an upstream credential.
 
 ### Fail-closed behavior
 

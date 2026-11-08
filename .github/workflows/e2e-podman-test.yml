@@ -17,11 +17,11 @@ on:
         required: false
         type: string
         default: ""
-      external-driver-binary:
+      prebuilt-conformance:
         required: false
-        type: string
-        default: ""
-      conformance-artifact-prefix:
+        type: boolean
+        default: false
+      external-driver-binary:
         required: false
         type: string
         default: ""
@@ -57,7 +57,7 @@ jobs:
 
       - uses: ./.github/actions/setup-e2e-cli
         with:
-          conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
+          conformance: ${{ inputs.prebuilt-conformance }}
 
       - uses: ./.github/actions/setup-e2e-gateway
         with:

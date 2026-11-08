@@ -11,7 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-bundled-z3 = ["z3/bundled"]
+vendored-z3 = ["z3/vendored"]
 prebuilt-z3 = ["z3/gh-release"]
 
 [dependencies]

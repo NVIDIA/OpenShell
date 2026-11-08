@@ -106,30 +106,21 @@ pub const PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
 /// fail-closes on unknown persisted values for defense in depth.
 pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
 
-/// Allowed values for `ocsf_schema_version`.
-///
-/// Only versions with actual downgrade transforms in
-/// `openshell_ocsf::format::downgrade` are accepted. Empty string disables
-/// downgrade (equivalent to unsetting the key). Malformed or unsupported
-/// versions (e.g. `"banana"`, `"1.6"`) are rejected at configure time.
-pub const OCSF_SCHEMA_VERSION_VALUES: &[&str] = &["", "1.1", "1.3"];
-
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
-    // When true the sandbox writes OCSF v1.8.0 JSONL records to
-    // `/var/log/openshell-ocsf*.log` (daily rotation, 3 files) in addition
-    // to the human-readable shorthand log. Defaults to false (no JSONL written).
+    // When true the supervisor emits OCSF-JSON records to stderr and writes
+    // JSONL to `/var/log/openshell-ocsf*.jsonl` when file logging is available.
+    // Defaults to false; shorthand output remains unchanged.
     RegisteredSetting {
         key: "ocsf_json_enabled",
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
-    // Target OCSF schema version for JSONL downgrade. When set (e.g. "1.1"
-    // or "1.3"), the JSONL layer strips fields and profiles that don't exist
-    // in the target version. Empty or unset means no downgrade.
+    // Deprecated and ignored: OpenShell emits OCSF 1.8.0 only. Still
+    // registered so existing values load; the supervisor reports a set value.
     RegisteredSetting {
         key: "ocsf_schema_version",
         kind: SettingValueKind::String,
-        allowed_string_values: Some(OCSF_SCHEMA_VERSION_VALUES),
+        allowed_string_values: None,
     },
     // Sandbox-level opt-in for the agent-driven policy proposal surface.
     // See AGENT_POLICY_PROPOSALS_ENABLED_KEY for details. Defaults to false.
@@ -176,9 +167,8 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OCSF_SCHEMA_VERSION_VALUES, PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES,
-        REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
-        registered_keys_csv, setting_for_key,
+        PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES, REGISTERED_SETTINGS,
+        RegisteredSetting, SettingValueKind, parse_bool_like, registered_keys_csv, setting_for_key,
     };
 
     #[test]
@@ -243,33 +233,15 @@ mod tests {
         }
     }
 
-    // ---- ocsf_schema_version validation ----
+    // ---- ocsf_schema_version (deprecated) ----
 
     #[test]
-    fn ocsf_schema_version_accepts_supported_versions() {
+    fn deprecated_ocsf_schema_version_accepts_any_value() {
         let setting = setting_for_key("ocsf_schema_version")
-            .expect("ocsf_schema_version should be registered");
+            .expect("ocsf_schema_version should stay registered while deprecated");
         assert_eq!(setting.kind, SettingValueKind::String);
-        assert_eq!(
-            setting.allowed_string_values,
-            Some(OCSF_SCHEMA_VERSION_VALUES)
-        );
-        assert!(setting.validate_string_value("").is_ok());
-        assert!(setting.validate_string_value("1.1").is_ok());
-        assert!(setting.validate_string_value("1.3").is_ok());
-    }
-
-    #[test]
-    fn ocsf_schema_version_rejects_malformed_and_unsupported() {
-        let setting = setting_for_key("ocsf_schema_version")
-            .expect("ocsf_schema_version should be registered");
-        for bad in [
-            "banana", "1.6", "1.5", "1.7", "1.7.0", "1.1.0", "2.0", " 1.1", "1.1 ", "v1.1",
-        ] {
-            let err = setting
-                .validate_string_value(bad)
-                .expect_err(&format!("expected '{bad}' to be rejected"));
-            assert_eq!(err, OCSF_SCHEMA_VERSION_VALUES);
+        for value in ["", "1.3", "anything"] {
+            assert!(setting.validate_string_value(value).is_ok(), "{value}");
         }
     }
 

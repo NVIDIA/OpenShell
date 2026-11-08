@@ -11,21 +11,23 @@ on:
         required: false
         type: string
         default: ""
+      source-sha:
+        description: Candidate source revision; defaults to the artifact run head SHA
+        required: false
+        type: string
+        default: ""
       category:
         description: Integration-test category, used for the job name and concurrency key
         required: true
         type: string
-        default: conformance
+        default: driver-specific
       test-matrix:
         description: JSON array of environment, installer, and testsuite combinations
         required: true
         type: string
         default: >-
           [
-            {"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"conformance"},
-            {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
-            {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"conformance"},
-            {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"conformance"}
+            {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"}
           ]
 
 permissions:
@@ -38,6 +40,9 @@ jobs:
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
       artifact-run-id: ${{ inputs['artifact-run-id'] }}
+      source-sha: ${{ inputs['source-sha'] }}
+      deb-artifact-name: ${{ contains(inputs.test-matrix, '"deb"') && 'deb-linux-amd64' || '' }}
+      rpm-artifact-name: ${{ contains(inputs.test-matrix, '"rpm"') && 'rpm-linux-x86_64' || '' }}
 
   integration:
     needs: prepare

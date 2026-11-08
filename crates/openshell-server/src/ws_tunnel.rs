@@ -30,6 +30,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use crate::ServerState;
+use crate::auth::audit::ConnectionSource;
 
 /// Create the WebSocket tunnel router.
 pub fn router(state: Arc<ServerState>) -> Router {
@@ -63,7 +64,10 @@ async fn handle_ws_tunnel(
     let (tunnel_read, tunnel_write) = tokio::io::split(tunnel_stream);
 
     let service_task = tokio::spawn(async move {
-        if let Err(e) = service.serve(service_stream).await {
+        if let Err(e) = service
+            .serve(service_stream, ConnectionSource::EdgeTunnel)
+            .await
+        {
             debug!(error = %e, "WS tunnel: multiplex service error");
         }
     });

@@ -116,7 +116,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 
     // NOTE: Detail popup overlay is now rendered by draw_sandbox_screen() in
-    // mod.rs using frame.size() so it renders over the full screen, not
+    // mod.rs using frame.area() so it renders over the full screen, not
     // constrained to this pane.
 }
 
