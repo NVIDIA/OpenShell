@@ -14,7 +14,7 @@ pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
 mod service;
 pub mod service_advertisement;
-mod service_discovery;
+pub mod service_discovery;
 mod validation;
 pub mod workspace;
 
@@ -526,22 +526,6 @@ impl OpenShell for OpenShellService {
         request: Request<ListServicesRequest>,
     ) -> Result<Response<ListServicesResponse>, Status> {
         service::handle_list_services(&self.state, request).await
-    }
-
-    async fn get_service_route_snapshot(
-        &self,
-        request: Request<openshell_core::proto::GetServiceRouteSnapshotRequest>,
-    ) -> Result<Response<openshell_core::proto::GetServiceRouteSnapshotResponse>, Status> {
-        service_discovery::get_snapshot(&self.state, request).await
-    }
-
-    type WatchServiceRoutesStream = service_discovery::RouteWatchStream;
-
-    async fn watch_service_routes(
-        &self,
-        request: Request<openshell_core::proto::WatchServiceRoutesRequest>,
-    ) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
-        service_discovery::watch(&self.state, request).await
     }
 
     async fn delete_service(
@@ -1450,5 +1434,24 @@ mod tests {
         assert_eq!(public.implementation_name, "openshell/vault");
         assert_eq!(public.protocol_major, 1);
         assert_eq!(public.protocol_minor, 2);
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::service_discovery_server::ServiceDiscovery for OpenShellService {
+    async fn get_service_route_snapshot(
+        &self,
+        request: Request<openshell_core::proto::GetServiceRouteSnapshotRequest>,
+    ) -> Result<Response<openshell_core::proto::GetServiceRouteSnapshotResponse>, Status> {
+        service_discovery::get_snapshot(&self.state, request).await
+    }
+
+    type WatchServiceRoutesStream = service_discovery::RouteWatchStream;
+
+    async fn watch_service_routes(
+        &self,
+        request: Request<openshell_core::proto::WatchServiceRoutesRequest>,
+    ) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+        service_discovery::watch(&self.state, request).await
     }
 }

@@ -19,6 +19,7 @@ use hyper_util::{
 use metrics::{counter, histogram};
 use openshell_core::proto::open_shell_server::OpenShellServer;
 use openshell_core::proto::sandbox_updates_server::SandboxUpdatesServer;
+use openshell_core::proto::service_discovery_server::ServiceDiscoveryServer;
 use openshell_core::proto::supervisor_host::v1::supervisor_host_server::SupervisorHostServer;
 use openshell_core::{
     Config,
@@ -313,6 +314,13 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
+        let discovery = ServiceDiscoveryServer::new(OpenShellService::new(self.state.clone()))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let discovery = GatewayInterceptorGrpcService::new(
+            discovery,
+            self.state.gateway_interceptors.clone(),
+            Some(self.state.clone()),
+        );
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -320,7 +328,9 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, reflection).with_sandbox_updates(sandbox_updates),
+            GrpcRouter::new(openshell, reflection)
+                .with_sandbox_updates(sandbox_updates)
+                .with_discovery(discovery),
             authenticator_chain,
             authz_policy,
             self.state
@@ -997,10 +1007,11 @@ where
 
 /// Combined gRPC service for public gateway services and reflection.
 #[derive(Clone)]
-pub struct GrpcRouter<N, R, U = N> {
+pub struct GrpcRouter<N, R, U = N, D = N> {
     openshell: N,
     reflection: R,
     sandbox_updates: Option<U>,
+    discovery: Option<D>,
 }
 
 impl<N, R> GrpcRouter<N, R> {
@@ -1009,6 +1020,7 @@ impl<N, R> GrpcRouter<N, R> {
             openshell,
             reflection,
             sandbox_updates: None,
+            discovery: None,
         }
     }
 
@@ -1017,13 +1029,25 @@ impl<N, R> GrpcRouter<N, R> {
             openshell: self.openshell,
             reflection: self.reflection,
             sandbox_updates: Some(sandbox_updates),
+            discovery: self.discovery,
+        }
+    }
+}
+
+impl<N, R, U, D> GrpcRouter<N, R, U, D> {
+    fn with_discovery<T>(self, discovery: T) -> GrpcRouter<N, R, U, T> {
+        GrpcRouter {
+            openshell: self.openshell,
+            reflection: self.reflection,
+            sandbox_updates: self.sandbox_updates,
+            discovery: Some(discovery),
         }
     }
 }
 
 pub const REFLECTION_PATH_PREFIX: &str = "/grpc.reflection.v1.";
 
-impl<N, R, U, B> tower::Service<Request<B>> for GrpcRouter<N, R, U>
+impl<N, R, U, D, B> tower::Service<Request<B>> for GrpcRouter<N, R, U, D>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
@@ -1039,6 +1063,11 @@ where
         + Send
         + 'static,
     U::Future: Send,
+    D: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    D::Future: Send,
     B: Send + 'static,
 {
     type Response = N::Response;
@@ -1058,6 +1087,13 @@ where
             .path()
             .starts_with("/openshell.v1.SandboxUpdates/")
             && let Some(mut svc) = self.sandbox_updates.clone()
+        {
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if req
+            .uri()
+            .path()
+            .starts_with("/openshell.v1.ServiceDiscovery/")
+            && let Some(mut svc) = self.discovery.clone()
         {
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {
@@ -1276,7 +1312,7 @@ where
                     )));
                 }
                 Principal::Operator(operator)
-            } else if let Some(chain) = chain {
+            } else if let Some(chain) = &chain {
                 match chain.authenticate(req.headers(), &path).await {
                     Ok(Authentication::Accepted(p)) => p,
                     Ok(outcome) => match (mtls_auth_enabled, peer_identity) {
@@ -1397,6 +1433,18 @@ where
                 return Ok(status_response(status));
             }
 
+            if path.starts_with("/openshell.v1.ServiceDiscovery/")
+                && req.headers().contains_key(http::header::AUTHORIZATION)
+                && let Some(chain) = &chain
+            {
+                let recheck = crate::grpc::service_discovery::BearerRecheck {
+                    chain: chain.clone(),
+                    headers: req.headers().clone(),
+                    policy: authz_policy.clone(),
+                    path: path.clone(),
+                };
+                req.extensions_mut().insert(recheck);
+            }
             req.extensions_mut().insert(principal);
             let call = inner.ready().await?.call(req);
             audit::with_request(path, origin, call).await
@@ -2945,11 +2993,14 @@ mod tests {
             calls: calls.clone(),
         };
         let mut router = GrpcRouter::new(service("openshell"), service("reflection"))
-            .with_sandbox_updates(service("sandbox_updates"));
+            .with_sandbox_updates(service("sandbox_updates"))
+            .with_discovery(service("discovery"));
 
         for path in [
             "/openshell.v1.OpenShell/Health",
             "/openshell.v1.SandboxUpdates/UpdateSandbox",
+            "/openshell.v1.ServiceDiscovery/GetServiceRouteSnapshot",
+            "/openshell.v1.ServiceDiscovery/WatchServiceRoutes",
             "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
         ] {
             router
@@ -2965,7 +3016,13 @@ mod tests {
 
         assert_eq!(
             *calls.lock().unwrap(),
-            vec!["openshell", "sandbox_updates", "reflection"]
+            vec![
+                "openshell",
+                "sandbox_updates",
+                "discovery",
+                "discovery",
+                "reflection"
+            ]
         );
     }
 
@@ -3064,7 +3121,11 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
+            vec![
+                "openshell.v1.OpenShell",
+                "openshell.v1.SandboxUpdates",
+                "openshell.v1.ServiceDiscovery"
+            ]
         );
 
         let descriptor_response = responses.message().await.unwrap().unwrap();
