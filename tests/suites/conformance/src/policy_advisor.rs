@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use testkit::sdk::raw::proto;
-use testkit::{Context, Error, Sandbox};
+use testkit::{Context, Error, ResultExt as _, Sandbox};
 
 const READY_TIMEOUT: Duration = Duration::from_mins(4);
 const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -161,12 +161,13 @@ async fn denied_address_produces_draft_rule(cx: &mut Context) -> testkit::Result
             "printf 'BINARY=%s\\n' \"$(readlink -f /proc/$$/exe)\"; \
              if exec 3<>/dev/tcp/1.1.1.1/443; then echo UNEXPECTED_ALLOWED; exit 1; else echo DENIED; fi",
         ])
-        .await?;
+        .await?
+        .success()
+        .context("the connection to 1.1.1.1:443 must be denied")?;
     testkit::ensure!(
-        probe.exit_code == 0 && probe.stdout.lines().any(|line| line == "DENIED"),
-        "the connection to 1.1.1.1:443 was not denied: stdout {:?}, stderr {:?}",
-        probe.stdout,
-        probe.stderr
+        probe.stdout.lines().any(|line| line == "DENIED"),
+        "the connection to 1.1.1.1:443 was not denied: stdout {:?}",
+        probe.stdout
     );
     let binary = probe
         .stdout
@@ -199,12 +200,13 @@ async fn denied_hostname_produces_draft_rule(cx: &mut Context) -> testkit::Resul
             "-c",
             "if exec 3<>/dev/tcp/pypi.org/80; then echo UNEXPECTED_ALLOWED; exit 1; else echo DENIED; fi",
         ])
-        .await?;
+        .await?
+        .success()
+        .context("the connection to pypi.org:80 must be denied")?;
     testkit::ensure!(
-        probe.exit_code == 0 && probe.stdout.lines().any(|line| line == "DENIED"),
-        "the connection to pypi.org:80 was not denied: stdout {:?}, stderr {:?}",
-        probe.stdout,
-        probe.stderr
+        probe.stdout.lines().any(|line| line == "DENIED"),
+        "the connection to pypi.org:80 was not denied: stdout {:?}",
+        probe.stdout
     );
 
     expect_draft(
@@ -289,13 +291,13 @@ async fn bash_path(sandbox: &Sandbox) -> testkit::Result<String> {
             "-c",
             "printf '%s\\n' \"$(readlink -f /proc/$$/exe)\"",
         ])
-        .await?;
+        .await?
+        .success()?;
     let path = output.stdout.trim();
     testkit::ensure!(
-        output.exit_code == 0 && is_bash_path(path),
-        "expected one absolute Bash path; got {:?}, stderr {:?}",
-        output.stdout,
-        output.stderr
+        is_bash_path(path),
+        "expected one absolute Bash path; got {:?}",
+        output.stdout
     );
     Ok(path.to_string())
 }
@@ -326,13 +328,9 @@ async fn policy_local(
             path,
             body,
         ])
-        .await?;
-    testkit::ensure!(
-        output.exit_code == 0,
-        "{method} http://policy.local{path} exited {}; stderr: {}",
-        output.exit_code,
-        output.stderr
-    );
+        .await?
+        .success()
+        .context(format!("{method} http://policy.local{path}"))?;
     let (headers, json) = output.stdout.split_once("\r\n\r\n").ok_or_else(|| {
         Error::msg(format!(
             "{method} http://policy.local{path} returned no complete HTTP response: {:?}",

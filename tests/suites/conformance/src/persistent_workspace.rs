@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use testkit::{Context, Poll};
+use testkit::{Context, Poll, ResultExt as _};
 
 /// Files in the workspace survive stop and start, and start runs the main
 /// command again.
@@ -31,19 +31,15 @@ async fn persistent_workspace_survives_stop_start(cx: &mut Context) -> testkit::
     sandbox.wait_ready().await?;
 
     let sentinel = format!("openshell-stop-start-{}", cx.run_id());
-    let write = sandbox
+    sandbox
         .exec([
             "sh",
             "-c",
             &format!("printf '%s\\n' '{sentinel}' > '{SENTINEL}' && sync"),
         ])
-        .await?;
-    testkit::ensure!(
-        write.exit_code == 0,
-        "writing the sentinel exited {}; stderr: {}",
-        write.exit_code,
-        write.stderr
-    );
+        .await?
+        .success()
+        .context("write the sentinel")?;
 
     sandbox.stop().await?;
     sandbox.start().await?;
