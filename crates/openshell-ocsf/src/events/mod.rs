@@ -140,6 +140,18 @@ impl OcsfEvent {
         }
     }
 
+    /// Context-derived sandbox attribution, never request-supplied resources.
+    #[must_use]
+    pub fn sandbox_id(&self) -> Option<&str> {
+        self.base()
+            .device
+            .as_ref()
+            .and_then(|device| device.container.as_ref())
+            .and_then(|container| container.uid.as_deref())
+            .or_else(|| self.base().unmapped.as_ref()?.get("sandbox_id")?.as_str())
+            .filter(|id| !id.is_empty())
+    }
+
     /// Returns the base event data common to all event classes.
     #[must_use]
     pub fn base(&self) -> &BaseEventData {
@@ -154,6 +166,22 @@ impl OcsfEvent {
             Self::DeviceConfigStateChange(e) => &e.base,
             Self::ApiActivity(e) => &e.base,
             Self::Base(e) => &e.base,
+        }
+    }
+
+    /// Returns mutable base data common to all event classes.
+    pub(crate) fn base_mut(&mut self) -> &mut BaseEventData {
+        match self {
+            Self::NetworkActivity(e) => &mut e.base,
+            Self::HttpActivity(e) => &mut e.base,
+            Self::SshActivity(e) => &mut e.base,
+            Self::ProcessActivity(e) => &mut e.base,
+            Self::Authentication(e) => &mut e.base,
+            Self::DetectionFinding(e) => &mut e.base,
+            Self::ApplicationLifecycle(e) => &mut e.base,
+            Self::DeviceConfigStateChange(e) => &mut e.base,
+            Self::ApiActivity(e) => &mut e.base,
+            Self::Base(e) => &mut e.base,
         }
     }
 }

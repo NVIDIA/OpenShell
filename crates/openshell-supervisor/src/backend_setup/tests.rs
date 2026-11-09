@@ -159,7 +159,13 @@ impl TestSetup {
                 sandbox_token: SecretJwt::parse("test-sandbox-token").unwrap(),
                 sandbox_expires_at: i64::MAX,
                 ssh_host_private_key: None,
+                traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
+                agent_otlp_headers: None,
+                otlp_tls: Vec::new(),
+                traces_otlp_tls: None,
+                ocsf_otlp_tls: None,
+                agent_otlp_tls: None,
             },
             sandbox_id: "sandbox-1".to_string(),
             selected_name: TEST_BACKEND,
@@ -825,6 +831,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         .store(true, Ordering::SeqCst);
     let startup = |await_main_process_attachment| {
         let config = crate::SandboxInstanceConfig {
+            app_router: None,
             command: vec!["test-agent".into(), "test-argument".into()],
             workdir: Some("/test-workspace".into()),
             timeout_secs: 15,
@@ -833,7 +840,9 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             sandbox_id: Some(setup.sandbox_id.clone()),
             sandbox: None,
             container_image: String::new(),
+            container_image_uid: None,
             openshell_endpoint: None,
+            gateway_home: None,
             policy_rules: Some(rules.to_string_lossy().into_owned()),
             policy_data: Some(data.to_string_lossy().into_owned()),
             ssh_socket_path: None,
@@ -1030,6 +1039,7 @@ async fn suspend_signal_exits_without_terminating_boundary() {
     let setup = TestSetup::new();
     let startup = || {
         let config = crate::SandboxInstanceConfig {
+            app_router: None,
             command: vec!["test-agent".into(), "test-argument".into()],
             workdir: Some("/test-workspace".into()),
             timeout_secs: 15,
@@ -1038,7 +1048,9 @@ async fn suspend_signal_exits_without_terminating_boundary() {
             sandbox_id: Some(setup.sandbox_id.clone()),
             sandbox: None,
             container_image: String::new(),
+            container_image_uid: None,
             openshell_endpoint: None,
+            gateway_home: None,
             policy_rules: Some(rules.to_string_lossy().into_owned()),
             policy_data: Some(data.to_string_lossy().into_owned()),
             ssh_socket_path: None,

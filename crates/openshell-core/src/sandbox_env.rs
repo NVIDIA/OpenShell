@@ -20,6 +20,12 @@ pub const ENDPOINT: &str = "OPENSHELL_ENDPOINT";
 /// Unique identifier of the sandbox being supervised.
 pub const SANDBOX_ID: &str = "OPENSHELL_SANDBOX_ID";
 
+/// Requested workload image reference, recorded in supervisor OCSF events.
+pub const CONTAINER_IMAGE: &str = "OPENSHELL_CONTAINER_IMAGE";
+
+/// Immutable workload image ID resolved by the compute driver at launch.
+pub const CONTAINER_IMAGE_UID: &str = "OPENSHELL_CONTAINER_IMAGE_UID";
+
 /// Filesystem path to the UNIX socket used for the in-sandbox SSH server.
 pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 
@@ -180,6 +186,9 @@ impl SupervisorOtlp {
 /// supervisors do.
 pub const OTLP_ENDPOINT_FLAG: &str = "otlp-endpoint";
 pub const OTLP_PROTOCOL_FLAG: &str = "otlp-protocol";
+pub const OTLP_CA_FILE_FLAG: &str = "otlp-ca-file";
+pub const OTLP_CERT_FILE_FLAG: &str = "otlp-cert-file";
+pub const OTLP_KEY_FILE_FLAG: &str = "otlp-key-file";
 pub const OTLP_OCSF_ENDPOINT_FLAG: &str = "otlp-ocsf-endpoint";
 pub const OTLP_OCSF_PROTOCOL_FLAG: &str = "otlp-ocsf-protocol";
 pub const OTLP_AGENT_ENDPOINT_FLAG: &str = "otlp-agent-endpoint";
@@ -196,6 +205,18 @@ pub struct SupervisorOtlpArgs {
     /// Transport to the trace collector: `grpc` or `http/protobuf`.
     #[arg(long = OTLP_PROTOCOL_FLAG, env = OTLP_PROTOCOL, default_value_t)]
     pub protocol: OtlpProtocol,
+
+    /// PEM certificates trusted to verify an `https://` trace collector.
+    #[arg(long = OTLP_CA_FILE_FLAG, env = "OPENSHELL_OTLP_CA_FILE")]
+    pub ca_file: Option<std::path::PathBuf>,
+
+    /// PEM client certificate presented to the trace collector.
+    #[arg(long = OTLP_CERT_FILE_FLAG, env = "OPENSHELL_OTLP_CERT_FILE", requires = "key_file")]
+    pub cert_file: Option<std::path::PathBuf>,
+
+    /// PEM private key for `--otlp-cert-file`.
+    #[arg(long = OTLP_KEY_FILE_FLAG, env = "OPENSHELL_OTLP_KEY_FILE", requires = "cert_file")]
+    pub key_file: Option<std::path::PathBuf>,
 
     /// OTLP collector endpoint for supervisor OCSF event export.
     #[arg(long = OTLP_OCSF_ENDPOINT_FLAG, env = OTLP_OCSF_ENDPOINT)]
@@ -629,6 +650,49 @@ mod tests {
                 .supervisor_otlp(),
             SupervisorOtlp::default()
         );
+    }
+
+    #[cfg(feature = "clap")]
+    #[test]
+    fn driver_flags_read_the_trace_collectors_tls_files() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct Driver {
+            #[command(flatten)]
+            otlp: SupervisorOtlpArgs,
+        }
+
+        let driver = Driver::try_parse_from([
+            "driver",
+            "--otlp-endpoint",
+            "https://collector:4317",
+            "--otlp-ca-file",
+            "/etc/otlp/ca.pem",
+            "--otlp-cert-file",
+            "/etc/otlp/client.pem",
+            "--otlp-key-file",
+            "/etc/otlp/client-key.pem",
+        ])
+        .expect("TLS files should parse");
+        assert_eq!(
+            [
+                driver.otlp.ca_file.as_deref(),
+                driver.otlp.cert_file.as_deref(),
+                driver.otlp.key_file.as_deref()
+            ],
+            [
+                Some(std::path::Path::new("/etc/otlp/ca.pem")),
+                Some(std::path::Path::new("/etc/otlp/client.pem")),
+                Some(std::path::Path::new("/etc/otlp/client-key.pem"))
+            ]
+        );
+        for flag in ["--otlp-cert-file", "--otlp-key-file"] {
+            assert!(
+                Driver::try_parse_from(["driver", flag, "/etc/otlp/file.pem"]).is_err(),
+                "{flag} needs its pair"
+            );
+        }
     }
 
     #[test]

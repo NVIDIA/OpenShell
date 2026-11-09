@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Runs testkit suites in tmachine environments on CI. Each row of `ROWS` below
-# names a tmachine environment and installer, the family (a workspace under
-# tests/suites/) and the package in it, the gateway name the installer
-# registers, and the runner label for the environment's architecture.
-# `openshell-test-runner` builds the tests, boots the environment, runs them
-# inside it and checks the results. The `family` input selects the rows of one
-# family; leave it empty to run every row.
+# names a tmachine environment and installer, the family (the path of a
+# workspace under tests/suites/, such as conformance or drivers/podman) and,
+# optionally, the package in it, the gateway name the installer registers, and
+# the runner label for the environment's architecture. `openshell-test-runner`
+# builds the tests, boots the environment, runs them inside it and checks the
+# results. The `family` input selects the rows of one family, including the
+# workspaces under it (drivers selects drivers/podman); leave it empty to run
+# every row.
 
 name: E2E Suites
 
@@ -15,7 +17,7 @@ on:
   workflow_call:
     inputs:
       family:
-        description: Run only the rows of this family (for example conformance); empty runs every row
+        description: Run only the rows of this family and the workspaces under it (for example conformance or drivers); empty runs every row
         required: false
         type: string
         default: ""
@@ -62,17 +64,42 @@ jobs:
           # Only amd64 for now: CI has no arm64 runner with KVM for tmachine,
           # and the caller only builds amd64 inputs. The gateway is the name the
           # installer registers with the CLI: `openshell` for the packages,
-          # `tmachine` for the k3s installers.
+          # `tmachine` for the k3s and binaries installers. A row without a
+          # package runs every package in the workspace; each driver suite is a
+          # workspace of its own.
           rows='[
-            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"conformance","package":"sandbox","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootful","installer":"rpm","family":"conformance","package":"sandbox","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless","installer":"rpm","family":"conformance","package":"sandbox","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"ubuntu-k3s","installer":"k3s","family":"conformance","package":"sandbox","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"conformance","package":"sandbox","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"ubuntu-docker-rootful-keycloak","installer":"deb","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"}
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-k3s","installer":"k3s","family":"conformance","package":"conformance","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"conformance","package":"conformance","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful-keycloak","installer":"deb","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful","installer":"rpm","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless","installer":"rpm","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"host-gateway","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful","installer":"rpm","family":"features","package":"host-gateway","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless","installer":"rpm","family":"features","package":"host-gateway","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-k3s","installer":"k3s","family":"features","package":"host-gateway","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"features","package":"host-gateway","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-default","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-auto","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-keep-id","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-private","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-default","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-auto","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-keep-id","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-private","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"}
           ]'
-          matrix=$(jq -c --arg family "${FAMILY}" \
-            '{include: map(select($family == "" or .family == $family))}' <<< "$rows")
+          # `suite` names the row's tests in the job and artifact names.
+          matrix=$(jq -c --arg family "${FAMILY}" '{include: map(
+              select($family == "" or .family == $family or (.family | startswith($family + "/")))
+              | .package //= ""
+              | .suite = (if .package == "" then .family else "\(.family)/\(.package)" end)
+              | .artifact = ([.suite, .environment, .installer] | join("-") | gsub("/"; "-"))
+            )}' <<< "$rows")
           if [ "$(jq '.include | length' <<< "$matrix")" -eq 0 ]; then
             echo "::error::No E2E suites match family '${FAMILY}'"
             exit 1
@@ -81,7 +108,7 @@ jobs:
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
 
   suites:
-    name: E2E suites (${{ matrix.family }}/${{ matrix.package }}, ${{ matrix.environment }}, ${{ matrix.installer }})
+    name: E2E suites (${{ matrix.suite }}, ${{ matrix.environment }}, ${{ matrix.installer }})
     needs: select
     strategy:
       fail-fast: false
@@ -145,11 +172,15 @@ jobs:
           # Retry dependency preparation, then run the suites once. The runner
           # builds the suites for the guest, so it needs no prepared archives.
           nix build --no-link .#openshell-test-runner || nix build --no-link .#openshell-test-runner
+          packages=()
+          if [ -n "${PACKAGE}" ]; then
+            packages=(--package "${PACKAGE}")
+          fi
           nix run .#openshell-test-runner -- \
             --environment "${ENVIRONMENT}" \
             --installer "${INSTALLER}" \
             --family "${FAMILY}" \
-            --package "${PACKAGE}" \
+            "${packages[@]}" \
             --gateway "${GATEWAY}" \
             --results artifacts/test-results
 
@@ -162,7 +193,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: e2e-results-${{ matrix.family }}-${{ matrix.package }}-${{ matrix.environment }}-${{ matrix.installer }}
+          name: e2e-results-${{ matrix.artifact }}
           path: artifacts/test-results
           if-no-files-found: ignore
           retention-days: 7

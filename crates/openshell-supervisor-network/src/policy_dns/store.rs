@@ -433,7 +433,7 @@ impl ResolvedEndpointStore {
             if allocated.saturating_mul(5) >= capacity.saturating_mul(4)
                 && !emitted.swap(true, Ordering::Relaxed)
             {
-                openshell_ocsf::ocsf_emit!(build_pool_high_water_event(
+                crate::telemetry::egress_emit!(build_pool_high_water_event(
                     allocated, capacity, family,
                 ));
             }

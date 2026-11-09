@@ -62,14 +62,14 @@ requests through `policy.local`. See [TESTING.md](../../TESTING.md#rust-cli-e2e)
 for the supported source and installed-artifact test paths.
 
 To run only the policy-related conformance tests against an installed
-candidate, run the `policy-advisor` suite of the `sandbox` package through the
+candidate, run the `policy-advisor` suite of the `conformance` crate through the
 test runner:
 
 ```bash
 nix run .#openshell-test-runner -- \
   --environment ubuntu-docker-rootful --installer deb \
-  --family conformance --package sandbox \
-  --filter 'binary_id(=sandbox::policy_advisor)'
+  --family conformance --package conformance \
+  --filter 'test(/^policy_advisor::/)'
 ```
 
 The GitHub write test above and the regressions below still exercise distinct

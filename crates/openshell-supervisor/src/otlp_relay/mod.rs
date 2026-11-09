@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use openshell_core::jwt::{OtlpTlsMaterial, SecretOtlpHeaders};
 use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_isolation_interface::contract::BoundaryDuplexStream;
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
@@ -227,6 +228,10 @@ pub struct OtlpRelayConfig {
     pub endpoint: String,
     /// Transport to the collector (`OPENSHELL_OTLP_AGENT_PROTOCOL`).
     pub protocol: OtlpProtocol,
+    /// Headers sent with every export, from the launch bundle.
+    pub headers: Option<SecretOtlpHeaders>,
+    /// TLS material for an `https://` collector, from the launch bundle.
+    pub tls: Option<OtlpTlsMaterial>,
     /// Sandbox identifier attached to every forwarded resource.
     pub sandbox_id: String,
 }
@@ -237,23 +242,26 @@ pub enum StartError {
     /// The collector endpoint is empty or not a URI, judged the same way as
     /// for the supervisor's own exporter.
     InvalidEndpoint(openshell_otel::SetupError),
-    /// The collector endpoint is a URI the exporter does not accept.
+    /// The exporter could not be set up for the endpoint.
     Transport(exporter::EndpointError),
-    /// The collector endpoint uses a scheme the relay does not speak. The
-    /// relay forwards over plaintext only, so an `https` endpoint keeps
-    /// it inactive rather than downgrading; the supervisor's own exporter
-    /// does speak TLS. TLS on the relayed hop is a tracked follow-up.
+    /// The collector endpoint uses a scheme other than `http` or `https`.
     UnsupportedScheme(String),
+    /// The TLS material from the launch bundle is unusable.
+    Tls(openshell_otel::TlsError),
+    /// TLS material was given for an `http` endpoint.
+    TlsWithoutHttps,
 }
 
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidEndpoint(error) => write!(f, "invalid collector endpoint: {error}"),
-            Self::Transport(error) => write!(f, "invalid collector endpoint: {error}"),
+            Self::Transport(error) => write!(f, "collector transport could not be set up: {error}"),
+            Self::Tls(error) => write!(f, "unusable collector TLS material: {error}"),
+            Self::TlsWithoutHttps => f.write_str("collector TLS material needs an https endpoint"),
             Self::UnsupportedScheme(scheme) => write!(
                 f,
-                "unsupported collector endpoint scheme {scheme:?}: the relay speaks plaintext OTLP (http) only"
+                "unsupported collector endpoint scheme {scheme:?}: use http or https"
             ),
         }
     }
@@ -316,18 +324,43 @@ fn relay_addr() -> SocketAddr {
 /// Starts the relay for `config`. Must be called inside a tokio runtime.
 ///
 /// Returns the relay handle and the reserved destination to install in the
-/// network proxy. Fails only when the endpoint is not a valid plaintext URI;
-/// an unreachable collector is handled lazily by the exporter. Surrounding
+/// network proxy. Fails only when the endpoint is not a valid `http` or
+/// `https` URI or the TLS material is unusable; an unreachable collector is
+/// handled lazily by the exporter. Surrounding
 /// whitespace is trimmed, as for the supervisor's own exporter.
 pub fn start(config: OtlpRelayConfig) -> Result<(OtlpRelay, ReservedDestination), StartError> {
     let (endpoint, uri) = openshell_otel::validated_endpoint(&config.endpoint)
         .map_err(StartError::InvalidEndpoint)?;
     if let Some(scheme) = uri.scheme_str()
         && !scheme.eq_ignore_ascii_case("http")
+        && !scheme.eq_ignore_ascii_case("https")
     {
         return Err(StartError::UnsupportedScheme(scheme.to_string()));
     }
-    let exporter = Exporter::new(endpoint, config.protocol).map_err(StartError::Transport)?;
+    let tls = config
+        .tls
+        .as_ref()
+        .map(OtlpTlsMaterial::otlp_tls)
+        .transpose()
+        .map_err(StartError::Tls)?;
+    let https = uri
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"));
+    if !https && tls.is_some() {
+        return Err(StartError::TlsWithoutHttps);
+    }
+    let tls = https.then(|| tls.unwrap_or_default());
+    let exporter = Exporter::new(
+        endpoint,
+        config.protocol,
+        config
+            .headers
+            .as_ref()
+            .map(|headers| openshell_otel::parse_otlp_headers(headers.expose_secret()))
+            .unwrap_or_default(),
+        tls.as_ref(),
+    )
+    .map_err(StartError::Transport)?;
     if config.sandbox_id.len() > enrichment::MAX_SANDBOX_ID_BYTES {
         // The attribution growth bound assumes a shorter id; batches near
         // the wire limit with many entries will be refused with 413.
@@ -362,6 +395,8 @@ pub fn start(config: OtlpRelayConfig) -> Result<(OtlpRelay, ReservedDestination)
 pub fn activate(
     endpoint: Option<String>,
     protocol: OtlpProtocol,
+    headers: Option<SecretOtlpHeaders>,
+    tls: Option<OtlpTlsMaterial>,
     sandbox_id: Option<String>,
 ) -> (Option<OtlpRelay>, Option<ReservedDestination>) {
     let Some(endpoint) = endpoint else {
@@ -390,6 +425,8 @@ pub fn activate(
     match start(OtlpRelayConfig {
         endpoint: endpoint.clone(),
         protocol,
+        headers,
+        tls,
         sandbox_id,
     }) {
         Ok((relay, reserved)) => (Some(relay), Some(reserved)),
@@ -727,7 +764,8 @@ mod tests {
 
     fn gated(endpoint: &str) -> (OtlpRelay, ReservedDestination, watch::Sender<bool>) {
         let (gate_tx, gate_rx) = watch::channel(false);
-        let exporter = Exporter::new(endpoint, OtlpProtocol::Grpc).unwrap();
+        let exporter =
+            Exporter::new(endpoint, OtlpProtocol::Grpc, http::HeaderMap::new(), None).unwrap();
         let (relay, reserved) = assemble(exporter, "sb-test".into(), Some(gate_rx));
         (relay, reserved, gate_tx)
     }
@@ -749,11 +787,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relays_to_an_otlp_http_collector_when_configured() {
+    async fn relays_to_an_otlp_http_collector_with_its_headers() {
         let mut collector = OtlpHttpTestServer::start().await;
         let (_relay, reserved) = start(OtlpRelayConfig {
             endpoint: collector.endpoint().to_string(),
             protocol: OtlpProtocol::HttpProtobuf,
+            headers: Some(SecretOtlpHeaders::new(
+                "x-mlflow-experiment-id=7".to_string(),
+            )),
+            tls: None,
             sandbox_id: "sb-http".into(),
         })
         .unwrap();
@@ -769,6 +811,7 @@ mod tests {
 
         let export = collector.next_export().await;
         assert_eq!(export.path, "/v1/traces");
+        assert_eq!(export.headers["x-mlflow-experiment-id"], "7");
         let decoded =
             opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest::decode(
                 export.body,
@@ -795,6 +838,8 @@ mod tests {
         let (relay, reserved) = start(OtlpRelayConfig {
             endpoint: collector.endpoint().to_string(),
             protocol: OtlpProtocol::Grpc,
+            headers: None,
+            tls: None,
             sandbox_id: "sb-test".into(),
         })
         .unwrap();
@@ -864,6 +909,8 @@ mod tests {
         let error = start(OtlpRelayConfig {
             endpoint: "not a uri".into(),
             protocol: OtlpProtocol::Grpc,
+            headers: None,
+            tls: None,
             sandbox_id: "sb-test".into(),
         })
         .err()
@@ -873,6 +920,8 @@ mod tests {
             let error = start(OtlpRelayConfig {
                 endpoint: blank.into(),
                 protocol: OtlpProtocol::Grpc,
+                headers: None,
+                tls: None,
                 sandbox_id: "sb-test".into(),
             })
             .err()
@@ -897,6 +946,8 @@ mod tests {
         let (relay, _reserved) = start(OtlpRelayConfig {
             endpoint: format!("  {}\n", collector.endpoint()),
             protocol: OtlpProtocol::Grpc,
+            headers: None,
+            tls: None,
             sandbox_id: "sb-test".into(),
         })
         .expect("a padded endpoint starts the relay");
@@ -912,7 +963,8 @@ mod tests {
         let before = tokio::runtime::Handle::current()
             .metrics()
             .num_alive_tasks();
-        let (relay, reserved) = activate(None, OtlpProtocol::Grpc, Some("sb-test".into()));
+        let (relay, reserved) =
+            activate(None, OtlpProtocol::Grpc, None, None, Some("sb-test".into()));
         assert!(relay.is_none());
         assert!(reserved.is_none());
         let after = tokio::runtime::Handle::current()
@@ -934,6 +986,8 @@ mod tests {
             Some(collector.endpoint().to_string()),
             OtlpProtocol::Grpc,
             None,
+            None,
+            None,
         );
         assert!(relay.is_none());
         assert!(reserved.is_none());
@@ -944,8 +998,81 @@ mod tests {
         drop(collector.shutdown().await);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relays_to_an_https_collector_with_its_tls_material() {
+        use openshell_core::jwt::SecretPrivateKeyPem;
+        use openshell_otel_test_support::{ServerTls, TestPki};
+
+        let pki = TestPki::generate();
+        let collector = OtlpTestServer::start_with_tls(&ServerTls::mutual(&pki)).await;
+        let (relay, reserved) = start(OtlpRelayConfig {
+            endpoint: collector.endpoint().to_string(),
+            protocol: OtlpProtocol::Grpc,
+            headers: None,
+            tls: Some(OtlpTlsMaterial {
+                ca_pem: Some(pki.ca_pem.clone()),
+                client: Some(openshell_core::jwt::OtlpClientIdentity {
+                    cert_pem: pki.client.cert_pem.clone(),
+                    key_pem: SecretPrivateKeyPem::new(pki.client.key_pem.clone()),
+                }),
+            }),
+            sandbox_id: "sb-tls".into(),
+        })
+        .expect("an https collector starts the relay");
+        let (mut client, boundary) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(reserved.handler.serve(Box::new(boundary)).unwrap());
+
+        let body = encoded_request("tls-span", &[]);
+        client
+            .write_all(&request("POST", "/v1/traces", PROTOBUF, &body))
+            .await
+            .unwrap();
+        assert_eq!(read_head(&mut client).await.status, 200);
+        relay.flush(FLUSH_TIMEOUT).await;
+        let received = collector.shutdown().await;
+        assert_eq!(received.spans.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relays_to_an_https_collector_trusted_by_the_platform_roots() {
+        let roots = crate::test_environment::fixture_dir().unwrap();
+        let ca_file = roots.path().join("ca.pem");
+        crate::test_environment::Environment::new()
+            .set("SSL_CERT_FILE", &ca_file)
+            .set("SSL_CERT_DIR", roots.path())
+            .run_async(async {
+                use openshell_otel_test_support::{ServerTls, TestPki};
+
+                let pki = TestPki::generate();
+                std::fs::write(&ca_file, &pki.ca_pem).unwrap();
+                let collector = OtlpTestServer::start_with_tls(&ServerTls::server_only(&pki)).await;
+                let (relay, reserved) = start(OtlpRelayConfig {
+                    endpoint: collector.endpoint().to_string(),
+                    protocol: OtlpProtocol::Grpc,
+                    headers: None,
+                    tls: None,
+                    sandbox_id: "sb-roots".into(),
+                })
+                .expect("an https collector starts the relay");
+                let (mut client, boundary) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(reserved.handler.serve(Box::new(boundary)).unwrap());
+
+                let body = encoded_request("roots-span", &[]);
+                client
+                    .write_all(&request("POST", "/v1/traces", PROTOBUF, &body))
+                    .await
+                    .unwrap();
+                assert_eq!(read_head(&mut client).await.status, 200);
+                relay.flush(FLUSH_TIMEOUT).await;
+                assert_eq!(collector.shutdown().await.spans.len(), 1);
+            })
+            .await;
+    }
+
     #[test]
-    fn https_endpoint_is_refused_at_start() {
+    fn unusable_tls_material_or_scheme_leaves_the_relay_inactive() {
+        use openshell_otel_test_support::TestPki;
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -954,23 +1081,41 @@ mod tests {
         let error = start(OtlpRelayConfig {
             endpoint: "https://collector.example:4317".into(),
             protocol: OtlpProtocol::Grpc,
+            headers: None,
+            tls: Some(OtlpTlsMaterial {
+                ca_pem: Some("not pem".into()),
+                ..OtlpTlsMaterial::default()
+            }),
             sandbox_id: "sb-test".into(),
         })
         .err()
-        .expect("https is not supported on the relay hop");
-        assert!(
-            matches!(error, StartError::UnsupportedScheme(ref scheme) if scheme == "https"),
-            "{error}"
-        );
-        // Lower-case comparison, and plain http still starts.
-        assert!(
-            start(OtlpRelayConfig {
-                endpoint: "HTTP://collector.example:4317".into(),
-                protocol: OtlpProtocol::Grpc,
-                sandbox_id: "sb-test".into(),
-            })
-            .is_ok()
-        );
+        .expect("the CA is unusable");
+        assert!(matches!(error, StartError::Tls(_)), "{error}");
+
+        let error = start(OtlpRelayConfig {
+            endpoint: "http://collector.example:4317".into(),
+            protocol: OtlpProtocol::Grpc,
+            headers: None,
+            tls: Some(OtlpTlsMaterial {
+                ca_pem: Some(TestPki::generate().ca_pem),
+                ..OtlpTlsMaterial::default()
+            }),
+            sandbox_id: "sb-test".into(),
+        })
+        .err()
+        .expect("TLS material needs an https endpoint");
+        assert!(matches!(error, StartError::TlsWithoutHttps), "{error}");
+
+        let error = start(OtlpRelayConfig {
+            endpoint: "ftp://collector.example:4317".into(),
+            protocol: OtlpProtocol::Grpc,
+            headers: None,
+            tls: None,
+            sandbox_id: "sb-test".into(),
+        })
+        .err()
+        .expect("only http and https are spoken");
+        assert!(matches!(error, StartError::UnsupportedScheme(ref scheme) if scheme == "ftp"));
     }
 
     #[tokio::test]

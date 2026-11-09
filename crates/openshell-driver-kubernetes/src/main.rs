@@ -228,6 +228,9 @@ async fn main() -> Result<()> {
         openshell_otel::DriverTracingConfig {
             endpoint: args.otlp.endpoint.as_deref(),
             protocol: args.otlp.protocol.into(),
+            ca_file: args.otlp.ca_file.as_deref(),
+            cert_file: args.otlp.cert_file.as_deref(),
+            key_file: args.otlp.key_file.as_deref(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
@@ -279,6 +282,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
+                app_listener:
+                    openshell_driver_kubernetes::config::KubernetesAppListenerConfig::default(),
                 boundary_port: args.sandbox_runtime_boundary_port,
             },
             https_proxy: args.https_proxy,
@@ -322,6 +327,7 @@ async fn main() -> Result<()> {
 
     let driver_service = ComputeDriverService::new(driver);
     let configuration_updates_service = openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver_service.clone());
+    let app_endpoints_service = openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpointsServer::new(driver_service.clone());
     let service = ComputeDriverServer::new(driver_service);
     let shutdown = async move {
         shutdown_signal().await;
@@ -337,6 +343,7 @@ async fn main() -> Result<()> {
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .add_service(configuration_updates_service)
+            .add_service(app_endpoints_service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
                 shutdown,
@@ -349,6 +356,7 @@ async fn main() -> Result<()> {
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .add_service(configuration_updates_service)
+            .add_service(app_endpoints_service)
             .serve_with_shutdown(args.bind_address, shutdown)
             .await
             .into_diagnostic()

@@ -16,18 +16,20 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
+openshell-crypto = { workspace = true }
 openshell-otel = { path = "../openshell-otel" }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "logs", "trace"] }
 prost = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["gzip", "tls-aws-lc"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-openshell-crypto = { workspace = true }
-rcgen = { workspace = true }
 tempfile = "3"
 
 [lints]

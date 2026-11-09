@@ -72,6 +72,13 @@ Omit `CAFile` to use system roots. For renewable OIDC service credentials, use
 `oidc.NewClientCredentialsAuth` from
 `github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/oidc`.
 
+## Discover the Active Gateway
+
+`gateway.NewClient("")` and `gateway.LoadConfig("")` select the active gateway
+from the user `active_gateway` file first, then fall back to the system
+`/etc/openshell/active_gateway`. `gateway.ListGateways` marks the selected
+gateway as active, including a system default.
+
 ## Create and Use a Sandbox
 
 Resource methods take an explicit workspace. The following example creates a

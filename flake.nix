@@ -74,6 +74,7 @@
           yq-go
           zizmor
           zstd
+          buf
         ];
         commonDevShell = {
           packages = [ rustToolchain ] ++ commonDevShellPackages;

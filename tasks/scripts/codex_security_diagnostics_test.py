@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from codex_security_diagnostics import coverage_summary
+from codex_security_diagnostics import PRIVATE_LOG_LIMIT, coverage_summary
 
 SCRIPT = Path(__file__).with_name("codex_security_diagnostics.py")
 SENSITIVE = "PRIVATE_FINDING_secret_token_source_code"
@@ -188,3 +188,34 @@ def test_scan_output_directory_stays_empty_until_scanner_writes(tmp_path):
     )
     assert result.returncode == 0
     assert json.loads(output.read_text())["coverage_document"] == "missing"
+
+
+def test_private_log_is_bounded_and_never_published(tmp_path):
+    output = tmp_path / "diagnostics.json"
+    private_log = tmp_path / "scan.log"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--scan-dir",
+            str(tmp_path / "scan"),
+            "--output",
+            str(output),
+            "--private-log",
+            str(private_log),
+            "--",
+            sys.executable,
+            "-c",
+            f"import sys; print({SENSITIVE!r}, flush=True); "
+            f"sys.stderr.write('x' * {PRIVATE_LOG_LIMIT * 2}); sys.exit(2)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 2
+    assert SENSITIVE in private_log.read_text()
+    assert private_log.stat().st_size == PRIVATE_LOG_LIMIT
+    assert private_log.stat().st_mode & 0o777 == 0o600
+    assert SENSITIVE not in result.stdout + result.stderr + output.read_text()

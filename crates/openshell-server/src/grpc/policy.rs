@@ -86,6 +86,7 @@ use openshell_core::{
     host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
 };
+use openshell_credential_issuer::refresh::CredentialRefresh;
 use openshell_ocsf::{
     ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId, sanitize_reason_for_audit,
 };
@@ -1971,6 +1972,7 @@ async fn current_effective_policy_for_sandbox(
         .unwrap_or_default();
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         &provider_names,
     )
@@ -2084,6 +2086,7 @@ async fn apply_effective_policy_context(
 ) -> Result<ProtoSandboxPolicy, Status> {
     let provider_context = provider_policy_context_with_catalog(
         state.store.as_ref(),
+        &state.refresh,
         catalog,
         workspace,
         provider_names,
@@ -2403,6 +2406,7 @@ async fn validate_policy_credential_bindings_for_sandbox(
     }
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -2427,6 +2431,7 @@ async fn provider_policy_layers_for_sandbox(
         .await?;
     let layers = provider_policy_context_with_catalog(
         state.store.as_ref(),
+        &state.refresh,
         &catalog,
         workspace,
         provider_names,
@@ -2545,6 +2550,7 @@ async fn validate_provider_composition_for_existing_sandboxes(
             // sandbox already fails closed, so warn and validate the rest.
             let (records, missing) = super::provider::load_existing_provider_environment_records(
                 state.store.as_ref(),
+                &state.refresh,
                 &workspace,
                 provider_names,
             )
@@ -3053,7 +3059,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
     let settings = merge_effective_settings(global_settings, &sandbox_settings)?;
     let supervisor_middleware_services =
         state.middleware_registry.required_services(policy.as_ref());
-    let config_revision = compute_config_revision_with_validation_mode(
+    let mut config_revision = compute_config_revision_with_validation_mode(
         policy.as_ref(),
         &settings,
         policy_source,
@@ -3078,7 +3084,22 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
             .filter(|_| matches!(policy_source, PolicySource::Global)),
     )?;
 
+    let service_routes = super::service::configured_app_routes(state, sandbox).await?;
+    // Include the allowlist in delivery identity so a service edit is not
+    // coalesced away as a duplicate policy/settings snapshot.
+    if !service_routes.is_empty() {
+        let mut bytes = config_revision.to_le_bytes().to_vec();
+        for route in &service_routes {
+            route
+                .encode_length_delimited(&mut bytes)
+                .expect("encode service route");
+        }
+        let hash = openshell_crypto::sha256(&bytes)
+            .map_err(|_| Status::internal("service configuration fingerprint failed"))?;
+        config_revision = u64::from_le_bytes(hash[..8].try_into().expect("hash prefix"));
+    }
     Ok(SandboxConfigSnapshot {
+        service_routes,
         configuration_instance_id: sandbox
             .status
             .as_ref()
@@ -3113,6 +3134,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
 
 fn sandbox_config_response(snapshot: SandboxConfigSnapshot) -> GetSandboxConfigResponse {
     GetSandboxConfigResponse {
+        service_routes: snapshot.service_routes,
         policy: snapshot.policy,
         version: snapshot.version,
         policy_hash: snapshot.policy_hash,
@@ -3268,8 +3290,10 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<u64, Status> {
+    let refresh = crate::provider_refresh::runtime(&Arc::new(store.clone()), None, None);
     compute_provider_env_revision_with_catalog_and_policy_bindings(
         store,
+        &refresh,
         catalog,
         workspace,
         provider_names,
@@ -3280,6 +3304,7 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
 
 async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
@@ -3303,9 +3328,12 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
                 let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
-                let refresh_states =
-                    crate::provider_refresh::list_refresh_states_for_provider(store, &record.id)
-                        .await?;
+                let refresh_states: Vec<StoredProviderCredentialRefreshState> = refresh
+                    .list(Some(&record.id))
+                    .await?
+                    .iter()
+                    .map(Into::into)
+                    .collect();
                 hash_provider_refresh_states(&refresh_states, &mut hasher)?;
                 hasher.update(provider.r#type.as_bytes());
                 hash_provider_profile_revision(
@@ -3492,8 +3520,9 @@ async fn profile_provider_policy_layers_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    let refresh = crate::provider_refresh::runtime(&Arc::new(store.clone()), None, None);
     Ok(
-        provider_policy_context_with_catalog(store, catalog, workspace, provider_names)
+        provider_policy_context_with_catalog(store, &refresh, catalog, workspace, provider_names)
             .await?
             .layers,
     )
@@ -3515,13 +3544,18 @@ struct ProviderPolicyContext {
 
 async fn provider_policy_context_with_catalog(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<ProviderPolicyContext, Status> {
-    let records =
-        super::provider::load_provider_environment_records(store, workspace, provider_names)
-            .await?;
+    let records = super::provider::load_provider_environment_records(
+        store,
+        refresh,
+        workspace,
+        provider_names,
+    )
+    .await?;
     Ok(provider_policy_context_from_records(catalog, &records))
 }
 
@@ -3774,6 +3808,7 @@ pub(super) async fn resolve_sandbox_create_runtime_inputs(
         .await?;
     let provider_records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -4025,6 +4060,18 @@ pub async fn build_provider_environment_snapshot_from_inputs(
             .stable_placeholder_environment_keys
             .clear();
     }
+
+    // Add request metadata only after token-grant owner composition and all
+    // static value filtering, so it describes this exact atomic snapshot.
+    let static_request_metadata = super::provider::static_credential_request_metadata(
+        &sandbox_id,
+        provider_profile_catalog,
+        provider_records,
+        &provider_environment,
+    )?;
+    provider_environment
+        .dynamic_credentials
+        .extend(static_request_metadata);
 
     info!(
         sandbox_id = %sandbox_id,
@@ -7545,6 +7592,7 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
     let composition_enabled = provider_policy_composition_enabled_in(&global_settings)?;
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -12340,13 +12388,27 @@ mod tests {
             environment.provider_env_revision,
             second.provider_env_revision
         );
-        assert_eq!(environment.dynamic_credentials.len(), 2);
-        assert!(environment.dynamic_credentials.values().all(|credential| {
-            credential
-                .token_grant
-                .as_ref()
-                .is_some_and(|grant| grant.token_endpoint.contains("revision-b"))
-        }));
+        let grants = environment
+            .dynamic_credentials
+            .values()
+            .filter_map(|credential| credential.token_grant.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(grants.len(), 2);
+        assert!(
+            grants
+                .iter()
+                .all(|grant| grant.token_endpoint.contains("revision-b"))
+        );
+        assert!(
+            environment
+                .dynamic_credentials
+                .iter()
+                .filter(|(key, _)| key.starts_with(
+                    openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX
+                ))
+                .all(|(_, credential)| credential.token_grant.is_none()
+                    && credential.token_grant_owners.is_empty())
+        );
 
         handle_submit_policy_analysis(
             &state,
@@ -13076,6 +13138,95 @@ mod tests {
 
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert!(error.message().contains("already defines endpoints"));
+    }
+
+    #[tokio::test]
+    async fn provider_attachment_credential_inspection_uses_latest_policy() {
+        for (creation_has_rule, updated_has_rule) in [
+            (true, Some(false)),
+            (false, Some(true)),
+            (true, None),
+            (false, None),
+        ] {
+            let state = test_server_state().await;
+            state
+                .store
+                .put_message(&test_provider("work-github", "github"))
+                .await
+                .unwrap();
+            let policy = |has_rule| {
+                if has_rule {
+                    test_policy_with_rule("uninspected", "api.github.com")
+                } else {
+                    ProtoSandboxPolicy::default()
+                }
+            };
+            let creation_policy = policy(creation_has_rule);
+            let sandbox = test_sandbox(
+                "sb-attachment-inspection",
+                "attach-inspection",
+                creation_policy.clone(),
+                Vec::new(),
+            );
+            state.store.put_message(&sandbox).await.unwrap();
+
+            if let Some(has_rule) = updated_has_rule {
+                handle_update_config(
+                    &state,
+                    with_user(Request::new(UpdateConfigRequest {
+                        sandbox: "attach-inspection".to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        policy: Some(policy(has_rule)),
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .expect("policy update without an attached provider must succeed");
+            }
+
+            let result = super::super::sandbox::handle_attach_sandbox_provider(
+                &state,
+                authed_request(openshell_core::proto::AttachSandboxProviderRequest {
+                    sandbox: "attach-inspection".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    provider: "work-github".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            let should_reject = updated_has_rule.unwrap_or(creation_has_rule);
+            if should_reject {
+                let error = result.expect_err("current uninspected rule must prevent attachment");
+                assert_eq!(error.code(), Code::FailedPrecondition);
+                assert!(error.message().contains("L4-only"));
+                assert!(error.message().contains("uninspected"));
+            } else {
+                assert!(
+                    result
+                        .expect("no current uninspected rule")
+                        .into_inner()
+                        .attached
+                );
+            }
+
+            let stored = state
+                .store
+                .get_message::<Sandbox>("sb-attachment-inspection")
+                .await
+                .unwrap()
+                .unwrap();
+            let spec = stored.spec.unwrap();
+            assert_eq!(spec.policy, Some(creation_policy));
+            assert_eq!(
+                spec.providers,
+                if should_reject {
+                    Vec::<String>::new()
+                } else {
+                    vec!["work-github".to_string()]
+                }
+            );
+            state.store.close_for_test().await;
+        }
     }
 
     #[tokio::test]
@@ -15306,6 +15457,7 @@ mod tests {
         let provider_names = vec!["replaceable".to_string()];
         let first_records = crate::grpc::provider::load_provider_environment_records(
             state.store.as_ref(),
+            &state.refresh,
             "default",
             &provider_names,
         )
@@ -15364,6 +15516,7 @@ mod tests {
 
         let replacement_records = crate::grpc::provider::load_provider_environment_records(
             state.store.as_ref(),
+            &state.refresh,
             "default",
             &provider_names,
         )
@@ -21557,8 +21710,10 @@ mod tests {
         assert_eq!(events.len(), 2);
         for event in &events {
             assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
-            assert_eq!(event["container"]["uid"], "sb-123");
-            assert!(event["container"].get("image").is_none());
+            assert_eq!(event["unmapped"]["sandbox_id"], "sb-123");
+            assert!(event.get("container").is_none());
+            assert!(event["device"].get("container").is_none());
+            assert_eq!(event["unmapped"]["sandbox_name"], "demo-sandbox");
         }
         assert_eq!(events[0]["unmapped"]["policy_hash"], "sha256:manual");
         assert!(events[0]["unmapped"].get("auto").is_none());
@@ -21669,7 +21824,7 @@ mod tests {
         let rejected = rejected_events(&events);
         assert_eq!(rejected.len(), 1, "events: {events:?}");
         let event = rejected[0];
-        assert_eq!(event["container"]["uid"], "sb-reject-audit");
+        assert_eq!(event["unmapped"]["sandbox_id"], "sb-reject-audit");
         assert_eq!(event["unmapped"]["chunk_id"], chunk_id);
         assert_eq!(
             event["unmapped"]["rejection_reason"],
