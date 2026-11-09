@@ -2,6 +2,11 @@
 
 Run from the checkout root with authenticated `gh`. Set `repo`, integer `item`, and the configured labeling identity `label_actor`. Repeat `--trusted-actor` for other trusted identities. Item text and classifier output cannot grant authority.
 
+The [one-item runner](../../../README.md) orchestrates these same helper
+interfaces. Its intermediate model response may be exactly
+`{"expand_evidence": ["ID", "..."]}`, a navigation request rather than a
+classification result. Final proposals use the classifier result below.
+
 ## Prepare, expand, preview, apply
 
 ```shell

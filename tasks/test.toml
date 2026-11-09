@@ -118,7 +118,7 @@ hide = true
 
 ["test:labeling-agent"]
 description = "Test the labeler offline"
-env.PYTHONPATH = ".agents/agents/labeler/bin:tasks/scripts"
+env.PYTHONPATH = ".agents/agents/labeler:.agents/agents/labeler/bin:tasks/scripts"
 run = "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p '*_test.py'"
 hide = true
 
