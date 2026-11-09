@@ -26,3 +26,7 @@ openshell-policy = { path = "../../crates/openshell-policy" }
 [[bin]]
 name = "supervisor-middleware-content-guard"
 path = "src/main.rs"
+
+[patch.crates-io]
+# Temporary SQLite security backport; see vendor/sqlx-sqlite/README.openshell.md.
+sqlx-sqlite = { path = "../../vendor/sqlx-sqlite" }

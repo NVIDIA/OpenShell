@@ -84,6 +84,8 @@ EXCLUDE_DIRS: set[str] = {
     ".cache",
     "python/openshell/_proto",
     "sdk/typescript/src/gen",
+    # Preserve upstream SQLx copyrights and its MIT/Apache-2.0 licenses.
+    "vendor/sqlx-sqlite",
 }
 
 # Individual filenames to skip.

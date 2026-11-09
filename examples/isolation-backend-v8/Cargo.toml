@@ -41,3 +41,7 @@ tonic-prost-build = "0.14"
 [[bin]]
 name = "js-sbx"
 path = "src/main.rs"
+
+[patch.crates-io]
+# Temporary SQLite security backport; see vendor/sqlx-sqlite/README.openshell.md.
+sqlx-sqlite = { path = "../../vendor/sqlx-sqlite" }

@@ -319,3 +319,7 @@ missing_panics_doc = "allow"
 name = "live_internet_traffic_perf"
 path = "tests/live_internet_traffic_perf.rs"
 required-features = ["e2e-host-gateway"]
+
+[patch.crates-io]
+# Temporary SQLite security backport; see vendor/sqlx-sqlite/README.openshell.md.
+sqlx-sqlite = { path = "../../vendor/sqlx-sqlite" }

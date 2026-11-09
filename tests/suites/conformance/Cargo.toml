@@ -27,3 +27,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["time"] }
 
 [workspace]
+
+[patch.crates-io]
+# Temporary SQLite security backport; see vendor/sqlx-sqlite/README.openshell.md.
+sqlx-sqlite = { path = "../../../vendor/sqlx-sqlite" }
