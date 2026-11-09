@@ -90,10 +90,16 @@ jobs:
           name: openshell-prover-${{ inputs.prover-target }}
           path: package-binaries/
 
+      - name: Download VM driver artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-driver-vm-${{ inputs.gateway-target }}
+          path: package-binaries/
+
       - name: Configure package inputs
         run: |
           set -euo pipefail
-          chmod +x package-binaries/openshell{,-gateway,-prover}
+          chmod +x package-binaries/openshell{,-gateway,-prover,-driver-vm}
           ls -lah package-binaries
 
       - name: Mark workspace safe for git
@@ -123,6 +129,19 @@ jobs:
           cp "${rpms[@]}" artifacts/
           echo "=== Built RPMs ==="
           ls -lah artifacts/
+
+      - name: Verify installed VM driver RPM
+        run: |
+          set -euo pipefail
+          vm_rpms=(artifacts/openshell-driver-vm-[0-9]*.rpm)
+          test "${#vm_rpms[@]}" -eq 1
+          test -f "${vm_rpms[0]}"
+          rpm -qlp "${vm_rpms[0]}" | grep -Fx /usr/libexec/openshell/openshell-driver-vm
+          rpm -qpR "${vm_rpms[0]}" | grep -Fx 'e2fsprogs >= 1.43'
+          rpm -qpR "${vm_rpms[0]}" | grep -Fx "openshell-gateway = $(rpm -qp --qf '%{VERSION}-%{RELEASE}' "${vm_rpms[0]}")"
+          dnf install -y artifacts/openshell-[0-9]*.rpm artifacts/openshell-gateway-[0-9]*.rpm "${vm_rpms[0]}"
+          /usr/libexec/openshell/openshell-driver-vm --version
+          bash tasks/scripts/test-rpm-vm-install.sh
 
       - name: Upload RPM artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

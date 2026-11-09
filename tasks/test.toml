@@ -72,7 +72,10 @@ hide = true
 
 ["test:packaging-assets"]
 description = "Run static packaging asset tests"
-run = "tasks/scripts/test-packaging-assets.sh"
+run = [
+  "tasks/scripts/test-packaging-assets.sh",
+  "uv run --no-project --with pytest --with pytest-asyncio --with pyyaml pytest tasks/scripts/rpm_vm_packaging_test.py",
+]
 run_windows = "echo Skipping test:packaging-assets: Linux service and RPM assets do not apply on Windows."
 hide = true
 

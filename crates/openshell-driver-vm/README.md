@@ -327,7 +327,10 @@ auto-detection. Set `OPENSHELL_COMPUTE_DRIVER=vm` to force the VM driver.
 
 On RPM-family Linux x86_64 and aarch64 systems, `install.sh` installs the
 `openshell` and `openshell-gateway` RPM packages from the selected release tag.
-The RPM gateway package is configured for the Podman driver.
+Install the matching `openshell-driver-vm` RPM separately to use MicroVMs; it
+places the driver under `/usr/libexec/openshell` and requires `e2fsprogs`.
+The RPM gateway package remains configured for Podman until you select
+`compute_driver = "vm"` in gateway TOML.
 
 On Apple Silicon macOS, `install.sh` stages the generated `openshell.rb`
 formula from the selected release in the `nvidia/openshell` Homebrew tap.

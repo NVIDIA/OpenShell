@@ -400,9 +400,10 @@ rec {
     '';
   };
 
-  # Build the CLI and gateway RPMs the way .github/workflows/build-rpm.yml does:
+  # Build RPMs the way .github/workflows/build-rpm.yml does:
   # `packit build locally` with openshell.spec in the same Fedora image, packaging
-  # the binaries staged by build-artifacts-binaries. The container runs on the
+  # binaries staged by build-artifacts-binaries and build-artifacts-vm-driver.
+  # The container runs on the
   # host's Linux architecture, so the RPMs match the tmachine guest.
   rpm = pkgs.writeShellApplication {
     name = "build-artifacts-rpm";
@@ -426,9 +427,10 @@ rec {
       for binary in \
         artifacts/binaries/${muslToolchain.target}/openshell \
         artifacts/binaries/${gnuToolchain.target}/openshell-gateway \
-        artifacts/binaries/${muslToolchain.target}/openshell-prover; do
+        artifacts/binaries/${muslToolchain.target}/openshell-prover \
+        artifacts/binaries/${gnuToolchain.target}/openshell-driver-vm; do
         if [[ ! -x "$binary" ]]; then
-          echo "missing $binary; run build-artifacts-binaries first" >&2
+          echo "missing $binary; run build-artifacts-binaries and build-artifacts-vm-driver first" >&2
           exit 1
         fi
       done
@@ -445,6 +447,7 @@ rec {
           --volume "$root/artifacts/binaries/${muslToolchain.target}/openshell:/binaries/openshell:ro" \
           --volume "$root/artifacts/binaries/${gnuToolchain.target}/openshell-gateway:/binaries/openshell-gateway:ro" \
           --volume "$root/artifacts/binaries/${muslToolchain.target}/openshell-prover:/binaries/openshell-prover:ro" \
+          --volume "$root/artifacts/binaries/${gnuToolchain.target}/openshell-driver-vm:/binaries/openshell-driver-vm:ro" \
           --volume "$output_dir:/out" \
           --volume openshell-rpm-cargo:/root/.cargo/registry \
           --volume openshell-rpm-dnf:/var/cache/libdnf5 \

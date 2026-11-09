@@ -242,7 +242,7 @@ jobs:
 
   build-rpm:
     name: Build RPM Packages
-    needs: [compute-versions, build-binaries]
+    needs: [compute-versions, build-binaries, build-vm-driver]
     uses: ./.github/workflows/rpm-package.yml
     with:
       checkout-ref: ${{ github.sha }}

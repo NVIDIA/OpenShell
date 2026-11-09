@@ -270,7 +270,7 @@ jobs:
 
   build-rpm:
     name: Build RPM packages
-    needs: [pr_metadata, version, build-binaries]
+    needs: [pr_metadata, version, build-binaries, build-vm-driver]
     if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       actions: read
