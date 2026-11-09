@@ -245,6 +245,14 @@ EOF
 | `--head, -H`        | Source branch (default: current)           |
 | `--web`             | Open in browser after creation             |
 
+## Labels
+
+Apply exactly one `area:` label and any relevant `topic:` labels. Choose them from
+the `### area:*` and `### topic:*` headings in `REVIEWERS.md`, reading each
+section's description against the files you changed. Do not choose from
+`gh label list`: it contains legacy labels such as `area:gateway` that have no
+reviewer roster, so they request no reviewers.
+
 ## After Creating
 
 The command outputs the PR URL and number.
