@@ -3,11 +3,8 @@
 
 """Offline tests for the managed labeling classifier's execution boundary."""
 
-import io
 import json
-import tempfile
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -19,7 +16,6 @@ from classifier import (
     classify,
     completed_proposal,
     create_client,
-    main,
     session_request,
 )
 
@@ -340,36 +336,25 @@ class ClientTests(unittest.TestCase):
         )
 
 
-class CliTests(unittest.TestCase):
-    def test_preview_does_not_create_a_transport_or_need_an_api_key(self):
-        with tempfile.TemporaryDirectory() as directory:
-            instructions = Path(directory) / "instructions.md"
-            evidence = Path(directory) / "evidence.json"
-            instructions.write_text("Trusted classifier instructions")
-            evidence.write_text('{"title": "Test evidence"}')
-            arguments = [
-                "classifier.py",
-                "--instructions",
-                str(instructions),
-                "--evidence",
-                str(evidence),
-                "--agent-id",
-                "agent_test",
-                "--agent-version",
-                "1",
-                "--environment-id",
-                "env_test",
-            ]
-            with (
-                patch("sys.argv", arguments),
-                patch("sys.stdout", new_callable=io.StringIO) as output,
-                patch("classifier.create_client") as client,
-            ):
-                self.assertEqual(main(), 0)
-                client.assert_not_called()
-                self.assertEqual(
-                    json.loads(output.getvalue())["agent"]["id"], "agent_test"
-                )
+class SessionReferenceTests(unittest.TestCase):
+    def test_session_reference_is_reported_before_sdk_polling(self):
+        client = FakeClient([sdk_page(proposal_events())])
+        observed = []
+
+        def record(session_id):
+            observed.append(session_id)
+            client.sessions.events.list.assert_not_called()
+
+        classify(client, {}, on_session=record)
+        self.assertEqual(observed, ["sesn_test"])
+
+    def test_uncertain_session_creation_preserves_uncertainty(self):
+        client = FakeClient([])
+        client.sessions.create.side_effect = OSError("connection lost")
+        with self.assertRaises(ClassifierError) as caught:
+            classify(client, {})
+        self.assertTrue(caught.exception.uncertain_write)
+        client.sessions.create.assert_called_once()
 
 
 if __name__ == "__main__":

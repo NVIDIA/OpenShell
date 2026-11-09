@@ -1,56 +1,103 @@
-# Labeling agent runtime integration
+# One-item labeling runner
 
-The runtime selects invocations and returns unvalidated proposals. The shared
-`/label-issue` helper owns eligibility, evidence, validation, writes, checkpoints,
-and reporting. See [#5276](https://github.com/NVIDIA/OpenShell/issues/5276) for
-activation prerequisites.
+The labeler prepares one issue or PR, expands evidence through the shared helper,
+classifies it with CMA, and returns a validated preview. Explicitly authorized
+application uses the saved exact preview without reclassification. No automatic
+trigger or backlog execution is installed.
 
-## Execution boundary
+## Setup
 
-Select an invocation with `events.select_invocation`, then call the
-shared helper's preparation. Only `status: ready` with `classifier_required: true`
-creates a model session. Pass the prepared evidence and trusted classifier
-instructions to `classifier.session_request`, call `classify`, and
-return its proposal to the shared preview/application helper. Follow the shared
-[command/result contract](skills/label-issue/references/result-contract.md).
+Use a trusted POSIX checkout with `uv` and authenticated `gh`. Configure a
+trusted labeling identity with repository permissions. Provision canonical
+taxonomy/routing definitions and the approved `meta:labeler-checkpoint` label
+before corresponding applications; the runner never provisions repository labels.
 
-Include the result schema and referenced classification guidance in the trusted
-instructions: the runtime cannot fetch referenced files or expand evidence.
+Provision a dedicated single-agent CMA configuration and an environment without
+preinstalled secrets. Pin a Sonnet configuration for initial observed runs.
+Configure `ANTHROPIC_API_KEY` in the invoking environment, never in evidence,
+arguments or committed files. The pinned version selects the model. The adapter
+disables tools, MCP servers and attached skills and supplies no GitHub credentials,
+repository mounts or vaults. Verify the saved configuration and CMA consumption
+on representative live runs before rollout; offline tests cannot establish them.
 
-Use a dedicated single-agent CMA configuration and an environment without
-preinstalled secrets. Pin a Sonnet configuration for initial observed runs; the
-pinned agent version, not this adapter, selects the model. Verify CMA consumption
-on representative evidence before rollout; CLI cost estimates are not CMA measurements.
+## Invocation
 
-`force` bypasses only the shared helper's unchanged-item check.
-
-## Smoke-test CLI
+From the checkout root, preview one issue or PR number or same-repository URL:
 
 ```shell
-uv run --no-project .agents/agents/labeler/bin/classifier.py \
-  --instructions /path/to/trusted-classifier-instructions.md \
-  --evidence /path/to/prepared-evidence.json \
+packet_dir=$(mktemp -d /tmp/openshell-label-run.XXXXXX)
+uv run --no-project .agents/agents/labeler/run.py 5411 \
+  --repo NVIDIA/OpenShell --output "$packet_dir" \
+  --trusted-actor "$label_actor" --executor "$label_actor" \
   --agent-id agent_CONFIGURED_ID --agent-version 1 \
-  --environment-id env_CONFIGURED_ID
+  --environment-id env_CONFIGURED_ID --human
 ```
 
-By default it prints the request without API calls or credentials. Output includes
-item evidence; keep it in the invoking session or appropriate artifacts.
+Ready work starts billable classification; preview performs no GitHub writes.
+Other preparation outcomes stop before creating an SDK client or session.
+Human `--force` bypasses only unchanged detection. `--request-preview` saves
+`request.json` without calling CMA or requiring an API key.
 
-Add `--run` with `ANTHROPIC_API_KEY` in the environment to create a billable
-session. Never include credentials in evidence. `--help` lists the budget and
-deadline defaults. The result contains `session_id` and `proposal`.
+The entry point installs the pinned `anthropic` SDK through script metadata.
+Imports and offline tests need no SDK. It replaces the adapter's temporary CLI.
+The SDK owns request retries and pagination; the runner never retries a
+classification. `--help` lists the shared budget/deadline defaults.
+`--budget-cents` is the invocation ceiling, divided into equal integer session
+ceilings across `--max-rounds` (1–8, default four). It must allow at least one
+cent per round. Classification rounds share a deadline; SDK retries can extend
+individual requests beyond it.
 
-The CLI installs its pinned `anthropic` SDK through script metadata. Importing the
-adapter and running offline tests need no SDK. The SDK owns request retries and
-event pagination; the adapter does not retry classifications.
+Review `preview.json`, including exact `mutation_requests`, ambiguity,
+prerequisites and bookkeeping. After authorizing this one-item application:
 
-On failure or interruption, cleanup sends `user.interrupt`, waits for idle, and
-archives using a separate 30-second polling deadline. SDK retries can extend
-individual requests beyond that deadline. Unconfirmed cleanup reports the
-session ID and warns that execution may continue. Successful sessions remain for
-review.
+```shell
+uv run --no-project .agents/agents/labeler/run.py 5411 \
+  --repo NVIDIA/OpenShell --output "$packet_dir" \
+  --trusted-actor "$label_actor" --executor "$label_actor" --apply --human
+```
+
+Application needs no CMA IDs or API key. The shared helper rechecks eligibility,
+material, labels and events, binds the exact preview, verifies additions before
+removals, and independently verifies completion. A classification no-op can
+still need checkpoint bookkeeping. See the [command/result contract](skills/label-issue/references/result-contract.md).
+
+## Evidence and reports
+
+Trusted instructions come from this agent's skill, result contract, migration
+policy and [expansion prompt](prompts/classify.md). Item content stays in the
+untrusted user message. The classifier may request evidence IDs; the helper
+expands them and the next round receives all delivered packets. Metadata never
+substitutes for inspected content. Failed expansion, deferred delivery and
+partial coverage remain explicit. The runner caps evidence input at 2 MiB;
+larger cases need local inspection.
+
+Stdout is one JSON report. `--human` adds the shared summary and normalized
+ambiguity sentence to stderr. Never post labeling comments. Keep the output
+directory private: it holds evidence, proposals and exact payloads. Each fresh
+preparation needs an empty directory. `executions.json` records IDs before
+polling; `proposal-N.json`, `result.json`, `preview.json` and `applied.json`
+preserve review/application artifacts. Failures retain stage and execution
+references. Exit codes match the helper: 0 for success/skips, 2 for
+held/prerequisite/stale, 1 for error/partial.
+
+## Recovery and activation
+
+On failure or interruption, the SDK adapter sends `user.interrupt`, waits for
+idle, and archives with a separate cleanup deadline. SDK retries can extend
+individual requests. Unconfirmed cleanup reports the session ID and warns that
+execution may continue. Successful sessions remain for review. An uncertain
+creation response may provide no ID; inspect CMA before starting another run.
 See the [session event API](https://platform.claude.com/docs/en/managed-agents/events-and-streaming).
+
+Honor shared-helper retry times. Stale inputs require fresh preparation and
+review; partial/uncertain writes require fresh reconciliation, never replay of
+saved requests. A candidate checkpoint alone is not completion.
+
+Use one coordinated executor per item. Local POSIX locking does not serialize
+different hosts. Automatic acceptance dispatch and coordination across entry
+points remain follow-up work; `bin/events.py` only selects future invocations.
+In particular, a `GITHUB_TOKEN` acceptance write needs an explicit dispatch
+hook, including drafts and independently of later reviewer-routing success.
 
 ## Verification
 
@@ -58,4 +105,7 @@ See the [session event API](https://platform.claude.com/docs/en/managed-agents/e
 mise run test:labeling-agent
 ```
 
-Offline tests fake CMA and permissions and perform no remote writes.
+Offline tests use the current shared helper with fake GitHub and SDK services.
+Live CMA configuration, representative previews and authorized applications
+remain pending, including legacy migration, missing evidence, unchanged skips,
+human force and partial failures.

@@ -11,6 +11,13 @@ Return the complete content-derived classification. Existing labels are reconcil
 
 ## Prepare and inspect
 
+For the managed end-to-end path, use
+`uv run --no-project .agents/agents/labeler/run.py <number-or-URL>`
+with the identity, CMA configuration and output directory in the
+[runner setup](../../README.md). Preview is the default; authorized `--apply`
+uses the saved exact preview without reclassification. `--request-preview`
+saves the model request without a session.
+
 Use the [commands and result contract](references/result-contract.md) to prepare evidence, preview labels and apply changes.
 
 Report unchanged, skipped, held or error outcomes. The helper enforces [accepted-work eligibility](../../../../../CONTRIBUTING.md#accepted-work) and lifecycle restrictions.
