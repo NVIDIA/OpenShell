@@ -76,10 +76,10 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   compute driver. Driver suites call it first.
 - `testkit::base_image()` for the image to create sandboxes from or build on:
   `OPENSHELL_TEST_BASE_IMAGE`, or OpenShell's default sandbox image.
-- `testkit::python_image()` for sandboxes that run `python3`:
-  `OPENSHELL_TEST_PYTHON_IMAGE`, or a pinned public uv Python image that any
-  gateway can pull. It has the standard library only, not curl, git, or
-  openssl.
+- `testkit::python_image()` for sandboxes that run `python3`, curl, git, or
+  openssl: `OPENSHELL_TEST_PYTHON_IMAGE`, or `openshell/e2e-python:dev`
+  (`e2e/python/Dockerfile.workload`). The tmachine installers load it into
+  every environment; `mise run e2e:workload:build` builds it locally.
 - `cx.cli([...])` to run the installed CLI against the same gateway, with
   `success()`, `failure()`, and `json()` on the output. `cx.cli_handle()`
   returns that CLI for code that can't borrow `cx`, such as a cleanup hook.

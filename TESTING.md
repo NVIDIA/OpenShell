@@ -429,7 +429,9 @@ Suites:
   `openshell-conformance` against the lane's gateway and writes a JUnit report
   under `results/`; set `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program,
   as Branch E2E does with the static build it makes once per architecture.
-  The
+  The Docker and Podman runners build `openshell/e2e-python:dev` for it; the
+  Kubernetes and VM runners set `OPENSHELL_TEST_PYTHON_IMAGE` to a pullable
+  Python image unless it is already set. The
   installed-artifact conformance lanes run the same crate through
   `openshell-test-runner` (see above).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or

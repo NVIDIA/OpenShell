@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-# Some tests run sandboxes from the e2e-python workload image, so load it next
-# to the runtime images.
+# Tests run sandboxes from the e2e-python workload image (the testkit's
+# python_image()), so load it next to the runtime images.
 - name: Copy OpenShell runtime and test workload images
   become: true
   ansible.builtin.copy:

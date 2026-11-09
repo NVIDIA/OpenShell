@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # The sandbox policy tests start from (testkit::policy::base()): the image's
-# system directories read-only, the sandbox's home and /tmp writable, and no
-# network access. Tests add the network access they need with
-# testkit::policy::allow(). It names no workload user, so the driver runs the
-# image's non-root user, or a default non-root user when the image has none.
+# system directories read-only, the sandbox's home and /tmp writable, the
+# sandbox user, and no network access. Tests add the network access they need
+# with testkit::policy::allow().
 version: 1
 filesystem_policy:
   include_workdir: true
@@ -13,3 +12,6 @@ filesystem_policy:
   read_write: [/sandbox, /tmp, /dev/null]
 landlock:
   compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
