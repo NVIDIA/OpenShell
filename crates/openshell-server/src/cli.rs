@@ -799,6 +799,10 @@ async fn run_from_args(
     let prepared = prepare_server_config_with_drivers(&mut args, &matches, &compute_drivers)?;
     validate_user_auth(&prepared.config)?;
 
+    openshell_ocsf::register_trace_correlation_extractor(
+        openshell_otel::current_ocsf_trace_correlation,
+    );
+
     // Initialize OCSF identity before tracing can emit gateway events.
     let gateway_identity = crate::gateway_ocsf::GatewayIdentity {
         name: prepared.config.name.clone(),
@@ -1753,11 +1757,7 @@ mod tests {
                         .build()
                         .unwrap();
                     let error = runtime
-                        .block_on(super::run_from_args(
-                            args,
-                            matches,
-                            test_registry("test", true),
-                        ))
+                        .block_on(super::run_from_args(args, matches, test_registry("test")))
                         .unwrap_err()
                         .to_string();
                     for expected in [
@@ -1913,12 +1913,9 @@ mod tests {
         }
     }
 
-    fn test_registry(name: &str, singleplayer: bool) -> crate::ComputeDriverRegistry {
-        let mut registration =
+    fn test_registry(name: &str) -> crate::ComputeDriverRegistry {
+        let registration =
             crate::ComputeDriverRegistration::new(name, 100, None, TestFactory).unwrap();
-        if singleplayer {
-            registration = registration.with_local_singleplayer();
-        }
         let mut registry = crate::ComputeDriverRegistry::new();
         registry.install(registration).unwrap();
         registry
@@ -1931,8 +1928,7 @@ mod tests {
             Some(detect_registered_local),
             TestFactory,
         )
-        .unwrap()
-        .with_local_singleplayer();
+        .unwrap();
         let mut registry = crate::ComputeDriverRegistry::new();
         registry.install(registration).unwrap();
         registry
@@ -2192,7 +2188,7 @@ mod tests {
                     "sqlite::memory:",
                     "--disable-tls",
                 ]);
-                let registry = test_registry("podman", true);
+                let registry = test_registry("podman");
 
                 let prepared =
                     super::prepare_server_config_with_drivers(&mut args, &matches, &registry)
@@ -2502,7 +2498,7 @@ mod tests {
         "#,
                 )
                 .unwrap();
-                let registry = test_registry("local", true);
+                let registry = test_registry("local");
                 let preflight = |argv: &[&str]| {
                     let (run, matches) = parse_with_args(argv);
                     super::run_config_preflight_with_drivers(
@@ -2557,7 +2553,7 @@ mod tests {
             .set("OPENSHELL_DRIVERS", "podman,docker")
             .run(|| {
                 let (run, matches) = parse_with_args(&["openshell-gateway"]);
-                let registry = test_registry("podman", true);
+                let registry = test_registry("podman");
 
                 let error = super::run_config_preflight_with_drivers(
                     super::ConfigPreflightArgs::default(),
@@ -2644,7 +2640,7 @@ mod tests {
             .remove("OPENSHELL_COMPUTE_DRIVER")
             .remove("OPENSHELL_DRIVERS")
             .run(|| {
-                preflight(&test_registry("local", false))
+                preflight(&test_registry("local"))
                     .expect_err("a pool table without a shared supervision driver must fail");
 
                 let mut registry = crate::ComputeDriverRegistry::new();
@@ -2841,7 +2837,7 @@ mod tests {
                     "--enable-mtls-auth",
                     "true",
                 ]);
-                let registry = test_registry("shared", false);
+                let registry = test_registry("shared");
 
                 super::run_config_preflight_with_drivers(
                     super::ConfigPreflightArgs::default(),
@@ -3462,7 +3458,7 @@ require_client_auth = true
                     "--metrics-tls-key",
                     "/metrics/tls.key",
                 ]);
-                let registry = test_registry("podman", true);
+                let registry = test_registry("podman");
 
                 let Err(error) =
                     super::prepare_server_config_with_drivers(&mut args, &matches, &registry)
@@ -3660,7 +3656,7 @@ require_client_auth = true
             .remove("OPENSHELL_GATEWAY_CONFIG")
             .remove("OPENSHELL_DRIVERS")
             .run(|| {
-                let registry = test_registry("shared", false);
+                let registry = test_registry("shared");
 
                 for (oidc_issuer, expected) in
                     [(None, false), (Some("https://idp.example.com"), false)]
@@ -3786,8 +3782,7 @@ require_client_auth = true
                     Some(detect_registered_local),
                     TestFactory,
                 )
-                .unwrap()
-                .with_local_singleplayer(),
+                .unwrap(),
             )
             .unwrap();
         let (preflight_args, preflight_matches) = parse_with_args(&argv);
@@ -3827,8 +3822,7 @@ require_client_auth = true
                     Some(detect_registered_local),
                     TestFactory,
                 )
-                .unwrap()
-                .with_local_singleplayer(),
+                .unwrap(),
             )
             .unwrap();
 
@@ -4084,7 +4078,7 @@ enabled = false
             .remove("OPENSHELL_DRIVERS")
             .remove("OPENSHELL_ENABLE_OPERATOR_AUTH")
             .run(|| {
-                let registry = test_registry("shared", false);
+                let registry = test_registry("shared");
                 for tls_args in [vec!["--disable-tls"], vec![]] {
                     let mut argv = vec![
                         "openshell-gateway",

@@ -228,7 +228,16 @@ The update records which sandboxes are attached before saving the new credential
 
 Credential refresh status tells you whether OpenShell obtained credentials. [Provider readiness](/how-it-works/providers/profiles#inspect-provider-readiness) tells you whether the sandbox applied the credentials, policy, and environment for new processes. It does not test access to a backend model or cancel requests already sent upstream.
 
-After a static credential update completes, launch a new client process to use the updated reference. An existing process keeps its revision-scoped reference; readiness does not make that old reference resolve the new value. Acknowledged detach revokes retained references and removes them from environments for future launches.
+After an ordinary static credential update completes, launch a new client
+process to use the updated reference. Existing processes keep their environment
+references; readiness does not guarantee that they use the replacement value.
+Credentials configured with
+[`stable_placeholder: true`](/how-it-works/providers/profiles#keep-an-externally-updated-placeholder-stable)
+let processes already holding a stable reference use a value-only update after
+the supervisor installs it. See
+[Runtime Limitations](/how-it-works/providers/profiles#runtime-limitations) for
+retained revision behavior. Acknowledged detach revokes retained references and
+removes them from environments for future launches.
 
 Set or clear a credential expiry timestamp:
 
@@ -437,20 +446,27 @@ state.
 
 ## How Credential Injection Works
 
-The agent process inside the sandbox never sees real credential values. At
-startup, OpenShell replaces each credential with an opaque placeholder token in
+At startup, OpenShell supplies each eligible provider credential as an opaque placeholder token in
 the agent's environment. When the agent sends an HTTP request containing a
 placeholder, the proxy resolves it immediately before forwarding the request.
+Credential injection does not automatically scrub credential values from
+upstream responses, so send credentialed requests only to trusted endpoints.
+Operator retrieval is a separate export path described in
+[Retrieve Runtime Credentials](#retrieve-runtime-credentials).
 
-Static credential resolution has two independent authorization boundaries:
+Static credential resolution has three independent authorization boundaries:
 
 1. Network policy must allow the calling binary and request destination.
 2. The credential binding must include the request host, port, and path. Profile
    endpoints provide the binding by default. An endpointless profile can use a
    sandbox policy endpoint that names the attached provider instance through
    `credential_binding.provider`.
+3. The request location must match the declared header, query parameter, or
+   path-template slot, or an explicitly enabled body/WebSocket rewrite policy.
+   Without placement metadata, static credentials resolve only in `Authorization`
+   or through those explicit rewrite policies.
 
-Both checks must pass. A provider profile endpoint does not grant network access
+All three checks must pass. A provider profile endpoint does not grant network access
 unless provider policy composition or the sandbox's own policy allows the
 request. A plain sandbox policy endpoint does not grant credential use unless
 the profile already covers it or the endpoint explicitly binds an endpointless
@@ -467,20 +483,29 @@ for endpoint matching and migration guidance.
 
 ### Supported injection locations
 
-The proxy resolves credential placeholders in the following parts of an HTTP request:
+The proxy automatically enforces declared placement when the gateway and
+supervisor support it. Moving a header credential into a query parameter, path,
+or unrelated header is denied before forwarding. A supporting supervisor defaults
+to `Authorization` when placement metadata is absent and rejects malformed
+metadata. Custom placements require a supporting gateway and an explicit profile
+declaration. Older supervisors keep their previous behavior.
 
 | Location | How the agent uses it | Example |
 |---|---|---|
-| Header value | Agent reads `$API_KEY` from env and places it in a header. | `Authorization: Bearer <placeholder>` |
+| Declared header value | Agent reads `$API_KEY` from env and places it in the declared header. | `Authorization: Bearer <placeholder>` |
 | Header value (Basic auth) | Agent base64-encodes `user:<placeholder>` in an `Authorization: Basic` header. The proxy decodes, resolves, and re-encodes. | `Authorization: Basic <base64>` |
-| Query parameter value | Agent places the placeholder in a URL query parameter. | `GET /api?key=<placeholder>` |
-| URL path segment | Agent builds a URL with the placeholder in the path. Supports concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
-| Supported request body | An inspected REST endpoint opts in with `request_body_credential_rewrite: true`. | `{"api_key":"<placeholder>"}` |
-| WebSocket text message | A REST or WebSocket endpoint opts in with `websocket_credential_rewrite: true`. | `{"token":"<placeholder>"}` |
+| Declared query parameter value | Agent uses the profile's `query_param`. | `GET /api?key=<placeholder>` |
+| Declared URL path slot | Agent uses the profile's `path_template`, including concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
 | AWS SigV4 signing | An endpoint configures `credential_signing`, and the proxy signs with the endpoint-bound AWS credentials. | `credential_signing: sigv4` |
 
 The proxy does not rewrite cookies, response content, unsupported request
 bodies, or WebSocket binary frames.
+
+Explicit endpoint policies can enable credential rewriting in request bodies
+or WebSocket text messages. WebSocket text message rewriting requires
+`protocol: websocket`. These flags do not authorize arbitrary query
+parameters, path slots, or unrelated headers. See [Profiles](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding)
+for placement configuration and upgrade requirements.
 
 ### Clients that parse JWT claims
 

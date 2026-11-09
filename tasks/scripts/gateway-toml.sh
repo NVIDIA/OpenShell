@@ -17,3 +17,27 @@ toml_escape() {
   value=${value//$'\t'/\\t}
   printf '%s' "${value}"
 }
+
+# Append OTLP export to a gateway config when OPENSHELL_DEV_OTLP_ENDPOINT is
+# set. Export stays off otherwise so no collector is assumed.
+append_dev_otlp_config() {
+  local config_path=$1
+  local endpoint=${OPENSHELL_DEV_OTLP_ENDPOINT:-}
+  if [[ -z "${endpoint}" ]]; then
+    echo "OTLP export disabled; set OPENSHELL_DEV_OTLP_ENDPOINT to enable it."
+    return
+  fi
+
+  cat >>"${config_path}" <<TOML
+
+[openshell.gateway.otlp]
+endpoint = "$(toml_escape "${endpoint}")"
+
+[openshell.gateway.otlp.ocsf]
+enabled = true
+
+[openshell.gateway.otlp.agent]
+enabled = true
+TOML
+  echo "OTLP trace export, OCSF log export, and the agent trace relay enabled for ${endpoint}."
+}

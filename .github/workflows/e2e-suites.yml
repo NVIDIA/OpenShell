@@ -7,9 +7,10 @@
 # optionally, the package in it, the gateway name the installer registers, and
 # the runner label for the environment's architecture. `openshell-test-runner`
 # builds the tests, boots the environment, runs them inside it and checks the
-# results. The `family` input selects the rows of one family, including the
-# workspaces under it (drivers selects drivers/podman); leave it empty to run
-# every row.
+# results; a conformance row can run the prebuilt `openshell-conformance`
+# instead (`prebuilt-conformance`). The `family` input selects the rows of one
+# family, including the workspaces under it (drivers selects drivers/podman);
+# leave it empty to run every row.
 
 name: E2E Suites
 
@@ -29,6 +30,11 @@ on:
         description: Immutable ID of the prepared integration inputs artifact
         required: true
         type: string
+      prebuilt-conformance:
+        description: Run the conformance rows with the openshell-conformance-x86_64-unknown-linux-musl artifact of this run instead of building the suites in every job
+        required: false
+        type: boolean
+        default: false
     secrets:
       CACHIX_AUTH_TOKEN:
         description: Token used to push Nix builds, such as the test runner, to Cachix
@@ -77,6 +83,11 @@ jobs:
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful","installer":"rpm","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless","installer":"rpm","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"host-gateway","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful","installer":"rpm","family":"features","package":"host-gateway","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless","installer":"rpm","family":"features","package":"host-gateway","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-k3s","installer":"k3s","family":"features","package":"host-gateway","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"features","package":"host-gateway","gateway":"tmachine","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-userns-default","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
@@ -156,8 +167,18 @@ jobs:
           artifact-ids: ${{ inputs['integration-inputs-artifact-id'] }}
           path: artifacts
 
+      # The program is built once per run (see build-conformance in
+      # branch-e2e.yml), so the conformance rows need not each build the suites.
+      - name: Download prebuilt openshell-conformance
+        if: inputs.prebuilt-conformance && matrix.family == 'conformance'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-conformance-x86_64-unknown-linux-musl
+          path: artifacts/prebuilt-conformance
+
       - name: Run the suites in this environment
         env:
+          PREBUILT_CONFORMANCE: ${{ inputs.prebuilt-conformance && matrix.family == 'conformance' }}
           ENVIRONMENT: ${{ matrix.environment }}
           INSTALLER: ${{ matrix.installer }}
           FAMILY: ${{ matrix.family }}
@@ -167,15 +188,21 @@ jobs:
           # Retry dependency preparation, then run the suites once. The runner
           # builds the suites for the guest, so it needs no prepared archives.
           nix build --no-link .#openshell-test-runner || nix build --no-link .#openshell-test-runner
-          packages=()
-          if [ -n "${PACKAGE}" ]; then
-            packages=(--package "${PACKAGE}")
+          # A prebuilt program replaces the build, and so the package choice.
+          selection=()
+          if [ "${PREBUILT_CONFORMANCE}" = "true" ]; then
+            program="artifacts/prebuilt-conformance/openshell-conformance"
+            chmod +x "${program}"
+            "${program}" list > /dev/null
+            selection=(--program "${program}")
+          elif [ -n "${PACKAGE}" ]; then
+            selection=(--package "${PACKAGE}")
           fi
           nix run .#openshell-test-runner -- \
             --environment "${ENVIRONMENT}" \
             --installer "${INSTALLER}" \
             --family "${FAMILY}" \
-            "${packages[@]}" \
+            "${selection[@]}" \
             --gateway "${GATEWAY}" \
             --results artifacts/test-results
 

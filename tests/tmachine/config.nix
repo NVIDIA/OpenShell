@@ -23,9 +23,12 @@ let
     OVMF = firmwarePkgs.OVMF;
   };
   qemu = qemuPkgs.qemu.override { hostCpuOnly = true; };
+  # Every installer loads the sandbox workload image tests run python3 in.
+  e2ePythonImage = "../../artifacts/images/openshell-e2e-python-dev.tar";
   k3sInputs = {
     agent_sandbox_version = "0.5.0";
     openshell_cli_binary = "../../artifacts/binaries/${muslTarget}/openshell";
+    openshell_e2e_python_image = e2ePythonImage;
     openshell_gateway_image = "../../artifacts/images/openshell-gateway-tmachine.tar";
     openshell_helm_chart = "../../artifacts/helm/helm-chart-0.0.0.tgz";
     openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
@@ -204,6 +207,7 @@ let
         inputs = {
           openshell_cli_binary = "../../artifacts/binaries/${muslTarget}/openshell";
           openshell_gateway_binary = "../../artifacts/binaries/${gnuTarget}/openshell-gateway";
+          openshell_e2e_python_image = e2ePythonImage;
           openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
           openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
         };
@@ -216,6 +220,7 @@ let
         ];
         inputs = {
           openshell_deb = "../../artifacts/packages/openshell.deb";
+          openshell_e2e_python_image = e2ePythonImage;
           openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
           openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
         };
@@ -227,6 +232,7 @@ let
         inputs = {
           openshell_rpm = "../../artifacts/packages/rpm/openshell.rpm";
           openshell_gateway_rpm = "../../artifacts/packages/rpm/openshell-gateway.rpm";
+          openshell_e2e_python_image = e2ePythonImage;
           openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
           openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
         };
@@ -245,7 +251,7 @@ let
         playbooks = [ "ansible/playbooks/drivers/podman/e2e.yaml" ];
         inputs = {
           openshell_podman_e2e_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-podman-e2e-tests.tar";
-          openshell_podman_e2e_workload_image = "../../artifacts/images/openshell-e2e-python-dev.tar";
+          openshell_podman_e2e_workload_image = e2ePythonImage;
         };
       }
     ];
