@@ -208,6 +208,56 @@ jobs:
           retention-days: 5
           if-no-files-found: error
 
+  # The test bundles of the tmachine E2E suites rows that don't run
+  # openshell-conformance, built once per run instead of in every row (see
+  # e2e-suites.yml). The rows only run on amd64, so only the x86_64 guest
+  # target is built. Each bundle holds its whole family; a row picks its
+  # package at run time.
+  build-e2e-bundles:
+    name: E2E suite bundles (x86_64-unknown-linux-musl)
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.run_integration == 'true'
+    permissions:
+      contents: read
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Build the bundles
+        env:
+          # One target directory for every family, so later families reuse
+          # testkit-ready and the dependencies the first one built.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          # Every row downloads the bundles. Line tables keep backtraces
+          # readable at a third of the size of full debuginfo.
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: |
+          set -euo pipefail
+          # Retry dependency preparation, then build once.
+          nix build --no-link .#openshell-test-runner || nix build --no-link .#openshell-test-runner
+          for family in features drivers/podman; do
+            nix run .#openshell-test-runner -- build \
+              --family "$family" --out "artifacts/e2e-bundles/${family//\//-}"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openshell-e2e-bundle-features-x86_64-unknown-linux-musl
+          path: artifacts/e2e-bundles/features
+          retention-days: 5
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openshell-e2e-bundle-drivers-podman-x86_64-unknown-linux-musl
+          path: artifacts/e2e-bundles/drivers-podman
+          retention-days: 5
+          if-no-files-found: error
+
   build-external-drivers:
     name: ${{ matrix.binary }} (${{ matrix.triple }})
     needs: [pr_metadata, version]
@@ -366,7 +416,7 @@ jobs:
     uses: ./.github/workflows/e2e-suites.yml
     with:
       family: conformance
-      prebuilt-conformance: true
+      prebuilt: true
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
     secrets:
@@ -375,7 +425,7 @@ jobs:
   # Run the testkit feature suites (tests/suites/features) on tmachine. The
   # environments and suites are listed in e2e-suites.yml.
   feature-specific-integration:
-    needs: prepare-integration
+    needs: [prepare-integration, build-e2e-bundles]
     permissions:
       actions: read
       contents: read
@@ -383,6 +433,7 @@ jobs:
     uses: ./.github/workflows/e2e-suites.yml
     with:
       family: features
+      prebuilt: true
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
     secrets:
@@ -391,7 +442,7 @@ jobs:
   # Run the testkit driver suites (tests/suites/drivers) on tmachine. The
   # environments and suites are listed in e2e-suites.yml.
   driver-specific-integration:
-    needs: prepare-integration
+    needs: [prepare-integration, build-e2e-bundles]
     permissions:
       actions: read
       contents: read
@@ -399,6 +450,7 @@ jobs:
     uses: ./.github/workflows/e2e-suites.yml
     with:
       family: drivers
+      prebuilt: true
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
     secrets:

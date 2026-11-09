@@ -215,7 +215,7 @@ candidate inputs (see [TESTING.md](TESTING.md)) and narrow the tests with a
 nextest filterset:
 
 ```shell
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful --installer deb \
   --family conformance --package conformance \
   --filter 'test(/^policy_advisor::/)'

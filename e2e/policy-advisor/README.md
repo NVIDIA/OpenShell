@@ -66,7 +66,7 @@ candidate, run the `policy-advisor` suite of the `conformance` crate through the
 test runner:
 
 ```bash
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful --installer deb \
   --family conformance --package conformance \
   --filter 'test(/^policy_advisor::/)'
