@@ -4,7 +4,8 @@ These modules start Part 3 of [#5276](https://github.com/NVIDIA/OpenShell/issues
 select invocations and return an unvalidated JSON classification proposal. The
 shared `/label-issue` helper from [#5355](https://github.com/NVIDIA/OpenShell/pull/5355)
 owns eligibility, evidence, validation, label writes, checkpoints, and local
-reporting. No automatic workflow is installed.
+reporting. The dormant [dispatch layer](README-labeling-dispatch.md) remains
+disabled pending runner integration and observed end-to-end runs.
 
 ## Execution boundary
 
@@ -104,3 +105,10 @@ mise run test:labeling-agent
 
 Offline tests fake CMA and permissions and perform no remote writes. Live
 configuration and model quality require observed runs.
+
+## Dispatch integration
+
+See [acceptance dispatch and coordination](README-labeling-dispatch.md) for the
+dormant workflow, cross-host mutex, provisional runner contract, acceptance-writer
+hook, and activation prerequisites. Keep both activation variables unset until
+those integration and human-policy prerequisites are complete.

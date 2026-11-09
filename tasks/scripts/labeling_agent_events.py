@@ -45,6 +45,7 @@ def select_invocation(
     repository: str,
     *,
     permission,
+    acceptance_actor: str | None = None,
 ) -> Invocation | None:
     """Route events only; the shared preflight must still verify current eligibility.
 
@@ -70,7 +71,16 @@ def select_invocation(
         return None
     sender = event.get("sender") or {}
     login = sender.get("login")
-    if sender.get("type") != "User" or not isinstance(login, str) or not login:
+    if not isinstance(login, str) or not login:
+        return None
+    if (event_name == "workflow_dispatch" and sender.get("type") == "Bot"
+            and acceptance_actor and login == acceptance_actor):
+        inputs = event.get("inputs") or {}
+        number = item_number(str(inputs.get("item", "")), repository)
+        if inputs.get("force", False) not in (False, "false"):
+            raise ValueError("Acceptance hooks cannot force classification")
+        return Invocation(repository, number, False, "acceptance")
+    if sender.get("type") != "User":
         return None
     if event_name == "issue_comment":
         comment = event.get("comment") or {}

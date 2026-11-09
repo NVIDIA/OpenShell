@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Accepted Work Labeling
+
+on:
+  issues:
+    types: [labeled]
+  pull_request_target:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      item:
+        description: Same-repository issue/PR number or URL
+        required: true
+        type: string
+      force:
+        description: Bypass unchanged detection (authorized humans only)
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  select:
+    # Install dormant. Preview must be explicitly enabled after dependency wiring.
+    if: vars.LABELING_PREVIEW_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      item: ${{ steps.select.outputs.item }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: tasks/scripts
+      - name: Select authorized invocation
+        id: select
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tasks/scripts/labeling_dispatch.py --select
+
+  label:
+    needs: select
+    if: needs.select.outputs.item != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Preview and application credentials belong to separate environments.
+    # Require approval and default-branch deployment restrictions on application.
+    environment: ${{ vars.LABELING_APPLICATION_ENABLED == 'true' && 'labeling-application' || 'labeling-preview' }}
+    permissions:
+      contents: write # atomic per-item Git ref mutex; no PR-head checkout
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Run shared labeling entry point and reviewer handoff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.LABELING_ANTHROPIC_API_KEY }}
+          LABELING_APPLY: ${{ vars.LABELING_APPLICATION_ENABLED }}
+          LABELING_APPLICATION_ENABLED: ${{ vars.LABELING_APPLICATION_ENABLED }}
+        run: python3 tasks/scripts/labeling_dispatch.py

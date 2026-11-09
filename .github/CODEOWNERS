@@ -46,3 +46,8 @@
 
 # Auditable SBOM check
 /tasks/scripts/verify-image-sbom.sh @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+
+# Acceptance dispatch and cross-host mutation coordination
+/tasks/scripts/labeling_dispatch.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/labeling_dispatch_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/labeling_item_lock.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr

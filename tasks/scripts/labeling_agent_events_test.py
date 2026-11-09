@@ -217,5 +217,20 @@ class EventTests(unittest.TestCase):
                 item_number(value, REPO)
 
 
+class AcceptanceWriterTests(unittest.TestCase):
+    def test_only_configured_bot_can_use_explicit_acceptance_hook(self):
+        payload = base_event(sender={"type": "Bot", "login": "github-actions[bot]"},
+                             inputs={"item": "5412", "force": "false"})
+        self.assertEqual(select_invocation("workflow_dispatch", payload, REPO,
+                         permission=lambda _: "none", acceptance_actor="github-actions[bot]"),
+                         Invocation(REPO, 5412, False, "acceptance"))
+        self.assertIsNone(select_invocation("workflow_dispatch", payload, REPO,
+                         permission=lambda _: "admin"))
+        payload["inputs"]["force"] = "true"
+        with self.assertRaises(ValueError):
+            select_invocation("workflow_dispatch", payload, REPO,
+                              permission=lambda _: "admin", acceptance_actor="github-actions[bot]")
+
+
 if __name__ == "__main__":
     unittest.main()
