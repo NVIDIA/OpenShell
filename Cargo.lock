@@ -4431,6 +4431,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-crypto",
+ "openshell-driver-sdk",
  "openshell-extension-core",
  "openshell-otel",
  "openshell-policy-schema",
@@ -4698,6 +4699,19 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "openshell-driver-sdk"
+version = "0.0.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "serde",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]

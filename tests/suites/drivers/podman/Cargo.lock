@@ -2144,6 +2144,7 @@ dependencies = [
  "miette",
  "nix",
  "openshell-crypto",
+ "openshell-driver-sdk",
  "openshell-extension-core",
  "openshell-policy-schema",
  "prost",
@@ -2182,6 +2183,19 @@ dependencies = [
  "thiserror 2.0.20",
  "tonic",
  "x509-parser",
+]
+
+[[package]]
+name = "openshell-driver-sdk"
+version = "0.0.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "serde",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
