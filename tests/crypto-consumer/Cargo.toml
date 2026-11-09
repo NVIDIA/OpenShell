@@ -22,8 +22,6 @@ integration = ["core-all", "sdk", "policy", "dep:openshell-crypto", "dep:rcgen",
 
 runtime = ["integration", "rcgen/ring", "rustls/ring", "jsonwebtoken/rust_crypto", "dep:openshell-extension-core", "dep:openshell-otel", "dep:serde_json"]
 openssl-runtime = ["integration", "openshell-crypto/openssl", "dep:serde_json"]
-core-aws-lc = ["core-all", "openshell-core/aws-lc"]
-sdk-aws-lc = ["sdk", "openshell-sdk/aws-lc"]
 
 [dependencies]
 openshell-extension-core = { path = "../../crates/openshell-extension-core", optional = true }
