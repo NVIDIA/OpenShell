@@ -601,6 +601,8 @@ rootful and rootless, and the `k3s` and `k3s-ha` installers. The tests run on
 the K3s node, so the K3s installers set the chart's `server.hostGatewayIP` to
 the node's address.
 
+The client runs as the main process of `sandbox create`. The `k3s-ha` row also exercises attaching to this short-lived main process through a gateway with several replicas.
+
 Run the VM-backed Rust CLI e2e suite:
 
 ```shell
