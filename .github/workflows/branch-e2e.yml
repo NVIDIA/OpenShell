@@ -212,7 +212,8 @@ jobs:
   # openshell-conformance, built once per run instead of in every row (see
   # e2e-suites.yml). The rows only run on amd64, so only the x86_64 guest
   # target is built. Each bundle holds its whole family; a row picks its
-  # package at run time.
+  # package at run time. Rust Cache (rust-cache.yml) saves the cache on main;
+  # keep the env and build commands aligned with its e2e-bundles job.
   build-e2e-bundles:
     name: E2E suite bundles (x86_64-unknown-linux-musl)
     needs: [pr_metadata]
@@ -228,11 +229,16 @@ jobs:
           ref: ${{ github.sha }}
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: e2e-bundles-v1-x86_64-unknown-linux-musl
       - name: Build the bundles
         env:
           # One target directory for every family, so later families reuse
-          # testkit-ready and the dependencies the first one built.
+          # testkit-ready and the dependencies the first one built. It is the
+          # root target directory, which setup-rust caches.
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
           # Every row downloads the bundles. Line tables keep backtraces
           # readable at a third of the size of full debuginfo.
