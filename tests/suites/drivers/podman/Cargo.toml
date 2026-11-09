@@ -16,6 +16,5 @@ publish = false
 container-engine-support = { path = "../../../support/container-engine" }
 openshell-testkit = { path = "../../../testkit/testkit" }
 podman-support = { path = "../../../support/podman" }
-tempfile = "3"
 
 [workspace]

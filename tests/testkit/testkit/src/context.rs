@@ -14,6 +14,7 @@ use rand::Rng;
 
 use crate::cleanup::{CLEANUP_TIMEOUT, Cleanup, Key};
 use crate::cli::{Cli, CliOutput};
+use crate::cli_sandbox::CliSandboxBuilder;
 use crate::error::{Error, Result, ResultExt};
 use crate::poll::{Poll, poll_until};
 
@@ -113,6 +114,24 @@ impl Context {
         }
     }
 
+    /// Start describing a sandbox named `cx.name(suffix)` that the
+    /// `openshell` CLI creates. Use it for what only `sandbox create`
+    /// offers, such as a `--policy` file or `--no-keep`; prefer
+    /// [`Context::sandbox`] otherwise.
+    pub fn cli_sandbox(&self, suffix: &str) -> CliSandboxBuilder<'_> {
+        CliSandboxBuilder::new(self, self.name(suffix))
+    }
+
+    /// `sandbox get --output json` for sandbox `name`. It reports fields the
+    /// SDK does not expose, such as `restart_count`, `restart_policy`,
+    /// `main_process_instance_id`, and `conditions`.
+    pub async fn sandbox_details(&self, name: &str) -> Result<serde_json::Value> {
+        self.cli(["sandbox", "get", name, "--output", "json"])
+            .await?
+            .success()?
+            .json()
+    }
+
     /// Track a sandbox the test is about to create through the CLI, so cleanup
     /// deletes it even if the test fails after the gateway accepted the create.
     /// Call this before the CLI command; use [`Context::adopt`] afterwards.
@@ -177,6 +196,17 @@ impl Context {
             name: name.to_string(),
             id: found.id,
         })
+    }
+
+    /// Wait up to `timeout` for the gateway to remove the sandbox by itself,
+    /// for example after a `--no-keep` main command exits, then check it is
+    /// gone from both get and list.
+    pub async fn wait_absent(&self, sandbox: &Sandbox, timeout: Duration) -> Result {
+        self.client
+            .wait_deleted(sandbox.name(), timeout, Some(sandbox.id()))
+            .await
+            .context(format!("wait for sandbox {} to be removed", sandbox.name()))?;
+        self.expect_absent(sandbox).await
     }
 
     /// Fail unless the sandbox is gone from both get and list.
@@ -446,6 +476,8 @@ pub struct Sandbox {
 /// The buffered output of an exec.
 #[derive(Debug)]
 pub struct ExecOutput {
+    /// The command and the sandbox it ran in, for reports.
+    pub command: String,
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
@@ -456,7 +488,8 @@ impl ExecOutput {
     pub fn success(self) -> Result<Self> {
         crate::ensure!(
             self.exit_code == 0,
-            "exec exited with {}; stdout: {}; stderr: {}",
+            "{} exited with {}; stdout: {}; stderr: {}",
+            self.command,
             self.exit_code,
             self.stdout.trim(),
             self.stderr.trim()
@@ -625,6 +658,7 @@ impl Sandbox {
             .await
             .context(format!("exec {command:?} in sandbox {}", self.name))?;
         Ok(ExecOutput {
+            command: format!("exec {command:?} in sandbox {}", self.name),
             exit_code: result.exit_code,
             stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&result.stderr).into_owned(),

@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use testkit::Context;
 use testkit::sdk::raw::proto;
+use testkit::{Context, ResultExt as _};
 
 /// A rejected launch must close promptly instead of hanging the exec.
 const REJECTED_LAUNCH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -66,7 +66,7 @@ async fn hard_requirement_accepts_added_device_paths(cx: &mut Context) -> testki
         .await?;
     sandbox.wait_ready().await?;
 
-    let output = sandbox
+    sandbox
         .exec([
             "sh",
             "-c",
@@ -76,13 +76,9 @@ async fn hard_requirement_accepts_added_device_paths(cx: &mut Context) -> testki
              printf landlock-ok > /tmp/landlock-check; \
              test \"$(cat /tmp/landlock-check)\" = landlock-ok",
         ])
-        .await?;
-    testkit::ensure!(
-        output.exit_code == 0,
-        "the hard_requirement sandbox could not read /dev/urandom or write /tmp: exit {}; stderr: {}",
-        output.exit_code,
-        output.stderr
-    );
+        .await?
+        .success()
+        .context("the hard_requirement sandbox must read /dev/urandom and write /tmp")?;
     Ok(())
 }
 
@@ -128,13 +124,11 @@ async fn replaced_policy_path_rejects_next_launch(cx: &mut Context) -> testkit::
                 format!("mv {LEAF} /sandbox/original-leaf; ln -s /var/tmp {LEAF}")
             },
         ] {
-            let output = sandbox.exec(["sh", "-c", script.as_str()]).await?;
-            testkit::ensure!(
-                output.exit_code == 0,
-                "({case}) `{script}` exited {}; stderr: {}",
-                output.exit_code,
-                output.stderr
-            );
+            sandbox
+                .exec(["sh", "-c", script.as_str()])
+                .await?
+                .success()
+                .context(format!("({case}) prepare the policy path"))?;
         }
 
         let next = tokio::time::timeout(REJECTED_LAUNCH_TIMEOUT, sandbox.exec(["true"]))

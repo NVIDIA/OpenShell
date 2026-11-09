@@ -2131,7 +2131,6 @@ version = "0.0.0"
 dependencies = [
  "container-engine-support",
  "openshell-testkit",
- "serde_json",
  "tempfile",
 ]
 

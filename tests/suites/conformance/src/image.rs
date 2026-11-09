@@ -24,13 +24,7 @@ async fn explicit_image_is_used(cx: &mut Context) -> testkit::Result {
 /// Fail unless the sandbox's `/etc/os-release` names Ubuntu and a version,
 /// as OpenShell's base image does.
 pub(crate) async fn expect_ubuntu(sandbox: &Sandbox) -> testkit::Result {
-    let output = sandbox.exec(["cat", "/etc/os-release"]).await?;
-    testkit::ensure!(
-        output.exit_code == 0,
-        "reading /etc/os-release exited {}; stderr: {}",
-        output.exit_code,
-        output.stderr
-    );
+    let output = sandbox.exec(["cat", "/etc/os-release"]).await?.success()?;
     let field = |key: &str| {
         output.stdout.lines().find_map(|line| {
             line.strip_prefix(key)

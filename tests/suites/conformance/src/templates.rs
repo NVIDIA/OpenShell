@@ -127,13 +127,12 @@ async fn sandbox_from_template_uses_its_workload(cx: &mut Context) -> testkit::R
 
     let output = sandbox
         .exec(["sh", "-c", "printf '%s' \"${FEATURE_FLAG:-missing}\""])
-        .await?;
+        .await?
+        .success()?;
     testkit::ensure!(
-        output.exit_code == 0 && output.stdout == "on",
-        "FEATURE_FLAG in a sandbox from the template is {:?}, exit {}; expected \"on\"; stderr: {}",
-        output.stdout,
-        output.exit_code,
-        output.stderr
+        output.stdout == "on",
+        "FEATURE_FLAG in a sandbox from the template is {:?}; expected \"on\"",
+        output.stdout
     );
     Ok(())
 }

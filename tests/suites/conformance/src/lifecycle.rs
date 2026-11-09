@@ -9,9 +9,8 @@
 
 use std::time::Duration;
 
-use serde_json::Value;
-use testkit::sdk::{SandboxPhase, SandboxRestartPolicy, SdkError};
-use testkit::{Context, Poll, Sandbox, poll_until};
+use testkit::sdk::{SandboxPhase, SandboxRestartPolicy};
+use testkit::{Context, Poll, ResultExt as _, Sandbox, poll_until};
 
 /// A long-running sandbox becomes ready, runs a command with exec, and is gone
 /// from get and list after delete.
@@ -66,22 +65,24 @@ async fn exec_outlives_startup_recovery_deadline(cx: &mut Context) -> testkit::R
         sandbox.exec(["sh", "-c", script.as_str()]),
     )
     .await
-    .map_err(|_| testkit::Error::msg("exec past the recovery deadline did not finish in 60s"))??;
+    .map_err(|_| testkit::Error::msg("exec past the recovery deadline did not finish in 60s"))??
+    .success()
+    .context("the recovery deadline must not end an admitted exec")?;
     testkit::ensure!(
-        output.exit_code == 0 && output.stdout == "past-recovery-deadline",
-        "the recovery deadline must not end an admitted exec: exited {} with stdout {:?}; stderr: {}",
-        output.exit_code,
-        output.stdout,
-        output.stderr
+        output.stdout == "past-recovery-deadline",
+        "the exec past the recovery deadline printed {:?}",
+        output.stdout
     );
 
-    let next = sandbox.exec(["printf", "fresh-exec"]).await?;
+    let next = sandbox
+        .exec(["printf", "fresh-exec"])
+        .await?
+        .success()
+        .context("exec after the recovery deadline")?;
     testkit::ensure!(
-        next.exit_code == 0 && next.stdout == "fresh-exec",
-        "exec after the recovery deadline exited {} with stdout {:?}; stderr: {}",
-        next.exit_code,
-        next.stdout,
-        next.stderr
+        next.stdout == "fresh-exec",
+        "exec after the recovery deadline printed {:?}",
+        next.stdout
     );
     Ok(())
 }
@@ -247,14 +248,7 @@ async fn main_exit_after_ready_sets_final_phase(cx: &mut Context) -> testkit::Re
 
     for (sandbox, code, phase) in &sandboxes {
         sandbox.wait_ready().await?;
-        let release = sandbox.exec(["touch", RELEASE_PATH]).await?;
-        testkit::ensure!(
-            release.exit_code == 0,
-            "releasing the main command of {} exited {}; stderr: {}",
-            sandbox.name(),
-            release.exit_code,
-            release.stderr
-        );
+        sandbox.exec(["touch", RELEASE_PATH]).await?.success()?;
         let finished = sandbox.wait_finished().await?;
         testkit::ensure!(
             finished.phase == *phase && finished.exit_code == Some(*code),
@@ -393,13 +387,12 @@ async fn canonical_main_environment(cx: &mut Context) -> testkit::Result {
 
         let exec = sandbox
             .exec(["sh", "-c", "printf '%s' \"${REPRO_SENTINEL:-missing}\""])
-            .await?;
+            .await?
+            .success()?;
         testkit::ensure!(
-            exec.exit_code == 0 && exec.stdout == declared,
-            "exec (tty {tty}) saw REPRO_SENTINEL={:?}, exit {}; expected {declared:?}; stderr: {}",
-            exec.stdout,
-            exec.exit_code,
-            exec.stderr
+            exec.stdout == declared,
+            "exec (tty {tty}) saw REPRO_SENTINEL={:?}; expected {declared:?}",
+            exec.stdout
         );
 
         if *tty {
@@ -499,7 +492,7 @@ fi
     )
     .await?;
 
-    let initial = sandbox_details(cx, &sandbox).await?;
+    let initial = cx.sandbox_details(sandbox.name()).await?;
     let initial_instance = initial["main_process_instance_id"]
         .as_str()
         .unwrap_or_default()
@@ -508,22 +501,17 @@ fi
         !initial_instance.is_empty(),
         "sandbox get reports no main process instance: {initial}"
     );
-    let release = sandbox
+    sandbox
         .exec(["touch", "/sandbox/.openshell-restart-release"])
-        .await?;
-    testkit::ensure!(
-        release.exit_code == 0,
-        "releasing the initial main command exited {}; stderr: {}",
-        release.exit_code,
-        release.stderr
-    );
+        .await?
+        .success()?;
 
     let restarted = poll_until(
         "the on-failure restart",
         RESTART_TIMEOUT,
         Duration::from_millis(250),
         async || {
-            let details = sandbox_details(cx, &sandbox).await?;
+            let details = cx.sandbox_details(sandbox.name()).await?;
             let instance = details["main_process_instance_id"]
                 .as_str()
                 .unwrap_or_default();
@@ -558,15 +546,6 @@ fi
     Ok(())
 }
 
-/// `sandbox get --output json`, which reports the main process instance and
-/// restart policy that the SDK does not expose.
-async fn sandbox_details(cx: &Context, sandbox: &Sandbox) -> testkit::Result<Value> {
-    cx.cli(["sandbox", "get", sandbox.name(), "--output", "json"])
-        .await?
-        .success()?
-        .json()
-}
-
 /// How long the gateway may take to remove an ephemeral sandbox after its
 /// main command exits. Both sandboxes are released before the test waits, so
 /// their removals overlap.
@@ -578,55 +557,29 @@ const EPHEMERAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 async fn detached_no_keep_sandbox_is_removed_after_main_exits(cx: &mut Context) -> testkit::Result {
     let mut sandboxes = Vec::new();
     for (suffix, code) in [("ez", 0), ("ef", 17)] {
-        let name = cx.name(suffix);
-        let release_path = format!("/sandbox/.ephemeral-release-{name}");
+        let builder = cx.cli_sandbox(suffix);
+        let release_path = format!("/sandbox/.ephemeral-release-{}", builder.name());
         let script =
             format!("while [ ! -e '{release_path}' ]; do sleep 0.1; done; sleep 1; exit {code}");
-        cx.track(&name);
-        cx.cli([
-            "sandbox",
-            "create",
-            "--name",
-            &name,
-            "--no-keep",
-            "--detach",
-            "--",
-            "sh",
-            "-c",
-            &script,
-        ])
-        .await?
-        .success()?;
-        sandboxes.push((cx.adopt(&name).await?, release_path, code));
+        let sandbox = builder
+            .args(["--no-keep"])
+            .command(["sh", "-c", &script])
+            .create()
+            .await?;
+        sandboxes.push((sandbox, release_path, code));
     }
 
     for (sandbox, release_path, _) in &sandboxes {
         sandbox.wait_ready().await?;
-        let release = sandbox.exec(["touch", release_path.as_str()]).await?;
-        testkit::ensure!(
-            release.exit_code == 0,
-            "releasing the main command of {} exited {}; stderr: {}",
-            sandbox.name(),
-            release.exit_code,
-            release.stderr
-        );
+        sandbox
+            .exec(["touch", release_path.as_str()])
+            .await?
+            .success()?;
     }
     for (sandbox, _, code) in &sandboxes {
-        poll_until(
-            &format!(
-                "ephemeral sandbox {} to be removed after exiting {code}",
-                sandbox.name()
-            ),
-            EPHEMERAL_CLEANUP_TIMEOUT,
-            Duration::from_millis(500),
-            async || match cx.client().get_sandbox(sandbox.name()).await {
-                Err(SdkError::NotFound { .. }) => Ok(Poll::Ready(())),
-                Err(error) => Err(error.into()),
-                Ok(found) => Ok(Poll::Pending(format!("phase {:?}", found.phase))),
-            },
-        )
-        .await?;
-        cx.expect_absent(sandbox).await?;
+        cx.wait_absent(sandbox, EPHEMERAL_CLEANUP_TIMEOUT)
+            .await
+            .context(format!("ephemeral sandbox exited {code}"))?;
     }
     Ok(())
 }
