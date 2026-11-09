@@ -16,7 +16,7 @@ from urllib.parse import quote, urlsplit
 
 from accepted_work import CLOSING_ISSUES_QUERY, check_issue_accepted_work, check_pr_accepted_work
 from check_maintainer_approval import parse_maintainers
-from label_issue_policy import is_inspected_source, load_taxonomy
+from label_issue_policy import load_taxonomy
 
 LIMIT = 2 * 1024 * 1024
 # Literal close-issue-message from .github/workflows/stale.yml (actions/stale).
@@ -180,10 +180,52 @@ def preflight(repository: str, number: int, *, api, force: bool = False) -> dict
             'eligibility': {'accepted': accepted, 'lifecycle': lifecycle, 'reason': reason}}
 
 
-def _artifact(kind, content, *, inspected=True, coverage='complete', **extra):
+def _semantic(kind, value):
+    """Substantive provider facts; raw artifacts retain all other context and bounds."""
+    if isinstance(value, list):
+        return [_semantic(kind, entry) for entry in value]
+    if not isinstance(value, dict):
+        return value
+    fields = {
+        'user': ('login', 'id', 'node_id', 'type'),
+        'label': ('name', 'id', 'node_id', 'description', 'assessment'),
+        'body': ('title', 'body'),
+        'item': ('repository', 'number', 'item_id', 'title', 'body', 'state', 'state_reason',
+                 'closed_at', 'merged_at', 'merged', 'user', 'assignees', 'draft', 'head', 'base',
+                 'changed_files'),
+        'patch': ('filename', 'previous_filename', 'sha', 'status', 'additions', 'deletions',
+                  'changes', 'patch', 'truncated', 'patch_truncated'),
+        'comment': ('id', 'node_id', 'body', 'user', 'author_association', 'created_at', 'updated_at'),
+        'review': ('id', 'node_id', 'body', 'user', 'author_association', 'state', 'submitted_at',
+                   'updated_at', 'commit_id'),
+        'review_comment': ('id', 'node_id', 'body', 'user', 'author_association', 'created_at',
+            'updated_at', 'diff_hunk', 'path', 'line', 'start_line', 'side', 'start_side',
+            'position', 'original_position', 'original_line', 'original_start_line',
+            'commit_id', 'original_commit_id', 'in_reply_to_id', 'subject_type'),
+        'lifecycle': ('__typename', 'id', 'createdAt', 'actor', 'closer'),
+    }
+    linked = kind == 'linked_issue'
+    kind = {'linked_issue': 'item', 'relevant_timeline': 'lifecycle'}.get(kind, kind)
+    result = {key: copy.deepcopy(value[key]) for key in fields.get(kind, value) if key in value}
+    if linked and 'labels' in value:
+        result['labels'] = copy.deepcopy(value['labels'])
+    for key in ('user', 'actor'):
+        if key in result:
+            result[key] = _semantic('user', result[key])
+    if 'assignees' in result:
+        result['assignees'] = _semantic('user', result['assignees'])
+    for key in ('head', 'base'):
+        if key in result and isinstance(result[key], dict):
+            result[key] = {k: result[key][k] for k in ('sha', 'ref') if k in result[key]}
+    return result
+
+
+def _artifact(kind, content, *, inspected=False, coverage='complete', **extra):
     raw_text = content.get('body') if isinstance(content, dict) else None
     encoded = json.dumps(content, ensure_ascii=False, sort_keys=True).encode('utf-8')
     digest = hashlib.sha256(encoded).hexdigest()
+    semantic_digest = hashlib.sha256(json.dumps(_semantic(kind, content),
+        ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
     if len(encoded) > LIMIT - 4096:
         # Slice characters, not encoded JSON bytes, then re-encode valid JSON.
         text = encoded.decode('utf-8')
@@ -196,7 +238,7 @@ def _artifact(kind, content, *, inspected=True, coverage='complete', **extra):
                 high = middle - 1
         content, coverage = text[:low], 'truncated'
     return {'kind': kind, 'content': content, 'inspected': inspected, 'coverage': coverage,
-            'source_digest': digest, 'source_bytes': len(encoded),
+            'source_digest': digest, 'source_bytes': len(encoded), 'semantic_digest': semantic_digest,
             **({'_raw_text': raw_text} if isinstance(raw_text, str) else {}), **extra}
 
 
@@ -223,7 +265,7 @@ def _write_packet(snapshot, preferred_ids):
     directory, index = Path(snapshot['_directory']), snapshot['evidence_index']
     packet = {key: snapshot[key] for key in (
         'schema_version', 'repository', 'number', 'kind', 'snapshot_id', 'item_id', 'eligibility')}
-    sections = {key: snapshot[key] for key in ('existing_labels', 'head', 'changed_paths', 'lifecycle_evidence')}
+    sections = {key: snapshot[key] for key in ('existing_labels', 'head', 'changed_paths')}
     sections['scopes'] = {key: snapshot['taxonomy'][key] for key in ('areas', 'topics')}
     for key, value in sections.items():
         if len(_json_bytes({**packet, key: value})) < LIMIT // 2:
@@ -233,16 +275,10 @@ def _write_packet(snapshot, preferred_ids):
             packet[key + '_ref'] = {'parts': _text_parts(directory, 'packet-' + key, encoded.decode()),
                                     'digest': hashlib.sha256(encoded).hexdigest(), 'coverage': 'deferred'}
     metadata = {artifact_id: {**{key: value for key, value in entry.items() if key != 'content'},
-                              **({'content_deferred': True} if entry['inspected'] else {})}
+                              'content_deferred': True}
                 for artifact_id, entry in index.items()}
-    # Reserve provenance overhead before paging/selection; newly delivered
-    # content may add this declaration to its metadata page after selection.
-    reserved = {identity: {**entry, **({'inspection': {
-        'source_digest': index[identity]['source_digest'], 'via': 'packet'}}
-        if index[identity]['inspected'] and not is_inspected_source(index[identity]) else {})}
-        for identity, entry in metadata.items()}
     pending_pages = []
-    if len(_json_bytes({**packet, 'evidence_index': reserved})) <= LIMIT // 2:
+    if len(_json_bytes({**packet, 'evidence_index': metadata})) <= LIMIT // 2:
         packet['evidence_index'] = metadata
         packet['index_coverage'] = 'complete'
     else:
@@ -250,7 +286,7 @@ def _write_packet(snapshot, preferred_ids):
         # explicit expansions are delivered separately below.
         pages, page, page_bytes = [], {}, 2
         for artifact_id, entry in metadata.items():
-            entry_bytes = len(_json_bytes(artifact_id)) + 1 + len(_json_bytes(reserved[artifact_id]))
+            entry_bytes = len(_json_bytes(artifact_id)) + 1 + len(_json_bytes(entry))
             if entry_bytes + 2 > LIMIT:
                 raise ValueError('Evidence metadata entry exceeds packet bound')
             if page_bytes + entry_bytes + bool(page) > LIMIT:
@@ -265,31 +301,24 @@ def _write_packet(snapshot, preferred_ids):
             pending_pages.append((path, page))
             pages.append(str(path))
         packet.update(evidence_index={}, index_pages=pages, index_coverage='paged')
-    delivered_provenance = {}
     ordered = list(dict.fromkeys([*preferred_ids, 'body', *index]))
     for artifact_id in ordered:
         entry = index.get(artifact_id)
-        if not entry or not entry['inspected']:
+        if not entry or not (entry['inspected'] or artifact_id in preferred_ids
+                or entry['kind'] in {'body', 'reconciliation', 'linked_issue', 'lifecycle'}):
             continue
         target = packet['evidence_index'] if artifact_id in packet['evidence_index'] else packet.setdefault('expanded_evidence', {})
         prior = target.get(artifact_id)
         delivered = {**metadata[artifact_id], 'content': entry['content']}
         delivered.pop('content_deferred', None)
-        declaration = None
-        if not snapshot.get('_preparing'):
-            declaration = entry['inspection'] if is_inspected_source(entry) else {
-                'source_digest': entry['source_digest'], 'via': 'packet'}
-            delivered['inspection'] = declaration
         target[artifact_id] = delivered
         if len(_json_bytes(packet)) > LIMIT:
             if prior is None:
                 target.pop(artifact_id)
             else:
                 target[artifact_id] = prior
-        elif declaration is not None:
-            delivered_provenance[artifact_id] = declaration
-    for identity, declaration in delivered_provenance.items():
-        metadata[identity]['inspection'] = declaration
+        else:
+            entry['inspected'] = delivered['inspected'] = metadata[artifact_id]['inspected'] = True
     encoded = _json_bytes(packet)
     if len(encoded) > LIMIT:
         raise ValueError('Packet reference metadata exceeds delivery bound')
@@ -299,8 +328,6 @@ def _write_packet(snapshot, preferred_ids):
             raise ValueError('Evidence metadata page exceeds delivery bound')
         path.write_bytes(page_bytes)
     Path(snapshot['packet_path']).write_bytes(encoded)
-    for identity, declaration in delivered_provenance.items():
-        index[identity]['inspection'] = declaration
 
 
 def _persist(snapshot, preferred_ids=()):
@@ -308,11 +335,6 @@ def _persist(snapshot, preferred_ids=()):
     artifacts = directory / 'artifacts'
     artifacts.mkdir(exist_ok=True)
     for artifact_id, entry in snapshot['evidence_index'].items():
-        declaration = entry.get('inspection')
-        if declaration is not None and (not isinstance(declaration, dict)
-                or declaration.get('source_digest') != entry.get('source_digest')
-                or declaration.get('via') not in ('packet', 'explicit_expansion')):
-            entry.pop('inspection', None)
         raw_text = entry.pop('_raw_text', None)
         if raw_text is not None:
             entry['text_source'] = {'characters': len(raw_text),
@@ -381,23 +403,9 @@ def _linked_issues(repository, number, api):
     raise ValueError('Closing-issue page budget exhausted')
 
 
-def _item_material(item):
-    keys = ('title', 'body', 'state', 'state_reason', 'closed_at', 'merged_at', 'merged',
-            'user', 'assignees', 'draft', 'head', 'base', 'changed_files')
-    result = {key: copy.deepcopy(item[key]) for key in keys if key in item}
-    for key in ('head', 'base'):
-        if key in result:
-            result[key] = {k: result[key][k] for k in ('sha', 'ref') if k in result[key]}
-    return result
-
-
 def prepare_snapshot(repository: str, number: int, directory: Path, *, api,
-                     assessment_labels=frozenset(), defer_delivery: bool = False) -> dict:
-    """Create a local packet with a separately reviewed assessment allowlist.
-
-    Wrapping preparation may defer initial exposure until its final packet by
-    leaving _preparing set, then clearing it before its final persistence.
-    """
+                     assessment_labels=frozenset()) -> dict:
+    """Create a local packet with a separately reviewed assessment allowlist."""
     facts = preflight(repository, number, api=api)
     repository, number = facts['repository'], facts['number']
     root = f'repos/{repository}'
@@ -428,17 +436,16 @@ def prepare_snapshot(repository: str, number: int, directory: Path, *, api,
     policy_text = json.dumps({'protocol': 1, 'maintainers': facts['maintainers_text'],
                               'reviewers': roster, 'contribution_policy': contribution_policy}, sort_keys=True)
     snapshot = {'schema_version': 1, 'repository': repository, 'number': number, 'kind': facts['kind'],
-                'snapshot_id': str(uuid.uuid4()), 'item_id': facts['item_id'], '_preparing': True,
+                'snapshot_id': str(uuid.uuid4()), 'item_id': facts['item_id'],
                 'policy_revision': facts['revision'], 'policy_version': hashlib.sha256(policy_text.encode()).hexdigest(),
                 'taxonomy': taxonomy, 'existing_labels': labels, 'trusted_maintainers': facts['maintainers'],
                 'malformed_classification_labels': _malformed(labels, taxonomy), 'eligibility': facts['eligibility'],
                 'head': (item.get('head') or {}).get('sha'), 'changed_paths': [],
-                'linked_closing_issues': linked, 'item_material': _item_material(item),
+                'linked_closing_issues': linked, 'item_material': _semantic('item', item),
                 'lifecycle_facts': {'closure_event': facts['closure_event'], 'closure_authority': facts['closure_authority']},
-                'lifecycle_evidence': [], 'evidence_index': index, '_directory': str(directory)}
+                'evidence_index': index, '_directory': str(directory)}
     if facts['closure_event']:
         index['closure'] = _artifact('lifecycle', facts['closure_event'], actor_authority=facts['closure_authority'])
-        snapshot['lifecycle_evidence'].append('closure')
     # Classification preparation may read discussion metadata even on open
     # items: recorded author abandonment or maintainer rejection must remain
     # available for the caller's restricting lifecycle interpretation.
@@ -456,16 +463,9 @@ def prepare_snapshot(repository: str, number: int, directory: Path, *, api,
             if login not in authorities:
                 authorities[login] = _authority(repository, user, author, set(facts['maintainers']), api)
             entry['actor_authority'] = copy.deepcopy(authorities[login])
-            if user.get('type') != 'Bot' and entry['actor_authority']['role'] in {'author', 'maintainer'}:
-                # Candidate delivery is not inspection provenance. Only the
-                # final packet or explicit acknowledgement can establish it.
-                entry['inspected'] = True
-                snapshot['lifecycle_evidence'].append(artifact_id)
     if facts['kind'] == 'pull_request':
         _refresh_collection(snapshot, 'files', api)
         index['files']['inspected'] = False
-    if not defer_delivery:
-        snapshot.pop('_preparing', None)
     _persist(snapshot)
     return snapshot
 
@@ -560,7 +560,7 @@ def _refresh_collection(snapshot, artifact_id, api):
             source_id, source_coverage = f'{prefix}:{entry["id"]}', 'complete'
         if source_id in replacements:
             raise ValueError('Duplicate evidence source identity')
-        candidate = _artifact(kind, entry, inspected=(kind == 'timeline_event'), coverage=source_coverage,
+        candidate = _artifact(kind, entry, coverage=source_coverage,
             source_user={key: value for key, value in (entry.get('user') or {}).items() if key in {'login', 'type'}},
             source_association=entry.get('author_association'))
         previous = index.get(source_id)
@@ -585,9 +585,6 @@ def _refresh_collection(snapshot, artifact_id, api):
         if entry.get('parent_id') in invalidated:
             index.pop(source_id)
     index.update(replacements)
-    snapshot['lifecycle_evidence'] = [source_id for source_id in snapshot['lifecycle_evidence']
-        if source_id not in invalidated and (source_id not in replacements
-            or replacements[source_id].get('actor_authority', {}).get('role') in {'author', 'maintainer'})]
     if artifact_id == 'files':
         snapshot['changed_paths'] = [entry['filename'] for entry in content]
         if len(content) != snapshot['item_material'].get('changed_files'):
@@ -611,7 +608,6 @@ def expand_evidence(snapshot: dict, evidence_ids: list[str], *, api) -> dict:
             raise ValueError(f'Unknown evidence ID: {artifact_id}')
         artifact = index[artifact_id]
         if not artifact.get('endpoint'):
-            artifact['inspected'] = True
             if artifact.get('kind') in {'comment', 'review', 'review_comment'}:
                 author = (snapshot['item_material'].get('user') or {}).get('login', '')
                 login = (artifact.get('source_user') or {}).get('login', '').casefold()
@@ -620,8 +616,6 @@ def expand_evidence(snapshot: dict, evidence_ids: list[str], *, api) -> dict:
                                                     set(snapshot['trusted_maintainers']), api)
                 authority = copy.deepcopy(authorities[login])
                 artifact['actor_authority'] = authority
-                if authority['role'] in {'author', 'maintainer'} and artifact_id not in snapshot['lifecycle_evidence']:
-                    snapshot['lifecycle_evidence'].append(artifact_id)
             continue
         try:
             _refresh_collection(snapshot, artifact_id, api)
@@ -629,11 +623,6 @@ def expand_evidence(snapshot: dict, evidence_ids: list[str], *, api) -> dict:
             artifact.update(inspected=False, coverage='incomplete')
             _persist(snapshot)
             raise
-    if not snapshot.get('_preparing'):
-        for artifact_id in evidence_ids:
-            entry = index[artifact_id]
-            entry['inspection'] = {'source_digest': entry['source_digest'],
-                                   'via': 'explicit_expansion'}
     _persist(snapshot, evidence_ids)
     return snapshot
 
@@ -649,6 +638,10 @@ def material_state(snapshot: dict) -> dict:
             'existing_labels', 'eligibility', 'head', 'changed_paths', 'item_material',
             'linked_closing_issues', 'lifecycle_facts', 'malformed_classification_labels', 'stale')
     result = copy.deepcopy({key: snapshot[key] for key in keys if key in snapshot})
+    result['taxonomy']['definitions'] = {name: _semantic('label', definition)
+        for name, definition in result['taxonomy']['definitions'].items()}
+    result['linked_closing_issues'] = _semantic('linked_issue', result['linked_closing_issues'])
+    result['lifecycle_facts']['closure_event'] = _semantic('lifecycle', result['lifecycle_facts']['closure_event'])
     result['evidence_index'] = {}
     for artifact_id, entry in snapshot.get('evidence_index', {}).items():
         result['evidence_index'][artifact_id] = {key: copy.deepcopy(value) for key, value in entry.items()

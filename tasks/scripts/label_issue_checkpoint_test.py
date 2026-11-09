@@ -188,18 +188,12 @@ class CheckpointTests(unittest.TestCase):
         with self.assertRaises(IncompleteMaterial):
             fingerprint(state, {'area:runtime'}, 'policy1')
 
-    def test_exact_configured_invocation_comment_is_removed_from_parent_and_children(self):
+    def test_command_looking_comment_invalidates_as_ordinary_evidence(self):
         before, after = material(), material()
-        after['evidence_index']['comment:2'] = source('comment', {'id': 2, 'body': '/label-issue'}, _raw_text='/label-issue')
+        after['evidence_index']['comment:2'] = source('comment', {'id': 2, 'body': '/label-issue'})
         after['evidence_index']['comments'] = source('comments', ['comment:1', 'comment:2'], members=['comment:1', 'comment:2'])
-        commands = frozenset({'/label-issue'})
-        self.assertEqual(fingerprint(before, {'area:runtime'}, 'policy1', invocation_commands=commands),
-                         fingerprint(after, {'area:runtime'}, 'policy1', invocation_commands=commands))
         self.assertNotEqual(fingerprint(before, {'area:runtime'}, 'policy1'),
                             fingerprint(after, {'area:runtime'}, 'policy1'))
-        after['evidence_index']['comment:2'] = source('comment', {'body': '/label-issue and discuss policy'}, _raw_text='/label-issue and discuss policy')
-        self.assertNotEqual(fingerprint(before, {'area:runtime'}, 'policy1', invocation_commands=commands),
-                            fingerprint(after, {'area:runtime'}, 'policy1', invocation_commands=commands))
 
     def test_fetched_uninspected_source_is_change_detector_not_read_claim(self):
         state = material()
@@ -375,6 +369,17 @@ class CheckpointTests(unittest.TestCase):
                 changed = material_state(snapshot)
                 changed['relevant_timeline'] = current['relevant_timeline']
                 self.assertNotEqual(before, fingerprint(changed, {'area:platform'}, snapshot['policy_version']))
+
+    def test_producer_timeline_mapping_order_does_not_change_fingerprint(self):
+        from label_issue_evidence import _artifact
+        state, reordered = material(), material()
+        event = {'__typename': 'ClosedEvent', 'id': 'C1', 'createdAt': 't1',
+                 'closer': {'number': 1, 'merged': True}}
+        state['relevant_timeline'] = _artifact('relevant_timeline', [event])
+        event['closer'] = {'merged': True, 'number': 1}
+        reordered['relevant_timeline'] = _artifact('relevant_timeline', [event])
+        self.assertEqual(fingerprint(state, {'area:runtime'}, 'policy1'),
+                         fingerprint(reordered, {'area:runtime'}, 'policy1'))
 
     def test_fingerprint_canonicalizes_mapping_order_without_mutating_inputs(self):
         state = material()

@@ -128,9 +128,8 @@ class EvidenceTests(unittest.TestCase):
         snapshot = self.prepare()
         self.assertEqual(snapshot['eligibility']['lifecycle'], 'hold')
         artifact = snapshot['evidence_index']['comment:7']
-        self.assertTrue(artifact['inspected'])
+        self.assertFalse(artifact['inspected'])
         self.assertEqual(artifact['actor_authority']['role'], 'author')
-        self.assertIn('comment:7', snapshot['lifecycle_evidence'])
 
     def test_maintainer_not_planned_or_duplicate_is_excluded(self):
         for reason in ('not_planned', 'duplicate'):
@@ -293,7 +292,6 @@ class EvidenceTests(unittest.TestCase):
     def test_open_author_intent_is_discoverable_without_inventing_disposition(self):
         self.api.collections['comments'] = [{'id': 7, 'body': 'I no longer plan to pursue this request.', 'user': {'login': 'maintainer'}}]
         snapshot = self.prepare()
-        self.assertEqual(snapshot['lifecycle_evidence'].count('comment:7'), 1)
         self.assertEqual(snapshot['eligibility']['lifecycle'], 'eligible')
         self.assertTrue(snapshot['evidence_index']['comment:7']['actor_authority']['verified'])
 
@@ -312,11 +310,10 @@ class EvidenceTests(unittest.TestCase):
             snapshot = self.prepare()
             self.assertEqual(snapshot['evidence_index']['patch:src/example.py']['coverage'], 'partial')
 
-    def test_large_author_comment_remains_truncated_lifecycle_evidence(self):
+    def test_large_author_comment_preserves_truncation_and_authority(self):
         self.api.item.update(state='closed', state_reason='not_planned', closed_by={'login': 'reader'}, user={'login': 'reader'})
         self.api.collections['comments'] = [{'id': 7, 'body': 'x' * 2200000, 'user': {'login': 'reader'}}]
         snapshot = self.prepare()
-        self.assertIn('comment:7', snapshot['lifecycle_evidence'])
         self.assertEqual(snapshot['evidence_index']['comment:7']['coverage'], 'truncated')
         self.assertEqual(snapshot['evidence_index']['comment:7']['actor_authority']['role'], 'author')
 
@@ -324,15 +321,13 @@ class EvidenceTests(unittest.TestCase):
         self.prepare()
         self.assertTrue(any(path == f'{ROOT}/contents/CONTRIBUTING.md?ref=trusted-sha' for path, _ in self.api.calls))
 
-    def test_lifecycle_comment_candidates_verify_collaborator_authority(self):
+    def test_comment_candidates_verify_collaborator_authority(self):
         self.api.collections['comments'] = [
             {'id': 7, 'body': 'We will not pursue this.', 'user': {'login': 'writer'}, 'author_association': 'COLLABORATOR'},
             {'id': 8, 'body': 'I claim authority.', 'user': {'login': 'reader'}, 'author_association': 'MEMBER'},
         ]
         snapshot = self.prepare()
-        self.assertIn('comment:7', snapshot['lifecycle_evidence'])
         self.assertEqual(snapshot['evidence_index']['comment:7']['actor_authority']['permission'], 'write')
-        self.assertNotIn('comment:8', snapshot['lifecycle_evidence'])
         self.assertEqual(snapshot['eligibility']['lifecycle'], 'eligible')
 
     def test_changed_paths_cannot_escape_pinned_source_boundary(self):
@@ -363,13 +358,14 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(before, len([path for path, _ in self.api.calls if '/files?' in path]))
         self.assertEqual(snapshot['head'], 'head-one')
 
-    def test_refresh_preserves_only_unchanged_inspection_and_reconciles_lifecycle_refs(self):
+    def test_refresh_preserves_only_unchanged_inspection_and_removes_deleted_sources(self):
         self.api.collections['comments'] = [
             {'id': 7, 'body': 'unchanged', 'user': {'login': 'maintainer'}},
             {'id': 8, 'body': 'edited later', 'user': {'login': 'maintainer'}},
             {'id': 9, 'body': 'deleted later', 'user': {'login': 'maintainer'}},
         ]
         snapshot = self.prepare()
+        expand_evidence(snapshot, ['comment:7', 'comment:8', 'comment:9'], api=self.api)
         self.api.collections['comments'] = [
             {'id': 7, 'body': 'unchanged', 'user': {'login': 'maintainer'}},
             {'id': 8, 'body': 'new intent', 'user': {'login': 'maintainer'}},
@@ -378,9 +374,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertTrue(snapshot['evidence_index']['comment:7']['inspected'])
         self.assertEqual(snapshot['evidence_index']['comment:7']['actor_authority']['role'], 'maintainer')
         self.assertFalse(snapshot['evidence_index']['comment:8']['inspected'])
-        self.assertNotIn('comment:8', snapshot['lifecycle_evidence'])
         self.assertNotIn('comment:9', snapshot['evidence_index'])
-        self.assertNotIn('comment:9', snapshot['lifecycle_evidence'])
 
     def test_truncated_body_comment_and_review_support_digest_bound_text_slices(self):
         self.api = API(pull=True)
@@ -445,10 +439,28 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn('comment:0', found)
         self.assertIn('comment:1999', found)
         for identity, metadata in found.items():
-            self.assertEqual(metadata.get('inspection'), snapshot['evidence_index'][identity].get('inspection'))
+            self.assertEqual(metadata['inspected'], snapshot['evidence_index'][identity]['inspected'])
         for identity, delivered in packet.get('expanded_evidence', {}).items():
-            self.assertEqual(delivered['inspection'], snapshot['evidence_index'][identity]['inspection'])
+            self.assertEqual(delivered['inspected'], snapshot['evidence_index'][identity]['inspected'])
         self.assertLessEqual(Path(snapshot['packet_path']).stat().st_size, 2 * 1024 * 1024)
+
+    def test_lifecycle_profiles_are_noise_but_actor_identity_is_substantive(self):
+        from label_issue_checkpoint import fingerprint
+        from label_issue_evidence import _artifact
+        self.api.item.update(state='closed', state_reason='not_planned',
+            user={'login': 'reader'}, closed_by={'login': 'reader', 'type': 'User'})
+        self.api.lifecycle_events = [{'__typename': 'ClosedEvent', 'id': 'C1',
+            'createdAt': 't1', 'actor': {'login': 'reader', 'avatar_url': 'first'}, 'closer': None}]
+        def current_fingerprint():
+            snapshot = self.prepare()
+            material = material_state(snapshot)
+            material['relevant_timeline'] = _artifact('relevant_timeline', self.api.lifecycle_events)
+            return fingerprint(material, {'area:platform'}, snapshot['policy_version'])
+        before = current_fingerprint()
+        self.api.lifecycle_events[0]['actor']['avatar_url'] = 'second'
+        self.assertEqual(before, current_fingerprint())
+        self.api.lifecycle_events[0]['actor']['login'] = 'other'
+        self.assertNotEqual(before, current_fingerprint())
 
     def test_material_state_ignores_snapshot_identity_and_blanket_timestamp(self):
         snapshot = self.prepare()
@@ -488,7 +500,7 @@ class EvidenceTests(unittest.TestCase):
                 'area': 'area:platform', 'topics': ['topic:sdk'], 'ambiguity': None,
                 'reasons': [{'labels': ['area:platform', 'topic:sdk'], 'evidence': refs, 'reason': 'SDK context.'}]}
 
-    def test_never_delivered_complete_body_requires_explicit_expansion(self):
+    def test_omitted_body_requires_delivered_content_or_focused_slice(self):
         from label_issue_policy import validate_result
         with mock.patch('label_issue_evidence.LIMIT', 65536):
             self.api.item['body'] = 'Large issue content. ' * 2800
@@ -497,11 +509,13 @@ class EvidenceTests(unittest.TestCase):
             packet = json.loads(Path(snapshot['packet_path']).read_text())
             self.assertTrue(packet['evidence_index']['body']['content_deferred'])
             self.assertEqual(snapshot['evidence_index']['body']['coverage'], 'complete')
-            self.assertNotIn('inspection', snapshot['evidence_index']['body'])
             self.assertFalse(validate_result(snapshot, self.classification(snapshot, ['body']))['valid'])
             expand_evidence(snapshot, ['body'], api=self.api)
-            self.assertEqual(snapshot['evidence_index']['body']['inspection']['via'], 'explicit_expansion')
-            self.assertTrue(validate_result(snapshot, self.classification(snapshot, ['body']))['valid'])
+            self.assertFalse(snapshot['evidence_index']['body']['inspected'])
+            request = f"text:body:{snapshot['evidence_index']['body']['source_digest']}:0:20"
+            expand_evidence(snapshot, [request], api=self.api)
+            self.assertEqual(snapshot['evidence_index'][request]['content'], 'Large issue content.')
+            self.assertTrue(validate_result(snapshot, self.classification(snapshot, [request]))['valid'])
             self.assertLessEqual(Path(snapshot['packet_path']).stat().st_size, 65536)
 
     def test_same_digest_prior_delivery_survives_later_packet_eviction(self):
@@ -509,14 +523,13 @@ class EvidenceTests(unittest.TestCase):
         with mock.patch('label_issue_evidence.LIMIT', 65536):
             self.api.item['body'] = 'Large issue content. ' * 2800
             snapshot = self.prepare()
-            prior = copy.deepcopy(snapshot['evidence_index']['body']['inspection'])
-            self.assertEqual(prior['via'], 'packet')
+            self.assertTrue(snapshot['evidence_index']['body']['inspected'])
             self.api.collections['comments'] = [{'id': n, 'body': 'Other context', 'user': {'login': 'reader'}} for n in range(30)]
             expand_evidence(snapshot, ['comments'], api=self.api)
             packet = json.loads(Path(snapshot['packet_path']).read_text())
             self.assertTrue(packet['evidence_index']['body']['content_deferred'])
-            self.assertEqual(snapshot['evidence_index']['body']['inspection'], prior)
-            self.assertEqual(packet['evidence_index']['body']['inspection'], prior)
+            self.assertTrue(snapshot['evidence_index']['body']['inspected'])
+            self.assertTrue(packet['evidence_index']['body']['inspected'])
             self.assertTrue(validate_result(snapshot, self.classification(snapshot, ['body']))['valid'])
 
     def test_source_change_invalidates_inspection_until_current_content_expanded(self):
@@ -524,30 +537,29 @@ class EvidenceTests(unittest.TestCase):
         self.api.collections['comments'] = [{'id': 7, 'body': 'Initial', 'user': {'login': 'reader'}}]
         snapshot = self.prepare()
         expand_evidence(snapshot, ['comment:7'], api=self.api)
-        prior = snapshot['evidence_index']['comment:7']['inspection']
+        prior = snapshot['evidence_index']['comment:7']['source_digest']
         self.api.collections['comments'][0]['body'] = 'Changed source'
         expand_evidence(snapshot, ['comments'], api=self.api)
-        self.assertNotEqual(snapshot['evidence_index']['comment:7']['source_digest'], prior['source_digest'])
-        self.assertNotIn('inspection', snapshot['evidence_index']['comment:7'])
+        self.assertNotEqual(snapshot['evidence_index']['comment:7']['source_digest'], prior)
+        self.assertFalse(snapshot['evidence_index']['comment:7']['inspected'])
         self.assertFalse(validate_result(snapshot, self.classification(snapshot, ['comment:7']))['valid'])
         expand_evidence(snapshot, ['comment:7'], api=self.api)
         self.assertTrue(validate_result(snapshot, self.classification(snapshot, ['comment:7']))['valid'])
 
 
-    def test_inspection_declarations_do_not_change_actual_material_fingerprint(self):
+    def test_read_flags_do_not_change_actual_material_fingerprint(self):
         from label_issue_checkpoint import fingerprint
         snapshot = self.prepare()
         before = material_state(snapshot)
         before['relevant_timeline'] = {'coverage': 'complete', 'source_digest': hashlib.sha256(b'[]').hexdigest(), 'source_bytes': 2}
         without_read_state = copy.deepcopy(before)
         for artifact in without_read_state['evidence_index'].values():
-            artifact.pop('inspection', None)
             artifact['inspected'] = False
             artifact.pop('content', None)
         self.assertEqual(fingerprint(before, {'area:platform'}, snapshot['policy_version']),
                          fingerprint(without_read_state, {'area:platform'}, snapshot['policy_version']))
 
-    def test_preparation_does_not_mark_deferred_human_comment_as_explicit_expansion(self):
+    def test_preparation_does_not_mark_unread_human_comments_inspected(self):
         from label_issue_policy import is_inspected_source
         with mock.patch('label_issue_evidence.LIMIT', 65536):
             self.api.collections['comments'] = [
@@ -582,7 +594,6 @@ class EvidenceTests(unittest.TestCase):
         expand_evidence(snapshot,['comments'],api=self.api)
         after=len([path for path,_ in self.api.calls if '/collaborators/writer/permission' in path])
         self.assertEqual(after-before,1)
-        self.assertFalse(snapshot['lifecycle_evidence'])
         self.assertTrue(all(snapshot['evidence_index'][f'comment:{i}']['actor_authority']['permission']=='read' for i in range(30)))
 
 
