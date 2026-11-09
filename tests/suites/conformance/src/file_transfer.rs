@@ -11,6 +11,7 @@
 //! why they run in every environment.
 
 use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
@@ -25,6 +26,7 @@ const LARGE_FILE_SIZE: usize = 512 * 1024;
 async fn upload_download_round_trip(cx: &mut Context) -> testkit::Result {
     let ft = Transfer::new(cx, "fr").await?;
     ft.upload_into_existing_directories().await?;
+    ft.upload_metadata_outside_workdir().await?;
     ft.round_trip().await?;
     ft.download_file().await?;
     ft.download_directory().await?;
@@ -51,6 +53,85 @@ async fn download_stays_inside_workspace(cx: &mut Context) -> testkit::Result {
     ft.reject_workspace_escape().await?;
     ft.download_dash_leading_name().await?;
     ft.sandbox.delete().await
+}
+
+const BACKPRESSURE_FILE_COUNT: usize = 12_000;
+const BACKPRESSURE_FILE_BYTES: usize = 8_192;
+
+/// An upload far larger than the supervisor's 4 MiB pending-stdin budget,
+/// made of many small files that keep tar busy creating them, completes on
+/// the first attempt with every file intact. The sender is not paced, so the
+/// transfer must apply backpressure (#4430).
+#[testkit::test]
+async fn large_upload_backpressure(cx: &mut Context) -> testkit::Result {
+    let ft = Transfer::new(cx, "fb").await?;
+    let source = ft.local("large-project");
+    create_dir_all(&source.join("payload"))?;
+
+    // Distinct pseudorandom bytes, so compression or identical-file checks
+    // can't hide dropped data.
+    let mut state: u64 = 4430;
+    let mut payload = vec![0_u8; BACKPRESSURE_FILE_BYTES];
+    let mut checksums = String::new();
+    for index in 0..BACKPRESSURE_FILE_COUNT {
+        for chunk in payload.chunks_mut(8) {
+            chunk.copy_from_slice(&splitmix64(&mut state).to_le_bytes()[..chunk.len()]);
+        }
+        let relative = format!("payload/{index:05}.bin");
+        fs::write(source.join(&relative), &payload)
+            .map_err(|error| Error::msg(format!("write {relative}: {error}")))?;
+        checksums.push_str(&format!("{}  {relative}\n", sha256_hex(&payload)?));
+    }
+    write(&source.join("SHA256SUMS"), &checksums)?;
+
+    let remote = format!("{}/backpressure", ft.remote_root);
+    let uploaded = ft
+        .cx
+        .cli_with_env(
+            &[("RUST_LOG", "warn")],
+            [
+                "sandbox",
+                "upload",
+                ft.sandbox.name(),
+                &source.display().to_string(),
+                &remote,
+                "--no-git-ignore",
+            ],
+        )
+        .await?
+        .success()?;
+    testkit::ensure!(
+        !uploaded
+            .message()
+            .contains("sandbox sync operation failed; retrying"),
+        "the large upload needed a retry: {}",
+        uploaded.message()
+    );
+
+    ft.sh(&format!(
+        "set -eu; cd '{remote}/large-project'; \
+         test \"$(find payload -type f | wc -l)\" -eq {BACKPRESSURE_FILE_COUNT}; \
+         test \"$(sha256sum SHA256SUMS | cut -d ' ' -f 1)\" = {}; \
+         sha256sum --check --quiet SHA256SUMS",
+        sha256_hex(checksums.as_bytes())?
+    ))
+    .await?;
+    ft.sandbox.delete().await
+}
+
+/// One step of SplitMix64, a small deterministic generator for fixture bytes.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn sha256_hex(bytes: &[u8]) -> testkit::Result<String> {
+    let digest =
+        openshell_crypto::sha256(bytes).map_err(|error| Error::msg(format!("SHA-256: {error}")))?;
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// A sandbox, a directory in its workspace, and a local scratch directory.
@@ -169,6 +250,53 @@ impl<'a> Transfer<'a> {
         Ok(())
     }
 
+    /// An upload to a directory outside the workspace keeps file modes and
+    /// symlinks, dangling ones included, overwrites files it carries, and
+    /// leaves other files in the destination alone.
+    async fn upload_metadata_outside_workdir(&self) -> testkit::Result {
+        let source = self.local("metadata-project");
+        create_dir_all(&source.join("payload"))?;
+        write(&source.join("payload/00000.bin"), "payload")?;
+        let script = source.join("run.sh");
+        write(&script, "#!/bin/sh\nprintf '%s\\n' upload-executable-ok\n")?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o751))
+            .map_err(|error| Error::msg(format!("chmod run.sh: {error}")))?;
+        for (target, link) in [
+            ("payload/00000.bin", "payload-link"),
+            ("missing-target", "dangling-link"),
+        ] {
+            symlink(target, source.join(link))
+                .map_err(|error| Error::msg(format!("symlink {link}: {error}")))?;
+        }
+        write(&source.join("conflict.txt"), "local-conflict")?;
+
+        let remote = format!(
+            "/tmp/file-transfer-{}-{}",
+            self.cx.run_id(),
+            self.sandbox.name()
+        );
+        let project = format!("{remote}/metadata-project");
+        self.sh(&format!(
+            "set -eu; test \"$(pwd -P)\" != '{remote}'; mkdir -p '{project}'; \
+             printf remote-conflict > '{project}/conflict.txt'; \
+             printf remote-preserved > '{project}/unrelated.txt'"
+        ))
+        .await?;
+
+        self.upload(&source, &remote, true).await?.success()?;
+        self.sh(&format!(
+            "set -eu; cd '{project}'; \
+             test \"$(stat -c %a run.sh)\" = 751; \
+             test \"$(./run.sh)\" = upload-executable-ok; \
+             test -L payload-link; test \"$(readlink payload-link)\" = payload/00000.bin; \
+             test -L dangling-link; test ! -e dangling-link; \
+             test \"$(readlink dangling-link)\" = missing-target; \
+             test \"$(cat conflict.txt)\" = local-conflict; \
+             test \"$(cat unrelated.txt)\" = remote-preserved"
+        ))
+        .await
+    }
+
     /// A directory with a nested file and a large binary file, and a single
     /// file, survive upload then download.
     async fn round_trip(&self) -> testkit::Result {
@@ -182,7 +310,7 @@ impl<'a> Transfer<'a> {
 
         let remote = format!("{}/roundtrip", self.remote_root);
         let uploaded = self.upload(&source, &remote, false).await?.success()?;
-        let warning = message(&uploaded);
+        let warning = uploaded.message();
         testkit::ensure!(
             warning.contains("outside a Git work tree")
                 && warning.contains(".gitignore rules are not applied"),
@@ -310,7 +438,7 @@ impl<'a> Transfer<'a> {
 
         let remote = format!("{}/reuploaded", self.remote_root);
         let rejected = self.upload(&runs, &remote, false).await?.failure()?;
-        let output = message(&rejected);
+        let output = rejected.message();
         testkit::ensure!(
             output.contains("filtering selected no files") && output.contains("--no-git-ignore"),
             "the rejected upload did not explain the --no-git-ignore override: {output}"
@@ -336,7 +464,7 @@ impl<'a> Transfer<'a> {
 
         for source in [etc_link.clone(), passwd_link, format!("{etc_link}/passwd")] {
             let rejected = self.download(&source, &destination).await?.failure()?;
-            let output = message(&rejected);
+            let output = rejected.message();
             testkit::ensure!(
                 output.contains("resolves to")
                     && output.contains("outside the")
@@ -360,16 +488,6 @@ impl<'a> Transfer<'a> {
             "dash-payload",
         )
     }
-}
-
-/// The CLI's stdout and stderr as one line of words. Error reports wrap to
-/// the terminal width and draw a gutter, so match against this instead.
-fn message(output: &CliOutput) -> String {
-    format!("{} {}", output.stdout, output.stderr)
-        .replace(['│', '×', '╰', '─', '╭', '├'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn git(repository: &Path, args: &[&str]) -> testkit::Result {

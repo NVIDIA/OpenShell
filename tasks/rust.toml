@@ -7,6 +7,10 @@
 description = "Compare native and sandbox-filtered TCP socket performance"
 run = "cargo run --release -p openshell-sandbox --features perf-harness --bin openshell-seccomp-perf --"
 
+["perf:live-internet"]
+description = "Compare live-Internet traffic on the host and in a sandbox on the active gateway"
+run = "uv run --no-project python tasks/scripts/live_internet_perf.py"
+
 ["rust:check"]
 description = "Check all Rust crates for errors"
 depends = ["rust:lockfiles:check"]

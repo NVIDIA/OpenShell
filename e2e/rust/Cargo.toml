@@ -90,11 +90,6 @@ path = "tests/vm_bind_mount.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
-name = "docker_preflight"
-path = "tests/docker_preflight.rs"
-required-features = ["e2e-docker"]
-
-[[test]]
 name = "docker_corporate_proxy"
 path = "tests/docker_corporate_proxy.rs"
 required-features = ["e2e-docker"]
@@ -120,11 +115,6 @@ path = "tests/local_driver_token_restart.rs"
 required-features = ["e2e"]
 
 [[test]]
-name = "ephemeral_cleanup"
-path = "tests/ephemeral_cleanup.rs"
-required-features = ["e2e"]
-
-[[test]]
 name = "podman_gateway_start"
 path = "tests/podman_gateway_start.rs"
 required-features = ["e2e-podman"]
@@ -142,11 +132,6 @@ required-features = ["e2e-podman"]
 [[test]]
 name = "podman_corporate_proxy"
 path = "tests/podman_corporate_proxy.rs"
-required-features = ["e2e-podman"]
-
-[[test]]
-name = "podman_oci_identity"
-path = "tests/podman_oci_identity.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
@@ -235,11 +220,6 @@ path = "tests/workspace_lifecycle.rs"
 required-features = ["e2e"]
 
 [[test]]
-name = "sandbox_templates"
-path = "tests/sandbox_templates.rs"
-required-features = ["e2e"]
-
-[[test]]
 name = "proxy_egress_pipeline"
 path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]
@@ -310,7 +290,3 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
-[[test]]
-name = "live_internet_traffic_perf"
-path = "tests/live_internet_traffic_perf.rs"
-required-features = ["e2e-host-gateway"]

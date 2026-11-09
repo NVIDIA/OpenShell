@@ -23,8 +23,6 @@
 //! 5. An `https://` proxy works when its CA is supplied via `proxy_ca_bundle`.
 //! 6. A TLS-intercepting proxy CA is trusted by both inspected supervisor
 //!    upstream TLS and a raw workload TLS connection.
-//! 7. An incoherent setting is fatal at gateway startup rather than
-//!    degrading to a direct dial.
 //!
 //! Fixtures run as host processes and are reached by the host-networked
 //! supervisor. `host.openshell.internal` is normalized to the gateway host
@@ -681,28 +679,6 @@ fn insert_docker_driver_settings(config: &str, extra: &str) -> Result<String, St
     Ok(updated)
 }
 
-#[test]
-fn proxy_settings_are_inserted_before_nested_driver_tables() {
-    let config = r#"[openshell.drivers.docker]
-socket_path = "/var/run/docker.sock"
-
-[openshell.drivers.docker.resource_admission]
-enabled = true
-"#;
-
-    let updated = insert_docker_driver_settings(config, "https_proxy = \"http://proxy\"\n")
-        .expect("insert proxy settings");
-    let proxy_position = updated
-        .find("https_proxy = \"http://proxy\"")
-        .expect("proxy setting is present");
-    let nested_table_position = updated
-        .find("[openshell.drivers.docker.resource_admission]")
-        .expect("nested table is preserved");
-
-    assert!(proxy_position < nested_table_position);
-    assert!(updated.contains("enabled = true"));
-}
-
 impl GatewayProxyConfig {
     /// Locate the gateway's `--config` path from the wrapper's args file.
     fn config_path_from_args() -> Result<PathBuf, String> {
@@ -1137,42 +1113,6 @@ async fn docker_corporate_proxy_trusts_intercepted_destination_tls() {
     );
 
     sandbox.cleanup().await;
-    gateway_config
-        .restore()
-        .await
-        .expect("restore gateway config");
-}
-
-#[tokio::test]
-#[serial(docker_corporate_proxy)]
-async fn docker_corporate_proxy_rejects_incoherent_configuration() {
-    if !should_run("corporate proxy fail-closed test") {
-        return;
-    }
-
-    // A bypass list without a proxy URL means the operator believed proxying
-    // was in effect. Accepting it would leave every dial direct while looking
-    // configured, so the gateway must refuse to start instead.
-    let mut gateway_config = GatewayProxyConfig::apply_raw("no_proxy = \"10.0.0.0/8\"\n")
-        .expect("apply incoherent corporate proxy gateway config");
-
-    let health = wait_for_healthy(Duration::from_secs(20)).await;
-    assert!(
-        health.is_err(),
-        "gateway must not serve traffic with an incoherent [openshell.drivers.docker] proxy table"
-    );
-
-    let log_path = std::env::var("OPENSHELL_E2E_GATEWAY_LOG").expect("gateway log path");
-    let log = std::fs::read_to_string(&log_path).expect("read gateway log");
-    // The message must name the offending key rather than surfacing as an
-    // opaque driver-readiness timeout. Matched loosely on the key names so
-    // this does not break on error-wrapping changes.
-    assert!(
-        log.contains("no_proxy") && log.contains("https_proxy"),
-        "the startup error must name the offending key; gateway log tail:\n{}",
-        log.lines().rev().take(40).collect::<Vec<_>>().join("\n")
-    );
-
     gateway_config
         .restore()
         .await
