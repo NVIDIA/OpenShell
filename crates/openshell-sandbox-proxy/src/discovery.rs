@@ -163,7 +163,7 @@ impl Args {
 
 async fn consume(args: &Args, routes: &cache::RouteCache, health: &Health) -> Result<(), Status> {
     let client = args.client().await?;
-    let mut grpc = client.raw_grpc();
+    let mut grpc = client.raw_service_discovery();
     let request = GetServiceRouteSnapshotRequest {
         workspace_scope: args.selector(),
         workspaces: args.selected_workspaces(),
@@ -302,5 +302,189 @@ mod tests {
         let mut too_many = set;
         too_many.workspace = (0..65).map(|i| format!("team-{i}")).collect();
         assert!(too_many.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    use openshell_core::proto::{
+        DiscoveredServiceRoute, GetServiceRouteSnapshotResponse, ServiceRouteEndpoint,
+        ServiceRouteSnapshot, WatchServiceRoutesResponse, WorkspaceSelector,
+        service_discovery_server::{ServiceDiscovery, ServiceDiscoveryServer},
+    };
+    use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+    use tonic::{Request, Response};
+
+    type Updates = Arc<
+        tokio::sync::Mutex<
+            Option<tokio::sync::mpsc::Sender<Result<WatchServiceRoutesResponse, Status>>>,
+        >,
+    >;
+
+    struct Discovery {
+        scope: Option<WorkspaceSelector>,
+        workspaces: Vec<String>,
+        snapshot: ServiceRouteSnapshot,
+        stream: Updates,
+    }
+
+    #[tonic::async_trait]
+    impl ServiceDiscovery for Discovery {
+        async fn get_service_route_snapshot(
+            &self,
+            request: Request<GetServiceRouteSnapshotRequest>,
+        ) -> Result<Response<GetServiceRouteSnapshotResponse>, Status> {
+            assert_eq!(request.get_ref().workspace_scope, self.scope);
+            assert_eq!(request.get_ref().workspaces, self.workspaces);
+            Ok(Response::new(GetServiceRouteSnapshotResponse {
+                snapshot: Some(self.snapshot.clone()),
+            }))
+        }
+        type WatchServiceRoutesStream = ReceiverStream<Result<WatchServiceRoutesResponse, Status>>;
+        async fn watch_service_routes(
+            &self,
+            request: Request<WatchServiceRoutesRequest>,
+        ) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+            assert_eq!(request.get_ref().workspace_scope, self.scope);
+            assert_eq!(request.get_ref().workspaces, self.workspaces);
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(Ok(WatchServiceRoutesResponse {
+                snapshot: Some(self.snapshot.clone()),
+            }))
+            .await
+            .unwrap();
+            *self.stream.lock().await = Some(tx);
+            Ok(Response::new(ReceiverStream::new(rx)))
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_only_service_drives_proxy_routes_for_single_finite_and_all_workspaces() {
+        for mode in 0..3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut flags = vec![
+                "openshell-sandbox-proxy".to_string(),
+                "--gateway-endpoint".into(),
+                format!("http://{addr}"),
+                "--allow-insecure-gateway".into(),
+            ];
+            if mode == 2 {
+                flags.push("--all-workspaces".into());
+            } else {
+                flags.extend(["--workspace".into(), "default".into()]);
+                if mode == 1 {
+                    flags.extend(["--workspace".into(), "team-b".into()]);
+                }
+            }
+            let args = Args::try_parse_from(flags).unwrap();
+            args.validate().unwrap();
+            let workspaces = if mode == 0 {
+                vec!["default"]
+            } else {
+                vec!["default", "team-b"]
+            };
+            let snapshot = ServiceRouteSnapshot {
+                revision: "initial".into(),
+                routes: workspaces
+                    .iter()
+                    .map(|workspace| DiscoveredServiceRoute {
+                        workspace: (*workspace).into(),
+                        sandbox: "demo".into(),
+                        name: "web".into(),
+                        hostname: format!("{workspace}--demo--web.example.com"),
+                        endpoint: Some(ServiceRouteEndpoint {
+                            host: "127.0.0.1".into(),
+                            port: 9443,
+                        }),
+                        installation_version: "installation-1".into(),
+                        expires_at: Some(
+                            openshell_core::time::timestamp_from_millis(crate::now_ms() + 12_000)
+                                .unwrap(),
+                        ),
+                        ..Default::default()
+                    })
+                    .collect(),
+            };
+            let stream = Arc::new(tokio::sync::Mutex::new(None));
+            let service = ServiceDiscoveryServer::new(Discovery {
+                scope: args.selector(),
+                workspaces: args.selected_workspaces(),
+                snapshot,
+                stream: stream.clone(),
+            });
+            let (sockets, rx) = tokio::sync::mpsc::channel(4);
+            let accept = tokio::spawn(async move {
+                loop {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    if sockets.send(Ok::<_, std::io::Error>(socket)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            // No OpenShell management service is registered: old RPC paths fail.
+            let server = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming_shutdown(ReceiverStream::new(rx), async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+            let (routes, mut changes) = tokio::sync::watch::channel(cache::Routes::new());
+            let health = Arc::new(Health::default());
+            let task_routes = routes.clone();
+            let task_health = health.clone();
+            let consumer =
+                tokio::spawn(async move { consume(&args, &task_routes, &task_health).await });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while stream.lock().await.is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(routes.borrow().len(), workspaces.len());
+            assert!(health.discovery_ready.load(Ordering::Acquire));
+            for workspace in workspaces {
+                assert!(
+                    routes
+                        .borrow()
+                        .contains_key(&format!("{workspace}--demo--web.example.com"))
+                );
+            }
+            stream
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .send(Ok(WatchServiceRoutesResponse {
+                    snapshot: Some(ServiceRouteSnapshot {
+                        routes: Vec::new(),
+                        revision: "withdrawn".into(),
+                    }),
+                }))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !changes.borrow_and_update().is_empty() {
+                    changes.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            drop(stream.lock().await.take());
+            tokio::time::timeout(Duration::from_secs(3), consumer)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            stop.send(()).unwrap();
+            accept.abort();
+            server.await.unwrap();
+        }
     }
 }
