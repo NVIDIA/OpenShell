@@ -26,6 +26,11 @@ runs:
       with:
         github-token: ${{ github.token }}
         summarize: false
+        # Downloads run in the daemon, so these must be in nix.conf, not NIX_CONFIG.
+        # The stall timeout only aborts transfers that receive no data for 60 s.
+        extra-conf: |
+          connect-timeout = 15
+          stalled-download-timeout = 60
 
     - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
       with:
@@ -38,10 +43,29 @@ runs:
       shell: bash
       env:
         NIX_SHELL_INSTALLABLE: ${{ inputs.shell-installable }}
+        # Successful runs finish in under 7 minutes. The retry keeps what the first try fetched.
+        FIRST_TRY_LIMIT_SECONDS: "900"
       run: |
-        # HTTP 416 is not retried by Nix; a fresh invocation restarts downloads.
-        if nix develop "$NIX_SHELL_INSTALLABLE" -c true; then
+        # HTTP 416 and stalled connections are not recovered within one Nix
+        # invocation; a fresh invocation restarts downloads. macOS runners have
+        # no timeout(1), so a watchdog stops the first try at the limit.
+        nix develop "$NIX_SHELL_INSTALLABLE" -c true &
+        nix_pid=$!
+        (
+          trap 'kill "$sleep_pid" 2>/dev/null; exit 0' TERM
+          sleep "$FIRST_TRY_LIMIT_SECONDS" >/dev/null 2>&1 &
+          sleep_pid=$!
+          wait "$sleep_pid"
+          echo "::warning::Nix shell preparation exceeded ${FIRST_TRY_LIMIT_SECONDS}s; stopping it."
+          kill -TERM "$nix_pid" 2>/dev/null
+        ) &
+        watchdog_pid=$!
+        status=0
+        wait "$nix_pid" || status=$?
+        kill -TERM "$watchdog_pid" 2>/dev/null || true
+        wait "$watchdog_pid" 2>/dev/null || true
+        if [[ "$status" -eq 0 ]]; then
           exit 0
         fi
-        echo "::warning::Nix shell preparation failed; retrying once."
+        echo "::warning::Nix shell preparation failed (exit $status); retrying once."
         nix develop "$NIX_SHELL_INSTALLABLE" -c true
