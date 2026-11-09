@@ -22,13 +22,12 @@ async fn core_dumps_are_disabled(cx: &mut Context) -> testkit::Result {
             "-c",
             "printf '%s %s' \"$(ulimit -c)\" \"$(ulimit -Hc)\"",
         ])
-        .await?;
+        .await?
+        .success()?;
     testkit::ensure!(
-        output.exit_code == 0 && output.stdout == "0 0",
-        "core file size limits (soft hard) are {:?}, exit {}; expected \"0 0\"; stderr: {}",
-        output.stdout,
-        output.exit_code,
-        output.stderr
+        output.stdout == "0 0",
+        "core file size limits (soft hard) are {:?}; expected \"0 0\"",
+        output.stdout
     );
     Ok(())
 }

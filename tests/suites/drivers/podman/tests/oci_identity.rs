@@ -9,7 +9,7 @@
 //! `oci-image` feature suite in `tests/suites/features`.
 
 use container_engine_support::Engine;
-use testkit::{Context, Error, ResultExt as _};
+use testkit::{Context, ResultExt as _};
 
 const OCI_IDENTITY: &str = "2345:2346";
 /// A complete policy without a `process` section, so the sandbox identity
@@ -33,10 +33,10 @@ async fn supervisor_runs_as_oci_identity_without_capabilities(cx: &mut Context) 
     cx.expect_compute_driver("podman").await?;
     let engine = Engine::from_env()?;
 
-    let tag = format!("localhost/openshell-test-oci-identity:{}", cx.run_id());
-    engine
-        .build_image(
-            &tag,
+    let image = engine
+        .build_test_image(
+            cx,
+            "oci-identity",
             &format!(
                 "FROM {}
 USER 0:0
@@ -50,53 +50,33 @@ USER {OCI_IDENTITY}
             ),
         )
         .await?;
-    // Cleanup runs last registered first, so the sandbox goes before the
-    // image it uses.
-    let (cleanup_engine, built) = (engine.clone(), tag.clone());
-    cx.on_cleanup(format!("remove image {tag}"), async move || {
-        cleanup_engine.remove_image(&built).await
-    });
     let image_user = engine
-        .output(["image", "inspect", "--format", "{{.Config.User}}", &tag])
+        .output([
+            "image",
+            "inspect",
+            "--format",
+            "{{.Config.User}}",
+            &image.tag,
+        ])
         .await?;
     testkit::ensure!(
         image_user == OCI_IDENTITY,
         "the test image has USER {image_user:?}; expected {OCI_IDENTITY}"
     );
 
-    let policy = tempfile::NamedTempFile::new()
-        .map_err(|error| Error::from_error(&error))
-        .context("create policy file")?;
-    std::fs::write(policy.path(), IMAGE_IDENTITY_POLICY)
-        .map_err(|error| Error::from_error(&error))
-        .context("write policy file")?;
-    let policy_path = policy
-        .path()
-        .to_str()
-        .ok_or_else(|| Error::msg("policy path is not UTF-8"))?;
+    let sandbox = cx
+        .cli_sandbox("oi")
+        .image(&image.tag)
+        .policy(IMAGE_IDENTITY_POLICY)
+        .command(["sleep", "infinity"])
+        .create()
+        .await
+        .context("sandbox starts from the OCI identity image")?;
+    sandbox.wait_ready().await?;
 
-    let name = cx.name("oi");
-    cx.track(&name);
-    cx.cli([
-        "sandbox",
-        "create",
-        "--name",
-        &name,
-        "--from",
-        &tag,
-        "--policy",
-        policy_path,
-        "--detach",
-        "--",
-        "sleep",
-        "infinity",
-    ])
-    .await?
-    .success()
-    .context("sandbox starts from the OCI identity image")?;
-    cx.adopt(&name).await?.wait_ready().await?;
-
-    let supervisor = engine.container_for_role(&name, "supervisor").await?;
+    let supervisor = engine
+        .container_for_role(sandbox.name(), "supervisor")
+        .await?;
     let user = engine
         .inspect_container(&supervisor, "{{.Config.User}}")
         .await?;

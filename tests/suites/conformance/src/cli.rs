@@ -23,18 +23,9 @@ const MAX_PAGES: usize = 1000;
 async fn cli_create_exec_list_delete(cx: &mut Context) -> testkit::Result {
     cx.cli(["status"]).await?.success()?;
 
-    let name = cx.name("cs");
-    cx.track(&name);
-    cx.cli(["sandbox", "create", "--name", &name, "--detach"])
-        .await?
-        .success()?;
-
-    let sandbox = cx.adopt(&name).await?;
-    let got: Value = cx
-        .cli(["sandbox", "get", &name, "--output", "json"])
-        .await?
-        .success()?
-        .json()?;
+    let sandbox = cx.cli_sandbox("cs").create().await?;
+    let name = sandbox.name().to_string();
+    let got = cx.sandbox_details(&name).await?;
     testkit::ensure!(
         got["name"] == name.as_str(),
         "sandbox get returned {:?}; expected {name:?}",
@@ -72,23 +63,12 @@ async fn cli_create_exec_list_delete(cx: &mut Context) -> testkit::Result {
 /// stopped, starts again, and can be stopped and deleted.
 #[testkit::test]
 async fn cli_stop_start_delete(cx: &mut Context) -> testkit::Result {
-    let name = cx.name("cl");
-    cx.track(&name);
-    cx.cli([
-        "sandbox",
-        "create",
-        "--name",
-        &name,
-        "--detach",
-        "--no-tty",
-        "--",
-        "sh",
-        "-c",
-        "exec sleep infinity",
-    ])
-    .await?
-    .success()?;
-    let sandbox = cx.adopt(&name).await?;
+    let sandbox = cx
+        .cli_sandbox("cl")
+        .command(["sh", "-c", "exec sleep infinity"])
+        .create()
+        .await?;
+    let name = sandbox.name().to_string();
     sandbox.wait_ready().await?;
 
     cx.cli(["sandbox", "stop", &name]).await?.success()?;
