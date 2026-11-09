@@ -1205,10 +1205,9 @@ dependencies = [
 name = "host-server-support"
 version = "0.0.0"
 dependencies = [
- "base64 0.22.1",
  "openshell-testkit",
- "sha1 0.10.6",
  "tokio",
+ "tungstenite",
 ]
 
 [[package]]
@@ -2267,6 +2266,7 @@ dependencies = [
  "libc",
  "libtest-mimic",
  "linkme",
+ "noyalib",
  "openshell-bootstrap",
  "openshell-core",
  "openshell-policy",

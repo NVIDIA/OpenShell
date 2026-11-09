@@ -79,7 +79,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 - `testkit::python_image()` for sandboxes that run `python3`, curl, git, or
   openssl: `OPENSHELL_TEST_PYTHON_IMAGE`, or `openshell/e2e-python:dev`
   (`e2e/python/Dockerfile.workload`). The tmachine installers load it into
-  every environment; `mise run e2e:workload:build` builds it locally.
+  every environment; `mise run e2e:workload:build` builds it locally. An
+  override image must run `python3` from one of `testkit::PYTHON_BINARIES`.
 - `cx.cli([...])` to run the installed CLI against the same gateway, with
   `success()`, `failure()`, and `json()` on the output. `cx.cli_handle()`
   returns that CLI for code that can't borrow `cx`, such as a cleanup hook.
@@ -87,13 +88,15 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 - `testkit::policy` for sandbox policies: `policy::base()` reads
   `testkit/src/base-policy.yaml`, which allows no network access, and
   `policy::allow(&mut policy, name, host, port, binaries)` adds an endpoint
-  that `policy::Endpoint` configures (`.rest(Access::Full)`,
-  `.credential_binding(provider)`, ...). Pass the result to
-  `cx.sandbox(..).policy(policy)`, or `policy::to_yaml` for the CLI.
+  (binaries apply to every endpoint under `name`) that `policy::Endpoint`
+  configures (`.rest(Access::Full)`, `.credential_binding(provider)`, ...).
+  Pass the result to `cx.sandbox(..).policy(policy)`, or `policy::to_yaml`
+  for the CLI.
   `testkit::PYTHON_BINARIES` names `python3` in `python_image()` images.
-- `testkit::install_provider(cx, name, profile, credentials)` to import a
-  provider profile, whose `id` must be `name`, and create a provider of it,
-  with cleanup for both.
+- `testkit::import_profile(cx, profile)` to import a provider profile and
+  return its `id`, and `testkit::create_provider(cx, name, type, credentials)`
+  to create a provider, each with cleanup. `testkit::install_provider(cx, name,
+  profile, credentials)` does both.
 - `testkit::YamlFile` for YAML a CLI command reads from a file.
 - `cx.client()` for SDK calls testkit does not wrap.
 - `error.grpc_code()` for the gRPC status code (`testkit::GrpcCode`) of a

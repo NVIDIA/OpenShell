@@ -28,6 +28,10 @@ pub fn base() -> proto::SandboxPolicy {
 /// Let `binaries` connect to `host:port` under the network policy `name`,
 /// adding the policy if it doesn't exist. Returns the new endpoint, which
 /// [`Endpoint`] configures further.
+///
+/// A policy's binaries apply to all its endpoints, so calling this again with
+/// the same `name` adds `binaries` to the existing ones, and every endpoint
+/// under `name` allows all of them. Use a different `name` to keep them apart.
 pub fn allow<'a>(
     policy: &'a mut proto::SandboxPolicy,
     name: &str,

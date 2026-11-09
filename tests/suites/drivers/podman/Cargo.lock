@@ -2255,6 +2255,7 @@ dependencies = [
  "libc",
  "libtest-mimic",
  "linkme",
+ "noyalib",
  "openshell-bootstrap",
  "openshell-core",
  "openshell-policy",

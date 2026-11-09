@@ -390,7 +390,8 @@ impl SandboxBuilder {
 /// as the SDK builds one from `spec` alone. The spec is destructured without
 /// `..`, so a field added to the SDK's spec fails to compile here instead of
 /// being dropped. [`SandboxBuilder::create`] rejects a GPU or service
-/// exposures before calling this.
+/// exposures before calling this. A policy field on the SDK's spec would
+/// replace this (#5410).
 fn policy_create_request(
     spec: SandboxSpec,
     policy: proto::SandboxPolicy,
