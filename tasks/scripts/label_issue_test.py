@@ -13,6 +13,7 @@ from pathlib import Path
 from label_issue import apply, main, prepare, preview, _lock_path
 from label_issue_evidence_test import API, REPO, ROOT
 from label_issue_github import GitHubError
+from label_issue_evidence import expand_evidence
 
 
 class LiveAPI(API):
@@ -99,6 +100,65 @@ class BoundaryTests(unittest.TestCase):
 
     def apply(self, snapshot, result=None, **kwargs):
         return apply(snapshot, self.result(snapshot) if result is None else result, api=self.api, trusted_actors=self.trusted, **kwargs)
+
+    def test_embedded_item_labels_remain_reconciliation_state(self):
+        self.api.item['labels'] = [{'name': label} for label in self.api.labels]
+        snapshot = self.prepared()
+        self.api.after_write = lambda api: api.item.update(labels=[{'name': label} for label in api.labels])
+        self.assertEqual(self.apply(snapshot)['status'], 'applied')
+        self.assertEqual(self.api.labels, ['state:accepted', 'area:platform'])
+
+    def test_provider_metadata_does_not_stale_preview_or_checkpoint(self):
+        self.api.item['user'] = {'login': 'writer', 'id': 9, 'type': 'User'}
+        self.api.item['assignees'] = [{'login': 'reader', 'id': 10, 'type': 'User'}]
+        self.api.collections['comments'] = [{'id': 7, 'body': 'Unrelated context',
+            'user': {'login': 'maintainer', 'id': 11, 'type': 'User'},
+            'created_at': 't1', 'updated_at': 't1'}]
+        snapshot = self.prepared()
+        self.api.collections['comments'][0].update(reactions={'total_count': 42}, html_url='new-url')
+        self.api.collections['comments'][0]['user'].update(avatar_url='new-avatar', followers_url='profile')
+        self.api.item['user']['avatar_url'] = 'author-avatar'
+        self.api.item['assignees'][0]['avatar_url'] = 'assignee-avatar'
+        self.api.definitions[0].update(color='ffffff', url='label-url')
+        self.assertEqual(preview(snapshot, self.result(snapshot), api=self.api)['status'], 'preview')
+        self.assertEqual(self.apply(snapshot)['status'], 'applied')
+        self.api.collections['comments'][0]['reactions']['total_count'] += 1
+        self.api.definitions[0]['color'] = '000000'
+        report = prepare(REPO, 3, Path(self.temp.name) / 'again', api=self.api, trusted_actors=self.trusted)
+        self.assertEqual(report['status'], 'unchanged')
+        self.assertFalse(report['classifier_required'])
+
+    def test_substantive_changes_stale_preview(self):
+        changes = [
+            lambda api: api.collections['comments'][0].update(body='Edited context'),
+            lambda api: api.collections['comments'][0].update(updated_at='t2'),
+            lambda api: api.collections['comments'][0]['user'].update(id=12),
+            lambda api: api.collections['comments'][0]['user'].update(login='reader'),
+            lambda api: api.collections['comments'].clear(),
+            lambda api: api.permissions.update(writer='read'),
+            lambda api: api.item['assignees'][0].update(login='other'),
+            lambda api: api.definitions[0].update(description='Changed scope'),
+            lambda api: api.definitions[0].update(node_id='OTHER_LABEL'),
+        ]
+        for change in changes:
+            with self.subTest(change=changes.index(change)):
+                self.api = LiveAPI()
+                self.api.item['assignees'] = [{'login': 'reader', 'type': 'User'}]
+                self.api.collections['comments'] = [{'id': 7, 'body': 'Context',
+                    'user': {'login': 'writer', 'id': 11, 'type': 'User'},
+                    'author_association': 'COLLABORATOR', 'updated_at': 't1'}]
+                snapshot = self.prepared()
+                change(self.api)
+                self.assertEqual(preview(snapshot, self.result(snapshot), api=self.api)['status'], 'stale')
+                self.assertEqual(self.api.writes, [])
+
+    def test_unread_irrelevant_human_context_does_not_hold_preview(self):
+        self.api.collections['comments'] = [{'id': 7, 'body': 'Thanks for the report.',
+            'user': {'login': 'maintainer', 'type': 'User'}}]
+        snapshot = self.prepared()
+        self.assertFalse(snapshot['evidence_index']['comment:7']['inspected'])
+        self.assertEqual(preview(snapshot, self.result(snapshot), api=self.api)['status'], 'preview')
+        self.assertEqual(self.api.writes, [])
 
     def test_real_additions_precede_removals_and_last_addition_has_v2_rationale(self):
         snapshot = self.prepared()
@@ -222,29 +282,25 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(self.api.labels, ['area:old'])
         self.assertFalse(any(('rationale' in str(write) for write in self.api.writes)))
 
-    def test_semantic_lifecycle_only_restricts_with_actual_human_authority(self):
+    def test_semantic_lifecycle_only_restricts_with_read_human_authority(self):
         self.api.collections['comments'] = [{'id': 7, 'body': 'We will not pursue this.', 'user': {'login': 'maintainer', 'type': 'User'}}]
         snapshot = self.prepared()
         result = self.result(snapshot)
         result['lifecycle'] = {'disposition': 'excluded', 'evidence': ['comment:7'], 'reason': 'Recorded maintainer rejection.'}
-        self.assertEqual(self.apply(snapshot, result)['status'], 'skipped')
-        self.assertEqual(self.api.writes, [])
-
-    def test_semantic_lifecycle_rejects_automatic_inspected_flag_without_source_provenance(self):
-        self.api.collections['comments'] = [{'id': 7, 'body': 'We will not pursue this.', 'user': {'login': 'maintainer', 'type': 'User'}}]
-        snapshot = self.prepared()
-        snapshot['evidence_index']['comment:7'].pop('inspection', None)
-        result = self.result(snapshot)
-        result['lifecycle'] = {'disposition': 'excluded', 'evidence': ['comment:7'], 'reason': 'Claimed rejection.'}
         self.assertEqual(self.apply(snapshot, result)['status'], 'held')
+        expand_evidence(snapshot, ['comment:7'], api=self.api)
+        self.assertEqual(self.apply(snapshot, result)['status'], 'skipped')
+        snapshot['evidence_index']['comment:7']['actor_authority']['role'] = 'unknown'
+        self.assertEqual(self.apply(snapshot, result)['status'], 'stale')
         self.assertEqual(self.api.writes, [])
 
-    def test_core_initial_delivery_waits_for_authority_metadata_and_final_packet(self):
+    def test_final_packet_omission_does_not_credit_intermediate_body_delivery(self):
         from label_issue_evidence import prepare_snapshot
         from label_issue_policy import is_inspected_source, validate_result
-        self.api.item['body'] = 'x' * 50000
-        self.api.collections['comments'] = [dict(id=i, body='context',
-            user={'login': 'reader', 'type': 'User'}) for i in range(20)]
+        self.api.item['pull_request'] = {'url': 'pull'}
+        self.api.pull.update(body='x' * 50000, changed_files=0)
+        self.api.collections['reviews'] = [dict(id=i, body='context',
+            user={'login': 'reader', 'type': 'User'}) for i in range(30)]
         with mock.patch('label_issue_evidence.LIMIT', 65536):
             standalone = prepare_snapshot(REPO, 3, Path(self.temp.name) / 'standalone', api=self.api)
             self.assertTrue(is_inspected_source(standalone['evidence_index']['body']))
@@ -252,9 +308,7 @@ class BoundaryTests(unittest.TestCase):
             packet = json.loads(Path(snapshot['packet_path']).read_text())
             self.assertTrue(packet['evidence_index']['body']['content_deferred'])
             self.assertFalse(is_inspected_source(snapshot['evidence_index']['body']))
-            self.assertNotIn('inspection', packet['evidence_index']['body'])
             self.assertFalse(validate_result(snapshot, self.result(snapshot))['valid'])
-            self.assertNotIn('_preparing', snapshot)
             self.assertLessEqual(Path(snapshot['packet_path']).stat().st_size, 65536)
 
     def test_untrusted_executor_cannot_write(self):
@@ -294,6 +348,7 @@ class BoundaryTests(unittest.TestCase):
         self.api.permissions['bot-writer'] = 'write'
         snapshot = self.prepared()
         result = self.result(snapshot)
+        expand_evidence(snapshot, ['comment:7'], api=self.api)
         result['lifecycle'] = {'disposition': 'excluded', 'evidence': ['comment:7'], 'reason': 'Bot says reject'}
         self.assertEqual(self.apply(snapshot, result)['status'], 'held')
         self.assertEqual(self.api.writes, [])
@@ -519,26 +574,26 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('area:old',self.api.labels)
         self.assertIn('area:platform',self.api.labels)
 
-    def test_reviews_and_review_comments_are_required_human_lifecycle_sources(self):
+    def test_read_reviews_and_review_comments_can_restrict_lifecycle(self):
         for collection,identity in [('reviews','review:8'),('review_comments','review-comment:8')]:
             with self.subTest(collection=collection):
                 self.api=LiveAPI(); self.api.item['pull_request']={'url':'pull'}; self.api.pull['changed_files']=0
                 self.api.collections[collection]=[{'id':8,'body':'We will not pursue this work.','user':{'login':'maintainer','type':'User'}}]
                 snapshot=self.prepared()
-                self.assertIn(identity,snapshot['lifecycle_evidence'])
+                self.assertFalse(snapshot['evidence_index'][identity]['inspected'])
+                expand_evidence(snapshot, [identity], api=self.api)
                 result=self.result(snapshot); result['lifecycle']={'disposition':'excluded','evidence':[identity],'reason':'Recorded maintainer disposition.'}
                 self.assertEqual(self.apply(snapshot,result)['status'],'skipped')
                 self.assertEqual(self.api.writes,[])
 
-    def test_old_manifest_cannot_omit_fresh_required_review_reading(self):
-        self.api.item['pull_request']={'url':'pull'}; self.api.pull['changed_files']=0
-        self.api.collections['reviews']=[{'id':8,'body':'Recorded rejection','user':{'login':'maintainer','type':'User'}}]
-        snapshot=self.prepared()
-        snapshot['lifecycle_evidence']=[]
-        snapshot['evidence_index']['review:8']['inspected']=False
-        snapshot['evidence_index']['review:8'].pop('inspection',None)
-        self.assertEqual(self.apply(snapshot)['status'],'held')
-        self.assertEqual(self.api.writes,[])
+    def test_unread_irrelevant_review_does_not_hold_preview(self):
+        self.api.item['pull_request'] = {'url': 'pull'}
+        self.api.pull['changed_files'] = 0
+        self.api.collections['reviews'] = [{'id': 8, 'body': 'Thanks for following up.', 'user': {'login': 'maintainer', 'type': 'User'}}]
+        snapshot = self.prepared()
+        self.assertFalse(snapshot['evidence_index']['review:8']['inspected'])
+        self.assertEqual(preview(snapshot, self.result(snapshot), api=self.api)['status'], 'preview')
+        self.assertEqual(self.api.writes, [])
 
     def test_transport_fields_and_diagnostics_survive_public_prepare(self):
         def limited_api(path,**kwargs):

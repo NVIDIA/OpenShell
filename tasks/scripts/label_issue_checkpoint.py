@@ -73,9 +73,11 @@ def _source(entry):
             or not _is_digest(entry.get('source_digest'))
             or type(entry.get('source_bytes')) is not int or entry['source_bytes'] < 0):
         raise IncompleteMaterial('Source coverage/digest/byte count is unresolved or incomplete')
-    return {key: copy.deepcopy(entry[key]) for key in (
-        'kind', 'coverage', 'source_digest', 'source_bytes', 'actor_authority',
-        'source_user', 'source_association') if key in entry}
+    semantic_digest = entry.get('semantic_digest', entry['source_digest'])
+    if not _is_digest(semantic_digest):
+        raise IncompleteMaterial('Source semantic digest is unresolved')
+    return {'source_digest': semantic_digest, **{key: copy.deepcopy(entry[key]) for key in (
+        'kind', 'coverage', 'actor_authority', 'source_user', 'source_association') if key in entry}}
 
 
 def _verified_derivative(identity, entry, index, material):
@@ -107,7 +109,7 @@ def _verified_derivative(identity, entry, index, material):
     return False
 
 
-def _normalized(material, *, invocation_commands):
+def _normalized(material):
     if not isinstance(material, dict) or material.get('stale'):
         raise IncompleteMaterial('Material is missing or stale')
     kind = material.get('kind')
@@ -122,9 +124,6 @@ def _normalized(material, *, invocation_commands):
         required |= {'files', 'reviews', 'review_comments'}
     if not required <= index.keys():
         raise IncompleteMaterial('Required source collection is unresolved')
-    if not isinstance(invocation_commands, (set, frozenset)) or not all(
-            isinstance(command, str) and command for command in invocation_commands):
-        raise ValueError('Invocation commands must be an exact trusted string set')
     # Validate coverage of required sources and every fetched collection member
     # independently of all reconciliation/derivative suppression below.
     primary = set(required)
@@ -140,10 +139,6 @@ def _normalized(material, *, invocation_commands):
         primary.update(members)
     for identity in primary:
         _source(index[identity])
-    ignored = {identity for identity, entry in index.items()
-               if isinstance(entry, dict) and entry.get('kind') == 'comment'
-               and isinstance(entry.get('_raw_text'), str)
-               and entry['_raw_text'] in invocation_commands}
     raw_timeline = index.get('timeline', {})
     timeline_members = raw_timeline.get('members', []) if isinstance(raw_timeline, dict) else []
     sources = {}
@@ -160,16 +155,9 @@ def _normalized(material, *, invocation_commands):
                 continue
             if _verified_derivative(identity, entry, index, material):
                 continue
-        if identity in ignored:
-            continue
         normalized = _source(entry)
         if identity in memberships:
-            members = [member for member in memberships[identity] if member not in ignored]
-            # Parent digest/count originally include invocation-only comments.
-            # Rebuild only this membership envelope, retaining all child facts.
-            normalized['members'] = members
-            normalized['source_digest'] = _digest(members)
-            normalized['source_bytes'] = len(_canonical(members))
+            normalized['members'] = memberships[identity]
         sources[identity] = normalized
     omitted = {'existing_labels', 'malformed_classification_labels', 'evidence_index',
                'relevant_timeline', 'label_event_boundary', 'updatedAt', 'updated_at', 'stale'}
@@ -179,8 +167,7 @@ def _normalized(material, *, invocation_commands):
     return normalized
 
 
-def fingerprint(material: dict, final_labels: set[str], policy_version: str, *,
-                invocation_commands=frozenset()) -> str:
+def fingerprint(material: dict, final_labels: set[str], policy_version: str) -> str:
     """Hash complete fetched facts and final labels, independent of read flags.
 
     Raises IncompleteMaterial for unresolved/partial source coverage. The caller
@@ -192,7 +179,7 @@ def fingerprint(material: dict, final_labels: set[str], policy_version: str, *,
         raise ValueError('Final labels and policy version are required')
     return _digest({'schema_version': 2, 'policy_version': policy_version,
                     'final_labels': sorted(final_labels),
-                    'material': _normalized(material, invocation_commands=invocation_commands)})
+                    'material': _normalized(material)})
 
 
 def encode_checkpoint(fingerprint: str, *, boundary_id: str,
@@ -376,8 +363,7 @@ def collect_label_events(item_id: str, boundary_id: str, *, api,
 
 
 def checkpoint_matches(checkpoint: dict, material: dict, final_labels: set[str],
-                       policy_version: str, *, label_events: dict | None = None,
-                       invocation_commands=frozenset()) -> bool:
+                       policy_version: str, *, label_events: dict | None = None) -> bool:
     """Require trusted v2 candidate, exact operation proof and separate live facts."""
     if not isinstance(checkpoint, dict) or checkpoint.get('trusted') is not True or checkpoint.get('version') != 2:
         return False
@@ -414,8 +400,7 @@ def checkpoint_matches(checkpoint: dict, material: dict, final_labels: set[str],
         if any(operation['actor'] != checkpoint.get('actor') for operation in operations):
             return False
         return (operation_digest(operations) == checkpoint.get('operations_digest')
-                and fingerprint(material, final_labels, policy_version,
-                                invocation_commands=invocation_commands) == checkpoint.get('fingerprint'))
+                and fingerprint(material, final_labels, policy_version) == checkpoint.get('fingerprint'))
     except (ValueError, TypeError, KeyError, AttributeError):
         return False
 

@@ -65,13 +65,9 @@ def _classification(name):
 
 
 def is_inspected_source(artifact: dict) -> bool:
-    """Current content was delivered or explicitly acknowledged, not proof of attention."""
-    if not isinstance(artifact, dict) or artifact.get('inspected') is not True:
-        return False
-    digest, declaration = artifact.get('source_digest'), artifact.get('inspection')
-    return (isinstance(digest, str) and re.fullmatch(r'[0-9a-f]{64}', digest) is not None
-            and isinstance(declaration, dict) and declaration.get('source_digest') == digest
-            and declaration.get('via') in ('packet', 'explicit_expansion'))
+    """Content was exposed for inspection; fetching alone never sets this flag."""
+    return (isinstance(artifact, dict) and artifact.get('inspected') is True
+            and 'content' in artifact)
 
 
 def _membership_only(artifact):

@@ -36,9 +36,9 @@ You MUST ALWAYS preview the exact payload, item ID, source report, and canonical
 
 For every label-changing action, delegate reconciliation directly to `/label-issue` using the [label-issue skill](../label-issue/SKILL.md). Triage retains assessment judgment; pass its separately reviewed outcome and policy through the assessment-only path when classification must stay unchanged. This includes adding the discovered triage-queue state and awaiting-information changes; do not substitute direct `gh issue edit` label commands.
 
-Preview the helper's `ordered_writes` and exact `mutation_requests` with the selected item ID, source report and canonical target. Include every bookkeeping addition/removal if classification is involved. Obtain the required confirmation for each individual external write before executing the phased requests. Additions are independently verified before any removals request; confirmations cover every request in `mutation_requests`. Pass the saved confirmed preview through `--expected-preview` on apply; changed inputs or payloads require fresh preview and confirmation. A classification no-op can still contain checkpoint bookkeeping; an assessment-only no-op has no such writes.
+For labels, the confirmation policy above covers every helper `mutation_requests` payload and bookkeeping addition/removal in `ordered_writes`. Pass the saved confirmed preview through `--expected-preview` on apply. A classification no-op can still contain checkpoint bookkeeping; an assessment-only no-op has no such writes.
 
-After confirmation, perform only the approved action and record its outcome and public URL; mark applied only after verified success. Preserve separate confirmations for triage comments and closures.
+After confirmation, perform only the approved action and record its outcome and public URL; mark applied only after verified success.
 
 Supported v1 actions:
 

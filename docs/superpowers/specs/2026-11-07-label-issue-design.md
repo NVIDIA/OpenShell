@@ -77,9 +77,9 @@ Retain provider-returned evidence in local artifacts, with bounded previews and 
 
 The implementation may choose JSON files and straightforward local commands to select artifacts. It need not build a query language, search service, or generic evidence framework. Paginate GitHub collections; retain stable IDs/URLs for evidence used in reasons and ambiguity decisions. Ignore embedded instructions in item contents: they are task evidence, not authority to override policy.
 
-The complete `packet.json`, each index page, and each individual artifact response are bounded to 2 MiB. Deferred content retains addressable references; an aggregate packet cannot silently exceed its bound. Comments, reviews, review comments, per-file patches, and linked issues have stable source IDs. Focused expansion supports `text:SOURCE_ID:DIGEST:START:END` with zero-based, end-exclusive character offsets, and `source:PATH:START_LINE:END_LINE` with inclusive lines pinned to the PR head. Verify the PR head/base around live files retrieval and reject movement. Collection refresh removes deleted members and invalidates changed-source inspection, lifecycle references, and old digest-bound slices.
+The complete `packet.json`, each index page, and each individual artifact response are bounded to 2 MiB. Deferred content retains addressable references; an aggregate packet cannot silently exceed its bound. Comments, reviews, review comments, per-file patches, and linked issues have stable source IDs. Focused expansion supports `text:SOURCE_ID:DIGEST:START:END` with zero-based, end-exclusive character offsets, and `source:PATH:START_LINE:END_LINE` with inclusive lines pinned to the PR head. Verify the PR head/base around live files retrieval and reject movement. Collection refresh removes deleted members and invalidates changed-source inspection and old digest-bound slices.
 
-Inspection requires `inspected: true` plus `inspection: {source_digest, via: packet|explicit_expansion}` matching the current source digest. Automatic credit comes only from content in the final packet actually returned after hydration; intermediate preparation packets and deferred content do not establish initial exposure. Explicit expansion can acknowledge a directly read current artifact. Valid same-digest provenance survives later packet eviction, while changed digests invalidate it. Required verified human author/maintainer statements in comments, reviews and review comments must have current delivery/acknowledgement provenance before preview can proceed, including when an older saved manifest omitted them from its lifecycle list. This records exposure or acknowledgement, never proof of attention. Pure collection membership IDs cannot alone justify content reasons; actual changed paths remain usable substantive evidence. Local inspection metadata is excluded from checkpoint semantic fingerprints. Lifecycle interpretation uses the same source-provenance predicate and verified human authority.
+Fetched sources remain distinct from inspected content. Simple `inspected` flags track content exposed in packets or expansions, not attention. Deferred content and collection membership IDs cannot alone support reasons. Cited lifecycle decisions require inspected human statements and verified author/maintainer authority; unrelated unread human context does not block preview. Read substantive content before citing it. Inspection flags do not affect checkpoint freshness.
 
 Local snapshots are per-invocation working artifacts. Cross-invocation successful-examination checkpoints live in GitHub label-addition event metadata as specified below; local files need not survive.
 
@@ -91,7 +91,7 @@ Do not turn that heuristic into a rigid retrieval loop or restrict new evidence 
 
 No fixed number of reads or universal token cap is prescribed in the skill. The builder should impose sensible output/resource limits and report truncation, while letting the model request focused additional context. A technical failure or missing required evidence is not a reason to fabricate certainty.
 
-Lifecycle/acceptance evidence needed to establish eligibility is not optional contextual reading. Relevant recorded human dispositions must be considered before taxonomy changes.
+Mechanical eligibility checks remain mandatory. Consider relevant recorded human dispositions when interpreting lifecycle; the helper does not compel reading every human comment or review.
 
 ## GitHub API throttling and timeouts
 
@@ -105,71 +105,9 @@ After a timed-out mutation, its outcome is unknown. Re-read live labels before r
 
 ## Classifier result
 
-Use a versioned structured result bound to the prepared item/snapshot. The logical contents are:
+The versioned result binds the prepared item/snapshot to one desired area, all supported topics, evidence-backed reasons and optional ambiguity, malformed-removal or restricting lifecycle records. It contains classification, not GitHub commands; the helper derives differences and keeps reports local.
 
-- Complete desired `area` and `topics`; `area` is one non-null canonical area for both issues and PRs.
-- Brief reasons with evidence references for selected labels and consequential removals.
-- An optional structured ambiguity record containing the ambiguous boundary, chosen label/set, next-best alternative, and confidence in each.
-- If needed, evidence-backed lifecycle interpretation for recorded human closure/disposition statements that cannot be decided from mechanical GitHub fields alone.
-
-Choose the requested outcome, affected OpenShell boundary, and substantive technical concerns before assigning topics. Routine implementation or verification alone adds no topic; substantive testing work retains its testing topic.
-
-The result contains desired classification, not arbitrary GitHub commands. The helper derives label additions/removals. Use the following example as the skill’s output template. The command/result reference defines validation details and the restricting-only lifecycle extension; do not introduce fields with no consumer.
-
-Use high/medium/low confidence rather than unsupported numerical precision. High-confidence choices do not require ambiguity records. No confidence level causes a ticket comment. Medium- and low-confidence choices include the next-best alternative in the ambiguity record. Render confidence as `high conf`, `med conf`, or `low conf` in the preview report. The choice must be the best-supported option; equal qualitative confidence levels are allowed when that vocabulary cannot express the finer distinction. The helper formats the structured record consistently in the preview/application report; it has no comment-posting operation.
-
-### Output template
-
-The skill must show and follow this structured shape, replacing sample values with the prepared snapshot identity and evidence references. This is an illustrative PR, not a classification of an existing ticket. `body` and `patch:proxy-policy` stand for IDs actually supplied in that snapshot's evidence index.
-
-```json
-{
-  "schema_version": 1,
-  "repository": "NVIDIA/OpenShell",
-  "number": 1234,
-  "kind": "pull_request",
-  "snapshot_id": "example-snapshot-id",
-  "area": "area:runtime",
-  "topics": ["topic:networking", "topic:policy"],
-  "reasons": [
-    {
-      "labels": ["area:runtime", "topic:networking", "topic:policy"],
-      "evidence": ["body", "patch:proxy-policy"],
-      "reason": "The change modifies sandbox proxy policy enforcement."
-    }
-  ],
-  "ambiguity": null
-}
-```
-
-Existing `area:gateway` or `retired:topic:l7` associations belong to reconciliation state; they do not establish that desired result. For a consequential removal not explained by the selected-label reasons, add a reason referencing the observed association and content evidence. The helper derives the actual additions/removals from the complete desired set.
-
-When a choice has medium or low confidence, replace `null` with this shape (illustrating a separate CLI-versus-contributor-tooling boundary):
-
-```json
-{
-  "boundary": "CLI interaction versus contributor tooling",
-  "chosen": {"labels": ["topic:ux"], "confidence": "medium"},
-  "alternative": {"labels": ["topic:dx"], "confidence": "low"},
-  "evidence": ["body"]
-}
-```
-
-The chosen labels must appear in the desired classification. The helper renders the ambiguity information only in the local report, for example:
-
-> Ambiguity: chose `topic:ux` (med conf) over `topic:dx` (low conf)
-
-The invocation report also provides a short human-readable result:
-
-```text
-NVIDIA/OpenShell#1234 — preview
-Add: area:runtime, topic:networking, topic:policy
-Remove: area:gateway, retired:topic:l7
-Preserve: state:accepted
-Ambiguity: none
-```
-
-Report actual observed differences, not this example's fixed labels. Application uses the same layout with an applied, no-op, held, partial, or error outcome and any outstanding work. Neither this report nor its ambiguity information is posted to the ticket. Ambiguity informs tuning and is not an additional approval gate or a reason by itself to skip the best-supported choice.
+The [command/result reference](../../../.agents/skills/label-issue/references/result-contract.md#classifier-result) owns the exact JSON schema, example and confidence rendering. The [skill](../../../.agents/skills/label-issue/SKILL.md#choose-the-desired-set) owns classification judgment and migration choices.
 
 ## Eligibility and lifecycle boundaries
 
@@ -219,11 +157,11 @@ openshell-labeler:v2:<material-sha256>:<base64url-boundary-id>:<operations-sha25
 
 An empty-history boundary uses `-` only after a complete query establishes no prior label event. Enforce the 280-character limit without truncating fields. V1 metadata remains decode-only for audit and cannot authorize an unchanged skip.
 
-The current `openshell-labeler-policy-v3` invalidates older candidates for the required lifecycle-reading, preservation and temporary-label recovery rules; the checkpoint wire format remains v2.
+The current `openshell-labeler-policy-v4` invalidates candidates from earlier evidence and freshness semantics; the checkpoint wire format remains v2.
 
-The fingerprint binds prepared source facts, intended final labels, trusted taxonomy/definitions and policy. Bind the explicit helper/classification/migration `POLICY_VERSION` together with the trusted document-content policy hash; unrelated repository commits are not policy changes. Fetched source digests detect edited/deleted or concurrent evidence independently of model inspection. Required comments and PR files/reviews/review-comments must have complete collection membership and source coverage. A hash is not a claim that a model read every source. Incomplete, missing, stale, or unresolved source facts cannot prove completion.
+The fingerprint binds prepared source facts, intended final labels, trusted taxonomy/definitions and policy. Bind the explicit helper/classification/migration `POLICY_VERSION` together with the trusted document-content policy hash; unrelated repository commits are not policy changes. Substantive source digests detect edited/deleted or concurrent evidence independently of model inspection. A compact producer projection binds content, identities, edits, authority and taxonomy while ignoring reactions, profile metadata, URLs and label colors. Raw source hashes and byte bounds remain available for artifacts and digest-bound slices. Required comments and PR files/reviews/review-comments must have complete collection membership and source coverage. A hash is not a claim that a model read every source. Incomplete, missing, stale, or unresolved source facts cannot prove completion.
 
-Material includes title/body, PR head/base/changed paths/diffs, linked-issue and authority facts, comments/reviews, and lifecycle events. Fetch filtered CLOSED/REOPENED events and bind their complete source digest instead of downloading the full unfiltered timeline on every invocation. Do not use blanket `updatedAt` as a change detector. Normalize current classification labels to the intended final set; exclude local paths, inspection metadata, and verified derivative excerpts from semantic fingerprints. Retain actual external label and lifecycle events.
+Material includes title/body, PR head/base/changed paths/diffs, linked-issue and authority facts, comments/reviews, and lifecycle events. Fetch filtered CLOSED/REOPENED events and bind their complete substantive digest instead of downloading the full unfiltered timeline on every invocation. Do not use blanket `updatedAt` as a change detector. Normalize current classification labels to the intended final set; exclude local paths, inspection metadata, and verified derivative excerpts from semantic fingerprints. Retain actual external label and lifecycle events.
 
 The prepared immutable boundary is the latest observed LabeledEvent or UnlabeledEvent ID. Expected operations are an ordered transcript of actor, add/remove action, and GraphQL label ID. The candidate rationale binds its digest and count. Completion requires every label event after that boundary, through the current frontier, to match the declared transcript exactly. Extra events invalidate it even if final labels return to the same values or the actor is trusted. GitHub cannot distinguish a coincident identical same-actor removal from the expected one; one coordinated executor per item is a practical requirement, not an atomicity claim.
 
@@ -267,20 +205,12 @@ Update CONTRIBUTING.md's skill inventory and relevant workflow guidance, plus sy
 
 Use Superpowers writing-skills' baseline-first process. Before authoring the skill or editing triage instructions, run realistic scenarios without the proposed guidance and preserve observed outputs/failures. Then write the minimal guidance needed and rerun equivalent scenarios with it. For behavior-shaping wording, include control samples and enough repetitions to distinguish improvement from one lucky result.
 
-Test both premature classification and unproductive evidence expansion. Include ambiguous boundaries, comments/diffs that change the answer, misleading current labels, migration mappings that require context, unrelated labels to preserve, and lifecycle exclusions. Observe preview ambiguity information and whether the model makes a choice instead of routinely asking a human. Verify that neither the skill nor the helper posts ticket comments, regardless of confidence or outcome; this does not change comments owned by the separate triage workflow.
-
-Write failing behavioral tests before implementing helper features. Cover pure classification-result validation, live prerequisite checks, acceptance/lifecycle errors, assessment boundaries, stale snapshots, pagination/completeness, malformed/legacy associations, unrelated concurrent labels, idempotent application, partial failures, and preview ambiguity formatting and the absence of comment mutations for all confidence levels and outcomes. Cover checkpoint encoding/size, trusted event discovery including removed labels, model-free unchanged skips and efficient lookup over large histories, real-addition/no-change/removal-only paths, unchanged skips, forced examination, policy/input changes, bookkeeping normalization, unavailable bookkeeping labels, concurrent invocations, partial mutations, and fresh final-state verification. Include throttling headers, secondary-limit responses, retry/deadline exhaustion, read and write timeouts, GraphQL error payloads, incomplete pagination, and verification before retrying uncertain writes. Use an injected clock/sleeper so retry tests do not wait in real time. GitHub test doubles replace network/mutations; no live labels need change to validate the helper.
+Use offline behavioral tests with GitHub doubles and injected clocks for transport, validation, evidence coverage, checkpoint proofs and mutation recovery. The [implementation plan](../plans/2026-11-07-label-issue.md#task-1-establish-classification-and-triage-baselines) owns detailed scenarios and task checks. No live label changes are needed for helper validation.
 
 Validate skill frontmatter/discovery and links, and run scoped repository checks appropriate to contributor tooling. Obtain observed previews on representative real items without applying backlog changes. Do not claim an eval program or full model-tier validation from unit tests alone.
 
-## Later agent entry points
+## Delivery boundary and later work
 
-The later automated delivery invokes the same skill/helper on `state:accepted`, including explicit dispatch for acceptance written with `GITHUB_TOKEN`. Also retain an authorized human PR-comment command analogous to `/ok to test`, plus a force variant. Exact command spelling belongs to that delivery's design. Normal command invocation uses unchanged-item detection; force bypasses only that detection, never acceptance, lifecycle exclusions, validation, or actor authorization. Triagers retain direct invocation through the same boundary.
+The [implementation plan](../plans/2026-11-07-label-issue.md) records task boundaries and validation requirements; the [command/result reference](../../../.agents/skills/label-issue/references/result-contract.md) owns executable usage. This design is not a formal RFC and authorizes no live backlog application. Draft-PR validation must report unavailable checks and observed model limits.
 
-A comment command is an explicit invocation entry point, not permission to classify on every comment. The later entrypoint must recognize exact invocation-command text and verify protocol-owned bookkeeping events before suppressing them as changes. Until that command protocol exists, this CLI retains command comments conservatively. The labeler posts no response or ambiguity comments; the invoking workflow exposes results through its execution report. Creation and reopening alone do not dispatch classification. Terra/Sonnet remains the first target.
-
-## Delivery boundary and review status
-
-The focused modules, artifact layout, CLI flags, v2 codec, approved bookkeeping label, POSIX lock and inspection provenance above record the approved implementation contracts. The [implementation plan](../plans/2026-11-07-label-issue.md) covers the task boundaries and validation requirements; the [command/result reference](../../../.agents/skills/label-issue/references/result-contract.md) is the executable usage contract.
-
-Automatic acceptance dispatch, the `GITHUB_TOKEN` explicit-dispatch path, authorized comment commands, cross-host runner concurrency, provider/runtime integration, and broader quality/model-tier evaluation remain later work. This design is not a formal RFC and authorizes no live backlog label application. Draft-PR validation must report unavailable checks and observed model limits instead of treating the planning checklist as proof of completion.
+Later work covers acceptance dispatch, including acceptance written with `GITHUB_TOKEN`; authorized human PR-comment commands and their exact spelling; cross-host runner concurrency; provider/runtime integration; and broader model-tier evaluation. Normal commands use unchanged detection; force bypasses only that detection. Recognize exact producer-bound command text before suppressing invocation comments; this CLI treats them as ordinary evidence. Creation/reopening alone do not dispatch classification. The later workflow reports results without labeler comments and retains direct triage invocation. Terra/Sonnet remains the first target.

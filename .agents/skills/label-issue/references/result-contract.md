@@ -10,7 +10,7 @@ uv run --no-project python tasks/scripts/label_issue.py prepare \
   --repo "$repo" --item "$item" --trusted-actor "$label_actor" --output "$packet_dir"
 ```
 
-For classification, continue only for `status: ready` with `classifier_required: true`. For separately authorized assessment-only preparation, continue for `status: ready` with `classifier_required: false` using the assessment path below. Read `packet.json`; use `manifest.json` for snapshot identity, `taxonomy.definitions`, `malformed_classification_labels` and relevant artifact metadata. Read `lifecycle_evidence` and its actual recorded facts, including verified human dispositions recorded in reviews and review comments. Preview holds if a freshly required source lacks current delivery/expansion provenance; merely hashing or enumerating it does not satisfy this requirement. An unchanged outcome is a deterministic no-model, no-write skip.
+For classification, continue only for `status: ready` with `classifier_required: true`. For separately authorized assessment-only preparation, continue for `status: ready` with `classifier_required: false` using the assessment path below. Read `packet.json`; use `manifest.json` for snapshot identity, `taxonomy.definitions`, `malformed_classification_labels` and relevant artifact metadata. An unchanged outcome is a deterministic no-model, no-write skip.
 
 ```shell
 uv run --no-project python tasks/scripts/label_issue.py expand \
@@ -27,7 +27,7 @@ uv run --no-project python tasks/scripts/label_issue.py preview \
   --executor "$label_actor" --human --output "$packet_dir/preview.json"
 ```
 
-Review `status`, `add`, `remove`, `preserve`, `ambiguity`, `missing_prerequisites`, `bookkeeping`, and `ordered_writes`. `mutation_requests` contains the exact ordered HTTP request payloads, one per verified phase. Application sends the additions phase first, verifies actual replacement labels, the exact event prefix and current material independently, then sends the removals phase. A failed or uncertain addition cannot authorize later removals. Approved temporary precleanup can precede additions in the first phase. Confirm every HTTP request listed in `mutation_requests`; `--expected-preview` binds the full list, ordered alias inputs and executor identity, including assessment-only writes. A new examination with no additions can still need bookkeeping events. The approved dedicated default `meta:labeler-checkpoint` must already exist; this helper never provisions it. Missing prerequisites block application. Approved temporary leftovers are cleaned independently of whether a new bookkeeping cycle is configured and cannot authorize an unchanged skip. Do not cycle acceptance, workflow or area/topic labels as substitutes.
+Review the desired differences, ambiguity, prerequisites and bookkeeping in the preview. Confirm the exact ordered payloads in `mutation_requests`; `--expected-preview` binds those requests and the executor, including assessment-only writes. Application verifies replacement labels, event prefix and fresh material after additions before sending removals. Approved temporary cleanup may precede additions. A no-change examination can still need bookkeeping; the dedicated `meta:labeler-checkpoint` must already exist. Missing prerequisites block application; the helper never provisions labels or cycles acceptance/workflow/classification labels as substitutes. Approved temporary leftovers are cleaned even when no new cycle is configured and prevent unchanged skips.
 
 For an authorized one-item application:
 
@@ -48,7 +48,7 @@ Exit codes: 0 for ready/preview/applied/no-op/unchanged/skipped, 2 for held/prer
 
 ## Classifier result
 
-Return one complete desired area/topic set, never commands or an ad hoc add/remove plan. Reasons connect the requested outcome and affected OpenShell boundary to substantive technical concerns. Routine implementation or verification steps alone add no topic; substantive testing work retains its testing topic. Copy all five envelope fields from this prepared manifest. The following illustrative issue has body evidence supporting CLI use more strongly than contributor tooling; replace its identity, labels and evidence IDs with observed snapshot values.
+Follow the [skill's classification judgment](../SKILL.md#choose-the-desired-set). Return a complete desired set and copy all five envelope fields from the prepared manifest. Replace this illustrative issue's identity, labels and evidence IDs with observed values.
 
 ```json
 {
@@ -75,9 +75,9 @@ Return one complete desired area/topic set, never commands or an ad hoc add/remo
 }
 ```
 
-`kind` is `issue` or `pull_request`. `area` is one string, never null/list. `topics` is a unique list with no arbitrary count cap. Choose against canonical scopes; keep a needed canonical label even if its live definition is absent. Preview shows that desired set plus missing prerequisites and blocks application. Documentation work gets documentation topic plus its content-derived area. Required language-specific SDK topics retain broad SDK subscription; missing taxonomy/routing preparation is a prerequisite, never a reason to drop the needed nested topic or reuse an obsolete label. Every desired label needs a reason citing current inspected substantive evidence. Index-only references cannot support a reason. Each cited artifact requires matching source-digest inspection provenance, established by delivery or explicit expansion.
+`kind` is `issue` or `pull_request`; `area` is one non-null string; `topics` is a unique list without a count cap. Every desired label requires a reason citing current inspected substantive content. Membership IDs alone cannot support a reason. Missing canonical scopes or live definitions appear as prerequisites and block application without changing the desired set.
 
-Use `ambiguity: null` for high-confidence choices. For a meaningful residual boundary, medium/low confidence uses the single structured record above; chosen labels belong to the desired set, alternatives to active scopes. Confidence vocabulary is high/medium/low, not numerical. The local report renders, for example, `Ambiguity: chose topic:ux (med conf) over topic:dx (low conf)`. No confidence level creates a comment or routine human-approval gate.
+`ambiguity` is null or the record shown above. Chosen labels belong to the desired set, alternatives to active scopes; confidence values are high/medium/low. The local report renders, for example, `Ambiguity: chose topic:ux (med conf) over topic:dx (low conf)`.
 
 Optional `removals` is a list of objects with `label`, `evidence`, `reason`. It is for malformed associations: the label must be observed and in the trusted prepared `malformed_classification_labels`; evidence includes `labels` plus inspected substantive content. Do not nominate unrelated priorities/workflow labels. Recognizable area/topic and retired classification associations reconcile from the complete desired set. Explain consequential removals not already explained by selected-label reasons with observed association and content evidence.
 

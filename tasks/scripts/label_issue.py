@@ -28,17 +28,13 @@ from label_issue_github import GitHubClient
 from label_issue_policy import format_report, is_inspected_source, plan_labels
 # Bump for classifier/skill/migration semantic changes; trusted document hashes
 # are bound separately, without binding unrelated repository HEAD changes.
-POLICY_VERSION = 'openshell-labeler-policy-v3'
+POLICY_VERSION = 'openshell-labeler-policy-v4'
 DEFAULT_BOOKKEEPING_LABEL = 'meta:labeler-checkpoint'
 # Configuration selects this reviewed authority; alternate names need code review.
 APPROVED_BOOKKEEPING_LABELS = frozenset({DEFAULT_BOOKKEEPING_LABEL})
 ADD_QUERY = 'mutation($input: AddLabelsToLabelableInput!) {\n apply: addLabelsToLabelable(input: $input) { labelable { __typename } }\n}'
 REMOVE_QUERY = 'mutation($input: RemoveLabelsFromLabelableInput!) {\n apply: removeLabelsFromLabelable(input: $input) { labelable { __typename } }\n}'
 TIMELINE_QUERY = 'query($item: ID!, $before: String) { node(id: $item) {\n __typename\n ... on Issue { CONNECTION }\n ... on PullRequest { CONNECTION }\n} }'.replace('CONNECTION', 'timelineItems(last: 100, before: $before,\n itemTypes: [CLOSED_EVENT, REOPENED_EVENT]) {\n nodes { __typename ... on ClosedEvent { id createdAt actor { login }\n closer { __typename ... on PullRequest { number merged mergedAt repository { nameWithOwner } } }\n } ... on ReopenedEvent { id createdAt actor { login } } }\n pageInfo { hasPreviousPage startCursor }\n}')
-
-
-def _canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode()
 
 
 def _report(source, status, message=None):
@@ -95,8 +91,7 @@ def _relevant_timeline(item_id, api):
             identities.add(event['id'])
         events = nodes + events
         if not page['hasPreviousPage']:
-            encoded = _canonical(events)
-            return {'kind': 'relevant_timeline', 'coverage': 'complete', 'source_digest': hashlib.sha256(encoded).hexdigest(), 'source_bytes': len(encoded)}
+            return evidence._artifact('relevant_timeline', events)
         before = page.get('startCursor')
         if not isinstance(before, str) or not before or before in cursors or (not nodes):
             raise ValueError('Invalid relevant timeline cursor')
@@ -104,9 +99,7 @@ def _relevant_timeline(item_id, api):
     raise ValueError('Relevant timeline page budget exhausted')
 
 
-def _hydrate(snapshot, api, template=None):
-    previous_inspection = {identity: (source.get('source_digest'), source.get('inspected', False))
-                           for identity, source in snapshot['evidence_index'].items()}
+def _hydrate(snapshot, api):
     collections = ['comments']
     if snapshot['kind'] == 'pull_request':
         collections += ['files', 'reviews', 'review_comments']
@@ -114,11 +107,10 @@ def _hydrate(snapshot, api, template=None):
         source = snapshot['evidence_index'][identity]
         if source.get('coverage') != 'complete' or 'members' not in source:
             evidence.expand_evidence(snapshot, [identity], api=api)
-    # Deterministic collection fetching is not a model read. Preserve only
-    # unchanged prior inspection, including the parent collection artifacts.
-    for identity, source in snapshot['evidence_index'].items():
-        digest, inspected = previous_inspection.get(identity, (None, False))
-        source['inspected'] = bool(inspected and digest == source.get('source_digest'))
+    # These internal preparation packets have not been returned to the caller.
+    # Only content in the final packet is available for subsequent inspection.
+    for source in snapshot['evidence_index'].values():
+        source['inspected'] = False
     # Authority is a fetched fact, independent of which source the model reads.
     # Resolve each distinct actor once in this hydration pass; do not mark any
     # new source inspected merely because deterministic checks fetched its role.
@@ -139,18 +131,6 @@ def _hydrate(snapshot, api, template=None):
             authorities[login] = evidence._authority(snapshot['repository'], user, author,
                 set(snapshot['trusted_maintainers']), api)
         source['actor_authority'] = copy.deepcopy(authorities[login])
-        if user.get('type') != 'Bot' and authorities[login]['role'] in {'author', 'maintainer'}:
-            if identity not in snapshot['lifecycle_evidence']:
-                snapshot['lifecycle_evidence'].append(identity)
-            # This only nominates required content for final delivery. No
-            # source-bound inspection credit exists until that delivery/ack.
-            source['inspected'] = True
-    if template:
-        for identity, previous in template['evidence_index'].items():
-            current = snapshot['evidence_index'].get(identity)
-            if current and is_inspected_source(previous) and previous.get('source_digest') == current.get('source_digest'):
-                current['inspected'] = True
-                current['inspection'] = copy.deepcopy(previous['inspection'])
     snapshot['relevant_timeline'] = _relevant_timeline(snapshot['item_id'], api)
     _persist(snapshot)
     return snapshot
@@ -163,7 +143,7 @@ def _material(snapshot):
 
 
 def _persist(snapshot):
-    # Keep delivery packets/inspection metadata consistent with the manifest.
+    # Keep bounded delivery packets consistent with the manifest.
     evidence._persist(snapshot)
 
 
@@ -179,7 +159,7 @@ def prepare(repository: str, number: int, directory: Path, *, api, force: bool=F
         if not eligibility['accepted'] and (not assessment_only):
             return _report(facts, 'skipped', 'Accepted work required for classification; assessment-only preparation is available')
         discovery = checkpoint.find_checkpoint(facts['item_id'], api=api, trusted_actors=actors) if not force and (not assessment_only) else {'status': 'bypassed'}
-        snapshot = evidence.prepare_snapshot(facts['repository'], facts['number'], directory, api=api, assessment_labels=assessment_labels, defer_delivery=True)
+        snapshot = evidence.prepare_snapshot(facts['repository'], facts['number'], directory, api=api, assessment_labels=assessment_labels)
         refreshed_eligibility = snapshot['eligibility']
         if refreshed_eligibility['lifecycle'] != 'eligible':
             return _report(snapshot, 'held' if refreshed_eligibility['lifecycle'] == 'hold' else 'skipped', refreshed_eligibility['reason'])
@@ -201,9 +181,6 @@ def prepare(repository: str, number: int, directory: Path, *, api, force: bool=F
             snapshot['label_event_boundary'] = checkpoint.latest_label_event(snapshot['item_id'], api=api)['boundary_id']
         if assessment_only:
             snapshot['label_event_boundary'] = checkpoint.latest_label_event(snapshot['item_id'], api=api)['boundary_id']
-        # Initial exposure is finalized only after all hydration metadata and
-        # boundary facts are present in the packet actually returned.
-        snapshot.pop('_preparing', None)
         _persist(snapshot)
         report = _report(snapshot, 'ready')
         report['classifier_required'] = not assessment_only
@@ -215,9 +192,9 @@ def prepare(repository: str, number: int, directory: Path, *, api, force: bool=F
 @contextmanager
 def _fresh(snapshot, api):
     with tempfile.TemporaryDirectory(prefix='openshell-label-refresh-') as directory:
-        current = evidence.prepare_snapshot(snapshot['repository'], snapshot['number'], Path(directory), api=api, assessment_labels=set(snapshot.get('_assessment_labels', [])), defer_delivery=True)
+        current = evidence.prepare_snapshot(snapshot['repository'], snapshot['number'], Path(directory), api=api, assessment_labels=set(snapshot.get('_assessment_labels', [])))
         current['assessment_only'] = snapshot.get('assessment_only', False)
-        _hydrate(current, api, template=snapshot)
+        _hydrate(current, api)
         yield current
 
 
@@ -360,14 +337,6 @@ def _preview(snapshot, result, api, assessment, bookkeeping_label, executor):
         boundary = checkpoint.latest_label_event(snapshot['item_id'], api=api)['boundary_id']
         if boundary != snapshot.get('label_event_boundary'):
             return _report(snapshot, 'stale', 'External label events changed since preparation')
-        missing = [identity for identity in current['lifecycle_evidence']
-                   if current['evidence_index'][identity].get('kind') in {'comment', 'review', 'review_comment'}
-                   and (not is_inspected_source(current['evidence_index'][identity])
-                        or current['evidence_index'][identity].get('coverage') != 'complete')]
-        if missing:
-            report = _report(snapshot, 'held', 'Required human lifecycle evidence must be delivered or explicitly acknowledged')
-            report['required_evidence'] = missing
-            return report
         return _plan(snapshot, result, api, assessment, bookkeeping_label, executor)
 
 
