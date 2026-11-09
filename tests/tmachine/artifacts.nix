@@ -84,8 +84,9 @@ let
 
   # Follow-up: binaries that do not yet run in the rootless tmachine guest. Each
   # entry says what it needs. Entries marked "wrapper lane" still run in the
-  # wrapper-based Podman lane (`mise run e2e:podman:ci`), so they are covered
-  # there until tmachine provides what they need.
+  # wrapper-based Podman lane (`mise run e2e:podman:ci`), whose PODMAN_CI_TESTS
+  # list in e2e/rust/e2e-podman.sh keeps only those binaries plus otlp_relay.
+  # Update both lists together.
   podmanE2eFollowUpBinaries = [
     # Needs the caller driver-config settings (`allow_driver_config`,
     # `enable_bind_mounts`), which the tmachine gateway does not enable. Wrapper

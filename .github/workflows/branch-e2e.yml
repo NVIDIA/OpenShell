@@ -373,8 +373,10 @@ jobs:
       image-tag: ${{ github.sha }}
       runner: linux-arm64-cpu8
 
+  # Runs only the Podman e2e/rust targets that podman-e2e-integration can't run
+  # yet; see PODMAN_CI_TESTS in e2e/rust/e2e-podman.sh.
   podman-e2e:
-    needs: [pr_metadata, build-binaries, build-conformance, build-images]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -382,7 +384,6 @@ jobs:
       packages: read
     uses: ./.github/workflows/e2e-podman-test.yml
     with:
-      prebuilt-conformance: true
       image-tag: ${{ github.sha }}
       suite-matrix: >-
         [{"suite":"ci","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:ci"}]

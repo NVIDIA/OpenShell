@@ -18,33 +18,19 @@ RUN_WITH_GATEWAY_COMMAND="__openshell_run_podman_e2e"
 # shellcheck source=e2e/support/conformance.sh
 source "${ROOT}/e2e/support/conformance.sh"
 
-# Keep required branch CI on the Podman targets that are known to pass. The
-# unfiltered e2e:podman task remains available while the omitted targets are
-# stabilized and can be added here.
+# Required branch CI runs only the Podman targets that the tmachine e2e-podman
+# testsuite can't run yet (see podmanE2eFollowUpBinaries in
+# tests/tmachine/artifacts.nix), plus otlp_relay, whose collector cases need the
+# OTLP endpoint this script configures. tmachine runs the rest of the Podman
+# targets and the conformance suite. Remove each target here once it moves to
+# testkit (#5297).
 PODMAN_CI_TESTS=(
-  bypass_detection
-  ephemeral_cleanup
-  core_dump_hardening
-  credential_gating
-  default_image
   driver_config_volume
-  edge_tunnel_e2e
-  forward_proxy_graphql_l7
-  forward_proxy_jsonrpc_l7
-  forward_proxy_l7_bypass
-  host_gateway_alias
-  landlock
-  live_policy_update
   local_driver_token_restart
-  no_proxy
-  ocsf_jsonl_conformance
   otlp_relay
   podman_corporate_proxy
   podman_gateway_start
-  podman_host_gateway
-  podman_oci_identity
   provider_token_exchange
-  upload_backpressure
 )
 
 if [ -n "${E2E_TEST}" ] && [ -n "${E2E_TEST_SET}" ]; then
@@ -79,7 +65,10 @@ if [ "${E2E_TEST}" = "gpu" ] && [ -z "${OPENSHELL_E2E_WORKLOAD_MANIFEST:-}" ] &&
 fi
 
 if [ "${1:-}" = "${RUN_WITH_GATEWAY_COMMAND}" ]; then
-  e2e_run_openshell_conformance "Podman"
+  # The tmachine Podman rows already run conformance for the ci set.
+  if [ "${E2E_TEST_SET}" != "ci" ]; then
+    e2e_run_openshell_conformance "Podman"
+  fi
   if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
     echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     exit 0
