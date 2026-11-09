@@ -18,10 +18,16 @@ tee "${work_dir}/rendered.yaml" >/dev/null
 
 # server.hostGatewayIP renders the gateway pod's only hostAliases entry
 # (deploy/helm/openshell/templates/_gateway-workload.tpl), which the
-# host-gateway component copies from hostAliases.0.ip.
-if grep -q '^ *hostAliases:' "${work_dir}/rendered.yaml"; then
+# host-gateway component copies from hostAliases.0.ip. The lane exports
+# OPENSHELL_E2E_EXPECTED_HOST_GATEWAY_IP when it sets server.hostGatewayIP, so
+# a chart change that moves the alias fails here instead of leaving the
+# external driver without the IP.
+if grep -q '^ *- host\.openshell\.internal$' "${work_dir}/rendered.yaml"; then
   cp -R "${plugin_dir}/host-gateway" "${work_dir}/host-gateway"
   printf 'components:\n  - host-gateway\n' >>"${work_dir}/kustomization.yaml"
+elif [ -n "${OPENSHELL_E2E_EXPECTED_HOST_GATEWAY_IP:-}" ]; then
+  echo "ERROR: server.hostGatewayIP is set, but the rendered chart has no host.openshell.internal hostAliases entry." >&2
+  exit 1
 fi
 
 kubectl kustomize "${work_dir}"
