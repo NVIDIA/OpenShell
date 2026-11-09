@@ -265,6 +265,14 @@ task running while using those endpoints.
 
 ### Viewing local traces
 
+For an automated collector receipt check, use `mise run e2e:kubernetes:tracing`
+with `OPENSHELL_E2E_KUBE_CONTEXT` pointing to a disposable test cluster and
+`OPENSHELL_BIN` pointing to the CLI under test. The task installs a temporary
+collector, uses the existing gateway harness, and fails when expected gateway
+or Kubernetes-driver spans do not arrive. The harness owns the test gateway
+release and namespace; do not run it against an existing working installation.
+Evidence is saved under `results/kubernetes-tracing/`.
+
 The gateway exports OTLP/gRPC to
 `http://openshell-collector.observability.svc.cluster.local:4317` through
 `ci/values-local-tracing.yaml`, which only `skaffold.yaml` layers. The Kubernetes

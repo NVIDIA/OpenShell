@@ -254,6 +254,13 @@ description = "Run Kubernetes e2e against Agent Sandbox v1alpha1"
 env = { AGENT_SANDBOX_VERSION = "v0.4.6" }
 run = "e2e/rust/e2e-kubernetes.sh"
 
+["e2e:kubernetes:tracing"]
+description = "Verify gateway and Kubernetes driver trace receipt at an isolated OTLP collector on a disposable test cluster"
+run = [
+  "uv run --no-project python -m unittest discover -s e2e/kubernetes/tracing -p '*_test.py'",
+  "uv run --no-project python e2e/kubernetes/tracing/run.py",
+]
+
 ["e2e:kubernetes:agent-sandbox-versions"]
 description = "Run Kubernetes e2e against Agent Sandbox v1beta1 and v1alpha1"
 run = [
