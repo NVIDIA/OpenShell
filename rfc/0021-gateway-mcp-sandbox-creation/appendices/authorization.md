@@ -37,15 +37,19 @@ rewrites a request cannot move a child to another parent or workspace.
   Either way the child keeps the caller's runtime class and user namespaces.
   Named providers must be attached to the caller; without any, the gateway
   fills in all of the caller's. Any other fields in the request are refused.
+  A name already used by a sandbox that is not the caller's child is refused
+  with `already_exists`. Names share one namespace per workspace, so a create
+  can tell a sandbox that a name is taken, but nothing else about that
+  sandbox.
 - `ListSandboxes`: returns only the caller's children.
-- `ListSandboxTemplates`: returns only templates in the caller's workspace
-  with the `openshell.ai/agent-usable: "true"` label and no driver
-  configuration, without their environment values, whatever scope or
+- `ListSandboxTemplates`: returns at most 50 templates, only those in the
+  caller's workspace with the `openshell.ai/agent-usable: "true"` label and no
+  driver configuration, without their environment values, whatever scope or
   selector the request names. `/mcp` calls it to build a sandbox's tool list.
 - `ExecSandbox`, `DeleteSandbox`, `GetSandboxLogs`: the target's parent must be
   the caller. Any other name, including the caller's own, a sibling and a
-  sandbox that does not exist, reads as "not found", so names cannot be
-  probed.
+  sandbox that does not exist, reads as "not found", so these calls cannot
+  probe names.
 
 ## The recorded creator
 
@@ -76,9 +80,13 @@ without an event.
   created it, or the user when a user did.
 - **Outcome:** a refusal by policy or by the request, such as not found or a
   limit, is denied with its code. An internal, unavailable or timed-out call
-  is allowed but failed. For an internal or unavailable error the agent sees
-  only a request id; the error's text goes to the gateway log and the event
-  (`error_detail`) under the same id.
+  is allowed but failed. For an internal, unknown or unavailable gateway
+  error the agent sees only a request id; the error's text goes to the gateway
+  log and the event (`error_detail`) under the same id. Other refusals keep
+  their message, which is written for agents; a conflict that is worth
+  retrying is reported as `unavailable` with its message. A job step that
+  fails in the child returns up to 200 characters of the child's own error
+  output, which is the child's data rather than the gateway's.
 - **Arguments:** the target; for `create_sandbox` the template, parent, image,
   providers and new id; for `list` the filter and count; for `exec` the
   argument list, working directory, timeout and exit code; for jobs the job

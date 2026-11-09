@@ -58,6 +58,8 @@ within its own limit:
   process id has not been written yet counts as running for 10 seconds.
 - **lost:** neither, for example because the job was killed or the child
   restarted. `wait` says so instead of waiting forever.
+- **not_found:** the child has no folder for the job, or the folder belongs to
+  another job id, for example because a later start removed it.
 
 ## Output
 
@@ -83,9 +85,13 @@ starts itself are part of that job.
 
 ## Requirements
 
-Jobs need `sh`, `/proc` and `stat` in the child and a writable `/tmp`. A child
-takes its filesystem rules from its parent's policy, so a parent whose policy
-does not let `/tmp` be written has children that cannot run jobs; starting one
-is refused with that reason before anything is claimed. The default policy
-allows it. A native detach option on `ExecSandbox`, handled by the sandbox
+Jobs need a POSIX `sh` and the common utilities the script calls: `cat`,
+`date`, `grep -E`, `head -c`, `ls`, `mkdir`, `mv`, `rm`, `sort -n`, `stat -c`,
+`tail` and `wc`, which busybox and coreutils both provide. `setsid` is used
+where it exists. They also need a readable `/proc` and a writable `/tmp`. A
+start checks `/tmp`, `/proc` and `stat` and is refused with the missing one
+before anything is claimed; a missing utility shows up as a failed job step.
+A child takes its filesystem rules from its parent's policy, so a parent whose
+policy does not let `/tmp` be written has children that cannot run jobs. The
+default policy allows it. A native detach option on `ExecSandbox`, handled by the sandbox
 runtime, can replace the script later.

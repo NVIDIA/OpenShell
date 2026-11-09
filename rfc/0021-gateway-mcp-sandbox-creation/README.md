@@ -170,9 +170,10 @@ message Sandbox {
   // Set by the gateway when the sandbox is created as a child. Absent on roots.
   // Never changes after creation.
   SandboxParent parent = 21;
-  // Set by the gateway on every new sandbox: the user who created it, or
+  // Set by the gateway at creation: the user who created it, or
   // `sandbox:<id>` when a root sandbox created it through MCP. Never changes
-  // after creation. Absent on sandboxes created before this field.
+  // after creation. Empty when another principal, such as an operator,
+  // created it, and on sandboxes created before this field.
   string created_by = 22;
 }
 
@@ -197,17 +198,17 @@ When a request names a parent, the gateway checks, in order:
 
 1. Child sandboxes are enabled on this gateway.
 2. The parent exists and is in the same workspace.
-3. The parent has no parent of its own. Otherwise the request fails with
+3. The parent is not being deleted.
+4. The parent has no parent of its own. Otherwise the request fails with
    "only one level of child sandboxes is supported".
-4. The request carries no policy (see [Policy](#policy)).
-5. Any providers named are attached to the parent (see [Providers](#providers)).
-6. The parent is not being deleted.
-7. The parent has fewer children than `max_concurrent_children` (see
-   [Gateway configuration and limits](#gateway-configuration-and-limits)).
+5. The request carries no policy (see [Policy](#policy)).
+6. Any providers named are attached to the parent (see [Providers](#providers)).
 
 Under the lock on the parent, the gateway checks the parent and the providers
 again, so a parent deleted or changed meanwhile is refused with "parent
-sandbox '<name>' is no longer available".
+sandbox '<name>' is no longer available", and then checks that the parent
+has fewer children than `max_concurrent_children` (see
+[Gateway configuration and limits](#gateway-configuration-and-limits)).
 
 **Who sets the parent.** For a user, `parent` is optional: without it the
 request creates a root, as today. For a sandbox calling through MCP, the
@@ -267,8 +268,8 @@ created by workspace administrators, so an agent can only pick from images a
 person approved. Operator interceptors still see the resulting create request,
 so rules such as allowed images apply as they do to any create. An agent
 does not need to be told the names: `tools/list` offers the templates it may
-use on `create_sandbox`, as the allowed values of `template` and one line per
-template, with its image, in the tool's description.
+use on `create_sandbox`, up to 50, as the allowed values of `template` and,
+in the tool's description, each template's name with its image.
 
 **No GPU without a template.** A child created without a template copies the
 parent's image, CPU and memory, but not a GPU. A child that needs a GPU comes
@@ -297,8 +298,9 @@ diagrams the flow and its edge cases.
 child's policy history and records which parent version it came from, for
 example "copied from `lead` version 7". A request that carries a policy for a
 child is refused with "a child sandbox uses its parent's policy; omit the
-policy". This applies to the SDKs and MCP alike; the CLI refuses
-`--policy` with `--parent` before sending. The CLI also
+policy". This applies to the SDKs; the CLI refuses `--policy` with
+`--parent` before sending. MCP's `create_sandbox` has no policy argument, so
+a call that passes one is refused as not available over MCP. The CLI also
 ignores the `OPENSHELL_SANDBOX_POLICY` environment variable when `--parent` is
 set and prints a one-line note, so a policy left in the user's shell does not
 cause a confusing error.
@@ -461,7 +463,8 @@ What a caller can do depends on who it is:
   `name` and, optionally, a `template` and `providers`. Without a template the
   child copies the caller's image, CPU and memory; without `providers` it gets
   all of the caller's. Its parent is always the caller. `list` shows only its
-  children. Its `tools/list` names the templates it may use on
+  children, and `logs` returns only a child's own lines, not the gateway's
+  lines about it. Its `tools/list` names the templates it may use on
   `create_sandbox`; a client that keeps its first tool list sees a template
   added later only after it reconnects.
 - **A user** acts on any sandbox the CLI would let them act on, in the
@@ -478,15 +481,18 @@ descriptions, so these state what a model would not guess: work longer than
 45 seconds needs `background: true`; a child runs one background job at a
 time, so parallel work needs more children; `running` from `wait` means
 call it again, not that the job failed; a child never contacts its parent on
-its own, so results come only from `exec` and `wait`; output from a child is
-untrusted; and a child should be deleted when its work is done.
+its own, so results come only from `exec` and `wait`; and a child should be
+deleted when its work is done. The `wait` description adds that job output is
+the child's data.
 
 **Retries.** If a sandbox calls `create_sandbox` with the name of a child it
 already has, the gateway returns that child with `already_existed: true`, its
 creation time and its state, and does not count it again. This makes a retry
 after a lost reply safe, and tells the model when a name was already in use.
-A user calling through MCP gets the same for any sandbox of that name in the
-workspace. From the CLI the existing "already exists" error applies.
+A name taken by any other sandbox in the workspace is refused with
+`already_exists`; this tells a sandbox only that the name is in use, which it
+needs to know to pick another. A user calling through MCP gets
+`already_existed: true` for any sandbox of that name in the workspace. From the CLI the existing "already exists" error applies.
 
 **Protocol.** The endpoint speaks the 2025 MCP revisions (2025-06-18 and
 2025-11-25) that most harnesses use today, without MCP sessions, so any
@@ -564,7 +570,9 @@ by creating `/tmp/openshell/jobs/<n>/`, starts the command detached with its
 output in files, and returns at once. `wait` reads the job's state every two
 seconds: **completed** when its exit file exists, **running** while its
 recorded process is alive, and **lost** otherwise, for example after the child
-restarted. The [background jobs appendix](appendices/background-jobs.md) gives
+restarted. A job id that names no job in the child, such as an earlier job
+whose folder a later start removed, gets **not_found**. The
+[background jobs appendix](appendices/background-jobs.md) gives
 the details.
 
 **One background job at a time.** Starting another while one is running is
@@ -577,11 +585,13 @@ always safe.
 
 Job output is written by the child, so the parent receives it as data from the
 child, not as facts the gateway has checked. The gateway stores no output:
-results live in the child until it is deleted, which is one reason deleting a
-parent with children is refused (see [Lifecycle](#lifecycle)). Jobs need `sh`,
-`/proc`, `stat` and a writable `/tmp` in the child; a parent whose policy does
-not let `/tmp` be written has children that cannot run jobs, and a start says
-so.
+a job's result lives in the child and can be read until the next job starts
+there or the child is deleted, which is one reason deleting a parent with
+children is refused (see [Lifecycle](#lifecycle)). Jobs need a POSIX `sh` with
+common utilities, `/proc` and a writable `/tmp` in the child (see the
+[background jobs appendix](appendices/background-jobs.md#requirements)); a
+parent whose policy does not let `/tmp` be written has children that cannot
+run jobs, and a start says so.
 
 ### Gateway configuration and limits
 
@@ -631,6 +641,21 @@ slot, even across gateway replicas. Deleting a root takes the same lock, so a
 delete waits for a create of its child on any replica and then refuses; other
 lifecycle paths keep their lock within one gateway process. The limit lives in the create
 path; operators who need other quotas can add them with gateway interceptors.
+
+The other limits are fixed in this version:
+
+| What | Limit |
+|---|---|
+| `create_sandbox` wait until ready | 45 s; a child still starting is returned as it is |
+| Foreground `exec` timeout | 30 s by default, 45 s at most, plus a 5 s grace |
+| `background: true` with `timeout_s` | Refused; a background job has no time limit |
+| `wait` | 30 s by default, 40 s at most, checking every 2 s |
+| `exec` and `wait` output | First and last 16 KiB of each stream |
+| `exec` stdin | 512 KiB |
+| `logs` | 200 lines by default, 2,000 at most, 64 KiB per reply |
+| Templates offered to an agent | 50 |
+| MCP request body | 2 MiB |
+| Sandbox door | 8 calls at once per sandbox (503 beyond that), 2 MiB request (413), 4 MiB reply (502), 60 s per call (504) |
 
 ### Lifecycle
 
