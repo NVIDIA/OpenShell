@@ -1894,13 +1894,6 @@ impl ComputeDriverRegistration {
         self
     }
 
-    /// Compatibility no-op retained for existing factory registrations.
-    /// Gateway mTLS user authentication is independent of compute drivers.
-    #[must_use]
-    pub fn with_local_singleplayer(self) -> Self {
-        self
-    }
-
     /// Attach process-wide tracing for this in-process compiled driver.
     #[must_use]
     pub fn with_in_process_tracing(
