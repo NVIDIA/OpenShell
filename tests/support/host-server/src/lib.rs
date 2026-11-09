@@ -301,3 +301,79 @@ fn header(head: &str, name: &str) -> Option<String> {
             .then(|| value.trim().to_string())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Complete a handshake with `recorder`, send `frames`, and close.
+    async fn send_frames(recorder: &WebSocketRecorder, frames: &[(u8, Vec<u8>)]) {
+        let mut stream = TcpStream::connect(("127.0.0.1", recorder.port))
+            .await
+            .unwrap();
+        stream.set_nodelay(true).unwrap();
+        stream
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        while find(&response, b"\r\n\r\n").is_none() {
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "closed during the handshake");
+            response.extend_from_slice(&buffer[..read]);
+        }
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+        // The RFC 6455 sample key's accept value.
+        assert!(
+            response.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            "{response}"
+        );
+        for (opcode, payload) in frames {
+            stream.write_all(&frame(*opcode, payload)).await.unwrap();
+        }
+        stream.write_all(&frame(0x08, &[])).await.unwrap();
+    }
+
+    /// A final, masked client frame.
+    fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mask = [1_u8, 2, 3, 4];
+        let mut frame = vec![0x80 | opcode];
+        match payload.len() {
+            length @ 0..=125 => frame.push(0x80 | u8::try_from(length).unwrap()),
+            length => {
+                frame.push(0x80 | 126);
+                frame.extend_from_slice(&u16::try_from(length).unwrap().to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(&mask);
+        frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        frame
+    }
+
+    #[tokio::test]
+    async fn websocket_recorder_sees_a_binary_frame_after_a_long_text_frame() {
+        let recorder = WebSocketRecorder::start().await.unwrap();
+        send_frames(
+            &recorder,
+            &[(0x01, vec![b'x'; 300]), (0x02, b"binary".to_vec())],
+        )
+        .await;
+        assert!(recorder.wait_until_finished().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn websocket_recorder_sees_no_binary_frame_in_text_frames() {
+        let recorder = WebSocketRecorder::start().await.unwrap();
+        send_frames(
+            &recorder,
+            &[(0x01, vec![b'x'; 300]), (0x01, b"text".to_vec())],
+        )
+        .await;
+        assert!(!recorder.wait_until_finished().await.unwrap());
+    }
+}

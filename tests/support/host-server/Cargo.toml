@@ -16,3 +16,6 @@ base64 = "0.22"
 openshell-testkit = { path = "../../testkit/testkit" }
 sha1 = "0.10"
 tokio = { version = "1.43", features = ["io-util", "net", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.43", features = ["macros", "rt"] }

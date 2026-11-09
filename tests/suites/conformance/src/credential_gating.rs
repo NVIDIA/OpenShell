@@ -79,29 +79,29 @@ async fn profile_rest_endpoint_keeps_body_placeholder(cx: &mut Context) -> testk
     allow(&mut policy, server.port)
         .rest(Access::Full)
         .request_body_credential_rewrite(false);
-    let sandbox = create_sandbox(cx, "rest", policy, &provider).await?;
+    let sandbox = create_sandbox(cx, "rest", policy, &[&provider]).await?;
     run_python(&sandbox, BODY_CLIENT, server.port).await?;
     expect_placeholder_body(&server).await
 }
 
 /// A provider's WebSocket endpoint completes the handshake but doesn't
 /// forward a binary frame, which the supervisor can't inspect for the
-/// credential.
+/// credential. The same client in a sandbox without the provider gets its
+/// binary frame through, which shows the denial comes from the credential.
 #[testkit::test]
 async fn profile_websocket_endpoint_denies_binary_frames(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::start("ok").await?;
     let websocket = WebSocketRecorder::start().await?;
     let provider = install_gating_provider(cx, Some((server.port, websocket.port))).await?;
 
-    let mut policy = policy::base();
-    allow(&mut policy, websocket.port).websocket(Access::ReadWrite);
-    let sandbox = create_sandbox(cx, "ws", policy, &provider).await?;
-    run_python(&sandbox, WEBSOCKET_CLIENT, websocket.port).await?;
-    websocket
-        .wait_for_handshake()
-        .await
-        .context("upstream should receive the WebSocket handshake")?;
-    let binary_seen = websocket.wait_until_finished().await?;
+    let control = WebSocketRecorder::start().await?;
+    let binary_seen = send_binary_frame(cx, "wsctl", &control, &[]).await?;
+    testkit::ensure!(
+        binary_seen,
+        "the binary frame didn't reach upstream from a sandbox without the provider"
+    );
+
+    let binary_seen = send_binary_frame(cx, "ws", &websocket, &[&provider]).await?;
     testkit::ensure!(
         !binary_seen,
         "credentialed WebSocket binary frame reached upstream"
@@ -137,7 +137,7 @@ async fn policy_binding_requires_inspection_or_opt_in(cx: &mut Context) -> testk
     allow(&mut opt_in, server.port)
         .allow_uninspected_credentials()
         .credential_binding(&provider);
-    let sandbox = create_sandbox(cx, "optin", opt_in, &provider).await?;
+    let sandbox = create_sandbox(cx, "optin", opt_in, &[&provider]).await?;
     sandbox.exec(["true"]).await?.success()?;
     Ok(())
 }
@@ -156,7 +156,7 @@ async fn policy_binding_rest_body_keeps_placeholder_without_rewrite(
         .rest(Access::Full)
         .request_body_credential_rewrite(false)
         .credential_binding(&provider);
-    let sandbox = create_sandbox(cx, "body", policy, &provider).await?;
+    let sandbox = create_sandbox(cx, "body", policy, &[&provider]).await?;
     run_python(&sandbox, BODY_CLIENT, server.port).await?;
     expect_placeholder_body(&server).await
 }
@@ -175,7 +175,7 @@ async fn policy_binding_rest_body_rewrite_sends_secret_upstream(
         .rest(Access::Full)
         .request_body_credential_rewrite(true)
         .credential_binding(&provider);
-    let sandbox = create_sandbox(cx, "rw", policy, &provider).await?;
+    let sandbox = create_sandbox(cx, "rw", policy, &[&provider]).await?;
     run_python(&sandbox, BODY_CLIENT, server.port).await?;
     let request = one_request(&server).await?;
     testkit::ensure!(
@@ -205,7 +205,7 @@ async fn policy_binding_updates_provider_environment_live(cx: &mut Context) -> t
     };
     let (unbound, bound) = (policy_binding(false), policy_binding(true));
 
-    let sandbox = create_sandbox(cx, "live", unbound.clone(), &provider).await?;
+    let sandbox = create_sandbox(cx, "live", unbound.clone(), &[&provider]).await?;
     wait_for_token(&sandbox, "TOKEN_ABSENT").await?;
 
     set_policy(cx, &sandbox, &bound)
@@ -217,6 +217,25 @@ async fn policy_binding_updates_provider_environment_live(cx: &mut Context) -> t
         .await
         .context("unbind the provider")?;
     wait_for_token(&sandbox, "TOKEN_ABSENT").await
+}
+
+/// Run [`WEBSOCKET_CLIENT`] against `server` in a sandbox with `providers`,
+/// and return whether its binary frame reached `server`.
+async fn send_binary_frame(
+    cx: &Context,
+    suffix: &str,
+    server: &WebSocketRecorder,
+    providers: &[&str],
+) -> Result<bool> {
+    let mut policy = policy::base();
+    allow(&mut policy, server.port).websocket(Access::ReadWrite);
+    let sandbox = create_sandbox(cx, suffix, policy, providers).await?;
+    run_python(&sandbox, WEBSOCKET_CLIENT, server.port).await?;
+    server
+        .wait_for_handshake()
+        .await
+        .context("upstream should receive the WebSocket handshake")?;
+    server.wait_until_finished().await
 }
 
 /// Let the image's Python reach `TEST_HOST` on `port`.
@@ -274,26 +293,26 @@ fn sandbox_with(
     cx: &Context,
     suffix: &str,
     policy: proto::SandboxPolicy,
-    provider: &str,
+    providers: &[&str],
 ) -> testkit::SandboxBuilder {
     cx.sandbox(suffix)
         .policy(policy)
         .spec(|spec| {
             spec.image = Some(testkit::python_image());
-            spec.providers = vec![provider.to_string()];
+            spec.providers = providers.iter().map(ToString::to_string).collect();
         })
         .command(["sleep", "infinity"])
 }
 
 /// Create a long-running sandbox from the Python image with `policy` and
-/// `provider`, and wait until it is Ready.
+/// `providers`, and wait until it is Ready.
 async fn create_sandbox(
     cx: &Context,
     suffix: &str,
     policy: proto::SandboxPolicy,
-    provider: &str,
+    providers: &[&str],
 ) -> Result<Sandbox> {
-    let sandbox = sandbox_with(cx, suffix, policy, provider).create().await?;
+    let sandbox = sandbox_with(cx, suffix, policy, providers).create().await?;
     sandbox.wait_ready().await?;
     Ok(sandbox)
 }
@@ -306,7 +325,7 @@ async fn expect_rejected(
     policy: proto::SandboxPolicy,
     provider: &str,
 ) -> Result<String> {
-    match sandbox_with(cx, suffix, policy, provider).create().await {
+    match sandbox_with(cx, suffix, policy, &[provider]).create().await {
         Ok(sandbox) => Err(Error::msg(format!(
             "the gateway accepted sandbox {}",
             sandbox.name()
