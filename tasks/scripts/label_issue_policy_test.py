@@ -39,10 +39,10 @@ def snapshot():
                     ROSTER, [{'name': name, 'id': name, 'assessment': name in ['state:triage-needed', 'state:needs-info']} for name in NAMES]),
                 existing_labels=['area:gateway', 'state:accepted', 'human:priority'],
                 evidence_index={'body': {'kind': 'body', 'inspected': True, 'source_digest': 'a' * 64,
-                    'inspection': {'source_digest': 'a' * 64, 'via': 'packet'}},
+                    'content': {'body': 'Policy behavior'}},
                                 'comment:1': {'inspected': False},
                                 'labels': {'kind': 'reconciliation', 'inspected': True, 'source_digest': 'd' * 64,
-                    'inspection': {'source_digest': 'd' * 64, 'via': 'packet'}}},
+                    'content': ['area:gateway', 'state:accepted', 'human:priority']}},
                 eligibility={'accepted': True, 'lifecycle': 'eligible'})
 
 
@@ -262,22 +262,20 @@ class PolicyTests(unittest.TestCase):
                 'snapshot_id', 'status', 'add', 'remove', 'preserve', 'final_labels',
                 'bookkeeping', 'ambiguity', 'missing_prerequisites', 'diagnostics'})
 
-    def test_inspected_flag_without_current_source_provenance_cannot_justify_reasons(self):
-        for declaration in [None, {'source_digest': 'b' * 64, 'via': 'packet'},
-                            {'source_digest': 'a' * 64, 'via': 'fetched'}]:
+    def test_unread_or_missing_content_cannot_justify_reasons(self):
+        for change in ('unread', 'missing_content'):
             snap = snapshot()
-            snap['evidence_index']['body']['source_digest'] = 'a' * 64
-            snap['evidence_index']['body'].pop('inspection', None)
-            if declaration is not None:
-                snap['evidence_index']['body']['inspection'] = declaration
+            if change == 'unread':
+                snap['evidence_index']['body']['inspected'] = False
+            else:
+                snap['evidence_index']['body'].pop('content')
             self.assertFalse(validate_result(snap, result())['valid'])
 
     def test_pure_membership_indexes_require_actual_substantive_child_or_paths(self):
         for kind in ['comments', 'reviews', 'review_comments', 'timeline']:
             snap, decision = snapshot(), result()
             snap['evidence_index']['index'] = dict(kind=kind, content=['comment:1'],
-                members=['comment:1'], inspected=True, source_digest='c' * 64,
-                inspection={'source_digest': 'c' * 64, 'via': 'explicit_expansion'})
+                members=['comment:1'], inspected=True, source_digest='c' * 64)
             decision['reasons'][0]['evidence'] = ['index']
             self.assertFalse(validate_result(snap, decision)['valid'])
         snap['evidence_index']['index']['kind'] = 'files'
@@ -288,8 +286,7 @@ class PolicyTests(unittest.TestCase):
         for kind in ['comments', 'reviews', 'review_comments', 'timeline']:
             snap, decision = snapshot(), result()
             snap['evidence_index']['index'] = dict(kind=kind, content='["comment:1", ...',
-                coverage='truncated', members=['comment:1'], inspected=True, source_digest='c' * 64,
-                inspection={'source_digest': 'c' * 64, 'via': 'explicit_expansion'})
+                coverage='truncated', members=['comment:1'], inspected=True, source_digest='c' * 64)
             decision['reasons'][0]['evidence'] = ['index']
             self.assertFalse(validate_result(snap, decision)['valid'])
 
