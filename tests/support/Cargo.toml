@@ -6,7 +6,3 @@
 [workspace]
 resolver = "2"
 members = ["container-engine", "keycloak", "podman"]
-
-[patch.crates-io]
-# Temporary SQLite security backport; see vendor/sqlx-sqlite/README.openshell.md.
-sqlx-sqlite = { path = "../../vendor/sqlx-sqlite" }

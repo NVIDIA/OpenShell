@@ -4,11 +4,6 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["vendor/sqlx-sqlite"]
-
-[patch.crates-io]
-# Temporary SQLite security backport; see vendor/sqlx-sqlite/README.openshell.md.
-sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
 
 [workspace.package]
 version = "0.0.0"

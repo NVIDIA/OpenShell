@@ -32,7 +32,3 @@ path = "src/main.rs"
 [[bin]]
 name = "governance-smoke-client"
 path = "src/smoke_client.rs"
-
-[patch.crates-io]
-# Temporary SQLite security backport; see vendor/sqlx-sqlite/README.openshell.md.
-sqlx-sqlite = { path = "../../vendor/sqlx-sqlite" }

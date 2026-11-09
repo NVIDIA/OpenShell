@@ -4,7 +4,3 @@
 [workspace]
 resolver = "2"
 members = ["host-gateway", "keycloak-provider-refresh", "kubernetes-updates", "oci-image"]
-
-[patch.crates-io]
-# Temporary SQLite security backport; see vendor/sqlx-sqlite/README.openshell.md.
-sqlx-sqlite = { path = "../../../vendor/sqlx-sqlite" }

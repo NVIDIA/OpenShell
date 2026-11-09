@@ -18,7 +18,3 @@ openshell-testkit = { path = "../../../testkit/testkit" }
 podman-support = { path = "../../../support/podman" }
 
 [workspace]
-
-[patch.crates-io]
-# Temporary SQLite security backport; see vendor/sqlx-sqlite/README.openshell.md.
-sqlx-sqlite = { path = "../../../../vendor/sqlx-sqlite" }
