@@ -15,6 +15,9 @@ unmaintained = "workspace"
 maximum-db-staleness = "P30D"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack — required by russh/ssh-key and RSA test fixtures; no patched release is available" },
+    # Temporary: SQLx's SQLite dependency-bound update is merged but unreleased.
+    # https://github.com/transact-rs/sqlx/pull/4502
+    { id = "RUSTSEC-2026-0459", reason = "sqlx-sqlite 0.9.0 requires libsqlite3-sys <0.38.0; remove this exception when a released SQLx accepts patched libsqlite3-sys >=0.39.0" },
 ]
 
 # -- Licenses ------------------------------------------------------------------

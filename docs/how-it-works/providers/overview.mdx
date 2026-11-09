@@ -228,7 +228,16 @@ The update records which sandboxes are attached before saving the new credential
 
 Credential refresh status tells you whether OpenShell obtained credentials. [Provider readiness](/how-it-works/providers/profiles#inspect-provider-readiness) tells you whether the sandbox applied the credentials, policy, and environment for new processes. It does not test access to a backend model or cancel requests already sent upstream.
 
-After a static credential update completes, launch a new client process to use the updated reference. An existing process keeps its revision-scoped reference; readiness does not make that old reference resolve the new value. Acknowledged detach revokes retained references and removes them from environments for future launches.
+After an ordinary static credential update completes, launch a new client
+process to use the updated reference. Existing processes keep their environment
+references; readiness does not guarantee that they use the replacement value.
+Credentials configured with
+[`stable_placeholder: true`](/how-it-works/providers/profiles#keep-an-externally-updated-placeholder-stable)
+let processes already holding a stable reference use a value-only update after
+the supervisor installs it. See
+[Runtime Limitations](/how-it-works/providers/profiles#runtime-limitations) for
+retained revision behavior. Acknowledged detach revokes retained references and
+removes them from environments for future launches.
 
 Set or clear a credential expiry timestamp:
 
@@ -437,10 +446,13 @@ state.
 
 ## How Credential Injection Works
 
-The agent process inside the sandbox never sees real credential values. At
-startup, OpenShell replaces each credential with an opaque placeholder token in
+At startup, OpenShell supplies each eligible provider credential as an opaque placeholder token in
 the agent's environment. When the agent sends an HTTP request containing a
 placeholder, the proxy resolves it immediately before forwarding the request.
+Credential injection does not automatically scrub credential values from
+upstream responses, so send credentialed requests only to trusted endpoints.
+Operator retrieval is a separate export path described in
+[Retrieve Runtime Credentials](#retrieve-runtime-credentials).
 
 Static credential resolution has three independent authorization boundaries:
 

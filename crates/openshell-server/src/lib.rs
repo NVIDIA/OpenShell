@@ -827,14 +827,21 @@ pub(crate) async fn run_server(
         .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
     );
 
-    let store = Arc::new(
-        Store::connect_with_pool_sizes(
-            database_url,
-            config.database_max_connections,
-            config.database_lock_max_connections,
-        )
-        .await?,
-    );
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut health_listener = HealthListener::new(config.health_bind_address);
+    let Some(store) = connect_store(
+        &config,
+        database_url,
+        &mut health_listener,
+        shutdown.as_mut(),
+    )
+    .await?
+    else {
+        info!("Shutdown signal received while waiting for the database; stopping gateway");
+        return Ok(());
+    };
+    let store = Arc::new(store);
     let credentials = credentials::CredentialRuntime::from_config_file_with_store(
         &config,
         config_file.as_ref(),
@@ -1153,26 +1160,7 @@ pub(crate) async fn run_server(
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
 
-    // Bind the unauthenticated health endpoint on a separate port when configured.
-    if let Some(health_bind_address) = config.health_bind_address {
-        let health_listener = TcpListener::bind(health_bind_address).await.map_err(|e| {
-            Error::transport(format!(
-                "failed to bind health port {health_bind_address}: {e}"
-            ))
-        })?;
-        info!(address = %health_bind_address, "Health server listening");
-        // `health_router` returns immediately; the listener serves
-        // `Initializing → 503` until the background monitor publishes the
-        // first real probe outcome, so the endpoint is always responsive.
-        let router = health_router(store.clone());
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(health_listener, router.into_make_service()).await {
-                error!("Health server error: {e}");
-            }
-        });
-    } else {
-        info!("Health server disabled");
-    }
+    health_listener.serve(store.clone()).await?;
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
     if let Some((metrics_bind_address, prometheus_handle)) = metrics_endpoint {
@@ -1311,7 +1299,7 @@ pub(crate) async fn run_server(
     provider_profile_sources::spawn_refresh(state.clone());
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
-    shutdown_signal().await;
+    shutdown.await;
     info!("Shutdown signal received; stopping gateway");
     state.gateway_shutting_down.store(true, Ordering::Release);
     state.supervisor_sessions.close_admission();
@@ -1607,6 +1595,112 @@ fn spawn_gateway_connection(
     }
 }
 
+/// First delay between attempts to reach an unreachable database at startup.
+const DATABASE_CONNECT_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+
+/// Longest delay between attempts to reach an unreachable database at startup.
+const DATABASE_CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+
+/// Connect to the database, retrying while it is unreachable.
+///
+/// The first failed attempt binds the health endpoint and starts listening
+/// for `shutdown`; a gateway running as PID 1 ignores SIGTERM until then.
+/// Returns `None` if `shutdown` completes first.
+async fn connect_store(
+    config: &Config,
+    database_url: &str,
+    health_listener: &mut HealthListener,
+    mut shutdown: std::pin::Pin<&mut impl Future<Output = ()>>,
+) -> Result<Option<Store>> {
+    let mut delay = DATABASE_CONNECT_RETRY_INITIAL_DELAY;
+    let mut waiting = false;
+    loop {
+        let attempt = Store::try_connect_with_pool_sizes(
+            database_url,
+            config.database_max_connections,
+            config.database_lock_max_connections,
+        );
+        let result = if waiting {
+            tokio::select! {
+                () = &mut shutdown => return Ok(None),
+                result = attempt => result?,
+            }
+        } else {
+            attempt.await?
+        };
+        let error = match result {
+            Ok(store) => return Ok(Some(store)),
+            Err(error @ persistence::PersistenceError::Unavailable(_)) => error,
+            Err(error) => return Err(Error::execution(error.to_string())),
+        };
+        if !waiting {
+            health_listener.bind().await?;
+            waiting = true;
+        }
+        warn!(
+            error = %error,
+            retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            "database unreachable; retrying"
+        );
+        tokio::select! {
+            () = &mut shutdown => return Ok(None),
+            () = tokio::time::sleep(delay) => {}
+        }
+        delay = (delay * 2).min(DATABASE_CONNECT_RETRY_MAX_DELAY);
+    }
+}
+
+/// The unauthenticated health endpoint, served on its own port when
+/// configured.
+struct HealthListener {
+    address: Option<SocketAddr>,
+    state: Option<watch::Sender<readiness::HealthState>>,
+}
+
+impl HealthListener {
+    const fn new(address: Option<SocketAddr>) -> Self {
+        Self {
+            address,
+            state: None,
+        }
+    }
+
+    /// Start serving probes, with `/readyz` reporting `Initializing` until
+    /// [`Self::serve`] publishes the database's health.
+    async fn bind(&mut self) -> Result<()> {
+        let Some(address) = self.address else {
+            return Ok(());
+        };
+        if self.state.is_some() {
+            return Ok(());
+        }
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(|e| Error::transport(format!("failed to bind health port {address}: {e}")))?;
+        info!(address = %address, "Health server listening");
+        let (sender, receiver) = watch::channel(readiness::HealthState::Initializing);
+        let router = http::health_router_from_receiver(receiver);
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router.into_make_service()).await {
+                error!("Health server error: {e}");
+            }
+        });
+        self.state = Some(sender);
+        Ok(())
+    }
+
+    /// Bind if not yet serving and publish `store`'s health from now on.
+    async fn serve(mut self, store: Arc<Store>) -> Result<()> {
+        self.bind().await?;
+        if let Some(sender) = self.state {
+            readiness::DatabaseHealthMonitor::spawn_into(store, sender);
+        } else {
+            info!("Health server disabled");
+        }
+        Ok(())
+    }
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -1779,31 +1873,11 @@ impl ComputeDriverRegistration {
         })
     }
 
-    /// Compatibility no-op retained for source compatibility with schema-v1
-    /// factory registrations. Schema v2 never inherits gateway keys into a
-    /// driver table; move every driver setting under
-    /// `[openshell.drivers.<name>]`.
-    #[deprecated(
-        since = "0.0.0",
-        note = "schema v2 does not inherit gateway keys into driver configuration"
-    )]
-    #[must_use]
-    pub fn with_inherited_config_keys(self, _keys: &'static [&'static str]) -> Self {
-        self
-    }
-
     /// Assign a bounded telemetry category chosen by the binary composition
     /// boundary. Runtime driver names are never used as telemetry values.
     #[must_use]
     pub fn with_telemetry_category(mut self, category: TelemetryComputeDriver) -> Self {
         self.telemetry_category = category;
-        self
-    }
-
-    /// Compatibility no-op retained for existing factory registrations.
-    /// Gateway mTLS user authentication is independent of compute drivers.
-    #[must_use]
-    pub fn with_local_singleplayer(self) -> Self {
         self
     }
 
@@ -3977,6 +4051,157 @@ mod tests {
             !start_attempted.load(Ordering::SeqCst),
             "persisted sandbox start must not run before the gateway listener is bound"
         );
+    }
+
+    /// A loopback address where nothing listens until a test binds it.
+    async fn reserved_loopback_address() -> SocketAddr {
+        TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve a loopback port")
+            .local_addr()
+            .expect("loopback address")
+    }
+
+    /// Status code of `GET path`, or `None` when nothing answers.
+    async fn http_status(address: SocketAddr, path: &str) -> Option<u16> {
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[address])
+            .await
+            .ok()?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .ok()?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.ok()?;
+        response.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    async fn wait_for_http_status(address: SocketAddr, path: &str, expected: u16) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while http_status(address, path).await != Some(expected) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{path} never returned {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_store_serves_probes_while_the_database_is_unreachable() {
+        let url = crate::persistence::PostgresStore::refusing_url_for_tests().await;
+        let health_address = reserved_loopback_address().await;
+        let mut health = super::HealthListener::new(Some(health_address));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _ = stopped.await;
+        };
+        tokio::pin!(shutdown);
+        let config = Config::new(None);
+
+        let probe = async {
+            wait_for_http_status(health_address, "/healthz", 200).await;
+            assert_eq!(http_status(health_address, "/readyz").await, Some(503));
+            stop.send(()).expect("connect_store is still waiting");
+        };
+        let (result, ()) = tokio::join!(
+            super::connect_store(&config, &url, &mut health, shutdown.as_mut()),
+            probe
+        );
+
+        assert!(
+            result.expect("shutdown is not an error").is_none(),
+            "shutdown ends the wait without a store"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_store_returns_a_configuration_error_without_retrying() {
+        let health_address = reserved_loopback_address().await;
+        let mut health = super::HealthListener::new(Some(health_address));
+        let shutdown = std::future::pending::<()>();
+        tokio::pin!(shutdown);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::connect_store(
+                &Config::new(None),
+                "postgres://openshell@127.0.0.1:1/openshell?sslmode=invalid",
+                &mut health,
+                shutdown.as_mut(),
+            ),
+        )
+        .await
+        .expect("a configuration error is not retried");
+
+        assert!(result.is_err());
+        assert_eq!(http_status(health_address, "/healthz").await, None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_connect_store_retries_until_the_database_answers() {
+        let schema = crate::persistence::test_postgres::TestSchema::create("startup").await;
+        let upstream = url::Url::parse(schema.url()).expect("parse the PostgreSQL URL");
+        let upstream_addresses: Vec<SocketAddr> = tokio::net::lookup_host((
+            upstream.host_str().expect("TCP PostgreSQL host"),
+            upstream.port().unwrap_or(5432),
+        ))
+        .await
+        .expect("resolve PostgreSQL")
+        .collect();
+        let late_address = reserved_loopback_address().await;
+        let mut url = upstream.clone();
+        url.set_host(Some("127.0.0.1")).expect("set host");
+        url.set_port(Some(late_address.port())).expect("set port");
+        let health_address = reserved_loopback_address().await;
+        let mut health = super::HealthListener::new(Some(health_address));
+        let shutdown = std::future::pending::<()>();
+        tokio::pin!(shutdown);
+        let config = Config::new(None);
+
+        // PostgreSQL becomes reachable only after the gateway reports that it
+        // is waiting.
+        let late_database = async {
+            wait_for_http_status(health_address, "/healthz", 200).await;
+            assert_eq!(http_status(health_address, "/readyz").await, Some(503));
+            let listener = TcpListener::bind(late_address)
+                .await
+                .expect("bind the late PostgreSQL address");
+            loop {
+                let (mut client, _) = listener.accept().await.expect("accept");
+                openshell_core::net::set_tcp_nodelay_best_effort(&client);
+                let mut upstream =
+                    openshell_core::net::connect_tcp_nodelay_best_effort(&upstream_addresses)
+                        .await
+                        .expect("connect to PostgreSQL");
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        };
+        let store = tokio::select! {
+            result = tokio::time::timeout(
+                Duration::from_mins(1),
+                super::connect_store(&config, url.as_str(), &mut health, shutdown.as_mut()),
+            ) => result
+                .expect("connect_store finishes once PostgreSQL answers")
+                .expect("connect")
+                .expect("no shutdown"),
+            () = late_database => unreachable!("the forwarder runs until the store connects"),
+        };
+        store.ping().await.expect("ping the connected store");
+
+        health
+            .serve(Arc::new(store))
+            .await
+            .expect("keep serving the bound health listener");
+        wait_for_http_status(health_address, "/readyz", 200).await;
+
+        schema.drop_schema().await;
     }
 }
 
