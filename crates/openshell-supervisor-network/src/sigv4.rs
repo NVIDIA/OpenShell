@@ -18,8 +18,7 @@ fn sign_without_tracing<'a>(
     params: &'a aws_sigv4::http_request::SigningParams<'a>,
 ) -> std::result::Result<SigningOutput<SigningInstructions>, aws_sigv4::http_request::SigningError>
 {
-    let no_tracing = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-    tracing::dispatcher::with_default(&no_tracing, || sign(request, params))
+    tracing::dispatcher::with_default(&tracing::Dispatch::none(), || sign(request, params))
 }
 
 /// AWS regions contain a hyphen followed by a digit (e.g., `us-east-1`).
@@ -386,45 +385,15 @@ pub fn apply_sigv4_headers_only_with_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use tracing::Subscriber;
-    use tracing::field::{Field, Visit};
-    use tracing_subscriber::Layer;
-    use tracing_subscriber::layer::SubscriberExt as _;
-
-    #[derive(Clone, Default)]
-    struct EventCapture(Arc<Mutex<Vec<String>>>);
-
-    struct FieldCapture<'a>(&'a mut String);
-
-    impl Visit for FieldCapture<'_> {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            use std::fmt::Write as _;
-            write!(self.0, "{}={value:?};", field.name())
-                .expect("writing tracing fields to a String cannot fail");
-        }
-    }
-
-    impl<S: Subscriber> Layer<S> for EventCapture {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut fields = String::new();
-            event.record(&mut FieldCapture(&mut fields));
-            self.0
-                .lock()
-                .expect("event capture mutex must not be poisoned")
-                .push(format!("{}:{fields}", event.metadata().target()));
-        }
-    }
 
     #[test]
     fn signing_does_not_emit_the_canonical_request_to_tracing() {
-        let events = EventCapture::default();
-        let captured = Arc::clone(&events.0);
-        let subscriber = tracing_subscriber::registry().with(events);
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(log.reopen().unwrap())
+            .finish();
         let session_token = "SYNTHETIC_SIGV4_SESSION_TOKEN";
         let raw = b"GET /bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n";
 
@@ -459,10 +428,7 @@ mod tests {
             tracing::trace!(target: "test_capture", "after signing");
         });
 
-        let events = captured
-            .lock()
-            .expect("event capture mutex must not be poisoned")
-            .join("\n");
+        let events = std::fs::read_to_string(log.path()).unwrap();
         assert!(events.contains("before signing"));
         assert!(events.contains("after signing"));
         assert!(!events.contains("aws_sigv4"));
