@@ -132,8 +132,7 @@ def check_pr_accepted_work(
     if author.lower() not in {login.lower() for login in maintainers}:
         try:
             result = api(
-                f"repos/{repository}/collaborators/"
-                f"{quote(author, safe='')}/permission"
+                f"repos/{repository}/collaborators/{quote(author, safe='')}/permission"
             )
             permission = result["permission"]
         except subprocess.CalledProcessError as exc:
