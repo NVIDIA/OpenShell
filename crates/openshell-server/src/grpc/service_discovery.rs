@@ -484,25 +484,25 @@ async fn publish_installations(
             previous.routes
         };
         for (bytes, route) in installation.routes.iter().zip(installed_routes) {
-                let hostname = if route.application_hostname.is_empty() {
-                    // Legacy reports can only be current against legacy configuration.
-                    state.config.supervisor_app_listener.service_hostname(
-                        workspace,
-                        sandbox.object_name(),
-                        &route.name,
-                        state.config.service_routing_discriminator(),
-                    )
-                } else {
-                    route.application_hostname.clone()
-                };
-                let label = hostname
-                    .strip_suffix(&format!(".{}", installation.service_domain))
-                    .ok_or_else(|| Status::internal("installed hostname domain mismatch"))?;
-                if label.is_empty() || label.len() > 63 || label.contains('.') {
-                    return Err(Status::failed_precondition(
-                        "service hostname exceeds DNS label limit",
-                    ));
-                }
+            let hostname = if route.application_hostname.is_empty() {
+                // Legacy reports can only be current against legacy configuration.
+                state.config.supervisor_app_listener.service_hostname(
+                    workspace,
+                    sandbox.object_name(),
+                    &route.name,
+                    state.config.service_routing_discriminator(),
+                )
+            } else {
+                route.application_hostname.clone()
+            };
+            let label = hostname
+                .strip_suffix(&format!(".{}", installation.service_domain))
+                .ok_or_else(|| Status::internal("installed hostname domain mismatch"))?;
+            if label.is_empty() || label.len() > 63 || label.contains('.') {
+                return Err(Status::failed_precondition(
+                    "service hostname exceeds DNS label limit",
+                ));
+            }
             let version = installation_version(&installation, bytes)?;
             routes.push(DiscoveredServiceRoute {
                 workspace: workspace.to_string(),

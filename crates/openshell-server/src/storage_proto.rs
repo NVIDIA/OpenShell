@@ -179,7 +179,7 @@ mod tests {
     // updates use a separate capability/service and add one classified RPC.
     // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "daa132037ee47c7a46b08dfab9bab379961bc06ff3e9ebbb329809b724f2a4f6";
+        "9570c5a65c405284cecb1d14067f91be2ce5d5dc98f2ceb0d7504ded776a863c";
     const DURABLE_SCHEMA_SHA256: &str =
         "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
