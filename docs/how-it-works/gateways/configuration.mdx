@@ -2140,3 +2140,9 @@ For rotation, add the replacement fingerprint, project the new certificate/key
 to the consumer, then remove the old fingerprint. The proxy reloads mounted
 identity and trust files on reconnect. No certificate issuance or renewal is
 performed by the gateway.
+
+Finite and all-workspace watches reserve capacity for every selected active
+workspace. When that set changes, the watch reacquires workspace capacity before
+publishing the next view. A newly selected workspace at capacity returns
+`RESOURCE_EXHAUSTED`; the client can reconnect. Installation-record limits apply
+per workspace; route and response-size limits also apply to the combined view.

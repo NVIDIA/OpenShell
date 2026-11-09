@@ -829,7 +829,6 @@ mod tests {
         let error = watch(
             &state,
             authed_request(WatchServiceRoutesRequest {
-                workspaces: Vec::new(),
                 workspace_scope: request().workspace_scope,
                 workspaces: Vec::new(),
             }),
@@ -1073,7 +1072,7 @@ mod tests {
                 })
             )
             .await
-            .is_err()
+            .is_ok()
         );
         let mut outsider = authed_request(request());
         if let Some(Principal::User(user)) = outsider.extensions_mut().get_mut::<Principal>() {
@@ -1910,7 +1909,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            selected_snapshot(&state, &principal, &Selection::All)
+            selected_snapshot(&state, &principal, &Selection::All, &[])
                 .await
                 .unwrap_err()
                 .code(),
@@ -1920,7 +1919,8 @@ mod tests {
             selected_snapshot(
                 &state,
                 &principal,
-                &Selection::Named(vec!["default".into()])
+                &Selection::Named(vec!["default".into()]),
+                &["default".into()]
             )
             .await
             .is_ok()
@@ -1995,9 +1995,14 @@ mod tests {
         .await
         .unwrap();
         let selected = Selection::Named(vec!["default".into(), "team-b".into()]);
-        let both = selected_snapshot(&state, &principal, &selected)
-            .await
-            .unwrap();
+        let both = selected_snapshot(
+            &state,
+            &principal,
+            &selected,
+            &["default".into(), "team-b".into()],
+        )
+        .await
+        .unwrap();
         assert_eq!(
             both.routes
                 .iter()
@@ -2007,9 +2012,14 @@ mod tests {
         );
         assert_eq!(
             both,
-            selected_snapshot(&state, &principal, &Selection::All)
-                .await
-                .unwrap()
+            selected_snapshot(
+                &state,
+                &principal,
+                &Selection::All,
+                &["default".into(), "team-b".into()]
+            )
+            .await
+            .unwrap()
         );
         state
             .store
@@ -2017,12 +2027,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            selected_snapshot(&state, &principal, &Selection::All)
+            selected_snapshot(&state, &principal, &Selection::All, &["default".into()])
                 .await
                 .unwrap()
                 .routes
                 .len(),
             1
+        );
+    }
+    #[tokio::test]
+    async fn all_workspace_watch_admits_new_workspaces_before_publishing_their_routes() {
+        use openshell_core::proto::{ObjectMeta, Workspace};
+        let (state, principal, _dir) = reader_fixture(true).await;
+        let mut stream = watch(
+            &state,
+            reader_request(
+                WatchServiceRoutesRequest {
+                    workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+                    workspaces: Vec::new(),
+                },
+                &principal,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(stream.next().await.unwrap().is_ok());
+        let blockers = (0..WATCHES_PER_WORKSPACE)
+            .map(|n| {
+                state
+                    .discovery
+                    .admit(&user(&format!("blocker-{n}")), &["later".into()], true)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        state
+            .store
+            .put_message(&Workspace {
+                metadata: Some(ObjectMeta {
+                    id: "later".into(),
+                    name: "later".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(stream.next().await.is_none());
+        assert_eq!(state.discovery_watches.available_permits(), 32);
+        drop(blockers);
+        assert!(
+            state
+                .discovery
+                .admit(&principal, &["default".into(), "later".into()], true)
+                .is_ok()
         );
     }
 }

@@ -338,10 +338,11 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
-        let discovery = ServiceDiscoveryServer::new(OpenShellService::new(self.state.clone()))
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
-        let discovery = GatewayInterceptorGrpcService::new(
-            discovery,
+        let discovery_service =
+            ServiceDiscoveryServer::new(OpenShellService::new(self.state.clone()))
+                .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let discovery_service = GatewayInterceptorGrpcService::new(
+            discovery_service,
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
@@ -354,7 +355,7 @@ impl MultiplexService {
         let grpc_service = AuthGrpcRouter::with_peer_identity(
             GrpcRouter::new(openshell, reflection)
                 .with_sandbox_updates(sandbox_updates)
-                .with_discovery(discovery),
+                .with_discovery(discovery_service),
             authenticator_chain,
             authz_policy,
             self.state
