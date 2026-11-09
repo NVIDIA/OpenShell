@@ -315,6 +315,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -335,6 +336,20 @@ jobs:
           chart-version: ${{ inputs.semver }}
           app-version: ${{ inputs.semver }}
           release-kind: public
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Sign OCI artifacts
+        env:
+          VERSION: ${{ inputs.semver }}
+        run: |
+          set -euo pipefail
+          for artifact in gateway sandbox supervisor helm-chart openshell-workspace; do
+            image="ghcr.io/nvidia/openshell/${artifact}"
+            digest=$(docker buildx imagetools inspect "${image}:${VERSION}" --format '{{.Manifest.Digest}}')
+            cosign sign --yes "${image}@${digest}"
+          done
 
   release:
     name: Publish Release Assets

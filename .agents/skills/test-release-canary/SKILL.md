@@ -48,6 +48,11 @@ validation lives in the `TypeScript SDK` branch check, including a publish
 dry-run. The tagged release workflow publishes the package to GitHub Packages;
 verify that job directly when diagnosing SDK publication failures.
 
+Release Dev signs the three runtime images and both OCI charts with keyless
+cosign in its `release-helm` job, including both dev chart versions. A signing
+failure fails publication and prevents the automatic canary. The canary itself
+does not verify signatures; see [OCI signature verification](../../../docs/security/verify-image-contents.mdx#verify-oci-signatures).
+
 ## Trigger paths
 
 The workflow has two triggers:
