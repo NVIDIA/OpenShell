@@ -6,7 +6,8 @@ SPDX-License-Identifier: Apache-2.0
 # Sandbox application proxy
 
 `openshell-sandbox-proxy` is an optional consumer of the gateway service discovery
-API. It selects the exact discovered hostname from TLS SNI and forwards TLS bytes
+API through the separate `openshell.v1.ServiceDiscovery` gRPC service.
+It selects the exact discovered hostname from TLS SNI and forwards TLS bytes
 to the owning supervisor's app listener. Application certificates and private
 keys remain at supervisors. HTTP, WebSockets, application authentication, and
 sandbox policy remain enforced by the existing listener and application.
