@@ -173,6 +173,17 @@ impl CliOutput {
         Ok(self)
     }
 
+    /// Stdout and stderr as one line of words, for matching an error report.
+    /// The CLI wraps reports to the terminal width and draws a gutter, so
+    /// match against this rather than the raw output.
+    pub fn message(&self) -> String {
+        format!("{} {}", self.stdout, self.stderr)
+            .replace(['│', '×', '╰', '─', '╭', '├'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Parse stdout as JSON, from a command run with `--output json`.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
         serde_json::from_str(&self.stdout)

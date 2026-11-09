@@ -2448,6 +2448,7 @@ dependencies = [
  "container-engine-support",
  "openshell-testkit",
  "podman-support",
+ "tempfile",
 ]
 
 [[package]]

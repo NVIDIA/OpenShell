@@ -517,6 +517,7 @@ name = "conformance"
 version = "0.0.0"
 dependencies = [
  "host-server-support",
+ "openshell-crypto",
  "openshell-testkit",
  "serde_json",
  "tempfile",

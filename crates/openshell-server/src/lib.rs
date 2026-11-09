@@ -3113,11 +3113,21 @@ mod tests {
 
     async fn start_plaintext_gateway_listener()
     -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        start_plaintext_gateway_listener_with_tunnel(false).await
+    }
+
+    async fn start_plaintext_gateway_listener_with_tunnel(
+        enable_websocket_tunnel: bool,
+    ) -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind test listener");
         let listen_addr = listener.local_addr().expect("failed to read local addr");
-        let state = test_state(listen_addr, false).await;
+        let mut state = test_state(listen_addr, false).await;
+        Arc::get_mut(&mut state)
+            .expect("test server state should be uniquely owned")
+            .config
+            .enable_websocket_tunnel = enable_websocket_tunnel;
         let service = MultiplexService::new(state);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(serve_gateway_listener(
@@ -3169,6 +3179,68 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
         );
+
+        stop_listener(shutdown, handle).await;
+    }
+
+    /// The edge-tunnel client path: gRPC carried in binary frames over a
+    /// WebSocket to `/_ws_tunnel` on the production listener reaches the
+    /// gateway's own services.
+    #[tokio::test]
+    async fn production_gateway_listener_serves_grpc_through_websocket_tunnel() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use openshell_core::proto::{
+            HealthRequest, ServiceStatus, open_shell_client::OpenShellClient,
+        };
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (addr, shutdown, handle) = start_plaintext_gateway_listener_with_tunnel(true).await;
+        let ws_url = format!("ws://127.0.0.1:{}/_ws_tunnel", addr.port());
+        let channel = tonic::transport::Endpoint::from_static("http://edge-tunnel.invalid")
+            .connect_with_connector(tower::service_fn(move |_| {
+                let ws_url = ws_url.clone();
+                async move {
+                    let (ws, _) = tokio_tungstenite::connect_async(ws_url)
+                        .await
+                        .map_err(Error::other)?;
+                    let (mut ws_sink, mut ws_source) = ws.split();
+                    let (client, bridge) = tokio::io::duplex(64 * 1024);
+                    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 32 * 1024];
+                        while let Ok(n @ 1..) = bridge_read.read(&mut buf).await {
+                            if ws_sink
+                                .send(Message::Binary(buf[..n].to_vec().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        let _ = ws_sink.close().await;
+                    });
+                    tokio::spawn(async move {
+                        while let Some(Ok(Message::Binary(data))) = ws_source.next().await {
+                            if bridge_write.write_all(&data).await.is_err() {
+                                break;
+                            }
+                        }
+                        let _ = bridge_write.shutdown().await;
+                    });
+                    Ok::<_, Error>(hyper_util::rt::TokioIo::new(client))
+                }
+            }))
+            .await
+            .expect("gRPC channel through the WebSocket tunnel");
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            OpenShellClient::new(channel).health(HealthRequest {}),
+        )
+        .await
+        .expect("health RPC through the tunnel timed out")
+        .expect("health RPC through the tunnel");
+        assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
 
         stop_listener(shutdown, handle).await;
     }
