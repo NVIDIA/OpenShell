@@ -2566,7 +2566,7 @@ pub(super) async fn handle_watch_sandbox(
                 let mut batch = std::mem::take(&mut deferred);
                 match first {
                     None => {}
-                    Some(Ok(evt)) => batch.push(evt),
+                    Some(Ok(evt)) => batch.push(Arc::unwrap_or_clone(evt)),
                     Some(Err(broadcast::error::RecvError::Lagged(n))) => {
                         // Lag is recoverable: surface a warning and keep streaming.
                         if tx
@@ -2612,7 +2612,7 @@ pub(super) async fn handle_watch_sandbox(
                 {
                     loop {
                         match rx.try_recv() {
-                            Ok(evt) => batch.push(evt),
+                            Ok(evt) => batch.push(Arc::unwrap_or_clone(evt)),
                             Err(broadcast::error::TryRecvError::Empty) => break,
                             // Keep draining: the receiver is usable after a skip.
                             Err(broadcast::error::TryRecvError::Lagged(n)) => lagged += n,
