@@ -175,6 +175,13 @@ as placeholders for proxy-time resolution.
 | `CLOUD_ML_REGION` | from `region` config | GCP region |
 | `GCP_LOCATION` | from `region` config | Alternative region var |
 
+For each non-secret variable, a sandbox create-time value overrides its template
+value, which overrides the provider default. The metadata project-ID endpoint
+uses the effective `GCP_PROJECT_ID`, including an explicitly empty value. A caller
+can supply it even when the provider has no `project_id` config. OpenShell resolves
+aliases independently; set both `GCP_PROJECT_ID` and `GOOGLE_CLOUD_PROJECT` when
+overriding the project so SDKs that read different variables agree.
+
 ## Using with GCP APIs
 
 The metadata emulator serves tokens with the `cloud-platform` OAuth2 scope,

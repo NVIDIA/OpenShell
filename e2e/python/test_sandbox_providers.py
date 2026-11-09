@@ -454,22 +454,53 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
 
 
 @pytest.mark.parametrize(
-    ("service_account_email", "provider_suffix"),
+    (
+        "service_account_email",
+        "provider_project",
+        "spec_project",
+        "template_project",
+        "provider_suffix",
+    ),
     [
-        (None, "no-email"),
-        ("", "empty-email"),
-        ("sdk@metadata-test-project.iam.gserviceaccount.com", "configured-email"),
+        (None, "metadata-test-project", None, None, "no-email"),
+        ("", "metadata-test-project", None, None, "empty-email"),
+        (
+            "sdk@metadata-test-project.iam.gserviceaccount.com",
+            "metadata-test-project",
+            None,
+            None,
+            "configured-email",
+        ),
+        (None, "provider-project", None, "template-project", "template-project"),
+        (
+            None,
+            "provider-project",
+            "caller-project",
+            "template-project",
+            "spec-project",
+        ),
+        (None, None, "caller-project", None, "missing-provider-project"),
     ],
-    ids=["no-email", "empty-email", "configured-email"],
+    ids=[
+        "no-email",
+        "empty-email",
+        "configured-email",
+        "template-project",
+        "spec-project",
+        "missing-provider-project",
+    ],
 )
 def test_google_metadata_sdk_discovery(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
     service_account_email: str | None,
+    provider_project: str | None,
+    spec_project: str | None,
+    template_project: str | None,
     provider_suffix: str,
 ) -> None:
     """Google's SDK discovers project/account metadata and refreshes a placeholder."""
-    config = {"project_id": "metadata-test-project"}
+    config = {"project_id": provider_project} if provider_project is not None else {}
     if service_account_email is not None:
         config["service_account_email"] = service_account_email
     with provider(
@@ -497,6 +528,14 @@ def test_google_metadata_sdk_discovery(
             )
         )
         spec = datamodel_pb2.SandboxSpec(policy=policy, providers=[provider_name])
+        if spec_project is not None:
+            spec.environment["GCP_PROJECT_ID"] = spec_project
+        if template_project is not None:
+            spec.template.CopyFrom(
+                openshell_pb2.SandboxTemplate(
+                    environment={"GCP_PROJECT_ID": template_project}
+                )
+            )
 
         def discover_metadata() -> str:
             import json
@@ -526,6 +565,7 @@ def test_google_metadata_sdk_discovery(
             return json.dumps(
                 {
                     "project": project,
+                    "environment_project": os.environ.get("GCP_PROJECT_ID"),
                     "account": credentials.service_account_email,
                     "token": credentials.token,
                     "expiry_present": credentials.expiry is not None,
@@ -538,7 +578,9 @@ def test_google_metadata_sdk_discovery(
             result = sb.exec_python(discover_metadata)
             assert result.exit_code == 0, result.stderr
             data = json.loads(result.stdout)
-            assert data["project"] == "metadata-test-project"
+            expected_project = spec_project or template_project or provider_project
+            assert data["project"] == expected_project
+            assert data["environment_project"] == expected_project
             assert data["account"] == (service_account_email or "default")
             assert data["metadata_host"] == data["metadata_ip"] == "127.0.0.1:8174"
             assert data["expiry_present"]

@@ -67,8 +67,10 @@ discovery:
 `environment.config` maps each destination environment variable to a provider
 config key. OpenShell trims the config value and skips missing or blank values.
 `environment.fixed` supplies literal values, including an explicitly empty
-string. Sandbox template and create-time environment values, including an
-explicitly empty value, take precedence over these non-secret defaults.
+string. Create-time environment values take precedence over sandbox template
+values, which take precedence over these non-secret defaults. Overrides preserve
+explicitly empty values. Supervisor metadata services read the same effective
+non-secret values as the workload.
 Provider credential keys remain credential-owned and reach the workload as
 opaque placeholders.
 

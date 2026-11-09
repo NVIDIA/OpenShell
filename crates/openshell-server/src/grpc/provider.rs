@@ -38,7 +38,7 @@ use openshell_policy::ProviderPolicyLayer;
 use openshell_providers::LEGACY_VERTEX_PRIVATE_KEY_ENV;
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tonic::Status;
 use tracing::warn;
 
@@ -2251,6 +2251,57 @@ fn validate_provider_environment_records_unique_at(
     }
     validate_dynamic_token_grant_bindings_unambiguous(&dynamic_bindings)?;
     Ok(())
+}
+
+/// Effective caller values for declared non-secret destinations only. Reserve
+/// credential keys even when their values are missing, expired, or withheld.
+pub(super) fn non_secret_provider_environment_overrides(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[ProviderEnvironmentRecord],
+    sandbox: &Sandbox,
+) -> BTreeMap<String, String> {
+    let Some(spec) = sandbox.spec.as_ref() else {
+        return BTreeMap::new();
+    };
+    let mut destinations = HashSet::new();
+    let mut credential_keys = reserved_bootstrap_credential_keys();
+    for record in records {
+        let provider = &record.provider;
+        credential_keys.extend(provider.credentials.keys().cloned());
+        credential_keys.extend(provider.credential_handles.keys().cloned());
+        for state in &record.refresh_states {
+            credential_keys.insert(state.credential_key.clone());
+            credential_keys.extend(state.additional_output_keys.values().cloned());
+        }
+        if let Some(profile) = get_provider_type_profile_for_scope(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        ) {
+            destinations.extend(profile.environment.config.keys().cloned());
+            destinations.extend(profile.environment.fixed.keys().cloned());
+            credential_keys.extend(
+                profile
+                    .credentials
+                    .iter()
+                    .flat_map(|credential| credential.accepted_stored_keys())
+                    .map(str::to_string),
+            );
+            credential_keys.extend(broker_only_provider_credential_keys(&profile.to_proto()));
+        }
+    }
+    destinations
+        .into_iter()
+        .filter(|key| is_valid_env_key(key) && !credential_keys.contains(key))
+        .filter_map(|key| {
+            let value = spec.environment.get(&key).or_else(|| {
+                spec.template
+                    .as_ref()
+                    .and_then(|template| template.environment.get(&key))
+            })?;
+            Some((key, value.clone()))
+        })
+        .collect()
 }
 
 fn provider_profile_environment_values(
