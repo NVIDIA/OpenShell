@@ -14,7 +14,7 @@ select compiled provider plugins.
 - Discover credentials and non-secret config from declared environment keys.
 - Apply bounded, literal non-secret environment defaults without overwriting
   existing values.
-- Validate credential collisions and named platform adapter requirements.
+- Validate credential collisions and environment declarations.
 - Use the shared authored-YAML compatibility boundary for profile imports and
   exports: reject duplicate keys and null objects without coercion, retain
   optional nulls, and preserve string types for YAML 1.1 readers.
@@ -38,7 +38,7 @@ Those are owned by the gateway and sandbox supervisor.
 | Credential discovery | `discovery.credentials` and credential `env_vars` |
 | Vertex config discovery | `discovery.config_env_vars` |
 | Workload resolution of non-secret values | Gateway key classification, independent of provider names |
-| Platform service dependency | `required_platform_adapter`; GCP metadata is available for non-Windows sandbox runtimes |
+| GCP metadata runtime requirement | Documented in the example profile header; the supervisor provides metadata for Linux sandboxes |
 | Vertex service account JSON credential | Removed from the example; configure gateway refresh material directly |
 | ID-selected provider plugins | Removed |
 | ID-selected CLI credential hints | Removed; setup guidance applies to the imported profile |
@@ -47,8 +47,9 @@ Those are owned by the gateway and sandbox supervisor.
 | GCP project and region config-key catalog | Removed; profile data supplies these declarations |
 
 Credential refresh strategies remain explicitly declared in credential metadata.
-The supervisor provides the `gcp-metadata` adapter for Linux sandboxes; the
-Windows/MXC runtime does not provide it.
+The supervisor provides the GCP metadata service for Linux sandboxes; the
+Windows/MXC runtime does not provide it. Profile import and attachment do not
+validate runtime support.
 
 ## Security Notes
 

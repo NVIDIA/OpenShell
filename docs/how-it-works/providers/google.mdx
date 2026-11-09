@@ -14,10 +14,13 @@ gateway-refreshed bearer tokens.
 
 ## Google Cloud Metadata
 
-The `google-cloud` example declares the `gcp-metadata` platform adapter and
-the SDK environment variables that use it. The sandbox relays metadata requests
-to the supervisor on Linux sandboxes using Docker, Podman, Kubernetes, or VM.
-Windows/MXC does not provide this adapter.
+The `google-cloud` example requires a Linux sandbox using Docker, Podman,
+Kubernetes, or VM. The sandbox relays metadata requests to the supervisor.
+Windows/MXC does not provide this metadata service. Verify the sandbox runtime
+before using the profile. Import and attachment do not check runtime support;
+on an unsupported runtime, SDK metadata discovery fails when the client tries
+to use it. Native Vertex bearer-token authentication does not require this
+service.
 
 Import the profile before creating a provider. This example has no API
 endpoints, so bind the provider to each Google API host in sandbox policy as
@@ -30,7 +33,7 @@ openshell profile import -f google-cloud.yaml --global
 
 The profile's `environment` declarations provide the non-secret metadata and
 project values listed below. A copy imported under another ID keeps those
-declarations and the same adapter requirement.
+declarations and still requires a supported sandbox runtime.
 
 ## Authentication Flows
 

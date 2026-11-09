@@ -41,10 +41,6 @@ pub enum ProviderError {
         profile_id: String,
         credential_name: String,
     },
-    #[error("required platform adapter 'gcp-metadata' is unavailable in this build")]
-    UnavailableGcpMetadataAdapter,
-    #[error("unknown required platform adapter")]
-    UnknownPlatformAdapter,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -158,7 +158,7 @@ def imported_provider_profile(
 
 
 def _endpointless_credential_profile(profile_id: str) -> openshell_pb2.ProviderProfile:
-    """Build an endpointless credential profile without a platform adapter."""
+    """Build an endpointless credential profile for placeholder delivery tests."""
     return openshell_pb2.ProviderProfile(
         id=profile_id,
         display_name=f"{profile_id} display",
