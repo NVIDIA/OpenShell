@@ -86,20 +86,7 @@ pub use metadata::{
 pub use network_trust::NetworkSupervisorTrustBundle;
 pub use sandbox_session::{SandboxSessionId, SandboxSessionIdError};
 
-/// Build version string derived from git metadata.
-///
-/// For local builds this is computed by `build.rs` from the exact release tag
-/// or the latest merged stable tag using the guess-next-dev scheme (e.g.
-/// `0.0.4-dev.6+g2bf9969ab`). In Docker/CI builds where `.git` is absent, it
-/// falls back to `CARGO_PKG_VERSION`, which the build pipeline already stamps.
-pub const VERSION: &str = match option_env!("OPENSHELL_GIT_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
-
-#[cfg(test)]
-#[path = "../build_version.rs"]
-mod build_version;
+pub use openshell_driver_sdk::VERSION;
 
 /// Encoded protobuf `FileDescriptorSet` for every proto in `proto/`.
 ///
