@@ -116,10 +116,6 @@ x509-parser = "0.16"
 arc-swap = "1"
 notify = "8"
 
-[target.'cfg(target_os = "windows")'.dependencies]
-# Clears the handle-inherit flag on the gateway's listening sockets (see gateway_listener.rs).
-windows = { workspace = true }
-
 [features]
 default = ["telemetry"]
 ## Compile in anonymous telemetry emission (forwards to openshell-core/telemetry).
@@ -150,5 +146,9 @@ wiremock = "0.6"
 # `testing` provides InMemorySpanExporter, so span assertions do not need a
 # collector, a network hop, or a flush barrier.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Windows-only tests read the inherit flag of the gateway's listening socket.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { workspace = true }
+
 [lints]
 workspace = true
