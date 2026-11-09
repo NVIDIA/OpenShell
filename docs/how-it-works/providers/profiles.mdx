@@ -87,11 +87,11 @@ the same non-secret destination from multiple providers when their values
 match. It rejects differing values and overlapping credential keys. Use
 distinct destination names when providers need different values.
 
-Use `required_platform_adapter` when a profile depends on a named runtime
-capability. Lint rejects unknown adapter names. Import, update, and attachment
-reject a recognized adapter that the deployment cannot provide, with a bounded
-diagnostic. The `gcp-metadata` adapter is available for Linux sandboxes using
-Docker, Podman, Kubernetes, or VM. Windows/MXC does not provide it.
+Check each example profile's header for runtime requirements before using it.
+Import and attachment validate the profile definition but do not check whether
+the sandbox runtime provides services its SDK settings depend on. For example,
+[Google Cloud metadata discovery](/how-it-works/providers/google#google-cloud-metadata)
+requires a supported Linux sandbox runtime.
 
 ## Understand Static Credential Endpoint Binding
 
@@ -398,9 +398,9 @@ cp providers/github.yaml providers/openai.yaml selected-profiles/
 openshell profile import --from ./selected-profiles --global
 ```
 
-Include only profiles whose platform requirements the deployment supports.
-Imports are atomic: a batch containing the Google Cloud metadata example fails
-on Windows/MXC because the `gcp-metadata` adapter is unavailable there.
+Imports are atomic: an invalid or conflicting profile rejects the whole batch.
+A successful import does not confirm runtime compatibility. Check the selected
+profiles' documented runtime requirements before attaching their providers.
 
 Omit `--global` to import into the current workspace instead.
 

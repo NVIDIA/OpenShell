@@ -1481,7 +1481,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         // provider's earlier output cannot change how this provider classifies
         // or populates its own keys. Cross-provider credential/config
         // collisions have already been rejected by the validation above.
-        inject_provider_profile_environment(catalog, provider, &mut provider_env)?;
+        inject_provider_profile_environment(catalog, provider, &mut provider_env);
         for key in profile_stable_placeholder_keys {
             // A stable placeholder is emitted only when the binding carries
             // the opaque handle that binds it to the sandbox, provider,
@@ -2079,14 +2079,13 @@ pub async fn validate_provider_profiles_present(
         else {
             continue;
         };
-        if let Some(profile) = get_provider_type_profile_for_scope(
+        if get_provider_type_profile_for_scope(
             catalog,
             &provider.r#type,
             &provider.profile_workspace,
-        ) {
-            profile
-                .ensure_platform_adapter_available()
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        )
+        .is_some()
+        {
             continue;
         }
         let requested = provider.r#type.trim();
@@ -2219,7 +2218,7 @@ async fn validate_provider_environment_keys_unique_at(
             &mut seen_profile_config,
             &provider_name,
             active_provider_environment_keys(refresh, catalog, &provider, now_ms).await?,
-            provider_profile_environment_values(catalog, &provider)?,
+            provider_profile_environment_values(catalog, &provider),
         )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
             catalog, &provider,
@@ -2244,7 +2243,7 @@ fn validate_provider_environment_records_unique_at(
             &mut seen_profile_config,
             &record.name,
             active_keys_with_refresh_states(catalog, provider, &record.refresh_states, now_ms),
-            provider_profile_environment_values(catalog, provider)?,
+            provider_profile_environment_values(catalog, provider),
         )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
             catalog, provider,
@@ -2257,29 +2256,25 @@ fn validate_provider_environment_records_unique_at(
 fn provider_profile_environment_values(
     catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
-) -> Result<Vec<(String, String)>, Status> {
+) -> Vec<(String, String)> {
     let mut profile_environment = HashMap::new();
-    inject_provider_profile_environment(catalog, provider, &mut profile_environment)?;
+    inject_provider_profile_environment(catalog, provider, &mut profile_environment);
     let mut values: Vec<_> = profile_environment.into_iter().collect();
     values.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-    Ok(values)
+    values
 }
 
 fn inject_provider_profile_environment(
     catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     environment: &mut HashMap<String, String>,
-) -> Result<(), Status> {
+) {
     // Only the resolved profile declares non-secret environment defaults.
     if let Some(profile) =
         get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
     {
-        profile
-            .ensure_platform_adapter_available()
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
         profile.environment.inject(&provider.config, environment);
     }
-    Ok(())
 }
 
 fn validate_provider_environment_key_ownership(
@@ -3114,7 +3109,6 @@ pub(super) async fn handle_import_provider_profiles(
         profile_conflict_diagnostics(state.store.as_ref(), &catalog, &workspace, &profiles).await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
-    diagnostics.extend(profile_adapter_diagnostics(&profiles));
     diagnostics.extend(profile_legacy_credential_diagnostics(&profiles));
     if !has_errors(&diagnostics) {
         diagnostics.extend(
@@ -3220,7 +3214,6 @@ pub(super) async fn handle_update_provider_profiles(
         .await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
-    diagnostics.extend(profile_adapter_diagnostics(&profiles));
     diagnostics.extend(profile_legacy_credential_diagnostics(&profiles));
     let expected_resource_version = if request.expected_resource_version != 0 {
         Some(request.expected_resource_version)
@@ -3759,26 +3752,6 @@ fn normalize_profile_id_request(id: &str) -> Result<String, Status> {
     normalize_profile_id(id).ok_or_else(|| {
         Status::invalid_argument("id must be lowercase kebab-case using only a-z, 0-9, and '-'")
     })
-}
-
-fn profile_adapter_diagnostics(
-    profiles: &[(String, ProviderTypeProfile)],
-) -> Vec<ProfileValidationDiagnostic> {
-    profiles
-        .iter()
-        .filter_map(|(source, profile)| {
-            profile
-                .ensure_platform_adapter_available()
-                .err()
-                .map(|error| ProfileValidationDiagnostic {
-                    source: source.clone(),
-                    profile_id: profile.id.clone(),
-                    field: "required_platform_adapter".to_string(),
-                    message: error.to_string(),
-                    severity: "error".to_string(),
-                })
-        })
-        .collect()
 }
 
 fn profile_legacy_credential_diagnostics(
@@ -5711,7 +5684,6 @@ mod tests {
         // service. Use an explicit data-only fork for those scenarios.
         let mut cloud_config = openshell_providers::example_profiles::load("google-cloud");
         cloud_config.id = "cloud-env-fixture".to_string();
-        cloud_config.required_platform_adapter.clear();
         store
             .put_message(&stored_provider_profile(cloud_config.to_proto()))
             .await
@@ -6298,77 +6270,6 @@ mod tests {
                 result.expect("valid credential key");
                 assert_eq!(dynamic.len(), 1);
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn gcp_metadata_platform_adapter_matches_host_capability() {
-        let state = test_server_state_without_provider_profiles().await;
-        let mut profile = custom_profile("requires-adapter");
-        profile.required_platform_adapter = "gcp-metadata".to_string();
-        let response = handle_import_provider_profiles(
-            &state,
-            authed_request(ImportProviderProfilesRequest {
-                profiles: vec![ProviderProfileImportItem {
-                    profile: Some(profile.clone()),
-                    source: "requires-adapter.yaml".to_string(),
-                }],
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        if cfg!(windows) {
-            assert!(!response.imported);
-            assert!(response.diagnostics.iter().any(|diagnostic| {
-                diagnostic.field == "required_platform_adapter"
-                    && diagnostic.message.contains("unavailable")
-                    && diagnostic.message.len() < 128
-            }));
-        } else {
-            assert!(response.imported, "{:?}", response.diagnostics);
-        }
-
-        // Existing stored and interceptor-vended profiles must pass the same
-        // capability check at attachment as profiles imported in this build.
-        state
-            .store
-            .put_message(&stored_provider_profile(profile))
-            .await
-            .unwrap();
-        create_empty_token_grant_provider(
-            state.store.as_ref(),
-            "needs-adapter",
-            "requires-adapter",
-        )
-        .await;
-        let catalog = ProviderProfileSources::with_default_sources()
-            .snapshot_catalog(state.store.as_ref(), "default")
-            .await
-            .unwrap();
-        let validation = validate_provider_profiles_present(
-            state.store.as_ref(),
-            &catalog,
-            "default",
-            &["needs-adapter".to_string()],
-        )
-        .await;
-        let environment = resolve_provider_environment(
-            state.store.as_ref(),
-            "default",
-            &["needs-adapter".to_string()],
-        )
-        .await;
-        if cfg!(windows) {
-            let error = validation.unwrap_err();
-            assert_eq!(error.code(), Code::FailedPrecondition);
-            assert!(error.message().contains("gcp-metadata"));
-            assert!(error.message().len() < 128);
-            assert_eq!(environment.unwrap_err().code(), Code::FailedPrecondition);
-        } else {
-            assert!(validation.is_ok());
-            assert!(environment.is_ok());
         }
     }
 
@@ -14120,7 +14021,6 @@ mod tests {
         let store = test_store().await;
         let mut project_profile = openshell_providers::example_profiles::load("google-cloud");
         project_profile.id = "project-env-fixture".into();
-        project_profile.required_platform_adapter.clear();
         project_profile.environment.fixed.clear();
         project_profile
             .environment

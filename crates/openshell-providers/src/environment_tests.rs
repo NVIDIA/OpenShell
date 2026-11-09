@@ -25,7 +25,6 @@ environment:
 discovery:
   credentials: [token]
   config_env_vars: [CUSTOM_PROJECT]
-required_platform_adapter: gcp-metadata
 ",
     )
     .unwrap()
@@ -120,14 +119,6 @@ fn renamed_google_examples_keep_environment_and_discovery_behavior() {
         renamed.environment.inject(&config, &mut renamed_env);
         assert!(!canonical_env.is_empty());
         assert_eq!(canonical_env, renamed_env);
-        assert_eq!(
-            canonical
-                .ensure_platform_adapter_available()
-                .map_err(|error| error.to_string()),
-            renamed
-                .ensure_platform_adapter_available()
-                .map_err(|error| error.to_string()),
-        );
         assert_eq!(
             discover_from_profile(&canonical, &context).unwrap(),
             discover_from_profile(&renamed, &context).unwrap()
@@ -245,38 +236,4 @@ fn lint_enforces_declaration_count_limits() {
             .iter()
             .any(|diagnostic| diagnostic.message == "at most 64 discovery config keys are allowed")
     );
-}
-
-#[test]
-fn platform_adapter_availability_and_unknown_adapter_errors() {
-    let mut profile = profile();
-    let availability = profile.ensure_platform_adapter_available();
-    if cfg!(windows) {
-        assert!(
-            availability
-                .unwrap_err()
-                .to_string()
-                .contains("unavailable")
-        );
-    } else {
-        assert!(availability.is_ok());
-    }
-    profile.required_platform_adapter = "unknown".repeat(10_000);
-    let diagnostics = validate_profile_set(&[("custom.yaml".into(), profile.clone())]);
-    assert!(
-        diagnostics
-            .iter()
-            .any(|d| d.field == "required_platform_adapter")
-    );
-    assert!(diagnostics.iter().all(|d| d.message.len() < 256));
-    assert!(
-        profile
-            .ensure_platform_adapter_available()
-            .unwrap_err()
-            .to_string()
-            .len()
-            < 128
-    );
-    profile.required_platform_adapter.clear();
-    assert!(profile.ensure_platform_adapter_available().is_ok());
 }

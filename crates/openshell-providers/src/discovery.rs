@@ -107,7 +107,6 @@ mod tests {
                 config_env_vars: Vec::new(),
             },
             environment: EnvironmentProfile::default(),
-            required_platform_adapter: String::new(),
             source: String::new(),
             scope: String::new(),
         }

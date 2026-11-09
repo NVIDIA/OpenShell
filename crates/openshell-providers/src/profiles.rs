@@ -758,8 +758,6 @@ pub struct ProviderTypeProfile {
     #[serde(default, skip_serializing_if = "EnvironmentProfile::is_empty")]
     pub environment: EnvironmentProfile,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub required_platform_adapter: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub scope: String,
@@ -845,18 +843,6 @@ fn valid_file_config_key(key: &str) -> bool {
 // narrower shape; direct gRPC imports and CLI YAML imports must preserve the
 // same policy intent through storage and JIT composition.
 impl ProviderTypeProfile {
-    /// Check runtime capability separately from schema lint. The supervisor
-    /// provides GCP metadata for non-Windows sandbox runtimes.
-    pub fn ensure_platform_adapter_available(&self) -> Result<(), crate::ProviderError> {
-        match self.required_platform_adapter.as_str() {
-            "gcp-metadata" if cfg!(windows) => {
-                Err(crate::ProviderError::UnavailableGcpMetadataAdapter)
-            }
-            "" | "gcp-metadata" => Ok(()),
-            _ => Err(crate::ProviderError::UnknownPlatformAdapter),
-        }
-    }
-
     #[must_use]
     pub fn from_proto(profile: &ProviderProfile) -> Self {
         Self {
@@ -913,7 +899,6 @@ impl ProviderTypeProfile {
                     fixed: environment.fixed.clone(),
                 },
             ),
-            required_platform_adapter: profile.required_platform_adapter.clone(),
         }
     }
 
@@ -1092,7 +1077,6 @@ impl ProviderTypeProfile {
                 config: self.environment.config.clone(),
                 fixed: self.environment.fixed.clone(),
             }),
-            required_platform_adapter: self.required_platform_adapter.clone(),
         }
     }
 
@@ -3258,15 +3242,6 @@ fn collect_environment_diagnostics(
             message,
         ));
     };
-    if !matches!(
-        profile.required_platform_adapter.as_str(),
-        "" | "gcp-metadata"
-    ) {
-        error(
-            "required_platform_adapter",
-            "unknown platform adapter; the only recognized adapter is gcp-metadata",
-        );
-    }
     let environment = &profile.environment;
     if environment.config.len() + environment.fixed.len() > MAX_ENVIRONMENT_ENTRIES {
         error("environment", "at most 64 environment defaults are allowed");
@@ -6588,7 +6563,6 @@ binaries:
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
                     environment: EnvironmentProfile::default(),
-                    required_platform_adapter: String::new(),
                     source: String::new(),
                     scope: String::new(),
                 },
@@ -6609,7 +6583,6 @@ binaries:
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
                     environment: EnvironmentProfile::default(),
-                    required_platform_adapter: String::new(),
                     source: String::new(),
                     scope: String::new(),
                 },
@@ -6630,7 +6603,6 @@ binaries:
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
                     environment: EnvironmentProfile::default(),
-                    required_platform_adapter: String::new(),
                     source: String::new(),
                     scope: String::new(),
                 },

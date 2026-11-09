@@ -2637,6 +2637,9 @@ enum ProviderProfileCategory {
 
 // Provider type profile metadata exposed to clients.
 message ProviderProfile {
+  reserved 16;
+  reserved "required_platform_adapter";
+
   string id = 1;
   string display_name = 2;
   string description = 3;
@@ -2663,9 +2666,6 @@ message ProviderProfile {
   repeated ProviderProfileFile files = 14;
   // Non-secret environment defaults declared by this profile.
   ProviderProfileEnvironment environment = 15;
-  // Named runtime capability required by this profile. Empty requires none.
-  // Import and attachment reject requirements unavailable in this deployment.
-  string required_platform_adapter = 16;
 }
 
 // EXPERIMENTAL: Provider file templates may change or be removed.

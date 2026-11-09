@@ -101,11 +101,17 @@ same scope as the existing profile; omit `--global` for workspace-scoped
 profiles. Import is create-only, so use `profile import` only when the profile
 does not already exist. See [profile management](/how-it-works/providers/profiles#provider-profiles).
 
-The Google Cloud metadata example also declares
-`required_platform_adapter: gcp-metadata`. The supervisor provides this service
-for Linux sandboxes using Docker, Podman, Kubernetes, or VM. Windows/MXC does not
-provide the metadata endpoint. Native Vertex bearer-token authentication does
-not require this adapter.
+The Google Cloud metadata example requires a Linux sandbox using Docker,
+Podman, Kubernetes, or VM. Windows/MXC does not provide the metadata endpoint.
+Import and attachment do not check runtime support, so they can succeed even
+when SDK metadata discovery will fail. Verify the sandbox runtime before using
+this profile. Native Vertex bearer-token authentication does not require the
+metadata service. See [Google Cloud metadata discovery](/how-it-works/providers/google#google-cloud-metadata).
+
+When importing several new profiles with `--from`, put reviewed profiles in a
+separate directory and check their runtime requirements first. Import is atomic:
+an invalid or conflicting definition rejects the whole batch. A successful
+import does not confirm that the selected profiles work with your runtime.
 
 ### Migrate service-account private keys
 

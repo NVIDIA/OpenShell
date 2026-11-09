@@ -132,6 +132,9 @@ mod tests {
     // legacy payload decoding. The provider-environment file map and peer
     // configuration notification are public-only. Older supervisors ignore the
     // additive file map while retaining the rest of the response.
+    // ProviderProfile's adapter requirement is removed with its field number
+    // and name reserved. Prior payloads ignore that field while preserving
+    // environment declarations at field 15; storage.v1 remains unchanged.
     // Preparation timing adds two optional timestamps to SandboxProvisioning.
     // Existing rows decode with both absent and retain their active deadline;
     // no stored attempt gains another phase or time budget on upgrade.
@@ -178,9 +181,9 @@ mod tests {
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "6a48aa216b6e58c3b988d4468a2bce48f191cde442cd16431a6745c31b633af5";
+        "82bafb2d6761f931bd61d779c138bd87029d1616a952671eccce92a15e99d21b";
     const DURABLE_SCHEMA_SHA256: &str =
-        "5007cbc16f1791107fd8084f34093e39de7b0e129a481d2bebd6978627278be1";
+        "0428468afb6a08ed0fb2d8c66dbc3c601771c3744f1fd4016b055d5c1a546a6f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "324526d75a8d523328a4c902f867400105826e6f540123f88a3ba1bbe8925958";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -868,7 +871,6 @@ mod tests {
         assert_eq!(profile.id, "profile");
         assert_eq!(profile.display_name, "Legacy");
         assert!(profile.environment.is_none());
-        assert!(profile.required_platform_adapter.is_empty());
 
         let policy_payload =
             PolicyRevisionPayload::decode(legacy_bytes(V0_0_116_POLICY_PAYLOAD).as_slice())
