@@ -527,9 +527,12 @@ remain supported. A policy with no usable filesystem paths also fails launch.
 Process identity is omitted so the selected compute driver can choose it. For
 Docker and Podman, each omitted identity field falls back to the image's OCI
 `USER`. Tell the user these are defaults and may need adjustment for their
-environment. Gateway inference is configured separately through `openshell
-inference set/get`. The generated `network_policies` block is the primary
-output.
+environment. Inference access uses provider profiles and sandbox attachments;
+the workload calls the provider's native endpoint and selects its model and
+timeout. Inspect the effective policy with `openshell policy get <sandbox>
+--full`, including provider-derived rules, and follow the published
+[inference guide](https://docs.nvidia.com/openshell/latest/how-it-works/inference).
+The generated `network_policies` block is the primary output.
 
 When the user explicitly requests `process.run_as_user` or
 `process.run_as_group`, accept `sandbox` or a numeric UID/GID from `1` through
