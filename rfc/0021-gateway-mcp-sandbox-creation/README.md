@@ -835,8 +835,11 @@ reused; its grants, lineage store and result files are not part of this design.
   about 30 seconds. A provider the parent loses reaches a running child the
   same way; testing measured about 15 seconds.
 - **The MCP door uses the sandbox's session token.** That token can do more
-  than call `/mcp`. The agent never sees it and must be unable to read the
-  token file. A token limited to `/mcp` is planned for v1.
+  than call `/mcp`, so the agent must never be able to read it. With the
+  Docker driver, the supervisor's credentials live in a volume mounted only
+  into the supervisor's container; the workload's container does not mount
+  it, and an end-to-end test checks this from both sides. A token limited to
+  `/mcp` is planned for v1.
 - **Background jobs were checked on Docker only.** They assume a process
   started with redirected input and output outlives the `exec` that started
   it, and that `/tmp` is writable. An end-to-end task exists for Podman but
@@ -945,8 +948,9 @@ reused; its grants, lineage store and result files are not part of this design.
 - **Background jobs on other drivers.** Docker is checked. Confirm on
   Kubernetes, Podman and VM drivers that a job keeps running after its `exec`
   ends and that a child created without a command stays ready.
-- **The session token file.** Confirm that the agent process cannot read the
-  sandbox's session token file.
+- **The session token on other drivers.** Docker is checked. Confirm on
+  Kubernetes, Podman and VM drivers that the agent process cannot read the
+  sandbox's session token.
 - **Automation identities.** Roots created by identities without workspace
   membership cannot create children through MCP in this version. Whether some
   automation identities, such as CI service accounts, should be rechecked
