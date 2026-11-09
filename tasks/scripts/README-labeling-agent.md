@@ -1,100 +1,113 @@
-# Labeling agent runtime integration
+# One-item labeling runner
 
-These modules start Part 3 of [#5276](https://github.com/NVIDIA/OpenShell/issues/5276):
-select invocations and return an unvalidated JSON classification proposal. The
-shared `/label-issue` helper from [#5355](https://github.com/NVIDIA/OpenShell/pull/5355)
-owns eligibility, evidence, validation, label writes, checkpoints, and local
-reporting. No automatic workflow is installed.
+The runner connects the shared [label-issue skill](../../.agents/skills/label-issue/SKILL.md)
+and helper to the managed classifier from [#5407](https://github.com/NVIDIA/OpenShell/pull/5407).
+The helper owns eligibility, evidence, validation, writes, checkpoints and local
+reporting. No automatic trigger or backlog execution is installed.
 
-## Execution boundary
+## Setup
 
-Select an invocation with `labeling_agent_events.select_invocation`, then call the
-shared helper's preparation. Only `status: ready` with `classifier_required: true`
-creates a model session. Pass the prepared evidence and trusted classifier
-instructions to `managed_label_classifier.session_request`, call `classify`, and
-return its proposal to the shared preview/application helper. Follow the shared
-[command/result contract](https://github.com/NVIDIA/OpenShell/blob/70fa003b902416459b2c08131b5cc265294d35d6/.agents/skills/label-issue/references/result-contract.md);
-this adapter checks JSON shape, not classification validity.
+Use a trusted checkout containing the helper and runner, POSIX, Python, `uv`, and
+authenticated `gh`. Configure a trusted GitHub labeling identity with the required
+repository permissions. Provision canonical taxonomy/routing definitions and the
+approved `meta:labeler-checkpoint` label before corresponding live applications;
+the runner never creates repository labels.
 
-Include the result schema and referenced classification guidance in the trusted
-instructions: the runtime cannot fetch referenced files or expand evidence.
-The caller must handle required evidence expansion through the shared helper.
-Do not silently treat missing or partial evidence as complete.
+Provision a dedicated single-agent CMA agent, pin its version, and use an
+environment without preinstalled secrets. Start with a Sonnet-level model.
+Configure `ANTHROPIC_API_KEY` in the invoking environment; never put credentials
+in instructions, evidence, arguments or committed files. The adapter supplies no
+GitHub credentials, repository mounts or vaults. It overrides tools, MCP servers
+and attached skills to empty lists. Verify these controls in an observed live run
+before unattended use. Offline tests do not verify the saved CMA configuration.
 
-Trusted instructions become the session system prompt; evidence becomes the user
-message. Session overrides disable tools, MCP servers, and attached skills without
-changing the saved agent. The adapter supplies no GitHub credentials, repository
-mounts, or vaults.
+## Preview and application
 
-Use a dedicated single-agent CMA configuration and an environment without
-preinstalled secrets. Start with a Sonnet-level model; the adapter pins the agent
-version rather than choosing a model. Verify overrides in a live smoke test before
-enabling automation.
-
-## Smoke-test CLI
-
-This temporary harness previews or submits prepared inputs. Consolidate it into
-the real entry point when the shared-helper integration is available.
+From the checkout root, preview one issue or PR by number or same-repository URL:
 
 ```shell
-uv run --no-project python tasks/scripts/managed_label_classifier.py \
-  --instructions /path/to/trusted-classifier-instructions.md \
-  --evidence /path/to/prepared-evidence.json \
+packet_dir=$(mktemp -d /tmp/openshell-label-run.XXXXXX)
+uv run --no-project python tasks/scripts/label_issue_runner.py 5411 \
+  --repo NVIDIA/OpenShell --output "$packet_dir" \
+  --trusted-actor "$label_actor" --executor "$label_actor" \
   --agent-id agent_CONFIGURED_ID --agent-version 1 \
-  --environment-id env_CONFIGURED_ID
+  --environment-id env_CONFIGURED_ID --human
 ```
 
-By default it prints the request without API calls or credentials. Output includes
-item evidence; keep it in the invoking session or appropriate artifacts.
+A ready item starts billable classification; preview performs no GitHub writes.
+Ineligible, excluded, held, unchanged or errored preparation stops before creating
+a transport or model session. `--force` is an invoking human's override of
+unchanged detection only. It confers no eligibility or write authorization.
 
-Add `--run` with `ANTHROPIC_API_KEY` in the environment to create a billable
-session. Never include credentials in evidence. Defaults are a 25-US-cent
-list-price ceiling (`--budget-cents`) and a 180-second deadline (`--timeout`).
-The result contains `session_id` and `proposal`; validate the proposal through
-the shared helper. Ambiguity belongs in local reports, never item comments.
+Use `--request-preview` to save `request.json` without a CMA call or API key.
+This mode still prepares live GitHub evidence and needs the non-secret CMA IDs.
+It replaces the adapter's temporary prepared-input CLI.
 
-## Completion and recovery
+The runner reads trusted classification instructions, result contract and migration
+policy from its checkout. Prepared content stays in the untrusted user message.
+The classifier may request `{"expand_evidence": ["ID", "..."]}` as its entire
+response. The runner expands those IDs through the shared helper and sends the
+delivered packets with the next round. It includes taxonomy definitions, malformed
+removal candidates and navigation metadata. Index membership never substitutes
+for inspected content. Deferred delivery, failed expansion and unresolved partial
+coverage remain explicit and cannot produce a successful checkpoint.
 
-Success requires JSON `agent.message` followed by idle `end_turn`. Failure or
-timeout archives the session; archival failure reports its ID. Successful
-sessions remain available for review. Session creation is never retried
-automatically after an uncertain response. Polling is bounded and error bodies
-are suppressed. See the [session event API](https://platform.claude.com/docs/en/managed-agents/events-and-streaming).
+Defaults are at most four sessions, a 180-second classification deadline, and a
+25-US-cent total list-price ceiling. `--max-rounds` accepts 1–8. The runner divides
+`--budget-cents` into equal integer per-session ceilings; their sum never exceeds
+the invocation budget. The budget must allow at least one cent per possible round.
+Evidence input is capped at 2 MiB; larger cases require local inspection.
 
-## Invocation selection
+Read `preview.json`, including exact ordered `mutation_requests`, ambiguity,
+prerequisites and bookkeeping. After explicitly authorizing this one-item
+application, use the same directory and identity:
 
-`select_invocation` returns `Invocation(repository, number, force, source)` or no
-invocation:
+```shell
+uv run --no-project python tasks/scripts/label_issue_runner.py 5411 \
+  --repo NVIDIA/OpenShell --output "$packet_dir" \
+  --trusted-actor "$label_actor" --executor "$label_actor" --apply --human
+```
 
-- `issues` / `pull_request_target`: `labeled` with `state:accepted`, including
-  automation-applied labels and drafts.
-- `issue_comment`: a new human PR comment containing only `/label-issue`,
-  `/label-issue force`, or `/label-issue --force`.
-- `workflow_dispatch`: a same-repository issue/PR number or URL and a Boolean
-  force input.
+Application loads the saved result and exact preview. It creates no CMA session
+and needs no CMA IDs or API key. The shared helper rechecks current eligibility,
+material and label events, compares exact payloads, verifies replacement
+additions before removals, and separately verifies completion. A no-change
+classification can still require checkpoint bookkeeping. See the shared
+[command/result contract](../../.agents/skills/label-issue/references/result-contract.md).
 
-Human commands require current write, maintain, or admin permission. Supply a live
-permission lookup that propagates failures; author association is insufficient.
-Force bypasses only unchanged detection in the shared helper. Other label and
-lifecycle events do not dispatch the classifier.
+## Reports and recovery
 
-## Pending wiring
+Stdout is one JSON report; `--human` adds the helper's concise summary and
+normalized ambiguity sentence to stderr. Never post labeling comments.
 
-After observed skill runs succeed, connect these modules using #5276's integration
-plan and trusted default-branch code. All entry points need coordinated per-item
-execution; #5355's local lock does not serialize separate hosts.
+Keep the output directory private to the invoking session: it contains item
+evidence, proposals and exact mutation payloads. Each new preparation needs an
+empty directory. `executions.json` records each session ID before polling;
+`proposal-N.json`, `result.json`, `preview.json` and `applied.json` preserve the
+review and application artifacts. Exceptions include the stage and known
+execution references. If session creation has an uncertain response, no ID may
+be available; inspect CMA before starting another run.
 
-[#5260](https://github.com/NVIDIA/OpenShell/pull/5260) writes acceptance using
-`GITHUB_TOKEN`; its label event will not start another workflow. Invoke the shared
-entry point explicitly after a successful acceptance-label write, including for
-drafts, independently of later reviewer-routing success. An existing acceptance
-label alone is not current eligibility: #5260 does not refresh it. Use the shared
-helper's preflight, which checks the item's author rather than the triggering
-actor and propagates lookup failures.
+Session failure or timeout attempts archival; archival failure reports its ID.
+Successful sessions remain available for review. Session creation is never
+automatically retried. Error reports preserve HTTP status, retryability,
+earliest retry time and write uncertainty. Honor retry times. Stale inputs
+require a fresh preparation and review. Partial/uncertain GitHub writes require
+fresh reconciliation, never blind replay of saved requests. A candidate
+checkpoint is not proof of successful completion.
 
-Remaining prerequisites are the shared interfaces, reviewed CMA configuration,
-acceptance-writer hook, label preparation, and observed end-to-end runs. See #5355
-for canonical-label and `meta:labeler-checkpoint` prerequisites.
+Exit codes match the helper: 0 for ready/preview/applied/no-op/unchanged/skipped,
+2 for held/prerequisite/stale, and 1 for error/partial.
+
+Use one coordinated executor per item. The helper's POSIX lock serializes local
+applications only; it does not serialize different hosts. Automatic acceptance
+dispatch and cross-entry-point coordination belong to the follow-up. In
+particular, [#5260](https://github.com/NVIDIA/OpenShell/pull/5260)'s successful
+`GITHUB_TOKEN` acceptance write needs an explicit runner hook, including drafts
+and independently of later reviewer-routing success; it does not trigger another
+workflow. `labeling_agent_events.select_invocation` remains a selector for those
+future callers, which must pass force only from authorized human invocations.
+No such hook is installed here.
 
 ## Verification
 
@@ -102,5 +115,8 @@ for canonical-label and `meta:labeler-checkpoint` prerequisites.
 mise run test:labeling-agent
 ```
 
-Offline tests fake CMA and permissions and perform no remote writes. Live
-configuration and model quality require observed runs.
+Offline tests use the actual shared helper with fake GitHub and CMA services.
+Before activation, observe representative live previews and explicitly authorized
+one-item applications covering legacy migration, missing evidence, unchanged
+skips, human force and partial failures. Record session IDs and verified outcomes
+locally. Dedicated CMA configuration and live verification remain pending.

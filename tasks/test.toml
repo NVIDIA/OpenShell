@@ -105,10 +105,11 @@ run = "uv run --no-project python -m unittest discover -s tasks/scripts -p check
 hide = true
 
 ["test:labeling-agent"]
-description = "Test managed labeling classifier and invocation routing offline"
+description = "Test one-item labeling runner, classifier and shared helper offline"
 run = [
   "uv run --no-project python -m unittest discover -s tasks/scripts -p managed_label_classifier_test.py",
   "uv run --no-project python -m unittest discover -s tasks/scripts -p labeling_agent_events_test.py",
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p label_issue*test.py",
 ]
 hide = true
 

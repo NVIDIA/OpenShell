@@ -11,7 +11,15 @@ Return the complete content-derived classification. Existing labels are reconcil
 
 ## Prepare and inspect
 
-From the checkout root use `uv run --no-project python tasks/scripts/label_issue.py`. Follow the [commands and result contract](references/result-contract.md); it owns GitHub reads, eligibility, preview, writes and checkpoints.
+For the managed end-to-end path, use
+`uv run --no-project python tasks/scripts/label_issue_runner.py <number-or-URL>`
+with the trusted identity, CMA configuration and output directory described in
+the [runner setup](../../../tasks/scripts/README-labeling-agent.md).
+Preview is the default; explicitly authorized `--apply` uses the saved exact
+preview without reclassification. `--request-preview` saves the model request
+without creating a session. No automatic triggering is installed.
+
+For direct helper operation, from the checkout root use `uv run --no-project python tasks/scripts/label_issue.py`. Follow the [commands and result contract](references/result-contract.md); it owns GitHub reads, eligibility, preview, writes and checkpoints.
 
 If preparation returns unchanged, skipped, held or error, report that outcome. `--force` bypasses only unchanged detection. The helper enforces the canonical [accepted-work policy](../../../CONTRIBUTING.md#accepted-work) and lifecycle boundaries; classification cannot grant eligibility.
 

@@ -2,10 +2,8 @@
 
 import io
 import json
-import tempfile
 import unittest
 import urllib.error
-from pathlib import Path
 from unittest.mock import patch
 
 from managed_label_classifier import (
@@ -17,7 +15,6 @@ from managed_label_classifier import (
     ManagedAgents,
     classify,
     completed_proposal,
-    main,
     session_request,
 )
 
@@ -249,6 +246,15 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(opened.call_count, 1)
         self.assertNotIn("test-secret", str(caught.exception))
 
+    def test_uncertain_session_creation_reports_uncertainty_without_retry(self):
+        with (
+            patch("urllib.request.urlopen", side_effect=OSError("connection lost")) as opened,
+            self.assertRaises(ClassifierError) as caught,
+        ):
+            ManagedAgents("test-secret").request("POST", "/sessions", {}, 5)
+        opened.assert_called_once()
+        self.assertTrue(caught.exception.uncertain_write)
+
     def test_invalid_response_is_rejected(self):
         for payload in [b"[]", b"not json"]:
             with (
@@ -258,32 +264,6 @@ class TransportTests(unittest.TestCase):
             ):
                 ManagedAgents("test-secret").request("GET", "/sessions/sesn_test", None, 5)
 
-
-class CliTests(unittest.TestCase):
-    def test_preview_does_not_create_a_transport_or_need_an_api_key(self):
-        with tempfile.TemporaryDirectory() as directory:
-            instructions = Path(directory) / "instructions.md"
-            evidence = Path(directory) / "evidence.json"
-            instructions.write_text("Trusted classifier instructions")
-            evidence.write_text('{"title": "Test evidence"}')
-            arguments = [
-                "managed_label_classifier.py",
-                "--instructions", str(instructions),
-                "--evidence", str(evidence),
-                "--agent-id", "agent_test",
-                "--agent-version", "1",
-                "--environment-id", "env_test",
-            ]
-            with (
-                patch("sys.argv", arguments),
-                patch("sys.stdout", new_callable=io.StringIO) as output,
-                patch("managed_label_classifier.ManagedAgents") as transport,
-            ):
-                self.assertEqual(main(), 0)
-                transport.assert_not_called()
-                self.assertEqual(
-                    json.loads(output.getvalue())["agent"]["id"], "agent_test"
-                )
 
 
 if __name__ == "__main__":
