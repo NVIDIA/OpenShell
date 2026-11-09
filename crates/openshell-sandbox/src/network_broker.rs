@@ -3124,8 +3124,9 @@ mod tests {
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         launcher
             .execute(move || {
-                // SAFETY: gettid has no preconditions.
-                let tid = u32::try_from(unsafe { libc::gettid() }).expect("positive tid");
+                // SAFETY: gettid has no arguments or side effects.
+                let tid = u32::try_from(unsafe { libc::syscall(libc::SYS_gettid) })
+                    .expect("positive tid");
                 let socket = socket2::Socket::new(
                     socket2::Domain::IPV4,
                     socket2::Type::STREAM.nonblocking(),
