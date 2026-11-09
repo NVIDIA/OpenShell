@@ -87,20 +87,26 @@ class PredicateTests(unittest.TestCase):
                 self.assertFalse(self.decide(issues=[value]))
 
     def test_acceptance_and_relationship_must_be_on_the_same_issue(self):
-        self.assertFalse(self.decide(issues=[
-            facts(), facts(author="contributor", accepted=False)
-        ]))
-        self.assertTrue(self.decide(issues=[
-            facts(accepted=False), facts(assignees=("contributor",))
-        ]))
+        self.assertFalse(
+            self.decide(issues=[facts(), facts(author="contributor", accepted=False)])
+        )
+        self.assertTrue(
+            self.decide(
+                issues=[facts(accepted=False), facts(assignees=("contributor",))]
+            )
+        )
 
     def test_only_target_repository_issues_qualify(self):
-        self.assertFalse(self.decide(issues=[
-            facts(repository="purp/OpenShell", author="contributor")
-        ]))
-        self.assertTrue(self.decide(issues=[
-            facts(repository="nvidia/openshell", author="contributor")
-        ]))
+        self.assertFalse(
+            self.decide(
+                issues=[facts(repository="purp/OpenShell", author="contributor")]
+            )
+        )
+        self.assertTrue(
+            self.decide(
+                issues=[facts(repository="nvidia/openshell", author="contributor")]
+            )
+        )
 
     def test_bots_do_not_receive_an_implicit_exemption(self):
         self.assertFalse(self.decide(author="dependabot[bot]"))
@@ -143,11 +149,14 @@ class GitHubAdapterTests(unittest.TestCase):
         api.assert_not_called()
 
     def test_checks_current_issue_author_assignees_and_paginated_labels(self):
-        result, api = self.check([
-            {"permission": "read"}, connection(42),
-            issue(author="other", assignees=("contributor",)),
-            [{"name": "area:build"}, {"name": ACCEPTED_LABEL}],
-        ])
+        result, api = self.check(
+            [
+                {"permission": "read"},
+                connection(42),
+                issue(author="other", assignees=("contributor",)),
+                [{"name": "area:build"}, {"name": ACCEPTED_LABEL}],
+            ]
+        )
         self.assertTrue(result)
         self.assertEqual(
             api.call_args_list[-2:],
@@ -163,25 +172,33 @@ class GitHubAdapterTests(unittest.TestCase):
         self.assertFalse(result)
 
     def test_cross_repository_references_are_not_fetched(self):
-        result, api = self.check([
-            {"permission": "read"}, connection(42, repository="purp/OpenShell")
-        ])
+        result, api = self.check(
+            [{"permission": "read"}, connection(42, repository="purp/OpenShell")]
+        )
         self.assertFalse(result)
         self.assertEqual(api.call_count, 2)
 
     def test_prs_are_not_issues_for_acceptance(self):
-        result, api = self.check([
-            {"permission": "read"}, connection(42),
-            {**issue(), "pull_request": {"url": "pull"}},
-        ])
+        result, api = self.check(
+            [
+                {"permission": "read"},
+                connection(42),
+                {**issue(), "pull_request": {"url": "pull"}},
+            ]
+        )
         self.assertFalse(result)
         self.assertEqual(api.call_count, 3)
 
     def test_reaches_a_qualifying_issue_on_a_later_page(self):
-        result, api = self.check([
-            {"permission": "read"}, connection(more=True, cursor="next"),
-            connection(42), issue(), [{"name": ACCEPTED_LABEL}],
-        ])
+        result, api = self.check(
+            [
+                {"permission": "read"},
+                connection(more=True, cursor="next"),
+                connection(42),
+                issue(),
+                [{"name": ACCEPTED_LABEL}],
+            ]
+        )
         self.assertTrue(result)
         graphql_calls = [
             call for call in api.call_args_list if call.args[0] == "graphql"
@@ -198,9 +215,9 @@ class GitHubAdapterTests(unittest.TestCase):
         error = subprocess.CalledProcessError(
             1, "gh", stderr="gh: Not Found (HTTP 404)"
         )
-        result, _ = self.check([
-            error, connection(42), issue(), [{"name": ACCEPTED_LABEL}]
-        ])
+        result, _ = self.check(
+            [error, connection(42), issue(), [{"name": ACCEPTED_LABEL}]]
+        )
         self.assertTrue(result)
 
     def test_permission_errors_propagate(self):
@@ -236,10 +253,14 @@ class GitHubAdapterTests(unittest.TestCase):
                 self.check(responses)
 
     def test_metadata_reads_never_call_label_mutation_endpoints(self):
-        _, api = self.check([
-            {"permission": "read"}, connection(42), issue(),
-            [{"name": ACCEPTED_LABEL}],
-        ])
+        _, api = self.check(
+            [
+                {"permission": "read"},
+                connection(42),
+                issue(),
+                [{"name": ACCEPTED_LABEL}],
+            ]
+        )
         for call in api.call_args_list:
             if call.args[0] == "graphql":
                 self.assertIn("query(", call.kwargs["data"]["query"])

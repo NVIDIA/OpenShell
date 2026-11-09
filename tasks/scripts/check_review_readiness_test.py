@@ -398,7 +398,10 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
             ) as load,
         ):
             plan = routing.check_review_readiness(
-                CATEGORIES, REPO, 42, apply=apply,
+                CATEGORIES,
+                REPO,
+                42,
+                apply=apply,
                 label_accepted_work=opened,
                 maintainers={"maintainer"},
             )
@@ -407,16 +410,17 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
     def test_new_draft_is_labeled_without_requesting_reviewers(self):
         plan, api, check, load = self.run_check(pr(draft=True))
         self.assertEqual(plan, routing.ReviewPlan((), (), True, ("state:accepted",)))
-        check.assert_called_once_with(
-            REPO, pr(draft=True), {"maintainer"}, api=api
+        check.assert_called_once_with(REPO, pr(draft=True), {"maintainer"}, api=api)
+        api.assert_has_calls(
+            [
+                mock.call(PULL),
+                mock.call(
+                    "repos/owner/repo/issues/42/labels",
+                    method="POST",
+                    data={"labels": ["state:accepted"]},
+                ),
+            ]
         )
-        api.assert_has_calls([
-            mock.call(PULL),
-            mock.call(
-                "repos/owner/repo/issues/42/labels", method="POST",
-                data={"labels": ["state:accepted"]},
-            ),
-        ])
         self.assertEqual(api.call_count, 2)
         load.assert_not_called()
 
@@ -468,8 +472,12 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
             mock.patch.object(routing, "_load_reviewers", return_value=reviewers()),
         ):
             plan = routing.check_review_readiness(
-                CATEGORIES, REPO, 42, apply=True,
-                label_accepted_work=True, maintainers={"maintainer"},
+                CATEGORIES,
+                REPO,
+                42,
+                apply=True,
+                label_accepted_work=True,
+                maintainers={"maintainer"},
             )
         self.assertEqual(
             plan, routing.ReviewPlan(("dave",), (), True, ("state:accepted",))
@@ -483,13 +491,19 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
         with (
             mock.patch.object(routing, "_api", return_value=pr("area:build")) as api,
             mock.patch.object(
-                routing, "check_pr_accepted_work", side_effect=ValueError("lookup failed")
+                routing,
+                "check_pr_accepted_work",
+                side_effect=ValueError("lookup failed"),
             ),
             self.assertRaisesRegex(ValueError, "lookup failed"),
         ):
             routing.check_review_readiness(
-                CATEGORIES, REPO, 42, apply=True,
-                label_accepted_work=True, maintainers={"maintainer"},
+                CATEGORIES,
+                REPO,
+                42,
+                apply=True,
+                label_accepted_work=True,
+                maintainers={"maintainer"},
             )
         api.assert_called_once_with(PULL)
 
@@ -498,12 +512,16 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
             routing, "_api", side_effect=[pr(author="MAINTAINER", draft=True), None]
         ) as api:
             plan = routing.check_review_readiness(
-                CATEGORIES, REPO, 42, apply=True,
-                label_accepted_work=True, maintainers={"maintainer"},
+                CATEGORIES,
+                REPO,
+                42,
+                apply=True,
+                label_accepted_work=True,
+                maintainers={"maintainer"},
             )
+        assert plan is not None
         self.assertTrue(plan.accepted_work)
         self.assertEqual(api.call_count, 2)
-
 
     def test_label_result_survives_the_refresh_before_reviewer_removal(self):
         before = pr("area:build", requested=("alice", "dave"))
@@ -514,13 +532,18 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
             ) as api,
             mock.patch.object(routing, "check_pr_accepted_work", return_value=True),
             mock.patch.object(
-                routing, "_load_reviewers",
+                routing,
+                "_load_reviewers",
                 return_value=reviewers(requested=("alice", "dave")),
             ),
         ):
             plan = routing.check_review_readiness(
-                CATEGORIES, REPO, 42, apply=True,
-                label_accepted_work=True, maintainers={"maintainer"},
+                CATEGORIES,
+                REPO,
+                42,
+                apply=True,
+                label_accepted_work=True,
+                maintainers={"maintainer"},
             )
         self.assertEqual(
             plan, routing.ReviewPlan((), ("alice",), True, ("state:accepted",))
@@ -539,8 +562,12 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
             self.assertRaises(subprocess.CalledProcessError),
         ):
             routing.check_review_readiness(
-                CATEGORIES, REPO, 42, apply=True,
-                label_accepted_work=True, maintainers={"maintainer"},
+                CATEGORIES,
+                REPO,
+                42,
+                apply=True,
+                label_accepted_work=True,
+                maintainers={"maintainer"},
             )
         load.assert_not_called()
 
@@ -574,14 +601,21 @@ class CliTests(unittest.TestCase):
                     0,
                 )
             self.assertEqual(
-                json.loads(output.getvalue()), {
-                    "add": ["alice"], "remove": [],
-                    "accepted_work": None, "add_labels": [],
-                }
+                json.loads(output.getvalue()),
+                {
+                    "add": ["alice"],
+                    "remove": [],
+                    "accepted_work": None,
+                    "add_labels": [],
+                },
             )
             check.assert_called_once_with(
-                {"area:runtime": {"alice"}}, REPO, 42, apply=True,
-                label_accepted_work=False, maintainers=None,
+                {"area:runtime": {"alice"}},
+                REPO,
+                42,
+                apply=True,
+                label_accepted_work=False,
+                maintainers=None,
             )
 
     def test_opened_pr_option_loads_trusted_maintainer_roster(self):
@@ -592,22 +626,36 @@ class CliTests(unittest.TestCase):
             maintainers.write_text("[@maintainer](https://github.com/maintainer)")
             with (
                 mock.patch.object(
-                    routing, "check_review_readiness",
+                    routing,
+                    "check_review_readiness",
                     return_value=routing.ReviewPlan((), (), True, ("state:accepted",)),
                 ) as check,
                 contextlib.redirect_stdout(io.StringIO()) as output,
             ):
-                result = routing.main([
-                    "--repo", REPO, "--pr", "42", "--reviewers", str(roster),
-                    "--maintainers", str(maintainers), "--label-accepted-work",
-                ])
+                result = routing.main(
+                    [
+                        "--repo",
+                        REPO,
+                        "--pr",
+                        "42",
+                        "--reviewers",
+                        str(roster),
+                        "--maintainers",
+                        str(maintainers),
+                        "--label-accepted-work",
+                    ]
+                )
             self.assertEqual(result, 0)
             self.assertEqual(
                 json.loads(output.getvalue())["add_labels"], ["state:accepted"]
             )
             check.assert_called_once_with(
-                {"area:runtime": {"alice"}}, REPO, 42, apply=False,
-                label_accepted_work=True, maintainers={"maintainer"},
+                {"area:runtime": {"alice"}},
+                REPO,
+                42,
+                apply=False,
+                label_accepted_work=True,
+                maintainers={"maintainer"},
             )
 
     def test_invalid_registry_fails_before_contacting_github(self):

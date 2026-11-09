@@ -235,7 +235,9 @@ def check_review_readiness(
     add_labels = ()
     labels = {label["name"] for label in pr["labels"]}
     if label_accepted_work:
-        accepted = check_pr_accepted_work(repository, pr, maintainers or set(), api=_api)
+        accepted = check_pr_accepted_work(
+            repository, pr, maintainers or set(), api=_api
+        )
         if accepted and ACCEPTED_LABEL not in labels:
             add_labels = (ACCEPTED_LABEL,)
             if apply:
