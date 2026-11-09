@@ -48,7 +48,8 @@ tests/suites/conformance/target/debug/openshell-conformance run --junit conforma
 The program runs only this suite: passing it means a gateway meets the
 conformance contract below. The machine that runs it must be reachable from
 sandboxes as `host.openshell.internal`, which rules out a gateway on a remote
-Kubernetes cluster. Feature and driver suites are not part of it. The
+Kubernetes cluster ([#5409](https://github.com/NVIDIA/OpenShell/issues/5409)).
+Feature and driver suites are not part of it. The
 [testkit README](../../testkit/README.md#test-programs) describes the commands
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
