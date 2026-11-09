@@ -38,6 +38,9 @@ jobs:
             runner: linux-arm64-cpu8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    defaults:
+      run:
+        shell: nix develop -c bash -euo pipefail {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -49,10 +52,45 @@ jobs:
           prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - uses: ./.github/actions/build-vm-driver
+      - name: Download openshell-sandbox
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          arch: ${{ matrix.arch }}
+          name: openshell-sandbox-${{ matrix.arch }}-unknown-linux-musl
+          path: sandbox
+
+      - name: Download openshell-supervisor
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-supervisor-${{ matrix.arch }}-unknown-linux-gnu
+          path: supervisor
+
+      - name: Download VM guest init
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-vm-init-${{ matrix.arch }}-unknown-linux-musl
+          path: vm-init
+
+      - name: Build VM runtime
+        run: |
+          # HTTP 416 is not retried by Nix; restart the build once on failure.
+          nix build .#vm-runtime || nix build .#vm-runtime
+
+      - name: Assemble compressed VM runtime
+        run: |
+          compressed_dir="${RUNNER_TEMP}/vm-runtime-compressed"
+          install -d "$compressed_dir"
+          cp result/compressed/*.zst "$compressed_dir/"
+          zstd -19 -T1 sandbox/openshell-sandbox -o "$compressed_dir/openshell-sandbox.zst"
+          zstd -19 -T1 supervisor/openshell-supervisor -o "$compressed_dir/openshell-supervisor.zst"
+          zstd -19 -T1 vm-init/openshell-vm-init -o "$compressed_dir/openshell-vm-init.zst"
+
+      - name: Build openshell-driver-vm
+        uses: ./.github/actions/build-rust-binary
+        env:
+          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR: ${{ runner.temp }}/vm-runtime-compressed
+        with:
+          package: openshell-driver-vm
+          binary: openshell-driver-vm
           triple: ${{ matrix.triple }}
-          supervisor-artifact: openshell-supervisor-${{ matrix.arch }}-unknown-linux-gnu
           cargo-version: ${{ inputs['cargo-version'] }}
           supervisor-image-tag: ${{ inputs['supervisor-image-tag'] }}
