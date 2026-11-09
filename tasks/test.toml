@@ -28,6 +28,7 @@ depends = [
   "test:review-readiness",
   "test:merge-gateway-toml",
   "test:accepted-work",
+  "test:labeling-agent",
 ]
 
 ["test:merge-gateway-toml"]
@@ -112,6 +113,14 @@ hide = true
 ["test:accepted-work"]
 description = "Test the shared accepted-work library"
 run = "uv run --no-project python -m unittest discover -s tasks/scripts -p label_accepted_work_test.py"
+hide = true
+
+["test:labeling-agent"]
+description = "Test managed labeling classifier and invocation routing offline"
+run = [
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p managed_label_classifier_test.py",
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p labeling_agent_events_test.py",
+]
 hide = true
 
 [e2e]
