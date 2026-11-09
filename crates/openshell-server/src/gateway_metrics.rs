@@ -23,6 +23,8 @@ use tonic::{Code, Status};
 
 // Gauges
 pub const SUPERVISOR_SESSIONS: &str = "openshell_server_supervisor_sessions";
+pub const SUPERVISOR_HOSTS: &str = "openshell_server_supervisor_hosts";
+pub const SUPERVISOR_HOST_INSTANCES_MAX: &str = "openshell_server_supervisor_host_instances_max";
 pub const RELAY_PENDING: &str = "openshell_server_relay_pending";
 pub const RELAY_PENDING_CAPACITY: &str = "openshell_server_relay_pending_capacity";
 pub const MUTATION_LOCK_CONNECTIONS_IN_USE: &str =
@@ -263,6 +265,16 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         "Supervisor control sessions registered on this gateway replica."
     );
     describe_gauge!(
+        SUPERVISOR_HOSTS,
+        Unit::Count,
+        "Shared supervisors whose assignment streams this gateway replica serves."
+    );
+    describe_gauge!(
+        SUPERVISOR_HOST_INSTANCES_MAX,
+        Unit::Count,
+        "Most sandbox instances placed on one shared supervisor this gateway replica serves."
+    );
+    describe_gauge!(
         RELAY_PENDING,
         Unit::Count,
         "Relay channels on this replica waiting for the supervisor to connect back, including channels opened for peer replicas."
@@ -335,6 +347,8 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
 
     // `increment(0)` registers a series without overwriting a value recorded earlier.
     gauge!(SUPERVISOR_SESSIONS).increment(0.0);
+    gauge!(SUPERVISOR_HOSTS).increment(0.0);
+    gauge!(SUPERVISOR_HOST_INSTANCES_MAX).increment(0.0);
     gauge!(RELAY_PENDING).increment(0.0);
     gauge!(RELAY_PENDING_CAPACITY).set(count_as_f64(relay.per_replica));
     for kind in RelayKind::ALL {
@@ -431,6 +445,11 @@ impl Drop for GaugeSlot {
     fn drop(&mut self) {
         self.0.decrement(1.0);
     }
+}
+
+pub fn record_supervisor_hosts(hosts: usize, most_instances: usize) {
+    gauge!(SUPERVISOR_HOSTS).set(count_as_f64(hosts));
+    gauge!(SUPERVISOR_HOST_INSTANCES_MAX).set(count_as_f64(most_instances));
 }
 
 pub fn record_relay_rejected(reason: RelayRejection) {
@@ -642,6 +661,8 @@ mod tests {
             ("openshell_server_mutation_lock_connections_capacity", 4),
             ("openshell_server_mutation_lock_connections_in_use", 0),
             ("openshell_server_supervisor_sessions", 0),
+            ("openshell_server_supervisor_hosts", 0),
+            ("openshell_server_supervisor_host_instances_max", 0),
             ("openshell_server_relay_pending", 0),
             (
                 "openshell_server_relay_rejected_total{reason=\"replica_capacity\"}",

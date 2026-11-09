@@ -40,7 +40,7 @@ use tonic::{Status, Streaming};
 
 use crate::proto::{
     AssignmentSnapshot, HostAccepted, HostGatewayHeartbeat, HostGatewayMessage, HostHello,
-    HostMessage, HostStatus, PoolMember, RouteOwner, SandboxInstanceAssignment,
+    HostMessage, HostRedirect, HostStatus, PoolMember, RouteOwner, SandboxInstanceAssignment,
     SandboxInstanceStatus, SandboxInstanceTakeover, host_gateway_message, host_message,
 };
 
@@ -167,6 +167,8 @@ pub struct MemberView {
     pub runtime_address: String,
     /// The member announced it is leaving the pool.
     pub leaving: bool,
+    /// Gateway replica serving the member's stream.
+    pub gateway_replica: String,
 }
 
 /// The gateway's durable view of a supervisor pool, replaced as a whole by
@@ -819,12 +821,15 @@ impl SupervisorHostController {
     }
 
     /// Serve one authenticated host stream. Reads the hello, supersedes any
-    /// session it replaces, and returns the gateway-to-host stream.
+    /// session it replaces, and returns the host's member ID and the
+    /// gateway-to-host stream. A host that does not ask to stay is redirected,
+    /// without a session, to the peer endpoint `home` names for its member.
     pub async fn attach(
         &self,
         identity: HostIdentity,
         mut inbound: Streaming<HostMessage>,
-    ) -> Result<ReceiverStream<Result<HostGatewayMessage, Status>>, Status> {
+        home: impl FnOnce(&str) -> Option<String>,
+    ) -> Result<(String, ReceiverStream<Result<HostGatewayMessage, Status>>), Status> {
         let hello = match tokio::time::timeout(HELLO_TIMEOUT, inbound.next()).await {
             Ok(Some(Ok(HostMessage {
                 payload: Some(host_message::Payload::Hello(hello)),
@@ -855,8 +860,16 @@ impl SupervisorHostController {
             return Err(Status::failed_precondition(MISSING_MEMBER));
         };
         validate_member(member).map_err(Status::invalid_argument)?;
-        let heartbeat = POOL_HEARTBEAT_INTERVAL;
+        let member_id = member.member_id.clone();
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
+        if !hello.stay
+            && let Some(peer_endpoint) = home(&member_id)
+        {
+            tracing::info!(member_id, peer_endpoint, "redirecting supervisor host");
+            let _ = tx.try_send(Ok(redirect(peer_endpoint)));
+            return Ok((member_id, ReceiverStream::new(rx)));
+        }
+        let heartbeat = POOL_HEARTBEAT_INTERVAL;
         let expires_at = identity.expires_at;
         let (session_id, superseded) = self.begin_session(identity, &hello)?;
         let peer_endpoint = lock(&self.inner.peer_endpoint).clone();
@@ -879,7 +892,7 @@ impl SupervisorHostController {
                 .await;
             controller.end_session(session_id);
         });
-        Ok(ReceiverStream::new(rx))
+        Ok((member_id, ReceiverStream::new(rx)))
     }
 
     /// Start a session for `hello`, superseding the same member's session. A
@@ -1276,6 +1289,16 @@ const MISSING_MEMBER: &str = "the shared supervisor did not name its pool member
 OPENSHELL_SUPERVISOR_POOL_MEMBER_ID to a stable member ID and \
 OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP to an IP reachable from sandbox runtimes";
 
+/// Sends a host to another gateway replica.
+#[must_use]
+pub fn redirect(peer_endpoint: String) -> HostGatewayMessage {
+    HostGatewayMessage {
+        payload: Some(host_gateway_message::Payload::Redirect(HostRedirect {
+            peer_endpoint,
+        })),
+    }
+}
+
 /// Check a pool member's identity, naming the setting that is wrong.
 fn validate_member(member: &PoolMember) -> Result<(), &'static str> {
     let valid = |value: &str| {
@@ -1445,6 +1468,7 @@ mod tests {
                 member_id: member.to_string(),
                 runtime_address: format!("10.0.0.{}:5500", member.len()),
             }),
+            stay: false,
         }
     }
 
@@ -1469,6 +1493,7 @@ mod tests {
             process_id: process.to_string(),
             runtime_address: format!("10.0.0.{}:5500", member.len()),
             leaving: false,
+            gateway_replica: String::new(),
         }
     }
 
@@ -1963,6 +1988,7 @@ mod tests {
                     instance_id: "p1".to_string(),
                     connection_epoch: 1,
                     member: None,
+                    stay: false,
                 },
             )
             .unwrap_err();

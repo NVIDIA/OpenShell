@@ -50,6 +50,7 @@ message HostGatewayMessage {
     HostRejected rejected = 2;
     AssignmentSnapshot assignments = 3;
     HostGatewayHeartbeat heartbeat = 4;
+    HostRedirect redirect = 5;
   }
 }
 
@@ -63,6 +64,9 @@ message HostHello {
   uint64 connection_epoch = 2;
   // Present when the host is a member of a supervisor pool.
   PoolMember member = 3;
+  // The host asks to be served by the replica it dialed: it is following a
+  // redirect or redialing the replica that last accepted it.
+  bool stay = 4;
 }
 
 // One member of a supervisor pool.
@@ -88,6 +92,12 @@ message HostAccepted {
   // instances' sessions here so they run on the replica serving this stream.
   // Empty when the replica has no peer endpoint.
   string peer_endpoint = 3;
+}
+
+// Another gateway replica should serve the host, which dials it at once with
+// HostHello.stay set. The stream ends after this message.
+message HostRedirect {
+  string peer_endpoint = 1;
 }
 
 // The gateway refuses the host; the stream ends after this message.

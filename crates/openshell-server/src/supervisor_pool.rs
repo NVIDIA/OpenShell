@@ -182,6 +182,7 @@ pub struct LiveMember {
     pub process_id: String,
     pub runtime_address: String,
     pub leaving: bool,
+    pub gateway_replica: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1168,6 +1169,7 @@ impl SupervisorPool {
                 process_id: payload.process_id,
                 runtime_address: payload.runtime_address,
                 leaving: payload.leaving,
+                gateway_replica: payload.gateway_replica,
             });
         }
         members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
@@ -2671,6 +2673,7 @@ impl SupervisorPool {
                 process_id: payload.process_id,
                 runtime_address: payload.runtime_address,
                 leaving: payload.leaving,
+                gateway_replica: payload.gateway_replica,
             });
         Ok(takeover_cause(owner, member.as_ref()))
     }
@@ -2825,6 +2828,7 @@ impl SupervisorPool {
                     process_id: member.process_id.clone(),
                     runtime_address: member.runtime_address.clone(),
                     leaving: member.leaving,
+                    gateway_replica: member.gateway_replica.clone(),
                 })
                 .collect(),
             owners: BTreeMap::new(),
@@ -2868,6 +2872,19 @@ impl SupervisorPool {
             );
         }
         lock(&self.minted).retain(|term, _| current_terms.contains(term));
+        let mut placed: BTreeMap<&str, usize> = served
+            .iter()
+            .map(|(member, _)| (member.as_str(), 0))
+            .collect();
+        for owner in view.owners.values() {
+            if let Some(count) = placed.get_mut(owner.member_id.as_str()) {
+                *count += 1;
+            }
+        }
+        crate::gateway_metrics::record_supervisor_hosts(
+            placed.len(),
+            placed.values().copied().max().unwrap_or(0),
+        );
         Some(view)
     }
 
@@ -5519,6 +5536,7 @@ mod tests {
             process_id: process_id.to_string(),
             runtime_address: "10.0.0.1:5500".to_string(),
             leaving,
+            gateway_replica: String::new(),
         };
         assert_eq!(takeover_cause(&owner, None), Some("expired"));
         assert_eq!(
@@ -5543,6 +5561,7 @@ mod tests {
             process_id: format!("p-{id}"),
             runtime_address: "10.0.0.1:5500".to_string(),
             leaving,
+            gateway_replica: String::new(),
         };
         let members = vec![member("m1", false), member("m2", false), member("m3", true)];
         let ring = ring_of(&members);

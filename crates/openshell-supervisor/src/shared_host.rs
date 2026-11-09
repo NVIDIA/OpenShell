@@ -1009,6 +1009,8 @@ enum StreamEnd {
         accepted: bool,
         redial: Option<String>,
     },
+    /// The gateway sent the host to another replica; dial it at once.
+    Redirected { peer_endpoint: String },
 }
 
 /// What a gateway sends a host on its assignment stream.
@@ -1095,6 +1097,11 @@ async fn attach_with(
     // unanswered ones is still quick.
     let mut unanswered = 0_u32;
     let mut redial = None;
+    // `redirected`: this attempt follows a redirect. `stay`: the attempt after
+    // a failed redirect stays wherever the Service lands it, so a stale ring
+    // cannot send it back to the replica it could not reach.
+    let mut redirected = false;
+    let mut stay = false;
     tokio::pin!(shutdown);
     loop {
         connection_epoch += 1;
@@ -1105,16 +1112,25 @@ async fn attach_with(
                 member_id: host.pool.member_id.clone(),
                 runtime_address: host.pool.runtime_address.to_string(),
             }),
+            stay: stay || redial.is_some(),
         };
         let attempt_timeout = timings.attempt_timeout(unanswered);
         let end = tokio::select! {
             end = run_stream(&host, connector.as_ref(), &reconciler, hello, &timings, attempt_timeout, redial.as_deref()) => end,
             () = &mut shutdown => return reconciler.shut_down().await,
         };
-        let StreamEnd::Lost {
-            accepted,
-            redial: next,
-        } = end;
+        let (accepted, next) = match end {
+            StreamEnd::Redirected { peer_endpoint } if !redirected => {
+                tracing::info!(%peer_endpoint, "gateway redirected the supervisor host");
+                redial = Some(peer_endpoint);
+                redirected = true;
+                continue;
+            }
+            StreamEnd::Redirected { .. } => (false, None),
+            StreamEnd::Lost { accepted, redial } => (accepted, redial),
+        };
+        stay = redirected && !accepted;
+        redirected = false;
         redial = next;
         if accepted {
             failed = 0;
@@ -1481,6 +1497,10 @@ async fn run_stream(
                         tracing::error!(reason = %rejected.reason, "gateway rejected the supervisor host");
                         break lost(accepted);
                     }
+                    Some(host_gateway_message::Payload::Redirect(redirect)) if !redirect.peer_endpoint.is_empty() => {
+                        break StreamEnd::Redirected { peer_endpoint: redirect.peer_endpoint };
+                    }
+                    Some(host_gateway_message::Payload::Redirect(_)) => break lost(accepted),
                     Some(host_gateway_message::Payload::Assignments(snapshot)) => {
                         if !accepted {
                             tracing::warn!("gateway sent assignments before accepting the host");
@@ -2315,6 +2335,47 @@ mod tests {
 
         let next = streams.recv().await.unwrap();
         assert_eq!(next.endpoint, None);
+    }
+
+    fn hello_stays(message: Option<HostMessage>) -> bool {
+        match message {
+            Some(HostMessage {
+                payload: Some(host_message::Payload::Hello(hello)),
+            }) => hello.stay,
+            other => panic!("expected a hello, got {other:?}"),
+        }
+    }
+
+    /// A redirected host dials the named replica at once and asks to stay;
+    /// when that replica does not accept it, the host asks the replica the
+    /// Service picks to keep it.
+    #[tokio::test(start_paused = true)]
+    async fn a_redirected_host_dials_the_replica_at_once_and_stays() {
+        let (_host, _gateway, mut streams, _root) =
+            attach_pool_host(vec![Attempt::Now, Attempt::Now, Attempt::Now, Attempt::Now]);
+        let mut first = streams.recv().await.unwrap();
+        assert!(!hello_stays(first.outbound.recv().await));
+        first
+            .inbound
+            .send(Ok(openshell_supervisor_control::controller::redirect(
+                "https://gw-b:8443".to_string(),
+            )))
+            .await
+            .unwrap();
+
+        let mut redirected = streams.recv().await.unwrap();
+        assert_eq!(redirected.endpoint.as_deref(), Some("https://gw-b:8443"));
+        assert_eq!(redirected.at, first.at);
+        assert!(hello_stays(redirected.outbound.recv().await));
+        drop(redirected);
+
+        let mut fallback = streams.recv().await.unwrap();
+        assert_eq!(fallback.endpoint, None);
+        assert!(hello_stays(fallback.outbound.recv().await));
+        drop(fallback);
+
+        let mut next = streams.recv().await.unwrap();
+        assert!(!hello_stays(next.outbound.recv().await));
     }
 
     /// A replica that keeps writing but stops reading fills the host's
