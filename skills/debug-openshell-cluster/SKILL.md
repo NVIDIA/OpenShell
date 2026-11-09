@@ -1749,3 +1749,13 @@ verify workload identity/memory survives and new connections reach the replaceme
 Shared serving leases last at most fifteen seconds from issuance, independently
 of configuration renewal; include membership failure detection when measuring a
 partition's stale-owner interval. Storage failures prevent renewal.
+
+
+Application ingress consumers call the separate `openshell.v1.ServiceDiscovery`
+service, rather than `OpenShell`. Discovery snapshots share a one-second cache
+per workspace (16 cached workspaces, four concurrent collections). The gateway
+admits 16 unary requests (four per principal, eight per workspace), and 32 watches
+(four per principal, 16 per workspace). `RESOURCE_EXHAUSTED` means capacity or
+record/route/byte limits; `UNAVAILABLE` means storage or collection timeout.
+Watches recheck bearer credentials and membership every second. Allow one refresh
+interval for withdrawals; route lease expiry remains independently enforced.

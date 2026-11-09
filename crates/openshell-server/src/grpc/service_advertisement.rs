@@ -468,12 +468,19 @@ async fn accept_inner(
 /// Discovery must call this before publishing each persisted installation.
 /// Freshness failures are absence; storage/decoding failures are errors.
 pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bool, Status> {
+    Ok(current_routes(state, record).await?.is_some())
+}
+
+pub(super) async fn current_routes(
+    state: &ServerState,
+    record: &Installation,
+) -> Result<Option<Vec<SandboxServiceRoute>>, Status> {
     if !state.config.supervisor_app_listener.enabled
         || record.expires_at_ms <= current_time_ms()
         || record.service_domain != state.config.supervisor_app_listener.domain
         || record.routes.is_empty()
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(sandbox) = state
         .store
@@ -481,7 +488,7 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
         .await
         .map_err(|_| Status::unavailable("sandbox storage unavailable"))?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if sandbox
         .metadata
@@ -489,14 +496,14 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
         .is_some_and(|m| m.deletion_time.is_some())
         || runtime_identity(&sandbox)? != record.runtime_identity
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(owner) = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
         .read(&record.sandbox_id)
         .await
         .map_err(|_| Status::unavailable("supervisor ownership unavailable"))?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if !owner.is_fresh(OWNER_TTL)
         || owner.session_id != record.session_id
@@ -508,7 +515,7 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
             != record.ownership_epoch
         || !sandbox_term_matches(&sandbox, owner.auth_epoch)
     {
-        return Ok(false);
+        return Ok(None);
     }
     if !record.pool_route.is_empty() {
         let endpoint = openshell_core::proto::compute::v1::SupervisorAppEndpoint {
@@ -522,7 +529,7 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
             .await
             .map_err(|_| Status::unavailable("pool application authority unavailable"))?
         {
-            return Ok(false);
+            return Ok(None);
         }
     }
     let config = super::policy::build_sandbox_config_snapshot(state, &sandbox).await?;
@@ -530,7 +537,7 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
         || config.configuration_instance_id != record.configuration_instance_id
         || config.config_revision != record.config_revision
     {
-        return Ok(false);
+        return Ok(None);
     }
     let routes = record
         .routes
@@ -542,7 +549,9 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
         routes,
         ..Default::default()
     };
-    Ok(validate_routes(&report, &config.service_routes).is_ok())
+    Ok(validate_routes(&report, &config.service_routes)
+        .is_ok()
+        .then_some(report.routes))
 }
 
 const CLEANUP_PAGE_SIZE: u16 = 128;
@@ -615,7 +624,8 @@ pub fn spawn_cleanup(state: Arc<ServerState>, mut shutdown: tokio::sync::watch::
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
+    use super::test_support::installed_fixture;
     use super::*;
 
     fn test_lease_authority() -> LeaseAuthority {
@@ -1072,6 +1082,82 @@ pub mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn accepted_installs_use_trusted_endpoints_and_withdraw_on_declaration_or_owner_change() {
+        let (state, owner, mut report) = installed_fixture().await;
+        accept(&state, &owner, &report, current_time_ms() + 10_000)
+            .await
+            .unwrap();
+        let stored = state
+            .store
+            .get(OBJECT_TYPE, "service-installation:sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let installation: Installation = serde_json::from_slice(&stored.payload).unwrap();
+        assert_eq!(installation.host, "10.0.0.7");
+        assert_eq!(installation.port, 9443);
+        assert!(is_current(&state, &installation).await.unwrap());
+        report.lease_sequence += 1;
+        report.routes[0].resource_version += 1;
+        assert!(
+            accept(&state, &owner, &report, current_time_ms() + 10_000)
+                .await
+                .is_err()
+        );
+        let mut endpoint = state
+            .store
+            .get_message::<openshell_core::proto::ServiceEndpoint>("endpoint")
+            .await
+            .unwrap()
+            .unwrap();
+        endpoint.target_port = 9090;
+        state.store.put_message(&endpoint).await.unwrap();
+        assert!(!is_current(&state, &installation).await.unwrap());
+        let index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+        index
+            .publish(
+                "sandbox",
+                "replacement",
+                "instance",
+                2,
+                "other-replica",
+                "local://other",
+            )
+            .await
+            .unwrap();
+        assert!(
+            accept(&state, &owner, &report, current_time_ms() + 10_000)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reports_cannot_broaden_or_partially_install_declarations() {
+        let declared = route();
+        let mut report = SupervisorServiceAdvertisement {
+            routes: vec![declared.clone()],
+            ..Default::default()
+        };
+        validate_routes(&report, std::slice::from_ref(&declared)).unwrap();
+        report.routes[0].target_port = 9090;
+        assert!(validate_routes(&report, std::slice::from_ref(&declared)).is_err());
+        report.routes = vec![declared.clone(), declared.clone()];
+        assert!(validate_routes(&report, std::slice::from_ref(&declared)).is_err());
+        report.routes = vec![declared.clone()];
+        let mut second = declared.clone();
+        second.endpoint_id = "second".into();
+        second.name = "other".into();
+        assert!(validate_routes(&report, &[declared.clone(), second]).is_err());
+        report.routes.clear();
+        validate_routes(&report, &[declared]).unwrap();
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
     pub async fn installed_fixture()
     -> (Arc<ServerState>, OwnerGuard, SupervisorServiceAdvertisement) {
         use openshell_core::proto::datamodel::v1::ObjectMeta;
@@ -1166,77 +1252,5 @@ pub mod tests {
             routes: config.service_routes,
         };
         (state, owner, report)
-    }
-
-    #[tokio::test]
-    async fn accepted_installs_use_trusted_endpoints_and_withdraw_on_declaration_or_owner_change() {
-        let (state, owner, mut report) = installed_fixture().await;
-        accept(&state, &owner, &report, current_time_ms() + 10_000)
-            .await
-            .unwrap();
-        let stored = state
-            .store
-            .get(OBJECT_TYPE, "service-installation:sandbox")
-            .await
-            .unwrap()
-            .unwrap();
-        let installation: Installation = serde_json::from_slice(&stored.payload).unwrap();
-        assert_eq!(installation.host, "10.0.0.7");
-        assert_eq!(installation.port, 9443);
-        assert!(is_current(&state, &installation).await.unwrap());
-        report.lease_sequence += 1;
-        report.routes[0].resource_version += 1;
-        assert!(
-            accept(&state, &owner, &report, current_time_ms() + 10_000)
-                .await
-                .is_err()
-        );
-        let mut endpoint = state
-            .store
-            .get_message::<openshell_core::proto::ServiceEndpoint>("endpoint")
-            .await
-            .unwrap()
-            .unwrap();
-        endpoint.target_port = 9090;
-        state.store.put_message(&endpoint).await.unwrap();
-        assert!(!is_current(&state, &installation).await.unwrap());
-        let index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
-        index
-            .publish(
-                "sandbox",
-                "replacement",
-                "instance",
-                2,
-                "other-replica",
-                "local://other",
-            )
-            .await
-            .unwrap();
-        assert!(
-            accept(&state, &owner, &report, current_time_ms() + 10_000)
-                .await
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn reports_cannot_broaden_or_partially_install_declarations() {
-        let declared = route();
-        let mut report = SupervisorServiceAdvertisement {
-            routes: vec![declared.clone()],
-            ..Default::default()
-        };
-        validate_routes(&report, std::slice::from_ref(&declared)).unwrap();
-        report.routes[0].target_port = 9090;
-        assert!(validate_routes(&report, std::slice::from_ref(&declared)).is_err());
-        report.routes = vec![declared.clone(), declared.clone()];
-        assert!(validate_routes(&report, std::slice::from_ref(&declared)).is_err());
-        report.routes = vec![declared.clone()];
-        let mut second = declared.clone();
-        second.endpoint_id = "second".into();
-        second.name = "other".into();
-        assert!(validate_routes(&report, &[declared.clone(), second]).is_err());
-        report.routes.clear();
-        validate_routes(&report, &[declared]).unwrap();
     }
 }

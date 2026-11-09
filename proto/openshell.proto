@@ -251,24 +251,6 @@ service OpenShell {
     };
   }
 
-  // Read installed, unexpired application routes in one explicit workspace.
-  rpc GetServiceRouteSnapshot(GetServiceRouteSnapshotRequest) returns (GetServiceRouteSnapshotResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "bearer"
-      scope: "sandbox:read"
-      workspace_role: "user"
-    };
-  }
-
-  // Full replacement views; reauthorize during the bounded watch lifetime.
-  rpc WatchServiceRoutes(WatchServiceRoutesRequest) returns (stream WatchServiceRoutesResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "bearer"
-      scope: "sandbox:read"
-      workspace_role: "user"
-    };
-  }
-
   // Delete one sandbox HTTP service endpoint.
   rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse) {
     option (openshell.options.v1.authorization) = {
@@ -874,6 +856,28 @@ service OpenShell {
       workspace_role: "user"
     };
   }
+}
+
+// Application ingress consumers discover routes independently of sandbox management.
+service ServiceDiscovery {
+  // Read installed, unexpired application routes in one explicit workspace.
+  rpc GetServiceRouteSnapshot(GetServiceRouteSnapshotRequest) returns (GetServiceRouteSnapshotResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Full replacement views; reauthorize during the bounded watch lifetime.
+  rpc WatchServiceRoutes(WatchServiceRoutesRequest) returns (stream WatchServiceRoutesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
 }
 
 // Optional sandbox mutations are separate from OpenShell so existing generated

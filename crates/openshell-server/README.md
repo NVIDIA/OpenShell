@@ -302,7 +302,7 @@ Both discovery RPCs require `supervisor_app_listener.enabled = true`. When the
 listener is disabled, they return `FAILED_PRECONDITION` without collecting routes
 or starting a watch.
 
-`GetServiceRouteSnapshot` and `WatchServiceRoutes` expose accepted installations
+`openshell.v1.ServiceDiscovery.GetServiceRouteSnapshot` and `WatchServiceRoutes` expose accepted installations
 for one explicit active workspace. They require `sandbox:read` and workspace
 user access; omitted/all-workspaces selectors and sandbox principals are rejected.
 Dedicated discovery machine grants are separate work.
@@ -315,11 +315,18 @@ snapshot revision includes lease renewals; `installation_version` remains stable
 across those renewals and changes when installation identity changes. These
 records establish neither application health nor ingress readiness.
 
-Collection checks installation resource versions across two scans, retrying once
-if changed. This is a verified view, not a transaction across configuration and
-owner resources. Reads are bounded to 1,000 installation records, 4,096 routes,
-4 MiB, and ten seconds. Overflow, corruption, or storage failure returns an error.
-Watches refresh and reauthorize each second, use a one-message buffer, and end
-after one minute or a five-second blocked send. Each gateway process accepts at
-most 32 watches. Reconnect and relist on stream termination; revisions are opaque
+Collection validates each installation once; lease renewals during a scan do not
+invalidate the view. This is not a cross-resource transaction. Reads are bounded
+to 1,000 records, 4,096 routes, 4 MiB, and ten seconds. A per-workspace cache shares
+one collection for a one-second refresh interval, retains at most 16 workspaces,
+and never returns expired routes. At most four collections and 16 unary snapshot
+requests run concurrently per gateway. Unary admission permits four requests per
+principal and eight per workspace. Overflow returns `RESOURCE_EXHAUSTED`; storage
+failure or timeout returns `UNAVAILABLE`; malformed records return `INTERNAL`.
+Watches recheck bearer authentication and workspace authorization each second,
+use a one-message buffer, and end after one minute or a five-second blocked send.
+Each gateway allows 32 watches, at most four per principal and 16 per workspace.
+Cache reuse adds at most one refresh interval to collection freshness; consumers
+must independently honor the advertised lease expiry.
+Reconnect and relist on stream termination; revisions are opaque
 equality tokens, not resumable cursors or an ordering across gateway replicas.
