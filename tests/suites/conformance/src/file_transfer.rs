@@ -169,14 +169,11 @@ impl<'a> Transfer<'a> {
 
     /// Run a shell script in the sandbox and require it to succeed.
     async fn sh(&self, script: &str) -> testkit::Result {
-        let output = self.sandbox.exec(["sh", "-c", script]).await?;
-        testkit::ensure!(
-            output.exit_code == 0,
-            "`{script}` exited with {}; stderr: {}",
-            output.exit_code,
-            output.stderr
-        );
-        Ok(())
+        self.sandbox
+            .exec(["sh", "-c", script])
+            .await?
+            .success()
+            .map(drop)
     }
 
     async fn upload(

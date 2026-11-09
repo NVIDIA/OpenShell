@@ -24,13 +24,7 @@ async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
     sandbox.wait_ready().await?;
 
     let marker = format!("openshell-e2e-{}", cx.run_id());
-    let output = sandbox.exec(["echo", marker.as_str()]).await?;
-    testkit::ensure!(
-        output.exit_code == 0,
-        "exec exited with {}; stderr: {}",
-        output.exit_code,
-        output.stderr
-    );
+    let output = sandbox.exec(["echo", marker.as_str()]).await?.success()?;
     testkit::ensure!(
         output.stdout == format!("{marker}\n"),
         "exec stdout was {:?}; expected {:?}",
@@ -272,13 +266,12 @@ async fn default_command_sandbox_is_listed_ready(cx: &mut Context) -> testkit::R
     cx.expect_listed(&sandbox, SandboxPhase::Ready).await?;
 
     let marker = format!("openshell-e2e-{}", cx.run_id());
-    let output = sandbox.exec(["echo", marker.as_str()]).await?;
+    let output = sandbox.exec(["echo", marker.as_str()]).await?.success()?;
     testkit::ensure!(
-        output.exit_code == 0 && output.stdout == format!("{marker}\n"),
-        "exec exited {} with stdout {:?}; stderr: {}",
-        output.exit_code,
+        output.stdout == format!("{marker}\n"),
+        "exec stdout was {:?}; expected {:?}",
         output.stdout,
-        output.stderr
+        format!("{marker}\n")
     );
     // The gateway's default image is OpenShell's Ubuntu base image.
     crate::image::expect_ubuntu(&sandbox).await?;
@@ -315,13 +308,15 @@ async fn restart_stopped_sandbox(cx: &mut Context) -> testkit::Result {
     );
 
     sandbox.start().await?;
-    let output = sandbox.exec(["echo", "started"]).await?;
+    let output = sandbox
+        .exec(["echo", "started"])
+        .await?
+        .success()
+        .context("exec after start")?;
     testkit::ensure!(
-        output.exit_code == 0 && output.stdout == "started\n",
-        "exec after start exited {} with stdout {:?}; stderr: {}",
-        output.exit_code,
-        output.stdout,
-        output.stderr
+        output.stdout == "started\n",
+        "exec after start printed {:?}; expected \"started\\n\"",
+        output.stdout
     );
     Ok(())
 }

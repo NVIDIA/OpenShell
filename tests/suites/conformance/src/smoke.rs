@@ -17,13 +17,7 @@ async fn create_exec_delete(cx: &mut Context) -> testkit::Result {
     sandbox.wait_ready().await?;
 
     let marker = format!("openshell-e2e-{}", cx.run_id());
-    let output = sandbox.exec(["echo", marker.as_str()]).await?;
-    testkit::ensure!(
-        output.exit_code == 0,
-        "exec exited with {}; stderr: {}",
-        output.exit_code,
-        output.stderr
-    );
+    let output = sandbox.exec(["echo", marker.as_str()]).await?.success()?;
     testkit::ensure!(
         output.stdout == format!("{marker}\n"),
         "exec stdout was {:?}; expected {:?}",
