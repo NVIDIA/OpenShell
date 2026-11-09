@@ -2014,15 +2014,6 @@ pub async fn sandbox_exec_grpc(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    // Verify the sandbox is ready before issuing the exec.
-    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready) {
-        return Err(miette::miette!(
-            "sandbox '{}' is not ready (phase: {}); wait for it to reach Ready state",
-            name,
-            phase_name(sandbox.phase())
-        ));
-    }
-
     // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
     let stdin_is_terminal = std::io::stdin().is_terminal();
     let tty = tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
@@ -2115,7 +2106,7 @@ pub async fn sandbox_exec_grpc(
         }
         (response, _) => response,
     }
-    .into_diagnostic()?
+    .map_err(|status| exec_start_error(status, &sandbox))?
     .into_inner();
 
     // Stream output to terminal in real-time.
@@ -2169,7 +2160,7 @@ pub async fn service_forward_tcp(
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
-    let mut replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+    let mut replica = fetch_sandbox_for_forward(&mut client, name, workspace).await?;
 
     let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
         .await
@@ -2203,7 +2194,7 @@ pub async fn service_forward_tcp(
             }
 
             _ = health_check.tick() => {
-                replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+                replica = fetch_sandbox_for_forward(&mut client, name, workspace).await?;
             }
 
             accepted = listener.accept() => {
@@ -2269,8 +2260,13 @@ fn forward_requires_session_token(status: &Status) -> bool {
         && status.message().contains("authorization_token is required")
 }
 
-/// Confirm the sandbox is still ready, returning the replica that owns it.
-async fn fetch_ready_sandbox_for_forward(
+/// Confirm the sandbox can still serve the forward, returning the replica that
+/// owns it.
+///
+/// The gateway decides whether each connection may reach the sandbox; this
+/// only stops a forward whose sandbox is gone or is stopping, stopped, or
+/// being deleted, since no connection can succeed until a new command acts.
+async fn fetch_sandbox_for_forward(
     client: &mut crate::tls::GrpcClient,
     name: &str,
     workspace: &str,
@@ -2299,15 +2295,23 @@ async fn fetch_ready_sandbox_for_forward(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox '{name}' not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready) {
+    if forward_ended_by_phase(sandbox.phase()) {
         return Err(miette::miette!(
-            "sandbox '{}' is no longer ready (phase: {}); stopping service forward",
-            name,
+            "sandbox '{name}' is no longer available (phase: {}); stopping service forward",
             phase_name(sandbox.phase())
         ));
     }
 
     Ok(replica)
+}
+
+/// Phases in which no forwarded connection can succeed until another command
+/// starts or recreates the sandbox.
+fn forward_ended_by_phase(phase: i32) -> bool {
+    matches!(
+        SandboxPhase::try_from(phase),
+        Ok(SandboxPhase::Stopping | SandboxPhase::Stopped | SandboxPhase::Deleting)
+    )
 }
 
 #[derive(Debug)]
@@ -2576,6 +2580,28 @@ impl Drop for TaskGuard {
     }
 }
 
+/// The gateway decides whether a sandbox can be used. When it refuses, name the
+/// phase this command saw and what would make the sandbox usable again.
+fn exec_start_error(status: Status, sandbox: &Sandbox) -> miette::Report {
+    if status.code() == Code::FailedPrecondition && status.message() == "sandbox is not ready" {
+        let name = sandbox.object_name();
+        let hint = match SandboxPhase::try_from(sandbox.phase()) {
+            Ok(SandboxPhase::Stopping | SandboxPhase::Stopped) => {
+                format!("start it with `openshell sandbox start {name}`")
+            }
+            Ok(SandboxPhase::Completed | SandboxPhase::Error) => {
+                "its main process exited and its supervisor is no longer connected".to_string()
+            }
+            _ => "wait for it to reach Ready state".to_string(),
+        };
+        return miette::miette!(
+            "sandbox '{name}' is not ready (phase: {}); {hint}",
+            phase_name(sandbox.phase())
+        );
+    }
+    miette::Report::from_err(status)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sandbox_exec_streaming_grpc(
     mut client: crate::tls::GrpcClient,
@@ -2638,7 +2664,7 @@ async fn sandbox_exec_streaming_grpc(
         }
         response => response,
     }
-    .into_diagnostic()?
+    .map_err(|status| exec_start_error(status, sandbox))?
     .into_inner();
 
     // Raw mode is only appropriate for an interactive terminal, not a pipe.
@@ -7124,14 +7150,14 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 mod tests {
     use super::{
         ForwardTcpConnectionError, PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
-        format_endpoint, format_log_line, forward_requires_session_token, git_sync_files,
-        has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
-        parse_driver_config_json, parse_env_from_pairs, parse_secret_material_env_pairs,
-        policy_revision_list_json, policy_revision_to_json, proto_execution_timeout,
-        provisioning_timeout_message, ready_false_condition_message, relay_local_socket,
-        resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
-        sandbox_upload_plan, service_endpoint_to_json, service_status_error,
-        service_url_for_gateway, workspace_member_to_json,
+        format_endpoint, format_log_line, forward_ended_by_phase, forward_requires_session_token,
+        git_sync_files, has_main_process_result, parse_cli_setting_value,
+        parse_credential_expiry_cli_value, parse_driver_config_json, parse_env_from_pairs,
+        parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
+        proto_execution_timeout, provisioning_timeout_message, ready_false_condition_message,
+        relay_local_socket, resolve_from, rootfs_tar_sources_supported_for_gateway,
+        sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
+        service_status_error, service_url_for_gateway, workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
 
@@ -9497,5 +9523,28 @@ mod tests {
         assert!(!forward_requires_session_token(&Status::permission_denied(
             "authorization_token is required for ForwardTcp"
         )));
+    }
+
+    #[test]
+    fn forward_leaves_reachability_after_exit_to_the_gateway() {
+        use openshell_core::proto::SandboxPhase;
+
+        for phase in [
+            SandboxPhase::Stopping,
+            SandboxPhase::Stopped,
+            SandboxPhase::Deleting,
+        ] {
+            assert!(forward_ended_by_phase(phase as i32), "{phase:?}");
+        }
+        for phase in [
+            SandboxPhase::Provisioning,
+            SandboxPhase::Starting,
+            SandboxPhase::Ready,
+            SandboxPhase::Completed,
+            SandboxPhase::Error,
+            SandboxPhase::Suspended,
+        ] {
+            assert!(!forward_ended_by_phase(phase as i32), "{phase:?}");
+        }
     }
 }

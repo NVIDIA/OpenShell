@@ -56,41 +56,28 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
     let port = server.port.to_string();
     let image = testkit::python_image();
 
-    // The client runs through `sandbox exec` in a Ready sandbox, not as the
-    // main process. A gateway with several replicas (k3s-ha) can refuse to
-    // attach to a main process that already finished with "sandbox is not
-    // ready" when the request reaches a replica that doesn't hold the
-    // sandbox's session.
     let name = cx.name("hg");
     cx.track(&name);
-    cx.cli([
-        "sandbox",
-        "create",
-        "--name",
-        &name,
-        "--from",
-        &image,
-        "--policy",
-        policy.path()?,
-        "--detach",
-        "--no-tty",
-        "--",
-        "sh",
-        "-c",
-        "exec sleep infinity",
-    ])
-    .await?
-    .success()
-    .context(format!("create a sandbox from {image}"))?;
-    cx.adopt(&name).await?.wait_ready().await?;
-
     let client = cx
         .cli([
-            "sandbox", "exec", "--name", &name, "--no-tty", "--", PYTHON, "-c", CLIENT, &port,
+            "sandbox",
+            "create",
+            "--name",
+            &name,
+            "--from",
+            &image,
+            "--policy",
+            policy.path()?,
+            "--no-tty",
+            "--",
+            PYTHON,
+            "-c",
+            CLIENT,
+            &port,
         ])
         .await?
         .success()
-        .context("run the client in the sandbox")?;
+        .context("run the client as the sandbox's main process")?;
     testkit::ensure!(
         client.stdout.contains(&marker),
         "the client did not get the host server's response:\n{}{}",

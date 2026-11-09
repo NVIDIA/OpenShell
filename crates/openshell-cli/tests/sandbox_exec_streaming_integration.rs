@@ -46,6 +46,7 @@ struct Calls {
 #[derive(Clone)]
 struct MockGateway {
     scenario: Scenario,
+    phase: proto::SandboxPhase,
     calls: Arc<Mutex<Calls>>,
 }
 
@@ -66,6 +67,20 @@ fn exit(code: i32) -> proto::ExecSandboxEvent {
 }
 
 impl MockGateway {
+    /// The gateway's access rule: only it decides whether a sandbox is usable.
+    fn require_reachable(&self) -> Result<(), Status> {
+        if matches!(
+            self.phase,
+            proto::SandboxPhase::Ready
+                | proto::SandboxPhase::Completed
+                | proto::SandboxPhase::Error
+        ) {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition("sandbox is not ready"))
+        }
+    }
+
     async fn exchange(
         self,
         mut input: tonic::Streaming<proto::ExecSandboxInput>,
@@ -189,7 +204,7 @@ macro_rules! mock_gateway {
                             ..Default::default()
                         }),
                         status: Some(proto::SandboxStatus {
-                            phase: proto::SandboxPhase::Ready.into(),
+                            phase: self.phase.into(),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -200,12 +215,14 @@ macro_rules! mock_gateway {
 
             type ExecSandboxStream = EventStream;
             async fn exec_sandbox(&self, _: Request<proto::ExecSandboxRequest>) -> Result<Response<EventStream>, Status> {
+                self.require_reachable()?;
                 self.calls.lock().unwrap().unary += 1;
                 Err(Status::unimplemented("test requires streaming exec"))
             }
 
             type ExecSandboxInteractiveStream = EventStream;
             async fn exec_sandbox_interactive(&self, request: Request<tonic::Streaming<proto::ExecSandboxInput>>) -> Result<Response<EventStream>, Status> {
+                self.require_reachable()?;
                 let (sender, receiver) = mpsc::channel(1);
                 let service = self.clone();
                 tokio::spawn(async move {
@@ -326,6 +343,10 @@ impl Drop for TestGateway {
 
 impl TestGateway {
     async fn start(scenario: Scenario) -> Self {
+        Self::start_in_phase(scenario, proto::SandboxPhase::Ready).await
+    }
+
+    async fn start_in_phase(scenario: Scenario, phase: proto::SandboxPhase) -> Self {
         let (ca, ca_key) = build_ca();
         let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
         let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
@@ -346,6 +367,7 @@ impl TestGateway {
         let calls = Arc::new(Mutex::new(Calls::default()));
         let service = MockGateway {
             scenario,
+            phase,
             calls: Arc::clone(&calls),
         };
         let task = tokio::spawn(async move {
@@ -476,6 +498,47 @@ async fn default_remote_exit_does_not_wait_for_idle_open_stdin() {
     assert!(output.stderr.is_empty());
     gateway.assert_one_stream();
     drop(held_open);
+}
+
+#[tokio::test]
+async fn exec_reaches_gateway_for_completed_and_error_sandboxes() {
+    // The supervisor keeps its access plane after the main process exits, so
+    // the gateway, not the CLI, decides whether the relay is still reachable.
+    for phase in [proto::SandboxPhase::Completed, proto::SandboxPhase::Error] {
+        let gateway = TestGateway::start_in_phase(Scenario::EarlyExit, phase).await;
+        let mut child = gateway.spawn();
+        let held_open = child.stdin.take().unwrap();
+        let output = finish(child).await;
+        drop(held_open);
+        assert!(
+            output.status.success(),
+            "{phase:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"before-exit\n");
+        gateway.assert_one_stream();
+    }
+}
+
+#[tokio::test]
+async fn exec_names_the_phase_when_the_gateway_refuses() {
+    let gateway =
+        TestGateway::start_in_phase(Scenario::EarlyExit, proto::SandboxPhase::Stopped).await;
+    let mut child = gateway.spawn();
+    drop(child.stdin.take());
+    let output = finish(child).await;
+    assert!(!output.status.success());
+    // The error renderer wraps long messages, so compare the words alone.
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .split_whitespace()
+        .filter(|word| *word != "│")
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        stderr.contains("is not ready (phase: Stopped); start it with `openshell sandbox start"),
+        "{stderr}"
+    );
+    assert!(gateway.calls.lock().unwrap().starts.is_empty());
 }
 
 #[tokio::test]
