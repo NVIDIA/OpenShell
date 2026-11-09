@@ -1873,19 +1873,6 @@ impl ComputeDriverRegistration {
         })
     }
 
-    /// Compatibility no-op retained for source compatibility with schema-v1
-    /// factory registrations. Schema v2 never inherits gateway keys into a
-    /// driver table; move every driver setting under
-    /// `[openshell.drivers.<name>]`.
-    #[deprecated(
-        since = "0.0.0",
-        note = "schema v2 does not inherit gateway keys into driver configuration"
-    )]
-    #[must_use]
-    pub fn with_inherited_config_keys(self, _keys: &'static [&'static str]) -> Self {
-        self
-    }
-
     /// Assign a bounded telemetry category chosen by the binary composition
     /// boundary. Runtime driver names are never used as telemetry values.
     #[must_use]
