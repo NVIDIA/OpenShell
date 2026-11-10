@@ -55,7 +55,7 @@ default = ["telemetry"]
 ## `--no-default-features` (plus any other features you need) for a build that
 ## contains no telemetry endpoint, no HTTP client, and no emission code at all.
 driver-extraction = ["dep:tar", "dep:tempfile"]
-telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking"]
+telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking", "openshell-driver-sdk/telemetry"]
 ## OAuth2 token request helpers used by supervisor and gateway.
 oauth = ["dep:reqwest"]
 ## Strict Ed25519 JWT issuance and verification for authenticated sandbox sessions.

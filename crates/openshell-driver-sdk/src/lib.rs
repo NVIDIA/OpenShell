@@ -9,20 +9,29 @@
 //! It depends only on workspace crates and crates.io.
 
 pub mod compute;
+pub mod config;
 pub mod container_paths;
 pub mod driver_mounts;
+pub mod driver_utils;
 #[cfg(unix)]
 pub mod e2fsprogs;
 pub mod error;
 pub mod extension_protocol;
 #[cfg(unix)]
 pub mod external_driver_socket;
+pub mod gpu;
 pub mod image;
+pub mod net;
+pub mod paths;
 pub mod progress;
 pub mod proto;
+pub mod proto_struct;
+pub mod resource_admission;
 pub mod sandbox_env;
 pub mod sandbox_generation;
 pub mod sandbox_session;
+pub mod settings;
+pub mod telemetry;
 pub mod time;
 
 /// Build version string derived from git metadata.

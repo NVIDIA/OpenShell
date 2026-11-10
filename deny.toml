@@ -166,6 +166,7 @@ wrappers = [
     "openshell-driver-kubernetes",
     "openshell-driver-kubernetes-secrets",
     "openshell-driver-podman",
+    "openshell-driver-sdk",
     "openshell-driver-vault",
     "openshell-driver-vm",
     "openshell-gateway-interceptors",
