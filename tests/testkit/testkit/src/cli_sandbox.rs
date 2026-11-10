@@ -6,28 +6,29 @@
 //! main command.
 
 use crate::cli::CliOutput;
-use crate::context::{Context, Sandbox};
+use crate::context::{Handles, Sandbox};
 use crate::error::{Result, ResultExt};
 use crate::yaml_file::YamlFile;
 
 /// A sandbox to create with `openshell sandbox create`. Start one with
-/// [`Context::cli_sandbox`].
+/// [`Context::cli_sandbox`](crate::Context::cli_sandbox).
 ///
 /// The sandbox is tracked for cleanup before the CLI runs, so a create the
 /// gateway accepted but the CLI reported as failed is still cleaned up. The
 /// CLI runs with `--no-tty`: tests never have a terminal.
-pub struct CliSandboxBuilder<'a> {
-    cx: &'a Context,
+#[must_use = "a CliSandboxBuilder does nothing until create(), create_ready() or run()"]
+pub struct CliSandboxBuilder {
+    handles: Handles,
     name: String,
     args: Vec<String>,
     policy: Option<String>,
     command: Vec<String>,
 }
 
-impl<'a> CliSandboxBuilder<'a> {
-    pub(crate) fn new(cx: &'a Context, name: String) -> Self {
+impl CliSandboxBuilder {
+    pub(crate) fn new(handles: Handles, name: String) -> Self {
         Self {
-            cx,
+            handles,
             name,
             args: Vec::new(),
             policy: None,
@@ -41,21 +42,18 @@ impl<'a> CliSandboxBuilder<'a> {
     }
 
     /// Create the sandbox from `image` (`--from`).
-    #[must_use]
-    pub fn image(self, image: &str) -> Self {
-        self.args(["--from", image])
+    pub fn image(self, image: impl Into<String>) -> Self {
+        self.args(["--from".to_string(), image.into()])
     }
 
     /// Create the sandbox with this policy YAML (`--policy`). It is written
     /// to a temporary file that lives until the CLI exits.
-    #[must_use]
-    pub fn policy_yaml(mut self, yaml: &str) -> Self {
-        self.policy = Some(yaml.to_string());
+    pub fn policy_yaml(mut self, yaml: impl Into<String>) -> Self {
+        self.policy = Some(yaml.into());
         self
     }
 
     /// Other `sandbox create` arguments, such as `--no-keep` or `--label`.
-    #[must_use]
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -66,7 +64,6 @@ impl<'a> CliSandboxBuilder<'a> {
     }
 
     /// The sandbox's main command. Empty selects the gateway's default.
-    #[must_use]
     pub fn command<I, S>(mut self, command: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -84,7 +81,7 @@ impl<'a> CliSandboxBuilder<'a> {
             .await?
             .success()
             .context(format!("create sandbox {}", self.name))?;
-        self.cx.adopt(&self.name).await
+        self.handles.adopt(&self.name).await
     }
 
     /// Create the sandbox and wait until it is Ready.
@@ -102,7 +99,7 @@ impl<'a> CliSandboxBuilder<'a> {
     }
 
     async fn invoke(&self) -> Result<CliOutput> {
-        self.cx.track(&self.name);
+        self.handles.track(&self.name);
         let policy = self.policy.as_deref().map(YamlFile::new).transpose()?;
         let mut args = vec!["sandbox", "create", "--name", &self.name, "--no-tty"];
         if let Some(policy) = &policy {
@@ -113,6 +110,6 @@ impl<'a> CliSandboxBuilder<'a> {
             args.push("--");
             args.extend(self.command.iter().map(String::as_str));
         }
-        self.cx.cli(args).await
+        self.handles.cli().run(args).await
     }
 }

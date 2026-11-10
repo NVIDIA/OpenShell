@@ -459,9 +459,8 @@ async fn image_update_retains_workspace_and_identity(cx: &mut Context) -> testki
         // The testkit's unique prefix leaves five characters of the name limit.
         .sandbox("image")
         .image(ORIGINAL_IMAGE.as_str())
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
     let original = get_sandbox(&mut client, workspace, sandbox.name()).await;
     let id = &original.metadata.as_ref().expect("sandbox metadata").id;
     assert!(!id.is_empty(), "sandbox must have a canonical ID");
@@ -598,9 +597,8 @@ async fn terminal_workload_can_stop_update_and_restart(cx: &mut Context) -> test
         .sandbox("term")
         .restart_policy(testkit::sdk::SandboxRestartPolicy::Never)
         .image(ORIGINAL_IMAGE.as_str())
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
     let original = get_sandbox(&mut client, workspace, sandbox.name()).await;
     let before = sandbox_resource(sandbox.id()).await;
     let original_claims = claim_uids(&before).await;

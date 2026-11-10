@@ -185,9 +185,8 @@ impl Keycloak {
         .await
         .context("Keycloak password grant")?;
 
-        let response: Value = serde_json::from_slice(&stdout)
-            .map_err(|error| Error::from_error(&error))
-            .context("decode Keycloak grant response")?;
+        let response: Value =
+            serde_json::from_slice(&stdout).context("decode Keycloak grant response")?;
         let token = |name: &str| {
             response
                 .get(name)

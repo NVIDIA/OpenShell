@@ -89,8 +89,10 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   every environment; `mise run e2e:workload:build` builds it locally. An
   override image must run `python3` from one of `testkit::PYTHON_BINARIES`.
 - `cx.cli([...])` to run the installed CLI against the same gateway, with
-  `success()`, `failure()`, `expect_stdout()`, and `json()` on the output. `cx.cli_handle()`
-  returns that CLI for code that can't borrow `cx`, such as a cleanup hook.
+  the same `success()`, `failure()` and `expect_stdout()` as exec output,
+  plus `json()`, and `report_text()` for matching a wrapped error report.
+  `cx.cli_handle()` returns that CLI for code that can't borrow `cx`, such as
+  a cleanup hook.
 - `cx.on_cleanup(name, hook)` to remove something when the test ends.
 - `testkit::policy` for sandbox policies: `policy::base()` reads
   `testkit/src/base-policy.yaml`, which allows no network access, and
@@ -106,6 +108,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   credentials)` does both.
 - `testkit::YamlFile` for YAML a CLI command reads from a file.
 - `cx.client()` for SDK calls testkit does not wrap.
+- `?` and `.context(..)` on I/O, JSON, YAML, SDK and gRPC results, which
+  convert into `testkit::Error`.
 - `error.grpc_code()` for the gRPC status code (`testkit::GrpcCode`) of a
   request the gateway refused, such as a sandbox create.
 - `poll_until` for waiting on other state, and `with_deadline(what, timeout,

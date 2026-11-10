@@ -87,6 +87,18 @@ impl From<tonic::Status> for Error {
     }
 }
 
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::from_error(&error)
+    }
+}
+
+impl From<serde_yml::Error> for Error {
+    fn from(error: serde_yml::Error) -> Self {
+        Self::from_error(&error)
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Self::from_error(&error)
