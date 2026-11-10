@@ -3544,9 +3544,8 @@ impl KubernetesComputeDriver {
             .ensure_network_additional_ca_config_map(namespace)
             .await?;
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        pods.create(
-            &PostParams::default(),
-            &crate::app_listener::configure_supervisor_pod(
+        let pod = crate::sandbox_runtime::with_runtime_class(
+            crate::app_listener::configure_supervisor_pod(
                 supervisor_pod(
                     namespace,
                     names,
@@ -3587,12 +3586,14 @@ impl KubernetesComputeDriver {
                 .map_err(KubernetesDriverError::Message)?,
                 &self.config.sandbox_runtime.app_listener,
             ),
-        )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?
-        .metadata
-        .uid
-        .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
+            &self.config.supervisor_runtime_class_name,
+        );
+        pods.create(&PostParams::default(), &pod)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?
+            .metadata
+            .uid
+            .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
     }
 
     /// Read the gateway's shared supervisor Service: its address and the
