@@ -814,14 +814,17 @@ pub async fn fetch_provider_profile_catalog(
     let mut profiles = Vec::new();
     loop {
         let response = client
-            .list_provider_profiles(ListProviderProfilesRequest {
+            .list_provider_profiles(assertion_profile_request(ListProviderProfilesRequest {
                 page_size: 100,
                 page_token,
                 workspace_scope: provider_profile_workspace_scope(workspace),
-            })
+            }))
             .await
             .into_diagnostic()?
             .into_inner();
+        for profile in &response.profiles {
+            validate_profile_grant_types(profile).into_diagnostic()?;
+        }
         profiles.extend(response.profiles);
         if response.next_page_token.is_empty() {
             break;
@@ -863,17 +866,29 @@ async fn fetch_provider_profile_exact(
     workspace: &str,
 ) -> std::result::Result<ProviderProfile, Status> {
     client
-        .get_provider_profile(GetProviderProfileRequest {
+        .get_provider_profile(assertion_profile_request(GetProviderProfileRequest {
             id: provider_type.to_string(),
             workspace_scope: provider_profile_workspace_scope(workspace),
-        })
+        }))
         .await
         .and_then(|response| {
-            response
-                .into_inner()
-                .profile
-                .ok_or_else(|| Status::internal("provider profile missing from response"))
+            let profile = response.into_inner().profile.ok_or_else(|| {
+                Status::internal(format!(
+                    "provider profile '{provider_type}' missing from response"
+                ))
+            })?;
+            validate_profile_grant_types(&profile)?;
+            Ok(profile)
         })
+}
+
+fn validate_profile_grant_types(profile: &ProviderProfile) -> std::result::Result<(), Status> {
+    if let Some(diagnostic) =
+        openshell_providers::unknown_token_grant_type_diagnostic("gateway", profile)
+    {
+        return Err(Status::failed_precondition(diagnostic.message));
+    }
+    Ok(())
 }
 
 async fn discover_existing_provider_data(
@@ -1679,17 +1694,9 @@ pub async fn provider_profile_describe_text(
     tls: &TlsOptions,
 ) -> Result<String> {
     let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .get_provider_profile(GetProviderProfileRequest {
-            id: id.to_string(),
-            workspace_scope: provider_profile_workspace_scope(workspace),
-        })
+    let profile = fetch_provider_profile_exact(&mut client, id, workspace)
         .await
         .into_diagnostic()?;
-    let profile = response
-        .into_inner()
-        .profile
-        .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
 
     format_provider_profile_description(&profile, output)
 }
@@ -1718,17 +1725,9 @@ pub async fn provider_profile_export_text(
     tls: &TlsOptions,
 ) -> Result<String> {
     let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .get_provider_profile(GetProviderProfileRequest {
-            id: id.to_string(),
-            workspace_scope: provider_profile_workspace_scope(workspace),
-        })
+    let profile = fetch_provider_profile_exact(&mut client, id, workspace)
         .await
         .into_diagnostic()?;
-    let profile = response
-        .into_inner()
-        .profile
-        .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
     let profile = ProviderTypeProfile::from_proto(&profile);
 
     match output {
@@ -1760,15 +1759,13 @@ pub async fn provider_profile_import(
 
     let mut client = grpc_client(server, tls).await?;
     if !items.is_empty() {
-        if profiles_require_stable_placeholders(&items) {
-            lint_profile_items(&mut client, items.clone(), workspace).await?;
-        }
+        check_profile_write_capabilities(&mut client, &items, workspace).await?;
         let response = client
-            .import_provider_profiles(ImportProviderProfilesRequest {
+            .import_provider_profiles(assertion_profile_request(ImportProviderProfilesRequest {
                 request_id: String::new(),
                 profiles: items,
                 workspace_scope: provider_profile_workspace_scope(workspace),
-            })
+            }))
             .await
             .into_diagnostic()?
             .into_inner();
@@ -1809,21 +1806,20 @@ pub async fn provider_profile_update(
 
     let mut client = grpc_client(server, tls).await?;
     if let Some(item) = items.pop() {
-        if profiles_require_stable_placeholders(std::slice::from_ref(&item)) {
-            lint_profile_items(&mut client, vec![item.clone()], workspace).await?;
-        }
+        check_profile_write_capabilities(&mut client, std::slice::from_ref(&item), workspace)
+            .await?;
         let expected_resource_version = item
             .profile
             .as_ref()
             .map_or(0, |profile| profile.resource_version);
         let response = client
-            .update_provider_profiles(UpdateProviderProfilesRequest {
+            .update_provider_profiles(assertion_profile_request(UpdateProviderProfilesRequest {
                 request_id: String::new(),
                 profile: Some(item),
                 expected_resource_version,
                 id: id.to_string(),
                 workspace_scope: provider_profile_workspace_scope(workspace),
-            })
+            }))
             .await
             .into_diagnostic()?
             .into_inner();
@@ -2174,14 +2170,41 @@ fn profiles_require_stable_placeholders(items: &[ProviderProfileImportItem]) -> 
         })
 }
 
-// Check support before persisting an opt-in: older gateways discard unknown
-// credential fields and can otherwise report a successful revision-scoped import.
+fn profiles_require_gateway_assertion(items: &[ProviderProfileImportItem]) -> bool {
+    items
+        .iter()
+        .filter_map(|item| item.profile.as_ref())
+        .any(openshell_providers::profile_uses_gateway_assertion)
+}
+
+fn assertion_profile_request<T>(body: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(body);
+    request.metadata_mut().insert(
+        openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    request
+}
+
+// Older gateways can accept a profile write without preserving the opt-in.
+async fn check_profile_write_capabilities(
+    client: &mut crate::tls::GrpcClient,
+    items: &[ProviderProfileImportItem],
+    workspace: &str,
+) -> Result<()> {
+    if profiles_require_stable_placeholders(items) || profiles_require_gateway_assertion(items) {
+        lint_profile_items(client, items.to_vec(), workspace).await?;
+    }
+    Ok(())
+}
+
 async fn lint_profile_items(
     client: &mut crate::tls::GrpcClient,
     items: Vec<ProviderProfileImportItem>,
     workspace: &str,
 ) -> Result<openshell_core::proto::LintProviderProfilesResponse> {
     let requires_stable = profiles_require_stable_placeholders(&items);
+    let requires_gateway_assertion = profiles_require_gateway_assertion(&items);
     let response = client
         .lint_provider_profiles(LintProviderProfilesRequest {
             profiles: items,
@@ -2193,6 +2216,11 @@ async fn lint_profile_items(
     if requires_stable && !response.supports_stable_placeholder {
         return Err(miette!(
             "gateway does not support stable_placeholder; upgrade the gateway before enabling it"
+        ));
+    }
+    if requires_gateway_assertion && !response.supports_openshell_gateway_assertion_source {
+        return Err(miette!(
+            "gateway does not support assertion_source openshell_gateway; upgrade the gateway before enabling it"
         ));
     }
     Ok(response)

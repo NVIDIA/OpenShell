@@ -59,6 +59,22 @@ struct ProviderCredentialStateInner {
     requires_stable_placeholders: bool,
 }
 
+/// Whether this exact URL can identify a provider assertion recipient.
+/// Reject URL parser normalization so the signed audience and transport URL
+/// identify the same destination byte for byte.
+#[must_use]
+pub fn provider_assertion_endpoint(endpoint: &str) -> bool {
+    url::Url::parse(endpoint).is_ok_and(|url| {
+        url.as_str() == endpoint
+            && url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
 #[derive(Debug)]
 struct StaticCredentialIdentityEpoch {
     identity: String,

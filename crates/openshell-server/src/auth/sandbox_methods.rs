@@ -33,6 +33,9 @@ mod tests {
         assert!(is_sandbox_callable(
             "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
         ));
+        assert!(is_sandbox_callable(
+            "/openshell.v1.OpenShell/MintProviderClientAssertion"
+        ));
     }
 
     #[test]

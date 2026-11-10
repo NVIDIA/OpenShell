@@ -1647,6 +1647,61 @@ mod provider_environment_tests {
     }
 }
 
+/// Obtain a dedicated provider assertion over the supervisor's authenticated
+/// gateway channel. This method never sends a session bearer to a provider.
+pub async fn mint_provider_client_assertion(
+    gateway: &GatewayEndpoint,
+    body: crate::proto::MintProviderClientAssertionRequest,
+    request_id: &str,
+) -> std::result::Result<String, TokenGrantFailure> {
+    let endpoint = token_grant_gateway_endpoint(gateway.url())?;
+    if endpoint.scheme() != "https"
+        || body.expected_provider_id.is_empty()
+        || !crate::provider_credentials::provider_assertion_endpoint(&body.token_endpoint)
+    {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
+    }
+    let mut client = connect(&gateway.with_url(endpoint.as_str()))
+        .await
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unavailable))?;
+    let expected_provider_id = body.expected_provider_id.clone();
+    let response = client
+        .mint_provider_client_assertion(token_grant_gateway_request(body, Some(request_id)))
+        .await
+        .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?
+        .into_inner();
+    provider_client_assertion_response(&expected_provider_id, response)
+}
+
+fn provider_client_assertion_response(
+    expected_provider_id: &str,
+    response: crate::proto::MintProviderClientAssertionResponse,
+) -> std::result::Result<String, TokenGrantFailure> {
+    if expected_provider_id.is_empty() || response.bound_provider_id != expected_provider_id {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
+    }
+    if response.client_assertion.is_empty() {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Unclassified));
+    }
+    Ok(response.client_assertion)
+}
+
+#[cfg(test)]
+mod provider_assertion_response_tests {
+    use super::*;
+
+    #[test]
+    fn refuses_missing_or_different_gateway_binding() {
+        for bound_provider_id in ["", "replacement"] {
+            let response = crate::proto::MintProviderClientAssertionResponse {
+                client_assertion: "synthetic-assertion".into(),
+                bound_provider_id: bound_provider_id.into(),
+            };
+            assert!(provider_client_assertion_response("installed", response).is_err());
+        }
+    }
+}
+
 /// Exchange a provider credential without retaining gateway diagnostics.
 ///
 /// Only a verified TLS connection can establish the provenance of a precise
@@ -1684,7 +1739,7 @@ pub async fn exchange_provider_subject_token(
     let mut client = connect(&gateway.with_url(endpoint.as_str()))
         .await
         .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unclassified))?;
-    let request = provider_subject_token_exchange_request(
+    let request = token_grant_gateway_request(
         ExchangeProviderSubjectTokenRequest {
             sandbox_id: sandbox_id.to_string(),
             provider: provider.to_string(),
@@ -1702,13 +1757,10 @@ pub async fn exchange_provider_subject_token(
     ))
 }
 
-/// Attach the exchange's request ID as `x-request-id` gRPC metadata.
+/// Attach the grant's request ID as `x-request-id` gRPC metadata.
 ///
 /// A value that is not valid metadata is omitted, never rewritten.
-fn provider_subject_token_exchange_request(
-    body: ExchangeProviderSubjectTokenRequest,
-    request_id: Option<&str>,
-) -> tonic::Request<ExchangeProviderSubjectTokenRequest> {
+fn token_grant_gateway_request<T>(body: T, request_id: Option<&str>) -> tonic::Request<T> {
     let mut request = tonic::Request::new(body);
     if let Some(request_id) = request_id.and_then(|value| value.parse().ok()) {
         request.metadata_mut().insert("x-request-id", request_id);
@@ -1805,10 +1857,8 @@ mod token_grant_exchange_tests {
             (Some("line\nbreak"), None),
             (None, None),
         ] {
-            let request = provider_subject_token_exchange_request(
-                ExchangeProviderSubjectTokenRequest::default(),
-                value,
-            );
+            let request =
+                token_grant_gateway_request(ExchangeProviderSubjectTokenRequest::default(), value);
             let carried = request.metadata().get("x-request-id");
             assert_eq!(carried.and_then(|value| value.to_str().ok()), expected);
         }

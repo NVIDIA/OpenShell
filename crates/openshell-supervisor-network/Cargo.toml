@@ -64,6 +64,10 @@ default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
 
 [dev-dependencies]
+axum = { workspace = true }
+hyper-util = { workspace = true, features = ["service"] }
+jsonwebtoken = { workspace = true }
+openshell-server = { path = "../openshell-server", features = ["test-support"] }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 
 openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }

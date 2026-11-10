@@ -364,6 +364,13 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn mint_provider_client_assertion(
+        &self,
+        _: tonic::Request<openshell_core::proto::MintProviderClientAssertionRequest>,
+    ) -> Result<Response<openshell_core::proto::MintProviderClientAssertionResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn exchange_provider_subject_token(
         &self,
         _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,

@@ -678,6 +678,13 @@ impl OpenShell for OpenShellService {
         policy::handle_get_sandbox_provider_environment(&self.state, request).await
     }
 
+    async fn mint_provider_client_assertion(
+        &self,
+        request: Request<openshell_core::proto::MintProviderClientAssertionRequest>,
+    ) -> Result<Response<openshell_core::proto::MintProviderClientAssertionResponse>, Status> {
+        provider::handle_mint_provider_client_assertion(&self.state, request).await
+    }
+
     async fn exchange_provider_subject_token(
         &self,
         request: Request<ExchangeProviderSubjectTokenRequest>,

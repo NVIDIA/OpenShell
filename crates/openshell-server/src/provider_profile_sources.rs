@@ -19,7 +19,8 @@ use openshell_gateway_interceptors::{
     ProviderProfileSourceSnapshot as InterceptorProfileSnapshot,
 };
 use openshell_providers::{
-    ProfileValidationDiagnostic, ProviderTypeProfile, normalize_profile_id, validate_profile_set,
+    ProfileValidationDiagnostic, ProviderTypeProfile, normalize_profile_id,
+    unknown_token_grant_type_diagnostic, validate_profile_set,
 };
 use prost::Message as _;
 use sha2::{Digest, Sha256};
@@ -760,6 +761,13 @@ fn build_effective_profiles(
                 "provider profile source '{source_id}' returned no profiles"
             )));
         }
+        if let Some(diagnostic) = snapshot
+            .profiles
+            .iter()
+            .find_map(|scoped| unknown_token_grant_type_diagnostic(source_id, &scoped.profile))
+        {
+            return Err(invalid_source_profile_status(source_id, diagnostic));
+        }
 
         catalog_hasher.update((source_id.len() as u64).to_le_bytes());
         catalog_hasher.update(source_id.as_bytes());
@@ -900,12 +908,19 @@ fn validate_source_profiles(
         .into_iter()
         .find(|diagnostic| diagnostic.severity == "error")
     {
-        return Err(Status::failed_precondition(format!(
-            "provider profile source '{source_id}' is invalid: {}",
-            format_diagnostic(diagnostic)
-        )));
+        return Err(invalid_source_profile_status(source_id, diagnostic));
     }
     Ok(())
+}
+
+fn invalid_source_profile_status(
+    source_id: &str,
+    diagnostic: ProfileValidationDiagnostic,
+) -> Status {
+    Status::failed_precondition(format!(
+        "provider profile source '{source_id}' is invalid: {}",
+        format_diagnostic(diagnostic)
+    ))
 }
 
 fn format_diagnostic(diagnostic: ProfileValidationDiagnostic) -> String {
@@ -1603,6 +1618,47 @@ mod tests {
             err.message()
                 .contains("provider profile source 'interceptor/test' is invalid")
         );
+    }
+
+    #[test]
+    fn catalog_rejects_unknown_raw_token_grant_types() {
+        use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
+
+        for (source_id, scope) in [
+            ("interceptor/test", ProfileScope::Static),
+            ("user", ProfileScope::Platform),
+            ("user", ProfileScope::Workspace),
+        ] {
+            let catalog = |grant_type| {
+                let mut entry = scoped(scope, "grant-profile");
+                entry.profile.credentials.push(ProviderProfileCredential {
+                    name: "access_token".into(),
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        grant_type,
+                        token_endpoint: "https://issuer.example/token".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+                build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+                    source_id: source_id.into(),
+                    revision: "revision".into(),
+                    profiles: vec![entry],
+                    user_managed: scope != ProfileScope::Static,
+                    allow_empty: false,
+                }])
+            };
+
+            catalog(0).expect("legacy unspecified grant must remain valid");
+            let error = catalog(i32::MAX).expect_err("unknown grant must fail before conversion");
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(
+                error.message(),
+                format!(
+                    "provider profile source '{source_id}' is invalid: provider profile 'grant-profile' credentials[1].token_grant.grant_type: unknown provider token grant type"
+                ),
+            );
+        }
     }
 
     #[tokio::test]

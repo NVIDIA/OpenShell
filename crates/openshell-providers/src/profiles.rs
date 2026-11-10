@@ -170,15 +170,64 @@ fn profile_duration_is_legacy_or_absent(value: &ProfileDurationWkt) -> bool {
     !matches!(value, ProfileDurationWkt::Present(_))
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenGrantAssertionSource {
+    #[default]
+    Spiffe,
+    OpenshellGateway,
+}
+
+/// Profile clients send this gRPC metadata key with value `1` when they can
+/// preserve the gateway assertion source on profile reads and writes.
+pub const GATEWAY_ASSERTION_PROFILE_CAPABILITY: &str =
+    "openshell-profile-openshell-gateway-assertion-source";
+
+/// Check the raw profile before conversion can default an unknown grant to client credentials.
+pub fn unknown_token_grant_type_diagnostic(
+    source: &str,
+    profile: &ProviderProfile,
+) -> Option<ProfileValidationDiagnostic> {
+    let index = profile.credentials.iter().position(|credential| {
+        credential.token_grant.as_ref().is_some_and(|grant| {
+            ProviderCredentialTokenGrantType::try_from(grant.grant_type).is_err()
+        })
+    })?;
+    Some(ProfileValidationDiagnostic::error(
+        source,
+        &profile.id,
+        format!("credentials[{index}].token_grant.grant_type"),
+        "unknown provider token grant type",
+    ))
+}
+
+/// Whether a wire profile requires a reader that preserves the identity source.
+#[must_use]
+pub fn profile_uses_gateway_assertion(profile: &ProviderProfile) -> bool {
+    profile.credentials.iter().any(|credential| {
+        credential.token_grant.as_ref().is_some_and(|grant| {
+            grant.grant_type == ProviderCredentialTokenGrantType::OpenshellClientCredentials as i32
+        })
+    })
+}
+
+impl TokenGrantAssertionSource {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_spiffe(&self) -> bool {
+        *self == Self::Spiffe
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TokenGrantProfile {
     #[serde(
         default = "default_token_grant_type",
         deserialize_with = "deserialize_token_grant_type",
-        serialize_with = "serialize_token_grant_type",
-        skip_serializing_if = "is_client_credentials_grant"
+        serialize_with = "serialize_token_grant_type"
     )]
     pub grant_type: ProviderCredentialTokenGrantType,
+    #[serde(default, skip_serializing_if = "TokenGrantAssertionSource::is_spiffe")]
+    pub assertion_source: TokenGrantAssertionSource,
     pub token_endpoint: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub audience: String,
@@ -209,6 +258,7 @@ pub struct TokenGrantProfile {
 impl PartialEq for TokenGrantProfile {
     fn eq(&self, other: &Self) -> bool {
         self.grant_type == other.grant_type
+            && self.assertion_source == other.assertion_source
             && self.token_endpoint == other.token_endpoint
             && self.audience == other.audience
             && self.jwt_svid_audience == other.jwt_svid_audience
@@ -1004,6 +1054,7 @@ impl ProviderTypeProfile {
                     path_template: credential.path_template.clone(),
                     token_grant: credential.token_grant.as_ref().map(token_grant_to_proto),
                     token_grant_owners: Vec::new(),
+                    token_grant_provider_id: String::new(),
                 })
                 .collect(),
             files: self
@@ -1036,6 +1087,19 @@ impl ProviderTypeProfile {
 
     pub fn validate_before_lowering(&self, source: &str) -> Vec<ProfileValidationDiagnostic> {
         let mut diagnostics = Vec::new();
+        for credential in &self.credentials {
+            if credential.token_grant.as_ref().is_some_and(|grant| {
+                grant.assertion_source == TokenGrantAssertionSource::OpenshellGateway
+                    && !is_client_credentials_grant(grant.grant_type)
+            }) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    &self.id,
+                    "credentials.token_grant.assertion_source",
+                    "openshell_gateway requires client_credentials",
+                ));
+            }
+        }
         for (index, endpoint) in self.endpoints.iter().enumerate() {
             collect_mcp_profile_diagnostics(source, &self.id, index, endpoint, &mut diagnostics);
             if endpoint.rules.as_ref().is_some_and(Vec::is_empty) {
@@ -1299,9 +1363,8 @@ fn effective_token_grant_type(
     }
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_client_credentials_grant(value: &ProviderCredentialTokenGrantType) -> bool {
-    effective_token_grant_type(*value) == ProviderCredentialTokenGrantType::ClientCredentials
+fn is_client_credentials_grant(grant_type: ProviderCredentialTokenGrantType) -> bool {
+    effective_token_grant_type(grant_type) == ProviderCredentialTokenGrantType::ClientCredentials
 }
 
 fn deserialize_category<'de, D>(deserializer: D) -> Result<ProviderProfileCategory, D::Error>
@@ -1444,6 +1507,7 @@ pub fn provider_token_grant_type_to_yaml(
     match grant_type {
         ProviderCredentialTokenGrantType::TokenExchange => "token_exchange",
         ProviderCredentialTokenGrantType::ClientCredentials
+        | ProviderCredentialTokenGrantType::OpenshellClientCredentials
         | ProviderCredentialTokenGrantType::Unspecified => "client_credentials",
     }
 }
@@ -1529,11 +1593,20 @@ fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCr
 fn token_grant_from_proto(
     token_grant: &openshell_core::proto::ProviderCredentialTokenGrant,
 ) -> TokenGrantProfile {
+    let (grant_type, assertion_source) =
+        match ProviderCredentialTokenGrantType::try_from(token_grant.grant_type) {
+            Ok(ProviderCredentialTokenGrantType::OpenshellClientCredentials) => (
+                ProviderCredentialTokenGrantType::ClientCredentials,
+                TokenGrantAssertionSource::OpenshellGateway,
+            ),
+            grant_type => (
+                effective_token_grant_type(grant_type.unwrap_or_default()),
+                TokenGrantAssertionSource::Spiffe,
+            ),
+        };
     TokenGrantProfile {
-        grant_type: effective_token_grant_type(
-            ProviderCredentialTokenGrantType::try_from(token_grant.grant_type)
-                .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials),
-        ),
+        grant_type,
+        assertion_source,
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
@@ -1558,7 +1631,17 @@ fn token_grant_to_proto(
     token_grant: &TokenGrantProfile,
 ) -> openshell_core::proto::ProviderCredentialTokenGrant {
     openshell_core::proto::ProviderCredentialTokenGrant {
-        grant_type: token_grant.grant_type as i32,
+        grant_type: match token_grant.assertion_source {
+            TokenGrantAssertionSource::Spiffe => token_grant.grant_type as i32,
+            TokenGrantAssertionSource::OpenshellGateway
+                if is_client_credentials_grant(token_grant.grant_type) =>
+            {
+                ProviderCredentialTokenGrantType::OpenshellClientCredentials as i32
+            }
+            // Infallible lowering must not normalize an invalid combination
+            // into a supported grant. Supported receivers reject unknown values.
+            TokenGrantAssertionSource::OpenshellGateway => -1,
+        },
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
@@ -3292,8 +3375,26 @@ fn validate_token_grant_subject_token(
     let grant_type = effective_token_grant_type(token_grant.grant_type);
     let mut diagnostics = Vec::new();
 
+    if token_grant.assertion_source == TokenGrantAssertionSource::OpenshellGateway
+        && (!is_client_credentials_grant(token_grant.grant_type)
+            || !openshell_core::provider_credentials::provider_assertion_endpoint(
+                &token_grant.token_endpoint,
+            )
+            || !token_grant.jwt_svid_audience.is_empty()
+            || !token_grant.client_assertion_type.is_empty()
+            || !token_grant.requested_token_type.is_empty())
+    {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            "credentials.token_grant",
+            "assertion_source openshell_gateway requires client_credentials, a canonical HTTPS token_endpoint, and default assertion type and audience; requested_token_type is only valid for token_exchange",
+        ));
+    }
+
     match grant_type {
-        ProviderCredentialTokenGrantType::ClientCredentials => {
+        ProviderCredentialTokenGrantType::ClientCredentials
+        | ProviderCredentialTokenGrantType::OpenshellClientCredentials => {
             if token_grant.subject_token.is_some() {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
@@ -5355,6 +5456,97 @@ credentials:
             reparsed.credentials[3].path_template,
             "/v1/{credential}/resources"
         );
+    }
+
+    #[test]
+    fn openshell_token_grant_profile_round_trips_and_rejects_unsafe_endpoints() {
+        let yaml = r"
+id: signed-provider
+display_name: Signed Provider
+credentials:
+  - name: access
+    auth_style: bearer
+    token_grant:
+      grant_type: client_credentials
+      assertion_source: openshell_gateway
+      token_endpoint: https://issuer.example/token
+";
+        let profile = parse_profile_yaml(yaml).unwrap();
+        let grant = profile.credentials[0].token_grant.as_ref().unwrap();
+        assert_eq!(
+            grant.grant_type,
+            ProviderCredentialTokenGrantType::ClientCredentials
+        );
+        assert_eq!(
+            grant.assertion_source,
+            super::TokenGrantAssertionSource::OpenshellGateway
+        );
+        let wire = profile.to_proto();
+        assert_eq!(
+            wire.credentials[0].token_grant.as_ref().unwrap().grant_type,
+            3
+        );
+        let exported = profile_to_yaml(&ProviderTypeProfile::from_proto(&wire)).unwrap();
+        assert!(exported.contains("grant_type: client_credentials"));
+        assert!(exported.contains("assertion_source: openshell_gateway"));
+        assert_eq!(parse_profile_yaml(&exported).unwrap().to_proto(), wire);
+        assert_eq!(token_grant_from_proto(&token_grant_to_proto(grant)), *grant);
+        let diagnostics = |profile: ProviderTypeProfile| {
+            validate_profile_set(&[("test.yaml".to_string(), profile)])
+                .into_iter()
+                .filter(|d| d.field == "credentials.token_grant")
+                .count()
+        };
+        assert_eq!(diagnostics(profile.clone()), 0);
+        for endpoint in [
+            "http://localhost/token",
+            "https://u:p@issuer.example/token",
+            "https://issuer.example/token?x=1",
+            "https://issuer.example/token#x",
+            "https://issuer.example/other/../token",
+        ] {
+            let mut bad = profile.clone();
+            bad.credentials[0]
+                .token_grant
+                .as_mut()
+                .unwrap()
+                .token_endpoint = endpoint.into();
+            assert_eq!(diagnostics(bad), 1);
+        }
+        let mut invalid_combination = profile.clone();
+        invalid_combination.credentials[0]
+            .token_grant
+            .as_mut()
+            .unwrap()
+            .grant_type = ProviderCredentialTokenGrantType::TokenExchange;
+        assert!(
+            !invalid_combination
+                .validate_before_lowering("test.yaml")
+                .is_empty()
+        );
+        assert!(
+            ProviderCredentialTokenGrantType::try_from(
+                invalid_combination.to_proto().credentials[0]
+                    .token_grant
+                    .as_ref()
+                    .unwrap()
+                    .grant_type
+            )
+            .is_err()
+        );
+        assert_eq!(diagnostics(invalid_combination), 1);
+        assert!(parse_profile_yaml(&yaml.replace("openshell_gateway", "unknown_issuer")).is_err());
+        assert!(
+            parse_profile_yaml(&yaml.replace("client_credentials", "openshell_client_credentials"))
+                .is_err()
+        );
+        let mut bad = profile;
+        bad.credentials[0]
+            .token_grant
+            .as_mut()
+            .unwrap()
+            .jwt_svid_audience = "elsewhere".into();
+        assert_eq!(diagnostics(bad), 1);
     }
 
     #[test]

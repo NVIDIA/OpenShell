@@ -871,6 +871,13 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::GetGatewayConfigResponse::default()))
     }
 
+    async fn mint_provider_client_assertion(
+        &self,
+        _: tonic::Request<proto::MintProviderClientAssertionRequest>,
+    ) -> Result<Response<proto::MintProviderClientAssertionResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn exchange_provider_subject_token(
         &self,
         _: tonic::Request<proto::ExchangeProviderSubjectTokenRequest>,

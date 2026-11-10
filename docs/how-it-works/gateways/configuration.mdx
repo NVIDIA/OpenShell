@@ -553,6 +553,27 @@ allow_unauthenticated_users = true
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
+## Provider client assertions
+
+To use a provider profile with `grant_type: client_credentials` and `assertion_source: openshell_gateway`, configure gateway JWT signing, enable TLS on the supervisor-to-gateway connection, and register the provider instance and credential in the gateway configuration. Set the same canonical HTTPS URL, including the path, in the profile and registration. Omit user information, query parameters and fragments. Leave `jwt_svid_audience`, `client_assertion_type`, `requested_token_type`, and `subject_token` unset.
+
+```toml
+[[openshell.gateway.provider_assertions]]
+provider_id = "<immutable provider ID>"
+credential_key = "access_token"
+token_endpoint = "https://issuer.example/oauth/token"
+```
+
+The gateway checks the authenticated sandbox's current provider attachment, profile and immutable provider ID before signing. A same-name replacement needs its own registration. Each replica allows 60 assertion requests per sandbox per minute, separate from extension credential minting.
+
+The supervisor sends the 60-second JWT to the registered endpoint in the OAuth2 `client_assertion` form field. Before issuing an access token, the token service must:
+
+- Verify the signature against the configured gateway's JWKS. Require EdDSA, type `openshell-provider-assertion+jwt`, the expected issuer, the exact token endpoint as audience, and a valid expiration.
+- Require `caller_kind=supervisor` and `sub=openshell-sandbox:<sandbox_id>` matching the signed `sandbox_id`. Reject reused assertion IDs (`jti`) through expiry.
+- Authorize the issuer, sandbox, immutable `provider_id`, and `credential_key` for the requested resource audience and every scope, including defaults when the request omits them.
+
+Upgrade all gateway replicas, supervisors and profile tools before opting in. Older tools can drop the source selection when processing a profile offline. The CLI checks gateway support before writes. A supporting gateway requires capable clients to read or write opted-in profiles and refuses a silent downgrade to SPIFFE. To change the source deliberately or roll back, remove opted-in credentials and registrations with the compatible tools first. Removing a registration stops new assertions; previously issued access tokens can remain usable until expiry.
+
 ## Service Routing
 
 Sandbox service URLs default to a readable composite hostname:

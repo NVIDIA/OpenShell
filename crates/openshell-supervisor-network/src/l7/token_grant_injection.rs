@@ -33,6 +33,7 @@ use crate::telemetry::egress_emit;
 /// Borrowed grant configuration for one endpoint-bound provider credential.
 pub struct TokenGrantRequest<'a> {
     pub provider_key: &'a str,
+    pub provider_id: &'a str,
     pub token_endpoint: &'a str,
     pub jwt_svid_audience: &'a str,
     pub client_assertion_type: &'a str,
@@ -75,6 +76,7 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
             self.grants
                 .obtain_provider_token(crate::token_grant::ObtainProviderTokenRequest {
                     provider_name: request.provider_key,
+                    provider_id: request.provider_id,
                     token_endpoint: request.token_endpoint,
                     jwt_svid_audience: request.jwt_svid_audience,
                     client_assertion_type: request.client_assertion_type,
@@ -385,8 +387,13 @@ async fn inject_selected(
             .token_grant
             .as_ref()
             .ok_or_else(|| refused(injection_configuration_failure()))?;
-        let request =
-            token_grant_request(provider_key, token_grant, request_id).map_err(refused)?;
+        let request = token_grant_request(
+            provider_key,
+            &cred.token_grant_provider_id,
+            token_grant,
+            request_id,
+        )
+        .map_err(refused)?;
         let access_token = resolver.obtain(request).await.map_err(refused)?;
         crate::token_grant::validate_access_token(&access_token)
             .map_err(|failure| refused(failure.at_stage(TokenGrantStage::Injection)))?;
@@ -511,6 +518,7 @@ fn ocsf_message_field(value: &str) -> String {
 
 fn token_grant_request<'a>(
     provider_key: &'a str,
+    provider_id: &'a str,
     token_grant: &'a ProviderCredentialTokenGrant,
     request_id: &'a str,
 ) -> Result<TokenGrantRequest<'a>, TokenGrantFailure> {
@@ -527,6 +535,7 @@ fn token_grant_request<'a>(
         })?;
     Ok(TokenGrantRequest {
         provider_key,
+        provider_id,
         token_endpoint: &token_grant.token_endpoint,
         jwt_svid_audience: &token_grant.jwt_svid_audience,
         client_assertion_type: &token_grant.client_assertion_type,
