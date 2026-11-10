@@ -507,8 +507,9 @@ use tokio::time::timeout;
 /// Time the workload gets to exit after TERM before it is killed.
 const WORKLOAD_TERM_GRACE: Duration = Duration::from_secs(5);
 
-/// Bound on stopping an instance, including its exit report and trace flush.
-/// Below the 10 second grace the Docker driver gives the supervisor.
+/// Bound on stopping a dedicated supervisor's instance, including its exit
+/// report and trace flush. Below the 10 second grace the Docker driver gives
+/// the supervisor.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Exit code reported when the boundary is lost before it reports the
@@ -1817,41 +1818,24 @@ pub async fn run_sandbox_instance(
                     ));
                 }
                 () = &mut shutdown_requested => {
-                    let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
-                    shutdown_deadline = Some(deadline);
                     if shutdown_ends_process {
+                        shutdown_deadline = Some(tokio::time::Instant::now() + SHUTDOWN_TIMEOUT);
                         running.begin_stop();
                     }
-                    let stop = async {
+                    let wait = async {
                         let _ = agent
                             .signal(openshell_isolation_interface::contract::BoundarySignal::Term)
                             .await;
-                        let status = if let Ok(result) = timeout(WORKLOAD_TERM_GRACE, agent.wait()).await {
+                        if let Ok(result) = timeout(WORKLOAD_TERM_GRACE, agent.wait()).await {
                             result
                         } else {
                             let _ = agent.terminate().await;
                             agent.wait().await
-                        }?;
-                        running.terminate().await?;
-                        Ok(status)
-                    };
-                    let exit_code = match tokio::time::timeout_at(deadline, stop).await {
-                        Ok(Ok(status)) => boundary_exit_code(status),
-                        Ok(Err(
-                            openshell_isolation_interface::contract::BackendError::Unavailable(error)
-                            | openshell_isolation_interface::contract::BackendError::Terminated(error),
-                        )) => {
-                            warn!(%error, "Isolation boundary lost while stopping; finishing shutdown");
-                            STOPPED_EXIT_CODE
-                        }
-                        Ok(Err(error)) => {
-                            return Err(miette::miette!("stop sandbox workload: {error}"));
-                        }
-                        Err(_) => {
-                            warn!("Isolation boundary did not stop in time; finishing shutdown");
-                            STOPPED_EXIT_CODE
                         }
                     };
+                    let exit_code =
+                        Box::pin(stop_workload(wait, || running.terminate(), shutdown_deadline))
+                            .await?;
                     break Some((exit_code, false));
                 }
                 // The agent wait is cancelled while suspending so a fenced
@@ -1970,6 +1954,58 @@ pub async fn run_sandbox_instance(
     drop(networking);
 
     Ok(exit_code)
+}
+
+/// Waits for a stopping workload, terminates its boundary, and returns the
+/// workload's exit code.
+///
+/// With a `deadline`, stopping also ends this process: the stop is abandoned
+/// when the deadline passes, and a lost boundary does not fail it. The
+/// workload's status is reported when the boundary returned one, otherwise
+/// `STOPPED_EXIT_CODE`.
+async fn stop_workload<W, T, F>(
+    wait: W,
+    terminate: T,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<i32>
+where
+    W: Future<
+        Output = std::result::Result<
+            openshell_isolation_interface::contract::BoundaryExitStatus,
+            openshell_isolation_interface::contract::BackendError,
+        >,
+    >,
+    T: FnOnce() -> F,
+    F: Future<
+        Output = std::result::Result<(), openshell_isolation_interface::contract::BackendError>,
+    >,
+{
+    let Some(deadline) = deadline else {
+        let status = wait
+            .await
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        terminate().await.map_err(|error| {
+            miette::miette!("sandbox did not acknowledge terminal state: {error}")
+        })?;
+        return Ok(boundary_exit_code(status));
+    };
+    let mut observed = None;
+    let stop = async {
+        observed = Some(wait.await?);
+        terminate().await
+    };
+    match tokio::time::timeout_at(deadline, stop).await {
+        Ok(Ok(())) => {}
+        Ok(Err(
+            openshell_isolation_interface::contract::BackendError::Unavailable(error)
+            | openshell_isolation_interface::contract::BackendError::Terminated(error),
+        )) => {
+            warn!(%error, "Isolation boundary lost while stopping; finishing shutdown");
+        }
+        Ok(Err(error)) => return Err(miette::miette!("stop sandbox workload: {error}")),
+        Err(_) => warn!("Isolation boundary did not stop in time; finishing shutdown"),
+    }
+    Ok(observed.map_or(STOPPED_EXIT_CODE, boundary_exit_code))
 }
 
 fn boundary_exit_code(status: openshell_isolation_interface::contract::BoundaryExitStatus) -> i32 {
@@ -5069,6 +5105,80 @@ mod tests {
             completion_phase_or_shutdown(std::future::pending(), shutdown.as_mut()).await,
             "shutdown must cancel an indefinitely retrying completion phase"
         );
+    }
+
+    use openshell_isolation_interface::contract::{BackendError, BoundaryExitStatus};
+
+    fn stop_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + SHUTDOWN_TIMEOUT
+    }
+
+    #[tokio::test]
+    async fn stopping_process_keeps_workload_status_when_boundary_is_lost() {
+        let exit_code = stop_workload(
+            async { Ok(BoundaryExitStatus::Exited(0)) },
+            || async { Err(BackendError::Unavailable("connection lost".into())) },
+            Some(stop_deadline()),
+        )
+        .await
+        .expect("a lost boundary does not fail the stop");
+        assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn stopping_process_reports_terminated_without_workload_status() {
+        let exit_code = stop_workload(
+            async { Err(BackendError::Terminated("boundary lost during wait".into())) },
+            || async { Ok(()) },
+            Some(stop_deadline()),
+        )
+        .await
+        .expect("a lost boundary does not fail the stop");
+        assert_eq!(exit_code, STOPPED_EXIT_CODE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopping_process_keeps_workload_status_past_its_deadline() {
+        let exit_code = stop_workload(
+            async { Ok(BoundaryExitStatus::Exited(3)) },
+            std::future::pending,
+            Some(stop_deadline()),
+        )
+        .await
+        .expect("an expired deadline does not fail the stop");
+        assert_eq!(exit_code, 3);
+    }
+
+    #[tokio::test]
+    async fn hosted_instance_stop_fails_when_boundary_is_lost() {
+        let error = stop_workload(
+            async { Ok(BoundaryExitStatus::Exited(0)) },
+            || async { Err(BackendError::Unavailable("connection lost".into())) },
+            None,
+        )
+        .await
+        .expect_err("a hosted instance reports a stop it could not confirm");
+        assert!(
+            error
+                .to_string()
+                .contains("sandbox did not acknowledge terminal state"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hosted_instance_stop_is_not_bounded_by_shutdown_timeout() {
+        let exit_code = stop_workload(
+            async {
+                tokio::time::sleep(SHUTDOWN_TIMEOUT * 2).await;
+                Ok(BoundaryExitStatus::Exited(0))
+            },
+            || async { Ok(()) },
+            None,
+        )
+        .await
+        .expect("hosted instance stops");
+        assert_eq!(exit_code, 0);
     }
 
     #[test]
