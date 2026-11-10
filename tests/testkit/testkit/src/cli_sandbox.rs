@@ -7,7 +7,8 @@
 
 use crate::cli::CliOutput;
 use crate::context::{Context, Sandbox};
-use crate::error::{Error, Result, ResultExt};
+use crate::error::{Result, ResultExt};
+use crate::yaml_file::YamlFile;
 
 /// A sandbox to create with `openshell sandbox create`. Start one with
 /// [`Context::cli_sandbox`].
@@ -95,7 +96,7 @@ impl<'a> CliSandboxBuilder<'a> {
 
     async fn invoke(&self) -> Result<CliOutput> {
         self.cx.track(&self.name);
-        let policy = self.policy.as_deref().map(PolicyFile::new).transpose()?;
+        let policy = self.policy.as_deref().map(YamlFile::new).transpose()?;
         let mut args = vec!["sandbox", "create", "--name", &self.name, "--no-tty"];
         if let Some(policy) = &policy {
             args.extend(["--policy", policy.path()?]);
@@ -106,23 +107,5 @@ impl<'a> CliSandboxBuilder<'a> {
             args.extend(self.command.iter().map(String::as_str));
         }
         self.cx.cli(args).await
-    }
-}
-
-/// A policy written to a temporary file for `sandbox create --policy`.
-struct PolicyFile(tempfile::NamedTempFile);
-
-impl PolicyFile {
-    fn new(contents: &str) -> Result<Self> {
-        let file = tempfile::NamedTempFile::new().context("create policy file")?;
-        std::fs::write(file.path(), contents)
-            .context(format!("write {}", file.path().display()))?;
-        Ok(Self(file))
-    }
-
-    fn path(&self) -> Result<&str> {
-        let path = self.0.path();
-        path.to_str()
-            .ok_or_else(|| Error::msg(format!("{} is not UTF-8", path.display())))
     }
 }

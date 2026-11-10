@@ -156,9 +156,10 @@ impl CliOutput {
     pub fn success(self) -> Result<Self> {
         crate::ensure!(
             self.exit_code == 0,
-            "`{}` exited with {}; stderr: {}",
+            "`{}` exited with {}; stdout: {}; stderr: {}",
             self.command,
             self.exit_code,
+            self.stdout.trim(),
             self.stderr.trim()
         );
         Ok(self)
