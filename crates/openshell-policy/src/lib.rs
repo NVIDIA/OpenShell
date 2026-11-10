@@ -805,17 +805,7 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
 // Sandbox UID/GID constants
 // ---------------------------------------------------------------------------
 
-/// Minimum accepted UID/GID for sandbox workload identity.
-///
-/// Linux reserves only identity `0` for root. Non-root system identities are
-/// valid workload identities when selected explicitly by the operator.
-pub const MIN_SANDBOX_UID: u32 = 1;
-
-/// Maximum accepted UID/GID for sandbox workload identity.
-///
-/// `u32::MAX` represents an invalid or unchanged identity in Linux APIs and
-/// POSIX ACLs, so the largest usable workload identity is one less.
-pub const MAX_SANDBOX_UID: u32 = u32::MAX - 1;
+pub use openshell_core::policy::{MAX_SANDBOX_UID, MIN_SANDBOX_UID};
 
 /// Minimum UID for the Kubernetes network proxy identity.
 ///
