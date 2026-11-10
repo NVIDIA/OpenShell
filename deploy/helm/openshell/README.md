@@ -470,16 +470,11 @@ and Service ports while retaining the configured port. This does not disable
 OpenTelemetry export. `service.metricsPort` must remain an integer from 1 to
 65535, even when metrics are disabled.
 
-When upgrading from `service.metricsPort: 0` or `false`, set
-`metrics.enabled=false` and restore a valid port such as `9090` in the same
-upgrade. Legacy disable values now fail rendering with migration guidance,
-including when combined with an explicit `metrics.enabled` value; they never
-silently enable the endpoint. Metrics TLS requires `metrics.enabled=true`.
-
 The dedicated metrics endpoint is plaintext by default for compatibility with
 existing Prometheus deployments. Enable `metrics.tls.enabled` to serve it over
-HTTPS. The initial implementation uses operator-provided Kubernetes Secrets;
-it does not generate metrics PKI or create a `ServiceMonitor`.
+HTTPS; this requires `metrics.enabled=true`. The initial implementation uses
+operator-provided Kubernetes Secrets; it does not generate metrics PKI or
+create a `ServiceMonitor`.
 
 A metrics TLS Secret that exists with malformed contents leaves the metrics
 listener disabled at startup while the gateway keeps serving; it never falls
