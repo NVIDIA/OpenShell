@@ -26,6 +26,8 @@ depends = [
   "test:maintainer-approval",
   "test:cargo-lockfile-alignment",
   "test:review-readiness",
+  "test:labeling-agent",
+  "test:accepted-work",
 ]
 
 ["test:cargo-lockfile-alignment"]
@@ -101,6 +103,20 @@ hide = true
 ["test:review-readiness"]
 description = "Test PR review readiness and reviewer reconciliation"
 run = "uv run --no-project python -m unittest discover -s tasks/scripts -p check_review_readiness_test.py"
+hide = true
+
+["test:labeling-agent"]
+description = "Test one-item labeling runner, classifier and shared helper offline"
+run = [
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p managed_label_classifier_test.py",
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p labeling_agent_events_test.py",
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p label_issue*test.py",
+]
+hide = true
+
+["test:accepted-work"]
+description = "Test the shared accepted-work library"
+run = "uv run --no-project python -m unittest discover -s tasks/scripts -p accepted_work_test.py"
 hide = true
 
 [e2e]
