@@ -679,6 +679,28 @@ fn insert_docker_driver_settings(config: &str, extra: &str) -> Result<String, St
     Ok(updated)
 }
 
+#[test]
+fn proxy_settings_are_inserted_before_nested_driver_tables() {
+    let config = r#"[openshell.drivers.docker]
+socket_path = "/var/run/docker.sock"
+
+[openshell.drivers.docker.resource_admission]
+enabled = true
+"#;
+
+    let updated = insert_docker_driver_settings(config, "https_proxy = \"http://proxy\"\n")
+        .expect("insert proxy settings");
+    let proxy_position = updated
+        .find("https_proxy = \"http://proxy\"")
+        .expect("proxy setting is present");
+    let nested_table_position = updated
+        .find("[openshell.drivers.docker.resource_admission]")
+        .expect("nested table is preserved");
+
+    assert!(proxy_position < nested_table_position);
+    assert!(updated.contains("enabled = true"));
+}
+
 impl GatewayProxyConfig {
     /// Locate the gateway's `--config` path from the wrapper's args file.
     fn config_path_from_args() -> Result<PathBuf, String> {
