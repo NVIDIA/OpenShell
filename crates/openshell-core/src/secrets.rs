@@ -71,6 +71,60 @@ pub fn header_value_contains_reserved_credential_marker(value: &str) -> bool {
     contains_raw_reserved_marker(&decoded)
 }
 
+/// Detect the reserved grant namespace in URL and other textual request locations.
+pub fn contains_grant_placeholder(value: &str) -> bool {
+    fn contains_raw(value: &str) -> bool {
+        [PLACEHOLDER_PREFIX, PROVIDER_ALIAS_MARKER]
+            .iter()
+            .any(|marker| {
+                value.match_indices(marker).any(|(start, _)| {
+                    let key = &value[start + marker.len()..];
+                    let end = key
+                        .bytes()
+                        .position(|byte| !is_env_key_char(byte))
+                        .unwrap_or(key.len());
+                    split_grant_env_key(&key[..end]).is_some()
+                })
+            })
+    }
+    contains_raw(value) || contains_raw(&percent_decode(value))
+}
+
+/// Detect a grant handle in any header form supported by the header rewriter.
+pub fn header_contains_grant_placeholder(value: &str) -> bool {
+    contains_grant_placeholder(value)
+        || decode_basic_auth_value(value.trim())
+            .is_some_and(|decoded| contains_grant_placeholder(&decoded))
+}
+
+#[must_use]
+pub fn valid_grant_placeholder_env_key(key: &str) -> bool {
+    key.as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        && key.bytes().all(is_env_key_char)
+        && !uses_reserved_revision_namespace(key)
+}
+
+#[must_use]
+pub fn valid_grant_placeholder_header(name: &str) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-connection"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "expect"
+    )
+}
+
 fn basic_auth_token(value: &str) -> Option<&str> {
     value
         .strip_prefix("Basic ")
@@ -675,8 +729,61 @@ impl SecretResolver {
         &self,
         value: &str,
     ) -> Result<Option<String>, UnresolvedPlaceholderError> {
+        self.rewrite_header_value_with(value, &mut |placeholder| {
+            self.resolve_placeholder(placeholder)
+        })
+    }
+
+    /// Validate that the established header grammar references exactly the
+    /// current grant handle once. This check has no resolver material.
+    pub fn matches_grant_header_placeholder(value: &str, expected: &str) -> bool {
+        let mut matches = 0;
+        let result = Self::default().rewrite_header_value_with(value, &mut |placeholder| {
+            if placeholder != expected {
+                return None;
+            }
+            matches += 1;
+            Some("")
+        });
+        matches == 1
+            && result.is_ok_and(|rewritten| {
+                rewritten
+                    .is_some_and(|value| !header_value_contains_reserved_credential_marker(&value))
+            })
+    }
+
+    /// Bind exactly one installed handle for a single HTTP header rewrite.
+    pub fn rewrite_grant_header_value(
+        name: &str,
+        value: &str,
+        handle: &str,
+        access_token: String,
+    ) -> Result<Option<String>, UnresolvedPlaceholderError> {
+        let key = placeholder_env_key(handle).ok_or_else(|| unresolved("header"))?;
+        let resolver = Self {
+            placements: HashMap::from([(
+                key.to_string(),
+                CredentialPlacement::Header(name.to_string()),
+            )]),
+            by_placeholder: HashMap::from([(
+                handle.to_string(),
+                SecretValue {
+                    value: Arc::from(access_token),
+                    expires_at_ms: 0,
+                },
+            )]),
+            ..Self::default()
+        };
+        resolver.rewrite_header_value_for_name(name, value)
+    }
+
+    fn rewrite_header_value_with<'a>(
+        &self,
+        value: &str,
+        resolve: &mut impl FnMut(&str) -> Option<&'a str>,
+    ) -> Result<Option<String>, UnresolvedPlaceholderError> {
         // Direct placeholder match: `x-api-key: openshell:resolve:env:KEY`
-        if let Some(secret) = self.resolve_placeholder(value.trim()) {
+        if let Some(secret) = resolve(value.trim()) {
             return Ok(Some(secret.to_string()));
         }
 
@@ -685,7 +792,7 @@ impl SecretResolver {
         // Basic auth decoding: `Basic <base64>` where the decoded content
         // contains a placeholder (e.g. `user:openshell:resolve:env:PASS`).
         if let Some(encoded) = basic_auth_token(trimmed)
-            && let Some(rewritten) = self.rewrite_basic_auth_token(encoded)?
+            && let Some(rewritten) = self.rewrite_basic_auth_token(encoded, resolve)?
         {
             return Ok(Some(format!("Basic {rewritten}")));
         }
@@ -699,7 +806,7 @@ impl SecretResolver {
         };
         let prefix = &trimmed[..split_at];
         let candidate = trimmed[split_at..].trim();
-        if let Some(secret) = self.resolve_placeholder(candidate) {
+        if let Some(secret) = resolve(candidate) {
             return Ok(Some(format!("{prefix} {secret}")));
         }
 
@@ -723,6 +830,17 @@ impl SecretResolver {
         &self,
         text: &mut String,
         location: &'static str,
+    ) -> Result<usize, UnresolvedPlaceholderError> {
+        self.rewrite_text_placeholders_with(text, location, &mut |placeholder| {
+            self.resolve_placeholder(placeholder)
+        })
+    }
+
+    fn rewrite_text_placeholders_with<'a>(
+        &self,
+        text: &mut String,
+        location: &'static str,
+        resolve: &mut impl FnMut(&str) -> Option<&'a str>,
     ) -> Result<usize, UnresolvedPlaceholderError> {
         if !contains_raw_reserved_marker(text) {
             return Ok(0);
@@ -749,7 +867,7 @@ impl SecretResolver {
                 let Some((token_end, token)) = self.credential_token_at(text, abs_start) else {
                     return Err(unresolved(location));
                 };
-                let Some(secret) = self.resolve_placeholder(token) else {
+                let Some(secret) = resolve(token) else {
                     return Err(self.unresolved_for(location, token));
                 };
                 rewritten.push_str(secret);
@@ -759,7 +877,7 @@ impl SecretResolver {
             }
 
             if let Some((token_end, token)) = alias_token_at(text, abs_start) {
-                let Some(secret) = self.resolve_placeholder(token) else {
+                let Some(secret) = resolve(token) else {
                     return Err(self.unresolved_for(location, token));
                 };
                 rewritten.push_str(secret);
@@ -825,11 +943,11 @@ impl SecretResolver {
     /// the decoded `username:password` string, and re-encode.
     ///
     /// Returns `None` if decoding fails or no placeholders are found.
-    fn rewrite_basic_auth_token(
+    fn rewrite_basic_auth_token<'a>(
         &self,
         encoded: &str,
+        resolve: &mut impl FnMut(&str) -> Option<&'a str>,
     ) -> Result<Option<String>, UnresolvedPlaceholderError> {
-        let b64 = base64::engine::general_purpose::STANDARD;
         let Some(decoded) = decode_basic_auth_token(encoded.trim()) else {
             return Ok(None);
         };
@@ -839,13 +957,16 @@ impl SecretResolver {
         }
 
         let mut rewritten = decoded;
-        let replacements = self.rewrite_text_placeholders_at_location(&mut rewritten, "header")?;
+        let replacements =
+            self.rewrite_text_placeholders_with(&mut rewritten, "header", resolve)?;
 
         if replacements == 0 {
             return Ok(None);
         }
 
-        Ok(Some(b64.encode(rewritten.as_bytes())))
+        Ok(Some(
+            base64::engine::general_purpose::STANDARD.encode(rewritten.as_bytes()),
+        ))
     }
 }
 
@@ -957,7 +1078,9 @@ fn placeholder_env_key(token: &str) -> Option<&str> {
 }
 
 pub fn uses_reserved_revision_namespace(key: &str) -> bool {
-    split_revisioned_env_key(key).is_some() || split_stable_env_key(key).is_some()
+    split_revisioned_env_key(key).is_some()
+        || split_stable_env_key(key).is_some()
+        || split_grant_env_key(key).is_some()
 }
 
 fn split_revisioned_env_key(key: &str) -> Option<(&str, &str)> {
@@ -974,7 +1097,14 @@ fn split_revisioned_env_key(key: &str) -> Option<(&str, &str)> {
 }
 
 fn split_stable_env_key(key: &str) -> Option<(&str, &str)> {
-    let suffix = key.strip_prefix('s')?;
+    split_handle_env_key(key.strip_prefix('s')?)
+}
+
+fn split_grant_env_key(key: &str) -> Option<(&str, &str)> {
+    split_handle_env_key(key.strip_prefix('g')?)
+}
+
+fn split_handle_env_key(suffix: &str) -> Option<(&str, &str)> {
     let (handle, env_key) = suffix.split_once('_')?;
     if handle.len() != 64
         || !handle
@@ -1013,6 +1143,14 @@ pub fn placeholder_for_env_key_for_revision(key: &str, revision: u64) -> String 
 
 pub(crate) fn placeholder_for_env_key_for_stable_handle(key: &str, handle: &str) -> String {
     format!("{PLACEHOLDER_PREFIX}s{handle}_{key}")
+}
+
+pub(crate) fn grant_placeholder_for_env_key(key: &str, handle: &str) -> Option<String> {
+    if !valid_grant_placeholder_env_key(key) {
+        return None;
+    }
+    let suffix = format!("g{handle}_{key}");
+    (split_grant_env_key(&suffix) == Some((handle, key))).then(|| placeholder_for_env_key(&suffix))
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,7 +1562,16 @@ pub fn rewrite_http_header_block(
             .position(|w| w == b"\r\n\r\n")
             .map_or(raw.len(), |p| raw.len().min(p + 4 + 256));
         let header_region = String::from_utf8_lossy(&raw[..scan_end]);
-        if contains_reserved_credential_marker(&header_region) {
+        // A detached grant has no resolver state. Detect its opaque handle
+        // in Basic's decoded value before the header can reach the origin.
+        if contains_reserved_credential_marker(&header_region)
+            || header_region
+                .split("\r\n")
+                .skip(1)
+                .take_while(|line| !line.is_empty())
+                .filter_map(|line| line.split_once(':'))
+                .any(|(_, value)| header_contains_grant_placeholder(value))
+        {
             return Err(unresolved("header"));
         }
         return Ok(RewriteResult {
@@ -1642,6 +1789,83 @@ mod tests {
         assert!(!header_value_contains_reserved_credential_marker(
             "Bearer ordinary-token"
         ));
+    }
+
+    #[test]
+    fn grant_header_requires_one_exact_handle_in_the_existing_header_grammar() {
+        let current = grant_placeholder_for_env_key("API_TOKEN", &"a".repeat(64)).unwrap();
+        let stale = grant_placeholder_for_env_key("API_TOKEN", &"b".repeat(64)).unwrap();
+        let basic = |user_password: &str| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(user_password)
+            )
+        };
+        for (value, expected) in [
+            (current.clone(), "issued".to_string()),
+            (format!("Bearer {current}"), "Bearer issued".to_string()),
+            (
+                basic(&format!("client-name:{current}")),
+                basic("client-name:issued"),
+            ),
+        ] {
+            assert!(SecretResolver::matches_grant_header_placeholder(
+                &value, &current
+            ));
+            assert_eq!(
+                SecretResolver::rewrite_grant_header_value(
+                    "Authorization",
+                    &value,
+                    &current,
+                    "issued".to_string()
+                )
+                .unwrap()
+                .as_deref(),
+                Some(expected.as_str()),
+            );
+        }
+        assert_eq!(
+            SecretResolver::rewrite_grant_header_value(
+                "X-Service-Key",
+                &current,
+                &current,
+                "issued".to_string(),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("issued"),
+        );
+        for value in [
+            stale.clone(),
+            basic(&format!("client-name:{stale}")),
+            basic(&format!("{current}:{current}")),
+            format!("{current} {current}"),
+            placeholder_for_env_key("API_TOKEN"),
+        ] {
+            assert!(!SecretResolver::matches_grant_header_placeholder(
+                &value, &current
+            ));
+        }
+        assert!(header_contains_grant_placeholder(&basic(&format!(
+            "client-name:{stale}"
+        ))));
+        assert!(contains_grant_placeholder(&percent_encode_query(&current)));
+        assert!(
+            SecretResolver::default()
+                .resolve_placeholder(&current)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn detached_grant_basic_handle_cannot_pass_a_relay_without_a_resolver() {
+        let handle = grant_placeholder_for_env_key("API_TOKEN", &"a".repeat(64)).unwrap();
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("client-name:{handle}"));
+        let request = format!(
+            "GET /resource HTTP/1.1\r\nHost: api.example\r\nAuthorization: Basic {encoded}\r\n\r\n"
+        );
+        assert!(rewrite_http_header_block(request.as_bytes(), None).is_err());
     }
 
     fn placement_resolver(placement: CredentialPlacement) -> SecretResolver {

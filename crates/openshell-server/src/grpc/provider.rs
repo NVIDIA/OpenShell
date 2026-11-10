@@ -2453,7 +2453,7 @@ fn push_dynamic_token_grant_binding(
         provider_name: provider_name.to_string(),
         credential_name: credential.name.clone(),
         // The supervisor selects one grant per case-insensitive header, using
-        // Authorization when bearer placement omits an explicit destination.
+        // Authorization when bearer or Basic placement omits an explicit destination.
         header_name: if credential.header_name.trim().is_empty() {
             "authorization".to_string()
         } else {
@@ -2547,6 +2547,22 @@ fn active_keys_with_refresh_states(
     let broker_only_credential_keys =
         broker_only_provider_credential_keys_for_provider(catalog, provider);
     let mut keys = active_provider_credential_keys(provider, now_ms, &broker_only_credential_keys);
+    if let Some(profile) =
+        get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
+    {
+        keys.extend(
+            profile
+                .credentials
+                .iter()
+                .filter(|credential| {
+                    credential
+                        .auth_style
+                        .trim()
+                        .eq_ignore_ascii_case("placeholder")
+                })
+                .flat_map(|credential| credential.env_vars.iter().cloned()),
+        );
+    }
     for state in refresh_states {
         // The primary key plus every co-minted output key this refresh owns,
         // so a configured-but-not-yet-minted refresh reserves all of them.
@@ -6474,6 +6490,7 @@ mod tests {
                 subject_token: None,
                 scopes: vec!["openid".to_string()],
                 requested_token_type: String::new(),
+                workload_credential_handle: String::new(),
                 cache_ttl: Some(prost_types::Duration { seconds: 300, nanos: 0 }),
                 audience_overrides: service_audiences
                     .iter()
@@ -7715,6 +7732,7 @@ mod tests {
                 subject_token: None,
                 scopes: vec!["read".to_string()],
                 requested_token_type: String::new(),
+                workload_credential_handle: String::new(),
                 cache_ttl: Some(prost_types::Duration {
                     seconds: 300,
                     nanos: 0,

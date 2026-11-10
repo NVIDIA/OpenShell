@@ -3993,6 +3993,50 @@ pub async fn build_provider_environment_snapshot_from_inputs(
         }
     }
 
+    // Resolve handles only for an actual sandbox attachment, using captured
+    // server-owned inputs. A different provider's credential refresh does not
+    // change the process environment required by an unchanged binding.
+    for credential in provider_environment.dynamic_credentials.values_mut() {
+        if !credential
+            .auth_style
+            .trim()
+            .eq_ignore_ascii_case("placeholder")
+        {
+            continue;
+        }
+        let [key] = credential.env_vars.as_slice() else {
+            continue;
+        };
+        let Some(record) = provider_records
+            .iter()
+            .find(|record| record.object_id == credential.token_grant_provider_id)
+        else {
+            continue;
+        };
+        let Some(grant) = credential.token_grant.as_mut() else {
+            continue;
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"openshell-grant-placeholder-v1");
+        for component in [
+            sandbox_id.as_str(),
+            spec.provider_attachment_epoch.as_str(),
+            record.object_id.as_str(),
+            credential.name.as_str(),
+            key.as_str(),
+        ] {
+            hasher.update(component.len().to_le_bytes());
+            hasher.update(component.as_bytes());
+        }
+        hash_provider_profile_revision(
+            provider_profile_catalog,
+            &record.provider.r#type,
+            &record.provider.profile_workspace,
+            &mut hasher,
+        );
+        grant.workload_credential_handle = hex::encode(hasher.finalize());
+    }
+
     let mut readiness_reason = provider_environment.readiness_reason;
 
     if supports_static_credential_bindings {

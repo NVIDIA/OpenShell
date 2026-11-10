@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use openshell_core::grpc_client::{GatewayCredentials, GatewayEndpoint};
 use openshell_core::proto::{
-    ImportProviderProfilesRequest, Provider, ProviderProfile, ProviderProfileImportItem, Sandbox,
-    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxStatus, datamodel::v1::ObjectMeta,
-    open_shell_server::OpenShell, workspace_selector,
+    DetachSandboxProviderRequest, ImportProviderProfilesRequest, Provider, ProviderProfile,
+    ProviderProfileImportItem, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxStatus,
+    datamodel::v1::ObjectMeta, open_shell_server::OpenShell, workspace_selector,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -31,6 +31,7 @@ const GATEWAY: &str = "wire-gateway";
 pub struct ProviderGrantGateway {
     pub sandbox: GatewayEndpoint,
     pub sibling: GatewayEndpoint,
+    service: OpenShellService,
     accept_loop: JoinHandle<()>,
     _shutdown: watch::Sender<bool>,
 }
@@ -131,7 +132,7 @@ impl ProviderGrantGateway {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let accept_loop = tokio::spawn(crate::serve_gateway_listener(
             listener,
-            MultiplexService::new(state),
+            MultiplexService::new(state.clone()),
             Some(tls),
             false,
             shutdown_rx,
@@ -140,9 +141,29 @@ impl ProviderGrantGateway {
         Self {
             sandbox: GatewayEndpoint::new(url.clone(), sandbox_credentials),
             sibling: GatewayEndpoint::new(url, sibling_credentials),
+            service: OpenShellService::new(state),
             accept_loop,
             _shutdown: shutdown,
         }
+    }
+
+    pub async fn detach(&self) {
+        let request = super::authenticate_as_dev_user(tonic::Request::new(()))
+            .expect("fixture user")
+            .map(|()| DetachSandboxProviderRequest {
+                sandbox: SANDBOX.into(),
+                provider: PROVIDER.into(),
+                workspace_scope: Some(workspace_selector("default")),
+                ..Default::default()
+            });
+        assert!(
+            self.service
+                .detach_sandbox_provider(request)
+                .await
+                .expect("detach provider from the fixture sandbox")
+                .into_inner()
+                .detached
+        );
     }
 }
 

@@ -69,6 +69,170 @@ async fn malformed_endpoint_key_fails_before_acquisition() {
 }
 
 #[tokio::test]
+async fn placeholder_grant_requires_the_current_handle_and_an_admitted_https_route() {
+    let fixture = TokenGrantTestFixture::success(SERVICE, "service-token");
+    {
+        let credentials = fixture.dynamic_credentials();
+        let mut credentials = credentials.write().unwrap();
+        let credential = credentials.get_mut(SERVICE).unwrap();
+        credential.auth_style = "placeholder".into();
+        credential.header_name.clear();
+        credential.env_vars = vec!["API_TOKEN".into()];
+        credential.token_grant_provider_id = "provider-id".into();
+        credential
+            .token_grant
+            .as_mut()
+            .unwrap()
+            .workload_credential_handle = "a".repeat(64);
+    }
+    let state = fixture.provider_credentials();
+    let ctx = L7EvalContext {
+        host: "api.example.com".into(),
+        port: 443,
+        request_default_port: Some(443),
+        provider_credentials: Some(state.clone()),
+        token_grant_resolver: Some(fixture.resolver()),
+        ..Default::default()
+    };
+    let snapshot = state.snapshot();
+    let handle = &snapshot.child_env["API_TOKEN"];
+    let request = |headers: &str| L7Request {
+        action: "GET".into(),
+        target: "/v1/projects".into(),
+        query_params: HashMap::new(),
+        raw_header: format!("GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n{headers}\r\n")
+            .into_bytes(),
+        body_length: BodyLength::None,
+    };
+    let owners = HashSet::from(["test-owner".to_owned()]);
+    let endpoint =
+        regorus::Value::from_json_str(r#"{"protocol":"rest","provider_credentialed":true}"#)
+            .unwrap();
+    let config = crate::l7::parse_l7_config(&endpoint).unwrap();
+    let eligible = format!("Authorization: Bearer {handle}\r\n");
+    let mut unguarded = config.clone();
+    unguarded.provider_credentialed = false;
+    assert!(
+        inject_for_admitted_owners(
+            request(&eligible),
+            &ctx,
+            &snapshot,
+            &owners,
+            &unguarded,
+            REQUEST_ID,
+            None,
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        inject_if_needed(request(&eligible), &ctx, REQUEST_ID)
+            .await
+            .is_err()
+    );
+    assert!(
+        inject_for_admitted_owners(
+            request(&eligible),
+            &ctx,
+            &snapshot,
+            &HashSet::new(),
+            &config,
+            REQUEST_ID,
+            None,
+        )
+        .await
+        .is_err()
+    );
+    let mut plaintext = ctx.clone();
+    plaintext.request_default_port = Some(80);
+    assert!(
+        inject_for_admitted_owners(
+            request(&eligible),
+            &plaintext,
+            &snapshot,
+            &owners,
+            &config,
+            REQUEST_ID,
+            None,
+        )
+        .await
+        .is_err()
+    );
+    for headers in [
+        format!("X-Unrelated: {handle}\r\n"),
+        format!("{eligible}authorization: another-value\r\n"),
+        format!("{eligible}Connection: Authorization\r\n"),
+        format!(
+            "Authorization: {}\r\n",
+            handle.replace(&"a".repeat(64), &"b".repeat(64))
+        ),
+    ] {
+        assert!(
+            inject_for_admitted_owners(
+                request(&headers),
+                &ctx,
+                &snapshot,
+                &owners,
+                &config,
+                REQUEST_ID,
+                None,
+            )
+            .await
+            .is_err()
+        );
+    }
+    let mut misplaced_query = request(&eligible);
+    misplaced_query.raw_header = format!(
+        "GET /v1/projects?probe={handle} HTTP/1.1\r\nHost: api.example.com\r\n{eligible}\r\n"
+    )
+    .into_bytes();
+    assert!(
+        inject_for_admitted_owners(
+            misplaced_query,
+            &ctx,
+            &snapshot,
+            &owners,
+            &config,
+            REQUEST_ID,
+            None,
+        )
+        .await
+        .is_err()
+    );
+
+    let challenge = request("").raw_header;
+    let forwarded = inject_for_admitted_owners(
+        request(""),
+        &ctx,
+        &snapshot,
+        &owners,
+        &config,
+        REQUEST_ID,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(forwarded.raw_header, challenge);
+    fixture.assert_no_requests();
+
+    let admitted = inject_for_admitted_owners(
+        request(&eligible),
+        &ctx,
+        &snapshot,
+        &owners,
+        &config,
+        REQUEST_ID,
+        None,
+    )
+    .await
+    .unwrap();
+    let headers = String::from_utf8(admitted.raw_header).unwrap();
+    assert!(headers.contains("Authorization: Bearer service-token\r\n"));
+    assert!(!headers.contains(handle));
+    fixture.assert_one_request(SERVICE);
+}
+
+#[tokio::test]
 async fn injects_independent_grants_and_replaces_all_protected_headers() {
     let (fixture, ctx) = fixture(Ok("identity-token"));
     let rewritten = inject_if_needed(request(), &ctx, REQUEST_ID).await.unwrap();
@@ -310,6 +474,8 @@ async fn admitted_owners_select_grants_independently_per_header() {
         (&["identity-owner"], false, true),
         (&["test-owner", "identity-owner"], true, true),
     ];
+    let endpoint = regorus::Value::from_json_str(r#"{"protocol":"rest"}"#).unwrap();
+    let config = crate::l7::parse_l7_config(&endpoint).unwrap();
     for (admitted, service, identity) in cases {
         let (fixture, mut ctx) = fixture(Ok("identity-token"));
         fixture
@@ -331,6 +497,7 @@ async fn admitted_owners_select_grants_independently_per_header() {
             &ctx,
             &state.snapshot(),
             &owners,
+            &config,
             REQUEST_ID,
             None,
         )

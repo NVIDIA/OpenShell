@@ -2463,6 +2463,11 @@ message ProviderCredentialTokenGrant {
   // OAuth2 requested_token_type. If omitted for token_exchange, OpenShell uses
   // urn:ietf:params:oauth:token-type:access_token.
   string requested_token_type = 10;
+
+  // Output-only handle for auth_style placeholder. The gateway binds it to
+  // the sandbox, attachment epoch, provider identity and profile revision.
+  // Profile-authored values are ignored.
+  string workload_credential_handle = 11;
 }
 
 // Provider credential declaration.

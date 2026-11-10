@@ -212,11 +212,18 @@ pub(crate) async fn prepare_inspected_request(
             L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => {}
         }
         let owners = admitted_token_grant_owners(engine, &scoped, &current_info)?;
+        if engine.is_stale() {
+            return Err(miette!("policy changed before token grant resolution"));
+        }
+        if let Some(guard) = credential_generation_guard(&scoped) {
+            guard.ensure_current()?;
+        }
         crate::l7::token_grant_injection::inject_for_admitted_owners(
             req,
             &scoped,
             snapshot,
             &owners,
+            config,
             request_id,
             observation_context.filter(|context| {
                 context.matches_config(&config.policy_hash, Some(snapshot.revision))
@@ -254,7 +261,7 @@ fn request_authority_matches_endpoint(
     request_host.eq_ignore_ascii_case(endpoint_host) && authority.effective_port == ctx.port
 }
 
-fn normalized_endpoint_host(host: &str) -> &str {
+pub(super) fn normalized_endpoint_host(host: &str) -> &str {
     host.trim()
         .trim_start_matches('[')
         .trim_end_matches(']')

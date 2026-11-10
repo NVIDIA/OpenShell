@@ -1185,6 +1185,9 @@ impl CredentialProfile {
     /// logical profile name instead.
     #[must_use]
     pub fn accepted_stored_keys(&self) -> Vec<&str> {
+        if self.auth_style.trim().eq_ignore_ascii_case("placeholder") {
+            return Vec::new();
+        }
         if self.env_vars.is_empty() {
             let name = self.name.trim();
             return (!name.is_empty()).then_some(name).into_iter().collect();
@@ -1661,6 +1664,7 @@ fn token_grant_to_proto(
             .as_ref()
             .map(token_grant_subject_token_to_proto),
         requested_token_type: token_grant.requested_token_type.clone(),
+        workload_credential_handle: String::new(),
     }
 }
 
@@ -2450,6 +2454,23 @@ pub fn validate_profile_set(
             let auth_style = credential.auth_style.trim().to_ascii_lowercase();
             match auth_style.as_str() {
                 "" | "basic" => {}
+                "placeholder" => {
+                    if credential.token_grant.is_none() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.auth_style",
+                            "auth_style placeholder requires a token_grant",
+                        ));
+                    }
+                    if !matches!(credential.env_vars.as_slice(), [key] if openshell_core::secrets::valid_grant_placeholder_env_key(key))
+                    {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source, profile_id, "credentials.env_vars",
+                            "auth_style placeholder requires exactly one valid environment variable",
+                        ));
+                    }
+                }
                 "bearer" | "header" => {
                     if credential.header_name.trim().is_empty() {
                         diagnostics.push(ProfileValidationDiagnostic::error(
@@ -2812,7 +2833,35 @@ pub fn validate_profile_set(
             .credentials
             .iter()
             .any(|credential| credential.token_grant.is_some());
+        let has_placeholder_grant = profile.credentials.iter().any(|credential| {
+            credential.token_grant.is_some()
+                && credential
+                    .auth_style
+                    .trim()
+                    .eq_ignore_ascii_case("placeholder")
+        });
+        if has_placeholder_grant && profile.endpoints.is_empty() {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                "endpoints",
+                "placeholder token_grant credentials require a REST endpoint with TLS inspection",
+            ));
+        }
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
+            if has_placeholder_grant
+                && (L7Protocol::parse(&endpoint.protocol) != Some(L7Protocol::Rest)
+                    || !endpoint.tls.is_empty()
+                    || endpoint.allow_uninspected_credentials
+                    || !endpoint.credential_signing.is_empty())
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    "placeholder token_grant credentials require protocol: rest with TLS inspection and no credential signing",
+                ));
+            }
             if !endpoint_is_valid(endpoint) {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
@@ -3755,16 +3804,39 @@ fn validate_token_grant_endpoint(token_endpoint: &str) -> Result<(), String> {
 fn validate_token_grant_auth_style(credential: &CredentialProfile) -> Result<(), String> {
     match credential.auth_style.trim().to_ascii_lowercase().as_str() {
         "" | "bearer" | "header" => Ok(()),
-        _ => Err("token_grant credentials support auth_style bearer or header".to_string()),
+        "placeholder"
+            if credential.query_param.trim().is_empty()
+                && credential.path_template.trim().is_empty()
+                && credential.refresh.is_none() =>
+        {
+            Ok(())
+        }
+        "placeholder" => Err(
+            "placeholder token_grant credentials cannot set query_param, path_template, or refresh"
+                .to_string(),
+        ),
+        _ => Err(
+            "token_grant credentials support auth_style bearer, header, or placeholder".to_string(),
+        ),
     }
 }
 
 fn validate_token_grant_header_name(credential: &CredentialProfile) -> Result<(), String> {
     let header_name = match credential.auth_style.trim().to_ascii_lowercase().as_str() {
-        "" | "bearer" if credential.header_name.trim().is_empty() => "Authorization",
-        "" | "bearer" | "header" => credential.header_name.trim(),
+        "" | "bearer" | "placeholder" if credential.header_name.trim().is_empty() => {
+            "Authorization"
+        }
+        "" | "bearer" | "header" | "placeholder" => credential.header_name.trim(),
         _ => return Ok(()),
     };
+    if credential
+        .auth_style
+        .trim()
+        .eq_ignore_ascii_case("placeholder")
+        && !openshell_core::secrets::valid_grant_placeholder_header(header_name)
+    {
+        return Err("invalid placeholder token_grant header_name".to_string());
+    }
     if header_name.is_empty() {
         return Ok(());
     }
@@ -6050,8 +6122,8 @@ credentials:
     }
 
     #[test]
-    fn validate_profile_set_rejects_token_grant_query_or_path_auth_style() {
-        for auth_style in ["query", "path"] {
+    fn validate_profile_set_rejects_unsupported_token_grant_auth_style() {
+        for auth_style in ["basic", "query", "path"] {
             let profile = parse_profile_yaml(&format!(
                 r"
 id: unsupported-token-grant-style
@@ -6073,9 +6145,88 @@ credentials:
 
             assert_eq!(
                 diagnostic.message,
-                "token_grant credentials support auth_style bearer or header"
+                "token_grant credentials support auth_style bearer, header, or placeholder"
             );
         }
+    }
+
+    #[test]
+    fn placeholder_token_grant_requires_unambiguous_rest_tls_configuration() {
+        let mut profile = parse_profile_yaml(
+            r"
+id: placeholder-grant
+display_name: Placeholder Grant
+credentials:
+  - name: access_token
+    auth_style: placeholder
+    env_vars: [API_TOKEN]
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+      assertion_source: openshell_gateway
+endpoints:
+  - host: api.example.com
+    port: 443
+    path: /v1/**
+    protocol: rest
+    access: full
+",
+        )
+        .unwrap();
+        let lint = |profile: &ProviderTypeProfile| {
+            validate_profile_set(&[("git.yaml".to_string(), profile.clone())])
+        };
+        let expect_invalid = |profile: &ProviderTypeProfile, field: &str| {
+            let diagnostics = lint(profile);
+            assert!(
+                diagnostics.iter().any(|error| error.field == field),
+                "expected a diagnostic for {field}: {diagnostics:?}"
+            );
+        };
+        assert!(lint(&profile).is_empty(), "default Authorization is valid");
+        profile.credentials[0].header_name = "aUtHoRiZaTiOn".into();
+        assert!(lint(&profile).is_empty(), "explicit Authorization is valid");
+
+        profile.credentials[0].header_name = "X-Api-Key".into();
+        assert!(lint(&profile).is_empty(), "a custom header is valid");
+        assert!(profile.credentials[0].accepted_stored_keys().is_empty());
+
+        let mut authored_proto = profile.to_proto();
+        authored_proto.credentials[0]
+            .token_grant
+            .as_mut()
+            .unwrap()
+            .workload_credential_handle = "a".repeat(64);
+        assert!(
+            ProviderTypeProfile::from_proto(&authored_proto)
+                .to_proto()
+                .credentials[0]
+                .token_grant
+                .as_ref()
+                .unwrap()
+                .workload_credential_handle
+                .is_empty()
+        );
+
+        let mut invalid = profile.clone();
+        invalid.credentials[0].env_vars.push("SECOND_TOKEN".into());
+        expect_invalid(&invalid, "credentials.env_vars");
+        let mut invalid = profile.clone();
+        invalid.credentials[0].token_grant = None;
+        expect_invalid(&invalid, "credentials.auth_style");
+        let mut invalid = profile.clone();
+        invalid.credentials[0].header_name = "Proxy-Authorization".into();
+        expect_invalid(&invalid, "credentials.header_name");
+        let mut invalid = profile.clone();
+        invalid.credentials[0].query_param = "token".into();
+        expect_invalid(&invalid, "credentials.token_grant.auth_style");
+        let mut invalid = profile.clone();
+        invalid.endpoints[0].allow_uninspected_credentials = true;
+        expect_invalid(&invalid, "endpoints[0]");
+        let mut invalid = profile.clone();
+        invalid.endpoints[0].protocol.clear();
+        expect_invalid(&invalid, "endpoints[0]");
+        profile.endpoints[0].tls = "skip".into();
+        expect_invalid(&profile, "endpoints[0]");
     }
 
     #[test]

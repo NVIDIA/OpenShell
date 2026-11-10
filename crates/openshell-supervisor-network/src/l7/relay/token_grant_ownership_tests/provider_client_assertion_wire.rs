@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! HTTPS Gateway and OAuth broker with the real supervisor credential relay.
-//! The workload and origin are the relay's existing duplex fixtures.
+//! Exercises automatic Bearer and client-supplied header placement.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -21,12 +22,15 @@ use hyper_util::{
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use openshell_core::{
-    grpc_client::{GatewayEndpoint, fetch_provider_environment, fetch_settings_snapshot},
+    grpc_client::{
+        GatewayEndpoint, ProviderEnvironmentResult, fetch_provider_environment,
+        fetch_settings_snapshot,
+    },
     oauth::DEFAULT_CLIENT_ASSERTION_TYPE,
     proto::{
         NetworkAccessPreset, NetworkBinary, NetworkEndpoint, ProviderCredentialTokenGrant,
         ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
-        ProviderProfileCredential,
+        ProviderProfileCredential, SandboxPolicy,
     },
     provider_credentials::ProviderCredentialState,
     token_grant_failure::REQUEST_ID_HEADER,
@@ -42,11 +46,15 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
-use super::{Connection, HOST, PORT, WAIT};
+use super::{Capture, Connection, HOST, PORT, WAIT};
+use crate::l7::L7EndpointConfig;
 use crate::l7::relay::L7EvalContext;
 use crate::l7::token_grant_injection::SpiffeTokenGrantResolver;
 use crate::opa::{NetworkAction, NetworkInput, OpaEngine};
 use crate::token_grant::SandboxInstanceTokenGrants;
+
+#[cfg(target_os = "linux")]
+mod placeholder_fetch;
 
 const CHILD_CERT_DIR: &str = "OPENSHELL_PROVIDER_ASSERTION_WIRE_CERT_DIR";
 const GATEWAY_ISSUER: &str = "openshell-gateway:wire-gateway";
@@ -55,20 +63,28 @@ const ENV_KEY: &str = "WIRE_AUTHORIZATION";
 const PLACEHOLDER_VALUE: &str = "fixture-placeholder-source";
 const ACCESS_TOKEN: &str = "fixture-granted-access-token";
 const RESOURCE_AUDIENCE: &str = "api://wire-origin";
-const PATH: &str = "/wire";
 
 #[test]
 fn provider_client_assertion_wire() {
+    let name = concat!(module_path!(), "::provider_client_assertion_wire");
+    with_tls_fixture(name, |cert_dir| run_bounded(run(cert_dir), WAIT * 4));
+}
+
+fn run_bounded(exercise: impl Future<Output = ()>, timeout: Duration) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(timeout, exercise)
+                .await
+                .expect("bounded local wire test")
+        });
+}
+
+fn with_tls_fixture(full_name: &str, exercise: impl FnOnce(&Path)) {
     if let Some(cert_dir) = std::env::var_os(CHILD_CERT_DIR) {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                tokio::time::timeout(WAIT * 4, run(Path::new(&cert_dir)))
-                    .await
-                    .expect("bounded local wire test")
-            });
+        exercise(Path::new(&cert_dir));
         return;
     }
 
@@ -84,7 +100,6 @@ fn provider_client_assertion_wire() {
         std::fs::write(cert_dir.path().join(name), pem).unwrap();
     }
     let ca = cert_dir.path().join("ca.pem");
-    let full_name = concat!(module_path!(), "::provider_client_assertion_wire");
     let (_, test_name) = full_name.split_once("::").expect("crate prefix");
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test_name, "--nocapture"])
@@ -106,43 +121,22 @@ fn provider_client_assertion_wire() {
 
 async fn run(cert_dir: &Path) {
     openshell_crypto::tls::ensure_default_provider();
-    let tls = TlsAcceptor::from_files(
-        &cert_dir.join("server-cert.pem"),
-        &cert_dir.join("server-key.pem"),
-        None,
-        false,
-        None,
-        None,
-        Vec::new(),
-    )
-    .unwrap();
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("broker bind");
-    let broker_url = format!(
-        "https://localhost:{}/token",
-        listener.local_addr().unwrap().port()
-    );
+    let target = "/wire";
+    let environment = &[(ENV_KEY, PLACEHOLDER_VALUE)];
+    let tls = gateway_tls(cert_dir);
+    let (listener, broker_url) = bind_broker().await;
     let binary = crate::test_support::executable_path("/usr/bin/curl");
     let gateway = ProviderGrantGateway::start(
         tls.clone(),
-        profile(&broker_url, &binary),
+        profile(&broker_url, &binary, "bearer", target, environment),
         CREDENTIAL,
         &broker_url,
-        &[(ENV_KEY, PLACEHOLDER_VALUE)],
+        environment,
     )
     .await;
     let broker = Broker::start(listener, tls.acceptor(), &broker_url, &gateway).await;
 
-    let settings = fetch_settings_snapshot(&gateway.sandbox, SANDBOX)
-        .await
-        .expect("fetch gateway-composed policy over TLS");
-    assert!(
-        settings.configuration_admitted,
-        "{}",
-        settings.configuration_error
-    );
-    let policy = settings.policy.expect("gateway-composed provider policy");
+    let policy = gateway_policy(&gateway.sandbox, SANDBOX).await;
     let engine = Arc::new(OpaEngine::from_proto(&policy).expect("provider policy compiles"));
     let delivery = fetch_provider_environment(&gateway.sandbox, SANDBOX)
         .await
@@ -151,10 +145,98 @@ async fn run(cert_dir: &Path) {
         delivery
             .dynamic_credentials
             .values()
-            .any(|credential| credential.token_grant_provider_id == PROVIDER_ID),
-        "Gateway delivers the immutable provider identity"
+            .any(
+                |credential| credential.token_grant_provider_id == PROVIDER_ID
+                    && credential.auth_style == "bearer"
+            ),
+        "Gateway delivers the immutable provider identity and authored placement"
     );
-    let state = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+    let state = provider_state(delivery);
+    let child = state.snapshot();
+    let workload_header = &child.child_env[ENV_KEY];
+    assert!(workload_header.starts_with("openshell:resolve:env:"));
+    assert!(
+        child
+            .child_env
+            .values()
+            .all(|value| { !value.contains(PLACEHOLDER_VALUE) && !value.contains(ACCESS_TOKEN) }),
+        "workload environment excludes granted and stored credential values",
+    );
+
+    let relay = WireRelay::new(engine, state, &binary, workload_header, target);
+
+    // The sibling has a valid session, but cannot mint for this sandbox.
+    fetch_provider_environment(&gateway.sibling, SIBLING)
+        .await
+        .expect("sibling session authenticates for its own sandbox");
+    relay.assert_refused(&gateway.sibling, 443).await;
+    broker.assert_outcomes(&[]);
+
+    let (response, capture) = relay.exchange(&gateway.sandbox, 443).await;
+    assert!(
+        response.starts_with("HTTP/1.1 204 "),
+        "expected origin response"
+    );
+    let [origin] = capture.requests.as_slice() else {
+        panic!("expected one request at the origin");
+    };
+    let values = origin
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.trim())
+        .collect::<Vec<_>>();
+    assert!(origin.starts_with(&format!("GET {target} HTTP/1.1\r\n")));
+    let expected = format!("Bearer {ACCESS_TOKEN}");
+    assert!(
+        values == [expected],
+        "exactly one Authorization header carries the granted access token"
+    );
+    assert!(!origin.contains(workload_header));
+    assert!(!origin.contains(PLACEHOLDER_VALUE));
+    broker.assert_outcomes(&[Outcome::Issued]);
+
+    *broker.state.audience.lock().unwrap() = format!("{broker_url}/other");
+    relay.assert_refused(&gateway.sandbox, 443).await;
+    broker.assert_outcomes(&[Outcome::Issued, Outcome::WrongAudience]);
+}
+
+fn gateway_tls(cert_dir: &Path) -> TlsAcceptor {
+    TlsAcceptor::from_files(
+        &cert_dir.join("server-cert.pem"),
+        &cert_dir.join("server-key.pem"),
+        None,
+        false,
+        None,
+        None,
+        Vec::new(),
+    )
+    .expect("fixture Gateway TLS")
+}
+
+async fn bind_broker() -> (TcpListener, String) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let url = format!(
+        "https://localhost:{}/token",
+        listener.local_addr().unwrap().port()
+    );
+    (listener, url)
+}
+
+async fn gateway_policy(gateway: &GatewayEndpoint, sandbox: &str) -> SandboxPolicy {
+    let settings = fetch_settings_snapshot(gateway, sandbox)
+        .await
+        .expect("fetch gateway-composed policy over TLS");
+    assert!(
+        settings.configuration_admitted,
+        "{}",
+        settings.configuration_error
+    );
+    settings.policy.expect("gateway-composed provider policy")
+}
+
+fn provider_state(delivery: ProviderEnvironmentResult) -> ProviderCredentialState {
+    ProviderCredentialState::from_bound_environment_with_stable_placeholders(
         delivery.provider_env_revision,
         delivery.environment,
         delivery.credential_expires_at_ms,
@@ -163,70 +245,24 @@ async fn run(cert_dir: &Path) {
         delivery.non_secret_environment_keys,
         delivery.stable_placeholder_environment_keys,
     )
-    .expect("provider installation accepted by supervisor");
-    let child = state.snapshot();
-    let placeholder = &child.child_env[ENV_KEY];
-    assert!(placeholder.starts_with("openshell:resolve:env:"));
-    assert!(
-        child
-            .child_env
-            .values()
-            .all(|value| { !value.contains(PLACEHOLDER_VALUE) && !value.contains(ACCESS_TOKEN) }),
-        "workload environment contains only the credential placeholder",
-    );
-
-    // Relay a request with an authentic credential for the wrong sandbox. It
-    // must fail before the broker sees a request or the origin receives bytes.
-    fetch_provider_environment(&gateway.sibling, SIBLING)
-        .await
-        .expect("sibling session authenticates for its own sandbox");
-    let (response, origin) = relay(&engine, &state, &binary, &gateway.sibling, placeholder).await;
-    assert!(
-        response.starts_with("HTTP/1.1 502 "),
-        "expected refused relay"
-    );
-    assert!(origin.is_empty(), "refused mint reached the origin");
-    broker.assert_outcomes(&[]);
-
-    let (response, origin) = relay(&engine, &state, &binary, &gateway.sandbox, placeholder).await;
-    assert!(
-        response.starts_with("HTTP/1.1 204 "),
-        "expected origin response"
-    );
-    let values = origin
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-        .map(|(_, value)| value.trim())
-        .collect::<Vec<_>>();
-    assert!(origin.starts_with("GET /wire HTTP/1.1\r\n"));
-    assert!(
-        values == [format!("Bearer {ACCESS_TOKEN}")],
-        "exactly one Authorization header carries the granted access token"
-    );
-    assert!(!origin.contains(placeholder));
-    assert!(!origin.contains(PLACEHOLDER_VALUE));
-    broker.assert_outcomes(&[Outcome::Issued]);
-
-    *broker.state.audience.lock().unwrap() = format!("{broker_url}/other");
-    let (response, origin) = relay(&engine, &state, &binary, &gateway.sandbox, placeholder).await;
-    assert!(
-        response.starts_with("HTTP/1.1 502 "),
-        "expected broker refusal"
-    );
-    assert!(origin.is_empty(), "broker refusal reached the origin");
-    broker.assert_outcomes(&[Outcome::Issued, Outcome::WrongAudience]);
+    .expect("provider installation accepted by supervisor")
 }
 
-fn profile(broker_url: &str, binary: &Path) -> ProviderProfile {
+fn profile(
+    broker_url: &str,
+    binary: &Path,
+    auth_style: &str,
+    path: &str,
+    environment: &[(&str, &str)],
+) -> ProviderProfile {
     ProviderProfile {
         id: "wire-grant".into(),
         display_name: "Local wire grant".into(),
         category: ProviderProfileCategory::Other as i32,
         credentials: vec![ProviderProfileCredential {
             name: CREDENTIAL.into(),
-            env_vars: vec![ENV_KEY.into()],
-            auth_style: "bearer".into(),
+            env_vars: environment.iter().map(|(key, _)| (*key).into()).collect(),
+            auth_style: auth_style.into(),
             header_name: "Authorization".into(),
             token_grant: Some(ProviderCredentialTokenGrant {
                 grant_type: ProviderCredentialTokenGrantType::OpenshellClientCredentials as i32,
@@ -240,7 +276,7 @@ fn profile(broker_url: &str, binary: &Path) -> ProviderProfile {
         endpoints: vec![NetworkEndpoint {
             host: HOST.into(),
             port: u32::from(PORT),
-            path: PATH.into(),
+            path: path.into(),
             protocol: "rest".into(),
             access: NetworkAccessPreset::Full as i32,
             ..Default::default()
@@ -253,70 +289,105 @@ fn profile(broker_url: &str, binary: &Path) -> ProviderProfile {
     }
 }
 
-async fn relay(
-    engine: &Arc<OpaEngine>,
-    state: &ProviderCredentialState,
-    binary: &Path,
-    caller: &GatewayEndpoint,
-    placeholder: &str,
-) -> (String, String) {
-    let authorization = engine
-        .authorize_egress(&NetworkInput {
-            host: HOST.into(),
-            port: PORT,
-            binary_path: PathBuf::from(binary),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        })
-        .expect("OPA resolves the provider route");
-    let NetworkAction::Allow {
-        matched_policy: Some(policy_name),
-    } = authorization.action
-    else {
-        panic!("Gateway policy did not admit the fixture destination");
-    };
-    assert_eq!(authorization.endpoint_configs.len(), 1);
-    let configs = authorization
-        .endpoint_configs
-        .iter()
-        .map(|entry| crate::l7::parse_l7_config(entry).unwrap())
-        .collect();
-    let ctx = L7EvalContext {
-        host: HOST.into(),
-        port: PORT,
-        request_default_port: Some(443),
-        workspace: "default".into(),
-        binary_path: binary.to_str().unwrap().into(),
-        policy_name,
-        provider_credentials: Some(state.clone()),
-        // A fresh resolver per case exercises acquisition without a cache hit.
-        token_grant_resolver: Some(Arc::new(SpiffeTokenGrantResolver::new(
-            SandboxInstanceTokenGrants::new(Some(caller.clone()), Some(SANDBOX.into()), None),
-        ))),
-        ..Default::default()
-    };
-    let mut connection =
-        Connection::new(configs, engine.clone(), authorization.generation, ctx, None);
-    connection.app.write_all(format!(
-        "GET {PATH} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nAuthorization: Bearer {placeholder}\r\nauthorization: Bearer stale-value\r\nContent-Length: 0\r\n\r\n"
-    ).as_bytes()).await.unwrap();
-    let response = connection.response().await;
-    assert!(
-        response.contains("Content-Length: 0\r\n"),
-        "empty workload response"
-    );
-    assert!(!response.contains(ACCESS_TOKEN));
-    assert!(!response.contains(PLACEHOLDER_VALUE));
-    let capture = connection.finish().await;
-    assert!(capture.requests.len() <= 1);
-    if capture.requests.is_empty() {
-        assert_eq!(capture.bytes_seen, 0, "no partial request at origin");
+struct WireRelay {
+    engine: Arc<OpaEngine>,
+    generation: u64,
+    config: L7EndpointConfig,
+    ctx: L7EvalContext,
+    request: String,
+}
+
+impl WireRelay {
+    fn new(
+        engine: Arc<OpaEngine>,
+        state: ProviderCredentialState,
+        binary: &Path,
+        workload_header: &str,
+        target: &str,
+    ) -> Self {
+        let authorization = engine
+            .authorize_egress(&NetworkInput {
+                host: HOST.into(),
+                port: PORT,
+                binary_path: binary.into(),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            })
+            .expect("OPA resolves the provider route");
+        let NetworkAction::Allow {
+            matched_policy: Some(policy_name),
+        } = authorization.action
+        else {
+            panic!("Gateway policy did not admit the fixture destination");
+        };
+        let [endpoint] = authorization.endpoint_configs.as_slice() else {
+            panic!("expected one provider endpoint");
+        };
+        Self {
+            engine,
+            generation: authorization.generation,
+            config: crate::l7::parse_l7_config(endpoint).unwrap(),
+            ctx: L7EvalContext {
+                host: HOST.into(),
+                port: PORT,
+                workspace: "default".into(),
+                binary_path: binary.to_str().unwrap().into(),
+                policy_name,
+                provider_credentials: Some(state),
+                ..Default::default()
+            },
+            request: format!(
+                "GET {target} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n\
+                 Authorization: Bearer {workload_header}\r\n\
+                 authorization: Bearer stale-value\r\nContent-Length: 0\r\n\r\n"
+            ),
+        }
     }
-    (
-        response,
-        capture.requests.into_iter().next().unwrap_or_default(),
-    )
+
+    async fn exchange(&self, caller: &GatewayEndpoint, default_port: u16) -> (String, Capture) {
+        let ctx = L7EvalContext {
+            request_default_port: Some(default_port),
+            // Each case must reach the acquisition path instead of a cache hit.
+            token_grant_resolver: Some(Arc::new(SpiffeTokenGrantResolver::new(
+                SandboxInstanceTokenGrants::new(Some(caller.clone()), Some(SANDBOX.into()), None),
+            ))),
+            ..self.ctx.clone()
+        };
+        let mut connection = Connection::new(
+            vec![self.config.clone()],
+            self.engine.clone(),
+            self.generation,
+            ctx,
+            None,
+        );
+        connection
+            .app
+            .write_all(self.request.as_bytes())
+            .await
+            .unwrap();
+        let response = connection.response().await;
+        assert!(
+            response.contains("Content-Length: 0\r\n"),
+            "empty workload response"
+        );
+        assert!(!response.contains(ACCESS_TOKEN));
+        assert!(!response.contains(PLACEHOLDER_VALUE));
+        (response, connection.finish().await)
+    }
+
+    async fn assert_refused(&self, caller: &GatewayEndpoint, default_port: u16) -> String {
+        let (response, capture) = self.exchange(caller, default_port).await;
+        assert!(
+            response.starts_with("HTTP/1.1 502 "),
+            "expected refused relay"
+        );
+        assert_eq!(
+            capture.bytes_seen, 0,
+            "refused request sent bytes to origin"
+        );
+        response
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -329,25 +400,15 @@ enum Outcome {
 
 struct Broker {
     state: Arc<BrokerState>,
-    accept_loop: JoinHandle<()>,
-}
-
-impl Drop for Broker {
-    fn drop(&mut self) {
-        self.accept_loop.abort();
-    }
+    _server: TlsServer,
 }
 
 struct BrokerState {
     audience: Mutex<String>,
+    access_token: Mutex<&'static str>,
     key_id: String,
     public_key: DecodingKey,
-    observations: Mutex<BrokerObservations>,
-}
-
-#[derive(Default)]
-struct BrokerObservations {
-    outcomes: Vec<Outcome>,
+    outcomes: Mutex<Vec<Outcome>>,
 }
 
 impl Broker {
@@ -375,40 +436,57 @@ impl Broker {
         };
         let state = Arc::new(BrokerState {
             audience: Mutex::new(audience.into()),
+            access_token: Mutex::new(ACCESS_TOKEN),
             key_id: jwk.common.key_id.clone().expect("Gateway key ID"),
             public_key: DecodingKey::from_jwk(jwk).expect("Gateway verification key"),
-            observations: Mutex::default(),
+            outcomes: Mutex::default(),
         });
         let router = Router::new()
             .fallback(token_request)
             .with_state(state.clone());
-        let accept_loop = tokio::spawn(async move {
+        Self {
+            state,
+            _server: TlsServer::start(listener, tls, router),
+        }
+    }
+
+    fn assert_outcomes(&self, expected: &[Outcome]) {
+        assert_eq!(*self.state.outcomes.lock().unwrap(), expected);
+    }
+}
+
+struct TlsServer(JoinHandle<()>);
+
+impl Drop for TlsServer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl TlsServer {
+    fn start(listener: TcpListener, tls: tokio_rustls::TlsAcceptor, router: Router) -> Self {
+        Self(tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let (stream, _) = accepted.expect("broker accept");
+                        let (stream, _) = accepted.expect("fixture accept");
                         openshell_core::net::set_tcp_nodelay_best_effort(&stream);
                         let tls = tls.clone();
                         let service = TowerToHyperService::new(router.clone());
                         connections.spawn(async move {
-                            let stream = tls.accept(stream).await.expect("broker TLS");
+                            let stream = tls.accept(stream).await.expect("fixture TLS");
                             Builder::new(TokioExecutor::new())
                                 .serve_connection(TokioIo::new(stream), service)
                                 .await
                         });
                     }
                     completed = connections.join_next(), if !connections.is_empty() => {
-                        let _ = completed.expect("broker connection").expect("broker task");
+                        let _ = completed.expect("fixture connection").expect("fixture task");
                     }
                 }
             }
-        });
-        Self { state, accept_loop }
-    }
-
-    fn assert_outcomes(&self, expected: &[Outcome]) {
-        assert_eq!(self.state.observations.lock().unwrap().outcomes, expected);
+        }))
     }
 }
 
@@ -433,10 +511,10 @@ struct AssertionClaims {
 
 async fn token_request(State(state): State<Arc<BrokerState>>, request: Request) -> Response {
     let outcome = state.verify(request).await;
-    state.observations.lock().unwrap().outcomes.push(outcome);
+    state.outcomes.lock().unwrap().push(outcome);
     if outcome == Outcome::Issued {
         Json(serde_json::json!({
-            "access_token": ACCESS_TOKEN,
+            "access_token": *state.access_token.lock().unwrap(),
             "expires_in": 300,
             "token_type": "Bearer",
         }))
