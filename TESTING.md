@@ -636,6 +636,11 @@ rootful and rootless, and the `k3s` and `k3s-ha` installers. The tests run on
 the K3s node, so the K3s installers set the chart's `server.hostGatewayIP` to
 the node's address.
 
+The `cli-attach` feature suite (`tests/suites/features/cli-attach`) checks how
+`sandbox connect` supervises its `ssh` process: it reconnects after losing the
+SSH transport and forwards a SIGTERM to `ssh`. The tests find those processes
+in `/proc`, so they need a Linux test host. CI runs them on Docker rootful.
+
 Run the VM-backed Rust CLI e2e suite:
 
 ```shell

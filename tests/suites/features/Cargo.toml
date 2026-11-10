@@ -3,4 +3,4 @@
 
 [workspace]
 resolver = "2"
-members = ["host-gateway", "keycloak-provider-refresh", "kubernetes-updates", "oci-image"]
+members = ["cli-attach", "host-gateway", "keycloak-provider-refresh", "kubernetes-updates", "oci-image"]
