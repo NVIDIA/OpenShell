@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use testkit::sdk::raw::proto;
-use testkit::{Context, ResultExt as _};
+use testkit::{Context, ResultExt as _, with_deadline};
 
 /// A rejected launch must close promptly instead of hanging the exec.
 const REJECTED_LAUNCH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -62,9 +62,8 @@ async fn hard_requirement_accepts_added_device_paths(cx: &mut Context) -> testki
         .sandbox("ld")
         .command(["sleep", "infinity"])
         .policy(policy("hard_requirement", &[]))
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
 
     sandbox
         .exec([
@@ -131,13 +130,14 @@ async fn replaced_policy_path_rejects_next_launch(cx: &mut Context) -> testkit::
                 .context(format!("({case}) prepare the policy path"))?;
         }
 
-        let next = tokio::time::timeout(REJECTED_LAUNCH_TIMEOUT, sandbox.exec(["true"]))
-            .await
-            .map_err(|_| {
-                testkit::Error::msg(format!(
-                    "({case}) the rejected launch did not close within {REJECTED_LAUNCH_TIMEOUT:?}"
-                ))
-            })?;
+        // The exec's own error is the rejection report, so keep it apart from
+        // the deadline's.
+        let next = with_deadline(
+            REJECTED_LAUNCH_TIMEOUT,
+            &format!("({case}) the rejected launch"),
+            async { Ok(sandbox.exec(["true"]).await) },
+        )
+        .await?;
         let report = match next {
             Ok(output) if output.exit_code == 0 => {
                 return Err(testkit::Error::msg(format!(

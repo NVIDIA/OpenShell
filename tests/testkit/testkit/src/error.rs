@@ -85,6 +85,12 @@ impl From<SdkError> for Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::from_error(&error)
+    }
+}
+
 /// Add context to a failing step.
 pub trait ResultExt<T> {
     fn context(self, context: impl fmt::Display) -> Result<T>;

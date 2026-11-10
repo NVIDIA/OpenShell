@@ -209,6 +209,12 @@ impl Context {
         self.expect_absent(sandbox).await
     }
 
+    /// Delete the sandbox, then check it is gone from both get and list.
+    pub async fn delete_and_expect_absent(&self, sandbox: &Sandbox) -> Result {
+        sandbox.delete().await?;
+        self.expect_absent(sandbox).await
+    }
+
     /// Fail unless the sandbox is gone from both get and list.
     pub async fn expect_absent(&self, sandbox: &Sandbox) -> Result {
         let name = sandbox.name();
@@ -375,6 +381,13 @@ impl SandboxBuilder {
         self
     }
 
+    /// Create the sandbox and wait until it is Ready.
+    pub async fn create_ready(self) -> Result<Sandbox> {
+        let sandbox = self.create().await?;
+        sandbox.wait_ready().await?;
+        Ok(sandbox)
+    }
+
     /// Create the sandbox. It is tracked for cleanup before the request is
     /// sent, so a create that fails after the gateway accepted it is still
     /// cleaned up.
@@ -495,6 +508,18 @@ impl ExecOutput {
             self.stderr.trim()
         );
         Ok(self)
+    }
+
+    /// Fail unless the command exited 0 and printed exactly `expected`.
+    pub fn expect_stdout(self, expected: &str) -> Result<Self> {
+        let output = self.success()?;
+        crate::ensure!(
+            output.stdout == expected,
+            "{} printed {:?}; expected {expected:?}",
+            output.command,
+            output.stdout
+        );
+        Ok(output)
     }
 }
 
@@ -648,6 +673,7 @@ impl Sandbox {
         S: Into<String>,
     {
         let command: Vec<String> = command.into_iter().map(Into::into).collect();
+        let description = format!("exec {command:?} in sandbox {}", self.name);
         let options = ExecOptions {
             timeout: Some(EXEC_TIMEOUT),
             ..ExecOptions::default()
@@ -656,13 +682,44 @@ impl Sandbox {
             .client
             .exec(&self.name, &command, options)
             .await
-            .context(format!("exec {command:?} in sandbox {}", self.name))?;
+            .context(&description)?;
         Ok(ExecOutput {
-            command: format!("exec {command:?} in sandbox {}", self.name),
+            command: description,
             exit_code: result.exit_code,
             stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
         })
+    }
+
+    /// Run `command` every 250 ms until `ready` accepts its output, and return
+    /// that output. An exec error fails at once; a timeout reports the last
+    /// output.
+    pub async fn poll_exec<I, S>(
+        &self,
+        what: &str,
+        timeout: Duration,
+        command: I,
+        ready: impl Fn(&ExecOutput) -> bool,
+    ) -> Result<ExecOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let command: Vec<String> = command.into_iter().map(Into::into).collect();
+        poll_until(what, timeout, Duration::from_millis(250), async || {
+            let output = self.exec(command.iter().cloned()).await?;
+            Ok(if ready(&output) {
+                Poll::Ready(output)
+            } else {
+                Poll::Pending(format!(
+                    "exited {} with stdout {:?}; stderr: {}",
+                    output.exit_code,
+                    output.stdout,
+                    output.stderr.trim()
+                ))
+            })
+        })
+        .await
     }
 
     /// Delete the sandbox and wait until it is gone.

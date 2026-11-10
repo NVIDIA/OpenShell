@@ -64,16 +64,11 @@ impl Engine {
         Ok(Self { command })
     }
 
-    /// Build `containerfile` as `tag`. The build context is empty. Prefer
-    /// [`Engine::build_test_image`], which also removes the image.
-    pub async fn build_image(&self, tag: &str, containerfile: &str) -> Result {
-        let context = tempfile::tempdir()
-            .map_err(|error| Error::from_error(&error))
-            .context("create build context")?;
+    /// Build `containerfile` as `tag`. The build context is empty.
+    async fn build_image(&self, tag: &str, containerfile: &str) -> Result {
+        let context = tempfile::tempdir().context("create build context")?;
         let file = context.path().join("Containerfile");
-        std::fs::write(&file, containerfile)
-            .map_err(|error| Error::from_error(&error))
-            .context("write Containerfile")?;
+        std::fs::write(&file, containerfile).context("write Containerfile")?;
         self.output([
             "build",
             "--file",
@@ -175,7 +170,6 @@ impl Engine {
             .kill_on_drop(true)
             .output()
             .await
-            .map_err(|error| Error::from_error(&error))
             .context(format!("run {command}"))?;
         testkit::ensure!(
             output.status.success(),

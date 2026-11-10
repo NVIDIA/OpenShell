@@ -313,9 +313,7 @@ impl Oci<'_> {
 
     /// Upload and download default to paths relative to the image workspace.
     async fn file_transfer_uses_workspace(&self, sandbox: &str) -> Result {
-        let local = tempfile::tempdir()
-            .map_err(|error| Error::from_error(&error))
-            .context("create temp dir")?;
+        let local = tempfile::tempdir().context("create temp dir")?;
         let upload = local.path().join("oci-transfer.txt");
         write(&upload, "oci-transfer-ok")?;
         self.cx
@@ -348,9 +346,7 @@ impl Oci<'_> {
             .await?
             .success()
             .context("download resolves relative paths in the workspace")?;
-        let downloaded = std::fs::read_to_string(&download)
-            .map_err(|error| Error::from_error(&error))
-            .context("read download")?;
+        let downloaded = std::fs::read_to_string(&download).context("read download")?;
         testkit::ensure!(
             downloaded == "oci-transfer-ok",
             "downloaded file has unexpected content: {downloaded:?}"
@@ -358,9 +354,7 @@ impl Oci<'_> {
 
         // A directory upload merges into an existing workspace directory.
         let merge = local.path().join("merge-upload");
-        std::fs::create_dir(&merge)
-            .map_err(|error| Error::from_error(&error))
-            .context("create merge dir")?;
+        std::fs::create_dir(&merge).context("create merge dir")?;
         write(&merge.join("conflict.txt"), "local-conflict")?;
         write(&merge.join("added.txt"), "local-added")?;
         self.exec(
@@ -495,9 +489,7 @@ fn workspace_checks(identity: &str, workspace: &str, image_file: bool) -> String
 }
 
 fn write(path: &std::path::Path, contents: &str) -> Result {
-    std::fs::write(path, contents)
-        .map_err(|error| Error::from_error(&error))
-        .context(format!("write {}", path.display()))
+    std::fs::write(path, contents).context(format!("write {}", path.display()))
 }
 
 fn utf8(path: &std::path::Path) -> Result<&str> {

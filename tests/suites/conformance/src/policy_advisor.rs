@@ -230,8 +230,7 @@ async fn create(
     if let Some(policy) = policy {
         builder = builder.policy(policy);
     }
-    let sandbox = builder.create().await?;
-    sandbox.wait_ready().await?;
+    let sandbox = builder.create_ready().await?;
     Ok(sandbox)
 }
 
