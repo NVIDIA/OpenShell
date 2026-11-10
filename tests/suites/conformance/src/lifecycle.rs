@@ -389,7 +389,7 @@ async fn main_environment(
 /// How long a restart under the on-failure policy may take to be reported.
 /// The runner kills a test after two minutes, so the test's deadlines must
 /// add up to less.
-const RESTART_TIMEOUT: Duration = Duration::from_secs(45);
+const RESTART_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a running main command may take to write its workspace marker.
 const MARKER_TIMEOUT: Duration = Duration::from_secs(15);
 
