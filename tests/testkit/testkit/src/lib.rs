@@ -53,7 +53,6 @@ pub use image::{PYTHON_BINARIES, base_image, python_image};
 pub use openshell_sdk as sdk;
 pub use poll::{Poll, poll_until};
 pub use program::main;
-pub use provider::{create_provider, import_profile, install_provider};
 pub use ready::check as check_ready;
 pub use registry::Test;
 pub use run::{TestInfo, run};

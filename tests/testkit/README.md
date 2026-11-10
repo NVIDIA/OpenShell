@@ -93,10 +93,10 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   Pass the result to `cx.sandbox(..).policy(policy)`, or `policy::to_yaml`
   for the CLI.
   `testkit::PYTHON_BINARIES` names `python3` in `python_image()` images.
-- `testkit::import_profile(cx, profile)` to import a provider profile and
-  return its `id`, and `testkit::create_provider(cx, name, type, credentials)`
-  to create a provider, each with cleanup. `testkit::install_provider(cx, name,
-  profile, credentials)` does both.
+- `cx.import_profile(profile)` to import a provider profile and return its
+  `id`, and `cx.create_provider(name, type, credentials)` to create a
+  provider, each with cleanup. `cx.install_provider(name, profile,
+  credentials)` does both.
 - `testkit::YamlFile` for YAML a CLI command reads from a file.
 - `cx.client()` for SDK calls testkit does not wrap.
 - `error.grpc_code()` for the gRPC status code (`testkit::GrpcCode`) of a

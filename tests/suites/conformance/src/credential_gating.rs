@@ -285,7 +285,8 @@ credentials:
 {endpoints}binaries:
 {binaries}"
     );
-    testkit::install_provider(cx, &name, &profile, &[(TOKEN_ENV, TEST_SECRET)]).await?;
+    cx.install_provider(&name, &profile, &[(TOKEN_ENV, TEST_SECRET)])
+        .await?;
     Ok(name)
 }
 
