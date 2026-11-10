@@ -61,9 +61,9 @@ oauth = ["dep:reqwest"]
 ## Strict Ed25519 JWT issuance and verification for authenticated sandbox sessions.
 jwt = ["dep:jsonwebtoken", "dep:zeroize"]
 ## Conversions to `openshell-otel` types.
-otel = ["dep:openshell-otel"]
+otel = ["dep:openshell-otel", "openshell-driver-sdk/otel"]
 ## Command-line flags shared by compute drivers.
-clap = ["dep:clap"]
+clap = ["dep:clap", "openshell-driver-sdk/clap"]
 ## Propagate the active W3C trace context on supervisor gateway calls.
 trace-context = ["otel"]
 
