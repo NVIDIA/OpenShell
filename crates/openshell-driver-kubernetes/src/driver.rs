@@ -486,6 +486,8 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 const SANDBOX_POD_NAME_ANNOTATION: &str = "agents.x-k8s.io/pod-name";
 const SANDBOX_SUSPENDED_CONDITION: &str = "Suspended";
 const POD_SCHEDULED_CONDITION: &str = "PodScheduled";
+/// User-facing text; the raw scheduler message exposes cluster details.
+const WAITING_FOR_CAPACITY_MESSAGE: &str = "Waiting for cluster capacity or a compatible node";
 const SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON: &str = "PodNotOwned";
 const SANDBOX_TOKEN_AUDIENCE: &str = "openshell-gateway";
 const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
@@ -6627,6 +6629,7 @@ async fn sandbox_runtime_workload_generation_matches(
 }
 
 /// The scheduler's verdict for a pod it cannot place, as a sandbox condition.
+/// The raw scheduler message stays in gateway logs.
 fn pod_unschedulable_condition(pod: &Pod) -> Option<SandboxCondition> {
     let condition = pod
         .status
@@ -6639,11 +6642,15 @@ fn pod_unschedulable_condition(pod: &Pod) -> Option<SandboxCondition> {
                 && condition.status == "False"
                 && condition.reason.as_deref() == Some("Unschedulable")
         })?;
+    debug!(
+        message = condition.message.as_deref().unwrap_or_default(),
+        "Pod is unschedulable"
+    );
     Some(SandboxCondition {
         r#type: POD_SCHEDULED_CONDITION.to_string(),
         status: "False".to_string(),
         reason: "Unschedulable".to_string(),
-        message: condition.message.clone().unwrap_or_default(),
+        message: WAITING_FOR_CAPACITY_MESSAGE.to_string(),
         transition_time: condition.last_transition_time.as_ref().and_then(|time| {
             openshell_core::time::timestamp_from_millis(time.0.timestamp_millis()).ok()
         }),
@@ -6933,7 +6940,11 @@ fn attach_kube_progress_metadata(
             mark_progress_active(metadata, PROGRESS_STEP_STARTING_SANDBOX);
         }
         "FailedScheduling" => {
-            mark_progress_detail(metadata, format!("Waiting to be scheduled: {message}"));
+            info!(message, "Pod failed scheduling");
+            mark_progress_detail(
+                metadata,
+                format!("Waiting to be scheduled: {WAITING_FOR_CAPACITY_MESSAGE}"),
+            );
         }
         _ => {}
     }
@@ -11360,14 +11371,14 @@ mod tests {
 
         assert_eq!(
             metadata.get(PROGRESS_ACTIVE_DETAIL_KEY).map(String::as_str),
-            Some("Waiting to be scheduled: 0/3 nodes are available: 3 Insufficient memory.")
+            Some("Waiting to be scheduled: Waiting for cluster capacity or a compatible node")
         );
         assert!(!metadata.contains_key(PROGRESS_COMPLETE_STEP_KEY));
         assert!(!metadata.contains_key(PROGRESS_ACTIVE_STEP_KEY));
     }
 
     #[test]
-    fn unschedulable_pod_reports_scheduler_message() {
+    fn unschedulable_pod_reports_generic_message() {
         let pod_with = |reason: &str, status: &str| Pod {
             status: Some(
                 serde_json::from_value(serde_json::json!({
@@ -11391,7 +11402,7 @@ mod tests {
         assert_eq!(condition.reason, "Unschedulable");
         assert_eq!(
             condition.message,
-            "0/3 nodes are available: 3 Insufficient memory."
+            "Waiting for cluster capacity or a compatible node"
         );
         assert!(condition.transition_time.is_some());
 
