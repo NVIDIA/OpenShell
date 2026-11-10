@@ -4426,7 +4426,6 @@ dependencies = [
  "glob",
  "h2",
  "ipnet",
- "jsonwebtoken",
  "libc",
  "miette",
  "nix 0.29.0",
@@ -4459,7 +4458,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
@@ -4707,6 +4705,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
+ "jsonwebtoken",
  "libc",
  "miette",
  "nix 0.29.0",
@@ -4715,6 +4714,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "rcgen",
  "rustix 1.1.4",
  "rustls",
  "serde",
@@ -4730,6 +4730,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
