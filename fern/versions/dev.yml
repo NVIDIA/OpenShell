@@ -2,7 +2,7 @@ landing-page:
   page: Home
   path: ../pages-dev/index.mdx
 navigation:
-- section: About NVIDIA OpenShell
+- section: About OpenShell
   slug: about
   contents:
   - page: Overview
