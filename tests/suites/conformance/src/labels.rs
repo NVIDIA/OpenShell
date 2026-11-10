@@ -26,7 +26,7 @@ async fn labels_are_stored_and_filter_list(cx: &mut Context) -> testkit::Result 
         let sandbox = cx
             .sandbox(suffix)
             .spec(|spec| spec.labels = labels.clone())
-            .create()
+            .create_ready()
             .await?;
         let got = sandbox.get().await?;
         testkit::ensure!(
