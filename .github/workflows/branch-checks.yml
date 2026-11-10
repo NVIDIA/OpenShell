@@ -666,8 +666,7 @@ jobs:
           set -euo pipefail
           changed=$(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- \
             python \
-            tasks/scripts/generate_python_proto.py \
-            tasks/scripts/verify-python-wheel.py)
+            tasks/scripts/generate_python_proto.py)
           if [ -z "$changed" ]; then
             echo "No added or changed Python SDK files."
             exit 0
