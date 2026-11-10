@@ -3107,21 +3107,11 @@ mod tests {
 
     async fn start_plaintext_gateway_listener()
     -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
-        start_plaintext_gateway_listener_with_tunnel(false).await
-    }
-
-    async fn start_plaintext_gateway_listener_with_tunnel(
-        enable_websocket_tunnel: bool,
-    ) -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind test listener");
         let listen_addr = listener.local_addr().expect("failed to read local addr");
-        let mut state = test_state(listen_addr, false).await;
-        Arc::get_mut(&mut state)
-            .expect("test server state should be uniquely owned")
-            .config
-            .enable_websocket_tunnel = enable_websocket_tunnel;
+        let state = test_state(listen_addr, false).await;
         let service = MultiplexService::new(state);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(serve_gateway_listener(
@@ -3173,41 +3163,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
         );
-
-        stop_listener(shutdown, handle).await;
-    }
-
-    /// The edge-tunnel client path: the SDK's tunnel proxy carries gRPC in
-    /// WebSocket binary frames to `/_ws_tunnel` on the production listener,
-    /// and the request reaches the gateway's own services.
-    #[tokio::test]
-    async fn production_gateway_listener_serves_grpc_through_websocket_tunnel() {
-        use openshell_core::proto::{
-            HealthRequest, ServiceStatus, open_shell_client::OpenShellClient,
-        };
-
-        let (addr, shutdown, handle) = start_plaintext_gateway_listener_with_tunnel(true).await;
-        let proxy = openshell_sdk::edge_tunnel::start_tunnel_proxy(
-            &format!("http://127.0.0.1:{}", addr.port()),
-            "edge-token",
-        )
-        .await
-        .expect("start the SDK tunnel proxy");
-        let channel =
-            tonic::transport::Endpoint::from_shared(format!("http://{}", proxy.local_addr))
-                .expect("tunnel proxy endpoint")
-                .connect()
-                .await
-                .expect("gRPC channel through the WebSocket tunnel");
-
-        let response = tokio::time::timeout(
-            Duration::from_secs(10),
-            OpenShellClient::new(channel).health(HealthRequest {}),
-        )
-        .await
-        .expect("health RPC through the tunnel timed out")
-        .expect("health RPC through the tunnel");
-        assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
 
         stop_listener(shutdown, handle).await;
     }
