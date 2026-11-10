@@ -26,14 +26,6 @@ impl Error {
         }
     }
 
-    /// A gateway's refusal, keeping its status code for [`Error::grpc_code`].
-    pub fn from_status(status: &tonic::Status) -> Self {
-        Self {
-            code: Some(status.code()),
-            ..Self::from_error(status)
-        }
-    }
-
     /// The gRPC status code, when the gateway refused a request.
     pub fn grpc_code(&self) -> Option<tonic::Code> {
         self.code
@@ -81,6 +73,16 @@ impl From<SdkError> for Error {
         Self {
             code: error.grpc_status().map(tonic::Status::code),
             ..Self::from_error(&error)
+        }
+    }
+}
+
+/// A gateway's refusal, keeping its status code for [`Error::grpc_code`].
+impl From<tonic::Status> for Error {
+    fn from(status: tonic::Status) -> Self {
+        Self {
+            code: Some(status.code()),
+            ..Self::from_error(&status)
         }
     }
 }

@@ -59,10 +59,9 @@ async fn cli_stop_start_delete(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
         .cli_sandbox("cl")
         .command(["sh", "-c", "exec sleep infinity"])
-        .create()
+        .create_ready()
         .await?;
     let name = sandbox.name().to_string();
-    sandbox.wait_ready().await?;
 
     cx.cli(["sandbox", "stop", &name]).await?.success()?;
     sandbox

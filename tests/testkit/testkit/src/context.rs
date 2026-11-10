@@ -200,7 +200,6 @@ impl Context {
             .await?
             .get_gateway_info(proto::GetGatewayInfoRequest {})
             .await
-            .map_err(|status| Error::from_error(&status))
             .context("get gateway info")?
             .into_inner();
         let drivers: Vec<(&str, &str)> = info
@@ -293,6 +292,13 @@ impl SandboxBuilder {
         self
     }
 
+    /// Create the sandbox from `image` instead of the gateway's default.
+    #[must_use]
+    pub fn image(mut self, image: impl Into<String>) -> Self {
+        self.spec.image = Some(image.into());
+        self
+    }
+
     #[must_use]
     pub fn restart_policy(mut self, policy: SandboxRestartPolicy) -> Self {
         self.spec.restart_policy = policy;
@@ -346,7 +352,6 @@ impl SandboxBuilder {
                     .await?
                     .create_sandbox(request)
                     .await
-                    .map_err(|status| Error::from_status(&status))
                     .context(format!("create sandbox {name}"))?;
                 self.client
                     .get_sandbox(&name)
@@ -564,7 +569,6 @@ impl Sandbox {
             .await?
             .update_config(request)
             .await
-            .map_err(|status| Error::from_error(&status))
             .context(format!("set {key} on sandbox {}", self.name))?;
         Ok(())
     }
@@ -581,7 +585,6 @@ impl Sandbox {
             .await?
             .get_sandbox_config(request)
             .await
-            .map_err(|status| Error::from_error(&status))
             .context(format!("get config of sandbox {}", self.name))?
             .into_inner())
     }
@@ -599,7 +602,6 @@ impl Sandbox {
             .await?
             .get_draft_policy(request)
             .await
-            .map_err(|status| Error::from_error(&status))
             .context(format!("get draft policy of sandbox {}", self.name))?
             .into_inner())
     }

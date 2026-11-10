@@ -64,7 +64,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 `Context` currently provides:
 
 - `cx.sandbox(suffix)` to build a sandbox with a run-unique name, then
-  `create()` it or `create_ready()` to also wait for Ready. The returned
+  `create()` it or `create_ready()` to also wait for Ready. Set its image
+  with `image(..)` and its policy with `policy(..)`. The returned
   `Sandbox` can wait for ready or finished, stop, start, exec or
   `poll_exec` until the output matches, read its config and draft policy, set
   a setting, read `sandbox get` JSON with `get_json()`, and delete. Its
@@ -72,8 +73,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   Exec output has `success()`, `failure()` and `expect_stdout()`.
 - `cx.cli_sandbox(suffix)` for a sandbox only `openshell sandbox create`
   can make, such as one with `policy_yaml(...)` or `--no-keep`. `create()`
-  detaches and returns the `Sandbox`; `run()` returns the attached CLI
-  output.
+  detaches and returns the `Sandbox`, `create_ready()` also waits for Ready,
+  and `run()` returns the attached CLI output.
 - `cx.track(name)` to register a sandbox created some other way, such as
   through the CLI, for cleanup. Call it before the
   create, so a create that fails after the gateway accepted it is still cleaned

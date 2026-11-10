@@ -87,6 +87,13 @@ impl<'a> CliSandboxBuilder<'a> {
         self.cx.adopt(&self.name).await
     }
 
+    /// Create the sandbox and wait until it is Ready.
+    pub async fn create_ready(self) -> Result<Sandbox> {
+        let sandbox = self.create().await?;
+        sandbox.wait_ready().await?;
+        Ok(sandbox)
+    }
+
     /// Create the sandbox attached to its main command and return the CLI's
     /// output, whatever its exit code. For a test of the main command's
     /// result, or of a create that must fail.

@@ -69,10 +69,9 @@ USER {OCI_IDENTITY}
         .image(&image.tag)
         .policy_yaml(IMAGE_IDENTITY_POLICY)
         .command(["sleep", "infinity"])
-        .create()
+        .create_ready()
         .await
         .context("sandbox starts from the OCI identity image")?;
-    sandbox.wait_ready().await?;
 
     let supervisor = engine
         .container_for_role(sandbox.name(), "supervisor")
