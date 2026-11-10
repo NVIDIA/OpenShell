@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Filesystem policy for NGC (nvcr.io) GPU images such as
+# nvcr.io/nvidia/pytorch. It extends the default policy with the paths that
+# CUDA, PyTorch, NCCL, and HPC-X need. See README.md for the failures each
+# addition fixes.
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /bin
+    - /usr
+    - /lib
+    - /etc
+    - /proc
+    - /var/log
+    - /dev/urandom
+    # NGC images install HPC-X, UCX, and other libraries under /opt. The
+    # loader cache resolves libmpi.so.40 there, so `import torch` fails
+    # without it.
+    - /opt
+    # Kernel-exported topology. PyTorch's cpuinfo reads
+    # /sys/devices/system/cpu; NCCL, NVML, and hwloc read /sys/bus/pci,
+    # /sys/class, and /sys/devices/system/node to discover PCI and NVLink
+    # topology.
+    - /sys
+  read_write:
+    - /tmp
+    - /dev/null
+    # PyTorch DataLoader workers and NCCL's shared-memory transport.
+    - /dev/shm
+
+landlock:
+  compatibility: best_effort
+
+# The check needs no outbound network access.
+network_policies: {}
