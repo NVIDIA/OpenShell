@@ -74,7 +74,13 @@ pub fn write(path: &Path, report: &Report) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let xml = report.to_string().map_err(std::io::Error::other)?;
-    std::fs::write(path, xml)
+    // Replace the file in one step, so a run that is killed while writing
+    // leaves the previous report, not a truncated one.
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = std::path::PathBuf::from(partial);
+    std::fs::write(&partial, xml)?;
+    std::fs::rename(&partial, path)
 }
 
 #[cfg(test)]
@@ -124,5 +130,26 @@ mod tests {
         ] {
             assert!(xml.contains(expected), "missing {expected} in\n{xml}");
         }
+    }
+
+    #[test]
+    fn write_replaces_the_report_and_leaves_no_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("results/junit.xml");
+        let one = [TestRun {
+            test: &PASSED,
+            outcome: Outcome::Passed,
+            duration: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }];
+        super::write(&path, &report("p", &one)).unwrap();
+        super::write(&path, &report("p", &[])).unwrap();
+        let xml = std::fs::read_to_string(&path).unwrap();
+        assert!(xml.contains(r#"tests="0""#), "{xml}");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
     }
 }

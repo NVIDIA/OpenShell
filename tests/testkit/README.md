@@ -185,7 +185,9 @@ A filter selects tests whose name contains it. `run` also takes:
   skipped.
 - `--timeout SECS` (default 900): a test that runs longer gets SIGTERM, then
   SIGKILL after `--grace SECS` (default 10).
-- `--junit PATH`: writes a JUnit report with one test suite per family.
+- `--junit PATH`: writes a JUnit report with one test suite per family. The
+  report is rewritten after each test, so a run that is stopped from outside
+  still leaves the results so far.
 
 Each test runs in its own process group. When the test's process exits, `run`
 kills anything left in the group, such as CLI processes the test started.
