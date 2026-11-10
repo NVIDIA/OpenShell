@@ -5,7 +5,15 @@
 //! direct while looking configured. A bypass list without a proxy URL means
 //! the operator believed proxying was in effect.
 
-#![cfg(unix)]
+// Only Docker, Podman and the VM driver have a proxy table.
+#![cfg(all(
+    unix,
+    any(
+        feature = "compute-driver-docker",
+        feature = "compute-driver-podman",
+        feature = "compute-driver-vm"
+    )
+))]
 
 use std::fs;
 use std::path::PathBuf;
@@ -81,14 +89,6 @@ fn combined(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
-}
-
-#[test]
-fn proxy_drivers_are_compiled_in() {
-    assert!(
-        !DRIVERS.is_empty(),
-        "build with a compute driver that has a proxy table"
-    );
 }
 
 #[tokio::test]
