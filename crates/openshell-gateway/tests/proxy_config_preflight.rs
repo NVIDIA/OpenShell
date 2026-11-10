@@ -99,15 +99,14 @@ async fn preflight_rejects_no_proxy_without_proxy() {
         let output = fixture
             .run(&["config", "preflight", "--path", fixture.config_path()])
             .await;
+        let report = combined(&output);
         assert!(
             !output.status.success(),
-            "preflight accepted an incoherent [openshell.drivers.{driver}] proxy table:\n{}",
-            combined(&output)
+            "preflight accepted an incoherent [openshell.drivers.{driver}] proxy table:\n{report}"
         );
         assert!(
-            combined(&output).contains("category=malformed"),
-            "preflight did not classify the {driver} config as malformed:\n{}",
-            combined(&output)
+            report.contains("category=malformed"),
+            "preflight did not classify the {driver} config as malformed:\n{report}"
         );
         assert_eq!(
             fs::read(&fixture.config).expect("config after preflight"),
