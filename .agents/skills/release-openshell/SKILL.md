@@ -86,4 +86,4 @@ Watch the stable release run and report its result.
 
 ## Python SDK
 
-Core no longer builds or publishes the Python SDK for releases. Stable and prerelease GitHub Releases carry no wheel, and nothing in core publishes to PyPI. `openshell` `0.1.7` is the last core-built wheel. From `0.1.8` on, [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python) publishes `openshell` on the same day as each stable core release, once its update PR for the core tag merges. The rolling `dev` release still attaches a development wheel until the SDK sources leave core (NVIDIA/OpenShell#5287).
+Core no longer builds or publishes the Python SDK for releases. The stable, prerelease, and rolling `dev` GitHub Releases carry no wheel, and nothing in core publishes to PyPI. `openshell` `0.1.7` is the last core-built wheel. From `0.1.8` on, [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python) publishes `openshell` on the same day as each stable core release, once its update PR for the core tag merges.
