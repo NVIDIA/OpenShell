@@ -120,6 +120,22 @@ pub struct ResumeGap {
 struct CursorSpace {
     epoch: Uuid,
     next: u64,
+    /// Terminal tombstone written by [`TracingLogBus::close`]. A closed space
+    /// never allocates another cursor, so late publishers cannot re-create the
+    /// buffers deletion just freed.
+    closed: bool,
+}
+
+impl CursorSpace {
+    /// A bare tombstone for an id that never published, so a subscribe-only
+    /// sandbox can be closed too. No epoch is ever handed out for it.
+    fn tombstone() -> Self {
+        Self {
+            epoch: Uuid::nil(),
+            next: 1,
+            closed: true,
+        }
+    }
 }
 
 /// Identity and extent of a sandbox's current cursor space.
@@ -144,8 +160,9 @@ struct SeqAllocator {
 impl SeqAllocator {
     /// Lock the cursor space.
     ///
-    /// Publication and teardown each hold this guard across their bus-map
-    /// mutation, which is what keeps cursors monotonic. Allocating and then
+    /// Publication, subscription, and teardown each hold this guard across
+    /// their bus-map mutation, which is what keeps cursors monotonic and makes
+    /// the closed check atomic with the entry it guards. Allocating and then
     /// releasing would let a teardown reset the counter in between, so the
     /// in-flight event lands in a freshly recreated entry carrying a cursor from
     /// the old space while the next publish restarts at 1.
@@ -164,31 +181,63 @@ impl SeqAllocator {
     /// The epoch is minted on the vacant path only — once per cursor space, not
     /// once per publish — so generating it under the allocator lock costs
     /// nothing on the hot path.
-    fn next_locked(spaces: &mut HashMap<String, CursorSpace>, sandbox_id: &str) -> (Uuid, u64) {
+    ///
+    /// Returns `None` for a closed space: the timeline is over and the caller
+    /// must drop the event rather than re-create the buffers [`TracingLogBus::close`]
+    /// freed.
+    fn next_locked(
+        spaces: &mut HashMap<String, CursorSpace>,
+        sandbox_id: &str,
+    ) -> Option<(Uuid, u64)> {
         let space = spaces
             .entry(sandbox_id.to_string())
             .or_insert_with(|| CursorSpace {
                 epoch: Uuid::new_v4(),
                 next: 1,
+                closed: false,
             });
+        if space.closed {
+            return None;
+        }
         let seq = space.next;
         space.next += 1;
-        (space.epoch, seq)
+        Some((space.epoch, seq))
     }
 
     /// Identity and extent of this sandbox's space, or `None` when no event has
-    /// been published into it.
+    /// been published into it or the space is closed.
     ///
     /// A resume cursor is validated against this: a different epoch means the
     /// cursor belongs to a space that no longer exists, and `None` means there
     /// is no space to resume into at all. An empty `tail_after` result is not
     /// on its own proof that a cursor is still valid.
     fn space(&self, sandbox_id: &str) -> Option<CursorSpaceInfo> {
-        self.lock().get(sandbox_id).map(|space| CursorSpaceInfo {
-            epoch: space.epoch,
-            highest_seq: space.next.saturating_sub(1),
-        })
+        self.lock()
+            .get(sandbox_id)
+            .filter(|space| !space.closed)
+            .map(|space| CursorSpaceInfo {
+                epoch: space.epoch,
+                highest_seq: space.next.saturating_sub(1),
+            })
     }
+
+    /// True when `sandbox_id` carries a tombstone in the locked space map.
+    ///
+    /// Shared by `subscribe` (which must test it atomically with the bus-map
+    /// insert) and `is_closed`, so the predicate has one definition.
+    fn is_closed_locked(spaces: &HashMap<String, CursorSpace>, sandbox_id: &str) -> bool {
+        spaces.get(sandbox_id).is_some_and(|space| space.closed)
+    }
+}
+
+/// A receiver that is already closed, for a tombstoned id.
+///
+/// Nothing is ever sent for a closed id, so the sender is dropped immediately
+/// and the receiver reports `Closed` on first use. Capacity is irrelevant.
+fn closed_receiver() -> broadcast::Receiver<Arc<CursoredEvent>> {
+    let (sender, receiver) = broadcast::channel(1);
+    drop(sender);
+    receiver
 }
 
 fn tail_after_impl(
@@ -247,12 +296,76 @@ impl TracingLogBus {
     }
 
     pub(crate) fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<Arc<CursoredEvent>> {
+        // Hold the allocator across the bus-map insert so the closed check is
+        // atomic with a concurrent [`Self::close`], mirroring `publish`. A
+        // closed id yields a receiver that is already closed instead of a new
+        // entry: re-creating the entry would undo the memory `close` reclaimed.
+        let spaces = self.seq.lock();
+        if SeqAllocator::is_closed_locked(&spaces, sandbox_id) {
+            return closed_receiver();
+        }
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner
             .per_id
             .entry(sandbox_id.to_string())
             .or_insert_with(PerSandbox::new)
             .subscribe()
+    }
+
+    /// Terminally close a sandbox's log and platform event streams.
+    ///
+    /// This is the deletion path: it frees both buses' buffers and leaves a
+    /// tombstone in the shared cursor space, so a late publisher — an open
+    /// `PushSandboxLogs` stream, a driver event queued after `Deleted`, the
+    /// gateway tracing layer including OCSF audit events — drops its event
+    /// instead of re-creating the ~1.7 MiB of channel and tail that nothing
+    /// would ever free again. Idempotent.
+    ///
+    /// Lifecycle: a sandbox's space stays open until [`Self::remove`] retires
+    /// it or this call closes it. `remove` is the reset path (re-publishing
+    /// mints a new epoch, as the resume tests pin). `closed` is terminal:
+    /// `publish`, `subscribe`, and the platform bus all refuse the id, the
+    /// cursor-space lookup reports no space, and `remove` leaves the tombstone
+    /// in place.
+    ///
+    /// Tombstones are unbounded on purpose. Each costs roughly a hundred
+    /// bytes, against the ~1.7 MiB of buffers it replaces; sandbox ids are
+    /// fresh UUIDs that are never reused, and all bus state is cleared on
+    /// gateway restart.
+    ///
+    /// The whole sequence runs under the cursor-space lock, so it is atomic
+    /// against publication and subscription on either bus. The platform bus
+    /// removal only takes its own map lock, never the allocator, so the
+    /// documented allocator -> bus map order holds.
+    pub fn close(&self, sandbox_id: &str) {
+        let mut spaces = self.seq.lock();
+        self.drop_bus_entries_locked(sandbox_id);
+        spaces
+            .entry(sandbox_id.to_string())
+            .and_modify(|space| space.closed = true)
+            .or_insert_with(CursorSpace::tombstone);
+    }
+
+    /// Drop both buses' per-sandbox entries.
+    ///
+    /// The caller holds the cursor-space lock. The platform bus removal takes
+    /// only its own map lock and never reaches for the allocator, so this
+    /// preserves the documented allocator -> bus map order.
+    fn drop_bus_entries_locked(&self, sandbox_id: &str) {
+        {
+            let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
+            inner.per_id.remove(sandbox_id);
+        }
+        self.platform_event_bus.remove(sandbox_id);
+    }
+
+    /// True once [`Self::close`] has run for this sandbox.
+    ///
+    /// The push-stream handler uses this as a cheap, lock-only existence
+    /// check: a tombstoned id can never gain a buffer again, so it needs no
+    /// store read.
+    pub fn is_closed(&self, sandbox_id: &str) -> bool {
+        SeqAllocator::is_closed_locked(&self.seq.lock(), sandbox_id)
     }
 
     /// Remove all bus entries for the given sandbox id, including the platform
@@ -273,15 +386,17 @@ impl TracingLogBus {
     /// replacement space. Both broadcast senders are dropped here too, so a
     /// stream that was live across the reset ends rather than silently
     /// continuing into a different space.
+    ///
+    /// [`Self::close`] is the terminal counterpart: a removed space can be
+    /// republished into, a closed one cannot. On a closed id this is a no-op on
+    /// the allocator, because dropping the tombstone there would let a late
+    /// publisher re-create the buffers deletion just freed.
     pub fn remove(&self, sandbox_id: &str) {
         let mut spaces = self.seq.lock();
-        {
-            let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
-            inner.per_id.remove(sandbox_id);
+        self.drop_bus_entries_locked(sandbox_id);
+        if spaces.get(sandbox_id).is_none_or(|space| !space.closed) {
+            spaces.remove(sandbox_id);
         }
-        // Takes only the platform bus map lock; never reaches for `spaces`.
-        self.platform_event_bus.remove(sandbox_id);
-        spaces.remove(sandbox_id);
     }
 
     pub(crate) fn tail(&self, sandbox_id: &str, max: usize) -> Vec<CursoredEvent> {
@@ -346,9 +461,13 @@ impl TracingLogBus {
     fn publish(&self, sandbox_id: &str, mut event: SandboxStreamEvent, tail_cap: usize) {
         // Hold the cursor space across the tail insert so a teardown cannot
         // reset the counter between allocation and insertion. Lock order is
-        // allocator -> bus map, matching `remove`.
+        // allocator -> bus map, matching `remove` and `close`.
         let mut spaces = self.seq.lock();
-        let (epoch, seq) = SeqAllocator::next_locked(&mut spaces, sandbox_id);
+        // A closed space is over: drop the event instead of allocating a
+        // cursor and re-creating the buffers `close` freed.
+        let Some((epoch, seq)) = SeqAllocator::next_locked(&mut spaces, sandbox_id) else {
+            return;
+        };
         event.cursor = WatchCursor::new(epoch, seq).encode();
 
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
@@ -448,6 +567,20 @@ fn display_level(target: &str, level: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Assert that neither bus holds a per-sandbox entry.
+    #[track_caller]
+    fn assert_bus_maps_empty(bus: &TracingLogBus) {
+        assert!(bus.inner.lock().unwrap().per_id.is_empty());
+        assert!(
+            bus.platform_event_bus
+                .inner
+                .lock()
+                .unwrap()
+                .per_id
+                .is_empty()
+        );
+    }
 
     #[test]
     fn cross_sandbox_denials_remain_gateway_wide() {
@@ -765,11 +898,12 @@ mod tests {
 
         assert_eq!(bus.cursor_space(sandbox_id), None);
 
-        // Subscribing must not mint a space. `subscribe` touches only the bus
-        // map, never the allocator -- and the watch handler subscribes before
-        // it validates the resume cursor. If a subscription could manufacture
-        // an epoch, a client resuming against a torn-down sandbox would create
-        // the very space its stale cursor is then checked against.
+        // Subscribing must not mint a space. `subscribe` takes the allocator
+        // lock to check the tombstone, but only inserts into the bus map -- and
+        // the watch handler subscribes before it validates the resume cursor.
+        // If a subscription could manufacture an epoch, a client resuming
+        // against a torn-down sandbox would create the very space its stale
+        // cursor is then checked against.
         let _log_rx = bus.subscribe(sandbox_id);
         let _platform_rx = bus.platform_event_bus.subscribe(sandbox_id);
         assert_eq!(bus.cursor_space(sandbox_id), None);
@@ -928,6 +1062,222 @@ mod tests {
     }
 
     #[test]
+    fn publish_after_close_drops_without_recreating_buffers() {
+        // The issue's leak: late publishers used to re-create the buffers a
+        // deleted sandbox's cleanup had just freed, and nothing ever freed them
+        // again.
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-closed-publish";
+        bus.publish_external(make_log_event(sandbox_id, "before"));
+        bus.platform_event_bus.publish(sandbox_id, stream_event(0));
+        bus.close(sandbox_id);
+
+        bus.publish_external(make_log_event(sandbox_id, "after"));
+        bus.platform_event_bus.publish(sandbox_id, stream_event(0));
+
+        assert!(
+            bus.tail(sandbox_id, 10).is_empty(),
+            "a closed sandbox must drop log lines"
+        );
+        assert!(
+            bus.platform_event_bus.tail(sandbox_id, 10).is_empty(),
+            "a closed sandbox must drop platform events"
+        );
+        assert_bus_maps_empty(&bus);
+        assert_eq!(bus.cursor_space(sandbox_id), None);
+        assert!(bus.is_closed(sandbox_id));
+    }
+
+    #[test]
+    fn tracing_log_bus_close_closes_active_receivers() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-close-receivers";
+        let mut log_rx = bus.subscribe(sandbox_id);
+        let mut platform_rx = bus.platform_event_bus.subscribe(sandbox_id);
+
+        bus.publish_external(make_log_event(sandbox_id, "hello"));
+        assert!(log_rx.try_recv().is_ok());
+
+        bus.close(sandbox_id);
+
+        match log_rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Closed) => {} // expected
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        match platform_rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Closed) => {} // expected
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        // A close that tombstoned but forgot the map removal would still pass
+        // the receiver assertions above; the map lengths are what prove the
+        // buffers were actually freed.
+        assert_bus_maps_empty(&bus);
+    }
+
+    #[test]
+    fn subscribe_after_close_yields_closed_receiver_and_creates_no_entry() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-sub-after-close";
+        bus.close(sandbox_id);
+
+        let mut log_rx = bus.subscribe(sandbox_id);
+        assert!(matches!(
+            log_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
+        let mut platform_rx = bus.platform_event_bus.subscribe(sandbox_id);
+        assert!(matches!(
+            platform_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
+
+        assert_bus_maps_empty(&bus);
+    }
+
+    #[test]
+    fn close_is_idempotent_and_remove_keeps_the_tombstone() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-close-idempotent";
+
+        bus.publish_external(make_log_event(sandbox_id, "line"));
+        bus.close(sandbox_id);
+        bus.close(sandbox_id);
+        assert!(bus.is_closed(sandbox_id));
+        assert_eq!(bus.seq.lock().len(), 1);
+
+        // `remove` is the reset path, but a closed id is terminal: the
+        // tombstone must survive so a late publisher still cannot re-create the
+        // buffers.
+        bus.remove(sandbox_id);
+        assert!(bus.is_closed(sandbox_id));
+        bus.publish_external(make_log_event(sandbox_id, "late"));
+        assert!(bus.tail(sandbox_id, 10).is_empty());
+        assert_bus_maps_empty(&bus);
+    }
+
+    #[test]
+    fn close_without_prior_publish_inserts_a_tombstone() {
+        // A subscribe-only sandbox has no cursor space to close, but deleting
+        // it must still refuse later publishes.
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-subscribe-only";
+        let _rx = bus.subscribe(sandbox_id);
+        bus.close(sandbox_id);
+
+        assert!(bus.is_closed(sandbox_id));
+        bus.publish_external(make_log_event(sandbox_id, "late"));
+        assert!(bus.tail(sandbox_id, 10).is_empty());
+        assert_bus_maps_empty(&bus);
+    }
+
+    #[test]
+    fn cursor_space_reports_none_for_a_closed_sandbox() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-closed-space";
+        bus.publish_external(make_log_event(sandbox_id, "line"));
+        assert!(bus.cursor_space(sandbox_id).is_some());
+
+        bus.close(sandbox_id);
+
+        assert_eq!(
+            bus.cursor_space(sandbox_id),
+            None,
+            "a tombstone must not look like a live space"
+        );
+    }
+
+    #[test]
+    fn tracing_layer_after_close_allocates_nothing() {
+        // The gateway tracing layer -- including the OCSF audit event emitted
+        // while serving the delete -- publishes for any event carrying a
+        // `sandbox_id`. Pin that route against the tombstone too.
+        use tracing_subscriber::prelude::*;
+
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-layer-closed";
+        bus.publish_external(make_log_event(sandbox_id, "before"));
+        bus.close(sandbox_id);
+
+        let subscriber = tracing_subscriber::registry().with(bus.layer());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(sandbox_id = "sb-layer-closed", "late gateway event");
+        });
+
+        assert!(bus.tail(sandbox_id, 10).is_empty());
+        // The layer must not re-create a closed entry.
+        assert_bus_maps_empty(&bus);
+        let spaces = bus.seq.lock();
+        assert_eq!(spaces.len(), 1, "only the tombstone may remain");
+        assert!(spaces[sandbox_id].closed);
+    }
+
+    #[test]
+    fn concurrent_publish_and_close_never_recreates_buffers() {
+        // A publish that allocated before `close` must not land in a re-created
+        // entry. The tombstone check and the bus-map insert share the allocator
+        // lock, so once `close` returns for an id nothing can refill its tail.
+        for round in 0..64 {
+            let bus = TracingLogBus::new();
+            let sandbox_id = format!("sb-close-race-{round}");
+            let barrier = Arc::new(std::sync::Barrier::new(5));
+
+            let publishers: Vec<_> = (0..4)
+                .map(|_| {
+                    let bus = bus.clone();
+                    let barrier = Arc::clone(&barrier);
+                    let sandbox_id = sandbox_id.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for _ in 0..64 {
+                            bus.publish_external(make_log_event(&sandbox_id, "x"));
+                            bus.platform_event_bus.publish(&sandbox_id, stream_event(0));
+                        }
+                    })
+                })
+                .collect();
+
+            barrier.wait();
+            bus.close(&sandbox_id);
+
+            for publisher in publishers {
+                publisher.join().expect("publisher thread panicked");
+            }
+
+            assert!(bus.is_closed(&sandbox_id));
+            assert!(
+                bus.tail(&sandbox_id, usize::MAX).is_empty(),
+                "a closed sandbox must never accumulate a tail again"
+            );
+            assert!(
+                bus.platform_event_bus
+                    .tail(&sandbox_id, usize::MAX)
+                    .is_empty()
+            );
+            assert_bus_maps_empty(&bus);
+            assert_eq!(bus.seq.lock().len(), 1, "only the tombstone remains");
+        }
+    }
+
+    #[test]
+    fn repeated_create_delete_cycles_keep_bus_maps_bounded() {
+        // The RSS proxy: buffers are freed every cycle and only the small
+        // tombstone accumulates.
+        let bus = TracingLogBus::new();
+        for index in 0..1_000 {
+            let sandbox_id = format!("sb-cycle-{index}");
+            bus.publish_external(make_log_event(&sandbox_id, "line"));
+            bus.platform_event_bus.publish(&sandbox_id, stream_event(0));
+            bus.close(&sandbox_id);
+            assert_bus_maps_empty(&bus);
+        }
+        assert_eq!(
+            bus.seq.lock().len(),
+            1_000,
+            "one tombstone per deleted sandbox"
+        );
+    }
+
+    #[test]
     fn display_level_maps_ocsf_target_to_ocsf() {
         assert_eq!(display_level(OCSF_TARGET, "INFO"), "OCSF");
         assert_eq!(display_level("openshell_server", "WARN"), "WARN");
@@ -1080,6 +1430,13 @@ impl PlatformEventBus {
     }
 
     pub(crate) fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<Arc<CursoredEvent>> {
+        // Same guard as `TracingLogBus::subscribe`: take the allocator lock so
+        // the closed check is atomic with `TracingLogBus::close`, and return an
+        // already-closed receiver for a tombstoned id.
+        let spaces = self.seq.lock();
+        if SeqAllocator::is_closed_locked(&spaces, sandbox_id) {
+            return closed_receiver();
+        }
         let mut inner = self.inner.lock().expect("platform event bus lock poisoned");
         inner
             .per_id
@@ -1093,7 +1450,9 @@ impl PlatformEventBus {
         // lock order as `TracingLogBus::publish`), so teardown cannot reset the
         // counter underneath an in-flight publish.
         let mut spaces = self.seq.lock();
-        let (epoch, seq) = SeqAllocator::next_locked(&mut spaces, sandbox_id);
+        let Some((epoch, seq)) = SeqAllocator::next_locked(&mut spaces, sandbox_id) else {
+            return;
+        };
         event.cursor = WatchCursor::new(epoch, seq).encode();
 
         let mut inner = self.inner.lock().expect("platform event bus lock poisoned");

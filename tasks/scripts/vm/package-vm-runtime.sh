@@ -20,8 +20,9 @@
 # Environment (optional, for provenance):
 #   GITHUB_SHA      - Git commit SHA
 #   GITHUB_RUN_ID   - GitHub Actions run ID
-#   CUSTOM_PROVENANCE_DIR - Directory containing provenance.json from custom
-#                           libkrunfw build (macOS only)
+#   CUSTOM_PROVENANCE_DIR - Directory containing the provenance.json written by
+#                           build-libkrun.sh, when it is not in --build-dir
+#                           (macOS reuses the Linux ARM64 kernel build)
 
 set -euo pipefail
 
@@ -120,38 +121,29 @@ download_umoci_binary "${PACKAGE_DIR}/umoci" "${UMOCI_VERSION}" "${UMOCI_GUEST_A
 
 echo "==> Writing provenance metadata..."
 
-LIBKRUNFW_COMMIT="unknown"
-KERNEL_VERSION="unknown"
-
-# Try custom provenance first (macOS builds produce this)
-if [ -n "$CUSTOM_PROVENANCE_DIR" ] && [ -f "${CUSTOM_PROVENANCE_DIR}/provenance.json" ]; then
-    LIBKRUNFW_COMMIT="$(jq -r '.libkrunfw_commit // "unknown"' "${CUSTOM_PROVENANCE_DIR}/provenance.json" 2>/dev/null || echo unknown)"
-    KERNEL_VERSION="$(jq -r '.kernel_version // "unknown"' "${CUSTOM_PROVENANCE_DIR}/provenance.json" 2>/dev/null || echo unknown)"
-fi
-
-# Fall back to inspecting the build directory (Linux builds)
-if [ "$LIBKRUNFW_COMMIT" = "unknown" ] && [ -d "${BUILD_DIR}/libkrunfw/.git" ]; then
-    LIBKRUNFW_COMMIT="$(git -C "${BUILD_DIR}/libkrunfw" rev-parse HEAD 2>/dev/null || echo unknown)"
-fi
-if [ "$KERNEL_VERSION" = "unknown" ] && [ -f "${BUILD_DIR}/libkrunfw/Makefile" ]; then
-    KERNEL_VERSION="$(grep -oE 'KERNEL_VERSION\s*=\s*linux-[^\s]+' "${BUILD_DIR}/libkrunfw/Makefile" | head -1 | sed 's/.*= *//' || echo unknown)"
-fi
-
 if ! command -v jq &>/dev/null; then
     echo "Error: jq is required for provenance generation" >&2
     exit 1
 fi
 
+# Kernel inputs come from the provenance.json written by build-libkrun.sh,
+# in the build dir or, for macOS, the directory holding the Linux kernel.c.
+KERNEL_PROVENANCE="${CUSTOM_PROVENANCE_DIR:-${BUILD_DIR}}/provenance.json"
+kernel_field() {
+    jq -r --arg k "$1" '.[$k] // "unknown"' "$KERNEL_PROVENANCE" 2>/dev/null || echo unknown
+}
+
 jq -n \
     --arg artifact "vm-runtime" \
     --arg platform "$PLATFORM" \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --arg kfw_commit "$LIBKRUNFW_COMMIT" \
-    --arg kver "$KERNEL_VERSION" \
+    --arg kfw_commit "$(kernel_field libkrunfw_commit)" \
+    --arg kver "$(kernel_field kernel_version)" \
+    --arg kcfg "$(kernel_field kernel_config_sha256)" \
     --arg umoci "$UMOCI_VERSION" \
     --arg sha "${GITHUB_SHA:-unknown}" \
     --arg run "${GITHUB_RUN_ID:-unknown}" \
-    '{artifact: $artifact, platform: $platform, build_timestamp: $ts, libkrunfw_commit: $kfw_commit, kernel_version: $kver, umoci_version: $umoci, github_sha: $sha, github_run_id: $run}' \
+    '{artifact: $artifact, platform: $platform, build_timestamp: $ts, libkrunfw_commit: $kfw_commit, kernel_version: $kver, kernel_config_sha256: $kcfg, umoci_version: $umoci, github_sha: $sha, github_run_id: $run}' \
     > "${PACKAGE_DIR}/provenance.json"
 
 # ── Create tarball ──────────────────────────────────────────────────────

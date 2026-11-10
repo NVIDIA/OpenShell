@@ -1691,10 +1691,12 @@ fn connect_exact(fd: RawFd, address: SocketAddr) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let changed_flags = original_flags & libc::O_NONBLOCK == 0;
-    if changed_flags
-        && unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0
-    {
-        return Err(io::Error::last_os_error());
+    if changed_flags {
+        // SAFETY: F_SETFL operates on the live retained socket descriptor
+        // with the flag word read by the documented F_GETFL above.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     let result = with_sockaddr(address, |pointer, length| {
         // SAFETY: pointer/length describe a live native sockaddr and `fd` is
@@ -1712,8 +1714,8 @@ fn connect_exact(fd: RawFd, address: SocketAddr) -> io::Result<()> {
             events: libc::POLLOUT,
             revents: 0,
         };
-        // SAFETY: poll points to one live pollfd.
         let timeout = i32::try_from(RELAY_CONNECT_TIMEOUT.as_millis()).map_err(io::Error::other)?;
+        // SAFETY: poll points to one live pollfd.
         if unsafe { libc::poll(&raw mut poll, 1, timeout) } <= 0 {
             return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
         }
@@ -1738,9 +1740,16 @@ fn connect_exact(fd: RawFd, address: SocketAddr) -> io::Result<()> {
             Err(io::Error::from_raw_os_error(socket_error))
         }
     });
-    let restore = if changed_flags && unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags) } < 0
-    {
-        Err(io::Error::last_os_error())
+    let restore = if changed_flags {
+        // SAFETY: F_SETFL restores the original flag word read by the
+        // documented F_GETFL; the restore runs even when the connect
+        // attempt failed.
+        let restore_result = unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags) };
+        if restore_result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     } else {
         Ok(())
     };
@@ -2480,6 +2489,168 @@ mod tests {
             runtime
                 .block_on(pending.complete(TcpOpenDecision::RelayReady))
                 .is_err()
+        );
+    }
+
+    /// Runs `child` in a forked process and returns the bytes it writes to a
+    /// pipe. Assertions belong in the parent: a panic in the child would
+    /// unwind into a copy of the test harness.
+    #[allow(unsafe_code)]
+    fn fork_capture(child: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("create probe pipe");
+        // SAFETY: fork isolates the rlimit and seccomp changes the callers
+        // make. The child writes one result and exits without running
+        // inherited destructors or the test harness.
+        match unsafe { nix::unistd::fork() }.expect("fork should succeed") {
+            nix::unistd::ForkResult::Child => {
+                drop(read_fd);
+                let result = child();
+                let _ = rustix::io::write(&write_fd, &result);
+                drop(write_fd);
+                // SAFETY: terminate the fork child without unwinding through
+                // the parent's test harness state.
+                unsafe { libc::_exit(0) };
+            }
+            nix::unistd::ForkResult::Parent { child } => {
+                drop(write_fd);
+                let mut result = Vec::new();
+                let mut buffer = [0_u8; 512];
+                loop {
+                    match rustix::io::read(&read_fd, &mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => result.extend_from_slice(&buffer[..read]),
+                        Err(error) if error == rustix::io::Errno::INTR => {}
+                        Err(error) => panic!("read probe result: {error}"),
+                    }
+                }
+                drop(read_fd);
+                match nix::sys::wait::waitpid(child, None).expect("waitpid should succeed") {
+                    nix::sys::wait::WaitStatus::Exited(_, 0) => {}
+                    status => panic!("probe child exited unexpectedly: {status:?}"),
+                }
+                result
+            }
+        }
+    }
+
+    #[test]
+    fn connect_exact_returns_a_failed_nonblocking_transition() {
+        // O_PATH descriptors support F_GETFL but reject F_SETFL with EBADF.
+        // That reaches the set-failure return without invalidating a
+        // descriptor that is also being connected.
+        let path = std::ffi::CString::new("/").expect("static path is NUL-free");
+        // SAFETY: path is a live NUL-terminated directory path; a successful
+        // open returns one newly owned descriptor.
+        let descriptor = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(
+            descriptor >= 0,
+            "open O_PATH: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: the successful open transferred ownership of the descriptor.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+
+        let error = connect_exact(descriptor.as_raw_fd(), "127.0.0.1:9".parse().unwrap())
+            .expect_err("an O_PATH descriptor rejects F_SETFL");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    /// Denies only the `F_SETFL` restore that `connect_exact` performs after a
+    /// bounded connect: the initial transition carries `O_NONBLOCK`, the restore
+    /// does not. The connect itself still succeeds, so the restore error is
+    /// the one the caller observes.
+    fn flag_restore_failure_filter() -> seccompiler::BpfProgram {
+        use seccompiler::{
+            SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+            SeccompRule,
+        };
+        use std::collections::BTreeMap;
+
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        rules.insert(
+            libc::SYS_fcntl,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        1,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Eq,
+                        u64::from(libc::F_SETFL.cast_unsigned()),
+                    )
+                    .expect("valid fcntl command condition"),
+                    SeccompCondition::new(
+                        2,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::MaskedEq(u64::from(libc::O_NONBLOCK.cast_unsigned())),
+                        0,
+                    )
+                    .expect("valid fcntl flag condition"),
+                ])
+                .expect("valid fcntl rule"),
+            ],
+        );
+        let architecture = std::env::consts::ARCH
+            .try_into()
+            .expect("supported target architecture");
+        SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM.cast_unsigned()),
+            architecture,
+        )
+        .expect("build restore filter")
+        .try_into()
+        .expect("compile restore filter")
+    }
+
+    #[test]
+    fn connect_exact_returns_the_flag_restore_failure() {
+        // Nothing can invalidate the retained descriptor between the two fcntl
+        // calls, so a filter that denies only the restore transition is the
+        // way to reach the restore-failure arm.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let filter = flag_restore_failure_filter();
+        let result = fork_capture(move || {
+            // SAFETY: PR_SET_NO_NEW_PRIVS is a one-way scalar transition
+            // required before loading an unprivileged seccomp filter.
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+                return i32::MIN.to_ne_bytes().to_vec();
+            }
+            if seccompiler::apply_filter(&filter).is_err() {
+                return i32::MIN.to_ne_bytes().to_vec();
+            }
+            // SAFETY: socket returns one newly owned descriptor on success.
+            let descriptor = unsafe {
+                libc::socket(
+                    libc::AF_INET,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    libc::IPPROTO_TCP,
+                )
+            };
+            if descriptor < 0 {
+                return i32::MIN.to_ne_bytes().to_vec();
+            }
+            // SAFETY: the successful socket call returned one owned descriptor.
+            let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+            match connect_exact(descriptor.as_raw_fd(), address) {
+                Ok(()) => 0_i32.to_ne_bytes().to_vec(),
+                Err(error) => error
+                    .raw_os_error()
+                    .unwrap_or(i32::MAX)
+                    .to_ne_bytes()
+                    .to_vec(),
+            }
+        });
+        let errno = i32::from_ne_bytes(
+            result
+                .try_into()
+                .expect("probe child writes one i32 status"),
+        );
+        assert_eq!(
+            errno,
+            libc::EPERM,
+            "restore failure must be returned to the caller"
         );
     }
 
