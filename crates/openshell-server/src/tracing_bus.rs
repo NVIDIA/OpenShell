@@ -88,14 +88,16 @@ impl PerSandbox {
         }
     }
 
-    fn tail(&self, max: usize) -> Vec<CursoredEvent> {
+    fn tail(&self, max: usize) -> Vec<Arc<CursoredEvent>> {
         let skip = self.tail.len().saturating_sub(max);
-        self.tail
-            .iter()
-            .skip(skip)
-            .map(|cursored| (**cursored).clone())
-            .collect()
+        self.tail.iter().skip(skip).cloned().collect()
     }
+}
+
+/// Deep-clone shared events. Call only after releasing the bus lock, so a
+/// large replay does not stall publishers.
+fn unshare(events: Vec<Arc<CursoredEvent>>) -> Vec<CursoredEvent> {
+    events.into_iter().map(Arc::unwrap_or_clone).collect()
 }
 
 /// The requested resume cursor is older than the oldest buffered event;
@@ -193,7 +195,7 @@ fn tail_after_impl(
     tail: &VecDeque<Arc<CursoredEvent>>,
     last_trimmed_seq: u64,
     after_seq: u64,
-) -> Result<Vec<CursoredEvent>, ResumeGap> {
+) -> Result<Vec<Arc<CursoredEvent>>, ResumeGap> {
     // Gap iff this bus dropped an event the client still needs, i.e. the
     // highest seq we evicted is newer than the client's position. Judged only
     // on this bus's own evictions — the other bus owns the seqs missing here.
@@ -207,10 +209,10 @@ fn tail_after_impl(
     // Skippable events (seq <= after_seq) are the oldest, at the front, so a
     // take-while would stop before reaching the wanted ones. Filter the whole
     // tail instead; order is preserved and caught-up yields an empty vec.
-    let res: Vec<CursoredEvent> = tail
+    let res: Vec<Arc<CursoredEvent>> = tail
         .iter()
         .filter(|cursored| cursored.seq > after_seq)
-        .map(|cursored| (**cursored).clone())
+        .cloned()
         .collect();
 
     Ok(res)
@@ -283,12 +285,15 @@ impl TracingLogBus {
     }
 
     pub(crate) fn tail(&self, sandbox_id: &str, max: usize) -> Vec<CursoredEvent> {
-        let inner = self.inner.lock().expect("tracing bus lock poisoned");
-        inner
+        let events = self
+            .inner
+            .lock()
+            .expect("tracing bus lock poisoned")
             .per_id
             .get(sandbox_id)
             .map(|per| per.tail(max))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        unshare(events)
     }
 
     /// Identity and extent of this sandbox's current cursor space.
@@ -305,11 +310,17 @@ impl TracingLogBus {
         sandbox_id: &str,
         after_seq: u64,
     ) -> Result<Vec<CursoredEvent>, ResumeGap> {
-        let inner = self.inner.lock().expect("tracing bus lock poisoned");
-        inner.per_id.get(sandbox_id).map_or_else(
-            || Ok(Vec::new()),
-            |per| tail_after_impl(&per.tail, per.last_trimmed_seq, after_seq),
-        )
+        let events = self
+            .inner
+            .lock()
+            .expect("tracing bus lock poisoned")
+            .per_id
+            .get(sandbox_id)
+            .map_or_else(
+                || Ok(Vec::new()),
+                |per| tail_after_impl(&per.tail, per.last_trimmed_seq, after_seq),
+            )?;
+        Ok(unshare(events))
     }
 
     /// Publish a log line from an external source (e.g., sandbox push).
@@ -569,8 +580,8 @@ mod tests {
     }
 
     /// Extract seqs from a run of buffered events, in order.
-    fn cursors(events: &[CursoredEvent]) -> Vec<u64> {
-        events.iter().map(|c| c.seq).collect()
+    fn cursors<E: std::borrow::Borrow<CursoredEvent>>(events: &[E]) -> Vec<u64> {
+        events.iter().map(|c| c.borrow().seq).collect()
     }
 
     #[test]
@@ -754,7 +765,7 @@ mod tests {
 
         assert_eq!(bus.cursor_space(sandbox_id), None);
 
-        // Subscribing must not mint a space. `sender_for` touches only the bus
+        // Subscribing must not mint a space. `subscribe` touches only the bus
         // map, never the allocator -- and the watch handler subscribes before
         // it validates the resume cursor. If a subscription could manufacture
         // an epoch, a client resuming against a torn-down sandbox would create
@@ -1095,12 +1106,15 @@ impl PlatformEventBus {
 
     /// Return buffered platform events for replay to late subscribers.
     pub(crate) fn tail(&self, sandbox_id: &str, max: usize) -> Vec<CursoredEvent> {
-        let inner = self.inner.lock().expect("platform event bus lock poisoned");
-        inner
+        let events = self
+            .inner
+            .lock()
+            .expect("platform event bus lock poisoned")
             .per_id
             .get(sandbox_id)
             .map(|per| per.tail(max))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        unshare(events)
     }
 
     pub(crate) fn tail_after(
@@ -1108,11 +1122,17 @@ impl PlatformEventBus {
         sandbox_id: &str,
         after_seq: u64,
     ) -> Result<Vec<CursoredEvent>, ResumeGap> {
-        let inner = self.inner.lock().expect("platform event bus lock poisoned");
-        inner.per_id.get(sandbox_id).map_or_else(
-            || Ok(Vec::new()),
-            |per| tail_after_impl(&per.tail, per.last_trimmed_seq, after_seq),
-        )
+        let events = self
+            .inner
+            .lock()
+            .expect("platform event bus lock poisoned")
+            .per_id
+            .get(sandbox_id)
+            .map_or_else(
+                || Ok(Vec::new()),
+                |per| tail_after_impl(&per.tail, per.last_trimmed_seq, after_seq),
+            )?;
+        Ok(unshare(events))
     }
 
     /// Remove the bus entry for the given sandbox id.
