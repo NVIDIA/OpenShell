@@ -6573,6 +6573,12 @@ impl ComputeRuntime {
         sandbox_id: &str,
     ) -> Result<bool, Status> {
         let _guard = self.lock_sandbox_for_lifecycle(delete_guard).await;
+        // A missing sandbox row means the sandbox is gone. Several readers make
+        // that inference with their own error policy -- this teardown, the
+        // push-log handler's store recheck (`ensure_log_stream_sandbox_exists`
+        // in grpc/policy.rs), and the `WatchSandbox` producer in
+        // grpc/sandbox.rs -- so a change to deletion semantics (soft delete,
+        // migration windows, record recreation) must update every one of them.
         let record = self
             .store
             .get(Sandbox::object_type(), sandbox_id)
@@ -6591,9 +6597,10 @@ impl ComputeRuntime {
     }
 
     fn cleanup_sandbox_state(&self, sandbox_id: &str) {
-        // `tracing_log_bus.remove` also clears the platform event bus and resets
-        // the shared cursor allocator last (see its docs).
-        self.tracing_log_bus.remove(sandbox_id);
+        // `tracing_log_bus.close` also clears the platform event bus and leaves
+        // a terminal tombstone in the shared cursor allocator, so late
+        // publishers cannot re-create the buffers this frees (see its docs).
+        self.tracing_log_bus.close(sandbox_id);
         self.sandbox_watch_bus.remove(sandbox_id);
     }
 
@@ -15517,6 +15524,105 @@ mod tests {
             watch_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn delete_tombstones_sandbox_log_and_event_buses() {
+        // #5402: cleanup frees the sandbox's log and platform-event buffers.
+        // Resetting the cursor space (`remove`) lets a late publisher re-create
+        // both, and nothing ever frees them again. The delete path must leave a
+        // terminal tombstone in the shared allocator instead.
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let log_line = |message: &str| openshell_core::proto::SandboxLogLine {
+            sandbox_id: "sb-1".to_string(),
+            event_time: openshell_core::time::timestamp_from_millis(1_000).ok(),
+            level: "INFO".to_string(),
+            target: "delete-tombstone".to_string(),
+            message: message.to_string(),
+            source: "sandbox".to_string(),
+            fields: HashMap::new(),
+        };
+        let platform_event = |message: &str| openshell_core::proto::SandboxStreamEvent {
+            payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Event(
+                PlatformEvent {
+                    source: "test".to_string(),
+                    reason: "Delete".to_string(),
+                    message: message.to_string(),
+                    ..Default::default()
+                },
+            )),
+            cursor: String::new(),
+        };
+
+        // Both buses hold buffers before the delete, so cleanup has memory to
+        // reclaim and the assertions below observe a real transition.
+        runtime
+            .tracing_log_bus
+            .publish_external(log_line("before delete"));
+        runtime
+            .tracing_log_bus
+            .platform_event_bus
+            .publish("sb-1", platform_event("before delete"));
+        assert_eq!(runtime.tracing_log_bus.tail("sb-1", 10).len(), 1);
+        assert_eq!(
+            runtime
+                .tracing_log_bus
+                .platform_event_bus
+                .tail("sb-1", 10)
+                .len(),
+            1
+        );
+
+        // The real delete: request, driver acknowledgement, then the Deleted
+        // watch event that owns gateway-side cleanup.
+        runtime
+            .delete_sandbox("default", "sandbox-a")
+            .await
+            .expect("the delete request is accepted");
+        runtime
+            .apply_deleted("sb-1")
+            .await
+            .expect("the deleted watch event completes cleanup");
+
+        assert!(
+            runtime.tracing_log_bus.is_closed("sb-1"),
+            "delete cleanup must tombstone the sandbox's cursor space, not reset it"
+        );
+        assert!(runtime.tracing_log_bus.tail("sb-1", 10).is_empty());
+        assert!(
+            runtime
+                .tracing_log_bus
+                .platform_event_bus
+                .tail("sb-1", 10)
+                .is_empty()
+        );
+
+        // Late publishers: an open PushSandboxLogs stream, a driver event
+        // queued behind the Deleted event, and the gateway tracing layer.
+        runtime
+            .tracing_log_bus
+            .publish_external(log_line("after delete"));
+        runtime
+            .tracing_log_bus
+            .platform_event_bus
+            .publish("sb-1", platform_event("after delete"));
+
+        assert!(
+            runtime.tracing_log_bus.tail("sb-1", 10).is_empty(),
+            "a late log publish must not re-create the buffers cleanup freed"
+        );
+        assert!(
+            runtime
+                .tracing_log_bus
+                .platform_event_bus
+                .tail("sb-1", 10)
+                .is_empty(),
+            "a late platform event must not re-create the buffers cleanup freed"
+        );
+        assert!(runtime.tracing_log_bus.is_closed("sb-1"));
     }
 
     #[tokio::test]
