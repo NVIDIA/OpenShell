@@ -71,7 +71,8 @@ let
   ) podmanModes;
   # fedora-podman-{rootful,rootless}-userns-{default,auto,keep-id,private}
   # configure the Podman gateway's user-namespace mode, for the Podman driver
-  # suite. Only the binaries installer applies the mode.
+  # suite. Every installer applies the mode through
+  # /etc/openshell-test/gateway-overrides.toml.
   podmanUsernsEnvironments = pkgs.lib.concatMap (
     podman:
     map (

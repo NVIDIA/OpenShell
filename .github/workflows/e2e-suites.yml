@@ -91,14 +91,14 @@ jobs:
             {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"features","package":"host-gateway","gateway":"tmachine","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootful-userns-default","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootful-userns-auto","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootful-userns-keep-id","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootful-userns-private","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless-userns-default","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless-userns-auto","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless-userns-keep-id","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless-userns-private","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"}
+            {"environment":"fedora-podman-rootful-userns-default","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-auto","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-default","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-auto","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"}
           ]'
           # `suite` names the row's tests in the job and artifact names.
           matrix=$(jq -c --arg family "${FAMILY}" '{include: map(
