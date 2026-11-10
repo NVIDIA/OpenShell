@@ -14,7 +14,7 @@ use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
     ContainerSummaryStateEnum, ContainerWaitResponse, CreateImageInfo, DeviceRequest, HealthConfig,
     HealthStatusEnum, HostConfig, Mount, MountTmpfsOptions, MountTypeEnum, MountVolumeOptions,
-    ProgressDetail, SystemInfo, VolumeCreateRequest,
+    ProgressDetail, SystemInfo, SystemVersion, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -917,9 +917,12 @@ impl DockerComputeDriver {
                 .map_err(|err| {
                     Error::execution(format!("failed to create Docker client: {err}"))
                 })?;
-        docker.version().await.map_err(|err| {
+        let version = docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
+        if let Some(warning) = unsupported_docker_engine_warning(&version) {
+            warn!("{warning}");
+        }
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
@@ -6031,6 +6034,31 @@ fn docker_cdi_gpu_inventory(info: &SystemInfo) -> CdiGpuInventory {
             .filter(|device| device.source.as_deref() == Some("cdi"))
             .filter_map(|device| device.id.as_deref()),
     )
+}
+
+/// Oldest Docker Engine major version the driver is supported on.
+const MIN_DOCKER_ENGINE_MAJOR: u64 = 28;
+
+/// Warn text when the daemon is a Docker Engine older than the supported
+/// minimum. Older engines fail sandbox bundle staging with opaque errors.
+fn unsupported_docker_engine_warning(version: &SystemVersion) -> Option<String> {
+    let engine = version
+        .components
+        .iter()
+        .flatten()
+        .find(|component| component.name == "Engine")?;
+    let major: u64 = engine
+        .version
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    (major < MIN_DOCKER_ENGINE_MAJOR).then(|| {
+        format!(
+            "Docker Engine {} is older than the supported minimum {MIN_DOCKER_ENGINE_MAJOR}.0; sandbox creation may fail. See the support matrix in the OpenShell docs.",
+            engine.version
+        )
+    })
 }
 
 fn docker_info_reports_wsl2(info: &SystemInfo) -> bool {
