@@ -689,6 +689,7 @@ fn run_hosted_sandbox_instance(
                     });
                     let instance = body(SandboxInstanceControls {
                         shutdown,
+                        shutdown_ends_process: false,
                         suspend: Box::pin(tokio_stream::wrappers::ReceiverStream::new(suspend_requested)),
                         readiness,
                     });

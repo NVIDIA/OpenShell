@@ -504,6 +504,18 @@ use provider_readiness::{EnvironmentIdentity, Tracker as ProviderReadinessTracke
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
+/// Time the workload gets to exit after TERM before it is killed.
+const WORKLOAD_TERM_GRACE: Duration = Duration::from_secs(5);
+
+/// Bound on stopping a dedicated supervisor's instance, including its exit
+/// report and trace flush. Below the 10 second grace the Docker driver gives
+/// the supervisor.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Exit code reported when the boundary is lost before it reports the
+/// stopped workload's status: terminated by TERM.
+const STOPPED_EXIT_CODE: i32 = 128 + 15;
+
 /// Whether a dedicated supervisor's environment grants the SSH socket to its
 /// group rather than its owner.
 #[must_use]
@@ -836,6 +848,7 @@ pub async fn run_sandbox_with_backend(
         bindings,
         SandboxInstanceControls {
             shutdown: Box::pin(wait_for_control_shutdown_signal()),
+            shutdown_ends_process: true,
             suspend,
             readiness,
         },
@@ -1001,6 +1014,9 @@ pub struct SandboxInstanceControls {
     /// Completes when the owner asks the instance to stop its workload. It is
     /// first polled once the workload has started.
     pub shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// True when `shutdown` also ends this process, so its boundary may be
+    /// stopping too and a lost connection is not worth recovering.
+    pub shutdown_ends_process: bool,
     /// Requests to suspend only this instance. A failed suspension can be
     /// retried by sending another request. Closing the stream disables it.
     pub suspend: Pin<Box<dyn futures::Stream<Item = ()> + Send>>,
@@ -1113,6 +1129,7 @@ pub async fn run_sandbox_instance(
     } = bindings;
     let SandboxInstanceControls {
         shutdown: shutdown_requested,
+        shutdown_ends_process,
         mut suspend,
         readiness,
     } = controls;
@@ -1785,6 +1802,7 @@ pub async fn run_sandbox_instance(
             SandboxInstanceReadiness::start(readiness, boundary_access.session_readiness());
         let instance_id = boundary_access.instance_id().to_string();
         let mut shutdown_requested = shutdown_requested;
+        let mut shutdown_deadline = None;
         // `None` means the boundary was suspended and its reference persisted.
         let lifecycle = loop {
             let wait_agent = agent.clone();
@@ -1804,23 +1822,25 @@ pub async fn run_sandbox_instance(
                     ));
                 }
                 () = &mut shutdown_requested => {
-                    let _ = agent
-                        .signal(openshell_isolation_interface::contract::BoundarySignal::Term)
-                        .await;
-                    let status = if let Ok(result) = timeout(Duration::from_secs(5), agent.wait()).await {
-                        result
-                    } else {
-                        let _ = agent.terminate().await;
-                        agent.wait().await
+                    if shutdown_ends_process {
+                        shutdown_deadline = Some(tokio::time::Instant::now() + SHUTDOWN_TIMEOUT);
+                        running.begin_stop();
                     }
-                    .map_err(|error| miette::miette!(error.to_string()))?;
-                    running
-                        .terminate()
-                        .await
-                        .map_err(|error| miette::miette!(
-                            "sandbox did not acknowledge terminal state: {error}"
-                        ))?;
-                    break Some((boundary_exit_code(status), false));
+                    let wait = async {
+                        let _ = agent
+                            .signal(openshell_isolation_interface::contract::BoundarySignal::Term)
+                            .await;
+                        if let Ok(result) = timeout(WORKLOAD_TERM_GRACE, agent.wait()).await {
+                            result
+                        } else {
+                            let _ = agent.terminate().await;
+                            agent.wait().await
+                        }
+                    };
+                    let exit_code =
+                        Box::pin(stop_workload(wait, || running.terminate(), shutdown_deadline))
+                            .await?;
+                    break Some((exit_code, false));
                 }
                 // The agent wait is cancelled while suspending so a fenced
                 // generation's stream failure cannot race the suspension.
@@ -1857,19 +1877,27 @@ pub async fn run_sandbox_instance(
         if !retain_access {
             instance_readiness.release();
         }
-        boundary_access
-            .publish_main_exit(exit_code, await_main_process_attachment)
-            .await;
+        let publish = boundary_access.publish_main_exit(exit_code, await_main_process_attachment);
+        if let Some(deadline) = shutdown_deadline {
+            let _ = tokio::time::timeout_at(deadline, publish).await;
+        } else {
+            publish.await;
+        }
+        let flush_timeout = shutdown_deadline.map_or(otlp_relay::FLUSH_TIMEOUT, |deadline| {
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(otlp_relay::FLUSH_TIMEOUT)
+        });
         // Flush relayed agent traces before the exit is reported so the last
         // spans of a short run are not lost. Bounded; never fails. When the
         // access plane is retained for exec sessions, the relay keeps serving
         // them and shuts down at final teardown instead.
         if retain_access {
             if let Some(relay) = otlp_relay.as_ref() {
-                relay.flush(otlp_relay::FLUSH_TIMEOUT).await;
+                relay.flush(flush_timeout).await;
             }
         } else if let Some(relay) = otlp_relay.take() {
-            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+            relay.shutdown(flush_timeout).await;
         }
         // `shutdown_requested` has already completed when shutdown won the
         // lifecycle select above and must not be polled again.
@@ -1930,6 +1958,58 @@ pub async fn run_sandbox_instance(
     drop(networking);
 
     Ok(exit_code)
+}
+
+/// Waits for a stopping workload, terminates its boundary, and returns the
+/// workload's exit code.
+///
+/// With a `deadline`, stopping also ends this process: the stop is abandoned
+/// when the deadline passes, and a lost boundary does not fail it. The
+/// workload's status is reported when the boundary returned one, otherwise
+/// `STOPPED_EXIT_CODE`.
+async fn stop_workload<W, T, F>(
+    wait: W,
+    terminate: T,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<i32>
+where
+    W: Future<
+        Output = std::result::Result<
+            openshell_isolation_interface::contract::BoundaryExitStatus,
+            openshell_isolation_interface::contract::BackendError,
+        >,
+    >,
+    T: FnOnce() -> F,
+    F: Future<
+        Output = std::result::Result<(), openshell_isolation_interface::contract::BackendError>,
+    >,
+{
+    let Some(deadline) = deadline else {
+        let status = wait
+            .await
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        terminate().await.map_err(|error| {
+            miette::miette!("sandbox did not acknowledge terminal state: {error}")
+        })?;
+        return Ok(boundary_exit_code(status));
+    };
+    let mut observed = None;
+    let stop = async {
+        observed = Some(wait.await?);
+        terminate().await
+    };
+    match tokio::time::timeout_at(deadline, stop).await {
+        Ok(Ok(())) => {}
+        Ok(Err(
+            openshell_isolation_interface::contract::BackendError::Unavailable(error)
+            | openshell_isolation_interface::contract::BackendError::Terminated(error),
+        )) => {
+            warn!(%error, "Isolation boundary lost while stopping; finishing shutdown");
+        }
+        Ok(Err(error)) => return Err(miette::miette!("stop sandbox workload: {error}")),
+        Err(_) => warn!("Isolation boundary did not stop in time; finishing shutdown"),
+    }
+    Ok(observed.map_or(STOPPED_EXIT_CODE, boundary_exit_code))
 }
 
 fn boundary_exit_code(status: openshell_isolation_interface::contract::BoundaryExitStatus) -> i32 {
@@ -5030,6 +5110,80 @@ mod tests {
             completion_phase_or_shutdown(std::future::pending(), shutdown.as_mut()).await,
             "shutdown must cancel an indefinitely retrying completion phase"
         );
+    }
+
+    use openshell_isolation_interface::contract::{BackendError, BoundaryExitStatus};
+
+    fn stop_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + SHUTDOWN_TIMEOUT
+    }
+
+    #[tokio::test]
+    async fn stopping_process_keeps_workload_status_when_boundary_is_lost() {
+        let exit_code = stop_workload(
+            async { Ok(BoundaryExitStatus::Exited(0)) },
+            || async { Err(BackendError::Unavailable("connection lost".into())) },
+            Some(stop_deadline()),
+        )
+        .await
+        .expect("a lost boundary does not fail the stop");
+        assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn stopping_process_reports_terminated_without_workload_status() {
+        let exit_code = stop_workload(
+            async { Err(BackendError::Terminated("boundary lost during wait".into())) },
+            || async { Ok(()) },
+            Some(stop_deadline()),
+        )
+        .await
+        .expect("a lost boundary does not fail the stop");
+        assert_eq!(exit_code, STOPPED_EXIT_CODE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopping_process_keeps_workload_status_past_its_deadline() {
+        let exit_code = stop_workload(
+            async { Ok(BoundaryExitStatus::Exited(3)) },
+            std::future::pending,
+            Some(stop_deadline()),
+        )
+        .await
+        .expect("an expired deadline does not fail the stop");
+        assert_eq!(exit_code, 3);
+    }
+
+    #[tokio::test]
+    async fn hosted_instance_stop_fails_when_boundary_is_lost() {
+        let error = stop_workload(
+            async { Ok(BoundaryExitStatus::Exited(0)) },
+            || async { Err(BackendError::Unavailable("connection lost".into())) },
+            None,
+        )
+        .await
+        .expect_err("a hosted instance reports a stop it could not confirm");
+        assert!(
+            error
+                .to_string()
+                .contains("sandbox did not acknowledge terminal state"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hosted_instance_stop_is_not_bounded_by_shutdown_timeout() {
+        let exit_code = stop_workload(
+            async {
+                tokio::time::sleep(SHUTDOWN_TIMEOUT * 2).await;
+                Ok(BoundaryExitStatus::Exited(0))
+            },
+            || async { Ok(()) },
+            None,
+        )
+        .await
+        .expect("hosted instance stops");
+        assert_eq!(exit_code, 0);
     }
 
     #[test]
