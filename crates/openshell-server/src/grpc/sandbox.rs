@@ -56,7 +56,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -741,12 +741,14 @@ async fn handle_create_sandbox_inner(
         crate::compute::provisioning_deadline::new_preparation_record(
             now_ms,
             state.config.image_preparation_timeout_seconds,
+            state.config.provisioning_repair_window_seconds * 1000,
         ),
     );
     crate::compute::provisioning_deadline::refresh_configuration(
         &state.store,
         &mut sandbox,
         now_ms,
+        state.config.provisioning_repair_window_seconds * 1000,
     )
     .await
     .map_err(Status::internal)?;
@@ -3928,12 +3930,10 @@ async fn run_interactive_exec_with_russh(
         )));
     }
 
-    let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
-        .await
-        .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
-    // russh client end of the loopback exec bridge — disable Nagle so keystroke
-    // and PTY tinygrams don't stall on delayed ACKs.
-    set_tcp_nodelay_best_effort(&stream);
+    let stream =
+        openshell_core::net::connect_tcp_nodelay_best_effort(("127.0.0.1", local_proxy_port))
+            .await
+            .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
 
     let config = Arc::new(exec_ssh_client_config());
     let remote_sshid = Arc::new(std::sync::Mutex::new(None));
@@ -4188,12 +4188,10 @@ async fn run_exec_with_russh(
         )));
     }
 
-    let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
-        .await
-        .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
-    // russh client end of the loopback exec bridge — disable Nagle so keystroke
-    // and PTY tinygrams don't stall on delayed ACKs.
-    set_tcp_nodelay_best_effort(&stream);
+    let stream =
+        openshell_core::net::connect_tcp_nodelay_best_effort(("127.0.0.1", local_proxy_port))
+            .await
+            .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
 
     let config = Arc::new(exec_ssh_client_config());
     let remote_sshid = Arc::new(std::sync::Mutex::new(None));

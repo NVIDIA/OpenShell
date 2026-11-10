@@ -1891,6 +1891,10 @@ fn error_to_errno(error: &io::Error) -> i32 {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests dial from the confined workload, where socket options are not under test"
+)]
 mod tests {
     use super::*;
     use crate::linux::socket_confinement;

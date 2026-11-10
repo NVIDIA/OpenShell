@@ -257,7 +257,7 @@ the image/effective policy or provider configuration. The supervisor remains
 alive while the workload stays unstarted. Inspect `openshell sandbox get` and
 repair the desired configuration with a complete policy replacement or provider
 change; do not treat a healthy container as proof that the workload is ready.
-If the 300-second provisioning repair window expires, the gateway records
+If the provisioning repair window (default 300 seconds) expires, the gateway records
 `ProvisioningTimedOut` and stops workload and supervisor compute. Inspect
 `provisioning` in sandbox JSON and TUI NOTES to distinguish cleanup pending from
 complete. Repairing configuration after expiry does not restart compute: wait
@@ -270,6 +270,14 @@ launching the workload while configuration is repaired. An unavailable boundary
 fails discovery within its control-request deadline. Permanent
 gateway errors and exhausted transient retries terminate startup; inspect those
 errors as connectivity, authorization, or lifecycle failures.
+
+For slow Kubernetes isolation backends, increase `runtime_bootstrap_grace_seconds`
+and the dedicated supervisor's `sandbox_attach_request_timeout_seconds` together.
+Shared supervisor deployments instead need `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS`
+on each shared host. The default is 300 seconds; allowed values are 1 through
+86400. Restart affected components and explicitly start a timed-out sandbox
+after cleanup; changing settings does not reset a persisted admission deadline.
+See [gateway configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#slow-sandbox-startup).
 
 ### Step 4: Check Docker-Backed Gateways
 
