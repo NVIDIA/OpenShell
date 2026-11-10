@@ -9,6 +9,7 @@
 //! program in `src/main.rs` runs them by linking this library.
 
 mod cli;
+mod credential_gating;
 mod file_transfer;
 mod lifecycle;
 mod persistent_workspace;

@@ -7,10 +7,12 @@ use std::fmt;
 
 use openshell_sdk::SdkError;
 
-/// A test failure: a message with the context it happened in.
+/// A test failure: a message with the context it happened in, and the gRPC
+/// status code when the gateway refused a request.
 #[derive(Debug)]
 pub struct Error {
     message: String,
+    code: Option<tonic::Code>,
 }
 
 /// The result of a test or test step.
@@ -20,7 +22,21 @@ impl Error {
     pub fn msg(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            code: None,
         }
+    }
+
+    /// A gateway's refusal, keeping its status code for [`Error::grpc_code`].
+    pub fn from_status(status: &tonic::Status) -> Self {
+        Self {
+            code: Some(status.code()),
+            ..Self::from_error(status)
+        }
+    }
+
+    /// The gRPC status code, when the gateway refused a request.
+    pub fn grpc_code(&self) -> Option<tonic::Code> {
+        self.code
     }
 
     pub fn from_display(error: impl fmt::Display) -> Self {
@@ -45,7 +61,10 @@ impl Error {
 
     #[must_use]
     pub fn context(self, context: impl fmt::Display) -> Self {
-        Self::msg(format!("{context}: {}", self.message))
+        Self {
+            message: format!("{context}: {}", self.message),
+            code: self.code,
+        }
     }
 }
 
@@ -59,7 +78,10 @@ impl std::error::Error for Error {}
 
 impl From<SdkError> for Error {
     fn from(error: SdkError) -> Self {
-        Self::from_error(&error)
+        Self {
+            code: error.grpc_status().map(tonic::Status::code),
+            ..Self::from_error(&error)
+        }
     }
 }
 
