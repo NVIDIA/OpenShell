@@ -320,7 +320,8 @@ invalidate the view. This is not a cross-resource transaction. Reads are bounded
 to 1,000 records, 4,096 routes, 4 MiB, and ten seconds. A per-workspace cache shares
 one collection for a one-second refresh interval, retains at most 16 workspaces,
 and never returns expired routes. At most four collections and 16 unary snapshot
-requests run concurrently per gateway. Unary admission permits four requests per
+requests run concurrently per gateway. Collections wait for a free slot within
+the ten-second timeout. Unary admission permits four requests per
 principal and eight per workspace. Overflow returns `RESOURCE_EXHAUSTED`; storage
 failure or timeout returns `UNAVAILABLE`; malformed records return `INTERNAL`.
 Watches recheck bearer authentication and workspace authorization each second,
