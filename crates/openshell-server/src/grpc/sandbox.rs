@@ -2484,7 +2484,7 @@ pub(super) async fn handle_watch_sandbox(
             // Events drained above the publication watermark. They are held
             // back rather than emitted so the client's highest delivered cursor
             // is never above an event still queued on the other source.
-            let mut deferred: Vec<CursoredEvent> = Vec::new();
+            let mut deferred: Vec<Arc<CursoredEvent>> = Vec::new();
 
             loop {
                 // Events withheld by the previous round are already in hand, so
@@ -2673,7 +2673,11 @@ pub(super) async fn handle_watch_sandbox(
                             continue;
                         }
                     }
-                    if tx.send(Ok(cursored.event)).await.is_err() {
+                    if tx
+                        .send(Ok(Arc::unwrap_or_clone(cursored).event))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
