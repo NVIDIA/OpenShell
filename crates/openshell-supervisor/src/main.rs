@@ -234,6 +234,10 @@ struct Args {
     #[arg(long, hide = true)]
     main_exit_marker: Option<PathBuf>,
 
+    /// Driver-owned acknowledgement of a successful guest filesystem flush.
+    #[arg(long, hide = true)]
+    termination_ack_marker: Option<PathBuf>,
+
     /// Stdin is a driver-owned liveness pipe. EOF means the driver exited.
     #[arg(long, hide = true)]
     parent_liveness_stdin: bool,
@@ -400,6 +404,7 @@ fn validate_role_arguments(args: &Args) -> Result<()> {
                 || args.health_socket_path.is_some()
                 || args.health_port.is_some()
                 || args.main_exit_marker.is_some()
+                || args.termination_ack_marker.is_some()
                 || args.parent_liveness_stdin
             {
                 return Err(miette::miette!(
@@ -431,6 +436,17 @@ fn validate_main_exit_marker(marker: Option<&Path>) -> Result<()> {
     {
         return Err(miette::miette!(
             "--main-exit-marker must be an absolute path"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_termination_ack_marker(marker: Option<&Path>) -> Result<()> {
+    if let Some(marker) = marker
+        && !marker.is_absolute()
+    {
+        return Err(miette::miette!(
+            "--termination-ack-marker must be an absolute path"
         ));
     }
     Ok(())
@@ -475,6 +491,7 @@ fn main() -> Result<()> {
     validate_role_arguments(&args)?;
     arm_parent_liveness(args.parent_liveness_stdin)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
+    validate_termination_ack_marker(args.termination_ack_marker.as_deref())?;
     let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
         let admitted_backend =
             std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND)
@@ -660,6 +677,7 @@ fn main() -> Result<()> {
                     auth_bundle,
                     admitted_isolation_backend: Some(admitted_backend),
                     main_exit_marker: args.main_exit_marker,
+                    termination_ack_marker: args.termination_ack_marker,
                     trace_context: openshell_supervisor::trace_context_from_environment(),
                     provider_workload_api_socket: std::env::var_os(
                         openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
@@ -1382,5 +1400,7 @@ mod tests {
         assert!(validate_main_exit_marker(Some(Path::new("relative"))).is_err());
         let absolute = std::env::temp_dir().join("openshell-main-exit");
         assert!(validate_main_exit_marker(Some(&absolute)).is_ok());
+        assert!(validate_termination_ack_marker(Some(Path::new("relative"))).is_err());
+        assert!(validate_termination_ack_marker(Some(&absolute)).is_ok());
     }
 }

@@ -62,6 +62,7 @@ tar = { version = "0.4", optional = true }
 flate2 = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
 zstd = { version = "0.14", optional = true }
+tempfile = "3"
 
 [features]
 # Portable test instrumentation, independent of the compute runtime.
@@ -118,7 +119,6 @@ defaults-without-telemetry = ["compute-driver"]
 [dev-dependencies]
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 temp-env = "0.3"
-tempfile = "3"
 rcgen = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 

@@ -1729,6 +1729,7 @@ bootstrap_image  = "nvcr.io/nvidia/base/ubuntu:24.04"
 krun_log_level   = 1
 vcpus            = 2
 mem_mib          = 2048
+# Initial size for new overlays; full-disk recovery can grow an existing overlay.
 overlay_disk_mib = 4096
 # Resolved sandbox UID/GID for new rootfs /etc/passwd entries.
 # Defaults to the image's sandbox account, or 1000 when the account is absent;
@@ -1867,6 +1868,8 @@ systemctl --user restart openshell-gateway
 ### Check local VM host tools
 
 For an explicitly selected local `vm` driver, preflight also checks a formatter (`mke2fs` or `mkfs.ext4`), `debugfs`, and `e2fsck`. Install e2fsprogs 1.43 or newer with your operating system's package manager. OpenShell does not install or manage these host dependencies.
+
+Full-overlay recovery also uses `resize2fs` from e2fsprogs. The current preflight does not check this tool; ensure it is available to the gateway service before relying on recovery.
 
 For example, on macOS:
 

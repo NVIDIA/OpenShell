@@ -247,6 +247,26 @@ the overlay while cached image disks remain unchanged. The overlay disk must be
 large enough to hold the compressed payload, unpacked rootfs, and sandbox writes
 during the first prepare.
 
+On restart, the driver checks a preserved overlay with read-only `e2fsck`,
+then replays the journal and checks the filesystem on a private copy before
+writing new launch files. If fewer than 32 MiB are available after the check,
+it grows the sparse disk and ext4 filesystem by at least 64 MiB and rechecks
+usable space before booting. Recovery can grow further in the same start.
+The driver refuses a full overlay if journal replay or repair would release
+saved blocks, or if preen requests orphan reconnection or another interactive
+repair. The original image remains untouched in these cases. Guest credential
+cleanup runs on the recovered copy after journal replay. VM shutdown flushes
+the guest filesystem and records a durable acknowledgement. A restart refuses
+an unacknowledged flush, and older overlays with an unreplayed journal are
+refused if no acknowledgement exists.
+The driver publishes an `OverlayDiskFull` warning when it grows the disk. Later
+full-disk restarts can grow it again. `overlay_disk_mib` sets the initial size
+of new overlays; it is not a hard cap on recovery growth, and changing it does
+not resize existing overlays. Recovery requires `resize2fs` on the gateway
+host. A missing previously published overlay is never replaced with an empty
+one. A failed recovery reports `OverlayDiskFull` and retains the original
+image for inspection.
+
 The driver also writes the accepted `DriverSandbox` launch request to
 `<state-dir>/sandboxes/<id>/sandbox.pb`. If the gateway restarts, it starts a
 new VM driver process. During graceful shutdown, the gateway first sends the
@@ -297,7 +317,7 @@ create TAP devices or install nftables/iptables rules.
 
 - macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
 - Rust toolchain
-- e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation and QEMU environment injection
+- e2fsprogs (`mke2fs` or `mkfs.ext4`, `debugfs`, `e2fsck`, and `resize2fs`) for root and overlay disk image creation and recovery
 - Guest-sandbox cross-compile toolchain (needed on macOS, and on Linux when host arch differs from the guest):
   - Matching static guest target: `rustup target add aarch64-unknown-linux-musl` (or `x86_64-unknown-linux-musl` for an amd64 guest)
   - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` cross-compiles the Linux guest `openshell-sandbox` and its matching `openshell-supervisor`.

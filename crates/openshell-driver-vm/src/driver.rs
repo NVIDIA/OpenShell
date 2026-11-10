@@ -21,10 +21,10 @@ use crate::lifecycle::{
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
     ext4_image_has_directory, extract_host_supervisor, extract_rootfs_archive_to,
-    prepare_sandbox_rootfs_from_image_root, recover_rootfs_image, remove_rootfs_image_file,
-    sandbox_guest_init_path, sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
-    sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
-    validate_host_supervisor, write_rootfs_image_file,
+    prepare_sandbox_rootfs_from_image_root, recover_rootfs_image_with_cleanup,
+    rootfs_image_needs_recovery, sandbox_guest_init_path, sandbox_guest_runtime_identity,
+    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
+    set_rootfs_image_file_mode, validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -215,6 +215,7 @@ const GUEST_BOUNDARY_CONFIG_ENV: &str = "OPENSHELL_VM_SANDBOX_BOOTSTRAP";
 const HOST_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
 const HOST_RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const HOST_BOUNDARY_GENERATION_FILE: &str = "boundary-generation";
+const PENDING_GUEST_GENERATIONS_FILE: &str = "pending-guest-generations";
 /// Per-sandbox host-only copy of the gateway-normalized destination trust.
 ///
 /// This file is deliberately outside the VM disks. The host supervisor is the
@@ -244,6 +245,10 @@ const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
 const OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION: &str = "sandbox-overlay-ext4-v1";
 const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
+const SANDBOX_OVERLAY_UNPUBLISHED_FILE: &str = "overlay-unpublished";
+const SANDBOX_OVERLAY_PUBLISHED_FILE: &str = "overlay-published";
+const SANDBOX_OVERLAY_RUNNING_FILE: &str = "overlay-running-unconfirmed";
+const SANDBOX_OVERLAY_FLUSH_ACK_FILE: &str = "overlay-flush-ack";
 const SANDBOX_OWNER_STATE_FILE: &str = "sandbox-owner-state";
 const SANDBOX_OWNER_STATE_V1: &str = "sandbox-owner-v1";
 const SANDBOX_OWNER_STATE_V2: &str = "sandbox-owner-v2";
@@ -1488,6 +1493,9 @@ impl VmDriver {
             );
         }
         configure_main_exit_marker(&mut command, state_dir);
+        command
+            .arg("--termination-ack-marker")
+            .arg(state_dir.join(SANDBOX_OVERLAY_FLUSH_ACK_FILE));
         if let Some(tls) = tls_paths {
             command.env(openshell_core::sandbox_env::TLS_CA, &tls.ca);
         }
@@ -1787,7 +1795,11 @@ impl VmDriver {
             self.fail_provisioning(
                 &sandbox_id,
                 &state_dir,
-                "ProvisioningFailed",
+                if err.message().contains("OverlayDiskFull:") {
+                    "OverlayDiskFull"
+                } else {
+                    "ProvisioningFailed"
+                },
                 err.message(),
                 overlay_preparation == OverlayPreparation::Fresh,
             )
@@ -1904,6 +1916,10 @@ impl VmDriver {
                 "Preparing writable VM overlay disk".to_string(),
             ),
         );
+        let previous_overlay_size = tokio::fs::metadata(&overlay_disk)
+            .await
+            .ok()
+            .map(|m| m.len());
         let sandbox_owner_state = self
             .prepare_overlay_in_worker(
                 &sandbox.id,
@@ -1916,6 +1932,26 @@ impl VmDriver {
             )
             .await
             .map_err(|err| Status::internal(format!("prepare guest overlay disk failed: {err}")))?;
+        if let Some(previous_size) = previous_overlay_size {
+            let recovered_size = tokio::fs::metadata(&overlay_disk)
+                .await
+                .map_err(|error| Status::internal(format!("stat recovered overlay: {error}")))?
+                .len();
+            if recovered_size > previous_size {
+                self.publish_platform_event(
+                    sandbox.id.clone(),
+                    platform_event(
+                        "vm",
+                        "Warning",
+                        "OverlayDiskFull",
+                        format!(
+                            "VM overlay was nearly full and grew by {} MiB for recovery; remove files or increase [openshell.drivers.vm] overlay_disk_mib for new sandboxes",
+                            (recovered_size - previous_size) / (1024 * 1024)
+                        ),
+                    ),
+                );
+            }
+        }
         self.ensure_provisioning_active(&sandbox.id).await?;
 
         if let Err(err) =
@@ -2216,7 +2252,7 @@ impl VmDriver {
             console_output = %console_output.display(),
             "vm driver: spawning VM launcher"
         );
-        let mut child = match command.spawn() {
+        let mut child = match spawn_vm_launcher_with_overlay_run(&mut command, &state_dir) {
             Ok(child) => child,
             Err(err) => {
                 warn!(
@@ -3630,11 +3666,72 @@ impl VmDriver {
 
         let template_path = overlay_template_image(&self.config.state_dir, overlay_size_bytes);
         let overlay_metadata = tokio::fs::metadata(&overlay_disk).await;
-        let recover_preserved_overlay = preparation == OverlayPreparation::PreserveExisting
-            && overlay_metadata.as_ref().is_ok_and(fs::Metadata::is_file);
-        let publish_new_overlay = preparation == OverlayPreparation::Fresh
-            || matches!(overlay_metadata, Err(error) if error.kind() == std::io::ErrorKind::NotFound);
-        if !overlay_template_image_ready(&template_path, overlay_size_bytes).await? {
+        let overlay_exists = match overlay_metadata {
+            Ok(metadata) if metadata.is_file() => true,
+            Ok(_) => {
+                return Err(format!(
+                    "overlay path {} is not a regular file",
+                    overlay_disk.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!("stat overlay {}: {error}", overlay_disk.display()));
+            }
+        };
+        let guest_flush_acknowledged = verify_overlay_shutdown(state_dir)?;
+        if preparation == OverlayPreparation::PreserveExisting
+            && overlay_exists
+            && !guest_flush_acknowledged
+            && rootfs_image_needs_recovery(&overlay_disk)?
+        {
+            return Err(format!(
+                "OverlayDiskFull: saved overlay {} has an unconfirmed ext4 journal; refusing to replay it without a guest filesystem flush acknowledgement",
+                overlay_disk.display()
+            ));
+        }
+        let published_marker = state_dir.join(SANDBOX_OVERLAY_PUBLISHED_FILE);
+        let unpublished_marker = state_dir.join(SANDBOX_OVERLAY_UNPUBLISHED_FILE);
+        let published = tokio::fs::try_exists(&published_marker)
+            .await
+            .map_err(|error| format!("inspect {}: {error}", published_marker.display()))?;
+        let unpublished = tokio::fs::try_exists(&unpublished_marker)
+            .await
+            .map_err(|error| format!("inspect {}: {error}", unpublished_marker.display()))?;
+        let publish_new_overlay = match (preparation, overlay_exists) {
+            (OverlayPreparation::Fresh, false) if !published => {
+                persist_overlay_marker(state_dir, SANDBOX_OVERLAY_UNPUBLISHED_FILE, true)?;
+                true
+            }
+            (OverlayPreparation::Fresh, _) => {
+                return Err(format!(
+                    "existing overlay state {} cannot be replaced during fresh preparation",
+                    overlay_disk.display()
+                ));
+            }
+            (OverlayPreparation::PreserveExisting, true) => {
+                // Legacy overlays acquire the marker before any repair, so a
+                // later missing image can never be mistaken for a first start.
+                persist_overlay_marker(state_dir, SANDBOX_OVERLAY_PUBLISHED_FILE, true)?;
+                false
+            }
+            (OverlayPreparation::PreserveExisting, false) if unpublished && !published => true,
+            (OverlayPreparation::PreserveExisting, false) => {
+                return Err(format!(
+                    "OverlayDiskFull: saved overlay {} is missing; refusing to create an empty replacement",
+                    overlay_disk.display()
+                ));
+            }
+        };
+        let cleanup_paths = if preparation == OverlayPreparation::PreserveExisting && overlay_exists
+        {
+            pending_guest_generation_paths(state_dir).await?
+        } else {
+            Vec::new()
+        };
+        if publish_new_overlay
+            && !overlay_template_image_ready(&template_path, overlay_size_bytes).await?
+        {
             let _cache_guard = self.image_cache_lock.lock().await;
             let template_path = template_path.clone();
             let staging_dir = self.image_staging_dir("overlay-template");
@@ -3652,6 +3749,7 @@ impl VmDriver {
         }
 
         let overlay_to_recover = overlay_disk.clone();
+        let state_dir_for_publish = state_dir.to_path_buf();
         let staging_dir = self.image_staging_dir("writable-overlay");
         let result = tokio::task::spawn_blocking(move || {
             if publish_new_overlay {
@@ -3664,10 +3762,14 @@ impl VmDriver {
                 prepare_sandbox_overlay_image(
                     &template_path,
                     &staging_overlay,
-                    preparation,
+                    OverlayPreparation::Fresh,
                     overlay_size_bytes,
                 )?;
-                fs::rename(&staging_overlay, &overlay_disk).map_err(|error| error.to_string())
+                publish_sandbox_overlay_image(
+                    &state_dir_for_publish,
+                    &staging_overlay,
+                    &overlay_disk,
+                )
             } else {
                 prepare_sandbox_overlay_image(
                     &template_path,
@@ -3680,10 +3782,26 @@ impl VmDriver {
         .await
         .map_err(|err| format!("overlay image preparation panicked: {err}"))?;
         result?;
-        if recover_preserved_overlay {
-            tokio::task::spawn_blocking(move || recover_rootfs_image(&overlay_to_recover))
-                .await
-                .map_err(|error| format!("overlay recovery panicked: {error}"))??;
+        if preparation == OverlayPreparation::PreserveExisting && overlay_exists {
+            tokio::task::spawn_blocking(move || {
+                recover_rootfs_image_with_cleanup(&overlay_to_recover, &cleanup_paths)
+            })
+            .await
+            .map_err(|error| format!("overlay recovery panicked: {error}"))??;
+            let pending = state_dir.join(PENDING_GUEST_GENERATIONS_FILE);
+            if let Err(error) = tokio::fs::remove_file(&pending).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(path = %pending.display(), %error, "could not clear guest cleanup marker");
+            }
+        }
+        if publish_new_overlay {
+            let unpublished = state_dir.join(SANDBOX_OVERLAY_UNPUBLISHED_FILE);
+            if let Err(error) = tokio::fs::remove_file(&unpublished).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(path = %unpublished.display(), %error, "could not clear unpublished overlay marker");
+            }
         }
         if write_owner_state && !owner_state_written_before_prepare {
             write_sandbox_owner_state(state_dir, owner_state).await?;
@@ -6876,6 +6994,132 @@ fn sandbox_overlay_image(state_dir: &Path) -> PathBuf {
     state_dir.join(SANDBOX_OVERLAY_IMAGE)
 }
 
+fn persist_overlay_marker(
+    state_dir: &Path,
+    name: &str,
+    allow_existing: bool,
+) -> Result<(), String> {
+    let path = state_dir.join(name);
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if allow_existing && error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if path.is_file() {
+                return Ok(());
+            }
+            return Err(format!(
+                "overlay marker {} is not a regular file",
+                path.display()
+            ));
+        }
+        Err(error) => return Err(format!("create overlay marker {}: {error}", path.display())),
+    };
+    file.write_all(b"overlay-marker-v1\n")
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::File::open(state_dir)?.sync_all())
+        .map_err(|error| format!("persist overlay marker {}: {error}", path.display()))
+}
+
+fn publish_sandbox_overlay_image(
+    state_dir: &Path,
+    staged_overlay: &Path,
+    overlay_disk: &Path,
+) -> Result<(), String> {
+    fs::rename(staged_overlay, overlay_disk)
+        .map_err(|error| format!("publish overlay {}: {error}", overlay_disk.display()))?;
+    // Make the final image name durable before the marker can say it was
+    // published. A failed marker write leaves an existing image to recover.
+    fs::File::open(state_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync overlay directory {}: {error}", state_dir.display()))?;
+    persist_overlay_marker(state_dir, SANDBOX_OVERLAY_PUBLISHED_FILE, false)
+}
+
+fn remove_overlay_marker(state_dir: &Path, name: &str) -> Result<(), String> {
+    let path = state_dir.join(name);
+    match fs::remove_file(&path) {
+        Ok(()) => fs::File::open(state_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("remove overlay marker {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove overlay marker {}: {error}", path.display())),
+    }
+}
+
+fn verify_overlay_shutdown(state_dir: &Path) -> Result<bool, String> {
+    let running = state_dir.join(SANDBOX_OVERLAY_RUNNING_FILE);
+    if !running.try_exists().map_err(|error| error.to_string())? {
+        return Ok(false);
+    }
+    let ack = state_dir.join(SANDBOX_OVERLAY_FLUSH_ACK_FILE);
+    if !ack.try_exists().map_err(|error| error.to_string())? {
+        return Err(format!(
+            "OverlayDiskFull: guest filesystem flush was not acknowledged for {}; refusing to recover the saved overlay",
+            state_dir.display()
+        ));
+    }
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviousOverlayRunState {
+    running: bool,
+    acknowledged: bool,
+}
+
+fn begin_overlay_run(state_dir: &Path) -> Result<PreviousOverlayRunState, String> {
+    let previous = PreviousOverlayRunState {
+        running: state_dir
+            .join(SANDBOX_OVERLAY_RUNNING_FILE)
+            .try_exists()
+            .map_err(|error| error.to_string())?,
+        acknowledged: state_dir
+            .join(SANDBOX_OVERLAY_FLUSH_ACK_FILE)
+            .try_exists()
+            .map_err(|error| error.to_string())?,
+    };
+    // Record the possible VM run before removing the old acknowledgement.
+    // The launcher cannot start until the acknowledgement is durably gone.
+    persist_overlay_marker(state_dir, SANDBOX_OVERLAY_RUNNING_FILE, true)?;
+    if let Err(error) = remove_overlay_marker(state_dir, SANDBOX_OVERLAY_FLUSH_ACK_FILE) {
+        rollback_overlay_run(state_dir, previous)?;
+        return Err(error);
+    }
+    Ok(previous)
+}
+
+fn rollback_overlay_run(state_dir: &Path, previous: PreviousOverlayRunState) -> Result<(), String> {
+    if previous.acknowledged {
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_FLUSH_ACK_FILE, true)?;
+    }
+    if !previous.running {
+        remove_overlay_marker(state_dir, SANDBOX_OVERLAY_RUNNING_FILE)?;
+    }
+    Ok(())
+}
+
+fn spawn_vm_launcher_with_overlay_run(
+    command: &mut Command,
+    state_dir: &Path,
+) -> Result<Child, String> {
+    // A restart after an unacknowledged guest flush cannot claim that the
+    // disk is healthy, even if journal replay happens to be clean.
+    let previous = begin_overlay_run(state_dir)?;
+    match command.spawn() {
+        Ok(child) => Ok(child),
+        Err(error) => {
+            rollback_overlay_run(state_dir, previous).map_err(|rollback| {
+                format!("launch VM helper: {error}; restore overlay markers: {rollback}")
+            })?;
+            Err(error.to_string())
+        }
+    }
+}
+
 fn overlay_template_image(root: &Path, size_bytes: u64) -> PathBuf {
     image_cache_root_dir(root)
         .join(OVERLAY_TEMPLATE_CACHE_DIR)
@@ -7400,24 +7644,25 @@ async fn remove_runtime_generation_material(state_dir: &Path) -> Result<(), Stri
         Err(error) => return Err(format!("read boundary generation marker: {error}")),
     };
     if !generation.is_empty() {
-        let overlay = sandbox_runtime_disk_paths(state_dir).overlay_disk;
-        let generation_for_cleanup = generation.clone();
-        tokio::task::spawn_blocking(move || {
-            let tls = guest_boundary_tls_paths(&generation_for_cleanup);
-            for guest_path in [
-                PathBuf::from(guest_boundary_config_path(&generation_for_cleanup)),
-                tls.certificate_chain_path,
-                tls.private_key_path,
-            ] {
-                remove_rootfs_image_file(
-                    &overlay,
-                    &overlay_upper_path(&guest_path.to_string_lossy()),
-                )?;
-            }
-            Ok::<(), String>(())
-        })
-        .await
-        .map_err(|error| format!("guest authentication cleanup task failed: {error}"))??;
+        // The guest may have left ext4 metadata in its journal. Writing with
+        // debugfs before e2fsck replays that journal can corrupt saved files.
+        // Queue guest credential cleanup until recovery has completed.
+        let pending = state_dir.join(PENDING_GUEST_GENERATIONS_FILE);
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&pending)
+            .await
+            .map_err(|error| format!("open {}: {error}", pending.display()))?;
+        file.write_all(format!("{generation}\n").as_bytes())
+            .await
+            .map_err(|error| format!("persist {}: {error}", pending.display()))?;
+        file.sync_all()
+            .await
+            .map_err(|error| format!("sync {}: {error}", pending.display()))?;
+        restrict_owner_read_write(&pending)
+            .await
+            .map_err(|error| format!("protect {}: {error}", pending.display()))?;
     }
     for path in [
         state_dir.join(HOST_AUTH_BUNDLE_FILE),
@@ -7431,6 +7676,35 @@ async fn remove_runtime_generation_material(state_dir: &Path) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+async fn pending_guest_generation_paths(state_dir: &Path) -> Result<Vec<String>, String> {
+    let pending = state_dir.join(PENDING_GUEST_GENERATIONS_FILE);
+    let contents = match tokio::fs::read_to_string(&pending).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("read {}: {error}", pending.display())),
+    };
+    let mut paths = Vec::new();
+    for generation in contents.lines() {
+        if generation.is_empty()
+            || generation.len() > 128
+            || !generation
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(format!("invalid guest generation in {}", pending.display()));
+        }
+        let tls = guest_boundary_tls_paths(generation);
+        for guest_path in [
+            PathBuf::from(guest_boundary_config_path(generation)),
+            tls.certificate_chain_path,
+            tls.private_key_path,
+        ] {
+            paths.push(overlay_upper_path(&guest_path.to_string_lossy()));
+        }
+    }
+    Ok(paths)
 }
 
 async fn clear_explicit_start_markers(state_dir: &Path) -> Result<(), std::io::Error> {
@@ -7569,34 +7843,32 @@ fn prepare_sandbox_overlay_image(
     expected_size_bytes: u64,
 ) -> Result<(), String> {
     if preparation == OverlayPreparation::PreserveExisting {
-        match fs::metadata(overlay_disk) {
-            Ok(metadata) if metadata.is_file() && metadata.len() == expected_size_bytes => {
-                return Ok(());
-            }
-            Ok(metadata) if metadata.is_file() => {
-                return Err(format!(
-                    "existing overlay disk '{}' has size {}, expected {}",
-                    overlay_disk.display(),
-                    metadata.len(),
-                    expected_size_bytes
-                ));
-            }
-            Ok(_) => {
-                return Err(format!(
-                    "existing overlay path '{}' is not a file",
-                    overlay_disk.display()
-                ));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(format!(
-                    "stat overlay disk {}: {err}",
-                    overlay_disk.display()
-                ));
-            }
-        }
+        return match fs::metadata(overlay_disk) {
+            Ok(metadata) if metadata.is_file() => Ok(()),
+            Ok(_) => Err(format!(
+                "existing overlay path '{}' is not a file",
+                overlay_disk.display()
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                "OverlayDiskFull: saved overlay {} is missing; refusing to create an empty replacement",
+                overlay_disk.display()
+            )),
+            Err(err) => Err(format!(
+                "stat overlay disk {}: {err}",
+                overlay_disk.display()
+            )),
+        };
     }
 
+    let template_metadata = fs::metadata(template_path)
+        .map_err(|error| format!("stat overlay template {}: {error}", template_path.display()))?;
+    if !template_metadata.is_file() || template_metadata.len() != expected_size_bytes {
+        return Err(format!(
+            "overlay template '{}' must be a {} byte file",
+            template_path.display(),
+            expected_size_bytes
+        ));
+    }
     create_sandbox_overlay_image_from_template(template_path, overlay_disk)
 }
 
@@ -11325,22 +11597,390 @@ mod tests {
     }
 
     #[test]
-    fn prepare_sandbox_overlay_creates_missing_overlay_on_start() {
+    fn prepare_sandbox_overlay_preserves_recovery_growth_on_later_starts() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let template = base.join("template.ext4");
+        let overlay = base.join("overlay.ext4");
+        std::fs::write(&template, b"fresh-overlay").unwrap();
+        std::fs::write(&overlay, b"saved-overlay-with-recovery-space").unwrap();
+
+        prepare_sandbox_overlay_image(
+            &template,
+            &overlay,
+            OverlayPreparation::PreserveExisting,
+            "saved-overlay".len() as u64,
+        )
+        .expect("preserve grown overlay");
+
+        assert_eq!(
+            std::fs::read(&overlay).unwrap(),
+            b"saved-overlay-with-recovery-space"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn failed_vm_launcher_spawn_restores_previous_overlay_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path();
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::write(&overlay, b"saved workload data").unwrap();
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_RUNNING_FILE, false).unwrap();
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_FLUSH_ACK_FILE, false).unwrap();
+
+        let mut command = Command::new("/openshell-test/nonexistent-vm-launcher");
+        spawn_vm_launcher_with_overlay_run(&mut command, state_dir)
+            .expect_err("launcher spawn must fail");
+        assert!(verify_overlay_shutdown(state_dir).unwrap());
+        assert_eq!(std::fs::read(&overlay).unwrap(), b"saved workload data");
+
+        remove_overlay_marker(state_dir, SANDBOX_OVERLAY_RUNNING_FILE).unwrap();
+        remove_overlay_marker(state_dir, SANDBOX_OVERLAY_FLUSH_ACK_FILE).unwrap();
+        let mut command = Command::new("/openshell-test/nonexistent-vm-launcher");
+        spawn_vm_launcher_with_overlay_run(&mut command, state_dir)
+            .expect_err("first launcher spawn must fail");
+        assert!(!state_dir.join(SANDBOX_OVERLAY_RUNNING_FILE).exists());
+        assert!(!state_dir.join(SANDBOX_OVERLAY_FLUSH_ACK_FILE).exists());
+        assert_eq!(std::fs::read(&overlay).unwrap(), b"saved workload data");
+    }
+
+    #[tokio::test]
+    async fn failed_publish_marker_preserves_overlay_for_restore() {
+        if ["mke2fs", "e2fsck", "debugfs"]
+            .iter()
+            .any(|tool| openshell_core::e2fsprogs::resolve(&[tool]).is_err())
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path();
+        let source = state_dir.join("source");
+        let staging = state_dir.join("staging-overlay.ext4");
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::create_dir_all(source.join("upper")).unwrap();
+        std::fs::create_dir_all(source.join("work")).unwrap();
+        std::fs::write(source.join("upper/saved.txt"), b"saved workload data\n").unwrap();
+        create_ext4_image_from_dir_with_size(&source, &staging, 64 * 1024 * 1024).unwrap();
+        write_sandbox_owner_state(
+            state_dir,
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_UNPUBLISHED_FILE, false).unwrap();
+        let marker = state_dir.join(SANDBOX_OVERLAY_PUBLISHED_FILE);
+        std::fs::create_dir(&marker).unwrap();
+        let error = publish_sandbox_overlay_image(state_dir, &staging, &overlay)
+            .expect_err("marker write must fail after publishing the complete image");
+        assert!(error.contains("marker"), "{error}");
+        assert!(overlay.exists());
+        assert!(!staging.exists());
+        std::fs::remove_dir(&marker).unwrap();
+
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = state_dir.to_path_buf();
+        driver.config.overlay_disk_mib = 64;
+        driver
+            .prepare_runtime_overlay(
+                state_dir,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+            .expect("restore the already published image after marker failure");
+        assert!(marker.is_file());
+        let output =
+            std::process::Command::new(openshell_core::e2fsprogs::resolve(&["debugfs"]).unwrap())
+                .args(["-R", "cat /upper/saved.txt"])
+                .arg(&overlay)
+                .output()
+                .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"saved workload data\n");
+    }
+
+    #[tokio::test]
+    async fn missing_published_overlay_refuses_empty_replacement() {
+        let base = tempfile::tempdir().unwrap();
+        let state_dir = base.path();
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        write_sandbox_owner_state(
+            state_dir,
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_PUBLISHED_FILE, false).unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = state_dir.to_path_buf();
+        driver.config.overlay_disk_mib = 64;
+
+        let error = driver
+            .prepare_runtime_overlay(
+                state_dir,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+            .expect_err("previously published overlay must not be replaced");
+        assert!(error.contains("OverlayDiskFull"), "{error}");
+        assert!(!overlay.exists());
+        assert!(!overlay_template_image(state_dir, 64 * 1024 * 1024).exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_dirty_overlay_without_flush_ack_refuses_journal_replay() {
+        if openshell_core::e2fsprogs::resolve(&["mke2fs"]).is_err() {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let state_dir = base.path();
+        let source = state_dir.join("source");
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::create_dir_all(source.join("upper")).unwrap();
+        std::fs::create_dir_all(source.join("work")).unwrap();
+        std::fs::write(source.join("upper/recover.txt"), b"saved marker\n").unwrap();
+        create_ext4_image_from_dir_with_size(&source, &overlay, 64 * 1024 * 1024).unwrap();
+        let mut image = std::fs::read(&overlay).unwrap();
+        image[1024 + 0x60] |= 0x4; // ext4 incompat RECOVER: journal replay pending.
+        std::fs::write(&overlay, &image).unwrap();
+        write_sandbox_owner_state(
+            state_dir,
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = state_dir.to_path_buf();
+        driver.config.overlay_disk_mib = 64;
+        let error = driver
+            .prepare_runtime_overlay(
+                state_dir,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+            .expect_err("legacy dirty image cannot be replayed without a flush ack");
+        assert!(error.contains("OverlayDiskFull"), "{error}");
+        assert!(error.contains("unconfirmed ext4 journal"), "{error}");
+        assert_eq!(std::fs::read(&overlay).unwrap(), image);
+    }
+
+    #[tokio::test]
+    async fn stopped_full_overlay_keeps_saved_files_or_refuses_start() {
+        if ["mke2fs", "e2fsck", "debugfs", "resize2fs"]
+            .iter()
+            .any(|tool| openshell_core::e2fsprogs::resolve(&[tool]).is_err())
+        {
+            return;
+        }
+
+        let base = tempfile::tempdir().unwrap();
+        let state_dir = base.path();
+        let source = state_dir.join("source");
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        let generation = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::fs::create_dir_all(source.join("upper/.openshell/state")).unwrap();
+        std::fs::create_dir_all(source.join("work")).unwrap();
+        std::fs::write(source.join("upper/recover.txt"), b"saved marker\n").unwrap();
+        std::fs::write(source.join("upper/fill"), vec![b'A'; 55 * 1024 * 1024]).unwrap();
+        std::fs::write(
+            source.join(format!(
+                "upper/.openshell/state/bootstrap-{generation}.json"
+            )),
+            b"old launch configuration",
+        )
+        .unwrap();
+        // The production image builder reserves extra initial headroom. Use
+        // mke2fs directly here to reproduce a guest that later filled it.
+        std::fs::File::create(&overlay)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let formatter = openshell_core::e2fsprogs::resolve(&["mke2fs", "mkfs.ext4"]).unwrap();
+        let mkfs_result = std::process::Command::new(formatter)
+            .args(["-q", "-F", "-t", "ext4", "-E", "root_owner=0:0", "-d"])
+            .arg(&source)
+            .arg(&overlay)
+            .output()
+            .unwrap();
+        assert!(mkfs_result.status.success(), "{mkfs_result:?}");
+        let image_header = std::fs::read(&overlay).unwrap();
+        let superblock = &image_header[1024..];
+        let free_blocks = u32::from_le_bytes(superblock[0x0c..0x10].try_into().unwrap());
+        let reserved_blocks = u32::from_le_bytes(superblock[0x08..0x0c].try_into().unwrap());
+        assert!(
+            free_blocks <= reserved_blocks,
+            "the guest must have no usable overlay blocks"
+        );
+        write_sandbox_owner_state(
+            state_dir,
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        std::fs::write(state_dir.join(HOST_BOUNDARY_GENERATION_FILE), generation).unwrap();
+        let saved_image = std::fs::read(&overlay).unwrap();
+
+        remove_runtime_generation_material(state_dir)
+            .await
+            .expect("stop queues guest cleanup");
+        assert_eq!(
+            std::fs::read(&overlay).unwrap(),
+            saved_image,
+            "stop must not write to an image with an unreplayed journal"
+        );
+        assert!(state_dir.join(PENDING_GUEST_GENERATIONS_FILE).exists());
+
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = state_dir.to_path_buf();
+        driver.config.overlay_disk_mib = 64;
+        begin_overlay_run(state_dir).expect("persist unacknowledged VM run");
+        let error = driver
+            .prepare_runtime_overlay(
+                state_dir,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+            .expect_err("unacknowledged guest flush must refuse restart");
+        assert!(error.contains("OverlayDiskFull"), "{error}");
+        assert_eq!(std::fs::read(&overlay).unwrap(), saved_image);
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_FLUSH_ACK_FILE, false)
+            .expect("supervisor acknowledged guest flush");
+        match driver
+            .prepare_runtime_overlay(
+                state_dir,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                let debugfs = openshell_core::e2fsprogs::resolve(&["debugfs"]).unwrap();
+                let marker = std::process::Command::new(&debugfs)
+                    .args(["-R", "cat /upper/recover.txt"])
+                    .arg(&overlay)
+                    .output()
+                    .unwrap();
+                assert!(marker.status.success(), "{marker:?}");
+                assert_eq!(marker.stdout, b"saved marker\n");
+                let dump = state_dir.join("saved-fill");
+                let output = std::process::Command::new(&debugfs)
+                    .arg("-R")
+                    .arg(format!("dump /upper/fill {}", dump.display()))
+                    .arg(&overlay)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let contents = std::fs::read(&dump).expect("saved filler survived restart");
+                assert_eq!(contents, vec![b'A'; 55 * 1024 * 1024]);
+                assert!(!state_dir.join(PENDING_GUEST_GENERATIONS_FILE).exists());
+            }
+            Err(error) => {
+                assert!(error.contains("OverlayDiskFull"), "{error}");
+                assert_eq!(std::fs::read(&overlay).unwrap(), saved_image);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn overlay_recovery_preserves_smaller_disk_after_default_increase() {
+        if ["mke2fs", "e2fsck", "debugfs"]
+            .iter()
+            .any(|tool| openshell_core::e2fsprogs::resolve(&[tool]).is_err())
+        {
+            return;
+        }
+
+        let base = unique_temp_dir();
+        let source = base.join("source");
+        let overlay = base.join("overlay.ext4");
+        std::fs::create_dir_all(source.join("upper")).unwrap();
+        std::fs::create_dir_all(source.join("work")).unwrap();
+        std::fs::write(source.join("upper/work.txt"), b"saved work\n").unwrap();
+        create_ext4_image_from_dir_with_size(&source, &overlay, 64 * 1024 * 1024).unwrap();
+        write_sandbox_owner_state(
+            &base,
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1001,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = base.clone();
+        driver.config.overlay_disk_mib = 128;
+        let template = overlay_template_image(&base, 128 * 1024 * 1024);
+        driver
+            .prepare_runtime_overlay(
+                &base,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+            .expect("start disk created under smaller default");
+
+        assert_eq!(std::fs::metadata(&overlay).unwrap().len(), 64 * 1024 * 1024);
+        assert!(!template.exists());
+        let output =
+            std::process::Command::new(openshell_core::e2fsprogs::resolve(&["debugfs"]).unwrap())
+                .arg("-R")
+                .arg("cat /upper/work.txt")
+                .arg(&overlay)
+                .output()
+                .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"saved work\n");
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn prepare_sandbox_overlay_refuses_missing_saved_overlay() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");
         let overlay = base.join("overlay.ext4");
         std::fs::write(&template, b"fresh-overlay").unwrap();
 
-        prepare_sandbox_overlay_image(
+        let error = prepare_sandbox_overlay_image(
             &template,
             &overlay,
             OverlayPreparation::PreserveExisting,
             "fresh-overlay".len() as u64,
         )
-        .expect("create missing overlay");
+        .expect_err("a missing saved overlay must not be replaced");
 
-        assert_eq!(std::fs::read(&overlay).unwrap(), b"fresh-overlay");
+        assert!(error.contains("OverlayDiskFull"), "{error}");
+        assert!(!overlay.exists());
 
         let _ = std::fs::remove_dir_all(base);
     }

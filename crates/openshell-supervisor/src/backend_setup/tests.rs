@@ -853,6 +853,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             auth_bundle: setup.auth.clone(),
             admitted_isolation_backend: Some(TEST_BACKEND.into()),
             main_exit_marker: Some(marker.clone()),
+            termination_ack_marker: None,
             trace_context: None,
             provider_workload_api_socket: None,
             // The binary loads the proxy trust directory from its environment.
@@ -1061,6 +1062,7 @@ async fn suspend_signal_exits_without_terminating_boundary() {
             auth_bundle: setup.auth.clone(),
             admitted_isolation_backend: Some(TEST_BACKEND.into()),
             main_exit_marker: Some(marker.clone()),
+            termination_ack_marker: None,
             trace_context: None,
             provider_workload_api_socket: None,
             // The binary loads the proxy trust directory from its environment.
