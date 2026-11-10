@@ -314,6 +314,8 @@ impl SandboxBuilder {
         self
     }
 
+    /// Whether the sandbox restarts when its main command exits: never, on
+    /// failure, or always.
     pub fn restart_policy(mut self, policy: SandboxRestartPolicy) -> Self {
         self.spec.restart_policy = policy;
         self

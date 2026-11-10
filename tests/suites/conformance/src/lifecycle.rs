@@ -488,6 +488,10 @@ const EPHEMERAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A detached sandbox created with `--no-keep` is removed once its main
 /// command exits, whether the command succeeds or fails.
+///
+/// This checks only what the gateway shows: get and list stop returning the
+/// sandbox. It doesn't check that the driver removed its containers, pods or
+/// VM state; conformance can't see driver resources.
 #[testkit::test]
 async fn detached_no_keep_sandbox_is_removed_after_main_exits(cx: &mut Context) -> testkit::Result {
     let mut sandboxes = Vec::new();

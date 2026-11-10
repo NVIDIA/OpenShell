@@ -106,6 +106,7 @@ async fn sandbox_from_template_uses_its_workload(cx: &mut Context) -> testkit::R
         "template list does not include {template_name}"
     );
 
+    // `SandboxBuilder` can't create from a template, so name, track and adopt by hand.
     let sandbox_name = cx.name("ts");
     cx.track(&sandbox_name);
     cx.client()

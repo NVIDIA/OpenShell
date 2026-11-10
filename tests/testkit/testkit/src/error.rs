@@ -31,13 +31,13 @@ impl Error {
         self.code
     }
 
-    pub fn from_display(error: impl fmt::Display) -> Self {
+    pub(crate) fn from_display(error: impl fmt::Display) -> Self {
         Self::msg(error.to_string())
     }
 
     /// An error with its sources, so a wrapper such as tonic's
     /// "transport error" still says what went wrong underneath.
-    pub fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
+    pub(crate) fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
         let mut message = error.to_string();
         let mut source = error.source();
         while let Some(cause) = source {
