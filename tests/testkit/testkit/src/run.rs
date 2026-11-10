@@ -33,6 +33,7 @@ where
     F: AsyncFnOnce(&mut Context) -> Result,
 {
     let name = info.name;
+    crate::budget::start();
     eprintln!("[{name}] {}", info.description);
 
     let gateway = Gateway::from_env().unwrap_or_else(|error| panic!("[{name}] {error}"));

@@ -42,6 +42,9 @@ const READY_SLACK: Duration = Duration::from_mins(1);
 const NEXTEST_TEST_FAILED: i32 = 100;
 /// nextest's exit code when `--no-tests fail` found no tests to run.
 const NEXTEST_NO_TESTS_RUN: i32 = 4;
+/// The variable that tells a test its per-test limit; testkit reads it
+/// (`openshell_testkit::TIMEOUT_ENV`).
+const TEST_TIMEOUT_ENV: &str = "OPENSHELL_TEST_TIMEOUT_SECS";
 /// How long a stopped test has between SIGTERM and SIGKILL. Matches nextest's
 /// default, so both kinds of bundle stop a hung test the same way.
 const TEST_GRACE_SECS: u64 = 10;
@@ -313,7 +316,10 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
     let config = format!("{guest}/nextest.toml");
     let timeout = TEST_TIMEOUT_SECS.to_string();
     let grace = TEST_GRACE_SECS.to_string();
-    let mut tests = vec!["env"];
+    // Each test is told its own limit, so a stuck step fails with its own
+    // error before the runner stops the test.
+    let budget = format!("{TEST_TIMEOUT_ENV}={TEST_TIMEOUT_SECS}");
+    let mut tests = vec!["env", budget.as_str()];
     tests.extend(env.iter().map(String::as_str));
     match kind {
         Kind::Nextest => {
@@ -371,7 +377,7 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
     // can be credentials, never appear in the command (or its errors).
     let log = format!("{guest}/{NEXTEST_LOG}");
     let script = format!(
-        r#"exec >"$0" 2>&1; {}; exec "$@""#,
+        r#"exec >"$0" 2>&1; date -u +%Y-%m-%dT%H:%M:%SZ >{RUN_STARTED_FILE} || true; {}; exec "$@""#,
         test_env::export_script(test_env::ENV_DIR)
     );
     let mut command = vec!["sh", "-c", &script, &log];
@@ -441,6 +447,9 @@ const WAIT_K3S_CONTROLLER: &str = include_str!("wait-k3s-controller.sh");
 /// The script retries for up to ten minutes; this catches one that stalls.
 const WAIT_K3S_CONTROLLER_TIMEOUT: Duration = Duration::from_mins(12);
 
+/// Where the run records when it started, in RFC 3339 UTC. The k3s diagnostics
+/// read it (see `collect-k3s.sh`) to collect the gateway's logs from then on.
+const RUN_STARTED_FILE: &str = "/var/tmp/openshell-run-started";
 /// Where the guest keeps the script's output until it is copied out.
 const COLLECT_K3S_OUTPUT: &str = "/var/tmp/openshell-k3s-diagnostics.txt";
 /// How long the guest lets the script run before stopping it. The script
@@ -551,6 +560,11 @@ mod tests {
     }
 
     #[test]
+    fn k3s_diagnostics_read_the_file_the_run_writes() {
+        assert!(COLLECT_K3S.contains(RUN_STARTED_FILE));
+    }
+
+    #[test]
     fn k3s_diagnostics_keep_everything_the_old_playbook_collected() {
         for wanted in [
             "systemctl show k3s.service",
@@ -576,6 +590,7 @@ mod tests {
             "free -m",
             "df -h",
             "[REDACTED]",
+            "--since-time",
         ] {
             assert!(COLLECT_K3S.contains(wanted), "missing {wanted:?}");
         }

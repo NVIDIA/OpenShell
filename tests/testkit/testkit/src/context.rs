@@ -258,6 +258,7 @@ impl Context {
     /// created and has not deleted. Returns the cleanup failures; they are
     /// reported separately from the test result.
     pub(crate) async fn cleanup(&self) -> Vec<String> {
+        crate::budget::release();
         self.cleanup.run(CLEANUP_TIMEOUT).await
     }
 }
@@ -479,7 +480,7 @@ impl Sandbox {
     pub async fn wait_ready(&self) -> Result<SandboxRef> {
         let snapshot = self
             .client
-            .wait_ready(&self.name, READY_TIMEOUT)
+            .wait_ready(&self.name, crate::budget::cap(READY_TIMEOUT))
             .await
             .context(format!("wait for sandbox {} to be ready", self.name))?;
         crate::ensure!(
@@ -616,7 +617,7 @@ impl Sandbox {
     {
         let command: Vec<String> = command.into_iter().map(Into::into).collect();
         let options = ExecOptions {
-            timeout: Some(EXEC_TIMEOUT),
+            timeout: Some(crate::budget::cap(EXEC_TIMEOUT)),
             ..ExecOptions::default()
         };
         let result = self
