@@ -54,28 +54,6 @@ Debian and RPM user services, place them in
 `~/.config/openshell/gateway.env`; the service supplies that file to both
 preflight and gateway startup.
 
-### Slow sandbox startup
-
-Slow isolation backends may need longer startup windows. These settings default
-to `300` seconds (5 minutes); allowed values are `1` through
-`86400`. Environment variables override TOML values.
-
-| Setting | Scope | Environment variable |
-|---|---|---|
-| `provisioning_repair_window_seconds` | `[openshell.gateway]`: configuration repair after admission starts | `OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS` |
-| `runtime_bootstrap_grace_seconds` | `[openshell.drivers.kubernetes]`: sandbox startup | `OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_SECONDS` |
-| `sandbox_attach_request_timeout_seconds` | `[openshell.drivers.kubernetes]`: dedicated supervisor startup | `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS` |
-
-For a 15-minute Kubernetes startup window, set both driver settings to `900`.
-For shared supervisors, set `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS=900` on each
-shared host's deployment; the driver setting does not change those deployments.
-A directly launched supervisor also accepts `--attach-request-timeout-seconds`.
-
-Restart the affected gateway and supervisors for new settings to take effect.
-Existing admission deadlines are preserved. After a sandbox times out, wait for
-cleanup, then explicitly start it again. The CLI wait timeout and the separate
-image-preparation timeout do not change these windows.
-
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
 ## Package-Managed Locations
@@ -126,6 +104,27 @@ version = 2
 ```
 
 The gateway selector is `compute_driver = "<driver>"`. It accepts one scalar driver name. Omit it to retain auto-detection.
+
+## Slow sandbox startup
+
+For slow isolation backends, increase these startup windows. Each defaults to
+`300` seconds (5 minutes) and accepts `1` through `86400` seconds. Environment
+variables override TOML values.
+
+| Setting | Scope | Environment variable |
+|---|---|---|
+| `provisioning_repair_window_seconds` | `[openshell.gateway]`: configuration repair after admission starts | `OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS` |
+| `runtime_bootstrap_grace_seconds` | `[openshell.drivers.kubernetes]`: sandbox startup | `OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_SECONDS` |
+| `sandbox_attach_request_timeout_seconds` | `[openshell.drivers.kubernetes]`: dedicated supervisor startup | `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS` |
+
+For a 15-minute Kubernetes startup window, set both driver settings to `900`.
+On shared supervisor deployments, set `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS=900`
+directly; the driver setting does not configure shared hosts. Directly launched
+supervisors also accept `--attach-request-timeout-seconds`.
+
+Restart affected gateways and supervisors to apply changes. Existing admission
+deadlines stay unchanged. After a timeout, wait for cleanup before starting the
+sandbox again. CLI wait and image-preparation timeouts are separate settings.
 
 ## Additional Destination CAs
 
