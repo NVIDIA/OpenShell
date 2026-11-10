@@ -3,8 +3,6 @@
 
 //! Utility helpers shared across compute-driver crates.
 
-pub use openshell_driver_sdk::driver_utils::*;
-
 use std::path::{Path, PathBuf};
 
 /// Container/pod label carrying the sandbox namespace.
@@ -143,7 +141,6 @@ pub fn supervisor_image_should_refresh(image: &str) -> bool {
 // Supervisor binary extraction helpers shared by container-backed drivers
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "driver-extraction")]
 /// Extract the payload of the first regular-file entry in a tar archive.
 ///
 /// Container archive endpoints return a single-file tar when `path` points to
@@ -174,7 +171,6 @@ pub fn extract_first_tar_entry(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-#[cfg(feature = "driver-extraction")]
 /// Atomically write `bytes` to `final_path` via a sibling temp file.
 ///
 /// Creates parent directories as needed. The temp file is synced, `chmod 755`

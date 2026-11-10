@@ -64,9 +64,9 @@ pub fn provisioning_evidence(
 pub struct DockerBoundarySpec {
     pub boundary_id: String,
     pub generation: String,
-    pub session_id: openshell_core::SandboxSessionId,
-    pub session_rotation: openshell_core::jwt::SessionRotation,
-    pub auth_epoch: openshell_core::jwt::CredentialEpoch,
+    pub session_id: openshell_driver_sdk::SandboxSessionId,
+    pub session_rotation: openshell_driver_sdk::jwt::SessionRotation,
+    pub auth_epoch: openshell_driver_sdk::jwt::CredentialEpoch,
     pub gateway_id: String,
     pub verification_keys: Vec<GatewayVerificationKey>,
     pub container_id: String,
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn provisioning_binds_container_and_image_claims() {
-        let session_id = openshell_core::SandboxSessionId::new();
+        let session_id = openshell_driver_sdk::SandboxSessionId::new();
         let tls =
             openshell_sandbox_backend::boundary_protocol::generate_sandbox_tls_material(session_id)
                 .unwrap();
@@ -174,8 +174,8 @@ mod tests {
             boundary_id: "sandbox-1".to_string(),
             generation: "generation-1".to_string(),
             session_id,
-            session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
-            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            session_rotation: openshell_driver_sdk::jwt::SessionRotation::new(1).unwrap(),
+            auth_epoch: openshell_driver_sdk::jwt::CredentialEpoch::new(1).unwrap(),
             gateway_id: "gateway-1".to_string(),
             verification_keys: vec![GatewayVerificationKey {
                 key_id: "key-1".to_string(),

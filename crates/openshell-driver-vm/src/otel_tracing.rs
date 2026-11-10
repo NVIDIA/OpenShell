@@ -11,7 +11,7 @@ mod tests {
     async fn driver_spans_reach_otlp_collector_with_resource_identity() {
         openshell_otel_test_support::assert_compute_driver_tracing(
             super::TRACING,
-            openshell_core::VERSION,
+            openshell_driver_sdk::VERSION,
             "vm.provision",
         )
         .await;

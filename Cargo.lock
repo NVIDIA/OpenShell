@@ -4416,6 +4416,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-container-runtime"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "openshell-driver-sdk",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tonic",
+]
+
+[[package]]
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
@@ -4444,7 +4458,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -4541,7 +4554,8 @@ dependencies = [
  "http 1.4.0",
  "libc",
  "miette",
- "openshell-core",
+ "openshell-container-runtime",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -4670,8 +4684,9 @@ dependencies = [
  "hyper-util",
  "miette",
  "nix 0.29.0",
- "openshell-core",
+ "openshell-container-runtime",
  "openshell-crypto",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -4715,7 +4730,7 @@ dependencies = [
  "prost-types",
  "protoc-bin-vendored",
  "rcgen",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "rustls",
  "serde",
  "serde_json",
@@ -4774,9 +4789,10 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "oci-client",
- "openshell-core",
+ "openshell-container-runtime",
  "openshell-crypto",
  "openshell-driver-podman",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",

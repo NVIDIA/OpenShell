@@ -38,6 +38,11 @@ pub mod settings;
 pub mod telemetry;
 pub mod time;
 
+pub use config::{AppArmorProfile, ImagePullPolicy, UpstreamProxyConfig};
+pub use error::{ComputeDriverError, Error, Result};
+pub use network_trust::NetworkSupervisorTrustBundle;
+pub use sandbox_session::{SandboxSessionId, SandboxSessionIdError};
+
 /// Build version string derived from git metadata.
 ///
 /// For local builds this is computed by `build.rs` from the exact release tag

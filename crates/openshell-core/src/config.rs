@@ -10,31 +10,10 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::num::{NonZeroI64, NonZeroU64};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
-
-// ── Public default constants ────────────────────────────────────────────
-//
-// Canonical source for default values used across multiple crates.
-// Clap `default_value_t` annotations and runtime fallbacks should
-// reference these constants instead of hardcoding literals.
-
-/// Default SSH port inside sandbox containers.
-pub const DEFAULT_SSH_PORT: u16 = 2222;
-
-/// Default cgroup PID limit for local container sandboxes.
-pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
-
-/// Typed default cgroup PID limit for local container sandboxes.
-#[must_use]
-pub fn default_sandbox_pids_limit() -> Option<NonZeroI64> {
-    NonZeroI64::new(DEFAULT_SANDBOX_PIDS_LIMIT)
-}
-
-/// CDI device identifier for requesting all NVIDIA GPUs.
-pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 
 /// Default operator-facing name for a gateway installation.
 pub const DEFAULT_GATEWAY_NAME: &str = "openshell";
@@ -1081,14 +1060,12 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ConfigDeliveryMode, DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_SERVICE_ROUTING_DOMAIN,
+        Config, ConfigDeliveryMode, DEFAULT_SERVICE_ROUTING_DOMAIN,
         GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
         GatewayJwtConfig, GatewayProviderProfileSourceConfig, MetricsTlsConfig,
-        PolicyValidationFailureMode, ServiceHostnameFormat, default_sandbox_pids_limit,
-        normalize_compute_driver_name,
+        PolicyValidationFailureMode, ServiceHostnameFormat, normalize_compute_driver_name,
     };
 
-    use std::num::NonZeroI64;
     use std::time::Duration;
 
     use std::{net::SocketAddr, path::PathBuf};
@@ -1482,14 +1459,6 @@ mod tests {
         assert_eq!(
             Config::new(None).with_metrics_tls(tls.clone()).metrics_tls,
             Some(tls)
-        );
-    }
-
-    #[test]
-    fn typed_sandbox_pids_default_matches_positive_constant() {
-        assert_eq!(
-            default_sandbox_pids_limit().map(NonZeroI64::get),
-            Some(DEFAULT_SANDBOX_PIDS_LIMIT)
         );
     }
 }
