@@ -4707,15 +4707,19 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
+ "libc",
  "miette",
  "nix 0.29.0",
+ "openshell-crypto",
  "openshell-otel",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
  "rustix 1.1.4",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -4724,6 +4728,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "url",
  "uuid",
 ]
 
