@@ -1,5 +1,5 @@
 ---
-name: triage-issue
+name: triage-validate-issue
 description: Assess community issues, validate technical claims, request missing evidence, and prepare valid work for human disposition.
 metadata:
   internal: true
