@@ -12,7 +12,7 @@ use openshell_sdk::{
 };
 use rand::Rng;
 
-use crate::cleanup::{CLEANUP_TIMEOUT, Cleanup};
+use crate::cleanup::{CLEANUP_TIMEOUT, Cleanup, Key};
 use crate::cli::{Cli, CliOutput};
 use crate::error::{Error, Result, ResultExt};
 use crate::poll::{Poll, poll_until};
@@ -269,18 +269,22 @@ fn track_sandbox(cleanup: &Cleanup, client: &WorkspaceScopedClient, name: &str) 
     let owned = name.to_string();
     // The timeout wraps the whole hook, not just the wait, so a gateway that
     // never answers the delete cannot hang cleanup.
-    cleanup.push_keyed(name, format!("delete sandbox {name}"), async move || {
-        client
-            .delete_sandbox(
-                &owned,
-                DeleteOptions {
-                    allow_missing: true,
-                },
-            )
-            .await?;
-        client.wait_deleted(&owned, CLEANUP_TIMEOUT, None).await?;
-        Ok(())
-    });
+    cleanup.push_keyed(
+        Key::Sandbox(name.to_string()),
+        format!("delete sandbox {name}"),
+        async move || {
+            client
+                .delete_sandbox(
+                    &owned,
+                    DeleteOptions {
+                        allow_missing: true,
+                    },
+                )
+                .await?;
+            client.wait_deleted(&owned, CLEANUP_TIMEOUT, None).await?;
+            Ok(())
+        },
+    );
 }
 
 /// The generated gRPC client, for public API the SDK does not wrap yet.
@@ -358,32 +362,16 @@ impl SandboxBuilder {
             // The SDK's spec has no policy field, so create through gRPC.
             Some(policy) => {
                 crate::ensure!(
-                    self.spec.image.is_none()
-                        && self.spec.environment.is_empty()
-                        && self.spec.providers.is_empty()
-                        && !self.spec.gpu
-                        && self.spec.service_exposures.is_empty(),
-                    "testkit creates a sandbox with a policy from its name, labels, command, restart policy, and policy only"
+                    !self.spec.gpu && self.spec.service_exposures.is_empty(),
+                    "testkit doesn't create a sandbox with a policy and a GPU or service exposures"
                 );
-                let request = proto::CreateSandboxRequest {
-                    name: name.clone(),
-                    labels: self.spec.labels,
-                    workspace_scope: self.grpc.scope(),
-                    spec: Some(proto::SandboxSpec {
-                        command: self.spec.command,
-                        tty: self.spec.tty,
-                        policy: Some(policy),
-                        restart_policy: restart_policy(self.spec.restart_policy) as i32,
-                        ..proto::SandboxSpec::default()
-                    }),
-                    ..proto::CreateSandboxRequest::default()
-                };
+                let request = policy_create_request(self.spec, policy, self.grpc.scope());
                 self.grpc
                     .client()
                     .await?
                     .create_sandbox(request)
                     .await
-                    .map_err(|status| Error::from_error(&status))
+                    .map_err(|status| Error::from_status(&status))
                     .context(format!("create sandbox {name}"))?;
                 self.client
                     .get_sandbox(&name)
@@ -402,11 +390,47 @@ impl SandboxBuilder {
     }
 }
 
-const fn restart_policy(policy: SandboxRestartPolicy) -> proto::SandboxRestartPolicy {
-    match policy {
-        SandboxRestartPolicy::Never => proto::SandboxRestartPolicy::Never,
-        SandboxRestartPolicy::OnFailure => proto::SandboxRestartPolicy::OnFailure,
-        SandboxRestartPolicy::Always => proto::SandboxRestartPolicy::Always,
+/// The gRPC request for a sandbox created from `spec` with `policy`, built
+/// as the SDK builds one from `spec` alone. The spec is destructured without
+/// `..`, so a field added to the SDK's spec fails to compile here instead of
+/// being dropped. [`SandboxBuilder::create`] rejects a GPU or service
+/// exposures before calling this. A policy field on the SDK's spec would
+/// replace this (#5410).
+fn policy_create_request(
+    spec: SandboxSpec,
+    policy: proto::SandboxPolicy,
+    workspace_scope: Option<proto::datamodel::v1::WorkspaceSelector>,
+) -> proto::CreateSandboxRequest {
+    let SandboxSpec {
+        name,
+        image,
+        labels,
+        environment,
+        providers,
+        gpu: _,
+        command,
+        tty,
+        service_exposures: _,
+        restart_policy,
+    } = spec;
+    proto::CreateSandboxRequest {
+        name: name.unwrap_or_default(),
+        labels,
+        workspace_scope,
+        spec: Some(proto::SandboxSpec {
+            environment,
+            template: image.map(|image| proto::SandboxTemplate {
+                image,
+                ..proto::SandboxTemplate::default()
+            }),
+            providers,
+            command,
+            tty,
+            policy: Some(policy),
+            restart_policy: proto::SandboxRestartPolicy::from(restart_policy) as i32,
+            ..proto::SandboxSpec::default()
+        }),
+        ..proto::CreateSandboxRequest::default()
     }
 }
 
@@ -425,6 +449,20 @@ pub struct ExecOutput {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+impl ExecOutput {
+    /// Fail unless the command exited 0.
+    pub fn success(self) -> Result<Self> {
+        crate::ensure!(
+            self.exit_code == 0,
+            "exec exited with {}; stdout: {}; stderr: {}",
+            self.exit_code,
+            self.stdout.trim(),
+            self.stderr.trim()
+        );
+        Ok(self)
+    }
 }
 
 impl Sandbox {
@@ -603,7 +641,7 @@ impl Sandbox {
             .wait_deleted(&self.name, DELETE_TIMEOUT, Some(&self.id))
             .await
             .context(format!("wait for sandbox {} to be deleted", self.name))?;
-        self.cleanup.remove(&self.name);
+        self.cleanup.remove(&Key::Sandbox(self.name.clone()));
         Ok(())
     }
 }
@@ -630,4 +668,27 @@ fn generate_run_id() -> String {
     (0..8)
         .map(|_| char::from(ALPHABET[rng.random_range(0..ALPHABET.len())]))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_create_request_keeps_the_spec_and_adds_the_policy() {
+        let spec = SandboxSpec {
+            image: Some("python:3".to_string()),
+            providers: vec!["provider".to_string()],
+            ..SandboxSpec::default()
+        };
+        let policy = crate::policy::base();
+
+        let spec = policy_create_request(spec, policy.clone(), None)
+            .spec
+            .expect("spec");
+
+        assert_eq!(spec.template.expect("template").image, "python:3");
+        assert_eq!(spec.providers, ["provider"]);
+        assert_eq!(spec.policy, Some(policy));
+    }
 }

@@ -1331,6 +1331,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     exit 2
   fi
   export HELM_PLUGINS="${ROOT}/e2e/helm-plugins"
+  export OPENSHELL_E2E_EXPECTED_HOST_GATEWAY_IP="${HOST_GATEWAY_IP}"
   helm_post_renderer_args+=(
     --post-renderer openshell-external-compute-driver
   )

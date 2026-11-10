@@ -153,7 +153,6 @@ jobs:
       release-tag: ${{ needs.promote.outputs.tag }}
       source-sha: ${{ needs.build.outputs.source_sha }}
       semver: ${{ needs.build.outputs.semver }}
-      python-version: ${{ needs.build.outputs.python_version }}
       npm-version: ${{ needs.build.outputs.npm_version }}
       is-prerelease: false
       make-latest: ${{ needs.promote.outputs.make-latest == 'true' }}

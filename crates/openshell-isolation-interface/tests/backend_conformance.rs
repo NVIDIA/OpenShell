@@ -78,6 +78,115 @@ fn workload_identity_rejects_root_and_normalizes_groups() {
 }
 
 #[test]
+fn workload_identity_deserialization_enforces_new_invariants() {
+    fn payload(uid: u32, gid: u32, gids: &[u32], source: &str, digest: &str) -> serde_json::Value {
+        serde_json::json!({
+            "uid": uid,
+            "gid": gid,
+            "supplementary_gids": gids,
+            "source": source,
+            "resource_digest": digest,
+        })
+    }
+
+    assert!(
+        serde_json::from_value::<ResolvedWorkloadIdentity>(payload(
+            0,
+            1000,
+            &[],
+            "policy",
+            "sha256:test"
+        ))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ResolvedWorkloadIdentity>(payload(
+            1000,
+            0,
+            &[],
+            "policy",
+            "sha256:test"
+        ))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ResolvedWorkloadIdentity>(payload(
+            1000,
+            1000,
+            &[0],
+            "policy",
+            "sha256:test"
+        ))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ResolvedWorkloadIdentity>(payload(
+            1000,
+            1000,
+            &[],
+            "",
+            "sha256:test"
+        ))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ResolvedWorkloadIdentity>(payload(1000, 1000, &[], "policy", ""))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ResolvedWorkloadIdentity>(payload(
+            1000,
+            1000,
+            &[],
+            " ",
+            "sha256:test"
+        ))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ResolvedWorkloadIdentity>(payload(1000, 1000, &[], "policy", " "))
+            .is_err()
+    );
+
+    let identity = workload_identity();
+    let encoded = serde_json::to_value(&identity).unwrap();
+    assert_eq!(
+        serde_json::from_value::<ResolvedWorkloadIdentity>(encoded).unwrap(),
+        identity
+    );
+
+    let decoded = serde_json::from_value::<ResolvedWorkloadIdentity>(payload(
+        1000,
+        1000,
+        &[1003, 1001, 1002, 1003],
+        "policy",
+        "sha256:test",
+    ))
+    .unwrap();
+    assert_eq!(decoded.supplementary_gids, vec![1001, 1002, 1003]);
+
+    let decoded = serde_json::from_value::<ResolvedWorkloadIdentity>(payload(
+        1000,
+        1000,
+        &[1000, 1001],
+        "policy",
+        "sha256:test",
+    ))
+    .unwrap();
+    assert_eq!(decoded.supplementary_gids, vec![1001]);
+}
+
+#[test]
+fn boundary_confirmation_rejects_invalid_embedded_identity() {
+    let encoded = serde_json::to_value(confirmation()).unwrap();
+    serde_json::from_value::<BoundaryConfirmation>(encoded.clone()).unwrap();
+
+    let mut invalid = encoded;
+    invalid["identity"]["uid"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<BoundaryConfirmation>(invalid).is_err());
+}
+
+#[test]
 fn confirmation_rejects_missing_generation_or_identity_drift() {
     let expected = workload_identity();
     let baseline = confirmation();
