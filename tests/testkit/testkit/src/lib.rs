@@ -33,6 +33,7 @@ mod context;
 mod error;
 pub mod gateway;
 mod image;
+mod output;
 pub mod policy;
 mod poll;
 pub mod program;

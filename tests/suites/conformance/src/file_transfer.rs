@@ -101,10 +101,10 @@ async fn large_upload_backpressure(cx: &mut Context) -> testkit::Result {
         .success()?;
     testkit::ensure!(
         !uploaded
-            .message()
+            .report_text()
             .contains("sandbox sync operation failed; retrying"),
         "the large upload needed a retry: {}",
-        uploaded.message()
+        uploaded.report_text()
     );
 
     ft.sh(&format!(
@@ -301,7 +301,7 @@ impl<'a> Transfer<'a> {
 
         let remote = format!("{}/roundtrip", self.remote_root);
         let uploaded = self.upload(&source, &remote, false).await?.success()?;
-        let warning = uploaded.message();
+        let warning = uploaded.report_text();
         testkit::ensure!(
             warning.contains("outside a Git work tree")
                 && warning.contains(".gitignore rules are not applied"),
@@ -428,7 +428,7 @@ impl<'a> Transfer<'a> {
 
         let remote = format!("{}/reuploaded", self.remote_root);
         let rejected = self.upload(&runs, &remote, false).await?.failure()?;
-        let output = rejected.message();
+        let output = rejected.report_text();
         testkit::ensure!(
             output.contains("filtering selected no files") && output.contains("--no-git-ignore"),
             "the rejected upload did not explain the --no-git-ignore override: {output}"
@@ -454,7 +454,7 @@ impl<'a> Transfer<'a> {
 
         for source in [etc_link.clone(), passwd_link, format!("{etc_link}/passwd")] {
             let rejected = self.download(&source, &destination).await?.failure()?;
-            let output = rejected.message();
+            let output = rejected.report_text();
             testkit::ensure!(
                 output.contains("resolves to")
                     && output.contains("outside the")

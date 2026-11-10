@@ -67,9 +67,9 @@ async fn global_setting_overrides_sandbox_scope(cx: &mut Context) -> testkit::Re
 
     let blocked = set_sandbox_setting(cx, &sandbox, "true").await?.failure()?;
     testkit::ensure!(
-        blocked.message().contains("managed globally"),
+        blocked.report_text().contains("managed globally"),
         "setting a globally managed key on the sandbox failed without saying the key is managed globally: {}",
-        blocked.message()
+        blocked.report_text()
     );
     cx.cli(["settings", "delete", sandbox.name(), "--key", KEY])
         .await?
