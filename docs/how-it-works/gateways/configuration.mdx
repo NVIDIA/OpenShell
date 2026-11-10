@@ -2018,7 +2018,8 @@ relist when they end. Discovery-only machine credentials are separate work.
 
 Discovery limits apply per gateway process: 1,000 installation records, 4,096
 routes, and 4 MiB per snapshot, with a ten-second collection timeout. Up to four
-collections and 16 unary requests run concurrently; unary requests are limited
+collections and 16 unary requests run concurrently. Collections wait for a free
+slot within the ten-second timeout; unary requests are limited
 to four per principal and eight per workspace. Watches are limited to 32 total,
 four per principal, and 16 per workspace. Capacity and size limits return
 `RESOURCE_EXHAUSTED`; storage failures and timeouts return `UNAVAILABLE`; corrupt

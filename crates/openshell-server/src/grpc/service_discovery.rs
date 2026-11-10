@@ -176,8 +176,9 @@ async fn cached_snapshot(
             .discovery
             .collections
             .clone()
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("too many discovery collections"))?;
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("discovery collections closed"))?;
         let result = snapshot(state, workspace).await;
         *cached = Some((tokio::time::Instant::now(), result.clone()));
         result
@@ -961,10 +962,6 @@ mod tests {
         );
         assert_eq!(a.unwrap(), first);
         assert_eq!(b.unwrap(), first);
-        assert_eq!(
-            cached_snapshot(&state, "other").await.unwrap_err().code(),
-            tonic::Code::ResourceExhausted
-        );
         drop(busy);
         state
             .store
@@ -978,6 +975,65 @@ mod tests {
                 .unwrap()
                 .routes
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_waits_for_a_slot_and_resumes_when_one_is_released() {
+        let (state, owner, report) = installed_fixture().await;
+        accept(&state, &owner, &report, current_time_ms() + 10_000)
+            .await
+            .unwrap();
+        let mut busy = state
+            .discovery
+            .collections
+            .clone()
+            .acquire_many_owned(u32::try_from(MAX_COLLECTIONS).unwrap())
+            .await
+            .unwrap();
+        let pending = cached_snapshot(&state, "default");
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut pending)
+                .await
+                .is_err(),
+            "collection must wait rather than fail when all slots are occupied"
+        );
+        drop(busy.split(1).unwrap());
+        let snapshot = tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.routes.len(), 1);
+        assert_eq!(state.discovery.collections.available_permits(), 1);
+        drop(busy);
+        assert_eq!(
+            state.discovery.collections.available_permits(),
+            MAX_COLLECTIONS
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_slot_wait_is_bounded_by_snapshot_timeout() {
+        let (state, _, _) = installed_fixture().await;
+        let busy = state
+            .discovery
+            .collections
+            .clone()
+            .acquire_many_owned(u32::try_from(MAX_COLLECTIONS).unwrap())
+            .await
+            .unwrap();
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let error = cached_snapshot(&state, "default").await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(error.message(), "service discovery collection timed out");
+        assert!(start.elapsed() >= SNAPSHOT_TIMEOUT);
+        assert!(start.elapsed() < SNAPSHOT_TIMEOUT + Duration::from_secs(1));
+        drop(busy);
+        assert_eq!(
+            state.discovery.collections.available_permits(),
+            MAX_COLLECTIONS
         );
     }
 
