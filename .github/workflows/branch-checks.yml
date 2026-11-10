@@ -725,3 +725,19 @@ jobs:
         run: |
           OPENSHELL_NPM_VERSION="$(uv run python tasks/scripts/release.py get-version --npm)" \
             mise run sdk:ts:publish
+
+  install-script:
+    name: install.sh
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The RPM lookup test uses gawk when present; gawk warns on bad escapes.
+      - name: Install gawk
+        run: sudo apt-get install -y --no-install-recommends gawk
+
+      - name: Test install.sh
+        run: tasks/scripts/test-install-sh.sh
