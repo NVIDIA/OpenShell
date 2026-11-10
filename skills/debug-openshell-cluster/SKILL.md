@@ -869,8 +869,12 @@ kubectl -n openshell describe hpa openshell
 
 The JSONPath filter keeps only pods whose first container is the gateway
 (`openshell-gateway`). It skips certificate hook Job pods, which older charts
-labeled like gateway pods. The metrics port is `service.metricsPort` (default
-`9090`).
+labeled like gateway pods. Helm enables metrics with `metrics.enabled=true`
+(the default). Set it to `false` to omit the listener and its container and
+Service ports. `service.metricsPort` selects the port (default `9090`) and
+must remain between 1 and 65535 even when metrics are disabled. Migrate legacy
+port `0` or `false` to `metrics.enabled=false` and a valid port in the same
+upgrade; those legacy values fail rendering. Metrics TLS requires enablement.
 
 The API server proxy connects to each pod from the control plane. A
 NetworkPolicy that accepts the metrics port only from a monitoring namespace

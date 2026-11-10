@@ -464,6 +464,18 @@ memory-based scaling does not guarantee spare capacity for handoff. See the
 
 ## Secure metrics scraping
 
+Metrics are enabled by default on `service.metricsPort: 9090`. Set
+`metrics.enabled=false` to disable the dedicated listener and its container
+and Service ports while retaining the configured port. This does not disable
+OpenTelemetry export. `service.metricsPort` must remain an integer from 1 to
+65535, even when metrics are disabled.
+
+When upgrading from `service.metricsPort: 0` or `false`, set
+`metrics.enabled=false` and restore a valid port such as `9090` in the same
+upgrade. Legacy disable values now fail rendering with migration guidance,
+including when combined with an explicit `metrics.enabled` value; they never
+silently enable the endpoint. Metrics TLS requires `metrics.enabled=true`.
+
 The dedicated metrics endpoint is plaintext by default for compatibility with
 existing Prometheus deployments. Enable `metrics.tls.enabled` to serve it over
 HTTPS. The initial implementation uses operator-provided Kubernetes Secrets;
@@ -590,6 +602,7 @@ discovery endpoint or its TLS CA.
 | grpcRoute.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
 | grpcRoute.replicaRouting.enabled | bool | `false` | Route requests carrying an `x-openshell-replica` header straight to that gateway replica. The CLI sets the header on long-lived sandbox connections (SSH, port forwards, exec) using the owner the gateway reports, so they skip the relay through a peer replica. Renders one Service per replica. Requires workload.kind=statefulset, workload.allowMultiReplicaStatefulSet=true, and at most 15 replicas. |
 | imagePullSecrets | list | `[]` | Image pull secrets attached to gateway and helper pods. |
+| metrics.enabled | bool | `true` | Enable the dedicated Prometheus metrics listener and its container and Service ports. |
 | metrics.tls.certSecretName | string | `""` | Kubernetes TLS Secret with tls.crt and tls.key. Empty reuses server.tls.certSecretName. |
 | metrics.tls.clientCaSecretName | string | `""` | Secret with ca.crt for verifying metrics scraper client certificates. It must not contain the gateway client CA. The chart rejects reusing the gateway client CA and client TLS Secret names; the check is by name only and cannot detect a different Secret holding the same CA. Required when requireClientCert is true. |
 | metrics.tls.enabled | bool | `false` | Enable TLS for the dedicated metrics listener. |
@@ -731,7 +744,7 @@ discovery endpoint or its TLS CA.
 | server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
 | server.workspaceStorageClass | string | `""` | Kubernetes StorageClass for the workspace PVC in sandbox pods. Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the workspace PVC stays Pending and the sandbox never starts. |
 | service.healthPort | int | `8081` | Gateway health service port. |
-| service.metricsPort | int | `9090` | Gateway metrics service port. |
+| service.metricsPort | int | `9090` | Gateway metrics service port (1-65535). Disable the endpoint with metrics.enabled, not port 0 or false. |
 | service.port | int | `8080` | Gateway gRPC/HTTP service port. |
 | service.type | string | `"ClusterIP"` | Kubernetes Service type for the gateway. |
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |

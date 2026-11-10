@@ -69,7 +69,7 @@ tests:
       service.metricsPort: -1
     asserts:
       - failedTemplate:
-          errorPattern: "service.metricsPort must be 0 \\(disabled\\) or between 1 and 65535"
+          errorPattern: "service.metricsPort must be an integer between 1 and 65535"
 
   - it: rejects a boolean primary port
     template: templates/statefulset.yaml
@@ -117,14 +117,14 @@ tests:
       service.metricsPort: 65536
     asserts:
       - failedTemplate:
-          errorPattern: "service.metricsPort must be 0 \\(disabled\\) or between 1 and 65535"
+          errorPattern: "service.metricsPort must be an integer between 1 and 65535"
 
   - it: accepts boundary ports with metrics disabled
     template: templates/gateway-config.yaml
     set:
       service.port: 1
       service.healthPort: 65535
-      service.metricsPort: 0
+      metrics.enabled: false
     asserts:
       - matchRegex:
           path: data["gateway.toml"]

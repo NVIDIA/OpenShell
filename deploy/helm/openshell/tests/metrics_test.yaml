@@ -1,0 +1,162 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: metrics endpoint enablement
+templates:
+  - templates/gateway-config.yaml
+  - templates/service.yaml
+  - templates/statefulset.yaml
+  - templates/deployment.yaml
+
+tests:
+  - it: enables the default listener and exposes port 9090
+    asserts:
+      - template: templates/gateway-config.yaml
+        matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^metrics_bind_address = "0\.0\.0\.0:9090"$'
+      - template: templates/service.yaml
+        contains:
+          path: spec.ports
+          content:
+            name: metrics
+            port: 9090
+            targetPort: metrics
+            protocol: TCP
+      - template: templates/statefulset.yaml
+        contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: metrics
+            containerPort: 9090
+            protocol: TCP
+
+  - it: disables metrics without changing gateway and health listeners
+    set:
+      metrics.enabled: false
+      service.metricsPort: 19090
+      gatewayConfig:
+        openshell.gateway:
+          metrics_bind_address: 0.0.0.0:29090
+    asserts:
+      - template: templates/gateway-config.yaml
+        notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^metrics_bind_address'
+      - template: templates/gateway-config.yaml
+        matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^bind_address = "0\.0\.0\.0:8080"$'
+      - template: templates/gateway-config.yaml
+        matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^health_bind_address = "0\.0\.0\.0:8081"$'
+      - template: templates/service.yaml
+        lengthEqual:
+          path: spec.ports
+          count: 1
+      - template: templates/statefulset.yaml
+        lengthEqual:
+          path: spec.template.spec.containers[0].ports
+          count: 2
+      - template: templates/statefulset.yaml
+        equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.port
+          value: health
+
+  - it: enables metrics on the retained custom port
+    set:
+      metrics.enabled: true
+      service.metricsPort: 19090
+    asserts:
+      - template: templates/gateway-config.yaml
+        matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^metrics_bind_address = "0\.0\.0\.0:19090"$'
+      - template: templates/service.yaml
+        contains:
+          path: spec.ports
+          content:
+            name: metrics
+            port: 19090
+            targetPort: metrics
+            protocol: TCP
+      - template: templates/statefulset.yaml
+        contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: metrics
+            containerPort: 19090
+            protocol: TCP
+
+  - it: disables the Deployment metrics port as well
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: external-postgres
+      metrics.enabled: false
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.containers[0].ports
+          count: 2
+
+  - it: keeps metrics enabled when legacy values omit the enablement setting
+    template: templates/gateway-config.yaml
+    set:
+      metrics.enabled: null
+      service.metricsPort: 19090
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^metrics_bind_address = "0\.0\.0\.0:19090"$'
+
+  - it: rejects a string instead of a boolean enablement setting
+    template: templates/statefulset.yaml
+    set:
+      metrics.enabled: "false"
+    asserts:
+      - failedTemplate:
+          errorMessage: metrics.enabled must be a boolean
+
+  - it: rejects a numeric enablement setting
+    template: templates/statefulset.yaml
+    set:
+      metrics.enabled: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: metrics.enabled must be a boolean
+
+  - it: rejects the legacy zero disable sentinel with migration guidance
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: 'to disable metrics, set metrics.enabled=false and keep a valid service.metricsPort'
+
+  - it: rejects the legacy boolean disable sentinel with migration guidance
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: false
+    asserts:
+      - failedTemplate:
+          errorPattern: 'to disable metrics, set metrics.enabled=false and keep a valid service.metricsPort'
+
+  - it: requires migration of the old port even with explicit disablement
+    template: templates/statefulset.yaml
+    set:
+      metrics.enabled: false
+      service.metricsPort: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: 'service.metricsPort must be an integer between 1 and 65535'
+
+  - it: permits a retained port collision while metrics are disabled
+    template: templates/gateway-config.yaml
+    set:
+      metrics.enabled: false
+      service.metricsPort: 8080
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^metrics_bind_address'
