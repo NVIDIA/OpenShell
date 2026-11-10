@@ -23,7 +23,9 @@ source "${ROOT}/e2e/support/conformance.sh"
 # stabilized and can be added here.
 PODMAN_CI_TESTS=(
   bypass_detection
+  ephemeral_cleanup
   driver_config_volume
+  edge_tunnel_e2e
   forward_proxy_graphql_l7
   forward_proxy_jsonrpc_l7
   forward_proxy_l7_bypass

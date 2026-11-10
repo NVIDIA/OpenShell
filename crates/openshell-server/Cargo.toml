@@ -142,7 +142,6 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["native
 rcgen = { workspace = true }
 rsa = { version = "0.9", features = ["pem"] }
 tokio-tungstenite = { workspace = true }
-openshell-sdk = { path = "../openshell-sdk" }
 futures-util = "0.3"
 wiremock = "0.6"
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
