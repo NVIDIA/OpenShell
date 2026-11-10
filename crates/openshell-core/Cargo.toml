@@ -24,8 +24,6 @@ tonic-prost = { workspace = true }
 tonic-types = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-tar = { version = "0.4", optional = true }
-tempfile = { version = "3", optional = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true }
@@ -52,7 +50,6 @@ default = ["telemetry"]
 ## Compile in anonymous telemetry emission support. On by default; disable with
 ## `--no-default-features` (plus any other features you need) for a build that
 ## contains no telemetry endpoint, no HTTP client, and no emission code at all.
-driver-extraction = ["dep:tar", "dep:tempfile"]
 telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking", "openshell-driver-sdk/telemetry"]
 ## OAuth2 token request helpers used by supervisor and gateway.
 oauth = ["dep:reqwest"]
