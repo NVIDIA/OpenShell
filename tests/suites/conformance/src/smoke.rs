@@ -21,5 +21,6 @@ async fn create_exec_delete(cx: &mut Context) -> testkit::Result {
         .await?
         .expect_stdout(&format!("{marker}\n"))?;
 
-    cx.delete_and_expect_absent(&sandbox).await
+    sandbox.delete().await?;
+    sandbox.expect_absent().await
 }

@@ -176,6 +176,18 @@ impl CliOutput {
         Ok(self)
     }
 
+    /// Fail unless the command exited 0 and printed exactly `expected`.
+    pub fn expect_stdout(self, expected: &str) -> Result<Self> {
+        let output = self.success()?;
+        crate::ensure!(
+            output.stdout == expected,
+            "`{}` printed {:?}; expected {expected:?}",
+            output.command,
+            output.stdout
+        );
+        Ok(output)
+    }
+
     /// Stdout and stderr as one line of words, for matching an error report.
     /// The CLI wraps reports to the terminal width and draws a gutter, so
     /// match against this rather than the raw output.

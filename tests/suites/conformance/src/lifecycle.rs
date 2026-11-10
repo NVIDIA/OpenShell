@@ -28,7 +28,8 @@ async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
         .await?
         .expect_stdout(&format!("{marker}\n"))?;
 
-    cx.delete_and_expect_absent(&sandbox).await
+    sandbox.delete().await?;
+    sandbox.expect_absent().await
 }
 
 /// Longer than the supervisor's 30s startup recovery deadline.
@@ -52,8 +53,8 @@ async fn exec_outlives_startup_recovery_deadline(cx: &mut Context) -> testkit::R
         PAST_RECOVERY_DEADLINE.as_secs()
     );
     with_deadline(
-        PAST_RECOVERY_EXEC_DEADLINE,
         "the exec past the recovery deadline",
+        PAST_RECOVERY_EXEC_DEADLINE,
         sandbox.exec(["sh", "-c", script.as_str()]),
     )
     .await?
@@ -110,9 +111,12 @@ async fn delete_is_prompt_when_workload_is_slow_to_handle_term(
     // Boundary containment may kill the workload before its handler finishes;
     // this asserts bounded deletion, not a graceful workload exit.
     with_deadline(
-        DELETE_DEADLINE,
         &format!("deleting sandbox {}", sandbox.name()),
-        cx.delete_and_expect_absent(&sandbox),
+        DELETE_DEADLINE,
+        async {
+            sandbox.delete().await?;
+            sandbox.expect_absent().await
+        },
     )
     .await
 }
@@ -156,7 +160,8 @@ async fn run_to_completion_exit_delete(cx: &mut Context) -> testkit::Result {
         again.restart_count
     );
 
-    cx.delete_and_expect_absent(&sandbox).await
+    sandbox.delete().await?;
+    sandbox.expect_absent().await
 }
 
 /// A main command that exits during provisioning is reported as the
@@ -232,7 +237,7 @@ async fn default_command_sandbox_is_listed_ready(cx: &mut Context) -> testkit::R
         ready.name,
         sandbox.name()
     );
-    cx.expect_listed(&sandbox, SandboxPhase::Ready).await?;
+    sandbox.expect_listed(SandboxPhase::Ready).await?;
 
     let marker = format!("openshell-e2e-{}", cx.run_id());
     sandbox
@@ -242,7 +247,8 @@ async fn default_command_sandbox_is_listed_ready(cx: &mut Context) -> testkit::R
     // The gateway's default image is OpenShell's Ubuntu base image.
     crate::image::expect_ubuntu(&sandbox).await?;
 
-    cx.delete_and_expect_absent(&sandbox).await
+    sandbox.delete().await?;
+    sandbox.expect_absent().await
 }
 
 /// A stopped sandbox rejects exec, accepts a second stop, and returns to
@@ -287,7 +293,8 @@ async fn stopped_sandbox_can_be_deleted(cx: &mut Context) -> testkit::Result {
         .create_ready()
         .await?;
     sandbox.stop().await?;
-    cx.delete_and_expect_absent(&sandbox).await
+    sandbox.delete().await?;
+    sandbox.expect_absent().await
 }
 
 /// Where the main command of [`canonical_main_environment`] records what it
@@ -418,7 +425,7 @@ fi
         )
         .await?;
 
-    let initial = cx.sandbox_details(sandbox.name()).await?;
+    let initial = sandbox.get_json().await?;
     let initial_instance = main_instance(&initial).to_string();
     testkit::ensure!(
         !initial_instance.is_empty(),
@@ -434,7 +441,7 @@ fi
         RESTART_TIMEOUT,
         Duration::from_millis(250),
         async || {
-            let details = cx.sandbox_details(sandbox.name()).await?;
+            let details = sandbox.get_json().await?;
             let instance = main_instance(&details);
             let replaced = !instance.is_empty() && instance != initial_instance;
             Ok(
@@ -467,7 +474,7 @@ fi
 }
 
 /// The ID of the sandbox's current main process instance, from
-/// [`Context::sandbox_details`]. Empty if none is reported.
+/// [`Sandbox::get_json`]. Empty if none is reported.
 fn main_instance(details: &serde_json::Value) -> &str {
     details["main_process_instance_id"]
         .as_str()
@@ -505,7 +512,8 @@ async fn detached_no_keep_sandbox_is_removed_after_main_exits(cx: &mut Context) 
             .success()?;
     }
     for (sandbox, _, code) in &sandboxes {
-        cx.wait_absent(sandbox, EPHEMERAL_CLEANUP_TIMEOUT)
+        sandbox
+            .wait_absent(EPHEMERAL_CLEANUP_TIMEOUT)
             .await
             .context(format!("ephemeral sandbox exited {code}"))?;
     }

@@ -63,15 +63,21 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 
 `Context` currently provides:
 
-- `cx.sandbox(suffix)` to build and create a sandbox with a run-unique name.
-  The returned `Sandbox` can wait for ready or finished, stop, start, exec,
-  read its config and draft policy, set a setting, and delete. `exec` output
-  has `success()`.
+- `cx.sandbox(suffix)` to build a sandbox with a run-unique name, then
+  `create()` it or `create_ready()` to also wait for Ready. The returned
+  `Sandbox` can wait for ready or finished, stop, start, exec or
+  `poll_exec` until the output matches, read its config and draft policy, set
+  a setting, read `sandbox get` JSON with `get_json()`, and delete. Its
+  `expect_listed`, `expect_absent` and `wait_absent` check list and get.
+  Exec output has `success()`, `failure()` and `expect_stdout()`.
+- `cx.cli_sandbox(suffix)` for a sandbox only `openshell sandbox create`
+  can make, such as one with `policy_yaml(...)` or `--no-keep`. `create()`
+  detaches and returns the `Sandbox`; `run()` returns the attached CLI
+  output.
 - `cx.track(name)` to register a sandbox created some other way, such as
   through the CLI, for cleanup. Call it before the
   create, so a create that fails after the gateway accepted it is still cleaned
   up. `cx.adopt(name)` returns a `Sandbox` handle for one the CLI created.
-- `cx.expect_listed` and `cx.expect_absent` to check a sandbox in list and get.
 - `cx.expect_compute_driver(name)` to fail unless the gateway runs only that
   compute driver. Driver suites call it first.
 - `testkit::base_image()` for the image to create sandboxes from or build on:
@@ -82,7 +88,7 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   every environment; `mise run e2e:workload:build` builds it locally. An
   override image must run `python3` from one of `testkit::PYTHON_BINARIES`.
 - `cx.cli([...])` to run the installed CLI against the same gateway, with
-  `success()`, `failure()`, and `json()` on the output. `cx.cli_handle()`
+  `success()`, `failure()`, `expect_stdout()`, and `json()` on the output. `cx.cli_handle()`
   returns that CLI for code that can't borrow `cx`, such as a cleanup hook.
 - `cx.on_cleanup(name, hook)` to remove something when the test ends.
 - `testkit::policy` for sandbox policies: `policy::base()` reads
@@ -101,7 +107,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 - `cx.client()` for SDK calls testkit does not wrap.
 - `error.grpc_code()` for the gRPC status code (`testkit::GrpcCode`) of a
   request the gateway refused, such as a sandbox create.
-- `poll_until` for waiting on other state.
+- `poll_until` for waiting on other state, and `with_deadline(what, timeout,
+  future)` for a step that must finish sooner than its own timeout.
 
 ## Running against a gateway
 

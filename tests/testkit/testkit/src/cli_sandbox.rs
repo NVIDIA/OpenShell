@@ -48,7 +48,7 @@ impl<'a> CliSandboxBuilder<'a> {
     /// Create the sandbox with this policy YAML (`--policy`). It is written
     /// to a temporary file that lives until the CLI exits.
     #[must_use]
-    pub fn policy(mut self, yaml: &str) -> Self {
+    pub fn policy_yaml(mut self, yaml: &str) -> Self {
         self.policy = Some(yaml.to_string());
         self
     }
@@ -79,7 +79,7 @@ impl<'a> CliSandboxBuilder<'a> {
     /// return the sandbox. It need not be Ready yet.
     pub async fn create(mut self) -> Result<Sandbox> {
         self.args.push("--detach".to_string());
-        self.run()
+        self.invoke()
             .await?
             .success()
             .context(format!("create sandbox {}", self.name))?;
@@ -89,7 +89,11 @@ impl<'a> CliSandboxBuilder<'a> {
     /// Create the sandbox attached to its main command and return the CLI's
     /// output, whatever its exit code. For a test of the main command's
     /// result, or of a create that must fail.
-    pub async fn run(&self) -> Result<CliOutput> {
+    pub async fn run(self) -> Result<CliOutput> {
+        self.invoke().await
+    }
+
+    async fn invoke(&self) -> Result<CliOutput> {
         self.cx.track(&self.name);
         let policy = self.policy.as_deref().map(PolicyFile::new).transpose()?;
         let mut args = vec!["sandbox", "create", "--name", &self.name, "--no-tty"];
