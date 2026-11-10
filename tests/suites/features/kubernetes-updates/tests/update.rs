@@ -458,7 +458,7 @@ async fn image_update_retains_workspace_and_identity(cx: &mut Context) -> testki
     let sandbox = cx
         // The testkit's unique prefix leaves five characters of the name limit.
         .sandbox("image")
-        .spec(|spec| spec.image = Some(ORIGINAL_IMAGE.to_string()))
+        .image(ORIGINAL_IMAGE.as_str())
         .create()
         .await?;
     sandbox.wait_ready().await?;
@@ -597,7 +597,7 @@ async fn terminal_workload_can_stop_update_and_restart(cx: &mut Context) -> test
     let sandbox = cx
         .sandbox("term")
         .restart_policy(testkit::sdk::SandboxRestartPolicy::Never)
-        .spec(|spec| spec.image = Some(ORIGINAL_IMAGE.to_string()))
+        .image(ORIGINAL_IMAGE.as_str())
         .create()
         .await?;
     sandbox.wait_ready().await?;

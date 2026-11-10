@@ -14,7 +14,7 @@ use host_server_support::{HttpRecorder, Request, WebSocketRecorder};
 use testkit::policy::{self, Access, Endpoint as _};
 use testkit::sdk::raw::proto;
 use testkit::{
-    Context, Error, GrpcCode, PYTHON_BINARIES, Poll, Result, ResultExt as _, Sandbox, YamlFile,
+    Context, Error, GrpcCode, PYTHON_BINARIES, Result, ResultExt as _, Sandbox, YamlFile,
 };
 
 const TEST_HOST: &str = "host.openshell.internal";
@@ -298,10 +298,8 @@ fn sandbox_with(
 ) -> testkit::SandboxBuilder {
     cx.sandbox(suffix)
         .policy(policy)
-        .spec(|spec| {
-            spec.image = Some(testkit::python_image());
-            spec.providers = providers.iter().map(ToString::to_string).collect();
-        })
+        .image(testkit::python_image())
+        .spec(|spec| spec.providers = providers.iter().map(ToString::to_string).collect())
         .command(["sleep", "infinity"])
 }
 
@@ -313,9 +311,9 @@ async fn create_sandbox(
     policy: proto::SandboxPolicy,
     providers: &[&str],
 ) -> Result<Sandbox> {
-    let sandbox = sandbox_with(cx, suffix, policy, providers).create().await?;
-    sandbox.wait_ready().await?;
-    Ok(sandbox)
+    sandbox_with(cx, suffix, policy, providers)
+        .create_ready()
+        .await
 }
 
 /// Fail unless the gateway rejects the sandbox as a failed precondition, and
@@ -384,25 +382,15 @@ fn redact(request: &Request) -> String {
 
 /// Wait until new exec sessions report `expected` from [`TOKEN_PRESENCE`].
 async fn wait_for_token(sandbox: &Sandbox, expected: &str) -> Result {
-    testkit::poll_until(
-        &format!("the provider environment to report {expected}"),
-        Duration::from_secs(30),
-        Duration::from_millis(500),
-        async || {
-            let output = sandbox.exec(["sh", "-lc", TOKEN_PRESENCE]).await?;
-            Ok(if output.stdout.contains(expected) {
-                Poll::Ready(())
-            } else {
-                Poll::Pending(format!(
-                    "exit {}; stdout: {}; stderr: {}",
-                    output.exit_code,
-                    output.stdout.trim(),
-                    output.stderr.trim()
-                ))
-            })
-        },
-    )
-    .await
+    sandbox
+        .poll_exec(
+            &format!("the provider environment to report {expected}"),
+            Duration::from_secs(30),
+            ["sh", "-lc", TOKEN_PRESENCE],
+            |output| output.stdout.contains(expected),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Replace `sandbox`'s policy with `policy` and wait until it is applied.
