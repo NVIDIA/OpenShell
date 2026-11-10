@@ -122,6 +122,14 @@ plaintext and mTLS gateways. `OPENSHELL_WORKSPACE` selects the workspace
 (default `openshell` on PATH). The CLI always targets the same gateway and
 workspace as the SDK. Each test logs the gateway it used.
 
+`OPENSHELL_TEST_TIMEOUT_SECS` is the time one test may take, as the runner
+enforces it. The runner sets it. When set, `cx.cli`, `cx.exec` and the wait
+helpers give up about five seconds before that limit, with their own error,
+instead of leaving the test to be stopped. When unset, as under plain
+`cargo test`, each step keeps its own timeout. A CLI command that runs longer
+than ten seconds, exits non-zero, or is still running after 30 seconds is
+reported on stderr; fast successful commands print nothing.
+
 Wait for the gateway, then run a suite. Run tests that share a gateway one at
 a time:
 

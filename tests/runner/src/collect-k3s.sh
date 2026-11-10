@@ -28,6 +28,27 @@ collect_log() {
   printf '\ncommand status: %s\n' "${PIPESTATUS[0]}"
 }
 
+# Gateway logs cover the whole run, so a failing test's window is included.
+# The runner records when the run started; without that, use a fixed window.
+# The tail is larger than for other logs because a gateway logs many lines.
+RUN_STARTED_FILE=/var/tmp/openshell-run-started
+log_since=--since=30m
+if run_started=$(cat "$RUN_STARTED_FILE" 2>/dev/null) &&
+  [[ $run_started =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+  log_since=--since-time=$run_started
+fi
+
+collect_gateway_log() {
+  printf '\n### %s (%s)\n' "$1" "$log_since"
+  shift
+  timeout 20s "$@" 2>&1 | {
+    head -c 65536
+    printf '\n### Remaining log tail\n'
+    tail -c 524288
+  }
+  printf '\ncommand status: %s\n' "${PIPESTATUS[0]}"
+}
+
 {
   date --utc --iso-8601=seconds
   collect 'K3s service state' systemctl show k3s.service \
@@ -74,8 +95,8 @@ collect_log() {
   mapfile -t gateway_pods < <(timeout 10s /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell get pods \
     --selector app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell --output name 2>/dev/null)
   for pod in "${gateway_pods[@]}"; do
-    collect "Gateway current logs ($pod)" /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell logs "$pod" -c openshell-gateway --tail=300 --timestamps
-    collect "Gateway previous logs ($pod)" /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell logs "$pod" -c openshell-gateway --previous --tail=300 --timestamps
+    collect_gateway_log "Gateway current logs ($pod)" /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell logs "$pod" -c openshell-gateway "$log_since" --timestamps
+    collect_gateway_log "Gateway previous logs ($pod)" /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell logs "$pod" -c openshell-gateway --previous "$log_since" --timestamps
   done
   collect 'Memory' free -m
   collect 'Disk' df -h / /var/lib/rancher/k3s

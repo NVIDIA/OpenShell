@@ -25,6 +25,7 @@ pub async fn poll_until<T>(
     interval: Duration,
     mut observe: impl AsyncFnMut() -> Result<Poll<T>>,
 ) -> Result<T> {
+    let timeout = crate::budget::cap(timeout);
     let started = Instant::now();
     loop {
         match observe().await? {
