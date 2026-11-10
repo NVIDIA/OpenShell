@@ -612,10 +612,6 @@ fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     }
 }
 const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
-/// Unsupervised shared sandbox instances removed at once by one reconcile pass.
-/// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
-const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
-
 fn random_sandbox_runtime_token() -> Result<String, KubernetesDriverError> {
     use std::fmt::Write as _;
 
@@ -2224,6 +2220,201 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
+    /// Resolve only a unique, live driver-owned supervisor. Multi-member pool
+    /// resolution must use the HA assignment/member API rather than guess.
+    pub async fn supervisor_app_endpoint(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<
+        Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>,
+        KubernetesDriverError,
+    > {
+        if !self.config.sandbox_runtime.app_listener.common.enabled {
+            return Ok(None);
+        }
+        let api = self
+            .supported_sandbox_api_for_lookup(self.client.clone())
+            .await
+            .map_err(KubernetesDriverError::Message)?;
+        let objects = api
+            .api
+            .list(&ListParams::default().labels(&self.sandbox_lookup_selector(sandbox_id)))
+            .await
+            .map_err(KubernetesDriverError::from_kube)?
+            .items;
+        let [object]: [DynamicObject; 1] = match objects.try_into() {
+            Ok(objects) => objects,
+            Err(_) => return Ok(None),
+        };
+        let namespace = object.metadata.namespace.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Precondition("sandbox namespace missing".into())
+        })?;
+        let uid = object
+            .metadata
+            .uid
+            .as_deref()
+            .ok_or_else(|| KubernetesDriverError::Precondition("sandbox UID missing".into()))?;
+        let placement = supervisor_placement(&object)?;
+        let mut pool_route = String::new();
+        let mut ownership_epoch = 0;
+        let mut member_address = None;
+        let pods = if let SupervisorPlacement::Shared { route } = &placement {
+            let Some(shared) = &self.shared_supervisor else {
+                return Ok(None);
+            };
+            let controller = shared.supervision().controller();
+            let Some(view) = controller.pool_view() else {
+                return Ok(None);
+            };
+            let Some(owner) = view
+                .owners
+                .get(route)
+                .filter(|_| view.desired.contains(route))
+            else {
+                return Ok(None);
+            };
+            let Some(member) = view.members.iter().find(|member| {
+                member.member_id == owner.member_id
+                    && member.process_id == owner.process_id
+                    && !member.leaving
+            }) else {
+                return Ok(None);
+            };
+            if !matches!(controller.observed(route),
+                openshell_supervisor_control::ObservedInstance::Reported(status)
+                    if status.sandbox_id == sandbox_id && status.ready
+                        && status.phase == openshell_supervisor_control::proto::SandboxInstancePhase::Supervising as i32)
+            {
+                return Ok(None);
+            }
+            let address = member
+                .runtime_address
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| {
+                    KubernetesDriverError::Precondition(
+                        "pool member runtime address is not an IP endpoint".into(),
+                    )
+                })?;
+            let pod =
+                Api::<Pod>::namespaced(self.client.clone(), &shared.config().service_namespace)
+                    .get_opt(&owner.member_id)
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?;
+            let Some(pod) = pod else {
+                return Ok(None);
+            };
+            let service =
+                Api::<Service>::namespaced(self.client.clone(), &shared.config().service_namespace)
+                    .get(&shared.config().service_name)
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?;
+            let Some(selector) = service
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.selector.as_ref())
+                .filter(|selector| !selector.is_empty())
+            else {
+                return Ok(None);
+            };
+            if !selector.iter().all(|(key, value)| {
+                pod.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(key))
+                    == Some(value)
+            }) {
+                return Ok(None);
+            }
+            pool_route = route.clone();
+            ownership_epoch = owner.auth_epoch;
+            member_address = Some(address.ip());
+            vec![pod]
+        } else {
+            let selector =
+                format!("openshell.ai/sandbox-id={sandbox_id},openshell.ai/component=supervisor");
+            Api::<Pod>::namespaced(self.client.clone(), namespace)
+                .list(&ListParams::default().labels(&selector))
+                .await
+                .map_err(KubernetesDriverError::from_kube)?
+                .items
+        };
+        // Includes terminating members in the ambiguity check; never guess a
+        // replacement's ownership during a rollout.
+        let [pod]: [Pod; 1] = match pods.try_into() {
+            Ok(pods) => pods,
+            Err(_) => return Ok(None),
+        };
+        if pod.metadata.deletion_timestamp.is_some() {
+            return Ok(None);
+        }
+        let app_port = i32::from(self.config.sandbox_runtime.app_listener.common.port);
+        if !pod
+            .spec
+            .as_ref()
+            .and_then(|spec| {
+                spec.containers
+                    .iter()
+                    .find(|container| container.name == "supervisor")
+            })
+            .is_some_and(|container| {
+                container.ports.as_ref().is_some_and(|ports| {
+                    ports.iter().any(|port| {
+                        port.name.as_deref() == Some("app") && port.container_port == app_port
+                    })
+                }) && container.env.as_ref().is_some_and(|env| {
+                    env.iter().any(|entry| {
+                        entry.name == "OPENSHELL_APP_LISTENER_ENABLED"
+                            && entry.value.as_deref() == Some("true")
+                    })
+                })
+            })
+        {
+            return Ok(None);
+        }
+        let Some(pod_uid) = pod.metadata.uid.as_deref() else {
+            return Ok(None);
+        };
+        if matches!(placement, SupervisorPlacement::Dedicated)
+            && !pod
+                .metadata
+                .owner_references
+                .as_ref()
+                .is_some_and(|owners| owners.iter().any(|o| o.uid == uid && o.kind == "Sandbox"))
+        {
+            return Ok(None);
+        }
+        let Some(status) = pod.status else {
+            return Ok(None);
+        };
+        if status.phase.as_deref() != Some("Running") {
+            return Ok(None);
+        }
+        let Some(host) = status
+            .pod_ip
+            .filter(|ip| ip.parse::<std::net::IpAddr>().is_ok())
+        else {
+            return Ok(None);
+        };
+        if member_address
+            .is_some_and(|address| host.parse::<std::net::IpAddr>().ok() != Some(address))
+        {
+            return Ok(None);
+        }
+        let component = match placement {
+            SupervisorPlacement::Dedicated => pod_uid.to_string(),
+            SupervisorPlacement::Shared { route } => route,
+        };
+        Ok(Some(
+            openshell_core::proto::compute::v1::SupervisorAppEndpoint {
+                host,
+                port: u32::from(self.config.sandbox_runtime.app_listener.common.port),
+                runtime_identity: kubernetes_runtime_identity(namespace, uid, &component),
+                pool_route,
+                ownership_epoch,
+            },
+        ))
+    }
+
     pub async fn get_sandbox(&self, sandbox_id: &str) -> Result<Option<Sandbox>, String> {
         info!(
             sandbox_id = %sandbox_id,
@@ -3349,9 +3540,8 @@ impl KubernetesComputeDriver {
             .ensure_network_additional_ca_config_map(namespace)
             .await?;
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        pods.create(
-            &PostParams::default(),
-            &crate::app_listener::configure_supervisor_pod(
+        let pod = crate::sandbox_runtime::with_runtime_class(
+            crate::app_listener::configure_supervisor_pod(
                 supervisor_pod(
                     namespace,
                     names,
@@ -3388,16 +3578,19 @@ impl KubernetesComputeDriver {
                         .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
                     owner,
                     &self.supervisor_otlp_environment(),
+                    self.config.sandbox_attach_request_timeout_seconds,
                 )
                 .map_err(KubernetesDriverError::Message)?,
                 &self.config.sandbox_runtime.app_listener,
             ),
-        )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?
-        .metadata
-        .uid
-        .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
+            &self.config.supervisor_runtime_class_name,
+        );
+        pods.create(&PostParams::default(), &pod)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?
+            .metadata
+            .uid
+            .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
     }
 
     /// Read the gateway's shared supervisor Service: its address and the
@@ -3907,6 +4100,7 @@ impl KubernetesComputeDriver {
             sandbox_api.api.clone(),
             cr_name.to_string(),
             Some(cr_uid.to_string()),
+            Duration::from_secs(self.config.runtime_bootstrap_grace_seconds),
         );
         Ok(())
     }
@@ -5348,7 +5542,7 @@ impl KubernetesComputeDriver {
         if !sandbox_runtime_bootstrap_is_stale(
             object,
             SystemTime::now(),
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
+            Duration::from_secs(self.config.runtime_bootstrap_grace_seconds),
         ) {
             return;
         }
@@ -5791,9 +5985,10 @@ fn spawn_sandbox_runtime_bootstrap_completion(
     sandboxes: Api<DynamicObject>,
     sandbox_name: String,
     expected_sandbox_uid: Option<String>,
+    bootstrap_grace: Duration,
 ) {
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + SANDBOX_RUNTIME_BOOTSTRAP_GRACE;
+        let deadline = tokio::time::Instant::now() + bootstrap_grace;
         match tokio::time::timeout_at(deadline, control.wait_available()).await {
             Ok(true) => {}
             Ok(false) | Err(_) => return,
@@ -10318,6 +10513,7 @@ mod tests {
     #[test]
     fn sandbox_runtime_bootstrap_marker_and_age_gate_rollback() {
         let started = Duration::from_hours(490_896);
+        let bootstrap_grace = Duration::from_mins(5);
         let mut object: DynamicObject = serde_json::from_value(serde_json::json!({
             "apiVersion": "agents.x-k8s.io/v1beta1",
             "kind": "Sandbox",
@@ -10340,13 +10536,13 @@ mod tests {
         let started_at = SystemTime::UNIX_EPOCH + started;
         assert!(!sandbox_runtime_bootstrap_is_stale(
             &object,
-            started_at + SANDBOX_RUNTIME_BOOTSTRAP_GRACE - Duration::from_secs(1),
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            started_at + bootstrap_grace - Duration::from_secs(1),
+            bootstrap_grace
         ));
         assert!(sandbox_runtime_bootstrap_is_stale(
             &object,
-            started_at + SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            started_at + bootstrap_grace,
+            bootstrap_grace
         ));
         object
             .metadata
@@ -10357,7 +10553,7 @@ mod tests {
         assert!(sandbox_runtime_bootstrap_is_stale(
             &object,
             started_at,
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            bootstrap_grace
         ));
         object
             .metadata

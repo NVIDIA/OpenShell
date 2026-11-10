@@ -86,6 +86,7 @@ use openshell_core::{
     host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
 };
+use openshell_credential_issuer::refresh::CredentialRefresh;
 use openshell_ocsf::{
     ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId, sanitize_reason_for_audit,
 };
@@ -1971,6 +1972,7 @@ async fn current_effective_policy_for_sandbox(
         .unwrap_or_default();
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         &provider_names,
     )
@@ -2084,6 +2086,7 @@ async fn apply_effective_policy_context(
 ) -> Result<ProtoSandboxPolicy, Status> {
     let provider_context = provider_policy_context_with_catalog(
         state.store.as_ref(),
+        &state.refresh,
         catalog,
         workspace,
         provider_names,
@@ -2403,6 +2406,7 @@ async fn validate_policy_credential_bindings_for_sandbox(
     }
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -2427,6 +2431,7 @@ async fn provider_policy_layers_for_sandbox(
         .await?;
     let layers = provider_policy_context_with_catalog(
         state.store.as_ref(),
+        &state.refresh,
         &catalog,
         workspace,
         provider_names,
@@ -2545,6 +2550,7 @@ async fn validate_provider_composition_for_existing_sandboxes(
             // sandbox already fails closed, so warn and validate the rest.
             let (records, missing) = super::provider::load_existing_provider_environment_records(
                 state.store.as_ref(),
+                &state.refresh,
                 &workspace,
                 provider_names,
             )
@@ -3284,8 +3290,10 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<u64, Status> {
+    let refresh = crate::provider_refresh::runtime(&Arc::new(store.clone()), None, None);
     compute_provider_env_revision_with_catalog_and_policy_bindings(
         store,
+        &refresh,
         catalog,
         workspace,
         provider_names,
@@ -3296,6 +3304,7 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
 
 async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
@@ -3319,9 +3328,12 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
                 let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
-                let refresh_states =
-                    crate::provider_refresh::list_refresh_states_for_provider(store, &record.id)
-                        .await?;
+                let refresh_states: Vec<StoredProviderCredentialRefreshState> = refresh
+                    .list(Some(&record.id))
+                    .await?
+                    .iter()
+                    .map(Into::into)
+                    .collect();
                 hash_provider_refresh_states(&refresh_states, &mut hasher)?;
                 hasher.update(provider.r#type.as_bytes());
                 hash_provider_profile_revision(
@@ -3508,8 +3520,9 @@ async fn profile_provider_policy_layers_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    let refresh = crate::provider_refresh::runtime(&Arc::new(store.clone()), None, None);
     Ok(
-        provider_policy_context_with_catalog(store, catalog, workspace, provider_names)
+        provider_policy_context_with_catalog(store, &refresh, catalog, workspace, provider_names)
             .await?
             .layers,
     )
@@ -3531,13 +3544,18 @@ struct ProviderPolicyContext {
 
 async fn provider_policy_context_with_catalog(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<ProviderPolicyContext, Status> {
-    let records =
-        super::provider::load_provider_environment_records(store, workspace, provider_names)
-            .await?;
+    let records = super::provider::load_provider_environment_records(
+        store,
+        refresh,
+        workspace,
+        provider_names,
+    )
+    .await?;
     Ok(provider_policy_context_from_records(catalog, &records))
 }
 
@@ -3790,6 +3808,7 @@ pub(super) async fn resolve_sandbox_create_runtime_inputs(
         .await?;
     let provider_records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -4041,6 +4060,18 @@ pub async fn build_provider_environment_snapshot_from_inputs(
             .stable_placeholder_environment_keys
             .clear();
     }
+
+    // Add request metadata only after token-grant owner composition and all
+    // static value filtering, so it describes this exact atomic snapshot.
+    let static_request_metadata = super::provider::static_credential_request_metadata(
+        &sandbox_id,
+        provider_profile_catalog,
+        provider_records,
+        &provider_environment,
+    )?;
+    provider_environment
+        .dynamic_credentials
+        .extend(static_request_metadata);
 
     info!(
         sandbox_id = %sandbox_id,
@@ -5084,6 +5115,7 @@ pub(super) async fn handle_report_sandbox_configuration(
         &state.store,
         &mut sandbox,
         current_time_ms(),
+        state.config.provisioning_repair_window_seconds * 1000,
     )
     .await
     .map_err(Status::internal)?;
@@ -5177,11 +5209,19 @@ pub(super) async fn handle_report_sandbox_configuration(
                 .map_err(Status::internal)?;
             return Err(Status::failed_precondition("provisioning deadline expired"));
         }
-        crate::compute::provisioning_deadline::record_admission_start(record, now_ms)
-            .map_err(Status::internal)?;
+        crate::compute::provisioning_deadline::record_admission_start(
+            record,
+            now_ms,
+            state.config.provisioning_repair_window_seconds * 1000,
+        )
+        .map_err(Status::internal)?;
         if reported == ConfigurationAdmissionState::Rejected {
-            crate::compute::provisioning_deadline::record_rejection(record, now_ms)
-                .map_err(Status::internal)?;
+            crate::compute::provisioning_deadline::record_rejection(
+                record,
+                now_ms,
+                state.config.provisioning_repair_window_seconds * 1000,
+            )
+            .map_err(Status::internal)?;
         }
     }
     let updated = state
@@ -5424,6 +5464,35 @@ pub(super) async fn handle_get_sandbox_logs(
     Ok(Response::new(GetSandboxLogsResponse { logs, buffer_total }))
 }
 
+/// How often an open push stream re-reads its sandbox record to detect that
+/// the sandbox was deleted.
+///
+/// Batches flush every 500ms, so this costs roughly one primary-key read per
+/// stream per second, and only when a batch arrives.
+const LOG_STREAM_EXISTENCE_RECHECK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Mutable state for one `PushSandboxLogs` stream.
+#[derive(Debug, Default)]
+struct LogStreamState {
+    /// Sandbox id the first batch validated as belonging to the caller.
+    validated_sandbox_id: Option<String>,
+    /// When the sandbox record was last confirmed to exist.
+    last_existence_check: Option<std::time::Instant>,
+}
+
+impl LogStreamState {
+    /// True when the cached existence proof is stale enough to re-read.
+    fn should_recheck(&self, now: std::time::Instant) -> bool {
+        self.last_existence_check.is_none_or(|checked_at| {
+            now.duration_since(checked_at) >= LOG_STREAM_EXISTENCE_RECHECK_PERIOD
+        })
+    }
+
+    fn mark_checked(&mut self, now: std::time::Instant) {
+        self.last_existence_check = Some(now);
+    }
+}
+
 pub(super) async fn handle_push_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
@@ -5436,7 +5505,7 @@ pub(super) async fn handle_push_sandbox_logs(
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let mut stream = request.into_inner();
-    let mut validated_sandbox_id = None;
+    let mut stream_state = LogStreamState::default();
 
     while let Some(batch) = stream
         .message()
@@ -5447,11 +5516,15 @@ pub(super) async fn handle_push_sandbox_logs(
             continue;
         }
 
-        ensure_log_stream_sandbox_scope(
+        // Auth first: a cross-sandbox push must keep the audited
+        // PermissionDenied rather than learn about existence.
+        ensure_log_stream_sandbox_scope(state, &principal, &batch.sandbox_id, &mut stream_state)
+            .await?;
+        ensure_log_stream_sandbox_exists(
             state,
-            &principal,
+            &mut stream_state,
             &batch.sandbox_id,
-            &mut validated_sandbox_id,
+            std::time::Instant::now(),
         )
         .await?;
 
@@ -5480,6 +5553,55 @@ pub(super) async fn handle_push_sandbox_logs(
     Ok(Response::new(PushSandboxLogsResponse {}))
 }
 
+/// End an open push stream once the sandbox behind it is gone.
+///
+/// A tombstone from [`crate::tracing_bus::TracingLogBus::close`] is checked on
+/// every batch and costs no store read. It ends the stream on the replica that
+/// ran delete cleanup. The store is re-read at most once per
+/// [`LOG_STREAM_EXISTENCE_RECHECK_PERIOD`], which ends a stream whose record
+/// disappears while the stream is still open, as a best effort on the other
+/// replicas. Freeing another replica's buffers is a separate concern (#5401);
+/// only the replica that removed the record arms a permanent tombstone.
+///
+/// Only a missing record ends the stream. A transient store failure is not
+/// proof of absence, so it keeps the stream open and the next cadence retries.
+///
+/// A missing sandbox row means the sandbox is gone. Several readers make that
+/// inference with their own error policy -- delete cleanup, this recheck, and
+/// the `WatchSandbox` producer in grpc/sandbox.rs -- so a change to deletion
+/// semantics (soft delete, migration windows, record recreation) must update
+/// every one of them.
+async fn ensure_log_stream_sandbox_exists(
+    state: &Arc<ServerState>,
+    stream_state: &mut LogStreamState,
+    sandbox_id: &str,
+    now: std::time::Instant,
+) -> Result<(), Status> {
+    if state.tracing_log_bus.is_closed(sandbox_id) {
+        return Err(Status::not_found("sandbox not found"));
+    }
+    if !stream_state.should_recheck(now) {
+        return Ok(());
+    }
+
+    match state.store.get(Sandbox::object_type(), sandbox_id).await {
+        Ok(Some(_)) => {
+            stream_state.mark_checked(now);
+            Ok(())
+        }
+        Ok(None) => Err(Status::not_found("sandbox not found")),
+        Err(error) => {
+            warn!(
+                sandbox_id,
+                %error,
+                "Sandbox existence recheck failed; keeping the log stream open"
+            );
+            stream_state.mark_checked(now);
+            Ok(())
+        }
+    }
+}
+
 fn validate_sandbox_log_timestamps(logs: &[SandboxLogLine]) -> Result<(), Status> {
     for (index, log) in logs.iter().enumerate() {
         if let Some(event_time) = log.event_time.as_ref() {
@@ -5491,16 +5613,21 @@ fn validate_sandbox_log_timestamps(logs: &[SandboxLogLine]) -> Result<(), Status
     Ok(())
 }
 
+/// Validate one batch's sandbox scope and, on the first batch, its existence.
+///
+/// On the first batch this reads the sandbox record and marks the
+/// existence-recheck clock, so the already-paid read also seeds the cadence
+/// instead of the caller issuing a second one on the next batch.
 async fn ensure_log_stream_sandbox_scope(
     state: &Arc<ServerState>,
     principal: &Principal,
     sandbox_id: &str,
-    validated_sandbox_id: &mut Option<String>,
+    stream_state: &mut LogStreamState,
 ) -> Result<(), Status> {
     // Guard every batch, so switching to another sandbox mid-stream is
     // recorded like any other cross-sandbox attempt.
     crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
-    if let Some(validated) = validated_sandbox_id.as_deref() {
+    if let Some(validated) = stream_state.validated_sandbox_id.as_deref() {
         if sandbox_id != validated {
             return Err(Status::permission_denied(
                 "log stream sandbox_id changed after validation",
@@ -5515,7 +5642,8 @@ async fn ensure_log_stream_sandbox_scope(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    *validated_sandbox_id = Some(sandbox_id.to_string());
+    stream_state.validated_sandbox_id = Some(sandbox_id.to_string());
+    stream_state.mark_checked(std::time::Instant::now());
     Ok(())
 }
 
@@ -7561,6 +7689,7 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
     let composition_enabled = provider_policy_composition_enabled_in(&global_settings)?;
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -8437,6 +8566,322 @@ mod tests {
     }
 
     #[test]
+    fn log_stream_state_rechecks_only_after_the_period() {
+        let mut stream_state = LogStreamState::default();
+        let now = std::time::Instant::now();
+        assert!(
+            stream_state.should_recheck(now),
+            "a stream that never read the record must check"
+        );
+
+        stream_state.mark_checked(now);
+        assert!(!stream_state.should_recheck(now));
+        let just_inside = now
+            + LOG_STREAM_EXISTENCE_RECHECK_PERIOD
+                .checked_sub(std::time::Duration::from_millis(1))
+                .expect("the recheck period must be at least a millisecond");
+        assert!(!stream_state.should_recheck(just_inside));
+        assert!(stream_state.should_recheck(now + LOG_STREAM_EXISTENCE_RECHECK_PERIOD));
+    }
+
+    #[tokio::test]
+    async fn log_stream_tombstone_ends_stream_without_a_store_read() {
+        // The record is present, so only the tombstone can end the stream: a
+        // path that consulted the store first would report it alive.
+        let state = test_server_state().await;
+        let sandbox_id = "sb-recheck-tombstone";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "recheck-tombstone",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let mut stream_state = LogStreamState::default();
+        let now = std::time::Instant::now();
+        stream_state.mark_checked(now);
+        state.tracing_log_bus.close(sandbox_id);
+
+        let error = ensure_log_stream_sandbox_exists(&state, &mut stream_state, sandbox_id, now)
+            .await
+            .expect_err("a tombstoned sandbox must end the stream on the next batch");
+
+        assert_eq!(error.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn log_stream_recheck_ends_stream_when_the_record_is_gone() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-recheck-gone";
+        let mut stream_state = LogStreamState::default();
+        let checked_at = std::time::Instant::now();
+        stream_state.mark_checked(checked_at);
+
+        let error = ensure_log_stream_sandbox_exists(
+            &state,
+            &mut stream_state,
+            sandbox_id,
+            checked_at + LOG_STREAM_EXISTENCE_RECHECK_PERIOD,
+        )
+        .await
+        .expect_err("a missing record must end the stream");
+
+        assert_eq!(error.code(), Code::NotFound);
+        assert!(
+            !state.tracing_log_bus.is_closed(sandbox_id),
+            "one absent sample must not arm a permanent tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_stream_recheck_keeps_stream_when_the_record_still_exists() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-recheck-alive";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "recheck-alive",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let mut stream_state = LogStreamState::default();
+        let checked_at = std::time::Instant::now();
+        stream_state.mark_checked(checked_at);
+        let now = checked_at + LOG_STREAM_EXISTENCE_RECHECK_PERIOD;
+
+        ensure_log_stream_sandbox_exists(&state, &mut stream_state, sandbox_id, now)
+            .await
+            .expect("a present record keeps the stream open");
+
+        assert!(!state.tracing_log_bus.is_closed(sandbox_id));
+        assert!(
+            !stream_state.should_recheck(now),
+            "the confirmed read restarts the cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_stream_recheck_survives_a_transient_store_failure() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-recheck-transient";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "recheck-transient",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let mut stream_state = LogStreamState::default();
+        let checked_at = std::time::Instant::now();
+        stream_state.mark_checked(checked_at);
+        let now = checked_at + LOG_STREAM_EXISTENCE_RECHECK_PERIOD;
+
+        // A failed read is not proof of absence: every later read fails too.
+        state.store.close().await;
+
+        ensure_log_stream_sandbox_exists(&state, &mut stream_state, sandbox_id, now)
+            .await
+            .expect("a store failure must not end the stream");
+        assert!(!state.tracing_log_bus.is_closed(sandbox_id));
+
+        ensure_log_stream_sandbox_exists(
+            &state,
+            &mut stream_state,
+            sandbox_id,
+            now + LOG_STREAM_EXISTENCE_RECHECK_PERIOD,
+        )
+        .await
+        .expect("the stream must survive to the next batch");
+    }
+
+    #[tokio::test]
+    async fn push_sandbox_logs_stream_ends_not_found_after_sandbox_delete() {
+        use openshell_core::proto::open_shell_client::OpenShellClient;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-log-deleted";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "log-deleted",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = crate::auth::principal::test_support::sandbox(sandbox_id);
+        let service = OpenShellServer::with_interceptor(
+            crate::grpc::OpenShellService::new(state.clone()),
+            move |mut request: Request<()>| {
+                request.extensions_mut().insert(principal.clone());
+                Ok(request)
+            },
+        );
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let call =
+            tokio::spawn(async move { client.push_sandbox_logs(ReceiverStream::new(rx)).await });
+
+        let batch = |message: &str, millis: i64| PushSandboxLogsRequest {
+            sandbox_id: sandbox_id.to_string(),
+            logs: vec![SandboxLogLine {
+                sandbox_id: sandbox_id.to_string(),
+                event_time: openshell_core::time::timestamp_from_millis(millis).ok(),
+                level: "INFO".to_string(),
+                target: "delete-test".to_string(),
+                message: message.to_string(),
+                source: "sandbox".to_string(),
+                fields: HashMap::new(),
+            }],
+        };
+
+        tx.send(batch("before delete", 1)).await.unwrap();
+        // Wait for the first batch to be ingested, so the second batch is the
+        // one that meets the tombstone.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.tracing_log_bus.tail(sandbox_id, 10).is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first batch must be ingested");
+
+        // What `cleanup_sandbox_state` does on the replica that serves the
+        // delete.
+        state.tracing_log_bus.close(sandbox_id);
+
+        tx.send(batch("after delete", 2)).await.unwrap();
+
+        let error = call
+            .await
+            .expect("client task must not panic")
+            .expect_err("a deleted sandbox must end its push stream");
+        assert_eq!(error.code(), Code::NotFound);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn push_sandbox_logs_probes_a_sandbox_record_once_per_validated_batch() {
+        use crate::otel_tracing::test_exporter;
+        use openshell_core::proto::open_shell_client::OpenShellClient;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-log-seeded-recheck";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "log-seeded-recheck",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = crate::auth::principal::test_support::sandbox(sandbox_id);
+        let service = OpenShellServer::with_interceptor(
+            crate::grpc::OpenShellService::new(state.clone()),
+            move |mut request: Request<()>| {
+                request.extensions_mut().insert(principal.clone());
+                Ok(request)
+            },
+        );
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let call =
+            tokio::spawn(async move { client.push_sandbox_logs(ReceiverStream::new(rx)).await });
+
+        // Count the sandbox-record reads the handler makes. The first batch's
+        // scope check already fetched the record, so the recheck clock must be
+        // seeded from it: a second read in the same batch would double what
+        // every open stream pays at startup.
+        let traced = test_exporter::install_traced();
+
+        tx.send(PushSandboxLogsRequest {
+            sandbox_id: sandbox_id.to_string(),
+            logs: vec![SandboxLogLine {
+                sandbox_id: sandbox_id.to_string(),
+                event_time: openshell_core::time::timestamp_from_millis(1).ok(),
+                level: "INFO".to_string(),
+                target: "seeded-recheck".to_string(),
+                message: "first batch".to_string(),
+                source: "sandbox".to_string(),
+                fields: HashMap::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.tracing_log_bus.tail(sandbox_id, 10).is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first batch must be ingested");
+
+        let record_reads: Vec<_> = traced
+            .wait_for_spans(|spans| {
+                spans.iter().any(|span| {
+                    span.name == "store.get"
+                        && test_exporter::attribute(span, "object.id").as_deref()
+                            == Some(sandbox_id)
+                })
+            })
+            .await
+            .into_iter()
+            .filter(|span| {
+                span.name == "store.get"
+                    && test_exporter::attribute(span, "object.id").as_deref() == Some(sandbox_id)
+            })
+            .collect();
+        assert_eq!(
+            record_reads.len(),
+            1,
+            "a validated batch must read the sandbox record once, not twice: the \
+             scope check proves existence, so only the recheck-cadence seed prevents \
+             a duplicate read per open stream"
+        );
+
+        drop(tx);
+        call.await
+            .expect("client task must not panic")
+            .expect("closing the client stream ends the push cleanly");
+        server.abort();
+    }
+
+    #[test]
     fn sandbox_log_timestamp_validation_rejects_malformed_batches_atomically() {
         let logs = vec![
             SandboxLogLine {
@@ -8644,7 +9089,7 @@ mod tests {
             Vec::new(),
         );
         sandbox.set_phase(SandboxPhase::Provisioning.into());
-        let preparation = new_preparation_record(current_time_ms() - 600_000, 1800);
+        let preparation = new_preparation_record(current_time_ms() - 600_000, 1800, 300_000);
         sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
         state.store.put_message(&sandbox).await.unwrap();
         let instance_id = uuid::Uuid::new_v4().to_string();
@@ -8733,7 +9178,8 @@ mod tests {
             Vec::new(),
         );
         sandbox.set_phase(SandboxPhase::Provisioning.into());
-        sandbox.status.as_mut().unwrap().provisioning = Some(new_preparation_record(0, 1800));
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(new_preparation_record(0, 1800, 300_000));
         state.store.put_message(&sandbox).await.unwrap();
         let error = handle_report_sandbox_configuration(
             &state,
@@ -11958,15 +12404,15 @@ mod tests {
         }
         let req = with_sandbox(Request::new(()), "sb-a");
         let principal = req.extensions().get::<Principal>().unwrap().clone();
-        let mut validated = None;
+        let mut stream_state = LogStreamState::default();
         let capture = openshell_ocsf::test_support::OcsfCapture::default();
         let _guard = capture.install();
 
-        ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut validated)
+        ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut stream_state)
             .await
             .expect("first frame should validate");
         assert!(capture.events().is_empty(), "own sandbox is not a denial");
-        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-b", &mut validated)
+        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-b", &mut stream_state)
             .await
             .expect_err("later frame must not switch sandbox ids");
 
@@ -11982,9 +12428,9 @@ mod tests {
         let state = test_server_state().await;
         let req = with_sandbox(Request::new(()), "sb-a");
         let principal = req.extensions().get::<Principal>().unwrap().clone();
-        let mut validated = None;
+        let mut stream_state = LogStreamState::default();
 
-        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut validated)
+        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut stream_state)
             .await
             .expect_err("missing sandbox must not validate");
 
@@ -12356,13 +12802,27 @@ mod tests {
             environment.provider_env_revision,
             second.provider_env_revision
         );
-        assert_eq!(environment.dynamic_credentials.len(), 2);
-        assert!(environment.dynamic_credentials.values().all(|credential| {
-            credential
-                .token_grant
-                .as_ref()
-                .is_some_and(|grant| grant.token_endpoint.contains("revision-b"))
-        }));
+        let grants = environment
+            .dynamic_credentials
+            .values()
+            .filter_map(|credential| credential.token_grant.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(grants.len(), 2);
+        assert!(
+            grants
+                .iter()
+                .all(|grant| grant.token_endpoint.contains("revision-b"))
+        );
+        assert!(
+            environment
+                .dynamic_credentials
+                .iter()
+                .filter(|(key, _)| key.starts_with(
+                    openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX
+                ))
+                .all(|(_, credential)| credential.token_grant.is_none()
+                    && credential.token_grant_owners.is_empty())
+        );
 
         handle_submit_policy_analysis(
             &state,
@@ -13092,6 +13552,95 @@ mod tests {
 
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert!(error.message().contains("already defines endpoints"));
+    }
+
+    #[tokio::test]
+    async fn provider_attachment_credential_inspection_uses_latest_policy() {
+        for (creation_has_rule, updated_has_rule) in [
+            (true, Some(false)),
+            (false, Some(true)),
+            (true, None),
+            (false, None),
+        ] {
+            let state = test_server_state().await;
+            state
+                .store
+                .put_message(&test_provider("work-github", "github"))
+                .await
+                .unwrap();
+            let policy = |has_rule| {
+                if has_rule {
+                    test_policy_with_rule("uninspected", "api.github.com")
+                } else {
+                    ProtoSandboxPolicy::default()
+                }
+            };
+            let creation_policy = policy(creation_has_rule);
+            let sandbox = test_sandbox(
+                "sb-attachment-inspection",
+                "attach-inspection",
+                creation_policy.clone(),
+                Vec::new(),
+            );
+            state.store.put_message(&sandbox).await.unwrap();
+
+            if let Some(has_rule) = updated_has_rule {
+                handle_update_config(
+                    &state,
+                    with_user(Request::new(UpdateConfigRequest {
+                        sandbox: "attach-inspection".to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        policy: Some(policy(has_rule)),
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .expect("policy update without an attached provider must succeed");
+            }
+
+            let result = super::super::sandbox::handle_attach_sandbox_provider(
+                &state,
+                authed_request(openshell_core::proto::AttachSandboxProviderRequest {
+                    sandbox: "attach-inspection".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    provider: "work-github".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            let should_reject = updated_has_rule.unwrap_or(creation_has_rule);
+            if should_reject {
+                let error = result.expect_err("current uninspected rule must prevent attachment");
+                assert_eq!(error.code(), Code::FailedPrecondition);
+                assert!(error.message().contains("L4-only"));
+                assert!(error.message().contains("uninspected"));
+            } else {
+                assert!(
+                    result
+                        .expect("no current uninspected rule")
+                        .into_inner()
+                        .attached
+                );
+            }
+
+            let stored = state
+                .store
+                .get_message::<Sandbox>("sb-attachment-inspection")
+                .await
+                .unwrap()
+                .unwrap();
+            let spec = stored.spec.unwrap();
+            assert_eq!(spec.policy, Some(creation_policy));
+            assert_eq!(
+                spec.providers,
+                if should_reject {
+                    Vec::<String>::new()
+                } else {
+                    vec!["work-github".to_string()]
+                }
+            );
+            state.store.close_for_test().await;
+        }
     }
 
     #[tokio::test]
@@ -15322,6 +15871,7 @@ mod tests {
         let provider_names = vec!["replaceable".to_string()];
         let first_records = crate::grpc::provider::load_provider_environment_records(
             state.store.as_ref(),
+            &state.refresh,
             "default",
             &provider_names,
         )
@@ -15380,6 +15930,7 @@ mod tests {
 
         let replacement_records = crate::grpc::provider::load_provider_environment_records(
             state.store.as_ref(),
+            &state.refresh,
             "default",
             &provider_names,
         )

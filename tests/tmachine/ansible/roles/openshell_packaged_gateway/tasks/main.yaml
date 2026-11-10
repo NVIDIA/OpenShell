@@ -21,17 +21,6 @@
     name: openshell_gateway
     tasks_from: "{{ openshell_gateway_driver }}.yaml"
 
-# The packaged gateway's configuration comes from its environment file, so it
-# can't apply an environment's Podman driver settings. Fail rather than test a
-# gateway without them.
-- name: Require no environment Podman driver settings
-  ansible.builtin.assert:
-    that:
-      - not (openshell_gateway_podman_driver_settings | default(''))
-    fail_msg: >-
-      This environment configures Podman driver settings, which only the
-      binaries installer applies.
-
 - name: Create packaged gateway environment directory
   become: true
   ansible.builtin.file:
@@ -55,6 +44,21 @@
       OPENSHELL_COMPUTE_DRIVER={{ openshell_gateway_driver }}
       OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
       OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
+
+# Override settings in the package's own configuration. The rpm seeds
+# ~/.config/openshell/gateway.toml from its default on first start, which comes
+# after this, so start from that default here and the package's seeding then
+# leaves the file alone. A package with no default, such as the deb, gets a
+# minimal file; its driver comes from gateway.env. An environment with no
+# overrides leaves the packaged configuration untouched.
+- name: Apply environment gateway overrides to the packaged gateway
+  ansible.builtin.include_role:
+    name: openshell_gateway
+    tasks_from: merge-settings.yaml
+  vars:
+    openshell_gateway_merge_target: "{{ openshell_gateway_home }}/.config/openshell/gateway.toml"
+    openshell_gateway_merge_default: /usr/share/openshell-gateway/gateway.toml.default
+    openshell_gateway_merge_user: "{{ openshell_gateway_user }}"
 
 - name: Start gateway user manager
   ansible.builtin.include_role:

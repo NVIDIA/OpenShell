@@ -23,6 +23,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
+| `crates/openshell-credential-issuer/` | Embedded credential issuer | Credential storage, built-in refresh execution/recovery/scheduling, typed secret owners, and existing driver transport |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
 | `crates/openshell-supervisor-control/` | Shared supervisor control | Gateway-owned assignment controller, launch registrations, recovery coordination, and host observations for a supervisor shared by many sandboxes |
@@ -60,7 +61,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |
 | `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
 | `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
-| `python/openshell/` | Python SDK | Python bindings and CLI packaging |
+| `python/openshell/` | Python SDK (frozen) | Moved to ai-openshell/sdk-python; kept until removal |
 | `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `tests/testkit/` | E2E testkit | Support library and `#[testkit::test]` attribute for SDK-driven E2E suites |
@@ -152,6 +153,7 @@ ocsf_emit!(event);
 
 - `crate::ocsf_ctx()` returns the process-wide `EventContext`. It is always available (falls back to defaults in tests).
 - `ocsf_emit!()` is non-blocking and cannot panic. It stores the event in a thread-local and emits via `tracing::info!()`.
+- In `openshell-supervisor-network`, emit with `crate::telemetry::egress_emit!` instead, or `crate::telemetry::emit_decision` for the records of one decision, so denied HTTP decisions get a deny span. Clippy rejects `ocsf_emit!` there.
 - The shorthand layer and JSONL layer extract the event from the thread-local. The shorthand format is derived automatically from the builder fields.
 - For security findings, **dual-emit**: one domain event (e.g., `SshActivityBuilder`) AND one `DetectionFindingBuilder` for the same incident.
 - Never log secrets, credentials, or query parameters in OCSF messages. The OCSF JSONL file may be shipped to external systems.
@@ -198,6 +200,11 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 
 - The Go SDK moved to [ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go) (module `github.com/ai-openshell/sdk-go`). Open SDK changes there.
 - `sdk/go/` is frozen until it is removed; Branch Checks fails PRs that change it. Proto changes do not need regenerated Go bindings.
+
+## Python SDK (`python/openshell/`)
+
+- The Python SDK moved to [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python), which publishes `openshell` to PyPI. Open SDK changes there.
+- `python/` and the SDK build script `tasks/scripts/generate_python_proto.py` are frozen until core removes them; Branch Checks fails PRs that change them. Put tests for core Python scripts next to the scripts, not under `python/`.
 
 ## TypeScript SDK (`sdk/typescript/`)
 

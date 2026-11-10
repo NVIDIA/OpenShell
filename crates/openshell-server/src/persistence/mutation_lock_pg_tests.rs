@@ -17,7 +17,7 @@ use super::mutation_lock::{
     GLOBAL_MUTATION_LOCK_KEY, LOCK_CONNECTION_MIN_BUDGET, MUTATION_LOCK_POOL_MAX_CONNECTIONS,
     MUTATION_LOCK_TIMEOUT, MutationLockKey, MutationLockSet,
 };
-use super::postgres::LOCK_CONNECTION_RELEASE_TIMEOUT;
+use super::postgres::{DATA_POOL_ACQUIRE_TIMEOUT, LOCK_CONNECTION_RELEASE_TIMEOUT};
 use super::test_postgres::TestSchema;
 use super::{
     DistributedMutationGuard, PersistenceError, PersistenceResult, PostgresStore, Store,
@@ -1259,6 +1259,77 @@ async fn postgres_mutation_lock_connection_failure_is_not_a_lock_timeout() {
     proxy.stalled.send_replace(false);
 
     fixture.finish(vec![saturated, unanswered]).await;
+}
+
+/// A data-pool caller whose `PostgreSQL` stops answering fails as retryable
+/// within the acquire timeout, and the next caller after it answers again
+/// gets a fresh connection.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_data_pool_fails_unavailable_while_postgres_does_not_answer() {
+    let schema = TestSchema::create("unavailable").await;
+    let proxy = StallingProxy::start(schema.url()).await;
+    let store = Store::Postgres(
+        PostgresStore::connect_with_lock_pool_size(&proxy.url, None, 1)
+            .await
+            .expect("connect a store through the proxy"),
+    );
+    store.ping().await.expect("ping before the network stalls");
+
+    proxy.stalled.send_replace(true);
+    let started = Instant::now();
+    let result = store.ping().await;
+    let waited = started.elapsed();
+    assert!(
+        matches!(result, Err(PersistenceError::Unavailable(_))),
+        "{result:?}"
+    );
+    assert!(
+        waited < DATA_POOL_ACQUIRE_TIMEOUT + Duration::from_secs(2),
+        "ping waited {waited:?}"
+    );
+
+    proxy.stalled.send_replace(false);
+    tokio::time::timeout(Duration::from_secs(5), store.ping())
+        .await
+        .expect("ping after the network recovers is bounded")
+        .expect("ping after the network recovers");
+
+    drop(store);
+    schema.drop_schema().await;
+}
+
+/// Migrating against a read-only server, as a standby before promotion,
+/// fails as retryable rather than as a fatal migration error.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_migrate_on_a_read_only_server_fails_unavailable() {
+    let schema = TestSchema::create("read_only").await;
+    let mut url = url::Url::parse(schema.url()).expect("parse the PostgreSQL URL");
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| {
+            let value = if key == "options" {
+                format!("{value} -cdefault_transaction_read_only=on")
+            } else {
+                value.into_owned()
+            };
+            (key.into_owned(), value)
+        })
+        .collect();
+    url.query_pairs_mut().clear().extend_pairs(pairs);
+    let store = PostgresStore::connect(url.as_str(), None, None)
+        .await
+        .expect("connect to the read-only server");
+
+    let result = store.migrate().await;
+    assert!(
+        matches!(result, Err(PersistenceError::Unavailable(_))),
+        "{result:?}"
+    );
+
+    drop(store);
+    schema.drop_schema().await;
 }
 
 #[tokio::test]

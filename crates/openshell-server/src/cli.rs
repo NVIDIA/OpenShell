@@ -679,6 +679,19 @@ fn prepare_server_config_with_drivers(
         config = config.with_ssh_session_ttl_secs(ttl);
     }
 
+    if let Some(gateway_file) = file.as_ref().map(|f| &f.openshell.gateway) {
+        apply_connection_cap(
+            "max_ssh_connections_per_sandbox",
+            gateway_file.max_ssh_connections_per_sandbox,
+            &mut config.max_ssh_connections_per_sandbox,
+        )?;
+        apply_connection_cap(
+            "max_service_connections_per_sandbox",
+            gateway_file.max_service_connections_per_sandbox,
+            &mut config.max_service_connections_per_sandbox,
+        )?;
+    }
+
     if let Some(mode) = file
         .as_ref()
         .and_then(|f| f.openshell.gateway.policy_validation_failure_mode)
@@ -703,6 +716,27 @@ fn prepare_server_config_with_drivers(
             ));
         }
         config.image_preparation_timeout_seconds = seconds;
+    }
+
+    if let Some(raw) = std::env::var_os("OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS") {
+        let raw = raw.to_str().ok_or_else(|| {
+            miette::miette!(
+                "OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS must be an integer number of seconds"
+            )
+        })?;
+        let window = raw.parse::<i64>().map_err(|_| {
+            miette::miette!(
+                "OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS must be an integer number of seconds"
+            )
+        })?;
+        validate_provisioning_repair_window_seconds(window)?;
+        config.provisioning_repair_window_seconds = window;
+    } else if let Some(window) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.provisioning_repair_window_seconds)
+    {
+        validate_provisioning_repair_window_seconds(window)?;
+        config.provisioning_repair_window_seconds = window;
     }
 
     if let Some(issuer) = args.oidc_issuer.clone() {
@@ -770,6 +804,13 @@ fn prepare_server_config_with_drivers(
     })
 }
 
+const UNAUTHENTICATED_USERS_WARNING: &str = "unauthenticated user access is enabled; only use this for trusted local development or a fully trusted fronting proxy";
+
+fn unauthenticated_users_allowed(file: Option<&ConfigFile>) -> bool {
+    file.and_then(|file| file.openshell.gateway.auth.as_ref())
+        .is_some_and(|auth| auth.allow_unauthenticated_users)
+}
+
 /// Reject an implicit development gateway before starting any listeners or services.
 fn validate_user_auth(config: &openshell_core::Config) -> Result<()> {
     if !config.auth.allow_unauthenticated_users
@@ -798,6 +839,10 @@ async fn run_from_args(
 ) -> Result<()> {
     let prepared = prepare_server_config_with_drivers(&mut args, &matches, &compute_drivers)?;
     validate_user_auth(&prepared.config)?;
+
+    openshell_ocsf::register_trace_correlation_extractor(
+        openshell_otel::current_ocsf_trace_correlation,
+    );
 
     // Initialize OCSF identity before tracing can emit gateway events.
     let gateway_identity = crate::gateway_ocsf::GatewayIdentity {
@@ -915,9 +960,7 @@ async fn run_from_args(
         );
     }
     if prepared.config.auth.allow_unauthenticated_users {
-        warn!(
-            "Unauthenticated user access enabled — only use this for trusted local development or a fully trusted fronting proxy"
-        );
+        warn!("{UNAUTHENTICATED_USERS_WARNING}");
     }
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
@@ -1157,7 +1200,12 @@ fn run_effective_config_preflight(
     })();
 
     match (validation, path.as_ref()) {
-        (Ok(driver), _) => Ok(driver),
+        (Ok(driver), _) => {
+            if unauthenticated_users_allowed(file.as_ref()) {
+                eprintln!("warning: {UNAUTHENTICATED_USERS_WARNING}");
+            }
+            Ok(driver)
+        }
         (Err(_), Some(path)) => Err(miette::miette!(
             "{}",
             config_file::ConfigPreflightError::invalid_current(path)
@@ -1620,6 +1668,15 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     }
 }
 
+fn validate_provisioning_repair_window_seconds(window: i64) -> Result<()> {
+    if !(1..=86_400).contains(&window) {
+        return Err(miette::miette!(
+            "provisioning_repair_window_seconds must be between 1 and 86400"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_grpc_rate_limit_args(requests: Option<u64>, window_seconds: Option<u64>) -> Result<()> {
     let disabled = matches!(requests, Some(0)) || matches!(window_seconds, Some(0));
     if disabled {
@@ -1635,6 +1692,17 @@ fn validate_grpc_rate_limit_args(requests: Option<u64>, window_seconds: Option<u
         return Err(miette::miette!(
             "gRPC rate limiting requires both --grpc-rate-limit-requests and --grpc-rate-limit-window-seconds (TOML keys grpc_rate_limit_requests and grpc_rate_limit_window_seconds) to be positive; set either value to 0 to disable"
         ));
+    }
+    Ok(())
+}
+
+/// Apply an optional per-sandbox relay cap from the gateway config file.
+fn apply_connection_cap(name: &str, value: Option<u32>, cap: &mut u32) -> Result<()> {
+    if let Some(value) = value {
+        if value == 0 {
+            return Err(miette::miette!("{name} must be at least 1"));
+        }
+        *cap = value;
     }
     Ok(())
 }
@@ -1722,6 +1790,20 @@ mod tests {
     }
 
     #[test]
+    fn preflight_detects_unauthenticated_users_opt_in() {
+        let parse =
+            |auth: &str| config_file_from_toml(&format!("[openshell]\nversion = 2\n{auth}"));
+        assert!(!super::unauthenticated_users_allowed(None));
+        assert!(!super::unauthenticated_users_allowed(Some(&parse(""))));
+        assert!(!super::unauthenticated_users_allowed(Some(&parse(
+            "[openshell.gateway.auth]\nallow_unauthenticated_users = false\n"
+        ))));
+        assert!(super::unauthenticated_users_allowed(Some(&parse(
+            "[openshell.gateway.auth]\nallow_unauthenticated_users = true\n"
+        ))));
+    }
+
+    #[test]
     fn startup_rejects_missing_user_auth_before_starting_services() {
         for auth in [
             "",
@@ -1753,11 +1835,7 @@ mod tests {
                         .build()
                         .unwrap();
                     let error = runtime
-                        .block_on(super::run_from_args(
-                            args,
-                            matches,
-                            test_registry("test", true),
-                        ))
+                        .block_on(super::run_from_args(args, matches, test_registry("test")))
                         .unwrap_err()
                         .to_string();
                     for expected in [
@@ -1913,12 +1991,9 @@ mod tests {
         }
     }
 
-    fn test_registry(name: &str, singleplayer: bool) -> crate::ComputeDriverRegistry {
-        let mut registration =
+    fn test_registry(name: &str) -> crate::ComputeDriverRegistry {
+        let registration =
             crate::ComputeDriverRegistration::new(name, 100, None, TestFactory).unwrap();
-        if singleplayer {
-            registration = registration.with_local_singleplayer();
-        }
         let mut registry = crate::ComputeDriverRegistry::new();
         registry.install(registration).unwrap();
         registry
@@ -1931,8 +2006,7 @@ mod tests {
             Some(detect_registered_local),
             TestFactory,
         )
-        .unwrap()
-        .with_local_singleplayer();
+        .unwrap();
         let mut registry = crate::ComputeDriverRegistry::new();
         registry.install(registration).unwrap();
         registry
@@ -2192,7 +2266,7 @@ mod tests {
                     "sqlite::memory:",
                     "--disable-tls",
                 ]);
-                let registry = test_registry("podman", true);
+                let registry = test_registry("podman");
 
                 let prepared =
                     super::prepare_server_config_with_drivers(&mut args, &matches, &registry)
@@ -2502,7 +2576,7 @@ mod tests {
         "#,
                 )
                 .unwrap();
-                let registry = test_registry("local", true);
+                let registry = test_registry("local");
                 let preflight = |argv: &[&str]| {
                     let (run, matches) = parse_with_args(argv);
                     super::run_config_preflight_with_drivers(
@@ -2557,7 +2631,7 @@ mod tests {
             .set("OPENSHELL_DRIVERS", "podman,docker")
             .run(|| {
                 let (run, matches) = parse_with_args(&["openshell-gateway"]);
-                let registry = test_registry("podman", true);
+                let registry = test_registry("podman");
 
                 let error = super::run_config_preflight_with_drivers(
                     super::ConfigPreflightArgs::default(),
@@ -2644,7 +2718,7 @@ mod tests {
             .remove("OPENSHELL_COMPUTE_DRIVER")
             .remove("OPENSHELL_DRIVERS")
             .run(|| {
-                preflight(&test_registry("local", false))
+                preflight(&test_registry("local"))
                     .expect_err("a pool table without a shared supervision driver must fail");
 
                 let mut registry = crate::ComputeDriverRegistry::new();
@@ -2841,7 +2915,7 @@ mod tests {
                     "--enable-mtls-auth",
                     "true",
                 ]);
-                let registry = test_registry("shared", false);
+                let registry = test_registry("shared");
 
                 super::run_config_preflight_with_drivers(
                     super::ConfigPreflightArgs::default(),
@@ -3462,7 +3536,7 @@ require_client_auth = true
                     "--metrics-tls-key",
                     "/metrics/tls.key",
                 ]);
-                let registry = test_registry("podman", true);
+                let registry = test_registry("podman");
 
                 let Err(error) =
                     super::prepare_server_config_with_drivers(&mut args, &matches, &registry)
@@ -3660,7 +3734,7 @@ require_client_auth = true
             .remove("OPENSHELL_GATEWAY_CONFIG")
             .remove("OPENSHELL_DRIVERS")
             .run(|| {
-                let registry = test_registry("shared", false);
+                let registry = test_registry("shared");
 
                 for (oidc_issuer, expected) in
                     [(None, false), (Some("https://idp.example.com"), false)]
@@ -3786,8 +3860,7 @@ require_client_auth = true
                     Some(detect_registered_local),
                     TestFactory,
                 )
-                .unwrap()
-                .with_local_singleplayer(),
+                .unwrap(),
             )
             .unwrap();
         let (preflight_args, preflight_matches) = parse_with_args(&argv);
@@ -3827,8 +3900,7 @@ require_client_auth = true
                     Some(detect_registered_local),
                     TestFactory,
                 )
-                .unwrap()
-                .with_local_singleplayer(),
+                .unwrap(),
             )
             .unwrap();
 
@@ -4084,7 +4156,7 @@ enabled = false
             .remove("OPENSHELL_DRIVERS")
             .remove("OPENSHELL_ENABLE_OPERATOR_AUTH")
             .run(|| {
-                let registry = test_registry("shared", false);
+                let registry = test_registry("shared");
                 for tls_args in [vec!["--disable-tls"], vec![]] {
                     let mut argv = vec![
                         "openshell-gateway",
@@ -4938,6 +5010,176 @@ mem_mib = "not-a-number"
                     .contains("image_preparation_timeout_seconds must be between 1 and 86400")
             );
         }
+            });
+    }
+
+    #[test]
+    fn server_config_prepares_provisioning_repair_window_from_toml() {
+        assert_eq!(
+            openshell_core::Config::new(None).provisioning_repair_window_seconds,
+            300
+        );
+        for seconds in [1, 86_400] {
+            super::validate_provisioning_repair_window_seconds(seconds).unwrap();
+        }
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state =
+                    std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    "[openshell]\nversion = 2\n[openshell.gateway]\nprovisioning_repair_window_seconds = 900\n",
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "podman",
+                    "--disable-tls",
+                ]);
+                let prepared = super::prepare_server_config(&mut args, &matches)
+                    .expect("server config is prepared");
+                assert_eq!(prepared.config.provisioning_repair_window_seconds, 900);
+            });
+    }
+
+    #[test]
+    fn server_config_rejects_unbounded_provisioning_repair_window() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state =
+                    std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                for window in [-1, 0, 86_401] {
+                    std::fs::write(
+                        &config_path,
+                        format!(
+                            "[openshell]\nversion = 2\n[openshell.gateway]\nprovisioning_repair_window_seconds = {window}\n"
+                        ),
+                    )
+                    .unwrap();
+                    let (mut args, matches) = parse_with_args(&[
+                        "openshell-gateway",
+                        "--config",
+                        config_path.to_str().unwrap(),
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--compute-driver",
+                        "podman",
+                        "--disable-tls",
+                    ]);
+                    let Err(error) = super::prepare_server_config(&mut args, &matches) else {
+                        panic!("unbounded repair window must be rejected");
+                    };
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("provisioning_repair_window_seconds must be between 1 and 86400")
+                    );
+                }
+            });
+    }
+
+    #[test]
+    fn server_config_env_overrides_provisioning_repair_window() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .set("OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS", "600")
+            .run(|| {
+                let state =
+                    std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    "[openshell]\nversion = 2\n[openshell.gateway]\nprovisioning_repair_window_seconds = 900\n",
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "podman",
+                    "--disable-tls",
+                ]);
+                let prepared = super::prepare_server_config(&mut args, &matches)
+                    .expect("server config is prepared");
+                assert_eq!(prepared.config.provisioning_repair_window_seconds, 600);
+            });
+    }
+
+    #[test]
+    fn server_config_sets_and_validates_per_sandbox_connection_caps() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                let prepare = |gateway: &str| {
+                    std::fs::write(
+                        &config_path,
+                        format!("[openshell]\nversion = 2\n[openshell.gateway]\n{gateway}\n"),
+                    )
+                    .unwrap();
+                    let (mut args, matches) = parse_with_args(&[
+                        "openshell-gateway",
+                        "--config",
+                        config_path.to_str().unwrap(),
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--compute-driver",
+                        "docker",
+                        "--disable-tls",
+                    ]);
+                    super::prepare_server_config(&mut args, &matches)
+                };
+
+                let defaults = prepare("").expect("defaults");
+                assert_eq!(defaults.config.max_ssh_connections_per_sandbox, 20);
+                assert_eq!(defaults.config.max_service_connections_per_sandbox, 20);
+
+                let set = prepare(
+                    "max_ssh_connections_per_sandbox = 5\nmax_service_connections_per_sandbox = 50",
+                )
+                .expect("caps are applied");
+                assert_eq!(set.config.max_ssh_connections_per_sandbox, 5);
+                assert_eq!(set.config.max_service_connections_per_sandbox, 50);
+
+                for key in [
+                    "max_ssh_connections_per_sandbox",
+                    "max_service_connections_per_sandbox",
+                ] {
+                    let Err(error) = prepare(&format!("{key} = 0")) else {
+                        panic!("a zero cap must be rejected");
+                    };
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("{key} must be at least 1")),
+                        "{error}"
+                    );
+                }
             });
     }
 

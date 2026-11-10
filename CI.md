@@ -144,6 +144,7 @@ Each run retains `report.json` and `report.md` for 90 days in
 `compatibility-review-run-<run-id>-attempt-<attempt>`. The report records both
 revisions, the train, tool/model metadata, coverage gaps, and actionable
 findings. Raw agent transcripts and PR discussions are not published.
+SDK failures retain the exception message in the report.
 The qualification summary links this separate advisory evidence without waiting
 for it; compatibility
 review remains missing from the blocking RFC profile during this rollout.
@@ -165,10 +166,11 @@ selected. DEB and RPM packages build only when integration qualification is sele
 the DEB on Ubuntu with Docker and installs the CLI and gateway RPMs on Fedora with
 rootful and rootless Podman. These lanes run conformance using the matching runtime
 images. Release Dev, Release, and Pre-release use the same package installers.
-The feature suites (`tests/suites/features`) run the same way, on the
-package installers. The Podman driver suite (`tests/suites/drivers/podman`) and the
-`e2e-podman` lane retain the binary installer because they configure its system
-service, local HTTP gateway, and CLI path. The driver suite and `e2e-podman` run
+The feature suites (`tests/suites/features`) and the Podman driver suite
+(`tests/suites/drivers/podman`) run the same way, on the package installers; the
+driver suite's environments merge their Podman settings into the packaged
+gateway's configuration (see `TESTING.md`). The `e2e-podman` lane runs on the
+RPM installer as well. The driver suite and `e2e-podman` run
 only in `Branch E2E Checks`. The manual Integration Tests workflow runs the
 remaining tmachine testsuites, such as `e2e-podman`, and downloads the packages
 selected by its matrix.
@@ -214,10 +216,10 @@ candidate inputs (see [TESTING.md](TESTING.md)) and narrow the tests with a
 nextest filterset:
 
 ```shell
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful --installer deb \
   --family conformance --package conformance \
-  --filter 'binary_id(=conformance::policy_advisor)'
+  --filter 'test(/^policy_advisor::/)'
 ```
 
 A local run does not replace the required PR E2E gate.
@@ -439,7 +441,7 @@ without rerunning qualification. These artifacts have different embedded version
 from the qualified prerelease. Existing stable tags are never moved; a retry must
 resolve to the same qualified candidate. A retry rebuilds, then publishes only what
 is missing: it keeps published GHCR version tags, Helm charts, GitHub Release assets,
-npm versions, and PyPI versions. Snap uploads are not skipped.
+and npm versions. Snap uploads are not skipped.
 
 Stable image builds save multi-platform OCI archives as workflow artifacts without
 pushing to GHCR. Publication copies those archives, including their attestations,
@@ -690,7 +692,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
 | `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups do not run E2E. |
-| `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
+| `.github/workflows/build-binaries-{linux,macos}.yml`, `build-vm-driver-{linux,macos}.yml` | Shared per-platform binary matrices used by branch and release workflows. Each platform is its own workflow, so a consumer depends only on the platforms it needs. The VM driver remains separate because its build consumes the runtime binaries. Its build steps stay inline rather than in a local action because release builds check out the release tag, which may predate the action. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
 | `.github/workflows/e2e-docker-test.yml`, `e2e-podman-test.yml`, `e2e-vm-test.yml`, `e2e-kubernetes-test.yml` | Reusable runtime lanes called directly by branch and release workflows. Callers select suites and declare only the artifacts each runtime consumes. |
@@ -719,19 +721,18 @@ Each step that publishes to an external registry, store, or site lives in its ow
 
 | File | Role |
 |---|---|
-| `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
+| `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries and packages, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
 | `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. Publishes the prerelease's notes preview, retagged, or generates notes when it is unavailable. The notes-only mode generates a release notes preview artifact. Published artifacts are never overwritten: a rerun fills in what is missing, and a bad published artifact is fixed by releasing a new patch version. |
 | `.github/workflows/release-auto-tag.yml` | Weekdays at 14:00 Europe/Zurich, tags the next `-pre.N` on `main` when commits landed since the latest one, then dispatches Pre-release. It skips when the train has no `-pre.1` or its version is already stable, so push each train's `-pre.1` tag by hand. |
 | `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually. A tagless dispatch creates the next candidate on its branch; explicit tags select existing candidates. Builds, then publishes and qualifies in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
 | `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
-| `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish release-labeled public schemas to Buf (`BUF_TOKEN` required) and GitHub Releases, and call the PyPI, snap, npm, and Go SDK publishers. |
+| `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish release-labeled public schemas to Buf (`BUF_TOKEN` required) and GitHub Releases, and call the snap, npm, and Go SDK publishers. The Python SDK is released from [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python), so no GitHub Release carries a wheel. |
 | `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable releases. Stable releases reuse the promoted prerelease's preview when available. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
 | `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. Manual dispatch uploads the `snap-linux-*` artifacts from `artifact-run-id`. |
 | `.github/workflows/sdk-typescript-publish.yml` | Publishes the TypeScript SDK to GitHub Packages. Called by stable Release; manual dispatch publishes a given tag and npm version. |
 | `.github/workflows/sdk-go-tag.yml` | Creates the `sdk/go/vX.Y.Z` tag and asks the Go module proxy to fetch it. Called by stable Release; manual dispatch tags a given version and commit. |
-| `.github/workflows/wheel-publish.yml` | Publishes the wheel attached to a stable GitHub Release to PyPI with Trusted Publishing in the `pypi` environment. Called by stable Release; manual dispatch publishes a given tag. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts

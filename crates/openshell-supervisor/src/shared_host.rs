@@ -175,6 +175,8 @@ pub struct SharedHostConfig {
     pub runtime_listen: SocketAddr,
     /// Time a withdrawn sandbox instance may take to stop its workload.
     pub removal_grace: Duration,
+    /// Initial boundary attachment and image-policy discovery budget.
+    pub attach_request_timeout: Duration,
     /// This process's identity as a member of the supervisor pool.
     pub pool: PoolIdentity,
 }
@@ -187,6 +189,7 @@ pub struct SharedHost {
     router: Arc<RuntimeRouter>,
     gateway_endpoint: String,
     removal_grace: Duration,
+    attach_request_timeout: Duration,
     /// Assignments of the latest snapshot that could not be admitted, reported
     /// as failed instances until the gateway withdraws them.
     rejected: Mutex<BTreeMap<String, SandboxInstanceStatusReport>>,
@@ -305,6 +308,7 @@ impl SharedHost {
             router,
             gateway_endpoint: config.gateway_endpoint,
             removal_grace: config.removal_grace,
+            attach_request_timeout: config.attach_request_timeout,
             rejected: Mutex::new(BTreeMap::new()),
             desired_routes: Mutex::new(None),
             pool: config.pool,
@@ -790,7 +794,7 @@ impl SharedHost {
             app_router: self
                 .app_listener
                 .as_ref()
-                .map(crate::app_listener::HostHandle::router),
+                .map(crate::app_listener::HostHandle::leased_router),
             command: main_process.command,
             workdir: registration.workdir,
             timeout_secs: 0,
@@ -816,6 +820,7 @@ impl SharedHost {
             auth_bundle: registration.auth,
             admitted_isolation_backend: Some(openshell_sandbox_backend::BACKEND_NAME.to_string()),
             main_exit_marker: None,
+            attach_request_timeout: self.attach_request_timeout,
             trace_context: registration.trace_context,
             // One process cannot hold a per-sandbox workload identity, so
             // providers that need one fail closed.
@@ -1621,6 +1626,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
@@ -1657,6 +1663,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
@@ -1778,6 +1785,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
@@ -1874,6 +1882,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
@@ -2095,6 +2104,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
@@ -2448,6 +2458,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),

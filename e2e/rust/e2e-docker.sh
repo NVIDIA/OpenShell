@@ -54,9 +54,9 @@ if [ "${1:-}" = "${RUN_WITH_GATEWAY_COMMAND}" ]; then
   exit 0
 fi
 
-if [ "${E2E_FEATURES}" != "e2e-conformance-only" ]; then
-  CONTAINER_ENGINE=docker bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
-fi
+# The conformance suite runs on every lane, including e2e-conformance-only,
+# and creates sandboxes from this image (testkit::python_image()).
+CONTAINER_ENGINE=docker bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
 
 exec "${ROOT}/e2e/with-docker-gateway.sh" \
   bash "${BASH_SOURCE[0]}" "${RUN_WITH_GATEWAY_COMMAND}"

@@ -1407,6 +1407,19 @@ fn validate_sandbox_source_path(workspace_root: &str, path: &str) -> Result<Stri
     Ok(cleaned)
 }
 
+/// Build the remote probe that prints the workspace root, then the resolved
+/// path if it exists. Uses only POSIX `[` and bare `realpath`, because busybox
+/// `realpath` has no `-e` and treats `--` as a file name.
+fn resolve_probe_command(sandbox_path: &str) -> String {
+    let operand = if sandbox_path.starts_with('/') {
+        sandbox_path.to_string()
+    } else {
+        format!("./{sandbox_path}")
+    };
+    let path = shell_escape(&operand);
+    format!("pwd -P && if [ -e {path} ]; then realpath {path}; fi")
+}
+
 /// Discover the workspace root and resolve every symlink in `sandbox_path` in
 /// one SSH probe, then refuse the result if it lands outside the workspace.
 ///
@@ -1421,10 +1434,7 @@ async fn resolve_sandbox_source_path(
     session: &SshSessionConfig,
     sandbox_path: &str,
 ) -> Result<String> {
-    let resolve_cmd = format!(
-        "pwd -P && realpath -e -- {path}",
-        path = shell_escape(sandbox_path)
-    );
+    let resolve_cmd = resolve_probe_command(sandbox_path);
     let output = ssh_run_capture_stdout(session, &resolve_cmd)
         .await
         .wrap_err_with(|| format!("failed to resolve sandbox source path '{sandbox_path}'"))?;
@@ -3077,6 +3087,30 @@ mod tests {
         assert_eq!(lexical_clean_absolute_path(""), None);
         assert_eq!(lexical_clean_absolute_path("sandbox/a"), None);
         assert_eq!(lexical_clean_absolute_path("./a"), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_probe_command_is_posix_and_resolves_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("-f"), "x").unwrap();
+        std::os::unix::fs::symlink(root.join("-f"), root.join("link")).unwrap();
+        let run = |path: &str| {
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(resolve_probe_command(path))
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let cwd = format!("{}\n", root.display());
+        assert!(!resolve_probe_command("a").contains(" -e --"));
+        assert_eq!(run("link"), format!("{cwd}{}/-f\n", root.display()));
+        assert_eq!(run("-f"), format!("{cwd}{}/-f\n", root.display()));
+        assert_eq!(run("missing"), cwd);
     }
 
     #[test]
