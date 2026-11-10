@@ -129,6 +129,17 @@ impl DatabaseHealthMonitor {
         Self { receiver: rx }
     }
 
+    /// Spawn a monitor with the production defaults that publishes to a
+    /// channel whose receivers already serve probes.
+    pub fn spawn_into(store: Arc<Store>, sender: watch::Sender<HealthState>) {
+        tokio::spawn(monitor_loop(
+            store,
+            sender,
+            DEFAULT_CHECK_INTERVAL,
+            DEFAULT_CHECK_TIMEOUT,
+        ));
+    }
+
     /// Subscribe to state updates.
     ///
     /// Returned receivers always observe the latest value with no lock

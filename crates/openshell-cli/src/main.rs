@@ -193,8 +193,9 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
-                        openshell_cli::oidc_auth::oidc_refresh_token(
+                        openshell_cli::oidc_auth::oidc_renew_token(
                             &bundle,
+                            meta.oidc_audience.as_deref(),
                             meta.oidc_scopes.as_deref(),
                             insecure,
                         ),
@@ -1714,6 +1715,25 @@ enum SandboxCommands {
         name: Option<String>,
     },
 
+    /// Suspend a ready sandbox and retain its memory state.
+    ///
+    /// Requires a compute driver and isolation backend that support
+    /// suspend and resume. Use `sandbox resume` to restore the sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Suspend {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Resume a suspended sandbox from its retained memory state.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Resume {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
     /// Execute a command in a running sandbox.
     ///
     /// Runs a command inside an existing sandbox using the gRPC exec endpoint.
@@ -2172,8 +2192,8 @@ enum PolicyCommands {
         name: Option<String>,
 
         /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
-        /// Options include allowed-ip=..., credential rewrite flags, and
-        /// allow-uninspected-credentials.
+        /// Options include allowed-ip=..., allow-encoded-slash, credential
+        /// rewrite flags, and allow-uninspected-credentials.
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -2756,7 +2776,12 @@ async fn run_async() -> Result<()> {
         // Top-level status
         // -----------------------------------------------------------
         Some(Commands::Status { output }) => {
-            if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+            // A gateway named on the command line must be registered.
+            let resolved = match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                Err(err) if cli.gateway.is_some() => return Err(err),
+                resolved => resolved,
+            };
+            if let Ok(ctx) = resolved {
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
                 run::gateway_status(
@@ -3597,6 +3622,14 @@ async fn run_async() -> Result<()> {
                         SandboxCommands::Start { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Suspend { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_suspend(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Resume { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_resume(endpoint, &name, &cli.workspace, &tls).await?;
                         }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -5539,6 +5572,38 @@ mod tests {
             Some(Commands::Sandbox {
                 command: Some(SandboxCommands::Start { name: None }),
             })
+        ));
+    }
+
+    #[test]
+    fn sandbox_suspend_and_resume_accept_optional_names() {
+        let suspend = Cli::try_parse_from(["openshell", "sandbox", "suspend", "demo"])
+            .expect("suspend command should parse");
+        assert!(matches!(
+            suspend.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Suspend { name: Some(ref name) }),
+            }) if name == "demo"
+        ));
+
+        let resume = Cli::try_parse_from(["openshell", "sandbox", "resume"])
+            .expect("resume command should parse");
+        assert!(matches!(
+            resume.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Resume { name: None }),
+            })
+        ));
+
+        let named = Cli::try_parse_from(["openshell", "sandbox", "resume", "demo"])
+            .expect("named resume should parse");
+        assert!(matches!(
+            named.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Resume {
+                    name: Some(ref name),
+                }),
+            }) if name == "demo"
         ));
     }
 

@@ -18,6 +18,7 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use openshell_core::proto::open_shell_server::OpenShellServer;
+use openshell_core::proto::sandbox_updates_server::SandboxUpdatesServer;
 use openshell_core::proto::supervisor_host::v1::supervisor_host_server::SupervisorHostServer;
 use openshell_core::{
     Config,
@@ -305,6 +306,13 @@ impl MultiplexService {
             openshell,
         );
         let reflection = self.state.reflection_service.clone();
+        let sandbox_updates = SandboxUpdatesServer::new(OpenShellService::new(self.state.clone()))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let sandbox_updates = GatewayInterceptorGrpcService::new(
+            sandbox_updates,
+            self.state.gateway_interceptors.clone(),
+            Some(self.state.clone()),
+        );
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -312,7 +320,7 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, reflection),
+            GrpcRouter::new(openshell, reflection).with_sandbox_updates(sandbox_updates),
             authenticator_chain,
             authz_policy,
             self.state
@@ -987,11 +995,12 @@ where
     }
 }
 
-/// Combined gRPC service that routes between `OpenShell` and reflection.
+/// Combined gRPC service for public gateway services and reflection.
 #[derive(Clone)]
-pub struct GrpcRouter<N, R> {
+pub struct GrpcRouter<N, R, U = N> {
     openshell: N,
     reflection: R,
+    sandbox_updates: Option<U>,
 }
 
 impl<N, R> GrpcRouter<N, R> {
@@ -999,13 +1008,22 @@ impl<N, R> GrpcRouter<N, R> {
         Self {
             openshell,
             reflection,
+            sandbox_updates: None,
+        }
+    }
+
+    fn with_sandbox_updates<U>(self, sandbox_updates: U) -> GrpcRouter<N, R, U> {
+        GrpcRouter {
+            openshell: self.openshell,
+            reflection: self.reflection,
+            sandbox_updates: Some(sandbox_updates),
         }
     }
 }
 
 pub const REFLECTION_PATH_PREFIX: &str = "/grpc.reflection.v1.";
 
-impl<N, R, B> tower::Service<Request<B>> for GrpcRouter<N, R>
+impl<N, R, U, B> tower::Service<Request<B>> for GrpcRouter<N, R, U>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
@@ -1016,6 +1034,11 @@ where
         + Send
         + 'static,
     R::Future: Send,
+    U: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    U::Future: Send,
     B: Send + 'static,
 {
     type Response = N::Response;
@@ -1029,6 +1052,13 @@ where
     fn call(&mut self, req: Request<B>) -> Self::Future {
         if req.uri().path().starts_with(REFLECTION_PATH_PREFIX) {
             let mut svc = self.reflection.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if req
+            .uri()
+            .path()
+            .starts_with("/openshell.v1.SandboxUpdates/")
+            && let Some(mut svc) = self.sandbox_updates.clone()
+        {
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {
             let mut svc = self.openshell.clone();
@@ -1062,9 +1092,8 @@ where
 /// local developer user when `auth.allow_unauthenticated_users` is explicitly
 /// enabled.
 ///
-/// When neither OIDC nor sandbox credentials are configured (a barebones
-/// dev gateway), the chain is left as `None` so the router short-circuits
-/// to pass-through unless mTLS or local unauthenticated users are enabled.
+/// When no bearer authenticators are configured, the chain is left as `None`.
+/// The router still requires an mTLS principal or the explicit development opt-in.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(peer) = state.peer_authenticator.clone() {
@@ -1100,8 +1129,8 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
 /// - Strip any external `x-openshell-auth-source` marker first (so callers
 ///   cannot spoof a sandbox identity).
 /// - Health probes / reflection bypass the chain entirely.
-/// - When no chain is configured (OIDC not configured), forward without
-///   authentication — preserves today's pass-through behavior.
+/// - When no chain is configured, require an mTLS principal or the explicit
+///   development opt-in.
 /// - Otherwise, run the chain. The first match produces a `Principal`.
 ///   `Principal::User` is gated by the RBAC `AuthzPolicy`.
 ///   `Principal::Sandbox` is gated by a supervisor-method allowlist, then
@@ -1297,10 +1326,15 @@ where
             } else if allow_unauthenticated_users {
                 unauthenticated_dev_user_principal()
             } else {
-                // No auth configured — dev / fronting-proxy deployments.
-                // Inject a local-dev principal so downstream handlers that
-                // call extract_principal() always find one.
-                unauthenticated_dev_user_principal()
+                audit::emit_authentication_failure(
+                    &path,
+                    &origin(req.headers()),
+                    None,
+                    AuthFailureReason::MissingCredential,
+                );
+                return Ok(status_response(tonic::Status::unauthenticated(
+                    "authentication required",
+                )));
             };
             let origin = origin(req.headers());
             audit::emit_logon(
@@ -2832,6 +2866,13 @@ mod tests {
             otel_span_name(&http::Method::POST, "/openshell.v1.OpenShell/CreateSandbox"),
             "openshell.v1.OpenShell/CreateSandbox"
         );
+        assert_eq!(
+            otel_span_name(
+                &http::Method::POST,
+                "/openshell.v1.SandboxUpdates/UpdateSandbox"
+            ),
+            "openshell.v1.SandboxUpdates/UpdateSandbox"
+        );
     }
 
     /// Non-RPC paths use a low-cardinality method-only name because sandbox
@@ -2901,10 +2942,12 @@ mod tests {
             name,
             calls: calls.clone(),
         };
-        let mut router = GrpcRouter::new(service("openshell"), service("reflection"));
+        let mut router = GrpcRouter::new(service("openshell"), service("reflection"))
+            .with_sandbox_updates(service("sandbox_updates"));
 
         for path in [
             "/openshell.v1.OpenShell/Health",
+            "/openshell.v1.SandboxUpdates/UpdateSandbox",
             "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
         ] {
             router
@@ -2918,7 +2961,10 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(*calls.lock().unwrap(), vec!["openshell", "reflection"]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["openshell", "sandbox_updates", "reflection"]
+        );
     }
 
     #[tokio::test]
@@ -3014,7 +3060,10 @@ mod tests {
             .collect();
         names.sort();
 
-        assert_eq!(names, vec!["openshell.v1.OpenShell"]);
+        assert_eq!(
+            names,
+            vec!["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
+        );
 
         let descriptor_response = responses.message().await.unwrap().unwrap();
         let Some(MessageResponse::FileDescriptorResponse(response)) =
@@ -3033,6 +3082,11 @@ mod tests {
                 .get_service_by_name("openshell.v1.OpenShell")
                 .is_some(),
             "a fresh descriptor pool must resolve the advertised service"
+        );
+        assert!(
+            reflected_pool
+                .get_service_by_name("openshell.v1.SandboxUpdates")
+                .is_some()
         );
         assert!(
             reflected_pool
@@ -3521,6 +3575,51 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn operator_only_requires_operator_certificate() {
+            for (peer_identity, operator) in [
+                (None, None),
+                (Some(mtls_identity("ordinary-user")), None),
+                (
+                    Some(operator_principal().identity),
+                    Some(operator_principal()),
+                ),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let authenticated = operator.is_some();
+                let (recorder, seen) = PrincipalRecorder::new();
+                // Operator-only authentication has no bearer chain and disables
+                // both user mTLS authentication and the development opt-in.
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    None,
+                    None,
+                    peer_identity,
+                    false,
+                    false,
+                )
+                .with_operator(operator);
+                let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+                let response = router.call(empty_request(path)).await.unwrap();
+
+                if authenticated {
+                    assert!(grpc_status(&response).is_none());
+                    assert!(matches!(
+                        *seen.lock().unwrap(),
+                        Some(Principal::Operator(_))
+                    ));
+                } else {
+                    assert_eq!(grpc_status(&response).as_deref(), Some("16"));
+                    assert!(seen.lock().unwrap().is_none());
+                    let events = capture.json_events();
+                    assert_eq!(events.len(), 1, "{events:?}");
+                    assert_router_authentication_failure(&events[0], path, "missing_credential", 2);
+                }
+            }
+        }
+
+        #[tokio::test]
         async fn operator_is_admin_but_not_supervisor_peer_or_unknown() {
             for (method, permitted) in [
                 ("GetProviderCredentials", true),
@@ -3659,12 +3758,25 @@ mod tests {
                     .unwrap();
                 assert_eq!(grpc_status(&response).as_deref(), Some("7"));
             }
-            let (recorder, _) = PrincipalRecorder::new();
-            let response = AuthGrpcRouter::new(recorder, None, None)
+            // Without a bearer chain, the development opt-in still grants no
+            // access to the assignment stream. Otherwise authentication fails
+            // before method authorization.
+            for (allow_unauthenticated_users, expected_status) in [(true, "7"), (false, "16")] {
+                let (recorder, seen) = PrincipalRecorder::new();
+                let response = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    None,
+                    None,
+                    None,
+                    false,
+                    allow_unauthenticated_users,
+                )
                 .call(empty_request(attach))
                 .await
                 .unwrap();
-            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+                assert_eq!(grpc_status(&response).as_deref(), Some(expected_status));
+                assert!(seen.lock().unwrap().is_none());
+            }
         }
 
         #[tokio::test]
@@ -3695,7 +3807,8 @@ mod tests {
                 assert_eq!(grpc_status(&response).as_deref(), Some("7"));
             }
             let (recorder, _) = PrincipalRecorder::new();
-            let mut router = AuthGrpcRouter::new(recorder, None, None);
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, true);
             let response = router
                 .call(empty_request(
                     "/openshell.v1.OpenShell/GetProviderCredentials",
@@ -4829,6 +4942,7 @@ mod tests {
                         sandbox_id: "sandbox-a".to_string(),
                         source: SandboxIdentitySource::BootstrapJwt {
                             issuer: "openshell-gateway:test".to_string(),
+                            auth_epoch: None,
                         },
                         trust_domain: None,
                     }),

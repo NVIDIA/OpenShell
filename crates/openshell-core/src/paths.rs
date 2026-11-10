@@ -167,6 +167,11 @@ pub fn is_file_permissions_too_open(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
 }
 
+/// Whether `path` is absolute under POSIX rules, whatever the host platform.
+pub fn is_posix_absolute(path: &Path) -> bool {
+    path.to_str().is_some_and(|path| path.starts_with('/'))
+}
+
 /// Compatibility re-export; authored policy path normalization is owned by
 /// `openshell-policy-schema`.
 pub use openshell_policy_schema::normalize_path;
@@ -174,6 +179,15 @@ pub use openshell_policy_schema::normalize_path;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_posix_absolute_ignores_host_path_syntax() {
+        assert!(is_posix_absolute(Path::new("/run/backend.sock")));
+        assert!(is_posix_absolute(Path::new("/")));
+        for path in ["", "relative", "./run", r"\run", r"C:\run", "C:/run"] {
+            assert!(!is_posix_absolute(Path::new(path)), "{path}");
+        }
+    }
 
     #[test]
     fn xdg_config_dir_respects_env() {

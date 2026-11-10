@@ -118,6 +118,18 @@ helm upgrade --install openshell \
 
 The chart automatically generates PKI secrets on first install using pre-install Helm hooks. No manual secret creation is required.
 
+To add labels or annotations to both certificate hook Pod templates, use
+`pkiInitJob.podLabels` and `pkiInitJob.podAnnotations`. Chart-owned Pod labels
+take precedence when custom keys conflict.
+For example, disable sidecar injection for hook Pods in an Istio-injected
+namespace:
+
+```yaml
+pkiInitJob:
+  podAnnotations:
+    sidecar.istio.io/inject: "false"
+```
+
 The default Kubernetes driver puts all workspaces in one sandbox namespace. To
 have the gateway create a namespace for each workspace, follow
 [Workspace on Kubernetes](/kubernetes/workspaces).
@@ -288,6 +300,8 @@ The most commonly changed values are:
 | `global.image.registry` / `global.image.tag` / `global.image.pullPolicy` | Shared registry, tag, and pull policy for the gateway, supervisor, and trusted sandbox runtime. Individual image settings take precedence. |
 | `gateway.image.registry` / `gateway.image.repository` / `gateway.image.tag` / `gateway.image.digest` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
 | `replicaCount` | Number of gateway replicas. Values above `1` require shared PostgreSQL through `server.externalDbSecret`. |
+| `priorityClassName` | Existing Kubernetes PriorityClass for gateway pods. Empty by default. |
+| `topologySpreadConstraints` | Kubernetes topology spread constraints for gateway replicas. Empty by default. Set selectors to match the gateway pod labels. |
 | `workload.kind` | Gateway workload controller. Use `statefulset` for SQLite or `deployment` with `server.externalDbSecret`. |
 | `workload.allowMultiReplicaStatefulSet` | Allow `replicaCount > 1` with `workload.kind=statefulset`. Prefer Deployment for external database-backed multi-replica gateways. |
 | `autoscaling.enabled` / `autoscaling.minReplicas` / `autoscaling.maxReplicas` | Render a HorizontalPodAutoscaler instead of a fixed `replicaCount`. Refer to [High Availability](/kubernetes/high-availability#scale-the-gateway). |
@@ -305,6 +319,7 @@ The most commonly changed values are:
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
 | `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
+| `server.serviceHostnameFormat` | Set to `hashed` to make exposed-service hostnames opaque per-gateway hash labels when multiple gateways share one service base domain behind a single ingress; the hash discriminator is the gateway installation name (`server.name`, defaulting to the release name), which must be unique among those gateways. Empty keeps the readable composite hostnames. Refer to [Ingress](/kubernetes/ingress#multiple-gateways-behind-one-ingress). |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
 | `supervisor.sandboxRuntime.boundaryPort` | Non-privileged TLS port used between paired supervisor and sandbox Pods. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
@@ -396,13 +411,19 @@ managed mode, the configured image-pull Secrets. The gateway stages their
 contents into each sandbox runtime generation's Secrets in the workspace
 namespace.
 
-The namespaced Role covers sandbox lifecycle and identity:
+The namespaced Role covers sandbox lifecycle, supervisor resources, and identity.
+Both the gateway chart and separate workspace chart grant these permissions.
+Stopped-sandbox updates use direct Pod `get` requests to check known workload and
+supervisor Pod names for remaining Pods.
 
 | API Group | Resource | Verbs |
 |---|---|---|
 | `agents.x-k8s.io` | `sandboxes`, `sandboxes/status` | create, delete, get, list, patch, update, watch |
 | `""` | `events` | get, list, watch |
-| `""` | `pods` | get |
+| `""` | `pods` | create, delete, get, list, patch, watch |
+| `""` | `services` | create, get |
+| `""` | `secrets` | create, delete |
+| `networking.k8s.io` | `networkpolicies` | create, get |
 
 The ClusterRole grants node inspection and token validation:
 
@@ -546,6 +567,8 @@ The gateway exposes `/healthz` for process liveness and `/readyz` for dependency
 
 - `startupProbe` and `livenessProbe` use `/healthz`.
 - `readinessProbe` uses `/readyz`, which reflects the latest result of an in-process background database check.
+
+A gateway that starts while its database is unreachable keeps retrying the connection. Meanwhile `/healthz` succeeds and `/readyz` reports not ready, so Kubernetes keeps the pod without routing traffic to it.
 
 Each sandbox supervisor Pod uses a `tcpSocket` readiness probe on port 5501. The supervisor accepts connections on that port only while its gateway session is ready. If you add a default-deny ingress policy to sandbox namespaces, allow TCP port 5501 from the node so kubelet can reach supervisor Pods.
 

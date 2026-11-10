@@ -38,6 +38,11 @@ pub struct BackendServices {
     pub ca_file_paths: Arc<Mutex<Option<(PathBuf, PathBuf)>>>,
     pub provider_credentials: ProviderCredentialState,
     pub sandbox_bearer: SessionBearerTokenSlot,
+    pub attach_request_timeout: std::time::Duration,
+    /// Gateway-granted authority to replace the generation's current owner.
+    pub takeover: Option<openshell_sandbox_backend::BoundaryTakeover>,
+    /// Recovery deadline (seconds) offered to the runtime at every attach.
+    pub supervisor_recovery_timeout_secs: Option<u32>,
 }
 
 /// Startup result; native payload decoding never reaches shared runtime
@@ -71,6 +76,7 @@ pub trait PreparedBackend: Send + Sync {
     async fn discover_policy(
         &self,
         bearer: SessionBearerTokenSlot,
+        attach_request_timeout: std::time::Duration,
     ) -> std::result::Result<(Option<String>, bool), BackendError>;
 
     /// Consume prepared launch data and retain the supervisor's live handles.
@@ -155,9 +161,10 @@ impl SelectedBackend {
     pub async fn discover_policy(
         &self,
         bearer: SessionBearerTokenSlot,
+        attach_request_timeout: std::time::Duration,
     ) -> Result<(Option<String>, bool)> {
         self.prepared
-            .discover_policy(bearer)
+            .discover_policy(bearer, attach_request_timeout)
             .await
             .map_err(|error| miette::miette!("discover workload image policy: {error}"))
     }
@@ -310,11 +317,13 @@ impl PreparedBackend for OpenShellLaunch {
     async fn discover_policy(
         &self,
         bearer: SessionBearerTokenSlot,
+        attach_request_timeout: std::time::Duration,
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
         openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(
             self.descriptor.clone(),
             bearer,
             self.transport.clone(),
+            attach_request_timeout,
         )
         .await
     }
@@ -324,17 +333,21 @@ impl PreparedBackend for OpenShellLaunch {
         services: BackendServices,
     ) -> std::result::Result<BuiltBackend, BackendError> {
         let payload = self.descriptor.backend_descriptor()?.payload;
+        let mut backend = openshell_sandbox_backend::OpenShellRuntimeBackend::new(
+            services.ca_file_paths,
+            services.provider_credentials,
+            services.sandbox_bearer,
+        )
+        .with_transport(self.transport)
+        .with_attach_request_timeout(services.attach_request_timeout)
+        .with_recovery_timeout_secs(services.supervisor_recovery_timeout_secs);
+        if let Some(takeover) = services.takeover {
+            backend = backend.with_takeover(takeover);
+        }
         Ok(BuiltBackend {
             payload,
             proxy_listener: None,
-            backend: Arc::new(
-                openshell_sandbox_backend::OpenShellRuntimeBackend::new(
-                    services.ca_file_paths,
-                    services.provider_credentials,
-                    services.sandbox_bearer,
-                )
-                .with_transport(self.transport),
-            ),
+            backend: Arc::new(backend),
         })
     }
 }

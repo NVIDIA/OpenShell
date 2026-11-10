@@ -551,6 +551,7 @@ mod tests {
                 sandbox_id: uuid::Uuid::new_v4().to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "launch-session".into(),
+                    auth_epoch: None,
                 },
                 trust_domain: Some("openshell".into()),
             }),

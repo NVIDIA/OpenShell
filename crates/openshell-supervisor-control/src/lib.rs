@@ -22,12 +22,12 @@
 //!
 //! The private wire protocol is generated in `openshell-core` and re-exported
 //! as [`proto`]. The supervisor process consumes the registration and status
-//! types and the private standby refusal marker ([`is_standby_refusal`]); it
-//! never uses the controller's desired state or the coordinator.
+//! types; it never links the controller or coordinator.
 
 pub mod controller;
 pub mod coordinator;
 pub mod credential;
+pub mod pool_timing;
 pub mod registration;
 pub mod status;
 
@@ -38,15 +38,18 @@ pub mod proto {
 }
 
 pub use controller::{
-    AssignmentError, HOST_HEARTBEAT_INTERVAL, HostIdentity, MAX_ASSIGNED_INSTANCES,
-    MAX_REPORTED_INSTANCES, ObservedInstance, STANDBY_REFUSAL_METADATA, STANDBY_REFUSAL_VALUE,
-    SharedObservation, SupervisorCredential, SupervisorHostController, is_standby_refusal,
+    AssignmentError, ConnectedMember, HostIdentity, InstanceOwner, MAX_ASSIGNED_INSTANCES,
+    MAX_POOL_INSTANCES, MAX_REPORTED_INSTANCES, MemberReport, MemberView, ObservedInstance,
+    POOL_HEARTBEAT_INTERVAL, POOL_RECOVERY_TIMEOUT_RANGE, POOL_RECOVERY_TIMEOUT_SECS, PoolView,
+    SupervisorCredential, SupervisorHostController,
 };
 pub use coordinator::{
-    InstanceSupervision, LaunchError, RecoverableInstance, RecoveryBaseline, RecoveryOutcome,
-    SharedSupervision,
+    InstancePlacement, InstanceSupervision, LaunchError, PlacementFuture, PlacementRequest,
+    RecoverableInstance, RecoveryBaseline, RecoveryOutcome, SharedSupervision,
 };
 pub use credential::deliver_credentials;
+/// Recovery deadlines, in seconds, a supervisor may offer a sandbox runtime.
+pub use openshell_sandbox_backend::boundary_protocol::SUPERVISOR_RECOVERY_TIMEOUT_RANGE;
 pub use registration::{
     INSTANCE_REMOVAL_GRACE, MAX_LAUNCH_MATERIAL_BYTES, ProxyCaMaterial, RegistrationError,
     RegistrationTraceContext, SandboxInstanceRegistration, SecretPem,

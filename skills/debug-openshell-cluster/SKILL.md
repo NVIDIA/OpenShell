@@ -70,6 +70,7 @@ openshell --gateway-endpoint <url> status
 Common findings:
 
 - `No active gateway`: register one with `openshell gateway add <endpoint>`.
+- `gateway has no user authentication configured`: configure OIDC, mTLS user or operator authentication, or gateway JWTs using the published gateway configuration reference. For trusted local development, explicitly set `[openshell.gateway.auth] allow_unauthenticated_users = true`; the gateway otherwise refuses to bind any ports.
 - Connection refused: gateway process is not running, service exposure is wrong, or a port-forward/proxy is not active.
 - TLS/certificate errors: the endpoint scheme or trust chain is wrong, a CLI mTLS bundle does not match the gateway CA, a supervisor is missing the gateway CA, or TLS termination does not match the gateway listener. Workloads and supervisors should not contain a user TLS client certificate or private key.
 - Fresh snap installations select `gateway-mode=user`, but the user gateway is globally disabled by default. `install.sh` enables `snap.openshell.user-gateway.service` only for its target user; direct snap installations must select one user and run `systemctl --user enable --now snap.openshell.user-gateway.service` from that user's session. Do not enable it for multiple concurrently logged-in users: every instance binds to `127.0.0.1:17670`, so later instances fail with an address-in-use error. Older snap revisions could leave the unit globally enabled; remove that state with `sudo systemctl disable --global snap.openshell.user-gateway.service`, then disable and stop the service from every other affected user's session. The global command does not stop running user services. Setting `gateway-mode=user` disables the system gateway without changing any user's service. To change the selected user, disable and stop the current user's unit before enabling the new user's unit. Upgraded installations retain their system-owned state through `openshell.system-gateway`. Existing HTTPS registrations continue to work after the service rename. Follow the published snap installation steps to enroll a new user, replace an old HTTP registration, or change modes safely through the `disable` maintenance state. If `gateway-mode=disable`, no local snap gateway is expected to run.
@@ -119,6 +120,14 @@ For Kubernetes mount-path conflicts, move caller PVC mounts away from
 `/.openshell` and `/run` to a data path such as `/data` or below `/sandbox`.
 These driver-managed paths remain reserved even for approved resources and
 `sub_path` mounts; changing approval labels does not resolve a path conflict.
+
+For dedicated Kubernetes supervisor placement, inspect the administrator's
+`supervisor_runtime_class_name` in the Kubernetes driver configuration and the
+supervisor Pod's `spec.runtimeClassName`. The setting is independent of the
+workload RuntimeClass and defaults to unset; it does not configure shared
+supervisor Deployments. If startup fails, check that the named RuntimeClass
+exists and its handler is available on eligible nodes. OpenShell does not retry
+with an ordinary supervisor Pod when the configured class is unavailable.
 
 For out-of-tree compute drivers, also check that their versioned admission-policy
 acknowledgement matches the gateway's policy. Configure standalone driver policy
@@ -228,6 +237,13 @@ rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
 The published supervisor image uses a shell-free distroless Debian 13 base.
+For Docker and Podman, supervisor OCSF `device.container.image.uid` identifies
+the workload image fixed at launch, and `image.name` carries its requested
+reference. Compare the UID with engine inspection of the workload container;
+the supervisor companion uses a separate image. An absent image object means
+the driver did not supply an immutable image ID; Kubernetes currently omits it.
+When no image UID is available, `unmapped.container_image` preserves any known
+workload image reference, including for VM and shared-supervisor records.
 For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
 runtime libraries, CA certificates, and inherited user and working directory.
 Use container logs, engine inspection and the configured exec health probe for
@@ -241,7 +257,7 @@ the image/effective policy or provider configuration. The supervisor remains
 alive while the workload stays unstarted. Inspect `openshell sandbox get` and
 repair the desired configuration with a complete policy replacement or provider
 change; do not treat a healthy container as proof that the workload is ready.
-If the 300-second provisioning repair window expires, the gateway records
+If the provisioning repair window (default 300 seconds) expires, the gateway records
 `ProvisioningTimedOut` and stops workload and supervisor compute. Inspect
 `provisioning` in sandbox JSON and TUI NOTES to distinguish cleanup pending from
 complete. Repairing configuration after expiry does not restart compute: wait
@@ -254,6 +270,14 @@ launching the workload while configuration is repaired. An unavailable boundary
 fails discovery within its control-request deadline. Permanent
 gateway errors and exhausted transient retries terminate startup; inspect those
 errors as connectivity, authorization, or lifecycle failures.
+
+For slow Kubernetes isolation backends, increase `runtime_bootstrap_grace_seconds`
+and the dedicated supervisor's `sandbox_attach_request_timeout_seconds` together.
+Shared supervisor deployments instead need `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS`
+on each shared host. The default is 300 seconds; allowed values are 1 through
+86400. Restart affected components and explicitly start a timed-out sandbox
+after cleanup; changing settings does not reset a persisted admission deadline.
+See [gateway configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#slow-sandbox-startup).
 
 ### Step 4: Check Docker-Backed Gateways
 
@@ -426,13 +450,13 @@ Common findings:
   probe and the companion supervisor's private health check. Do not add
   capabilities, attach a workload network, or disable the runtime seccomp
   profile. There is no sandbox nftables or nested-network setup to repair.
-- Gateway fails to start with an `additional_ca_bundle` error: the Podman
-  driver validates the setting at startup. The file must exist on the gateway
-  host, be non-empty, and contain at least one PEM certificate.
+- Gateway fails to start with an `additional_ca_bundle` error: gateway startup
+  validates the configured single bundle. The file must exist on the gateway
+  host, be a regular non-symlink file, and contain at least one PEM certificate.
 - Inspected HTTPS to a private-CA destination fails (for example
   `curl: (52) Empty reply from server`), or the supervisor exits at startup,
-  with `additional_ca_bundle` set: the supervisor container needs the CA, not
-  just the workload. Check
+  with a global `additional_ca_bundle` configured: the supervisor container
+  needs the staged CA, not just the workload. Check
   `podman inspect <sandbox>-supervisor --format '{{json .Mounts}}'` for a
   read-only bind of the bundle at `/etc/openshell/tls/additional/ca-bundle.pem`,
   and `--format '{{json .Config.Cmd}}'` for `--additional-ca-bundle` with that
@@ -494,6 +518,17 @@ aliases. Confirm the credential driver's namespace matches its Role and
 RoleBinding. An unset workload `image_pull_policy` uses Kubernetes defaults;
 the global Helm pull policy applies to runtime and supervisor images.
 
+When multiple gateways share one service base domain, confirm each release
+sets `server.serviceHostnameFormat: hashed` and a `server.name` unique among
+those gateways — the installation name is the hash discriminator for
+exposed-service hostnames, so a duplicate name silently routes two gateways'
+services to the same hostnames and a rename invalidates every previously
+issued URL. Check the rendered pair with:
+
+```bash
+kubectl -n <gateway-namespace> get cm <release>-config -o jsonpath='{.data.gateway\.toml}' | rg -n '^name|service_hostname_format'
+```
+
 The chart mounts the `gateway.toml` ConfigMap key directly at
 `/etc/openshell/gateway.toml` as a read-only `subPath` file. This avoids the
 atomic-writer symlink exposed by a ConfigMap directory mount because the gateway
@@ -510,6 +545,100 @@ kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
 
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
+
+Gateway pod scheduling accepts top-level `nodeSelector`, `affinity`,
+`tolerations`, `priorityClassName`, and `topologySpreadConstraints` values for
+both StatefulSet and Deployment workloads. The last two default to unset.
+If a gateway pod stays Pending, inspect its scheduling events, confirm the
+named PriorityClass exists (`kubectl get priorityclass`), and check that topology
+spread selectors match the gateway pod labels and that eligible nodes have the
+required topology labels. These values apply only to gateway pods.
+
+#### Additional destination CA ConfigMap
+
+When `supervisor.network.additionalCaConfigMapName` is set, Helm must mount the
+**source** operator ConfigMap's `ca.crt` key into the gateway at
+`/etc/openshell-tls/additional-ca-source/ca.crt`. The rendered
+`gateway.toml` must contain the global (not Kubernetes-driver-local) setting:
+
+```toml
+[openshell.supervisor.network]
+additional_ca_bundle = "/etc/openshell-tls/additional-ca-source/ca.crt"
+```
+
+Inspect the source, render, and live gateway mount before inspecting sandbox
+pods:
+
+```bash
+helm -n openshell get values openshell | grep -A3 additionalCaConfigMapName
+kubectl -n openshell get configmap <source-configmap> -o jsonpath='{.data.ca\.crt}' >/dev/null
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -A2 '^\[openshell.supervisor.network\]'
+kubectl -n openshell get pod <gateway-pod> -o jsonpath='{.spec.volumes[?(@.name=="additional-ca-source")]}{"\n"}'
+```
+
+At startup, the gateway normalizes the source once and stages a
+content-addressed, read-only artifact below
+`/var/lib/openshell-state/openshell/network-supervisor/`. The gateway workload
+sets `XDG_STATE_HOME=/var/lib/openshell-state` and mounts the writable
+`gateway-state` volume there. Check that wiring before debugging the driver:
+
+```bash
+kubectl -n openshell get pod <gateway-pod> -o jsonpath='{.spec.containers[0].env[?(@.name=="XDG_STATE_HOME")]}{"\n"}'
+kubectl -n openshell get pod <gateway-pod> -o jsonpath='{.spec.containers[0].volumeMounts[?(@.name=="gateway-state")]}{"\n"}'
+kubectl -n openshell get pod <gateway-pod> -o jsonpath='{.spec.volumes[?(@.name=="gateway-state")]}{"\n"}'
+```
+
+At sandbox creation or restart, the Kubernetes driver creates or verifies an
+immutable, content-addressed ConfigMap in the target sandbox namespace. Its
+name binds the effective gateway identity and normalized trust digest. The
+managed ConfigMap must have `openshell.ai/managed-by=openshell`, the matching
+`openshell.ai/gateway-id` label, and an
+`openshell.ai/additional-ca-generation` annotation. Different trust
+generations intentionally coexist so running sandboxes retain their startup
+trust. The supervisor Pod mounts the ConfigMap read-only at
+`/etc/openshell/tls/additional/ca-bundle.pem` and receives
+`--additional-ca-bundle` for that path; the immutable flag plus the driver's
+per-creation digest and exact-byte validation close deletion/recreation races
+after the API check.
+
+Kubernetes RBAC cannot restrict `create` by `resourceNames` or restrict `get`
+by a name prefix. When this feature is enabled, the chart grants the gateway
+service account ConfigMap `get`/`create` in the shared sandbox namespace. In
+managed/operator modes, the existing ClusterRoleBinding makes those permissions
+cluster-wide. It does not grant ConfigMap `list`, `watch`, `patch`, `update`, or
+`delete`. Prefer a dedicated gateway service account and namespace-scoped
+bindings when the read boundary matters. Check the objects and authorization:
+
+```bash
+kubectl -n <sandbox-namespace> get configmap \
+  -l openshell.ai/managed-by=openshell,openshell.ai/gateway-id=<effective-gateway-id> \
+  --show-labels
+kubectl auth can-i get configmaps -n <sandbox-namespace> \
+  --as system:serviceaccount:openshell:<gateway-service-account>
+kubectl auth can-i create configmaps -n <sandbox-namespace> \
+  --as system:serviceaccount:openshell:<gateway-service-account>
+kubectl auth can-i patch configmaps -n <sandbox-namespace> \
+  --as system:serviceaccount:openshell:<gateway-service-account>
+kubectl auth can-i delete configmaps -n <sandbox-namespace> \
+  --as system:serviceaccount:openshell:<gateway-service-account>
+```
+
+A missing, mutable, unowned, wrong-generation, or wrong-data managed ConfigMap
+fails closed. Do not relabel or edit it blindly. Investigate the object owner;
+remove an invalid object only after confirming no sandbox uses it, then retry
+so the driver can recreate the exact generation. Diagnostics deliberately omit
+certificate contents; inspect the source object separately rather than copying
+PEM into logs or tickets.
+
+Changing source ConfigMap contents does not reload the gateway or a running
+supervisor: restart the gateway to reread/normalize it, then recreate or
+restart affected sandboxes. Removing the Helm setting means newly created or
+recreated sandbox pods have no additional-CA volume/mount, but existing running
+pods retain startup trust until restarted. The driver intentionally has no
+ConfigMap list/delete permission; unused managed generations can remain. After
+all sandboxes are migrated, use an operator identity to verify the generation
+annotation and pod references, then explicitly delete unused ConfigMaps in each
+applicable namespace. Do not add list/delete RBAC as a cleanup workaround.
 
 When no external credential driver is enabled, the Helm chart uses the
 gateway's default encrypted database credential storage. The chart creates a
@@ -687,23 +816,6 @@ returns `UNAVAILABLE` with "lock sandbox SSH identity failed", and neither
 `openshell_server_mutation_lock_timeouts_total` nor
 `openshell_server_mutation_lock_errors_total` counts it.
 
-With `supervisor_topology = "gateway"` and replicated gateway storage, the
-shared supervisor's assignment stream belongs to the existing sandbox
-reconciler lease holder. Look for `acquired reconciler lease` and `supervisor
-host attached` on the same gateway Pod. A standby returns `UNAVAILABLE` with
-`reconnect to the gateway reconciler leader`; the supervisor retries using a
-fresh connection. Its gateway endpoint must balance across eligible replicas;
-remove session affinity that pins retries to a standby. Hosted workloads
-continue running during reconnection. After takeover, the new leader recovers
-durable assignments before sending its first snapshot.
-
-Creates through a standby can take an extra driver reconciliation interval
-before the leader assigns their instances. The standby reads readiness from
-observations carried by the reconciler lease, refreshed on renewal (10
-seconds) and polled every 5 seconds. An expired or unreadable lease means
-unknown supervision, not instance failure. Check gateway storage connectivity
-and lease-renewal logs when readiness lags across all sandboxes.
-
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor
 owner over the internal `PeerRelay` RPC. Check the headless peer Service,
@@ -865,6 +977,41 @@ directory first, and on OpenShift the SCC must admit `admin_socket_group`. The
 gateway asks the agent on its own node, so sandbox registrations must cover
 every agent that may run a gateway Pod. `helm status <release>` prints these
 prerequisites when delegation is enabled.
+
+#### Secure metrics TLS
+
+When `metrics.tls.enabled=true`, the dedicated metrics listener uses its own
+TLS configuration and, when requested, an independent scraper client CA. Do
+not use the gateway client CA: sandbox workloads receive gateway client
+credentials, so trusting that CA here would grant them metrics access. The
+chart fails rendering when `metrics.tls.clientCaSecretName` matches
+`server.tls.clientCaSecretName` or `server.tls.clientTlsSecretName`; that
+check is by name only. Inspect
+the rendered configuration and the read-only Secret mounts before debugging the
+scraper:
+
+```bash
+kubectl -n openshell get configmap openshell-config \
+  -o jsonpath='{.data.gateway\.toml}' | grep -A6 '^\[openshell\.gateway\.metrics_tls\]'
+kubectl -n openshell get statefulset openshell \
+  -o jsonpath='{.spec.template.spec.volumes[?(@.name=="metrics-tls-cert")]}{"\n"}{.spec.template.spec.volumes[?(@.name=="metrics-tls-client-ca")]}' | jq .
+kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200 | grep -E 'metrics.*TLS|listener=metrics'
+```
+
+`metrics-tls-cert` must reference a Secret with `tls.crt` and `tls.key`; when
+mTLS is enabled, `metrics-tls-client-ca` must reference a Secret with `ca.crt`.
+An absent mount means the release was rendered without metrics TLS. A failed
+certificate reload retains the previous working listener; correct the Secret
+contents rather than disabling verification. Configure the scraper with the
+metrics server CA and, for mTLS, its dedicated client certificate and key. Do
+not use `insecureSkipVerify`.
+
+A Secret that exists with malformed contents leaves the metrics listener
+disabled while the gateway remains available; it never falls back to
+plaintext. A missing Secret, or a client CA Secret without a `ca.crt` key,
+never reaches the gateway: kubelet fails the non-optional volume mounts and
+the pod does not start (`FailedMount`). Correct the Secret and restart the
+gateway before retrying the scrape.
 
 If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
 is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
@@ -1171,6 +1318,137 @@ done
 Any `no` result can strand recovery before workload Pod creation. Upgrade the
 OpenShell chart rather than treating missing workload Pods as Pod failures.
 
+#### Shared supervisor high availability
+
+`supervisor.autoscaling.enabled=true` gives replica ownership to a separate
+memory HPA named `<fullname>-supervisor`; `supervisor.replicas` is then ignored.
+The default target is `512Mi` average memory per Pod, with two to four members.
+Check `kubectl describe hpa <fullname>-supervisor -n <namespace>` and
+`kubectl top pods -n <namespace> -l app.kubernetes.io/component=supervisor`.
+An unknown memory target or `ScalingActive=False` can mean the resource metrics
+API (usually Metrics Server) is unavailable. The top-level `autoscaling` values
+control the gateway HPA separately. Scaling up adds capacity for new sandboxes
+and does not redistribute existing owners; check individual Pod memory as well
+as the average. See the published High Availability guide for configuration
+and enabling or disabling autoscaling on an existing release.
+
+With `supervisor_topology = "gateway"`, the gateway always coordinates the
+shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
+`supervisor.replicas` members (default 1, which has no failover). The chart
+renders only `[openshell.gateway.supervisor_pool] recovery_timeout_secs` (the
+driver's `shared_supervisor` table carries no pool settings), rolls one member
+at a time, sets no affinity by default (set `supervisor.affinity` to control
+supervisor scheduling; top-level `affinity` applies only to the gateway), gives
+each member a 60-second grace period to leave,
+and adds a `<release>-supervisor` PodDisruptionBudget with `maxUnavailable: 1`
+unless `supervisor.podDisruptionBudget.enabled` is `false` (default `true`).
+If a node drain stalls on supervisor evictions, check the budget's allowed
+disruptions; disable it only for the maintenance window.
+Each member takes its stable member ID from `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`
+(the Pod name) and its runtime address from
+`OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP` (the Pod IP, which sandbox runtimes
+must be able to reach). Only the Deployment's replica count depends on
+`supervisor.replicas`: scaling it must not change the
+gateway ConfigMap or the supervisor Pod template, so neither the gateway nor
+the remaining members restart. A member removed by scaling down announces
+that it is leaving (`pool member is leaving` in its log), and the gateway logs
+`cause=leaving` as it moves each of its sandboxes. A scale step that restarts
+the gateway or every supervisor Pod means something besides
+`supervisor.replicas` changed in the release values.
+
+```bash
+kubectl -n openshell get deployment,poddisruptionbudget,pod -l app.kubernetes.io/component=supervisor -o wide
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E -A2 'supervisor_topology|shared_supervisor|supervisor_pool'
+kubectl -n openshell logs -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+  -c openshell-gateway --prefix --tail=500 | grep -E 'supervisor pool|taking over a shared sandbox instance'
+kubectl -n openshell logs -l app.kubernetes.io/name=openshell-supervisor --prefix --tail=500 \
+  | grep -Ei 'takeover|sandbox instance'
+kubectl -n <sandbox-namespace> logs -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/boundary-role=workload \
+  --tail=200 | grep -E 'sandbox-supervisor-|Supervisor takeover'
+```
+
+Each sandbox instance runs on one member, and a live owner keeps it. A
+member's console log names an instance by its route (the Sandbox's
+`openshell.ai/sandbox-runtime-supervisor-session` annotation) at the end of
+`admitted assigned sandbox instance <route>`, `removing withdrawn sandbox
+instance <route>`, and `relinquishing a sandbox instance ... <route>`; the
+member whose latest such line for a route is an admission supervises it. Other
+lines that mention the route, such as SSH relay socket paths, say nothing
+about ownership. Gateway console fields are styled, so strip ANSI escapes
+(for example `sed 's/\x1b\[[0-9;]*m//g'`) before matching `cause=leaving`. The
+gateway logs `shared supervisor pool enabled; reconciling pool membership and
+ownership` at startup. When an owner's process exits, its node is lost, or it
+leaves, the gateway logs `taking over a shared sandbox instance from a failed
+supervisor` with `from`, `to`, `term`, and `cause` (`expired`: the member's
+record expired; `leaving`: it announced leaving; `restarted`: its process
+changed, and a member whose process restarted re-adopts its own instances
+first), revokes the previous owner's
+credentials for that sandbox, and grants the instance to a live member.
+Runtimes dial the supervisor Service, and a member that does not own the
+instance redirects the runtime to the owner's Pod IP on the runtime port, so
+the workload must reach every supervisor Pod IP. The replacement and the
+sandbox runtime both log `Supervisor takeover confirmed; previous owner
+fenced`. The sandbox keeps its Pod, generation, PIDs, and memory; open proxied
+connections and exec or SSH streams break and must reconnect.
+
+The sandbox runtime writes these OCSF findings to the workload Pod log:
+
+- `sandbox-supervisor-connection-lost`: the runtime lost its supervisor and
+  froze the workload.
+- `sandbox-supervisor-recovery-expired`: no replacement confirmed within the
+  recovery timeout, so the runtime terminated the workload.
+- `sandbox-supervisor-takeover-denied`: the runtime refused a supervisor
+  without a valid grant for the current term, such as a fenced owner returning.
+
+The recovery timeout is the gateway's
+`[openshell.gateway.supervisor_pool] recovery_timeout_secs` (Helm
+`supervisor.recoveryTimeoutSeconds`, 30 to 300 seconds, default 60). Each pool
+supervisor offers it to a sandbox runtime when it attaches. A graceful leave hands instances over at
+once.
+A lost node takes up to about 22 seconds to detect, before the replacement
+starts: the gateway closes the member's silent stream after 5 seconds, the
+member's record expires 15 seconds after its last refresh, and a reconcile pass
+runs every 2 seconds. A short timeout
+terminates workloads that would have recovered. A gateway replica that just
+started waits 30 seconds before it takes over instances whose owner looks
+failed, so members cut off by a gateway restart reconnect first. With one
+replica, or when no live member takes over before the timeout, the workload
+ends in `sandbox-supervisor-recovery-expired`.
+
+`supervisor pool reconciliation failed; retrying` means a gateway replica could
+not read or write the pool's store records: `supervisor_pool_member` (one per
+member, refreshed every 2 seconds by the gateway replica serving its newest
+stream, independently of reconciliation; older than 15 seconds means dead),
+`supervisor_instance_assignment` (one per instance the pool must run, written by
+the replica that launched it; it holds the handle of the launch material, which
+the gateway's credential store keeps), `supervisor_instance_owner` (one per
+instance, written with compare-and-swap, naming the owner and its term),
+`supervisor_pool_capacity` (one per member, listing the routes whose owner
+record names it; changed in the same transaction as each owner record, so a
+member is never charged more than 256 instances across replicas), and
+`supervisor_instance_report` (one per instance and ownership term, the owner's
+latest report of that term, recorded by the replica serving it). `supervisor
+pool member refresh failed` or `did not finish in time` means the replica could
+not keep a member's record fresh; if it persists for 15 seconds the member's
+instances move. Every gateway replica
+serves the pool from these records, so a sandbox launched through one replica
+reaches a member connected to another. `could not load a supervisor pool
+instance's launch material` points at the credential store instead. Check the
+database. To read the records on PostgreSQL without changing them:
+
+```sql
+SELECT object_type, id,
+       (extract(epoch FROM now()) * 1000)::bigint - updated_at_ms AS age_ms,
+       convert_from(payload, 'UTF8') AS record
+FROM objects
+WHERE object_type IN ('supervisor_pool_member', 'supervisor_instance_assignment',
+                      'supervisor_instance_owner', 'supervisor_pool_capacity',
+                      'supervisor_instance_report')
+ORDER BY object_type, id;
+```
+
+Do not edit or delete these records; the gateway fences takeovers with them.
+
 #### Corporate upstream proxy
 
 When the deployment routes sandbox egress through a corporate HTTP forward
@@ -1234,6 +1512,52 @@ network supervisor logs for CONNECT and upstream-proxy decisions:
 kubectl -n <sandbox-namespace> logs pod/<supervisor-pod> --tail=200 | grep -Ei 'upstream|connect|proxy'
 ```
 
+#### Sandbox image-update activation and recovery
+
+`openshell.v1.SandboxUpdates/UpdateSandbox` uses the existing authenticated
+gateway listener and defaults to disabled. Check the effective
+`[openshell.gateway] enable_sandbox_updates` value and its overrides,
+`--enable-sandbox-updates true` or
+`OPENSHELL_ENABLE_SANDBOX_UPDATES=true`. Canonical Helm values use:
+
+```yaml
+gatewayConfig:
+  "openshell.gateway":
+    enable_sandbox_updates: true
+```
+
+Do not enable the flag to work around an error. It attests that all incompatible
+gateways, including unregistered processes and Jobs, have been drained and
+retired, their outstanding driver operations have settled, and old binaries
+cannot return through rollout or rollback configurations. Keep it false during
+a rolling upgrade. SQLite supports one gateway process, not shared-file HA.
+
+On PostgreSQL, fresh gateway membership must advertise sandbox-update protocol 1;
+malformed or truncated membership reads fail closed. Administrative, monitoring,
+and backup connections do not block updates, and custom `application_name` values
+are preserved. Membership expiry does not prove a gateway has stopped. Follow the
+[activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-updates).
+
+The gateway retries accepted updates automatically, even with new updates disabled.
+Repeated automatic failures back off up to 15 minutes per gateway. Replicas retry
+independently, and restarting a gateway resets its delay. Recovery warnings include
+the attempt count and retry delay.
+To resume immediately, read the sandbox resource version and call `UpdateSandbox`
+with that version and no selected fields. Restore a compatible driver if recovery
+reports missing support. Start, stop, and provisioning retry retain the barrier;
+explicit deletion can reclaim an unrecoverable sandbox and its storage. Preserve
+request admission semantics: use a new ID or no ID for the explicit resume request,
+and never change the original payload under its original ID. See the
+[recovery contract](https://docs.nvidia.com/openshell/latest/sdk/api-errors#sandbox-image-update-recovery).
+
+Split Helm deployments need the current `openshell-workspace` Role. Update
+preflight requires `get` on Pods: it checks the controller-recorded workload
+name, the Sandbox resource name, and `os-supervisor-<sandbox-id>` directly.
+Any remaining Pod at those names, including a terminating Pod, blocks the update.
+The checks make at most three Pod reads regardless of namespace size and do not
+discover unexpectedly named Pods. Upgrade the workspace chart alongside the
+gateway chart.
+
 ### Step 7: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:
@@ -1291,9 +1615,10 @@ credential failures.
 | Symptom | Likely cause | Check |
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
-| Collector receives no OCSF log records, or `openshell.ocsf.gap` records | `[openshell.gateway.otlp.ocsf]` missing or without `enabled = true`, an unreachable or non-gRPC endpoint, or export failures and queue pressure | Check `[openshell.gateway.otlp.ocsf]` for `enabled = true` and the endpoint it resolves to, the gateway's `OTLP exporting enabled` startup log for `ocsf_endpoint`, export warnings, and `openshell_ocsf_otlp_*` metrics. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
-| Gateway OCSF JSONL stops growing, has gaps, or is rejected by a SIEM | File errors, queue pressure, shipper falling behind retention, or a schema mismatch | Inspect gateway warnings and `openshell_ocsf_log_*` metrics; check `[openshell.gateway.ocsf_log]`, `schema_version`, directory permissions, free space, per-replica paths, and shipper rotation checkpoints. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
-| `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
+| Collector receives no OCSF log records, or `openshell.ocsf.gap` records | `[openshell.gateway.otlp.ocsf]` missing or without `enabled = true`, an unreachable endpoint or one that does not speak the table's `protocol`, or export failures and queue pressure | Check `[openshell.gateway.otlp.ocsf]` for `enabled = true` and the endpoint it resolves to, the gateway's `OTLP exporting enabled` startup log for `ocsf_endpoint` and `ocsf_protocol`, export warnings, and `openshell_ocsf_otlp_*` metrics. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
+| Gateway OCSF JSONL stops growing, has gaps, or is rejected by a SIEM | File errors, queue pressure, or shipper falling behind retention | Inspect gateway warnings and `openshell_ocsf_log_*` metrics; check `[openshell.gateway.ocsf_log]`, directory permissions, free space, per-replica paths, and shipper rotation checkpoints. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
+| `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with `OPENSHELL_DEV_OTLP_ENDPOINT` set but no collector is listening, for example because `helm:k3s:forward` stopped | Start the collector forwarding again, or restart the gateway task without `OPENSHELL_DEV_OTLP_ENDPOINT`; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
+| Sandbox log shows `OTLP agent trace relay inactive: not enabled by the gateway` at startup, then `agent OTLP export attempted but the agent trace relay is not enabled` when the agent exports | The gateway does not enable `[openshell.gateway.otlp.agent]`, so the supervisor refuses the workload's OTLP relay address | Set `enabled = true` in `[openshell.gateway.otlp.agent]` (Helm: `gatewayConfig."openshell.gateway.otlp.agent".enabled`) with an endpoint from that table or `[openshell.gateway.otlp]`, and recreate the sandbox; `openshell logs <sandbox> --source sandbox` then shows `OTLP agent trace relay enabled` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Docker or Podman sandbox never registers | Wrong gateway endpoint, unavailable host networking, or supervisor startup failure | Gateway logs and supervisor container logs |
 | CPU-only VM startup reports that read-only `/proc` cannot be removed | Older supervisors can infer GPU requirements from host devices | Check gateway, VM driver, and bundled supervisor versions; use matching updated artifacts. CPU-only VMs do not require read-write `/proc`. |
@@ -1303,14 +1628,18 @@ credential failures.
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
 | Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full lock pool on one replica (4 connections unless `database_lock_max_connections` is set), a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, `openshell_server_mutation_lock_connections_in_use` against its capacity, the `detail` field of `mutation lock acquisition timed out` in gateway logs, `mutation lock held longer than the lock wait timeout` warnings and `openshell_server_mutation_lock_hold_seconds`, the `pg_locks` query in Step 6 |
+| RPCs fail after about 5 seconds with `UNAVAILABLE` `DATABASE_UNAVAILABLE` or "database unavailable: pool timed out" | PostgreSQL unreachable or not answering, or every data-pool connection busy | `database health check` warnings and `/readyz` on the gateway, PostgreSQL logs, `database_max_connections` and the connection sizing in the High Availability guide |
+| Kubernetes gateway pod Running but never Ready, logging `database unreachable; retrying` | The gateway started while PostgreSQL was unreachable and waits for it | PostgreSQL pod and Service endpoints, the host and port in the database URL, network policy between the gateway and PostgreSQL |
 | Mutating RPCs return `INTERNAL` with "could not open a mutation lock connection" | PostgreSQL out of connection slots, restarting, or unreachable | `openshell_server_mutation_lock_errors_total`, PostgreSQL logs, `SELECT count(*) FROM pg_stat_activity` against `max_connections`, `database_max_connections` and `database_lock_max_connections`, the connection sizing in the High Availability guide |
 | `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
 | HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
 | One replica holds most sessions after a rollout | Expected: sessions stay where they reconnected | `openshell_server_supervisor_sessions` per pod; it fades as sandboxes are recreated |
+| Certificate hook Job stays active after `certgen` exits successfully | An injected sidecar is still running in the hook Pod | Inspect all container statuses. Configure `pkiInitJob.podLabels` or `pkiInitJob.podAnnotations` as required by the injector, then retry the Helm install or upgrade to recreate the hook Pods |
 | Gateway or `<release>-certgen` hook pod rejected with `violates PodSecurity "restricted:latest"` | The rendered container lacks `runAsNonRoot` or `seccompProfile`: an older chart version does not set them, or an override in `securityContext` / `pkiInitJob.securityContext` unset them | `kubectl -n openshell get events --field-selector reason=FailedCreate`; upgrade the chart, then remove overrides that unset those fields |
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
 | OpenShift `<release>-supervisor` Deployment never creates pods after setting `supervisor_topology = "gateway"` (SCC `runAsUser`/`fsGroup` not in the namespace range) | `supervisor.podSecurityContext` defaults `runAsUser`, `runAsGroup`, and `fsGroup` to 65534, outside the namespace's assigned UID/GID ranges | `kubectl -n openshell get events --field-selector reason=FailedCreate`; compare with the `openshift.io/sa.scc.*` annotations from `oc describe ns openshell`; set `supervisor.podSecurityContext.runAsUser`, `.runAsGroup`, and `.fsGroup` to `null`, as `deploy/helm/openshell/ci/values-openshift-scc.yaml` does, and keep `runAsNonRoot` and `seccompProfile` |
-| Shared sandboxes stay `Starting` or report `unavailable` readiness with `supervisor_topology = "gateway"`, gateway logs say no shared supervisor host is connected | The `<release>-supervisor` Pod cannot reach or authenticate to the gateway: wrong `OPENSHELL_TLS_CA`, the `<release>-supervisor-token` Secret is missing or still empty (gateway logs `wrote the supervisor token Secret` once it has delivered a token; `no usable supervisor token` in the supervisor means it has not), or the gateway was deployed without TLS or without the sandbox-JWT signing key | `kubectl -n openshell logs deployment/<release>-supervisor` for `gateway accepted the supervisor host` or a refusal; gateway logs for `supervisor host attached`, `wrote the supervisor token Secret`, or `failed to write the supervisor token Secret`; `kubectl -n openshell get secret <release>-supervisor-token -o jsonpath='{.metadata.annotations}'` shows the token expiry; the gateway refuses to start the topology without TLS or `gateway_jwt` |
+| Shared sandboxes stay `Starting` or report `unavailable` readiness with `supervisor_topology = "gateway"`, gateway logs say no shared supervisor host is connected | The `<release>-supervisor` Pod cannot reach or authenticate to the gateway: wrong `OPENSHELL_TLS_CA`, the `<release>-supervisor-token` Secret is missing or still empty (gateway logs `wrote the supervisor token Secret` once it has delivered a token; `no usable supervisor token` in the supervisor means it has not; right after a fresh install the kubelet can take about 90 seconds to project the written token into the already-ready Pod, so launches can be refused for no live pool member until the supervisor logs `gateway accepted the supervisor host`), or the gateway was deployed without TLS or without the sandbox-JWT signing key | `kubectl -n openshell logs deployment/<release>-supervisor` for `gateway accepted the supervisor host` or a refusal (a refusal or startup failure naming `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID` or `_ADVERTISE_IP` means the Pod lacks its member identity; the chart sets them from the Pod name and IP); gateway logs for `supervisor host attached`, `wrote the supervisor token Secret`, or `failed to write the supervisor token Secret`; `kubectl -n openshell get secret <release>-supervisor-token -o jsonpath='{.metadata.annotations}'` shows the token expiry; the gateway refuses to start the topology without TLS or `gateway_jwt` |
+| Shared sandbox workloads terminate after a supervisor Pod or node failure (`sandbox-supervisor-recovery-expired`) | One supervisor replica (no member to fail over to), no live pool member took over, or the recovery timeout is shorter than detection plus takeover | `supervisor.replicas` and the `<release>-supervisor` PodDisruptionBudget; gateway `taking over a shared sandbox instance` logs; workload Pod `sandbox-supervisor-*` findings; `supervisor.recoveryTimeoutSeconds`. See "Shared supervisor high availability" in Step 6 |
 | Gateway pod rejected with `violates PodSecurity` (`hostPath volumes`) or an SCC error naming `supplementalGroups` after enabling `spiffe_delegation` | The SPIRE admin socket mount is a `hostPath` volume, which Baseline and Restricted forbid; OpenShift restricted-v2 also rejects an `admin_socket_group` outside the namespace range | `kubectl -n openshell get events --field-selector reason=FailedCreate`; add a Pod Security exception or custom admission policy (or custom SCC) for the gateway; do not remove the gateway's security context |
 | Gateway pod stays `ContainerCreating` with `hostPath type check failed` for the SPIRE admin directory | The SPIRE agent on that node has not created its admin socket directory | `kubectl -n openshell describe pod <gateway-pod>`; start the agent with its admin socket on the host before the gateway |
 | Shared-sandbox grants fail with `code=unavailable stage=workload_identity` | The gateway cannot open the admin socket: the agent is down, or the gateway lacks the socket's group (the gateway never changes its own groups) | Gateway logs for `dynamic token grant failed`; check the agent and the gateway Pod's `supplementalGroups`, or the process groups outside Helm |
@@ -1376,3 +1705,48 @@ probes. Arguments after `--` validate the effective daemon invocation,
 including its command-line overrides. Preflight preserves every failed file. Do
 not advise users to delete or rewrite it automatically; back it up and follow the
 manual schema-v2 migration in the Gateway Configuration reference.
+
+## Supervisor application ingress
+
+When `[openshell.supervisor.app_listener]` is explicitly enabled, check its
+`port` and `domain` separately from the gateway API and supervisor runtime ports.
+The Kubernetes TLS Secret is configured with `tls_secret_name` under
+`[openshell.drivers.kubernetes.sandbox_runtime.app_listener]`. Disabled listeners
+create no app TLS mount or app port. TLS material is mounted only in supervisors
+and reloads on supervisor restart.
+
+Inspect supervisor Pods with `kubectl`. In both dedicated and shared topologies,
+connect to the current sandbox owner's Pod IP and configured app port. The driver
+creates no app Services. Preserve service SNI and Host when using curl's
+`--connect-to`, and verify the application certificate. A port-forward bypasses
+NetworkPolicy forwarding; also test from a permitted in-cluster client. Operators
+provide ingress network rules. Running supervisors retain their startup listener
+configuration until restarted.
+
+Service changes arrive through polling or push configuration. Only admitted
+service declarations are installed. Polling and accepted live push sessions
+renew a 30-second lease; rejected configuration or expired freshness closes
+routes. When the listener is enabled, polling delays are capped at five seconds
+even if the configured interval is longer; failed polls do not renew the lease.
+App traffic uses application/edge authentication independently of gateway
+user authentication. This listener stage does not add service discovery or
+change the public URLs printed by the CLI.
+
+When enabled application routes are not published, check the authenticated
+supervisor session and installed configuration before checking ingress. The
+gateway requests installation evidence every five seconds with a fifteen-second
+lease measured from challenge issuance. Instances report only when their serving
+freshness covers that lease. Replayed, late, stale-configuration, and replaced
+session reports cannot renew evidence. Endpoint resolution comes from the
+compute driver once per challenge/report exchange, with fresh resolution for the
+next challenge. Acceptance still checks durable ownership and shared member
+readiness; ambiguous shared ownership must not publish an address.
+
+For shared pools, compare the discovered endpoint to the
+acknowledged owner's Pod IP and configured app port, not its runtime port or a
+load-balanced supervisor Service. Publication requires a current ownership term,
+live member, and acknowledged ready report. During takeover old streams may close;
+verify workload identity/memory survives and new connections reach the replacement.
+Shared serving leases last at most fifteen seconds from issuance, independently
+of configuration renewal; include membership failure detection when measuring a
+partition's stale-owner interval. Storage failures prevent renewal.

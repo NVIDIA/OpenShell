@@ -13,6 +13,11 @@
 [![Security Policy](https://img.shields.io/badge/Security-Report%20a%20Vulnerability-red)](SECURITY.md)
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen)](https://docs.nvidia.com/openshell/latest/index.html)
 
+> [!NOTE]
+> 🚧 OpenShell is now part of the CNCF! We’re in the process of moving development to [ai-openshell](https://github.com/ai-openshell) and governance to the CNCF. Until the move is complete, please continue to use the [NVIDIA/OpenShell](https://github.com/NVIDIA/OpenShell) repo for code, issues, and pull requests.
+
+<!-- Separate the two GitHub alert blocks. -->
+
 > [!IMPORTANT]
 > **New in OpenShell 0.1.x:** a stable release cadence, new isolation primitives, an expanded extension surface, and new APIs. [Read the 0.1.0 upgrade guide](https://docs.nvidia.com/openshell/latest/upgrade/0-1-0).
 
@@ -37,6 +42,8 @@ openshell sandbox create --name demo
 ```
 
 The installer sets up the CLI and a local gateway. The default sandbox image is minimal Ubuntu with no agent installed. To run a real agent, follow [Run Your First Agent](https://docs.nvidia.com/openshell/latest/about/run-your-first-agent): it runs OpenCode against a free OpenRouter model and shows how to approve new access as the agent needs it.
+
+For native Windows support through Microsoft MXC, see the [Windows build and runtime guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md) for setup and current limitations.
 
 ## Explore Further
 

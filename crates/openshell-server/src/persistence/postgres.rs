@@ -6,9 +6,9 @@ use super::mutation_lock::{
     MUTATION_LOCK_TIMEOUT, MUTATION_LOCK_TIMEOUT_SETTING, MutationLockSet,
 };
 use super::{
-    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
-    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
-    map_migrate_error,
+    AtomicWrite, DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, atomic_write_order,
+    current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::gateway_metrics::GaugeSlot;
 use crate::policy_store::{
@@ -40,7 +40,7 @@ use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE}
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
-    pool: PgPool,
+    pub(super) pool: PgPool,
     /// Dedicated connections for session-level mutation advisory locks.
     lock_pool: PgPool,
     /// How acquisitions and guards use the lock pool's connections.
@@ -275,6 +275,46 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 /// wait on itself until the acquire times out.
 pub const MIN_MAX_CONNECTIONS: u32 = 2;
 
+/// How long a data-pool caller waits for a connection, including opening one.
+pub(super) const DATA_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether a connect or migration failure means `PostgreSQL` is not serving
+/// yet, so startup retries it. A bad host, credentials, or certificate stays
+/// fatal.
+fn is_unavailable_at_startup(error: &sqlx::Error) -> bool {
+    use std::io::ErrorKind;
+    match error {
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Io(error) => matches!(
+            error.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+                | ErrorKind::BrokenPipe
+                | ErrorKind::TimedOut
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+        ),
+        // read_only_sql_transaction, too_many_connections, admin_shutdown,
+        // crash_shutdown, cannot_connect_now.
+        sqlx::Error::Database(error) => matches!(
+            error.code().as_deref(),
+            Some("25006" | "53300" | "57P01" | "57P02" | "57P03")
+        ),
+        _ => false,
+    }
+}
+
+fn map_startup_error(error: &sqlx::Error) -> PersistenceError {
+    if is_unavailable_at_startup(error) {
+        PersistenceError::Unavailable(error.to_string())
+    } else {
+        map_db_error(error)
+    }
+}
+
 impl PostgresStore {
     /// Connect and size the data and lock pools, falling back to
     /// [`DEFAULT_MAX_CONNECTIONS`] and `MUTATION_LOCK_POOL_MAX_CONNECTIONS`.
@@ -304,9 +344,10 @@ impl PostgresStore {
         );
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            .acquire_timeout(DATA_POOL_ACQUIRE_TIMEOUT)
             .connect(url)
             .await
-            .map_err(|e| map_db_error(&e))?;
+            .map_err(|e| map_startup_error(&e))?;
         let lock_pool = PgPoolOptions::new()
             .max_connections(lock_pool_size)
             .min_connections(0)
@@ -351,22 +392,30 @@ impl PostgresStore {
         POSTGRES_MIGRATOR
             .run(&self.pool)
             .await
-            .map_err(|e| map_migrate_error(&e))?;
+            .map_err(|e| match &e {
+                sqlx::migrate::MigrateError::Execute(error)
+                | sqlx::migrate::MigrateError::ExecuteMigration(error, _)
+                    if is_unavailable_at_startup(error) =>
+                {
+                    PersistenceError::Unavailable(e.to_string())
+                }
+                _ => map_migrate_error(&e),
+            })?;
         self.migrate_legacy_time_payloads().await
     }
 
     async fn migrate_legacy_time_payloads(&self) -> PersistenceResult<()> {
-        let mut transaction = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        let mut transaction = self.pool.begin().await.map_err(|e| map_startup_error(&e))?;
         // Serialize this application-level data migration across gateway replicas.
         sqlx::query("SELECT pg_advisory_xact_lock(3052)")
             .execute(&mut *transaction)
             .await
-            .map_err(|e| map_db_error(&e))?;
+            .map_err(|e| map_startup_error(&e))?;
         let rows =
             sqlx::query("SELECT id, object_type, payload FROM objects ORDER BY id FOR UPDATE")
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|e| map_db_error(&e))?;
+                .map_err(|e| map_startup_error(&e))?;
 
         for row in rows {
             let id: String = row.try_get("id").map_err(|e| map_db_error(&e))?;
@@ -384,11 +433,14 @@ impl PostgresStore {
                     .bind(id)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|e| map_db_error(&e))?;
+                    .map_err(|e| map_startup_error(&e))?;
             }
         }
 
-        transaction.commit().await.map_err(|e| map_db_error(&e))
+        transaction
+            .commit()
+            .await
+            .map_err(|e| map_startup_error(&e))
     }
 
     /// Verify the database is reachable by acquiring a pooled connection
@@ -731,6 +783,107 @@ RETURNING resource_version, created_at_ms, updated_at_ms
                 })
             }
         }
+    }
+
+    pub async fn write_atomically(
+        &self,
+        writes: &[AtomicWrite],
+    ) -> PersistenceResult<Vec<Option<WriteResult>>> {
+        let now_ms = current_time_ms();
+        let result_of = |row: &sqlx::postgres::PgRow| {
+            let resource_version: i64 = row.try_get("resource_version").unwrap_or(1);
+            WriteResult {
+                resource_version: resource_version.max(1).cast_unsigned(),
+                created_at_ms: row.get("created_at_ms"),
+                updated_at_ms: row.get("updated_at_ms"),
+            }
+        };
+        let mut results = vec![None; writes.len()];
+        // One transaction on one data-pool connection; dropping it on an
+        // early return rolls every write back. Writes run in a fixed row
+        // order, so concurrent groups take row locks in one order.
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        for index in atomic_write_order(writes) {
+            match &writes[index] {
+                AtomicWrite::Create {
+                    object_type,
+                    id,
+                    name,
+                    workspace,
+                    payload,
+                } => {
+                    let row = sqlx::query(
+                        r"
+INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $6, $6, '{}'::jsonb, 1)
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(name)
+                    .bind(workspace)
+                    .bind(payload)
+                    .bind(now_ms)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    results[index] = Some(result_of(&row));
+                }
+                AtomicWrite::Update {
+                    object_type,
+                    id,
+                    payload,
+                    expected_version,
+                } => {
+                    let row = sqlx::query(
+                        r"
+UPDATE objects
+SET payload = $4, updated_at_ms = $5, resource_version = resource_version + 1
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .bind(payload)
+                    .bind(now_ms)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?
+                    .ok_or(PersistenceError::Conflict {
+                        current_resource_version: None,
+                    })?;
+                    results[index] = Some(result_of(&row));
+                }
+                AtomicWrite::Delete {
+                    object_type,
+                    id,
+                    expected_version,
+                } => {
+                    let deleted = sqlx::query(
+                        r"
+DELETE FROM objects
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+",
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    if deleted.rows_affected() == 0 {
+                        return Err(PersistenceError::Conflict {
+                            current_resource_version: None,
+                        });
+                    }
+                }
+            }
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(results)
     }
 
     pub async fn delete_if(
@@ -2181,6 +2334,55 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_to_a_refusing_server_fails_unavailable_within_the_acquire_timeout() {
+        let url = PostgresStore::refusing_url_for_tests().await;
+        let started = std::time::Instant::now();
+
+        let error = PostgresStore::connect(&url, None, None)
+            .await
+            .expect_err("nothing listens on the port");
+
+        assert!(
+            matches!(error, PersistenceError::Unavailable(_)),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() < DATA_POOL_ACQUIRE_TIMEOUT + Duration::from_secs(3),
+            "connect waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn startup_retries_io_errors_only_while_postgres_does_not_answer() {
+        use std::io::ErrorKind;
+        let io = |kind: ErrorKind| map_startup_error(&sqlx::Error::Io(kind.into()));
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::TimedOut,
+            ErrorKind::HostUnreachable,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                matches!(io(kind), PersistenceError::Unavailable(_)),
+                "{kind:?}"
+            );
+        }
+        // An unresolvable host, a missing certificate file, a failed TLS handshake.
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::NotFound,
+            ErrorKind::InvalidData,
+        ] {
+            assert!(
+                matches!(io(kind), PersistenceError::Database(_)),
+                "{kind:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn lock_connection_timeout_is_contention_only_if_the_pool_filled_during_the_wait() {

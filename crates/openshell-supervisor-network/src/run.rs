@@ -22,7 +22,7 @@ use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
-    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
+    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx,
 };
 
 use openshell_core::activity::ActivitySender;
@@ -296,6 +296,7 @@ pub async fn run_networking(
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<NetworkMediationSource>>,
     proxy_listener: Option<ProxyListenerConfig>,
+    reserved_destination: Option<crate::proxy::ReservedDestination>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -501,7 +502,7 @@ pub async fn run_networking(
                         let upstream_config = build_upstream_client_config(&system_ca_bundle)?;
                         let cert_cache = CertCache::new(ca);
                         let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
-                        ocsf_emit!(
+                        crate::telemetry::egress_emit!(
                             ConfigStateChangeBuilder::new(ocsf_ctx())
                                 .severity(SeverityId::Informational)
                                 .status(StatusId::Success)
@@ -520,7 +521,7 @@ pub async fn run_networking(
                         // cannot rewrite credentials, so it fails closed on
                         // TLS-bearing connections (see proxy.rs) rather than
                         // leaking placeholders through a raw tunnel.
-                        ocsf_emit!(
+                        crate::telemetry::egress_emit!(
                             ConfigStateChangeBuilder::new(ocsf_ctx())
                                 .severity(SeverityId::High)
                                 .status(StatusId::Failure)
@@ -539,7 +540,7 @@ pub async fn run_networking(
                 // rewrite credentials, so it fails closed on TLS-bearing
                 // connections (see proxy.rs) rather than leaking placeholders
                 // through a raw tunnel.
-                ocsf_emit!(
+                crate::telemetry::egress_emit!(
                     ConfigStateChangeBuilder::new(ocsf_ctx())
                         .severity(SeverityId::High)
                         .status(StatusId::Failure)
@@ -624,6 +625,7 @@ pub async fn run_networking(
             proxy_listener
                 .as_ref()
                 .map(|proxy| proxy.authorization.clone()),
+            reserved_destination,
         )
         .await?;
         Some(proxy_handle)

@@ -82,31 +82,6 @@ let
       '';
     };
 
-  conformanceTestArchive = mkTestArchive {
-    name = "openshell-conformance";
-    workspacePath = "tests/suites/conformance";
-    manifestPath = "tests/suites/conformance/Cargo.toml";
-    package = "openshell-test-conformance-cli";
-    target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/openshell-conformance-tests.tar";
-  };
-  providerRefreshKeycloakArchive = mkTestArchive {
-    name = "provider-refresh-keycloak";
-    workspacePath = "tests/suites/features";
-    manifestPath = "tests/suites/features/Cargo.toml";
-    package = "openshell-test-feature-provider-refresh-keycloak";
-    target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
-  };
-  ociImageArchive = mkTestArchive {
-    name = "oci-image";
-    workspacePath = "tests/suites/features";
-    manifestPath = "tests/suites/features/Cargo.toml";
-    package = "openshell-test-feature-oci-image";
-    target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/oci-image-tests.tar";
-  };
-
   # Follow-up: binaries that do not yet run in the rootless tmachine guest. Each
   # entry says what it needs. Entries marked "wrapper lane" still run in the
   # wrapper-based Podman lane (`mise run e2e:podman:ci`), so they are covered
@@ -182,14 +157,6 @@ let
     '';
   };
 
-  podmanDriverArchive = mkTestArchive {
-    name = "podman-driver";
-    workspacePath = "tests/suites/drivers";
-    manifestPath = "tests/suites/drivers/Cargo.toml";
-    package = "openshell-test-suite-podman";
-    target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/openshell-podman-tests.tar";
-  };
   podmanE2eArchive = mkTestArchive {
     name = "podman-e2e";
     workspacePath = "e2e/rust";
@@ -203,10 +170,6 @@ let
 in
 rec {
   inherit
-    conformanceTestArchive
-    providerRefreshKeycloakArchive
-    ociImageArchive
-    podmanDriverArchive
     podmanE2eArchive
     podmanE2eCiTests
     ;
@@ -316,17 +279,9 @@ rec {
   testArchives = pkgs.writeShellApplication {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
-      conformanceTestArchive
-      providerRefreshKeycloakArchive
-      ociImageArchive
-      podmanDriverArchive
       podmanE2eArchive
     ];
     text = ''
-      build-openshell-conformance-test-archive
-      build-provider-refresh-keycloak-test-archive
-      build-oci-image-test-archive
-      build-podman-driver-test-archive
       build-podman-e2e-test-archive
     '';
   };

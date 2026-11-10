@@ -34,11 +34,11 @@ use openshell_core::proto::{
     ExecSandboxStdout, GetSandboxRequest, GetSandboxTemplateRequest, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, Provider, ProviderMutationKind,
-    ResourceRequirements, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResources,
-    SandboxResponse, SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse,
+    ResourceRequirements, ResumeSandboxRequest, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResources, SandboxResponse, SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse,
     SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SshRelayTarget,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    WatchSandboxRequest, relay_open, tcp_forward_init,
+    StartSandboxRequest, StopSandboxRequest, SuspendSandboxRequest, TcpForwardFrame,
+    TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
@@ -315,6 +315,102 @@ pub(super) async fn handle_create_sandbox(
     result
 }
 
+/// Only the workload image is mutable in the first update contract. Runtime
+/// replacement is an explicit Stop/Update/Start workflow, never Delete/Create.
+pub(super) async fn handle_update_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<openshell_core::proto::UpdateSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let request = request.into_inner();
+    validate_image_update_request(&request)?;
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &request.name,
+        crate::auth::workspace_authz::selected_workspace_name(request.workspace_scope.as_ref())?,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    super::workspace::resolve_workspace(state.store.as_ref(), sandbox.object_workspace())
+        .await?
+        .ensure_active()?;
+    let mut candidate = sandbox.clone();
+    let spec = candidate
+        .spec
+        .as_mut()
+        .ok_or_else(|| Status::failed_precondition("sandbox has no spec"))?;
+    if let Some(image) = &request.image {
+        spec.template
+            .get_or_insert_with(Default::default)
+            .image
+            .clone_from(image);
+    }
+    openshell_core::sandbox_update::apply_configuration(
+        &mut candidate,
+        request.command.as_ref(),
+        request.environment.as_ref(),
+        request.labels.as_ref(),
+        request.annotations.as_ref(),
+    );
+    let candidate_spec = candidate.spec.as_ref().expect("spec checked above");
+    validate_sandbox_spec(&request.name, candidate_spec)?;
+
+    let sandbox = Box::pin(
+        state
+            .compute
+            .update_sandbox_configuration(sandbox.object_id(), &request),
+    )
+    .await?;
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+        service_urls: HashMap::new(),
+    }))
+}
+
+fn validate_image_update_request(
+    request: &openshell_core::proto::UpdateSandboxRequest,
+) -> Result<(), Status> {
+    if request.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    if request.expected_resource_version == 0 {
+        return Err(Status::invalid_argument(
+            "expected_resource_version must be nonzero",
+        ));
+    }
+    if let Some(image) = &request.image
+        && (image.is_empty()
+            || image.len() > super::MAX_TEMPLATE_STRING_LEN
+            || image.chars().any(|c| c.is_whitespace() || c.is_control()))
+    {
+        return Err(Status::invalid_argument(
+            "image must be a nonempty bounded OCI reference without whitespace or control characters",
+        ));
+    }
+    for map in [request.labels.as_ref(), request.annotations.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if map
+            .values
+            .keys()
+            .any(|key| openshell_core::sandbox_update::is_system_metadata_key(key))
+        {
+            return Err(Status::invalid_argument(
+                "system metadata cannot be updated",
+            ));
+        }
+    }
+    if let Some(labels) = &request.labels {
+        super::validation::validate_labels(&labels.values)?;
+    }
+    if let Some(annotations) = &request.annotations {
+        super::validation::validate_annotations(&annotations.values, "annotations")?;
+    }
+    Ok(())
+}
+
 /// Allocate a gateway-owned staging slot for a local rootfs tar archive.
 ///
 /// The caller writes the archive to the returned path and then names the token
@@ -569,6 +665,7 @@ async fn handle_create_sandbox_inner(
     .await?;
     validate_provider_environment_keys_unique_with_catalog(
         state.store.as_ref(),
+        crate::provider_refresh::RefreshStateReader::Runtime(&state.refresh),
         &provider_profile_catalog,
         &workspace,
         &spec.providers,
@@ -644,12 +741,14 @@ async fn handle_create_sandbox_inner(
         crate::compute::provisioning_deadline::new_preparation_record(
             now_ms,
             state.config.image_preparation_timeout_seconds,
+            state.config.provisioning_repair_window_seconds * 1000,
         ),
     );
     crate::compute::provisioning_deadline::refresh_configuration(
         &state.store,
         &mut sandbox,
         now_ms,
+        state.config.provisioning_repair_window_seconds * 1000,
     )
     .await
     .map_err(Status::internal)?;
@@ -786,10 +885,7 @@ fn validate_create_sandbox_request_pre_io(
     workload_template_name: &str,
 ) -> Result<(), Status> {
     // Validate labels (keys and values must meet Kubernetes requirements).
-    for (key, value) in &request.labels {
-        crate::grpc::validation::validate_label_key(key)?;
-        crate::grpc::validation::validate_label_value(value)?;
-    }
+    crate::grpc::validation::validate_labels(&request.labels)?;
     crate::grpc::validation::validate_caller_annotations(&request.annotations, "annotations")?;
 
     if request.service_exposures.len() > MAX_CREATE_SERVICE_EXPOSURES {
@@ -1459,6 +1555,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     .await?;
     validate_provider_environment_keys_unique_with_catalog(
         state.store.as_ref(),
+        crate::provider_refresh::RefreshStateReader::Runtime(&state.refresh),
         &provider_profile_catalog,
         &workspace,
         &candidate_spec.providers,
@@ -1471,11 +1568,13 @@ pub(super) async fn handle_attach_sandbox_provider(
         &candidate_spec.providers,
     )
     .await?;
+    let current_policy =
+        super::policy::current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
     super::policy::validate_candidate_sandbox_credential_policy(
         state,
         &workspace,
         &candidate_spec.providers,
-        candidate_spec.policy.as_ref(),
+        Some(&current_policy),
     )
     .await?;
 
@@ -1834,6 +1933,103 @@ async fn handle_start_sandbox_inner(
         .supervisor_sessions
         .project_endpoint_status(&mut sandbox, remote_authority);
     info!(sandbox_name = %name, "StartSandbox request completed successfully");
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+        service_urls: HashMap::new(),
+    }))
+}
+
+pub(super) async fn handle_suspend_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<SuspendSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let result = handle_suspend_sandbox_inner(state, request).await;
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::Sandbox,
+        LifecycleOperation::Suspend,
+        if result.is_ok() {
+            TelemetryOutcome::Success
+        } else {
+            TelemetryOutcome::Failure
+        },
+    );
+    result
+}
+
+async fn handle_suspend_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<SuspendSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let resolved = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.name,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = resolved.object_workspace();
+    let name = resolved.object_name();
+    let sandbox = state.compute.suspend_sandbox(workspace, name).await?;
+    info!(sandbox_name = %name, "SuspendSandbox request completed successfully");
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+        service_urls: HashMap::new(),
+    }))
+}
+
+pub(super) async fn handle_resume_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<ResumeSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let result = handle_resume_sandbox_inner(state, request).await;
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::Sandbox,
+        LifecycleOperation::Resume,
+        if result.is_ok() {
+            TelemetryOutcome::Success
+        } else {
+            TelemetryOutcome::Failure
+        },
+    );
+    result
+}
+
+async fn handle_resume_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<ResumeSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let resolved = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.name,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = resolved.object_workspace().to_string();
+    let name = resolved.object_name().to_string();
+    let mut sandbox = state
+        .compute
+        .resume_sandbox_authenticated(
+            &workspace,
+            &name,
+            req.restart_if_restore_fails,
+            state.sandbox_session_jwt_authority.as_deref(),
+        )
+        .await?;
+    let remote_authority =
+        crate::supervisor_session::remote_supervisor_owner(state, sandbox.object_id())
+            .await?
+            .is_some();
+    state
+        .supervisor_sessions
+        .project_endpoint_status(&mut sandbox, remote_authority);
+    info!(sandbox_name = %name, "ResumeSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
@@ -2290,7 +2486,7 @@ pub(super) async fn handle_watch_sandbox(
             // Events drained above the publication watermark. They are held
             // back rather than emitted so the client's highest delivered cursor
             // is never above an event still queued on the other source.
-            let mut deferred: Vec<CursoredEvent> = Vec::new();
+            let mut deferred: Vec<Arc<CursoredEvent>> = Vec::new();
 
             loop {
                 // Events withheld by the previous round are already in hand, so
@@ -2479,7 +2675,11 @@ pub(super) async fn handle_watch_sandbox(
                             continue;
                         }
                     }
-                    if tx.send(Ok(cursored.event)).await.is_err() {
+                    if tx
+                        .send(Ok(Arc::unwrap_or_clone(cursored).event))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -2499,7 +2699,11 @@ pub(super) async fn handle_watch_sandbox(
 fn is_watch_terminal(phase: SandboxPhase) -> bool {
     matches!(
         phase,
-        SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped | SandboxPhase::Error
+        SandboxPhase::Ready
+            | SandboxPhase::Completed
+            | SandboxPhase::Stopped
+            | SandboxPhase::Suspended
+            | SandboxPhase::Error
     )
 }
 
@@ -2713,9 +2917,48 @@ pub(super) async fn handle_forward_tcp(
     Ok(Response::new(stream))
 }
 
+/// The per-sandbox relay budget a forward stream draws from. SSH relays and
+/// service forwards are counted apart so open forwards cannot starve SSH.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelayBudget {
+    Ssh,
+    Service,
+}
+
+impl RelayBudget {
+    fn of(init: &TcpForwardInit) -> Self {
+        match init.target {
+            Some(tcp_forward_init::Target::Tcp(_)) => Self::Service,
+            _ => Self::Ssh,
+        }
+    }
+
+    fn counts(self, state: &ServerState) -> &std::sync::Mutex<HashMap<String, u32>> {
+        match self {
+            Self::Ssh => &state.ssh_connections_by_sandbox,
+            Self::Service => &state.service_connections_by_sandbox,
+        }
+    }
+
+    fn limit(self, config: &openshell_core::Config) -> u32 {
+        match self {
+            Self::Ssh => config.max_ssh_connections_per_sandbox,
+            Self::Service => config.max_service_connections_per_sandbox,
+        }
+    }
+
+    const fn exhausted_message(self) -> &'static str {
+        match self {
+            Self::Ssh => "sandbox SSH connection limit reached",
+            Self::Service => "sandbox service forward connection limit reached",
+        }
+    }
+}
+
 struct ForwardConnectionGuard {
     state: Arc<ServerState>,
     token: Option<String>,
+    budget: RelayBudget,
     sandbox_id: String,
 }
 
@@ -2724,7 +2967,7 @@ impl Drop for ForwardConnectionGuard {
         if let Some(token) = self.token.as_deref() {
             decrement_ssh_connection_count(&self.state.ssh_connections_by_token, token);
         }
-        decrement_ssh_connection_count(&self.state.ssh_connections_by_sandbox, &self.sandbox_id);
+        decrement_ssh_connection_count(self.budget.counts(&self.state), &self.sandbox_id);
     }
 }
 
@@ -2733,7 +2976,8 @@ impl Drop for ForwardConnectionGuard {
 /// `target.tcp` streams are authorized by the caller's gateway principal, which
 /// `handle_forward_tcp` has already checked against the sandbox's workspace, so
 /// they carry no session token and touch no store: the only per-connection
-/// state is the in-memory per-sandbox connection count. `target.ssh` streams
+/// state is the in-memory per-sandbox connection count, kept in a budget apart
+/// from SSH relays (see [`RelayBudget`]). `target.ssh` streams
 /// keep requiring the `CreateSshSession` token because the process that opens
 /// them is an ssh `ProxyCommand` that holds nothing else. A token supplied with
 /// a TCP target (older clients) is still validated and counted per token.
@@ -2744,9 +2988,10 @@ async fn acquire_forward_connection_guard(
     sandbox: &Sandbox,
 ) -> Result<ForwardConnectionGuard, Status> {
     let sandbox_id = sandbox.object_id().to_string();
+    let budget = RelayBudget::of(init);
     let token = init.authorization_token.trim();
     if token.is_empty() {
-        if !matches!(init.target, Some(tcp_forward_init::Target::Tcp(_))) {
+        if budget == RelayBudget::Ssh {
             return Err(crate::auth::audit::reject_credential(
                 Some(principal),
                 AuthRejection::new(
@@ -2756,10 +3001,11 @@ async fn acquire_forward_connection_guard(
                 ),
             ));
         }
-        acquire_sandbox_connection_slot(&state.ssh_connections_by_sandbox, &sandbox_id)?;
+        acquire_sandbox_connection_slot(state, budget, &sandbox_id)?;
         return Ok(ForwardConnectionGuard {
             state: state.clone(),
             token: None,
+            budget,
             sandbox_id,
         });
     }
@@ -2768,16 +3014,12 @@ async fn acquire_forward_connection_guard(
         .await
         .map_err(|rejection| crate::auth::audit::reject_credential(Some(principal), rejection))?;
     crate::auth::audit::emit_ssh_session_logon(&state.logons, principal, token);
-    acquire_ssh_connection_slots(
-        &state.ssh_connections_by_token,
-        &state.ssh_connections_by_sandbox,
-        token,
-        &sandbox_id,
-    )?;
+    acquire_ssh_connection_slots(state, budget, token, &sandbox_id)?;
 
     Ok(ForwardConnectionGuard {
         state: state.clone(),
         token: Some(token.to_string()),
+        budget,
         sandbox_id,
     })
 }
@@ -2841,16 +3083,15 @@ async fn validate_ssh_forward_token(
 }
 
 const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
-const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
 
 fn acquire_ssh_connection_slots(
-    token_counts: &std::sync::Mutex<HashMap<String, u32>>,
-    sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
+    state: &ServerState,
+    budget: RelayBudget,
     token: &str,
     sandbox_id: &str,
 ) -> Result<(), Status> {
     {
-        let mut counts = token_counts.lock().unwrap();
+        let mut counts = state.ssh_connections_by_token.lock().unwrap();
         let count = counts.entry(token.to_string()).or_insert(0);
         if *count >= MAX_CONNECTIONS_PER_TOKEN {
             return Err(Status::resource_exhausted(
@@ -2860,26 +3101,24 @@ fn acquire_ssh_connection_slots(
         *count += 1;
     }
 
-    if let Err(status) = acquire_sandbox_connection_slot(sandbox_counts, sandbox_id) {
-        decrement_ssh_connection_count(token_counts, token);
+    if let Err(status) = acquire_sandbox_connection_slot(state, budget, sandbox_id) {
+        decrement_ssh_connection_count(&state.ssh_connections_by_token, token);
         return Err(status);
     }
 
     Ok(())
 }
 
-/// Reserve one of the per-sandbox relay slots shared by SSH sessions and
-/// service forwards.
+/// Reserve one of the sandbox's relay slots in the given budget.
 fn acquire_sandbox_connection_slot(
-    sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
+    state: &ServerState,
+    budget: RelayBudget,
     sandbox_id: &str,
 ) -> Result<(), Status> {
-    let mut counts = sandbox_counts.lock().unwrap();
+    let mut counts = budget.counts(state).lock().unwrap();
     let count = counts.entry(sandbox_id.to_string()).or_insert(0);
-    if *count >= MAX_CONNECTIONS_PER_SANDBOX {
-        return Err(Status::resource_exhausted(
-            "sandbox SSH connection limit reached",
-        ));
+    if *count >= budget.limit(&state.config) {
+        return Err(Status::resource_exhausted(budget.exhausted_message()));
     }
     *count += 1;
     Ok(())
@@ -4231,6 +4470,7 @@ mod tests {
             SandboxPhase::Ready,
             SandboxPhase::Completed,
             SandboxPhase::Stopped,
+            SandboxPhase::Suspended,
             SandboxPhase::Error,
         ] {
             assert!(is_watch_terminal(phase), "{phase:?} should stop the watch");
@@ -4239,6 +4479,7 @@ mod tests {
             SandboxPhase::Provisioning,
             SandboxPhase::Starting,
             SandboxPhase::Stopping,
+            SandboxPhase::Suspending,
             SandboxPhase::Deleting,
             SandboxPhase::Unknown,
         ] {
@@ -4481,9 +4722,9 @@ mod tests {
         })
     }
 
-    fn sandbox_connection_count(state: &ServerState, sandbox_id: &str) -> u32 {
-        state
-            .ssh_connections_by_sandbox
+    fn sandbox_connection_count(state: &ServerState, budget: RelayBudget, sandbox_id: &str) -> u32 {
+        budget
+            .counts(state)
             .lock()
             .unwrap()
             .get(sandbox_id)
@@ -4510,10 +4751,13 @@ mod tests {
             "no per-token accounting without a token"
         );
         assert!(state.ssh_connections_by_token.lock().unwrap().is_empty());
-        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 1);
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
+            1
+        );
         drop(guard);
         assert_eq!(
-            sandbox_connection_count(&state, sandbox.object_id()),
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
             0,
             "dropping the guard releases the sandbox slot"
         );
@@ -4608,7 +4852,10 @@ mod tests {
             err.message(),
             "authorization_token is required for SSH targets"
         );
-        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Ssh, sandbox.object_id()),
+            0
+        );
         assert_ssh_token_failure(&events, "missing_credential", "");
     }
 
@@ -4627,7 +4874,10 @@ mod tests {
 
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
         assert_eq!(err.message(), "SSH session token not found");
-        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
+            0
+        );
         assert_ssh_token_failure(&events, "invalid_credential", "canary-ssh-token-unknown");
     }
 
@@ -4741,13 +4991,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_forwards_without_token_share_the_per_sandbox_connection_cap() {
+    async fn tcp_forwards_are_capped_per_sandbox() {
         let state = test_server_state().await;
         let sandbox = test_sandbox("fwd", Vec::new());
         let init = forward_init(loopback_tcp_target(), "");
+        let cap = openshell_core::config::DEFAULT_MAX_CONNECTIONS_PER_SANDBOX;
 
         let mut guards = Vec::new();
-        for _ in 0..MAX_CONNECTIONS_PER_SANDBOX {
+        for _ in 0..cap {
             guards.push(
                 acquire_forward_connection_guard(&state, &forward_caller(), &init, &sandbox)
                     .await
@@ -4759,10 +5010,13 @@ mod tests {
             .err()
             .expect("cap reached");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(err.message(), "sandbox SSH connection limit reached");
         assert_eq!(
-            sandbox_connection_count(&state, sandbox.object_id()),
-            MAX_CONNECTIONS_PER_SANDBOX
+            err.message(),
+            "sandbox service forward connection limit reached"
+        );
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
+            cap
         );
 
         guards.pop();
@@ -4771,7 +5025,65 @@ mod tests {
             .expect("slot freed by a closed connection");
         drop(guard);
         drop(guards);
-        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_and_service_budgets_are_independent() {
+        let mut state = test_server_state().await;
+        {
+            let config = &mut Arc::get_mut(&mut state).expect("sole state owner").config;
+            config.max_ssh_connections_per_sandbox = 1;
+            config.max_service_connections_per_sandbox = 2;
+        }
+        let sandbox = test_sandbox("fwd", Vec::new());
+        store_ssh_session(&state, "canary-ssh-token-a", "sandbox-fwd", false, 0).await;
+        store_ssh_session(&state, "canary-ssh-token-b", "sandbox-fwd", false, 0).await;
+        let tcp = forward_init(loopback_tcp_target(), "");
+        let ssh = |token: &str| {
+            forward_init(
+                tcp_forward_init::Target::Ssh(SshRelayTarget::default()),
+                token,
+            )
+        };
+        let acquire = |init: TcpForwardInit| {
+            let state = state.clone();
+            let sandbox = sandbox.clone();
+            async move {
+                acquire_forward_connection_guard(&state, &forward_caller(), &init, &sandbox).await
+            }
+        };
+
+        let _forwards = [
+            acquire(tcp.clone()).await.expect("first forward"),
+            acquire(tcp.clone()).await.expect("second forward"),
+        ];
+        let err = acquire(tcp).await.err().expect("forward budget spent");
+        assert_eq!(
+            err.message(),
+            "sandbox service forward connection limit reached"
+        );
+
+        let _ssh = acquire(ssh("canary-ssh-token-a"))
+            .await
+            .expect("open forwards leave the SSH budget alone");
+        let err = acquire(ssh("canary-ssh-token-b"))
+            .await
+            .err()
+            .expect("SSH budget spent");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(err.message(), "sandbox SSH connection limit reached");
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Ssh, sandbox.object_id()),
+            1
+        );
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
+            2
+        );
     }
 
     #[test]
@@ -7896,6 +8208,21 @@ mod tests {
         assert_eq!(process.run_as_group, "1234");
     }
 
+    #[test]
+    fn create_sandbox_accepts_more_than_128_labels() {
+        let request = CreateSandboxRequest {
+            name: "many-labels".into(),
+            spec: Some(SandboxSpec::default()),
+            labels: (0..129)
+                .map(|index| (format!("label-{index}"), "value".into()))
+                .collect(),
+            ..Default::default()
+        };
+        for workload_template in ["", "workload-template"] {
+            validate_create_sandbox_request_pre_io(&request, workload_template).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn create_sandbox_still_rejects_long_label_values() {
         let state = test_server_state().await;
@@ -9378,7 +9705,8 @@ mod tests {
                 update_sandbox_cas(&state, &sandbox_id, 0, |sandbox| {
                     if first_attempt {
                         first_attempt = false;
-                        barrier.wait();
+                        // Hand off queued work so SQLx can return the connection to other writers.
+                        tokio::task::block_in_place(|| barrier.wait());
                     }
                     let annotations = &mut sandbox.metadata.as_mut().unwrap().annotations;
                     let count = annotations
@@ -10366,3 +10694,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod image_update_tests;

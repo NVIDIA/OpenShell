@@ -50,6 +50,17 @@ mod session {
     /// JOSE `typ` of the supervisor token: the credential of the gateway's
     /// shared supervisor process for the assignment stream, and nothing else.
     pub const SUPERVISOR_JWT_TYPE: &str = "openshell-supervisor+jwt";
+    /// JOSE `typ` of a supervisor takeover grant.
+    ///
+    /// The grant is the gateway's authorization for one supervisor process to
+    /// replace the owner of one runtime generation at a strictly higher
+    /// credential epoch. Only the sandbox runtime verifies it, and only while
+    /// staging a replacement attach.
+    pub const SUPERVISOR_TAKEOVER_JWT_TYPE: &str = "openshell-supervisor-takeover+jwt";
+    /// Longest lifetime of a takeover grant. Replay safety comes from the
+    /// strictly increasing epoch it names; the bound only limits how long an
+    /// unused grant stays usable.
+    pub const MAX_SUPERVISOR_TAKEOVER_TTL: Duration = Duration::from_mins(10);
     pub const SANDBOX_SESSION_AUDIENCE: &str = "openshell-sandbox";
     pub const DEFAULT_SESSION_TOKEN_TTL: Duration = Duration::from_hours(1);
     pub const MIN_SESSION_TOKEN_TTL: Duration = Duration::from_mins(1);
@@ -194,6 +205,54 @@ mod session {
         component: SessionComponent,
     }
 
+    /// Claims of a supervisor takeover grant. The subject and audience are the
+    /// sandbox's, like its Sandbox Protocol session token, but the JOSE `typ`
+    /// keeps the two from ever being accepted for each other.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SupervisorTakeoverClaims {
+        iss: String,
+        sub: String,
+        aud: String,
+        iat: i64,
+        exp: i64,
+        jti: String,
+        sandbox_id: SandboxId,
+        runtime_generation: SandboxGenerationId,
+        auth_epoch: CredentialEpoch,
+        supervisor_instance: String,
+        owner: String,
+        component: SessionComponent,
+    }
+
+    /// The replacement of the supervisor that owns one runtime generation.
+    ///
+    /// The gateway grants it only after durably advancing the sandbox's
+    /// credential epoch to `auth_epoch`; ordinary credential refresh keeps the
+    /// epoch and never produces a grant.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SupervisorTakeover {
+        pub sandbox_id: SandboxId,
+        pub runtime_generation: SandboxGenerationId,
+        /// Ownership term the grant starts; it must exceed the term the
+        /// runtime currently accepts.
+        pub auth_epoch: CredentialEpoch,
+        /// Supervisor process identity the runtime pins once the replacement
+        /// is confirmed (a canonical UUID chosen by the gateway).
+        pub supervisor_instance: String,
+        /// Supervisor pool member that owns the new term, for audit.
+        pub owner: String,
+    }
+
+    /// A takeover grant whose signature, issuer, audience, and lifetime were
+    /// verified.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct VerifiedSupervisorTakeover {
+        pub takeover: SupervisorTakeover,
+        pub token_id: Uuid,
+        pub expires_at: i64,
+    }
+
     /// Durable identity shared by every short-lived token for one sandbox runtime.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct SandboxRuntimeIdentity {
@@ -329,6 +388,102 @@ mod session {
         }
     }
 
+    /// A PEM private key. Redacted from diagnostics and cleared on drop.
+    #[derive(Clone)]
+    pub struct SecretPrivateKeyPem(Zeroizing<String>);
+
+    impl SecretPrivateKeyPem {
+        #[must_use]
+        pub fn new(value: String) -> Self {
+            Self(Zeroizing::new(value))
+        }
+
+        #[must_use]
+        pub fn expose_secret(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl fmt::Debug for SecretPrivateKeyPem {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("SecretPrivateKeyPem([REDACTED])")
+        }
+    }
+
+    impl Serialize for SecretPrivateKeyPem {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_str(self.expose_secret())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for SecretPrivateKeyPem {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            String::deserialize(deserializer).map(Self::new)
+        }
+    }
+
+    /// TLS material for one OTLP collector connection, as PEM. The private
+    /// key is redacted from diagnostics and cleared on drop.
+    #[derive(Clone, Default, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct OtlpTlsMaterial {
+        /// Certificates trusted to verify the collector instead of the
+        /// platform roots.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ca_pem: Option<String>,
+        /// Client certificate presented to the collector.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub client: Option<OtlpClientIdentity>,
+    }
+
+    /// The headers and TLS material one supervisor export sends its
+    /// collector.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct OtlpExportCredentials<'a> {
+        pub headers: Option<&'a SecretOtlpHeaders>,
+        pub tls: Option<&'a OtlpTlsMaterial>,
+    }
+
+    /// A PEM client certificate chain and its private key.
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct OtlpClientIdentity {
+        pub cert_pem: String,
+        pub key_pem: SecretPrivateKeyPem,
+    }
+
+    #[cfg(feature = "otel")]
+    impl OtlpTlsMaterial {
+        /// The material as exporter TLS settings.
+        pub fn otlp_tls(&self) -> Result<openshell_otel::OtlpTls, openshell_otel::TlsError> {
+            openshell_otel::OtlpTls::from_pem(
+                self.ca_pem.as_deref().map(str::as_bytes),
+                self.client.as_ref().map(|client| {
+                    (
+                        client.cert_pem.as_bytes(),
+                        client.key_pem.expose_secret().as_bytes(),
+                    )
+                }),
+            )
+        }
+    }
+
+    impl fmt::Debug for OtlpTlsMaterial {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("OtlpTlsMaterial")
+                .field("ca_pem", &self.ca_pem.is_some())
+                .field("client", &self.client)
+                .finish()
+        }
+    }
+
     /// Trusted launch input delivered only to `openshell-supervisor`.
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -347,10 +502,30 @@ mod session {
         /// Never delivered to the workload. Missing only in older bundles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ssh_host_private_key: Option<SecretSshHostKey>,
+        /// Headers for the supervisor's trace collector, present only when
+        /// the gateway has them. Never delivered to the workload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub traces_otlp_headers: Option<SecretOtlpHeaders>,
         /// Headers for the OCSF OTLP collector, present only when the gateway
         /// has them. Never delivered to the workload.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ocsf_otlp_headers: Option<SecretOtlpHeaders>,
+        /// Headers for the agent trace relay's collector, present only when
+        /// the gateway configures them. Never delivered to the workload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_otlp_headers: Option<SecretOtlpHeaders>,
+        /// TLS material for the supervisor's collectors, each distinct
+        /// material once, present only when the gateway configures it.
+        /// Never delivered to the workload.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub otlp_tls: Vec<OtlpTlsMaterial>,
+        /// Position in `otlp_tls` of each collector's material.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub traces_otlp_tls: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ocsf_otlp_tls: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_otlp_tls: Option<usize>,
     }
 
     /// Gateway-created authentication input trusted by a compute driver.
@@ -412,7 +587,46 @@ mod session {
             SandboxGenerationId::parse(self.runtime_generation.to_string())
                 .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
             SessionRotation::new(self.session_rotation.get())?;
+            let references = [
+                self.traces_otlp_tls,
+                self.ocsf_otlp_tls,
+                self.agent_otlp_tls,
+            ];
+            if references
+                .into_iter()
+                .flatten()
+                .any(|index| index >= self.otlp_tls.len())
+            {
+                return Err(SessionJwtError::InvalidOtlpTlsReference);
+            }
             Ok(())
+        }
+
+        /// What the supervisor's trace export sends its collector.
+        pub fn traces_otlp(&self) -> OtlpExportCredentials<'_> {
+            self.otlp_credentials(self.traces_otlp_headers.as_ref(), self.traces_otlp_tls)
+        }
+
+        /// What the supervisor's OCSF export sends its collector.
+        pub fn ocsf_otlp(&self) -> OtlpExportCredentials<'_> {
+            self.otlp_credentials(self.ocsf_otlp_headers.as_ref(), self.ocsf_otlp_tls)
+        }
+
+        /// What the agent trace relay sends its collector.
+        pub fn agent_otlp(&self) -> OtlpExportCredentials<'_> {
+            self.otlp_credentials(self.agent_otlp_headers.as_ref(), self.agent_otlp_tls)
+        }
+
+        /// [`Self::validate`] rejects a `tls` index outside `otlp_tls`.
+        fn otlp_credentials<'a>(
+            &'a self,
+            headers: Option<&'a SecretOtlpHeaders>,
+            tls: Option<usize>,
+        ) -> OtlpExportCredentials<'a> {
+            OtlpExportCredentials {
+                headers,
+                tls: tls.and_then(|index| self.otlp_tls.get(index)),
+            }
         }
 
         pub fn sandbox_bearer_slot(&self) -> Result<SessionBearerTokenSlot, SessionJwtError> {
@@ -437,7 +651,13 @@ mod session {
                 .field("sandbox_token", &"[REDACTED]")
                 .field("sandbox_expires_at", &self.sandbox_expires_at)
                 .field("ssh_host_private_key", &self.ssh_host_private_key)
+                .field("traces_otlp_headers", &self.traces_otlp_headers)
                 .field("ocsf_otlp_headers", &self.ocsf_otlp_headers)
+                .field("agent_otlp_headers", &self.agent_otlp_headers)
+                .field("otlp_tls", &self.otlp_tls)
+                .field("traces_otlp_tls", &self.traces_otlp_tls)
+                .field("ocsf_otlp_tls", &self.ocsf_otlp_tls)
+                .field("agent_otlp_tls", &self.agent_otlp_tls)
                 .finish()
         }
     }
@@ -721,6 +941,49 @@ mod session {
             })
         }
 
+        /// Mint a takeover grant for `takeover`, valid for `ttl` (at most
+        /// [`MAX_SUPERVISOR_TAKEOVER_TTL`]). The caller must already have
+        /// advanced the sandbox's persisted credential epoch to
+        /// `takeover.auth_epoch`.
+        pub fn mint_supervisor_takeover(
+            &self,
+            takeover: &SupervisorTakeover,
+            ttl: Duration,
+        ) -> Result<MintedSessionToken, SessionJwtError> {
+            if ttl.is_zero() || ttl > MAX_SUPERVISOR_TAKEOVER_TTL {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            validate_takeover_identity(&takeover.supervisor_instance, &takeover.owner)?;
+            let issued_at = self.clock.now_unix_seconds();
+            let expires_at =
+                issued_at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX));
+            let token_id = Uuid::new_v4();
+            let claims = SupervisorTakeoverClaims {
+                iss: self.issuer.clone(),
+                sub: format!("{SANDBOX_SUBJECT_PREFIX}{}", takeover.sandbox_id),
+                aud: SANDBOX_SESSION_AUDIENCE.to_string(),
+                iat: issued_at,
+                exp: expires_at,
+                jti: token_id.to_string(),
+                sandbox_id: takeover.sandbox_id.clone(),
+                runtime_generation: takeover.runtime_generation.clone(),
+                auth_epoch: takeover.auth_epoch,
+                supervisor_instance: takeover.supervisor_instance.clone(),
+                owner: takeover.owner.clone(),
+                component: SessionComponent::OpenShellSupervisor,
+            };
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some(self.key_id.clone());
+            header.typ = Some(SUPERVISOR_TAKEOVER_JWT_TYPE.to_string());
+            let token = encode(&header, &claims, &self.encoding_key)
+                .map_err(|_| SessionJwtError::SigningFailed)?;
+            Ok(MintedSessionToken {
+                token: SecretJwt::parse(token)?,
+                expires_at,
+                token_id,
+            })
+        }
+
         fn mint(
             &self,
             profile: SessionTokenProfile,
@@ -818,6 +1081,57 @@ mod session {
                 &["iss", "aud", "iat", "exp", "sub", "jti"],
             )?;
             self.validate_claims(claims)
+        }
+
+        /// Verify a supervisor takeover grant. Only the Sandbox profile, which
+        /// the runtime uses, verifies grants; the gateway profile refuses them.
+        pub fn verify_supervisor_takeover(
+            &self,
+            token: &str,
+        ) -> Result<VerifiedSupervisorTakeover, SessionJwtError> {
+            if self.profile != SessionTokenProfile::Sandbox {
+                return Err(SessionJwtError::WrongTokenType);
+            }
+            let claims = decode_signed::<SupervisorTakeoverClaims>(
+                &self.keys,
+                token,
+                SUPERVISOR_TAKEOVER_JWT_TYPE,
+                &["iss", "aud", "iat", "exp", "sub", "jti"],
+            )?;
+            if claims.iss != self.issuer {
+                return Err(SessionJwtError::WrongIssuer);
+            }
+            if claims.aud != SANDBOX_SESSION_AUDIENCE {
+                return Err(SessionJwtError::WrongAudience);
+            }
+            if claims.sub != format!("{SANDBOX_SUBJECT_PREFIX}{}", claims.sandbox_id) {
+                return Err(SessionJwtError::SubjectMismatch);
+            }
+            SandboxGenerationId::parse(claims.runtime_generation.to_string())
+                .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
+            validate_takeover_identity(&claims.supervisor_instance, &claims.owner)?;
+            let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
+            // A grant must expire, within its own bound.
+            let max_lifetime =
+                i64::try_from(MAX_SUPERVISOR_TAKEOVER_TTL.as_secs()).unwrap_or(i64::MAX);
+            if claims.exp == 0
+                || claims.exp <= claims.iat
+                || claims.exp.saturating_sub(claims.iat) > max_lifetime
+            {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            validate_lifetime(claims.iat, claims.exp, self.clock.now_unix_seconds())?;
+            Ok(VerifiedSupervisorTakeover {
+                takeover: SupervisorTakeover {
+                    sandbox_id: claims.sandbox_id,
+                    runtime_generation: claims.runtime_generation,
+                    auth_epoch: claims.auth_epoch,
+                    supervisor_instance: claims.supervisor_instance,
+                    owner: claims.owner,
+                },
+                token_id,
+                expires_at: claims.exp,
+            })
         }
 
         fn validate_claims(
@@ -1011,6 +1325,8 @@ mod session {
         MissingRuntimeIdentity,
         #[error("sandbox runtime identity is invalid")]
         InvalidRuntimeIdentity,
+        #[error("OTLP TLS reference is outside the bundle's TLS material")]
+        InvalidOtlpTlsReference,
         #[error("key ID is invalid")]
         InvalidKeyId,
         #[error("verification key IDs must be unique")]
@@ -1074,6 +1390,22 @@ mod session {
             return Err(SessionJwtError::InvalidGatewayId);
         }
         Ok(gateway_id)
+    }
+
+    /// A takeover names a non-blank supervisor instance and owner without
+    /// whitespace; the runtime compares the instance with its attach request.
+    fn validate_takeover_identity(
+        supervisor_instance: &str,
+        owner: &str,
+    ) -> Result<(), SessionJwtError> {
+        let valid = |value: &str| {
+            !value.is_empty() && value.len() <= 253 && !value.chars().any(char::is_whitespace)
+        };
+        if valid(supervisor_instance) && valid(owner) {
+            Ok(())
+        } else {
+            Err(SessionJwtError::InvalidRuntimeIdentity)
+        }
     }
 
     fn validate_key_id(key_id: String) -> Result<String, SessionJwtError> {
@@ -1456,9 +1788,124 @@ mod tests {
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
                 ssh_host_private_key: None,
+                traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
+                agent_otlp_headers: None,
+                otlp_tls: Vec::new(),
+                traces_otlp_tls: None,
+                ocsf_otlp_tls: None,
+                agent_otlp_tls: None,
             };
             bundle.validate().expect("non-expiring auth bundle");
+        }
+
+        fn takeover(epoch: u64) -> SupervisorTakeover {
+            SupervisorTakeover {
+                sandbox_id: SandboxId::parse("sandbox-a").expect("sandbox ID"),
+                runtime_generation: SandboxGenerationId::parse("generation-1")
+                    .expect("runtime generation"),
+                auth_epoch: CredentialEpoch::new(epoch).expect("auth epoch"),
+                supervisor_instance: "6a8f1f4e-8c0e-4d55-9d8c-1d6e2f3a4b5c".to_string(),
+                owner: "supervisor-1".to_string(),
+            }
+        }
+
+        #[test]
+        fn takeover_grants_are_their_own_profile_verified_only_by_the_runtime() {
+            let (issuer, gateway, sandbox, identity) = fixture();
+            let expected = takeover(2);
+            let minted = issuer
+                .mint_supervisor_takeover(&expected, std::time::Duration::from_mins(5))
+                .expect("mint takeover grant");
+            let verified = sandbox
+                .verify_supervisor_takeover(minted.token.expose_secret())
+                .expect("runtime verifies the grant");
+            assert_eq!(verified.takeover, expected);
+            assert_eq!(verified.token_id, minted.token_id);
+            assert_eq!(verified.expires_at, 1_900_000_000 + 300);
+
+            // A grant is never a session credential, and no other credential is
+            // a grant: neither session profile nor the shared supervisor token.
+            assert_eq!(
+                sandbox.verify(minted.token.expose_secret()),
+                Err(SessionJwtError::WrongTokenType)
+            );
+            assert_eq!(
+                gateway.verify_supervisor_takeover(minted.token.expose_secret()),
+                Err(SessionJwtError::WrongTokenType)
+            );
+            let pair = issuer.mint_pair(&identity).expect("token pair");
+            for token in [&pair.sandbox.token, &pair.gateway.token] {
+                assert_eq!(
+                    sandbox.verify_supervisor_takeover(token.expose_secret()),
+                    Err(SessionJwtError::WrongTokenType)
+                );
+            }
+            let host = issuer
+                .mint_supervisor_token(std::time::Duration::from_mins(15))
+                .expect("supervisor token");
+            assert_eq!(
+                sandbox.verify_supervisor_takeover(host.token.expose_secret()),
+                Err(SessionJwtError::WrongTokenType)
+            );
+        }
+
+        #[test]
+        fn takeover_grants_are_bounded_named_and_expire() {
+            let (issuer, _gateway, _sandbox, _identity) = fixture();
+            for ttl in [
+                std::time::Duration::ZERO,
+                MAX_SUPERVISOR_TAKEOVER_TTL + std::time::Duration::from_secs(1),
+            ] {
+                assert_eq!(
+                    issuer.mint_supervisor_takeover(&takeover(2), ttl).err(),
+                    Some(SessionJwtError::InvalidLifetime)
+                );
+            }
+            for (instance, owner) in [("", "member"), ("instance", ""), ("in stance", "m")] {
+                let mut unnamed = takeover(2);
+                unnamed.supervisor_instance = instance.to_string();
+                unnamed.owner = owner.to_string();
+                assert_eq!(
+                    issuer
+                        .mint_supervisor_takeover(&unnamed, std::time::Duration::from_mins(5))
+                        .err(),
+                    Some(SessionJwtError::InvalidRuntimeIdentity)
+                );
+            }
+
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).unwrap();
+            let issuer = SessionJwtIssuer::from_ed25519_pem(
+                key.serialize_pem().unwrap().as_bytes(),
+                "current",
+                "test",
+                None,
+                Arc::new(FixedClock(1_900_000_000)),
+            )
+            .unwrap();
+            let verifier_at = |now| {
+                SessionJwtVerifier::new(
+                    "test",
+                    SessionTokenProfile::Sandbox,
+                    [SessionVerificationKey {
+                        key_id: "current".to_string(),
+                        public_key_pem: key.public_key_pem().into_bytes(),
+                    }],
+                    Arc::new(FixedClock(now)),
+                )
+                .unwrap()
+            };
+            // A non-expiring session issuer still mints expiring grants.
+            let minted = issuer
+                .mint_supervisor_takeover(&takeover(3), std::time::Duration::from_mins(1))
+                .unwrap();
+            verifier_at(1_900_000_030)
+                .verify_supervisor_takeover(minted.token.expose_secret())
+                .expect("grant within its lifetime");
+            assert_eq!(
+                verifier_at(1_900_000_200).verify_supervisor_takeover(minted.token.expose_secret()),
+                Err(SessionJwtError::Expired)
+            );
         }
 
         #[test]
@@ -1468,6 +1915,50 @@ mod tests {
             let debug = format!("{:?}", pair.sandbox.token);
             assert_eq!(debug, "SecretJwt([REDACTED])");
             assert!(!debug.contains(pair.sandbox.token.expose_secret()));
+        }
+
+        #[test]
+        fn each_supervisor_export_reads_its_own_credentials() {
+            let (issuer, _gateway, _sandbox, identity) = fixture();
+            let pair = issuer.mint_pair(&identity).expect("token pair");
+            let headers = |lane: &str| Some(SecretOtlpHeaders::new(format!("lane={lane}")));
+            let tls = |lane: &str| OtlpTlsMaterial {
+                ca_pem: Some(format!("{lane}-ca")),
+                client: None,
+            };
+            let bundle = SupervisorAuthBundle {
+                session_id: SandboxSessionId::new(),
+                session_rotation: SessionRotation::new(1).expect("session rotation"),
+                runtime_generation: identity.runtime_generation.clone(),
+                auth_epoch: identity.auth_epoch,
+                gateway_token: pair.gateway.token,
+                gateway_expires_at: pair.gateway.expires_at,
+                sandbox_token: pair.sandbox.token,
+                sandbox_expires_at: pair.sandbox.expires_at,
+                ssh_host_private_key: None,
+                traces_otlp_headers: headers("traces"),
+                ocsf_otlp_headers: headers("ocsf"),
+                agent_otlp_headers: headers("agent"),
+                otlp_tls: vec![tls("agent"), tls("ocsf"), tls("traces")],
+                traces_otlp_tls: Some(2),
+                ocsf_otlp_tls: Some(1),
+                agent_otlp_tls: Some(0),
+            };
+
+            for (lane, credentials) in [
+                ("traces", bundle.traces_otlp()),
+                ("ocsf", bundle.ocsf_otlp()),
+                ("agent", bundle.agent_otlp()),
+            ] {
+                assert_eq!(
+                    credentials.headers.map(SecretOtlpHeaders::expose_secret),
+                    Some(format!("lane={lane}").as_str())
+                );
+                assert_eq!(
+                    credentials.tls.and_then(|tls| tls.ca_pem.as_deref()),
+                    Some(format!("{lane}-ca").as_str())
+                );
+            }
         }
 
         #[test]
@@ -1486,9 +1977,25 @@ mod tests {
                 ssh_host_private_key: Some(SecretSshHostKey::new(
                     "private-ssh-host-key".to_string(),
                 )),
+                traces_otlp_headers: Some(SecretOtlpHeaders::new(
+                    "authorization=traces-token".to_string(),
+                )),
                 ocsf_otlp_headers: Some(SecretOtlpHeaders::new(
                     "authorization=collector-token".to_string(),
                 )),
+                agent_otlp_headers: Some(SecretOtlpHeaders::new(
+                    "authorization=agent-token".to_string(),
+                )),
+                otlp_tls: vec![OtlpTlsMaterial {
+                    ca_pem: Some("agent-ca".to_string()),
+                    client: Some(OtlpClientIdentity {
+                        cert_pem: "agent-cert".to_string(),
+                        key_pem: SecretPrivateKeyPem::new("agent-private-key".to_string()),
+                    }),
+                }],
+                traces_otlp_tls: None,
+                ocsf_otlp_tls: None,
+                agent_otlp_tls: Some(0),
             };
 
             let encoded = serde_json::to_vec(&bundle).expect("serialize auth bundle");
@@ -1509,22 +2016,63 @@ mod tests {
             assert!(!debug.contains(bundle.sandbox_token.expose_secret()));
             assert!(!debug.contains("private-ssh-host-key"));
             assert!(!debug.contains("collector-token"));
-            assert_eq!(debug.matches("[REDACTED]").count(), 4);
+            assert!(!debug.contains("agent-token"));
+            assert!(!debug.contains("traces-token"));
+            assert!(!debug.contains("agent-private-key"));
+            assert_eq!(debug.matches("[REDACTED]").count(), 7);
             assert_eq!(
-                decoded.ssh_host_private_key.unwrap().expose_secret(),
+                decoded
+                    .ssh_host_private_key
+                    .as_ref()
+                    .unwrap()
+                    .expose_secret(),
                 "private-ssh-host-key"
             );
             assert_eq!(
-                decoded.ocsf_otlp_headers.unwrap().expose_secret(),
+                decoded
+                    .traces_otlp_headers
+                    .as_ref()
+                    .unwrap()
+                    .expose_secret(),
+                "authorization=traces-token"
+            );
+            assert_eq!(
+                decoded.ocsf_otlp_headers.as_ref().unwrap().expose_secret(),
                 "authorization=collector-token"
             );
+            assert_eq!(
+                decoded.agent_otlp_headers.as_ref().unwrap().expose_secret(),
+                "authorization=agent-token"
+            );
+            let agent_tls = decoded.agent_otlp().tls.expect("agent collector TLS");
+            assert_eq!(agent_tls.ca_pem.as_deref(), Some("agent-ca"));
+            let client = agent_tls.client.as_ref().unwrap();
+            assert_eq!(client.cert_pem, "agent-cert");
+            assert_eq!(client.key_pem.expose_secret(), "agent-private-key");
             let mut legacy = serde_json::to_value(&bundle).unwrap();
             let fields = legacy.as_object_mut().unwrap();
             fields.remove("ssh_host_private_key");
+            fields.remove("traces_otlp_headers");
             fields.remove("ocsf_otlp_headers");
+            fields.remove("agent_otlp_headers");
+            fields.remove("otlp_tls");
+            fields.remove("agent_otlp_tls");
             let legacy: SupervisorAuthBundle = serde_json::from_value(legacy).unwrap();
             assert!(legacy.ssh_host_private_key.is_none());
+            assert!(legacy.traces_otlp_headers.is_none());
             assert!(legacy.ocsf_otlp_headers.is_none());
+            assert!(legacy.agent_otlp_headers.is_none());
+            assert!(legacy.otlp_tls.is_empty() && legacy.agent_otlp_tls.is_none());
+
+            decoded
+                .validate()
+                .expect("references within the TLS material");
+            let mut dangling = decoded.clone();
+            dangling.traces_otlp_tls = Some(1);
+            assert!(matches!(
+                dangling.validate(),
+                Err(SessionJwtError::InvalidOtlpTlsReference)
+            ));
         }
 
         #[derive(Serialize)]

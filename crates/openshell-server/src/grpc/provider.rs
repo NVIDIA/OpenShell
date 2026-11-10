@@ -19,6 +19,7 @@ use crate::provider_profile_sources::{
     EffectiveProviderProfileCatalog, ProfileScope, ProviderProfileSources,
     profile_response_payload, profile_storage_payload, stored_profile_resource_version,
 };
+use crate::provider_refresh::RefreshStateReader;
 use crate::storage_proto::{
     StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
     StoredProviderProfile,
@@ -34,6 +35,7 @@ use openshell_core::proto::{
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
 };
+use openshell_credential_issuer::refresh::CredentialRefresh;
 use openshell_policy::ProviderPolicyLayer;
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -322,20 +324,28 @@ pub(super) async fn update_provider_record(
     let catalog = ProviderProfileSources::with_default_sources()
         .snapshot_catalog(store, workspace)
         .await?;
-    update_provider_record_with_catalog(store, &catalog, workspace, provider).await
+    update_provider_record_with_catalog(
+        store,
+        &crate::provider_refresh::test_runtime(store),
+        &catalog,
+        workspace,
+        provider,
+    )
+    .await
 }
 
 pub(super) async fn update_provider_record_with_catalog(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider: Provider,
 ) -> Result<Provider, Status> {
-    update_provider_record_validating(store, workspace, catalog, provider, &[], None).await
+    update_provider_record_validating(store, refresh, workspace, catalog, provider, &[], None).await
 }
 
 async fn reject_refresh_owned_credential_updates(
-    store: &Store,
+    refresh: &dyn CredentialRefresh,
     provider_id: &str,
     credential_updates: &HashMap<String, String>,
 ) -> Result<(), Status> {
@@ -344,9 +354,7 @@ async fn reject_refresh_owned_credential_updates(
     }
 
     let mut refresh_owned_keys = HashSet::new();
-    for refresh_state in
-        crate::provider_refresh::list_refresh_states_for_provider(store, provider_id).await?
-    {
+    for refresh_state in refresh.list(Some(provider_id)).await? {
         let strategy =
             ProviderCredentialRefreshStrategy::try_from(refresh_state.strategy).unwrap_or_default();
         if !crate::provider_refresh::is_gateway_mintable_strategy(strategy) {
@@ -376,6 +384,7 @@ async fn reject_refresh_owned_credential_updates(
 
 async fn update_provider_record_validating(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     workspace: &str,
     catalog: &EffectiveProviderProfileCatalog,
     provider: Provider,
@@ -422,7 +431,7 @@ async fn update_provider_record_validating(
         ));
     }
 
-    reject_refresh_owned_credential_updates(store, existing.object_id(), &provider.credentials)
+    reject_refresh_owned_credential_updates(refresh, existing.object_id(), &provider.credentials)
         .await?;
 
     let current_version = existing.metadata.as_ref().map_or(0, |m| m.resource_version);
@@ -500,7 +509,11 @@ async fn update_provider_record_validating(
             validate_provider_credentials(&profile, &candidate, &updated_credential_values)?;
         }
         validate_provider_update_against_attached_sandboxes_with_catalog(
-            store, catalog, workspace, &candidate,
+            store,
+            RefreshStateReader::Runtime(refresh),
+            catalog,
+            workspace,
+            &candidate,
         )
         .await?;
 
@@ -582,11 +595,19 @@ pub(super) async fn delete_provider_record(
         &openshell_core::Config::new(None).with_credential_drivers(["test-static"]),
     )
     .map_err(|err| Status::internal(format!("create test credential runtime failed: {err}")))?;
-    delete_provider_record_with_credentials(store, workspace, &credentials, name).await
+    delete_provider_record_with_credentials(
+        store,
+        &crate::provider_refresh::runtime(&Arc::new(store.clone()), Some(&credentials), None),
+        workspace,
+        &credentials,
+        name,
+    )
+    .await
 }
 
 pub(super) async fn delete_provider_record_with_credentials(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     workspace: &str,
     credentials: &crate::credentials::CredentialRuntime,
     name: &str,
@@ -612,8 +633,7 @@ pub(super) async fn delete_provider_record_with_credentials(
     }
 
     crate::provider_refresh::delete_refresh_states_for_provider_with_credentials(
-        store,
-        credentials,
+        refresh,
         provider.object_id(),
     )
     .await?;
@@ -1025,13 +1045,20 @@ pub(super) async fn resolve_provider_environment_with_credentials(
     provider_names: &[String],
     credentials: &crate::credentials::CredentialRuntime,
 ) -> Result<ProviderEnvironment, Status> {
-    let records = load_provider_environment_records(store, workspace, provider_names).await?;
+    let records = load_provider_environment_records(
+        store,
+        &crate::provider_refresh::test_runtime(store),
+        workspace,
+        provider_names,
+    )
+    .await?;
     resolve_provider_environment_from_records_with_credentials(catalog, &records, credentials).await
 }
 
 /// Loads one provider; `Ok(None)` means it does not exist.
 async fn load_provider_environment_record(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     workspace: &str,
     name: &str,
 ) -> Result<Option<ProviderEnvironmentRecord>, Status> {
@@ -1044,8 +1071,12 @@ async fn load_provider_environment_record(
     };
     let provider = Provider::decode(record.payload.as_slice())
         .map_err(|e| Status::internal(format!("failed to decode provider '{name}': {e}")))?;
-    let refresh_states =
-        crate::provider_refresh::list_refresh_states_for_provider(store, &record.id).await?;
+    let refresh_states = refresh
+        .list(Some(&record.id))
+        .await?
+        .iter()
+        .map(Into::into)
+        .collect();
     Ok(Some(ProviderEnvironmentRecord {
         name: name.to_string(),
         object_id: record.id,
@@ -1059,6 +1090,7 @@ async fn load_provider_environment_record(
 /// provider is `None`. Store errors short-circuit.
 async fn load_optional_provider_environment_records(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<Option<ProviderEnvironmentRecord>>, Status> {
@@ -1066,17 +1098,18 @@ async fn load_optional_provider_environment_records(
     futures::future::try_join_all(
         provider_names
             .iter()
-            .map(|name| load_provider_environment_record(store, workspace, name)),
+            .map(|name| load_provider_environment_record(store, refresh, workspace, name)),
     )
     .await
 }
 
 pub(super) async fn load_provider_environment_records(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<ProviderEnvironmentRecord>, Status> {
-    load_optional_provider_environment_records(store, workspace, provider_names)
+    load_optional_provider_environment_records(store, refresh, workspace, provider_names)
         .await?
         .into_iter()
         .zip(provider_names)
@@ -1091,13 +1124,14 @@ pub(super) async fn load_provider_environment_records(
 /// missing providers instead of failing.
 pub(super) async fn load_existing_provider_environment_records<'a>(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     workspace: &str,
     provider_names: &'a [String],
 ) -> Result<(Vec<ProviderEnvironmentRecord>, Vec<&'a str>), Status> {
     let mut records = Vec::with_capacity(provider_names.len());
     let mut missing = Vec::new();
     for (record, name) in
-        load_optional_provider_environment_records(store, workspace, provider_names)
+        load_optional_provider_environment_records(store, refresh, workspace, provider_names)
             .await?
             .into_iter()
             .zip(provider_names)
@@ -1534,6 +1568,78 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     })
 }
 
+/// Copy authored request metadata for static values that survived snapshot
+/// filtering. The reserved namespace keeps it separate from endpoint token grants;
+/// older supervisors ignore entries without `token_grant` before parsing selectors.
+pub(super) fn static_credential_request_metadata(
+    sandbox_id: &str,
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[ProviderEnvironmentRecord],
+    environment: &ProviderEnvironment,
+) -> Result<HashMap<String, ProviderProfileCredential>, Status> {
+    use openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX;
+    let mut metadata = HashMap::new();
+    for record in records {
+        let provider = &record.provider;
+        let Some(profile) = get_provider_type_profile_for_scope(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        ) else {
+            continue;
+        };
+        let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
+        for credential in &profile.credentials {
+            // Keep malformed explicit metadata distinguishable from a wholly
+            // absent declaration. The supervisor validates authored fields and
+            // fails closed; absence selects its default request placement.
+            if credential.auth_style.is_empty()
+                && credential.header_name.is_empty()
+                && credential.query_param.is_empty()
+                && credential.path_template.is_empty()
+            {
+                continue;
+            }
+            for key in credential.accepted_stored_keys() {
+                if !environment.environment.contains_key(key)
+                    || !environment.static_credential_keys.contains(key)
+                {
+                    continue;
+                }
+                let Some(baseline) = environment.static_credential_bindings.get(key) else {
+                    continue;
+                };
+                // A later optional declaration with the same environment key
+                // must not override metadata belonging to the actual owner.
+                let expected = static_credential_binding(
+                    Some(sandbox_id),
+                    record,
+                    key,
+                    &baseline.endpoints,
+                    refresh_epochs.get(key).map(String::as_str),
+                    credential.stable_placeholder,
+                );
+                if expected != *baseline {
+                    continue;
+                }
+                metadata.insert(
+                    format!("{STATIC_CREDENTIAL_METADATA_PREFIX}{key}"),
+                    ProviderProfileCredential {
+                        name: credential.name.clone(),
+                        env_vars: vec![key.to_string()],
+                        auth_style: credential.auth_style.clone(),
+                        header_name: credential.header_name.clone(),
+                        query_param: credential.query_param.clone(),
+                        path_template: credential.path_template.clone(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+    Ok(metadata)
+}
+
 fn refresh_authorization_epochs_by_key(
     record: &ProviderEnvironmentRecord,
 ) -> Result<HashMap<String, String>, Status> {
@@ -1950,6 +2056,7 @@ pub async fn validate_provider_environment_keys_unique(
         .await?;
     validate_provider_environment_keys_unique_with_catalog(
         store,
+        RefreshStateReader::Runtime(&crate::provider_refresh::test_runtime(store)),
         &catalog,
         workspace,
         provider_names,
@@ -2005,12 +2112,14 @@ pub async fn validate_provider_profiles_present(
 
 pub async fn validate_provider_environment_keys_unique_with_catalog(
     store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<(), Status> {
     validate_provider_environment_keys_unique_at(
         store,
+        refresh,
         catalog,
         workspace,
         provider_names,
@@ -2022,6 +2131,7 @@ pub async fn validate_provider_environment_keys_unique_with_catalog(
 
 pub async fn validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
     store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider: &Provider,
@@ -2034,13 +2144,14 @@ pub async fn validate_provider_credential_key_available_for_attached_sandboxes_w
         .or_insert_with(|| "pending".to_string());
     candidate.credential_expiration_times.remove(credential_key);
     validate_provider_update_against_attached_sandboxes_with_catalog(
-        store, catalog, workspace, &candidate,
+        store, refresh, catalog, workspace, &candidate,
     )
     .await
 }
 
 pub async fn validate_provider_update_against_attached_sandboxes(
     store: &Store,
+    refresh: RefreshStateReader<'_>,
     workspace: &str,
     provider: &Provider,
 ) -> Result<(), Status> {
@@ -2048,13 +2159,14 @@ pub async fn validate_provider_update_against_attached_sandboxes(
         .snapshot_catalog(store, workspace)
         .await?;
     validate_provider_update_against_attached_sandboxes_with_catalog(
-        store, &catalog, workspace, provider,
+        store, refresh, &catalog, workspace, provider,
     )
     .await
 }
 
 pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
     store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider: &Provider,
@@ -2067,6 +2179,7 @@ pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
         };
         validate_provider_environment_keys_unique_at(
             store,
+            refresh,
             catalog,
                         workspace,
             &spec.providers,
@@ -2086,6 +2199,7 @@ pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
 
 async fn validate_provider_environment_keys_unique_at(
     store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
@@ -2111,7 +2225,7 @@ async fn validate_provider_environment_keys_unique_at(
             &mut seen_credentials,
             &mut seen_plugin_config,
             &provider_name,
-            active_provider_environment_keys(store, catalog, &provider, now_ms).await?,
+            active_provider_environment_keys(refresh, catalog, &provider, now_ms).await?,
             provider_plugin_environment_keys(catalog, &provider),
         )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
@@ -2389,13 +2503,13 @@ fn validate_dynamic_token_grant_bindings_unambiguous(
 }
 
 async fn active_provider_environment_keys(
-    store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     now_ms: i64,
 ) -> Result<Vec<String>, Status> {
     active_provider_environment_keys_for_identity(
-        store,
+        refresh,
         catalog,
         provider,
         provider.object_id(),
@@ -2405,7 +2519,7 @@ async fn active_provider_environment_keys(
 }
 
 async fn active_provider_environment_keys_for_identity(
-    store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     provider_identity: &str,
@@ -2414,7 +2528,7 @@ async fn active_provider_environment_keys_for_identity(
     let refresh_states = if provider_identity.is_empty() {
         Vec::new()
     } else {
-        crate::provider_refresh::list_refresh_states_for_provider(store, provider_identity).await?
+        refresh.list(provider_identity).await?
     };
     Ok(active_keys_with_refresh_states(
         catalog,
@@ -4109,6 +4223,7 @@ pub(super) async fn handle_update_provider(
         .await?;
     let result = update_provider_record_validating(
         state.store.as_ref(),
+        &state.refresh,
         &workspace,
         &catalog,
         provider,
@@ -4809,27 +4924,24 @@ pub(super) async fn handle_get_provider_refresh_status(
         .ok_or_else(|| Status::not_found("provider not found"))?;
 
     let states = if request.credential_key.trim().is_empty() {
-        crate::provider_refresh::list_refresh_states_for_provider(
-            state.store.as_ref(),
-            provider.object_id(),
-        )
-        .await?
+        state.refresh.list(Some(provider.object_id())).await?
     } else {
-        crate::provider_refresh::get_refresh_state(
-            state.store.as_ref(),
-            &workspace,
-            provider.object_id(),
-            request.credential_key.trim(),
-        )
-        .await?
-        .into_iter()
-        .collect()
+        state
+            .refresh
+            .get(
+                &workspace,
+                provider.object_id(),
+                request.credential_key.trim(),
+            )
+            .await?
+            .into_iter()
+            .collect()
     };
 
     Ok(Response::new(GetProviderRefreshStatusResponse {
         credentials: states
             .iter()
-            .map(crate::provider_refresh::refresh_status_from_state)
+            .map(|refresh| crate::provider_refresh::refresh_status_from_state(&refresh.into()))
             .collect(),
     }))
 }
@@ -4992,6 +5104,7 @@ pub(super) async fn handle_configure_provider_refresh(
         .await?;
     validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
         state.store.as_ref(),
+        RefreshStateReader::Runtime(&state.refresh),
         &catalog,
         &workspace,
         &provider,
@@ -5007,6 +5120,7 @@ pub(super) async fn handle_configure_provider_refresh(
     for additional_key in additional_output_keys.values() {
         validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
             state.store.as_ref(),
+            RefreshStateReader::Runtime(&state.refresh),
             &catalog,
             &workspace,
             &provider,
@@ -5093,13 +5207,12 @@ pub(super) async fn handle_configure_provider_refresh(
                 .to_proto(refresh.max_lifetime_seconds)
         }),
     };
-    let existing_refresh_state = crate::provider_refresh::get_refresh_state(
-        state.store.as_ref(),
-        &workspace,
-        provider.object_id(),
-        credential_key,
-    )
-    .await?;
+    let existing_refresh_state = state
+        .refresh
+        .get(&workspace, provider.object_id(), credential_key)
+        .await?
+        .as_ref()
+        .map(Into::<StoredProviderCredentialRefreshState>::into);
     if existing_refresh_state.as_ref().is_some_and(|state| {
         state
             .metadata
@@ -5182,12 +5295,10 @@ pub(super) async fn handle_configure_provider_refresh(
         .await?;
     state_record.secret_material_handles = staged_material_handles.clone();
     let persist_result = if let Some(expected_version) = existing_refresh_version {
-        match crate::provider_refresh::replace_refresh_state_if_current(
-            state.store.as_ref(),
-            &state_record,
-            expected_version,
-        )
-        .await
+        match state
+            .refresh
+            .replace((&state_record).into(), expected_version)
+            .await
         {
             Ok(true) => Ok(()),
             Ok(false) => Err(Status::aborted(
@@ -5196,7 +5307,7 @@ pub(super) async fn handle_configure_provider_refresh(
             Err(err) => Err(err),
         }
     } else {
-        crate::provider_refresh::create_refresh_state(state.store.as_ref(), &state_record).await
+        state.refresh.create((&state_record).into()).await
     };
     if let Err(err) = persist_result {
         if let Err(cleanup_err) = state
@@ -5242,6 +5353,7 @@ pub(super) async fn handle_configure_provider_refresh(
         };
         let result = update_provider_record_with_catalog(
             state.store.as_ref(),
+            &state.refresh,
             &catalog,
             &workspace,
             updated,
@@ -5287,16 +5399,12 @@ pub(super) async fn handle_rotate_provider_credential(
     if credential_key.is_empty() {
         return Err(Status::invalid_argument("credential_key is required"));
     }
-    let refresh_state = crate::provider_refresh::refresh_provider_credential(
-        state.store.as_ref(),
-        &workspace,
-        &state.credentials,
-        Some(&state.compute),
-        provider_name,
-        credential_key,
-    )
-    .await?;
-    publish_provider_change(state, &workspace, provider_name);
+    let refreshed =
+        CredentialRefresh::rotate(&state.refresh, &workspace, provider_name, credential_key)
+            .await?;
+    crate::provider_refresh::publish_change(state, &refreshed);
+    let refresh_state =
+        crate::storage_proto::StoredProviderCredentialRefreshStateV2::from(&refreshed);
 
     replay_facts.refresh(&refresh_state)?;
     Ok(Response::new(RotateProviderCredentialResponse {
@@ -5363,13 +5471,12 @@ pub(super) async fn handle_delete_provider_refresh(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
-    let existing_refresh_state = crate::provider_refresh::get_refresh_state(
-        state.store.as_ref(),
-        &workspace,
-        provider.object_id(),
-        credential_key,
-    )
-    .await?;
+    let existing_refresh_state = state
+        .refresh
+        .get(&workspace, provider.object_id(), credential_key)
+        .await?
+        .as_ref()
+        .map(Into::<StoredProviderCredentialRefreshState>::into);
     let Some(refresh_state) = existing_refresh_state else {
         return Ok(Response::new(DeleteProviderRefreshResponse {
             outcome: super::deletion_outcome(
@@ -5380,8 +5487,7 @@ pub(super) async fn handle_delete_provider_refresh(
         }));
     };
     crate::provider_refresh::delete_observed_refresh_state_with_credentials(
-        state.store.as_ref(),
-        &state.credentials,
+        &state.refresh,
         refresh_state.clone(),
     )
     .await?;
@@ -5450,6 +5556,7 @@ pub(super) async fn handle_delete_provider(
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &workspace, &name).await;
     let result = delete_provider_record_with_credentials(
         state.store.as_ref(),
+        &state.refresh,
         &workspace,
         &state.credentials,
         &name,
@@ -5528,6 +5635,10 @@ fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
         _ => TelemetryProviderProfile::Custom,
     }
 }
+
+#[cfg(test)]
+#[path = "provider_refresh_routing_tests.rs"]
+mod refresh_routing_tests;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -5700,6 +5811,7 @@ mod tests {
                     sandbox_id: "grant-sandbox".to_string(),
                     source: SandboxIdentitySource::BootstrapJwt {
                         issuer: SECRET.to_string(),
+                        auth_epoch: None,
                     },
                     trust_domain: None,
                 }));
@@ -5749,6 +5861,7 @@ mod tests {
                     sandbox_id: "broker-sandbox".to_string(),
                     source: SandboxIdentitySource::BootstrapJwt {
                         issuer: SECRET.to_string(),
+                        auth_epoch: None,
                     },
                     trust_domain: None,
                 }));
@@ -6198,9 +6311,14 @@ mod tests {
             .snapshot_catalog(store, "default")
             .await
             .unwrap();
-        let mut records = load_provider_environment_records(store, "default", &["provider".into()])
-            .await
-            .unwrap();
+        let mut records = load_provider_environment_records(
+            store,
+            &crate::provider_refresh::test_runtime(store),
+            "default",
+            &["provider".into()],
+        )
+        .await
+        .unwrap();
         let valid = resolve_provider_environment_from_records(&catalog, &records)
             .await
             .expect("valid dynamic environment");
@@ -8952,10 +9070,15 @@ mod tests {
             .snapshot_catalog(state.store.as_ref(), "default")
             .await
             .unwrap();
-        let provider =
-            update_provider_record_with_catalog(state.store.as_ref(), &catalog, "default", updated)
-                .await
-                .unwrap();
+        let provider = update_provider_record_with_catalog(
+            state.store.as_ref(),
+            &state.refresh,
+            &catalog,
+            "default",
+            updated,
+        )
+        .await
+        .unwrap();
         let refresh_state = crate::provider_refresh::new_refresh_state(
             &provider,
             "default",
@@ -10359,8 +10482,10 @@ mod tests {
             .clone();
 
         let (store_hit, release_store) = credentials.gate_next_store();
+        let refresh = crate::provider_refresh::test_runtime(&store);
         let update = update_provider_record_validating(
             &store,
+            &refresh,
             "default",
             &catalog,
             provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-second"),
@@ -10459,6 +10584,7 @@ mod tests {
 
         let error = update_provider_record_validating(
             &store,
+            &crate::provider_refresh::test_runtime(&store),
             "default",
             &catalog,
             provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-failed"),
@@ -10522,8 +10648,10 @@ mod tests {
 
         // Pause one writer after it reads the provider version. A second writer
         // publishes while it waits, so only a database CAS can reject the loser.
+        let refresh = crate::provider_refresh::test_runtime(&store);
         let loser = update_provider_record_validating(
             &store,
+            &refresh,
             "default",
             &catalog,
             provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-loser"),
@@ -10534,6 +10662,7 @@ mod tests {
             store_hit.await.unwrap();
             let result = update_provider_record_validating(
                 &store,
+                &crate::provider_refresh::test_runtime(&store),
                 "default",
                 &catalog,
                 provider_with_credential_value(
@@ -10828,6 +10957,7 @@ mod tests {
 
         let updated = update_provider_record_validating(
             &store,
+            &crate::provider_refresh::test_runtime(&store),
             "default",
             &catalog,
             Provider {
@@ -10870,6 +11000,7 @@ mod tests {
 
         let updated = update_provider_record_validating(
             &store,
+            &crate::provider_refresh::test_runtime(&store),
             "default",
             &catalog,
             Provider {
@@ -10936,6 +11067,7 @@ mod tests {
 
         update_provider_record_validating(
             &store,
+            &crate::provider_refresh::test_runtime(&store),
             "default",
             &catalog,
             Provider {
@@ -12237,6 +12369,142 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn static_request_metadata_is_minimal_owner_bound_and_tracks_delivered_values() {
+        use openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX;
+        let store = test_store().await;
+        let mut owned = custom_profile("metadata-owner");
+        owned.credentials = vec![static_credential("token", "TOKEN", true)];
+        owned.endpoints = vec![NetworkEndpoint {
+            host: "api.example.com".into(),
+            port: 443,
+            protocol: "rest".into(),
+            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+            ..Default::default()
+        }];
+        let mut optional = owned.clone();
+        optional.id = "metadata-optional".into();
+        optional.credentials[0].required = false;
+        optional.credentials[0].header_name = "x-wrong-owner".into();
+        let sources = ProviderProfileSources::from_test_profiles(vec![owned.clone(), optional]);
+        let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+        let record = |name: &str, id: &str, profile: &str| ProviderEnvironmentRecord {
+            name: name.into(),
+            object_id: id.into(),
+            resource_version: 1,
+            provider: Provider {
+                r#type: profile.into(),
+                profile_workspace: "default".into(),
+                ..Default::default()
+            },
+            refresh_states: Vec::new(),
+        };
+        let mut records = [
+            record("owner", "owner-id", "metadata-owner"),
+            record("optional", "optional-id", "metadata-optional"),
+        ];
+        records[0]
+            .provider
+            .credentials
+            .insert("TOKEN".into(), "synthetic-sensitive-token".into());
+        let endpoints = vec![StaticCredentialEndpointBinding {
+            host: "api.example.com".into(),
+            port: 443,
+            path: "/**".into(),
+        }];
+        let baseline = static_credential_binding(
+            Some("sandbox"),
+            &records[0],
+            "TOKEN",
+            &endpoints,
+            None,
+            false,
+        );
+        let mut environment = ProviderEnvironment {
+            environment: HashMap::from([("TOKEN".into(), "synthetic-sensitive-token".into())]),
+            static_credential_keys: HashSet::from(["TOKEN".into()]),
+            static_credential_bindings: HashMap::from([("TOKEN".into(), baseline.clone())]),
+            ..Default::default()
+        };
+        let metadata =
+            static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                .unwrap();
+        let key = format!("{STATIC_CREDENTIAL_METADATA_PREFIX}TOKEN");
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(
+            metadata[&key],
+            ProviderProfileCredential {
+                name: "token".into(),
+                env_vars: vec!["TOKEN".into()],
+                auth_style: "bearer".into(),
+                header_name: "authorization".into(),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            environment.static_credential_bindings["TOKEN"], baseline,
+            "legacy handles and identities must not change"
+        );
+        let encoded = metadata[&key].encode_to_vec();
+        assert!(
+            !encoded
+                .windows(b"synthetic-sensitive-token".len())
+                .any(|window| window == b"synthetic-sensitive-token")
+        );
+        // Preserve malformed authored fields for the supervisor to reject;
+        // silently dropping them would incorrectly select its default location.
+        for (style, header, query, path, explicit, valid) in [
+            ("", "", "", "", false, true),
+            (" ", "", "", "", true, false),
+            ("", "x-api-key", "", "", true, false),
+            ("header", "Bad Header", "", "", true, false),
+            ("bearer", "authorization", "api_key", "", true, true),
+            (
+                "bearer",
+                "authorization",
+                "api_key",
+                "/v1/{credential}/resources",
+                true,
+                true,
+            ),
+            ("query", "", "api?key", "", true, false),
+            ("basic", "x-custom", "", "", true, true),
+            ("basic", "Authorization", "", "", true, true),
+        ] {
+            let mut declared = owned.clone();
+            declared.credentials[0].auth_style = style.into();
+            declared.credentials[0].header_name = header.into();
+            declared.credentials[0].query_param = query.into();
+            declared.credentials[0].path_template = path.into();
+            let sources = ProviderProfileSources::from_test_profiles(vec![declared]);
+            let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+            let metadata =
+                static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                    .unwrap();
+            assert_eq!(
+                metadata.contains_key(&key),
+                explicit,
+                "style {style:?}, header {header:?}"
+            );
+            let installed = openshell_core::provider_credentials::ProviderCredentialState::from_bound_environment(
+                1, environment.environment.clone(), HashMap::new(), metadata,
+                environment.static_credential_bindings.clone(), vec![],
+            );
+            assert_eq!(
+                installed.is_ok(),
+                valid,
+                "style {style:?}, header {header:?}, query {query:?}"
+            );
+        }
+        environment.environment.remove("TOKEN");
+        assert!(
+            static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                .unwrap()
+                .is_empty(),
+            "expired or withheld material must not leave request metadata behind"
+        );
+    }
+
     #[test]
     fn external_stable_placeholder_binding_preserves_only_value_changes() {
         let mut record = ProviderEnvironmentRecord {
@@ -12452,9 +12720,14 @@ mod tests {
             .await
             .unwrap();
         let names = vec!["stable-refresh".to_string()];
-        let records = load_provider_environment_records(state.store.as_ref(), "default", &names)
-            .await
-            .unwrap();
+        let records = load_provider_environment_records(
+            state.store.as_ref(),
+            &state.refresh,
+            "default",
+            &names,
+        )
+        .await
+        .unwrap();
         let revision_1 = crate::grpc::policy::compute_provider_env_revision_with_catalog(
             state.store.as_ref(),
             &catalog,
@@ -12525,10 +12798,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(unchanged.credentials["ACCESS_TOKEN"], "token-1");
-        let unchanged_records =
-            load_provider_environment_records(state.store.as_ref(), "default", &names)
-                .await
-                .unwrap();
+        let unchanged_records = load_provider_environment_records(
+            state.store.as_ref(),
+            &state.refresh,
+            "default",
+            &names,
+        )
+        .await
+        .unwrap();
         let unchanged_environment =
             resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
                 &catalog,
@@ -12553,6 +12830,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-1")
         );
@@ -12569,9 +12849,14 @@ mod tests {
             })
             .await
             .unwrap();
-        let records = load_provider_environment_records(state.store.as_ref(), "default", &names)
-            .await
-            .unwrap();
+        let records = load_provider_environment_records(
+            state.store.as_ref(),
+            &state.refresh,
+            "default",
+            &names,
+        )
+        .await
+        .unwrap();
         let revision_2 = crate::grpc::policy::compute_provider_env_revision_with_catalog(
             state.store.as_ref(),
             &catalog,
@@ -12608,6 +12893,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-2")
         );
@@ -12625,6 +12913,9 @@ mod tests {
             reconstructed
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-2")
         );
@@ -12641,9 +12932,14 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(revision_2, revision_3);
-        let records = load_provider_environment_records(state.store.as_ref(), "default", &names)
-            .await
-            .unwrap();
+        let records = load_provider_environment_records(
+            state.store.as_ref(),
+            &state.refresh,
+            "default",
+            &names,
+        )
+        .await
+        .unwrap();
         let third = resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
             &catalog,
             &records,
@@ -12671,6 +12967,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             None
         );
@@ -12819,6 +13118,7 @@ mod tests {
 
         let records = load_provider_environment_records(
             &store,
+            &crate::provider_refresh::test_runtime(&store),
             "default",
             &["legacy-openai-handle".to_string()],
         )
@@ -12920,9 +13220,14 @@ mod tests {
             .snapshot_catalog(&store, "default")
             .await
             .unwrap();
-        let records = load_provider_environment_records(&store, "default", &provider_names)
-            .await
-            .unwrap();
+        let records = load_provider_environment_records(
+            &store,
+            &crate::provider_refresh::test_runtime(&store),
+            "default",
+            &provider_names,
+        )
+        .await
+        .unwrap();
         let policy_bindings = HashMap::from([(
             "my-google-cloud".to_string(),
             vec![StaticCredentialEndpointBinding {
@@ -12984,10 +13289,14 @@ mod tests {
         .await
         .expect("provider with stable credential");
 
-        let records =
-            load_provider_environment_records(&store, "default", &["stable-provider".to_string()])
-                .await
-                .expect("provider records");
+        let records = load_provider_environment_records(
+            &store,
+            &crate::provider_refresh::test_runtime(&store),
+            "default",
+            &["stable-provider".to_string()],
+        )
+        .await
+        .expect("provider records");
         let policy_bindings = HashMap::from([(
             "stable-provider".to_string(),
             vec![StaticCredentialEndpointBinding {
@@ -13065,9 +13374,14 @@ mod tests {
         .unwrap();
 
         let provider_names = ["my-google-cloud".to_string()];
-        let records = load_provider_environment_records(&store, "default", &provider_names)
-            .await
-            .unwrap();
+        let records = load_provider_environment_records(
+            &store,
+            &crate::provider_refresh::test_runtime(&store),
+            "default",
+            &provider_names,
+        )
+        .await
+        .unwrap();
         assert!(records[0].provider.credentials.is_empty());
         assert!(
             records[0]
@@ -15483,9 +15797,14 @@ mod tests {
             .snapshot_catalog(state.store.as_ref(), "default")
             .await
             .unwrap();
-        let keys = active_provider_environment_keys(state.store.as_ref(), &catalog, &provider, 0)
-            .await
-            .unwrap();
+        let keys = active_provider_environment_keys(
+            RefreshStateReader::Runtime(&state.refresh),
+            &catalog,
+            &provider,
+            0,
+        )
+        .await
+        .unwrap();
         assert!(keys.contains(&"AWS_ACCESS_KEY_ID".to_string()));
         assert!(keys.contains(&"AWS_SECRET_ACCESS_KEY".to_string()));
         assert!(keys.contains(&"AWS_SESSION_TOKEN".to_string()));

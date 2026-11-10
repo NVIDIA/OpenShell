@@ -35,6 +35,7 @@ mod lifecycle_reconciliation {
             sandbox_api_version: Arc::new(OnceCell::new()),
             lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
+            network_trust_bundle: None,
             operator_allowlist: None,
             shared_supervisor: None,
         };

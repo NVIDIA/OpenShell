@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# E2E overlay: supervise new sandbox generations with a high-availability pool
+# of two shared supervisors, so a failed or leaving member's sandboxes move to
+# the other member. Layer it on a workspace-mode overlay to cover managed or
+# operator namespaces.
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+
+supervisor:
+  replicas: 2
+  recoveryTimeoutSeconds: 60

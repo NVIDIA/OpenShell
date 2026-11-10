@@ -20,6 +20,7 @@ static OCSF_CTX_FALLBACK: LazyLock<EventContext> = LazyLock::new(|| EventContext
     sandbox_id: String::new(),
     sandbox_name: String::new(),
     container_image: String::new(),
+    container_image_uid: None,
     hostname: "test".to_string(),
     product_version: env!("CARGO_PKG_VERSION").to_string(),
     proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
@@ -58,4 +59,14 @@ pub fn ctx() -> ContextRef<'static> {
         return ContextRef::Shared(bound);
     }
     ContextRef::Borrowed(OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_context_names_no_sandbox() {
+        assert!(OCSF_CTX_FALLBACK.container().is_none());
+    }
 }
