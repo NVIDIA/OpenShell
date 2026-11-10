@@ -11,7 +11,7 @@ use openshell_bootstrap::{list_gateways, load_active_gateway, load_gateway_metad
 use openshell_core::ObjectName;
 use openshell_core::proto::{ListProvidersRequest, ListSandboxesRequest, ListWorkspacesRequest};
 
-use crate::oidc_auth::oidc_refresh_token;
+use crate::oidc_auth::oidc_renew_token;
 use crate::tls::{GrpcClient, TlsOptions, grpc_client};
 
 /// Complete gateway names from local metadata files (no network call).
@@ -136,8 +136,9 @@ async fn completion_grpc_client(server: &str, gateway_name: &str) -> Option<Grpc
             Some("oidc") => {
                 if let Some(bundle) = load_oidc_token(gateway_name) {
                     if is_token_expired(&bundle) {
-                        match oidc_refresh_token(
+                        match oidc_renew_token(
                             &bundle,
+                            meta.oidc_audience.as_deref(),
                             meta.oidc_scopes.as_deref(),
                             tls_opts.gateway_insecure,
                         )

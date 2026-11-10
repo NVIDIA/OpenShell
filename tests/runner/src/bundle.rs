@@ -8,6 +8,10 @@
 //! `nextest` config with the runner's `JUnit` profile, and `testkit-ready`,
 //! which waits for the gateway before the tests run. The guest needs only the
 //! `cargo-nextest` binary to run it.
+//!
+//! A family that ships a prebuilt test program, such as `openshell-conformance`,
+//! can run it instead: the bundle then holds that program alone, built once
+//! elsewhere for the guest target, and the runner builds nothing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,13 +38,44 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 path = "junit.xml"
 "#;
 
+/// The prebuilt program's name in a program bundle.
+pub const PROGRAM_BINARY: &str = "test-program";
+
+/// What a bundle runs the tests with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A nextest archive, run with `cargo-nextest`.
+    Nextest,
+    /// A prebuilt testkit program (`list`, `ready` and `run`), run directly.
+    Program,
+}
+
 /// The bundle directory, removed when this is dropped.
-pub struct Bundle(TempDir);
+pub struct Bundle(TempDir, Kind);
 
 impl Bundle {
     pub fn path(&self) -> &Path {
         self.0.path()
     }
+
+    pub const fn kind(&self) -> Kind {
+        self.1
+    }
+}
+
+/// A bundle holding only `program`, a testkit program already built for the
+/// guest target. `program` must be a static binary, as the guest's libc is
+/// not known.
+pub fn program(program: &Path) -> Result<Bundle> {
+    ensure!(
+        program.is_file(),
+        "--program {} is not a file",
+        program.display()
+    );
+    let dir = tempfile::tempdir().context("create bundle directory")?;
+    std::fs::copy(program, dir.path().join(PROGRAM_BINARY))
+        .with_context(|| format!("copy {}", program.display()))?;
+    Ok(Bundle(dir, Kind::Program))
 }
 
 /// The Rust target for guests. tmachine only boots guests of the host's
@@ -137,7 +172,7 @@ pub fn build(workspace: &Path, packages: &[String], target: &str, ready: &Path) 
     std::fs::write(stage.join("nextest.toml"), NEXTEST_CONFIG)?;
     std::fs::copy(ready, stage.join(READY_BINARY))
         .with_context(|| format!("copy {}", ready.display()))?;
-    Ok(Bundle(dir))
+    Ok(Bundle(dir, Kind::Nextest))
 }
 
 /// Copy every `Cargo.toml` under `workspace` into `stage`, keeping relative
@@ -175,6 +210,21 @@ fn run(command: &mut Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_bundle_holds_only_the_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("openshell-conformance");
+        std::fs::write(&path, b"binary").unwrap();
+        let bundle = program(&path).unwrap();
+        assert_eq!(bundle.kind(), Kind::Program);
+        let names: Vec<_> = std::fs::read_dir(bundle.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [PROGRAM_BINARY]);
+        assert!(program(&dir.path().join("missing")).is_err());
+    }
 
     #[test]
     fn built_executable_finds_the_named_binary() {

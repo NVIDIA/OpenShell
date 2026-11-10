@@ -169,8 +169,7 @@ git worktree remove --force "$wt"
    ```
 
 4. **Watch and verify.** Check that `Select Qualified Prerelease` names the
-   approved candidate, the GitHub Release has assets, no job failed, and the
-   wheel reached PyPI:
+   approved candidate, the GitHub Release has assets and no job failed:
 
    ```shell
    gh run watch <run-id> --exit-status
