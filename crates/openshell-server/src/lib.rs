@@ -3183,55 +3183,28 @@ mod tests {
         stop_listener(shutdown, handle).await;
     }
 
-    /// The edge-tunnel client path: gRPC carried in binary frames over a
-    /// WebSocket to `/_ws_tunnel` on the production listener reaches the
-    /// gateway's own services.
+    /// The edge-tunnel client path: the SDK's tunnel proxy carries gRPC in
+    /// WebSocket binary frames to `/_ws_tunnel` on the production listener,
+    /// and the request reaches the gateway's own services.
     #[tokio::test]
     async fn production_gateway_listener_serves_grpc_through_websocket_tunnel() {
-        use futures::{SinkExt as _, StreamExt as _};
         use openshell_core::proto::{
             HealthRequest, ServiceStatus, open_shell_client::OpenShellClient,
         };
-        use tokio_tungstenite::tungstenite::Message;
 
         let (addr, shutdown, handle) = start_plaintext_gateway_listener_with_tunnel(true).await;
-        let ws_url = format!("ws://127.0.0.1:{}/_ws_tunnel", addr.port());
-        let channel = tonic::transport::Endpoint::from_static("http://edge-tunnel.invalid")
-            .connect_with_connector(tower::service_fn(move |_| {
-                let ws_url = ws_url.clone();
-                async move {
-                    let (ws, _) = tokio_tungstenite::connect_async(ws_url)
-                        .await
-                        .map_err(Error::other)?;
-                    let (mut ws_sink, mut ws_source) = ws.split();
-                    let (client, bridge) = tokio::io::duplex(64 * 1024);
-                    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge);
-                    tokio::spawn(async move {
-                        let mut buf = vec![0u8; 32 * 1024];
-                        while let Ok(n @ 1..) = bridge_read.read(&mut buf).await {
-                            if ws_sink
-                                .send(Message::Binary(buf[..n].to_vec().into()))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        let _ = ws_sink.close().await;
-                    });
-                    tokio::spawn(async move {
-                        while let Some(Ok(Message::Binary(data))) = ws_source.next().await {
-                            if bridge_write.write_all(&data).await.is_err() {
-                                break;
-                            }
-                        }
-                        let _ = bridge_write.shutdown().await;
-                    });
-                    Ok::<_, Error>(hyper_util::rt::TokioIo::new(client))
-                }
-            }))
-            .await
-            .expect("gRPC channel through the WebSocket tunnel");
+        let proxy = openshell_sdk::edge_tunnel::start_tunnel_proxy(
+            &format!("http://127.0.0.1:{}", addr.port()),
+            "edge-token",
+        )
+        .await
+        .expect("start the SDK tunnel proxy");
+        let channel =
+            tonic::transport::Endpoint::from_shared(format!("http://{}", proxy.local_addr))
+                .expect("tunnel proxy endpoint")
+                .connect()
+                .await
+                .expect("gRPC channel through the WebSocket tunnel");
 
         let response = tokio::time::timeout(
             Duration::from_secs(10),
