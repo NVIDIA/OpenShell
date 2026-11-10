@@ -17,6 +17,10 @@ If BASE does not exist it is created first: from DEFAULT when that file exists
 text is parsed as TOML before it is written, and the script fails, leaving BASE
 as it was, if it is not valid.
 
+The overrides must be valid TOML, and the script fails if any of their values is
+missing from the merged result, so a statement it cannot rewrite is an error
+rather than a silent no-op.
+
 Limits: a key's value in BASE is replaced as written lines, up to the next key,
 header, comment or blank line. A key can't be removed.
 """
@@ -28,7 +32,8 @@ import sys
 import tomllib
 
 HEADER = re.compile(r"^\s*\[([^\[\]]+)\]\s*(#.*)?$")
-KEY = re.compile(r"^\s*([A-Za-z0-9_-]+|\"[^\"]+\")\s*=")
+ARRAY_HEADER = re.compile(r"^\s*\[\[[^\[\]]+\]\]\s*(#.*)?$")
+KEY = re.compile(r"^\s*([A-Za-z0-9_-]+|\"[^\"]+\"|'[^']+')\s*=")
 MINIMAL = "[openshell]\nversion = 2\n"
 
 
@@ -36,8 +41,17 @@ def table_name(line):
     return re.sub(r"\s+", "", HEADER.match(line).group(1))
 
 
+def is_boundary(line):
+    """A table or array-of-tables header ends the current table."""
+    return bool(HEADER.match(line) or ARRAY_HEADER.match(line))
+
+
+def key_name(raw):
+    return raw[1:-1] if raw[0] in "\"'" else raw
+
+
 def is_statement_start(line):
-    return bool(HEADER.match(line) or KEY.match(line))
+    return bool(is_boundary(line) or KEY.match(line))
 
 
 def is_break(line):
@@ -51,7 +65,7 @@ def statements(lines):
     for line in lines:
         key = KEY.match(line)
         if key:
-            found.append((key.group(1), [line]))
+            found.append((key_name(key.group(1)), [line]))
         elif found and not is_break(line):
             found[-1][1].append(line)
     return found
@@ -81,14 +95,14 @@ def apply(lines, table, new):
         return lines + ["", f"[{table}]", *(l for _, stmt in new for l in stmt)]
     for key, stmt in new:
         end = next(
-            (i for i in range(start + 1, len(lines)) if HEADER.match(lines[i])),
+            (i for i in range(start + 1, len(lines)) if is_boundary(lines[i])),
             len(lines),
         )
         existing = next(
             (
                 i
                 for i in range(start + 1, end)
-                if (m := KEY.match(lines[i])) and m.group(1) == key
+                if (m := KEY.match(lines[i])) and key_name(m.group(1)) == key
             ),
             None,
         )
@@ -100,6 +114,15 @@ def apply(lines, table, new):
             stop += 1
         lines[existing:stop] = stmt
     return lines
+
+
+def contains(merged, expected):
+    """Whether every table and value in EXPECTED is present in MERGED."""
+    if isinstance(expected, dict):
+        return isinstance(merged, dict) and all(
+            k in merged and contains(merged[k], v) for k, v in expected.items()
+        )
+    return merged == expected
 
 
 def main():
@@ -117,13 +140,22 @@ def main():
     else:
         text = MINIMAL
     lines = text.splitlines()
-    for table, new in override_tables(open(args.overrides).read()).items():
+    override_text = open(args.overrides).read()
+    try:
+        wanted = tomllib.loads(override_text)
+    except tomllib.TOMLDecodeError as error:
+        sys.exit(f"{args.overrides} is not valid TOML: {error}")
+    for table, new in override_tables(override_text).items():
         lines = apply(lines, table, new)
     merged = "\n".join(lines) + "\n"
     try:
-        tomllib.loads(merged)
+        result = tomllib.loads(merged)
     except tomllib.TOMLDecodeError as error:
         sys.exit(f"merged {args.base} is not valid TOML: {error}")
+    # The rewriter works on lines, so confirm every override really landed
+    # rather than trusting it to have handled each statement.
+    if not contains(result, wanted):
+        sys.exit(f"the overrides in {args.overrides} were not all applied to {args.base}")
     with open(args.base, "w") as out:
         out.write(merged)
     if created:
