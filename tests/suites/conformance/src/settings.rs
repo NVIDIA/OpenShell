@@ -137,6 +137,10 @@ async fn expect_sandbox_setting(
     .await
 }
 
+// The global-setting helpers take `&Cli` rather than `&Context` because the
+// cleanup hook that restores the setting calls them after the test body,
+// when the context can no longer be borrowed.
+
 /// The gateway-global value of `key` as the CLI shows it, [`UNSET`] if none.
 async fn read_global_setting(cli: &testkit::Cli, key: &str) -> testkit::Result<String> {
     let settings: Value = cli

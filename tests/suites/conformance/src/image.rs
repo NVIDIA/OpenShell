@@ -3,7 +3,7 @@
 
 //! Sandbox image suite: a sandbox runs the image it is created from.
 
-use testkit::{Context, Sandbox};
+use testkit::{Context, ResultExt as _, Sandbox};
 
 /// A sandbox created with an explicit image runs that image.
 #[testkit::test]
@@ -17,7 +17,7 @@ async fn explicit_image_is_used(cx: &mut Context) -> testkit::Result {
         .await?;
     expect_ubuntu(&sandbox)
         .await
-        .map_err(|error| error.context(format!("sandbox from image {image}")))
+        .context(format!("sandbox from image {image}"))
 }
 
 /// Fail unless the sandbox's `/etc/os-release` names Ubuntu and a version,
