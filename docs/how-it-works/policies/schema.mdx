@@ -55,6 +55,11 @@ These defaults and the filesystem path restrictions below also apply when the su
 Each path must be absolute, must not contain `..`, and must not exceed 4096
 bytes. `read_write` cannot contain `/`. A policy can list at most 256 paths.
 
+Policy paths can follow system symlinks only when the workload cannot modify
+any containing directory. A symlink beneath a directory the workload owns or
+can write causes launch to fail, including in `best_effort` mode. List the
+target directory directly for links inside a writable workspace.
+
 ```yaml showLineNumbers={false}
 filesystem_policy:
   include_workdir: true
@@ -69,8 +74,8 @@ filesystem_policy:
 | `compatibility` | string | `best_effort` | `best_effort` or `hard_requirement` |
 
 Both values skip individual paths that are missing or that the workload cannot
-open. They differ when none of the listed paths can be applied, or when Landlock
-fails to enforce the policy's rules:
+open. If none of the listed paths can be applied, launch fails in either mode.
+They differ when Landlock fails to build or enforce the policy's rules:
 
 | Value | Behavior |
 |---|---|
@@ -153,7 +158,7 @@ the gateway host.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `protocol` | string | None | `rest`, `websocket`, `graphql`, `mcp`, or `json-rpc` for request inspection, or `tcp` for a native TCP connection. `graphql`, `mcp`, and `json-rpc` endpoints refuse requests that carry an `Upgrade` header with `403`. Refer to [Connection and Request Checks](/how-it-works/policies/network-rules#connection-and-request-checks). |
+| `protocol` | string | None | `rest`, `websocket`, `graphql`, `mcp`, or `json-rpc` for request inspection, or `tcp` for a native TCP connection. `rest`, `graphql`, `mcp`, and `json-rpc` endpoints refuse requests that carry an `Upgrade` header with `403`. Refer to [Connection and Request Checks](/how-it-works/policies/network-rules#connection-and-request-checks). |
 | `tls` | string | Automatic | `skip` relays traffic without terminating TLS, so OpenShell cannot inspect it. Do not use it with a request protocol. |
 | `enforcement` | string | `audit` | `enforce` blocks requests that break the endpoint's rules. `audit` logs them and allows the request. |
 | `access` | string | None | Access preset: `read-only`, `read-write`, or `full`. Refer to [Access Presets](#access-presets). |
@@ -166,8 +171,8 @@ the gateway host.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `credential_binding.provider` | string | None | Binds the static credentials of an attached provider whose profile defines no endpoints. Valid only in a sandbox policy. |
-| `request_body_credential_rewrite` | bool | `false` | Replaces credential placeholders in REST request bodies. |
-| `websocket_credential_rewrite` | bool | `false` | Replaces credential placeholders in client WebSocket text messages. |
+| `request_body_credential_rewrite` | bool | `false` | Replaces ordinary static credential placeholders in REST bodies, including those with declared HTTP placement. |
+| `websocket_credential_rewrite` | bool | `false` | Replaces ordinary static credential placeholders in client WebSocket text messages, including those with declared HTTP placement. Requires `protocol: websocket`. |
 | `allow_uninspected_credentials` | bool | `false` | Allows a provider-credentialed endpoint to omit request inspection or use `tls: skip`. |
 | `credential_signing` | string | None | AWS request signing: `sigv4`, `sigv4:body`, or `sigv4:no_body`. |
 | `signing_service` | string | None | AWS service name, such as `bedrock` or `s3`. Required with `credential_signing`. |

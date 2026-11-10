@@ -427,6 +427,8 @@ message SandboxConfigSnapshot {
   string configuration_instance_id = 15;
   string configuration_error = 16;
   uint64 settings_revision = 17;
+  // Explicit application ingress allowlist. Absent means no app routes.
+  repeated SandboxServiceRoute service_routes = 18;
 }
 
 // Response containing effective sandbox settings and policy, projected from
@@ -477,6 +479,17 @@ message GetSandboxConfigResponse {
   string configuration_instance_id = 15;
   // Monotonic revision of the sandbox-scoped settings row.
   uint64 settings_revision = 17;
+  repeated SandboxServiceRoute service_routes = 18;
+}
+
+// Gateway-declared service installed by a supervisor; this does not grant
+// access to arbitrary workload ports or assert application health.
+message SandboxServiceRoute {
+  string endpoint_id = 1;
+  string name = 2;
+  uint32 target_port = 3;
+  int32 authorization_mode = 4;
+  uint64 resource_version = 5;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

@@ -141,11 +141,17 @@ Windows MXC gateway records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCS
 
 ## JSON Record Structure
 
-Gateway-produced records use the `OpenShell Gateway` product identity; supervisor records use `OpenShell Sandbox Supervisor`. The producing device and the affected sandbox are separate identities, so a gateway event can still identify an affected sandbox through its container fields.
+Gateway-produced records use the `OpenShell Gateway` product identity; supervisor records use `OpenShell Sandbox Supervisor`. Gateway records keep the gateway host in `device` and use `unmapped.sandbox_id` and, when available, `unmapped.sandbox_name` for sandbox attribution from the event context. API Activity `resources` describe request targets and do not determine sandbox log routing or the OTLP `openshell.sandbox.id` attribute. Cross-sandbox authorization denials remain gateway-wide, even when a resource names the requested sandbox. Authentication records do not attach a sandbox container.
 
 For gateway-produced records, `device.os.name` and `device.os.type_id` identify the OS running the gateway process: Linux (200), Windows (100), or macOS (300). Linux supervisor records continue to report Linux, regardless of the gateway's OS. A native macOS gateway therefore reports macOS while its Linux sandboxes report Linux; a gateway running inside a Linux container reports Linux, even on a Mac host.
 
-`metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. Use `container.uid` to associate the event with its sandbox, not `metadata.uid`. Records without a sandbox association omit the container; unknown images are omitted rather than represented by an empty image name.
+`metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. For supervisor records, use `device.container.uid` to associate the event with its sandbox and `device.container.name` for the sandbox name. These records declare the `container` profile in `metadata.profiles`. Records without a sandbox association omit `device.container`.
+
+Docker and Podman supervisor records include `device.container.image.uid`, the immutable workload image ID resolved at launch, and `device.container.image.name` when the requested image reference is available. The UID identifies the workload image, even when a mutable tag later changes. When the driver has not supplied a resolved image UID, including Kubernetes, VM, and shared-supervisor records, events omit `device.container.image` and preserve any known image reference in `unmapped.container_image`.
+
+<Warning>
+Sandbox identity has moved from top-level `container` to `device.container` for supervisor records, and to `unmapped.sandbox_id` and `unmapped.sandbox_name` for gateway records, to conform to OCSF 1.8.0. Update SIEM mappings and parsers, including XSIAM content pack rules that read `container.uid` or `container.name`, to use the paths for the producing component. Image-based filters should also read `unmapped.container_image` when `device.container.image` is absent.
+</Warning>
 
 Some fields depend on the event class:
 
@@ -153,7 +159,7 @@ Some fields depend on the event class:
 - Process Activity records from the sandbox name the `openshell-sandbox` launcher as `actor.process`.
 - `connection_info` carries `direction_id` and `direction`. OpenShell reports Unknown (`0`) where it does not track the direction.
 
-Each JSONL file line, or the payload after the stderr marker, is a complete OCSF v1.8.0 JSON object. Records validate against OCSF v1.8.0 except for the top-level `container` object, which OCSF does not define at the event level. Here is an example of a network connection event:
+Each JSONL file line, or the payload after the stderr marker, is a complete OCSF v1.8.0 JSON object. Supervisor records identify the sandbox under `device.container` and validate against OCSF v1.8.0 without a top-level `container` exception. Here is an example of a network connection event:
 
 ```json
 {
@@ -246,11 +252,11 @@ And a denied connection, produced when `curl https://github.com` runs in a sandb
       "name": "Linux",
       "type_id": 200,
       "type": "Linux"
+    },
+    "container": {
+      "name": "docs-deny",
+      "uid": "3949f6fc-2b84-45b2-a631-46debe41d84f"
     }
-  },
-  "container": {
-    "name": "docs-deny",
-    "uid": "3949f6fc-2b84-45b2-a631-46debe41d84f"
   },
   "dst_endpoint": {
     "domain": "github.com",
@@ -279,6 +285,37 @@ And a denied connection, produced when `curl https://github.com` runs in a sandb
 <Note>
 The JSON examples above are formatted for readability. The actual JSONL file contains one JSON object per line with no whitespace formatting.
 </Note>
+
+## Refusal Records
+
+Every record that describes a refusal sets `action` to `Denied`. On Network and HTTP Activity, `disposition` is `Blocked`, except for FORWARD requests with an unsupported scheme, which report `Rejected`. Besides policy denials, this includes:
+
+- FORWARD requests the proxy rejects as unparsable, non-canonical, or invalid GraphQL or JSON-RPC.
+- L7 evaluation errors under `enforcement: enforce`. Under `enforcement: audit` they report `action` Other and `disposition` Allowed, because the request proceeds.
+- Google Cloud metadata server emulation responses with status 403 or 405.
+- Fail-closed request, response, and WebSocket middleware, including the HTTP Activity record for a fail-closed response stage and the Detection Findings for a fail-closed stage or chain or a failed post-middleware policy evaluation.
+- Response delivery the supervisor refuses because middleware stopped it, its preflight failed, or the upstream response head could not be normalized for it.
+
+Count these records when you track denials, for example with `select(.action == "Denied")`.
+
+## Follow a Deny Trace
+
+HTTP Activity and API Activity records emitted inside a sampled OpenTelemetry span carry `trace.uid` and list `trace` in `metadata.profiles`. These are the classes OCSF 1.8.0 declares the Trace profile for. The UID is the W3C trace ID, 32 lowercase hexadecimal characters. Search for it in your Jaeger or Tempo backend. A sampled ID does not guarantee export or retention in the trace backend.
+
+```json
+{
+  "metadata": { "profiles": ["container", "host", "network_proxy", "security_control", "trace"] },
+  "trace": { "uid": "0af7651916cd43dd8448eb211c80319c" }
+}
+```
+
+OTLP log export links every OCSF record, whatever its class, to the active sampled span through the log record's own trace and span ID fields. Use those fields for log-to-trace links in your backend.
+
+With OTLP trace export enabled on a dedicated supervisor, denied HTTP requests can create an INFO `supervisor.egress.deny` span around the audit records for that decision. The span records the policy, reason, and destination when available. At the default log level, every deny span is a root span. At debug level, FORWARD policy, destination, credential-binding, and request middleware denials can join the available connect trace and its authorization, resolve, and dial spans. Other deny spans, including L7 denials inside CONNECT tunnels and response middleware denials, remain root spans. Shared supervisor hosts do not initialize OTLP exporters, so their records carry no trace correlation. Workload `traceparent` headers never supply supervisor correlation.
+
+To bound telemetry volume when a workload retries blocked destinations, the supervisor creates at most 10 deny spans per destination at once and one more per second after that. A process-wide budget also allows at most 100 spans at once and refills at 100 per second across destinations. Rate-limited decisions create no additional deny span, while all audit records are still emitted. Records can retain correlation to an already active sampled span, including a connect span at debug level.
+
+Gateway records and their OTLP trace context can inherit the caller's incoming `traceparent`, including before authentication succeeds. The caller also decides whether they are correlated at all, because an unsampled `traceparent` suppresses `trace.uid`. Treat gateway trace IDs as correlation hints, not evidence of the caller's identity, and do not treat a missing `trace.uid` as meaningful.
 
 ## OCSF Event Classes in JSON
 

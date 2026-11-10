@@ -19,7 +19,7 @@ Set an OTLP collector endpoint in `gateway.toml`:
 endpoint = "https://backend:4317"
 ```
 
-In the Helm chart, set the table under `gatewayConfig`. The gateway passes the endpoint to the compute drivers and sandbox supervisors it starts, and supervisors connect to the collector directly, so it must be reachable from sandboxes too. For a separate trace collector, OTLP/HTTP, TLS, sampling, and the other settings, refer to [OTLP Export](/how-it-works/gateways/configuration#otlp-export).
+In the Helm chart, set the table under `gatewayConfig`. The gateway passes the endpoint to the compute drivers and sandbox supervisors it starts, and supervisors connect to the collector directly, so it must be reachable from sandboxes too. For a separate trace collector, OTLP/HTTP, headers, TLS, sampling, and the other settings, refer to [OTLP Export](/how-it-works/gateways/configuration#otlp-export).
 
 ## What Is Traced
 
@@ -29,6 +29,8 @@ In the Helm chart, set the table under `gatewayConfig`. The gateway passes the e
 | Gateway background work | Reconciliation, driver watches, and credential refresh. These start their own traces because no request supplies a parent. Credential refresh creates a span only when a credential is due or needs cleanup. |
 | Compute drivers | Child spans for each compute-driver operation the gateway performs, from both the gateway's side and the driver's side. |
 | Sandbox supervisors | Supervisor startup, such as loading policy. |
+
+These are OpenShell's own spans. Spans that the agent produces travel separately, through the [agent trace relay](/observability/overview#agent-traces).
 
 Spans for routine or high-volume operations use DEBUG level, and the default INFO level does not export them. These include store operations, health checks, the RPCs that supervisors call on a timer (`GetSandboxConfig` and `ReportProviderReadiness`), and how supervisors handle egress connections. Set the gateway or sandbox log level to `debug` to include them.
 
@@ -68,6 +70,8 @@ Give each installation that reports to the same collector its own name, includin
 ## Trace Context
 
 The gateway continues a valid W3C `traceparent` sent by the caller, so a client's trace can include the gateway's spans for its requests. Without one, the gateway starts a new trace.
+
+The CLI forwards `TRACEPARENT` and `TRACESTATE` from its environment on gateway requests from its standard commands. A CI pipeline instrumented with an OpenTelemetry integration that exports these variables (for example the Jenkins OpenTelemetry plugin or an OpenTelemetry GitHub Action) therefore parents the gateway's spans for the commands it runs, with no collector or provider configuration on the CI runner.
 
 The gateway also passes its trace context to compute drivers, so driver spans appear in the same trace as the gateway request that caused them. Built-in drivers export their spans through the gateway's process. Managed external drivers receive the trace endpoint, gateway name, and compute driver from the gateway. Drivers that you run yourself own their telemetry configuration.
 

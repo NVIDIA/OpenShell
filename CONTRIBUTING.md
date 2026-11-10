@@ -70,9 +70,11 @@ Use agents and the repository skills as needed to understand the affected code, 
 
 Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTAINERS.md) before it can merge. This is enforced by the `OpenShell / Maintainer Approval` status check, which turns green once one of those reviewers approves. Reviews from other contributors are welcome and count toward the general approval requirement, but they do not satisfy this check.
 
-Pull requests that touch the enforcement machinery itself — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `.github/CODEOWNERS`, or the enforcement scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
+Pull requests that touch the enforcement machinery or reviewer routing — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `REVIEWERS.md`, `.github/CODEOWNERS`, or the enforcement and reviewer-routing scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
 
-Maintainers are not requested automatically. If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
+Use exactly one `area:` label and any relevant `topic:` labels on your pull request. The [reviewer routing workflow](.github/workflows/review-readiness.yml) requests all matching members of [REVIEWERS.md](REVIEWERS.md), excluding the author, when a PR opens ready for review, leaves draft status, or gains or loses an area/topic label. Reviewers do not need repository write access to receive requests or review PRs. Manual reviewer choices and people who have commented or reviewed are preserved. Propose roster membership changes through a reviewed PR.
+
+If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
 
 ## Agent Skills
 
@@ -380,7 +382,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
-| `python/`       | Python SDK and bindings                       |
+| `python/`       | Python SDK (frozen, moved to ai-openshell/sdk-python) |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
 | `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
@@ -388,7 +390,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `tests/testkit/` | Support library for SDK-driven end-to-end suites |
 | `tests/suites/` | End-to-end suites, grouped by test family |
 | `tests/tmachine/` | QEMU test machines provisioned with Ansible, and the `Session` API that drives them |
-| `tests/runner/` | `openshell-test-runner`: runs a test family in a tmachine environment and checks the results |
+| `tests/runner/` | `openshell-test-runner`: builds a test family for tmachine guests, runs it in a tmachine environment and checks the results |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |

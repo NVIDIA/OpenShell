@@ -71,15 +71,15 @@ pub fn install(
 ) -> (TracingHandle, Option<SetupError>) {
     let driver_otlp = driver.is_some().then_some(otlp).flatten();
     let driver_endpoint = driver_otlp.and_then(OtlpExport::traces_endpoint);
-    let driver_protocol = driver_otlp.map_or(openshell_otel::Protocol::Grpc, |otlp| {
-        otlp.traces_protocol().into()
-    });
+    let driver_transport = driver_otlp
+        .map(OtlpExport::traces_transport)
+        .unwrap_or_default();
     let (driver_tracer_provider, driver_setup_error) = driver.map_or_else(
         || (None, None),
         |descriptor| {
             descriptor.provider_for(
                 driver_endpoint,
-                driver_protocol,
+                &driver_transport,
                 openshell_core::VERSION,
                 gateway.name(),
                 gateway.compute_driver(),
@@ -263,6 +263,7 @@ mod tests {
             sandbox_id: "portable-audit".into(),
             sandbox_name: "portable-audit".into(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "gateway-host".into(),
             product_version: openshell_core::VERSION.into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),
@@ -318,6 +319,7 @@ mod tests {
             sandbox_id: "sandbox-filter-test".into(),
             sandbox_name: "filter-test".into(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "gateway-host".into(),
             product_version: openshell_core::VERSION.into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),

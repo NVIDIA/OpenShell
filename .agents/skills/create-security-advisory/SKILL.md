@@ -10,6 +10,9 @@ metadata:
 Prepare every report with the required [advisory template](assets/advisory-template.md);
 keep GitHub metadata separate from its description.
 
+Keep the [private reporting form](../../../.github/VULNERABILITY_REPORT.yml) and
+the template aligned when changing report requirements.
+
 ## Scope and privacy
 
 Follow the repository's current [SECURITY.md](../../../SECURITY.md). This contributor

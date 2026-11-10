@@ -96,7 +96,9 @@ context. When `[openshell.gateway.otlp.agent]` is enabled, the driver also
 sets `OPENSHELL_OTLP_AGENT_ENDPOINT`, which starts the supervisor's agent trace
 relay. Each endpoint is accompanied by its `_PROTOCOL` variable
 (`OPENSHELL_OTLP_PROTOCOL`, `OPENSHELL_OTLP_AGENT_PROTOCOL`) when the collector
-uses `http/protobuf`. None of these is configurable in driver TOML.
+uses `http/protobuf`. Collector headers and TLS material reach the supervisor
+in its launch credentials, not the Pod environment. None of these is
+configurable in driver TOML.
 
 The driver creates one namespace-wide `NetworkPolicy` before it releases any
 workload Pod. It selects every OpenShell workload, denies all workload egress,
@@ -260,8 +262,13 @@ fails closed.
   and the routing preface only selects which generation-pinned TLS identity
   the supervisor demands.
 
-The topology does not support upstream proxies or provider SPIFFE identity, and
-the shared supervisor is a single point of failure for the sandboxes it hosts.
+The topology does not support upstream proxies or provider SPIFFE identity.
+With a live replacement supervisor and a takeover-capable runtime, the gateway
+can move a paused sandbox generation to the replacement using a signed takeover
+grant. Recovery preserves workload processes and memory, but proxied connections
+and interactive sessions must reconnect. If recovery exceeds the configured
+deadline, the runtime terminates the workload. It cannot recover a lost workload
+Pod or node. See [supervisor recovery](../../docs/kubernetes/high-availability.mdx#recover-from-a-supervisor-failure).
 Shared sandbox instances export no supervisor OTLP traces or OCSF events and do
 not relay agent traces; the driver warns at startup when the gateway configures
 any of them.

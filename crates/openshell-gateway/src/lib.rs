@@ -73,8 +73,7 @@ pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
 fn install_mxc_compute_driver(registry: &mut ComputeDriverRegistry) {
     let registration = ComputeDriverRegistration::new("mxc", u16::MAX, None, MxcFactory)
         .expect("first-party driver name is valid")
-        .with_telemetry_category(TelemetryComputeDriver::anonymous_category("mxc"))
-        .with_local_singleplayer();
+        .with_telemetry_category(TelemetryComputeDriver::anonymous_category("mxc"));
     registry
         .install(registration)
         .expect("first-party driver names are unique");
@@ -204,7 +203,6 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
         .map(|registration| {
             registration
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("podman"))
-                .with_local_singleplayer()
                 .with_in_process_tracing(openshell_driver_podman::otel_tracing::TRACING)
         }),
         #[cfg(feature = "compute-driver-docker")]
@@ -217,14 +215,11 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
         .map(|registration| {
             registration
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("docker"))
-                .with_local_singleplayer()
                 .with_in_process_tracing(openshell_driver_docker::otel_tracing::TRACING)
         }),
         #[cfg(feature = "compute-driver-vm")]
         ComputeDriverRegistration::new("vm", u16::MAX, None, VmFactory).map(|registration| {
-            registration
-                .with_telemetry_category(TelemetryComputeDriver::anonymous_category("vm"))
-                .with_local_singleplayer()
+            registration.with_telemetry_category(TelemetryComputeDriver::anonymous_category("vm"))
         }),
     ] {
         registry
@@ -319,6 +314,7 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         let driver = std::sync::Arc::new(
             openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver),
         );
+        context.register_app_endpoints(driver.clone())?;
         Ok((
             openshell_server::ComputeDriverInstance::InProcess(driver.clone()),
             Some(driver),
@@ -332,6 +328,7 @@ fn kubernetes_config(
 ) -> openshell_core::Result<openshell_driver_kubernetes::KubernetesComputeConfig> {
     let mut config: openshell_driver_kubernetes::KubernetesComputeConfig =
         context.driver_config()?;
+    config.sandbox_runtime.app_listener.common = context.app_listener_config();
     config.sandbox_runtime_image = prefer_environment(
         config.sandbox_runtime_image,
         std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV).ok(),
@@ -749,3 +746,7 @@ mod tests {
         assert!(<VmFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&VmFactory));
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;

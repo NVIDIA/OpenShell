@@ -114,7 +114,7 @@ pub enum ObservedInstance {
     /// assigned this route.
     Pending,
     /// The host reconciled to that snapshot (or the route is not assigned)
-    /// and does not host the route.
+    /// and does not host the route, or the pool reports the route expired.
     Absent,
     /// The host's latest report of the instance.
     Reported(SandboxInstanceStatus),
@@ -187,6 +187,9 @@ pub struct PoolView {
     /// gateway replica that serves the owner, for judging instances whose
     /// owner streams to another replica.
     pub reports: BTreeMap<String, SandboxInstanceStatus>,
+    /// Routes whose owner's process has been gone past the runtime's
+    /// recovery deadline, so the runtime has ended their workloads.
+    pub expired: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for PoolView {
@@ -198,6 +201,7 @@ impl std::fmt::Debug for PoolView {
             .field("desired", &self.desired)
             .field("assignments", &self.assignments.keys().collect::<Vec<_>>())
             .field("reports", &self.reports.keys().collect::<Vec<_>>())
+            .field("expired", &self.expired)
             .finish()
     }
 }
@@ -356,6 +360,8 @@ struct Inner {
     /// stream attached or ended, or a member announced leaving.
     membership: watch::Sender<u64>,
     observed: Mutex<Observed>,
+    /// This replica's peer endpoint, sent in every `HostAccepted`.
+    peer_endpoint: Mutex<String>,
 }
 
 /// Gateway-owned desired assignments and observed status of the shared
@@ -406,8 +412,15 @@ impl SupervisorHostController {
                 revision: watch::Sender::new(0),
                 membership: watch::Sender::new(0),
                 observed: Mutex::new(Observed::default()),
+                peer_endpoint: Mutex::new(String::new()),
             }),
         }
+    }
+
+    /// Tell attaching hosts to dial their sandbox sessions to `peer_endpoint`.
+    /// Call it before any host attaches.
+    pub fn set_peer_endpoint(&self, peer_endpoint: String) {
+        *lock(&self.inner.peer_endpoint) = peer_endpoint;
     }
 
     /// Offer every instance's runtime `recovery_timeout_secs` instead of
@@ -757,6 +770,9 @@ impl SupervisorHostController {
         let desired = lock(&self.inner.desired);
         let pool = lock(&self.inner.pool);
         let observed = lock(&self.inner.observed);
+        if pool.view.expired.contains(route) {
+            return ObservedInstance::Absent;
+        }
         let Some(owner) = pool.view.owners.get(route) else {
             return ObservedInstance::NoHost;
         };
@@ -843,6 +859,7 @@ impl SupervisorHostController {
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
         let expires_at = identity.expires_at;
         let (session_id, superseded) = self.begin_session(identity, &hello)?;
+        let peer_endpoint = lock(&self.inner.peer_endpoint).clone();
         tx.send(Ok(HostGatewayMessage {
             payload: Some(host_gateway_message::Payload::Accepted(HostAccepted {
                 session_id: session_id.to_string(),
@@ -850,6 +867,7 @@ impl SupervisorHostController {
                     seconds: i64::try_from(heartbeat.as_secs()).unwrap_or(15),
                     nanos: 0,
                 }),
+                peer_endpoint,
             })),
         }))
         .await
@@ -1480,6 +1498,7 @@ mod tests {
                 .collect(),
             owners,
             reports: BTreeMap::new(),
+            expired: BTreeSet::new(),
         }
     }
 

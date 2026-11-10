@@ -10,6 +10,7 @@
 //! - Build version metadata
 
 pub mod activity;
+pub mod app_listener;
 pub mod auth;
 pub mod compute;
 pub mod config;
@@ -74,8 +75,8 @@ pub use config::{
     AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuthConfig,
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
     GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig, GatewayJwtConfig,
-    GatewayProviderProfileSourceConfig, ImagePullPolicy, MtlsAuthConfig, OidcConfig,
-    PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
+    GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig, MtlsAuthConfig,
+    OidcConfig, PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};

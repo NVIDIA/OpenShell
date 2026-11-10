@@ -729,6 +729,23 @@ fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gat
         sandbox_env::OTLP_AGENT_ENDPOINT_FLAG,
         sandbox_env::OTLP_AGENT_PROTOCOL_FLAG,
     );
+    if let Some(traces) = otlp_config.and_then(|otlp| otlp.traces.as_ref()) {
+        let collector = &traces.collector;
+        for (flag, path) in [
+            (sandbox_env::OTLP_CA_FILE_FLAG, collector.ca_file()),
+            (sandbox_env::OTLP_CERT_FILE_FLAG, collector.cert_file()),
+            (sandbox_env::OTLP_KEY_FILE_FLAG, collector.key_file()),
+        ] {
+            if let Some(path) = path {
+                command.arg(format!("--{flag}")).arg(path);
+            }
+        }
+    }
+    // The driver's own trace exporter reads this like any OTLP SDK; keeping
+    // it out of the arguments keeps the headers out of process listings.
+    if let Some(headers) = openshell_server::gateway_trace_headers(otlp_config) {
+        command.env("OTEL_EXPORTER_OTLP_TRACES_HEADERS", headers.expose_secret());
+    }
     // The driver names its own spans with the gateway name, and supervisors
     // name their spans, OCSF records, and relayed traces with it.
     if !otlp.is_empty() {
@@ -877,6 +894,81 @@ mod tests {
     }
 
     #[test]
+    fn vm_driver_receives_trace_headers_in_its_environment_only() {
+        crate::test_environment::Environment::new()
+            .remove("OTEL_EXPORTER_OTLP_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+            .run(|| {
+                let otlp: OtlpConfig = toml::from_str(
+                    "endpoint = 'http://collector.internal:4318'\n\
+                 headers = { authorization = 'Bearer secret-token' }\n",
+                )
+                .unwrap();
+                let mut command = tokio::process::Command::new("openshell-driver-vm");
+                append_otlp_args(&mut command, Some(&otlp), "production-us-west");
+
+                let env = command
+                    .as_std()
+                    .get_envs()
+                    .find(|(name, _)| *name == "OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+                    .and_then(|(_, value)| value)
+                    .map(|value| value.to_string_lossy().into_owned());
+                assert_eq!(env.as_deref(), Some("authorization=Bearer%20secret-token"));
+                assert!(
+                    command
+                        .as_std()
+                        .get_args()
+                        .all(|arg| !arg.to_string_lossy().contains("secret-token"))
+                );
+            });
+    }
+
+    #[test]
+    fn vm_driver_receives_the_trace_collectors_tls_file_paths() {
+        let dir = tempdir().unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["collector".into()]).unwrap();
+        let [ca, cert, key] = ["ca.pem", "client.pem", "client-key.pem"].map(|name| {
+            let path = dir.path().join(name);
+            let pem = if name == "client-key.pem" {
+                certified.signing_key.serialize_pem()
+            } else {
+                certified.cert.pem()
+            };
+            std::fs::write(&path, pem).unwrap();
+            path
+        });
+        let collector = OtlpCollectorConfig::new("https://collector:4317", OtlpProtocol::Grpc)
+            .with_tls_files(Some(ca.clone()), Some(cert.clone()), Some(key.clone()))
+            .unwrap();
+        assert!(collector.tls().client_identity().is_some());
+        let otlp = OtlpConfig {
+            service_name: None,
+            traces: Some(OtlpTracesConfig { collector }),
+            ocsf: None,
+            agent: None,
+        };
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_otlp_args(&mut command, Some(&otlp), "production-us-west");
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for (flag, path) in [
+            ("--otlp-ca-file", ca),
+            ("--otlp-cert-file", cert),
+            ("--otlp-key-file", key),
+        ] {
+            let pair = [flag.to_string(), path.display().to_string()];
+            assert!(
+                args.windows(2).any(|window| window == pair),
+                "{pair:?} in {args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn vm_driver_command_includes_gateway_otlp_configuration() {
         let mut command = tokio::process::Command::new("openshell-driver-vm");
         append_otlp_args(
@@ -884,10 +976,10 @@ mod tests {
             Some(&OtlpConfig {
                 service_name: Some("custom-gateway".to_string()),
                 traces: Some(OtlpTracesConfig {
-                    collector: OtlpCollectorConfig {
-                        endpoint: "http://collector.internal:4317".to_string(),
-                        protocol: OtlpProtocol::Grpc,
-                    },
+                    collector: OtlpCollectorConfig::new(
+                        "http://collector.internal:4317",
+                        OtlpProtocol::Grpc,
+                    ),
                 }),
                 ocsf: None,
                 agent: None,
@@ -916,10 +1008,10 @@ mod tests {
             Some(&OtlpConfig {
                 service_name: None,
                 traces: Some(OtlpTracesConfig {
-                    collector: OtlpCollectorConfig {
-                        endpoint: "http://collector.internal:4318".to_string(),
-                        protocol: OtlpProtocol::HttpProtobuf,
-                    },
+                    collector: OtlpCollectorConfig::new(
+                        "http://collector.internal:4318",
+                        OtlpProtocol::HttpProtobuf,
+                    ),
                 }),
                 ocsf: None,
                 agent: None,
@@ -951,10 +1043,10 @@ mod tests {
                 service_name: None,
                 traces: None,
                 ocsf: Some(OcsfOtlpConfig {
-                    collector: OtlpCollectorConfig {
-                        endpoint: "http://siem.internal:4318".to_string(),
-                        protocol: OtlpProtocol::HttpProtobuf,
-                    },
+                    collector: OtlpCollectorConfig::new(
+                        "http://siem.internal:4318",
+                        OtlpProtocol::HttpProtobuf,
+                    ),
                     schema_version: Some("2.0".into()),
                 }),
                 agent: None,
@@ -990,10 +1082,10 @@ mod tests {
                 traces: None,
                 ocsf: None,
                 agent: Some(AgentOtlpConfig {
-                    collector: OtlpCollectorConfig {
-                        endpoint: "http://agents.internal:4318".to_string(),
-                        protocol: OtlpProtocol::HttpProtobuf,
-                    },
+                    collector: OtlpCollectorConfig::new(
+                        "http://agents.internal:4318",
+                        OtlpProtocol::HttpProtobuf,
+                    ),
                 }),
             }),
             "production-us-west",
