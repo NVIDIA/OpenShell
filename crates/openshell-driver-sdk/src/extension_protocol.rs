@@ -15,7 +15,7 @@ pub const PROTOCOL_MINOR: u32 = 0;
 /// Capability for compute drivers that require gateway-minted launch credentials.
 ///
 /// Drivers require this capability when every launch needs a
-/// [`crate::jwt::SandboxLaunchAuthentication`] bundle. The gateway checks its
+/// `SandboxLaunchAuthentication` bundle. The gateway checks its
 /// configured signer before accepting sandbox creation.
 pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
 
