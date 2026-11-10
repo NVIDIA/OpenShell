@@ -18,25 +18,39 @@ pub const CLEANUP_TIMEOUT: Duration = Duration::from_mins(2);
 
 type HookFn = Box<dyn FnOnce() -> BoxFuture<'static, Result> + Send>;
 
+/// What a hook is registered for, so it can be registered once and cancelled.
+/// The variants are separate namespaces, so keys of different kinds never
+/// collide.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Key {
+    /// The hook that deletes the sandbox with this name.
+    Sandbox(String),
+}
+
 struct Hook {
     /// What the hook does, for reporting a failure.
     name: String,
     /// Registers the hook at most once; see [`Cleanup::push_keyed`].
-    key: Option<String>,
+    key: Option<Key>,
     run: HookFn,
 }
 
 impl Hook {
-    fn new<F, Fut>(name: String, key: Option<String>, hook: F) -> Self
+    fn new<F, Fut>(name: String, hook: F) -> Self
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result> + Send + 'static,
     {
         Self {
             name,
-            key,
+            key: None,
             run: Box::new(move || hook().boxed()),
         }
+    }
+
+    fn keyed(mut self, key: Key) -> Self {
+        self.key = Some(key);
+        self
     }
 }
 
@@ -54,25 +68,25 @@ impl Cleanup {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result> + Send + 'static,
     {
-        lock(&self.hooks).push(Hook::new(name.into(), None, hook));
+        lock(&self.hooks).push(Hook::new(name.into(), hook));
     }
 
     /// Add a hook unless one with `key` is registered, in which case the
     /// existing hook keeps its place in the order.
-    pub(crate) fn push_keyed<F, Fut>(&self, key: &str, name: impl Into<String>, hook: F)
+    pub(crate) fn push_keyed<F, Fut>(&self, key: Key, name: impl Into<String>, hook: F)
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result> + Send + 'static,
     {
         let mut hooks = lock(&self.hooks);
-        if !hooks.iter().any(|hook| hook.key.as_deref() == Some(key)) {
-            hooks.push(Hook::new(name.into(), Some(key.to_string()), hook));
+        if !hooks.iter().any(|hook| hook.key.as_ref() == Some(&key)) {
+            hooks.push(Hook::new(name.into(), hook).keyed(key));
         }
     }
 
     /// Drop the hook registered with `key`, if any, without running it.
-    pub(crate) fn remove(&self, key: &str) {
-        lock(&self.hooks).retain(|hook| hook.key.as_deref() != Some(key));
+    pub(crate) fn remove(&self, key: &Key) {
+        lock(&self.hooks).retain(|hook| hook.key.as_ref() != Some(key));
     }
 
     /// Run every hook, last registered first, each limited to `timeout`. A
@@ -121,7 +135,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use super::Cleanup;
+    use super::{Cleanup, Key};
+
+    fn sandbox(name: &str) -> Key {
+        Key::Sandbox(name.to_string())
+    }
     use crate::error::Error;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
@@ -130,7 +148,7 @@ mod tests {
 
     /// Register a hook, keyed if `key` is set, that records `name` in `log`
     /// when it runs.
-    fn record(cleanup: &Cleanup, key: Option<&str>, log: &Log, name: &'static str) {
+    fn record(cleanup: &Cleanup, key: Option<Key>, log: &Log, name: &'static str) {
         let log = Arc::clone(log);
         let hook = async move || {
             log.lock().unwrap().push(name);
@@ -160,12 +178,12 @@ mod tests {
     async fn keyed_hook_is_registered_once_and_can_be_removed() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let cleanup = Cleanup::default();
-        record(&cleanup, Some("a"), &log, "a");
+        record(&cleanup, Some(sandbox("a")), &log, "a");
         record(&cleanup, None, &log, "b");
         // Already registered: keeps its place before "b".
-        record(&cleanup, Some("a"), &log, "a again");
-        record(&cleanup, Some("c"), &log, "c");
-        cleanup.remove("c");
+        record(&cleanup, Some(sandbox("a")), &log, "a again");
+        record(&cleanup, Some(sandbox("c")), &log, "c");
+        cleanup.remove(&sandbox("c"));
         assert!(cleanup.run(TIMEOUT).await.is_empty());
         assert_eq!(*log.lock().unwrap(), ["b", "a"]);
     }
@@ -174,10 +192,10 @@ mod tests {
     async fn a_running_hook_can_change_the_remaining_hooks() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let cleanup = Cleanup::default();
-        record(&cleanup, Some("removed"), &log, "removed");
+        record(&cleanup, Some(sandbox("removed")), &log, "removed");
         let handle = cleanup.clone();
         cleanup.push("remove", async move || {
-            handle.remove("removed");
+            handle.remove(&sandbox("removed"));
             Ok(())
         });
         assert!(cleanup.run(TIMEOUT).await.is_empty());

@@ -4388,6 +4388,7 @@ dependencies = [
  "openshell-bootstrap",
  "openshell-core",
  "openshell-crypto",
+ "openshell-otel",
  "openshell-policy",
  "openshell-providers",
  "openshell-sdk",
@@ -4411,6 +4412,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wiremock",
 ]
 
 [[package]]
@@ -5333,11 +5335,13 @@ dependencies = [
  "openshell-ocsf",
  "openshell-ocsf-validate",
  "openshell-otel",
+ "openshell-otel-test-support",
  "openshell-policy",
  "openshell-policy-schema",
  "openshell-sandbox-backend",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost-types",
  "rcgen",
@@ -6709,7 +6713,6 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
- "serde_yaml",
  "spin",
  "thiserror 2.0.20",
 ]

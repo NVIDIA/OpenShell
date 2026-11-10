@@ -266,8 +266,9 @@ task running while using those endpoints.
 ### Viewing local traces
 
 The gateway exports OTLP/gRPC to
-`http://openshell-collector.observability.svc.cluster.local:4317` through the
-default Skaffold values. Forward OTLP/gRPC and the trace UI to the host:
+`http://openshell-collector.observability.svc.cluster.local:4317` through
+`ci/values-local-tracing.yaml`, which only `skaffold.yaml` layers. The Kubernetes
+E2E wrapper omits it, so E2E clusters export no traces. Forward OTLP/gRPC and the trace UI to the host:
 
 ```bash
 mise run helm:k3s:forward
@@ -278,9 +279,10 @@ Kubernetes compute-driver spans under their distinct service names, along with
 Agent Sandbox controller reconciliation spans linked through the Sandbox
 trace-context annotation. The same command exposes OTLP/gRPC on
 `http://127.0.0.1:4317` and, when deployed, the Kubernetes gateway on
-`http://127.0.0.1:8090`. The local `gateway:docker`, `gateway:podman`, and
-`gateway:vm` tasks detect the collector listener at startup and enable trace
-export, OCSF log export, and the agent trace relay only while it is reachable.
+`http://127.0.0.1:8090`. The local `gateway`, `gateway:docker`,
+`gateway:podman`, and `gateway:vm` tasks enable trace export, OCSF log export,
+and the agent trace relay only when `OPENSHELL_DEV_OTLP_ENDPOINT` is set, for
+example `OPENSHELL_DEV_OTLP_ENDPOINT=http://127.0.0.1:4317`.
 Spans an agent exports from inside a sandbox arrive through the supervisor's
 relay with `openshell.telemetry.source=agent` and share `openshell.sandbox.id`
 with that sandbox's supervisor spans.
@@ -642,6 +644,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/skaffold.yaml` | Skaffold config — images, Helm releases, values overlays |
 | `deploy/helm/openshell/values.yaml` | Default Helm values |
 | `deploy/helm/openshell/ci/values-skaffold.yaml` | Dev overrides (image pull policy, TLS disabled for local Skaffold) |
+| `deploy/helm/openshell/ci/values-local-tracing.yaml` | OTLP export to the `helm:k3s:create` collector (Skaffold only) |
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |

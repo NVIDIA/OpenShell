@@ -322,6 +322,16 @@ pub fn shared_control_policy(
     policy
 }
 
+/// Set the dedicated supervisor Pod's `runtimeClassName`. An empty class
+/// leaves it unset.
+#[must_use]
+pub fn with_runtime_class(mut pod: Pod, class: &str) -> Pod {
+    if let Some(spec) = pod.spec.as_mut().filter(|_| !class.is_empty()) {
+        spec.runtime_class_name = Some(class.to_string());
+    }
+    pod
+}
+
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub fn supervisor_pod(
     namespace: &str,
@@ -1080,6 +1090,25 @@ mod tests {
             .map(|volume| volume.name.clone())
             .collect();
         (env, volumes)
+    }
+
+    #[test]
+    fn supervisor_runtime_class_is_set_only_when_configured() {
+        let pod = Pod {
+            spec: Some(PodSpec::default()),
+            ..Default::default()
+        };
+        let class = |pod: Pod, name: &str| {
+            with_runtime_class(pod, name)
+                .spec
+                .unwrap()
+                .runtime_class_name
+        };
+        assert_eq!(class(pod.clone(), ""), None);
+        assert_eq!(
+            class(pod, "kata-supervisor").as_deref(),
+            Some("kata-supervisor")
+        );
     }
 
     #[test]

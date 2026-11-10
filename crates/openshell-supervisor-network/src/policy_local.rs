@@ -12,7 +12,7 @@ use openshell_core::proto::{
     SandboxPolicy as ProtoSandboxPolicy,
 };
 use openshell_ocsf::{
-    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit, sanitize_reason_for_audit,
+    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, sanitize_reason_for_audit,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -721,7 +721,7 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
 /// and the endpoint the agent is asking to reach — what a developer needs
 /// to see in the audit trace to correlate against the inbox card.
 fn emit_policy_propose_event(chunk_id: &str, summary: &str) {
-    ocsf_emit!(
+    crate::telemetry::egress_emit!(
         ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
@@ -741,7 +741,7 @@ fn emit_policy_propose_event(chunk_id: &str, summary: &str) {
 fn emit_policy_decision_event(chunk: &PolicyChunk) {
     let summary = summarize_chunk_for_audit(chunk);
     match chunk.status.as_str() {
-        "approved" => ocsf_emit!(
+        "approved" => crate::telemetry::egress_emit!(
             ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
@@ -763,7 +763,7 @@ fn emit_policy_decision_event(chunk: &PolicyChunk) {
             } else {
                 format!("\"{sanitized}\"")
             };
-            ocsf_emit!(
+            crate::telemetry::egress_emit!(
                 ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                     .severity(SeverityId::Low)
                     .status(StatusId::Success)

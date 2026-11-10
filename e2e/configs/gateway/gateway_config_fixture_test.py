@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_DIR = REPO_ROOT / "e2e/configs/gateway"
 TEST_GUEST_ROLE_PATH = (
     REPO_ROOT

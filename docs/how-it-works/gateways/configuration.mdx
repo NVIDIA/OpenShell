@@ -299,6 +299,11 @@ credential_drivers        = ["kubernetes-secrets"]
 
 ssh_session_ttl_secs  = 3600
 
+# Per-sandbox caps on concurrent relays. SSH sessions and service forwards
+# have separate budgets. Each defaults to 20 and must be at least 1.
+max_ssh_connections_per_sandbox     = 20
+max_service_connections_per_sandbox = 20
+
 # Absolute image preparation and initial supervisor startup budget.
 # Applies to new attempts only; allowed values are 1 through 86400 seconds.
 image_preparation_timeout_seconds = 1800
@@ -634,7 +639,7 @@ that the previous process has stopped, not that sharing a SQLite file enables HA
 
 ## Database Pool
 
-`[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving.
+`[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving. On Postgres, a caller that gets no connection within 5 seconds fails instead of waiting for the database to answer, usually with a retryable `UNAVAILABLE` error whose reason is `DATABASE_UNAVAILABLE`.
 
 Omit the key to use the backend default, which is unchanged from earlier releases:
 
@@ -834,6 +839,7 @@ Each OCSF event becomes one log record:
 | Timestamp | The OCSF `time`. The observed timestamp is when the gateway received the event. |
 | Severity | Unknown, Informational, and Other are INFO, Low is WARN, Medium is WARN2, High is ERROR, Critical is ERROR2, and Fatal is FATAL. The severity text is the OCSF severity name. |
 | Attributes | `ocsf.class_uid`, `ocsf.activity_id`, `ocsf.severity_id`, `ocsf.metadata.uid`, and, for events associated with a sandbox, `openshell.sandbox.id`. |
+| Trace context | The trace and span ID of the sampled span active when the event was emitted, for every OCSF class. Absent when no sampled span was active. |
 
 `schema_version` in this table is deprecated and ignored; the gateway logs a warning at startup when it is set.
 
@@ -1364,6 +1370,9 @@ workspace_default_storage_size = "10Gi"
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.
 # default_runtime_class_name   = "kata-containers"
+# Kubernetes RuntimeClass for dedicated supervisor pods. Only the administrator
+# sets it. It never inherits the workload class. Empty (default) = omit.
+# supervisor_runtime_class_name = "kata-supervisor"
 # Pod annotation keys that sandbox templates may set. Each entry is an exact
 # key or a `<domain>/*` wildcard. Empty (default) rejects every template
 # annotation. Keys under openshell.ai (OpenShell sandbox identity) and
@@ -1861,6 +1870,8 @@ openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
 Without `--path`, the command validates a nonempty `OPENSHELL_GATEWAY_CONFIG`. Otherwise, it validates an existing XDG gateway config when one is discovered. When neither source selects a config, preflight validates the effective daemon arguments. An explicit missing path, a legacy schema-v1 file, invalid TOML, a symlink, or any nonregular file fails. Preflight merges the selected file with the current `OPENSHELL_*` environment and applies the daemon's read-only startup checks. These checks include selector and socket normalization, registered-driver selection and configuration, rate-limit pairs, TLS and mTLS relationships, interceptor registrations, and supervisor middleware registrations. When a selected file omits `compute_driver`, preflight validates each configured table for an auto-detectable driver without running the runtime detection probes, which can connect local sockets or launch discovery commands. It validates configured driver TLS requirements, including the gateway CA, without requiring package-generated certificate files to exist before certificate generation. It does not construct a compute driver or connect to a transport. A failed preflight always preserves the file; it never migrates, replaces, or rewrites configuration.
 
 Config preflight validates configuration without loading launch-signing keys, so a successful result does not confirm that the key files exist or form a usable pair. Gateway startup validates configured or discovered signing bundles. Sandbox creation checks the selected driver's launch-signing requirement before image preparation.
+
+When `allow_unauthenticated_users = true`, preflight prints a warning to stderr and still exits 0.
 
 To validate the exact daemon arguments that a wrapper will pass, place them after
 `--` instead of using `--path`:

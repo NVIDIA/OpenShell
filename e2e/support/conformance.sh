@@ -23,6 +23,12 @@ e2e_require_openshell_bin() {
   export OPENSHELL_BIN="${binary_dir}/$(basename "${OPENSHELL_BIN}")"
 }
 
+# A pullable image for testkit::python_image() on lanes that can't load the
+# locally built openshell/e2e-python:dev into their compute platform. It
+# matches the Rust harness's E2E_WORKLOAD_IMAGE for those lanes.
+# shellcheck disable=SC2034 # Used by the scripts that source this file.
+E2E_PULLABLE_PYTHON_IMAGE="ghcr.io/astral-sh/uv:0.12.17-python3.12-trixie-slim@sha256:9a59bb7206905ccaae4f7dab222fbac47c125a21e5fc16f43f427cd6c940ade3"
+
 # Print the path of the openshell-conformance program: OPENSHELL_CONFORMANCE_BIN
 # if set, else a debug build from this checkout.
 e2e_openshell_conformance_bin() {

@@ -31,6 +31,9 @@ use tracing::debug;
 #[cfg(unix)]
 #[allow(unsafe_code, clippy::useless_conversion)]
 fn set_controlling_tty(fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: fd is the slave PTY of a pre-exec child that already ran
+    // setsid; argument zero requests ownership without stealing the
+    // terminal from another session.
     if unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -626,6 +629,9 @@ impl ProcessHandle {
             #[cfg(target_os = "linux")]
             let mut prepared_sandbox = prepared_sandbox;
             #[allow(unsafe_code)]
+            // SAFETY: pre_exec only registers the hook; the closure runs
+            // post-fork and pre-exec in the child process, never in the
+            // launcher parent.
             unsafe {
                 cmd.pre_exec(move || {
                     if let Some(slave_fd) = terminal_slave_fd {

@@ -150,6 +150,19 @@ when a placeholder is present but requests receive
 `credential_endpoint_mismatch`. A profileless static provider fails closed
 because the gateway cannot construct a binding.
 
+Usable credential placement is enforced automatically when both gateway and
+supervisor support it. `credential_placement_mismatch` means a placeholder is
+outside its declared header, query parameter, or path-template slot. Match the
+profile. Explicit body/WebSocket rewrite policies retain their documented
+behavior for ordinary credentials. Without placement metadata, a supporting
+supervisor permits only `Authorization` and those explicit rewrite policies;
+malformed metadata is rejected. For custom headers, query parameters, or path
+slots, update the imported profile with explicit placement and upgrade the
+gateway before the supervisor. Older gateways cannot forward placement metadata;
+older supervisors retain their previous behavior. Updating example YAML does not
+update an imported profile. Check provider readiness after changing placement and
+launch a new process if retained references were revoked.
+
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port
 must match. For a tunnel to `api.example.com:8443`, send
@@ -925,7 +938,12 @@ openshell sandbox exec work-session -- <client-command>
 The application owns the native base URL, model, request shape, and timeout.
 Launch a new process after attachment readiness so it inherits the installed provider environment. Use the `debug-inference` skill for endpoint, policy, credential-binding, or migration failures.
 
-For an ordinary static provider update, wait for the update and launch a new client process to obtain the new reference. Do not claim that readiness updates the environment of an existing process or retargets its old reference. Acknowledged detach revokes retained references and removes them from future process environments.
+For an ordinary static provider update, wait for the update and launch a new
+client process to obtain the new reference. Readiness does not update an
+existing process's environment or guarantee that it uses the replacement value.
+See [Runtime Limitations](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles#runtime-limitations)
+for retained revision and stable-placeholder behavior. Acknowledged detach
+revokes retained references and removes them from future process environments.
 
 ## Workflow 8: Gateway Management
 

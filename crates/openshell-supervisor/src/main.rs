@@ -18,7 +18,6 @@ use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_isolation_interface::contract::BackendDescriptor;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 mod logging;
@@ -466,6 +465,10 @@ fn main() -> Result<()> {
         return openshell_supervisor::check_control_readiness(&args.socket);
     }
 
+    openshell_ocsf::register_trace_correlation_extractor(
+        openshell_otel::current_ocsf_trace_correlation,
+    );
+
     let args = Args::parse();
     if args.mode == SupervisorMode::Shared {
         return shared::run(args);
@@ -574,7 +577,7 @@ fn main() -> Result<()> {
                 otlp_layer_provider
                     .as_ref()
                     .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
-                    .with_filter(otlp_span_filter(&args.log_level)),
+                    .with_filter(openshell_otel::supervisor_span_filter(&args.log_level)),
             )
             .init();
         if !file_available {
@@ -859,16 +862,6 @@ fn supervisor_resource_attributes(
         .collect()
 }
 
-/// A more verbose log level raises `openshell*` spans; dependency spans stay at
-/// INFO so they do not flood the exporter queue.
-fn otlp_span_filter(log_level: &str) -> EnvFilter {
-    let level = log_level
-        .parse::<LevelFilter>()
-        .unwrap_or(LevelFilter::INFO)
-        .max(LevelFilter::INFO);
-    EnvFilter::new(format!("info,openshell={level}"))
-}
-
 /// Choose the supervisor's exit status for a sandbox run.
 ///
 /// The reserved status tells the compute driver that the sandbox rejected the
@@ -1001,15 +994,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn otlp_span_filter_raises_only_openshell_targets() {
-        let directives = |log_level: &str| otlp_span_filter(log_level).to_string();
-        assert_eq!(directives("warn"), "openshell=info,info");
-        assert_eq!(directives("info"), "openshell=info,info");
-        assert_eq!(directives("debug"), "openshell=debug,info");
-        assert_eq!(directives("info,h2=debug"), "openshell=info,info");
-    }
 
     #[test]
     fn only_workspace_validation_failure_exits_with_reserved_status() {

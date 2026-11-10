@@ -343,6 +343,10 @@ request, which the read-only preset denies. Run `npm install --no-audit`, or
 replace `access: read-only` with explicit rules that also allow the audit's
 `POST` requests. An endpoint cannot combine `access` and `rules`.
 
+To set the option on a live sandbox without replacing the policy, add
+`allow-encoded-slash` to the `--add-endpoint` options segment of
+`openshell policy update`, which requires a `rest` or `websocket` endpoint.
+
 Verify that a scoped package lookup succeeds:
 
 ```shell
@@ -408,6 +412,11 @@ instead of broadening the range when an address changes.
 
 ### Allow WebSocket Messages
 
+REST endpoints refuse requests carrying an `Upgrade` header with `403 Forbidden`
+in both `enforce` and `audit` mode. To migrate a REST endpoint that previously
+relayed WebSocket traffic, configure a separate `protocol: websocket` endpoint
+on its own path or port with explicit upgrade and message rules.
+
 Use `protocol: websocket` to control WebSocket connections and the messages
 that clients send over them. This template requires `/usr/bin/node` and a
 WebSocket service you control. It permits the `/v1/realtime` upgrade and client
@@ -443,8 +452,9 @@ frames or messages from the server. If the endpoint carries provider
 credentials, OpenShell closes the connection with close code `1008` when the
 client sends a binary frame, because it cannot check the frame for credentials.
 Set `allow_uninspected_credentials: true` to relay binary frames anyway. Set
-`websocket_credential_rewrite: true` only when client text messages contain
-OpenShell credential placeholders that must be resolved.
+`websocket_credential_rewrite: true` when client text messages contain credential
+placeholders that must be resolved. This explicitly authorizes WebSocket text
+rewriting for ordinary static credentials, including credentials with HTTP placement metadata.
 
 When new network rules take effect, OpenShell closes open WebSocket connections,
 so the client must reconnect. The client might receive close code `1012`, or the
