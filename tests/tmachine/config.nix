@@ -274,7 +274,7 @@ let
   };
 
   # Runs a test family in a tmachine environment with tests/runner
-  # (`nix run .#openshell-test-runner -- --environment ubuntu-docker-rootful
+  # (`nix run .#openshell-test-runner -- run --environment ubuntu-docker-rootful
   # --installer deb --family conformance`). It cross-builds guest test bundles
   # and drives tmachine sessions, so it needs the toolchains and the VM tools.
   testRunner = pkgs.writeShellApplication {

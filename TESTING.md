@@ -224,7 +224,7 @@ Adapted from the handover notes in NVIDIA/OpenShell#4629 by Evan Lezar.
 
 ### Running suites in a tmachine environment (`tests/runner/`)
 
-`openshell-test-runner` runs a test family inside a tmachine VM, against the
+`openshell-test-runner run` runs a test family inside a tmachine VM, against the
 OpenShell that the VM's installer set up. `--family` is the path of the
 workspace under `tests/suites/`, such as `conformance` or `drivers/podman`, and
 `--package` narrows it to some of its packages. It must name a workspace, so
@@ -233,7 +233,7 @@ selects every row whose family is that name or lies under it, so `drivers`
 selects all the driver suites.
 
 ```shell
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful --installer deb \
   --family conformance --package conformance
 ```
@@ -256,7 +256,13 @@ names, as the program does, such as `--filter policy_advisor::`, rather than a
 nextest filterset. The runner runs the program's `ready`
 and `run` commands in the guest and still writes `junit.xml` and `nextest.log`
 (the program's output) to the results directory. Branch E2E builds
-`openshell-conformance` once and passes it to every conformance row this way. Two runs on one host
+`openshell-conformance` once and passes it to every conformance row this way.
+
+`openshell-test-runner build --family <family> --out <dir>` builds a family's
+test bundle for the guest without booting a VM, and `run --bundle <dir>` runs
+it instead of building one. `--package` then selects the tests to run from the
+bundle, which must hold those packages. Branch E2E builds the `features` and
+`drivers/podman` bundles once and passes them to their rows this way. Two runs on one host
 need different `TMACHINE_SSH_PORT` values (default 2222). The installer
 inputs, such as the Debian package and the images, come from `artifacts/`,
 built by `nix run .#build-artifacts` or downloaded by CI.
@@ -320,7 +326,7 @@ The Keycloak fixture is `tests/support/keycloak`. Run the suite that uses it
 with:
 
 ```shell
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful-keycloak --installer deb \
   --family features --package keycloak-provider-refresh
 ```
@@ -523,7 +529,7 @@ rebuilds only the RPMs. Run conformance against the installed RPMs:
 
 ```shell
 nix run .#build-artifacts
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment fedora-podman-rootful --installer rpm \
   --family conformance --package conformance
 ```
@@ -561,7 +567,7 @@ the gateway with one mode (`default`, `auto`, `keep-id` or `private`); only the
 `binaries` installer applies it:
 
 ```shell
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment fedora-podman-rootless-userns-keep-id --installer binaries \
   --gateway tmachine --family drivers/podman
 ```
@@ -572,7 +578,7 @@ drivers against installed deb packages on Ubuntu and rpm packages on Fedora.
 CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
 
 ```shell
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful --installer deb \
   --family features --package oci-image
 ```

@@ -390,7 +390,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `tests/testkit/` | Support library for SDK-driven end-to-end suites |
 | `tests/suites/` | End-to-end suites, grouped by test family |
 | `tests/tmachine/` | QEMU test machines provisioned with Ansible, and the `Session` API that drives them |
-| `tests/runner/` | `openshell-test-runner`: runs a test family in a tmachine environment and checks the results |
+| `tests/runner/` | `openshell-test-runner`: builds a test family for tmachine guests, runs it in a tmachine environment and checks the results |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |
