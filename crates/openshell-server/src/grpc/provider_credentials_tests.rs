@@ -166,7 +166,8 @@ async fn emits_one_disclosure_event_per_attempt_without_values() {
     assert_eq!(delivered["workspace"], "other");
     assert_eq!(delivered["provider"], "provider");
     assert_eq!(delivered["credential_keys"], "STATIC_KEY");
-    assert!(events[2]["unmapped"].get("provider").is_none());
+    assert_eq!(events[2]["unmapped"]["provider"], "provider");
+    assert!(events[2]["unmapped"].get("credential_keys").is_none());
     let recorded = serde_json::to_string(&events).unwrap();
     for secret in [
         "old-access-token",
@@ -179,6 +180,47 @@ async fn emits_one_disclosure_event_per_attempt_without_values() {
             "{secret} leaked into {recorded}"
         );
     }
+}
+
+#[tokio::test]
+async fn denied_and_invalid_attempts_keep_safe_target_attribution() {
+    let (state, _) = fixture().await;
+    let capture = openshell_ocsf::test_support::OcsfCapture::default();
+    let _guard = capture.install();
+    handle(
+        &state,
+        crate::grpc::test_support::authed_request(request(&["STATIC_KEY"])),
+    )
+    .await
+    .unwrap_err();
+    let mut mixed = request(&["STATIC_KEY", "API_KEY=secret-from-invalid-input"]);
+    mixed.name = "provider secret-from-invalid-input".into();
+    handle(&state, authenticated(mixed)).await.unwrap_err();
+    let mut mixed = request(&["STATIC_KEY", "API_KEY=secret-from-invalid-input"]);
+    mixed.workspace_scope = Some(workspace_selector("Bad secret-from-invalid-input"));
+    handle(&state, authenticated(mixed)).await.unwrap_err();
+
+    let events = crate::auth::audit::test_support::disclosure_events(&capture);
+    assert_eq!(events.len(), 3, "{events:?}");
+    let denied = &events[0]["unmapped"];
+    assert_eq!(denied["outcome"], "denied");
+    assert_eq!(denied["workspace"], "other");
+    assert_eq!(denied["provider"], "provider");
+    assert_eq!(denied["credential_keys"], "STATIC_KEY");
+    let bad_name = &events[1]["unmapped"];
+    assert_eq!(bad_name["outcome"], "failed");
+    assert_eq!(bad_name["workspace"], "other");
+    assert_eq!(bad_name["credential_keys"], "STATIC_KEY");
+    assert!(bad_name.get("provider").is_none());
+    let bad_workspace = &events[2]["unmapped"];
+    assert_eq!(bad_workspace["provider"], "provider");
+    assert_eq!(bad_workspace["credential_keys"], "STATIC_KEY");
+    assert!(bad_workspace.get("workspace").is_none());
+    let recorded = serde_json::to_string(&events).unwrap();
+    assert!(
+        !recorded.contains("secret-from-invalid-input"),
+        "leaked into {recorded}"
+    );
 }
 
 #[tokio::test]
