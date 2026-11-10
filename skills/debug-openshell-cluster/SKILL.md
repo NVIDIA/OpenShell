@@ -121,6 +121,14 @@ For Kubernetes mount-path conflicts, move caller PVC mounts away from
 These driver-managed paths remain reserved even for approved resources and
 `sub_path` mounts; changing approval labels does not resolve a path conflict.
 
+For dedicated Kubernetes supervisor placement, inspect the administrator's
+`supervisor_runtime_class_name` in the Kubernetes driver configuration and the
+supervisor Pod's `spec.runtimeClassName`. The setting is independent of the
+workload RuntimeClass and defaults to unset; it does not configure shared
+supervisor Deployments. If startup fails, check that the named RuntimeClass
+exists and its handler is available on eligible nodes. OpenShell does not retry
+with an ordinary supervisor Pod when the configured class is unavailable.
+
 For out-of-tree compute drivers, also check that their versioned admission-policy
 acknowledgement matches the gateway's policy. Configure standalone driver policy
 through its administrator-owned `--admission-config-json` option.
