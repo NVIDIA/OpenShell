@@ -87,6 +87,9 @@ version = 2
 [openshell.gateway.tls]
 # ... gateway listener TLS ...
 
+[openshell.gateway.metrics_tls]
+# ... dedicated metrics listener TLS ...
+
 [openshell.gateway.oidc]
 # ... JWT bearer auth ...
 
@@ -275,6 +278,11 @@ credential_drivers        = ["kubernetes-secrets"]
 
 ssh_session_ttl_secs  = 3600
 
+# Per-sandbox caps on concurrent relays. SSH sessions and service forwards
+# have separate budgets. Each defaults to 20 and must be at least 1.
+max_ssh_connections_per_sandbox     = 20
+max_service_connections_per_sandbox = 20
+
 # Absolute image preparation and initial supervisor startup budget.
 # Applies to new attempts only; allowed values are 1 through 86400 seconds.
 image_preparation_timeout_seconds = 1800
@@ -350,6 +358,14 @@ client_ca_path        = "/etc/openshell/certs/client-ca.pem"
 # external_cert_path    = "/etc/openshell/certs/external.pem"
 # external_key_path     = "/etc/openshell/certs/external-key.pem"
 # external_server_names = ["gateway.example.com"]
+
+# Dedicated metrics-listener TLS. Omit this table to retain the plaintext
+# metrics listener. Use a CA that is distinct from the gateway client CA.
+[openshell.gateway.metrics_tls]
+cert_path           = "/etc/openshell/metrics/server/tls.crt"
+key_path            = "/etc/openshell/metrics/server/tls.key"
+client_ca_path      = "/etc/openshell/metrics/client-ca/ca.crt"
+require_client_auth = true
 
 [openshell.gateway.gateway_jwt]
 signing_key_path = "/etc/openshell/jwt/signing.pem"
@@ -438,6 +454,61 @@ authentication mechanism accepts them or `allow_unauthenticated_users = true`.
 The client-certificate handshake policy has no `require_client_auth` TOML field. Client certificates are optional at the transport layer; gateway RPC authorization enforces the configured user or sandbox identity.
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
+
+## Metrics Listener TLS
+
+The dedicated metrics listener is configured with `metrics_bind_address`. It
+remains plaintext unless `[openshell.gateway.metrics_tls]` is configured, which
+preserves compatibility with existing Prometheus deployments. TLS for this
+listener is independent from `[openshell.gateway.tls]`: it has its own server
+certificate, optional client CA, and reload worker.
+
+```toml
+[openshell.gateway]
+metrics_bind_address = "0.0.0.0:9090"
+
+[openshell.gateway.metrics_tls]
+cert_path           = "/etc/openshell/metrics/server/tls.crt"
+key_path            = "/etc/openshell/metrics/server/tls.key"
+client_ca_path      = "/etc/openshell/metrics/client-ca/ca.crt"
+require_client_auth = true
+```
+
+`cert_path` and `key_path` are required whenever the table is present. Omit
+`client_ca_path` for HTTPS with anonymous scraping. Set `client_ca_path` and
+`require_client_auth = true` for mTLS; a client without a certificate, or with
+a certificate from another CA, cannot scrape `/metrics`. When
+`require_client_auth = false`, anonymous clients remain allowed, but any client
+certificate they present must validate against `client_ca_path`.
+
+The metrics client CA must be distinct from the gateway listener client CA. In
+Kubernetes, sandbox workloads receive gateway client credentials for their
+control-plane connection. Reusing that CA for metrics would let those workload
+identities access the metrics endpoint. The metrics server certificate may be
+the same certificate used by the gateway listener when its SANs cover the
+metrics Service DNS name.
+
+The listener watches its certificate, key, and optional client CA files. A
+valid change is applied without restarting the gateway; an invalid replacement
+keeps the last known-good configuration active. Reload logs and OCSF events
+include `listener=metrics` to distinguish this boundary from gateway TLS.
+
+If the metrics certificate, key, or client CA cannot be loaded at startup,
+the gateway continues serving its control-plane and health listeners but
+disables the metrics listener. It does not fall back to plaintext. Correct the
+mounted Secret and restart the gateway to restore metrics scraping. On
+Kubernetes, this applies to a Secret that exists with malformed contents: a
+Secret that is missing entirely, or a client CA Secret without a `ca.crt`
+key, never reaches the gateway, because kubelet fails the non-optional volume
+mounts and the pod does not start (`FailedMount`).
+
+For a Helm installation, set `metrics.tls.enabled=true` and provide the
+operator-managed Secret names through `metrics.tls.certSecretName` and, for
+mTLS, `metrics.tls.clientCaSecretName`. The chart does not create
+metrics-specific PKI or monitoring resources. It rejects a
+`metrics.tls.clientCaSecretName` that reuses the gateway client CA or client
+TLS Secret names; that comparison is by name only and cannot detect a
+different Secret holding the same CA.
 
 `[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup keeps the workload unstarted until the effective policy and matching provider configuration pass admission. A rejected startup exposes `ConfigurationInvalid` and remains available for policy/provider repair in either mode. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 
@@ -544,7 +615,7 @@ that the previous process has stopped, not that sharing a SQLite file enables HA
 
 ## Database Pool
 
-`[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving.
+`[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving. On Postgres, a caller that gets no connection within 5 seconds fails instead of waiting for the database to answer, usually with a retryable `UNAVAILABLE` error whose reason is `DATABASE_UNAVAILABLE`.
 
 Omit the key to use the backend default, which is unchanged from earlier releases:
 
@@ -600,7 +671,7 @@ Allow enough retention and disk space for shipper outages. Graceful shutdown all
 
 ## OTLP Export
 
-`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each can use its own collector.
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each can use its own collector. [OTLP Collectors](/observability/overview#otlp-collectors) shows where each signal goes.
 
 The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing diagnostic log events.
 
@@ -744,6 +815,7 @@ Each OCSF event becomes one log record:
 | Timestamp | The OCSF `time`. The observed timestamp is when the gateway received the event. |
 | Severity | Unknown, Informational, and Other are INFO, Low is WARN, Medium is WARN2, High is ERROR, Critical is ERROR2, and Fatal is FATAL. The severity text is the OCSF severity name. |
 | Attributes | `ocsf.class_uid`, `ocsf.activity_id`, `ocsf.severity_id`, `ocsf.metadata.uid`, and, for events associated with a sandbox, `openshell.sandbox.id`. |
+| Trace context | The trace and span ID of the sampled span active when the event was emitted, for every OCSF class. Absent when no sampled span was active. |
 
 `schema_version` in this table is deprecated and ignored; the gateway logs a warning at startup when it is set.
 
@@ -1271,6 +1343,9 @@ workspace_default_storage_size = "10Gi"
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.
 # default_runtime_class_name   = "kata-containers"
+# Kubernetes RuntimeClass for dedicated supervisor pods. Only the administrator
+# sets it. It never inherits the workload class. Empty (default) = omit.
+# supervisor_runtime_class_name = "kata-supervisor"
 # Pod annotation keys that sandbox templates may set. Each entry is an exact
 # key or a `<domain>/*` wildcard. Empty (default) rejects every template
 # annotation. Keys under openshell.ai (OpenShell sandbox identity) and
@@ -1769,6 +1844,8 @@ Without `--path`, the command validates a nonempty `OPENSHELL_GATEWAY_CONFIG`. O
 
 Config preflight validates configuration without loading launch-signing keys, so a successful result does not confirm that the key files exist or form a usable pair. Gateway startup validates configured or discovered signing bundles. Sandbox creation checks the selected driver's launch-signing requirement before image preparation.
 
+When `allow_unauthenticated_users = true`, preflight prints a warning to stderr and still exits 0.
+
 To validate the exact daemon arguments that a wrapper will pass, place them after
 `--` instead of using `--path`:
 
@@ -1865,3 +1942,23 @@ unnamed service on sandbox `demo` in workspace `default` uses SNI and Host
 the owning supervisor while preserving that hostname. Automatic discovery and
 application URL publication are separate work; current CLI URLs still identify
 the existing gateway path.
+
+Enabled supervisors report installed service routes through their authenticated
+gateway sessions. The gateway accepts only current configuration and ownership,
+resolves the supervisor endpoint through the compute driver, and expires
+installation evidence unless renewed. Reports do not establish application
+health or confirm that external ingress is ready. No additional reporting port
+or application credentials are required. Shared Kubernetes discovery selects the
+acknowledged pool owner's Pod IP and app port. The gateway revalidates the
+ownership term and live membership against shared storage. During takeover,
+old installations are withdrawn and the new endpoint appears only after the
+replacement installs the configuration. Application connections may need to
+reconnect; the sandbox workload and public URL remain unchanged.
+
+Shared listeners require both current configuration and a gateway-issued serving
+lease of at most fifteen seconds. Lease deadlines include queueing time; keep
+supervisor and gateway clocks synchronized. Loss of serving authority closes
+application streams even if configuration continues renewing. Under a partition,
+allow for pool membership failure detection before the last serving lease expires.
+Storage errors prevent lease renewal. Discovery expiry and serving expiry are
+separate from external ingress readiness.

@@ -47,9 +47,10 @@ experimental:
   - ./pages-v0.1.5/_components
   - ./pages-v0.1.6/_components
   - ./pages-v0.1.7/_components
+  - ./pages-v0.1.8/_components
   - ./components
 versions:
-- display-name: Latest (v0.1.7)
+- display-name: Latest (v0.1.8)
   path: ./versions/latest.yml
   slug: latest
   announcement:
@@ -60,6 +61,14 @@ versions:
 - display-name: Dev
   path: ./versions/dev.yml
   slug: dev
+  announcement:
+    message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>New
+      in OpenShell 0.1.x:</strong> a stable release cadence, new isolation primitives,
+      an expanded extension surface, and new APIs. <a href="https://docs.nvidia.com/openshell/dev/upgrade/0-1-0"
+      target="_blank" rel="noreferrer">Read the 0.1.0 upgrade guide</a>.</span>'
+- display-name: v0.1.8
+  path: ./versions/v0.1.8.yml
+  slug: v0.1.8
   announcement:
     message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>New
       in OpenShell 0.1.x:</strong> a stable release cadence, new isolation primitives,
@@ -138,22 +147,6 @@ versions:
       <a href="https://docs.nvidia.com/openshell/dev/upgrade/0-1-0" target="_blank"
       rel="noreferrer">Read the 0.1.0 upgrade guide</a>.</span>'
 redirects:
-- source: /openshell/dev/kubernetes/sandbox-runtime
-  destination: /openshell/dev/kubernetes/setup
-- source: /openshell/dev/about/how-it-works
-  destination: /openshell/dev/about/architecture
-- source: /openshell/dev/extensibility/extension-negotiation
-  destination: /openshell/dev/extensibility/overview#protocol-negotiation
-- source: /openshell/dev/providers/google-vertex-ai
-  destination: /openshell/dev/how-it-works/providers/google#vertex-ai
-- source: /openshell/dev/about/supported-agents
-  destination: /openshell/dev/about/run-your-first-agent
-- source: /openshell/dev/get-started/quickstart
-  destination: /openshell/dev/about/run-your-first-agent
-- source: /openshell/dev/about/why-open-shell
-  destination: /openshell/dev/about/overview
-- source: /openshell/dev/sdk/type-script
-  destination: /openshell/dev/sdk/typescript
 - source: /openshell/latest/kubernetes/sandbox-runtime
   destination: /openshell/latest/kubernetes/setup
 - source: /openshell/latest/about/how-it-works
@@ -190,6 +183,22 @@ redirects:
   destination: /openshell/latest/tutorials
 - source: /openshell/tutorials/:path*
   destination: /openshell/latest/tutorials/:path*
+- source: /openshell/dev/kubernetes/sandbox-runtime
+  destination: /openshell/dev/kubernetes/setup
+- source: /openshell/dev/about/how-it-works
+  destination: /openshell/dev/about/architecture
+- source: /openshell/dev/extensibility/extension-negotiation
+  destination: /openshell/dev/extensibility/overview#protocol-negotiation
+- source: /openshell/dev/providers/google-vertex-ai
+  destination: /openshell/dev/how-it-works/providers/google#vertex-ai
+- source: /openshell/dev/about/supported-agents
+  destination: /openshell/dev/about/run-your-first-agent
+- source: /openshell/dev/get-started/quickstart
+  destination: /openshell/dev/about/run-your-first-agent
+- source: /openshell/dev/about/why-open-shell
+  destination: /openshell/dev/about/overview
+- source: /openshell/dev/sdk/type-script
+  destination: /openshell/dev/sdk/typescript
 - source: /openshell/:path*/index.html
   destination: /openshell/:path*
 - source: /openshell/:path*.html

@@ -1,0 +1,384 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "OCSF JSON Export"
+sidebar-title: "OCSF JSON Export"
+description: "How to enable full OCSF JSON logging for SIEM integration, compliance, and structured analysis."
+keywords: "Generative AI, Cybersecurity, OCSF, JSON, SIEM, Compliance, Observability"
+---
+
+The [shorthand log format](/observability/logging) is optimized for humans and agents reading logs in real time. For machine consumption or SIEM integration, enable OCSF JSON output: one native JSON object per record. Collection is best-effort, not a guarantee of complete audit history.
+
+## Gateway Output
+
+Configure `[openshell.gateway.ocsf_log]` in `gateway.toml` to collect gateway-origin OCSF events into one JSONL file. This includes gateway-wide events such as TLS certificate reloads, even when no sandbox log stream applies. Collection preserves native OCSF fields and event IDs and does not depend on `RUST_LOG`.
+
+To send gateway OCSF events directly to an OpenTelemetry collector instead, enable [OCSF log export](/how-it-works/gateways/configuration#ocsf-log-export).
+
+The gateway writes OCSF events to a local JSONL file. Give each replica its own path and configure the shipper to follow renamed rotation segments. See [OCSF JSONL configuration](/how-it-works/gateways/configuration#ocsf-jsonl-output) for queue bounds, retention, loss metrics, and best-effort delivery limits.
+
+This output is separate from the supervisor stderr and file output described below. Enabling one does not enable the other. The gateway JSONL sink does not archive supervisor log lines pushed to the gateway; those lines carry OCSF shorthand text, not the full structured record.
+
+Gateway records use the configured gateway name for both `device.uid` and `device.name`. Replicas of one installation share that identity; `device.hostname` identifies the emitting replica. Assign distinct gateway names to installations whose events are collected together. Reusing a name, including the default name, groups those installations under the same identity. Renaming a gateway changes its audit identity.
+
+The gateway emits an Authentication (`class_uid: 3002`) event when it rejects a gRPC request during authentication. The caller receives the same error either way. It also emits one when a handler rejects a credential it checks itself: the SSH session token of a `ForwardTcp` SSH connection, or a compute-driver identity on `IssueSandboxToken` that no longer matches the sandbox's recorded runtime. Those events identify the already-authenticated caller in `user`. `auth_protocol` names the mechanism involved, when one applies: `OpenID` for OIDC bearer tokens, or `mtls`, `sandbox_jwt`, `compute_driver`, `k8s_service_account`, or `ssh_session_token`. `status_detail` holds the reason category:
+
+| Reason | Severity | Meaning |
+|---|---|---|
+| `missing_credential` | Low | No credential was presented. |
+| `expired_credential` | Low | The credential has expired. |
+| `conflicting_credentials` | Medium | An operator certificate arrived together with an `authorization` header. |
+| `malformed_credential` | Medium | The credential could not be parsed. |
+| `invalid_credential` | Medium | The credential failed signature, key, or claim verification. |
+| `audience_or_issuer_mismatch` | Medium | The credential was issued by or for a different party. |
+| `unknown_identity` | Medium | The credential names an identity the gateway does not recognize. |
+| `stale_identity` | Medium | The credential names a sandbox runtime or gateway pod that has since been replaced or stopped. |
+| `identity_provider_unavailable` | Medium | The OIDC key endpoint, Kubernetes API, compute driver, or gateway database could not verify the credential. |
+
+`src_endpoint` holds the address of the connection's immediate peer, which is the proxy or load balancer when one fronts the gateway, or the name `edge-tunnel` for requests carried over the WebSocket tunnel. `metadata.correlation_uid` holds the request's `x-request-id` when it is a UUID. The gateway generates one when the client sends none and returns it in the response. A client-supplied ID is recorded as sent, so it identifies the request, not the client.
+
+The gateway also emits an Informational Authentication event with `status: Success` the first time a replica accepts a credential, such as a bearer token, client certificate, or SSH session token. Later requests with the same credential emit nothing, so supervisor polling does not repeat the event. A refreshed token or renewed certificate is a new credential and logs on again, as does a credential still in use an hour later. Each replica records its own logons, and a replica tracking more than 16,384 credentials forgets the oldest early. `user` identifies the principal the same way `actor.user` does for authorization denials, described below. The `src_endpoint` and `metadata.correlation_uid` come from the request that logged on. A sandbox credential on `IssueSandboxToken` or `RefreshSandboxToken` logs on only after the gateway has checked the sandbox's recorded runtime or token lineage, so a credential that fails that check records no successful logon. Requests admitted by `auth.allow_unauthenticated_users`, or by a gateway with no authentication configured, emit no success event, though SSH session tokens they present still log on. To select only rejected requests, filter Authentication events on `status_id: 2` (Failure) rather than on `class_uid` alone.
+
+These events never include presented credentials, other request headers, or verification error text.
+
+The gateway emits an API Activity (`class_uid: 6003`) event with Medium severity when its method, role, scope, sandbox, workspace, or operator checks refuse an authenticated caller. `actor.user` identifies the principal: its `type` is `User`, `Admin` for an mTLS operator, `Sandbox`, or `Gateway Peer`, and `uid` is the subject, sandbox ID, or gateway replica ID. `api.operation` names the gRPC method, and `resources` names the sandbox, workspace, or extension service that was refused, when one applies, by `uid` for a sandbox ID or by `name` otherwise. `status_detail` holds the reason category:
+
+| Reason | Meaning |
+|---|---|
+| `method_not_permitted` | The principal type may not call the method, or may not call it with these arguments. |
+| `unknown_method` | The gateway does not recognize the method, for example one added in a newer client. |
+| `missing_role` | The caller lacks the OIDC role the method requires. |
+| `missing_scope` | The caller's token lacks the scope the method requires. |
+| `cross_sandbox` | A sandbox principal referenced a sandbox other than its own, by ID or by name. |
+| `not_workspace_member` | The caller is not a member of the workspace. |
+| `insufficient_workspace_role` | The caller's workspace role is below the one the operation requires. |
+| `platform_admin_required` | The operation spans workspaces or assigns the workspace admin role. |
+| `operator_required` | The operation requires a verified mTLS operator. |
+| `extension_service_not_selected` | A sandbox requested a credential for an extension service its policy does not select. A policy update can race the request, so this raises no finding. |
+
+When a sandbox principal is refused with `method_not_permitted`, `cross_sandbox`, or `platform_admin_required`, the gateway also emits a High-severity Detection Finding (`class_uid: 2004`) with `finding_info.uid` `sandbox-authorization-boundary`. Supervisors never make these requests, so the sandbox's credential may be compromised. Both events carry the same `metadata.correlation_uid`. Some methods answer a refused request with "not found" so callers cannot probe for resources; the event still records the denial.
+
+Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
+
+## Enable Sandbox JSON Export
+
+Use the `ocsf_json_enabled` setting to toggle JSON export. The setting can be applied globally, for all sandboxes, or per-sandbox.
+
+Global:
+
+```shell
+openshell settings set --global --key ocsf_json_enabled --value true
+```
+
+Per-sandbox:
+
+```shell
+openshell settings set my-sandbox --key ocsf_json_enabled --value true
+```
+
+The setting takes effect on the next poll cycle, by default every 10 seconds. No sandbox restart is required.
+
+To disable:
+
+```shell
+openshell settings set --global --key ocsf_json_enabled --value false
+```
+
+### Windows MXC gateways
+
+MXC audit events originate in the Windows gateway rather than an in-sandbox
+supervisor. Enable the MXC ETW consumer in `gateway.toml`, then explicitly opt
+the gateway into durable JSONL output:
+
+```toml
+[openshell.drivers.mxc]
+etw_audit = true
+```
+
+```powershell
+$env:OPENSHELL_OCSF_JSON = "1"
+# Optional; defaults to %PROGRAMDATA%\OpenShell\logs.
+$env:OPENSHELL_OCSF_LOG_DIR = "D:\OpenShell\audit"
+openshell-gateway --drivers mxc --config gateway.toml
+```
+
+This environment-configured sink is available on all platforms independently of
+the selected compute driver. On Unix hosts its default directory is
+`$XDG_STATE_HOME/openshell/logs` (or `$HOME/.local/state/openshell/logs`). It rotates
+daily and retains the three most recent files. Diagnostic `--log-level` values
+do not suppress records in this explicitly enabled audit sink.
+Prefer the `gateway.toml` output above for configured retention and loss metrics;
+enabling both sinks writes to both independently.
+
+## Output Location
+
+When `ocsf_json_enabled=true`, sandbox supervisors emit full OCSF JSON to stderr alongside shorthand output:
+
+```text
+2026-10-07T23:21:19.000Z OCSF NET:OPEN [MED] DENIED ...
+2026-10-07T23:21:19.000Z OCSF-JSON {"class_uid":4001,...}
+```
+
+The example payload is abbreviated. Each actual `OCSF-JSON` line contains one complete compact JSON object. Configure your collector to match the `OCSF-JSON` token after the UTC timestamp and decode everything after the following space as JSON. Select these lines to avoid ingesting the shorthand copy of each event. The JSON preserves the original `metadata.uid`.
+
+Collect stderr through the supervisor's platform log interface:
+
+```shell
+docker logs --follow <supervisor-container>
+podman logs --follow <supervisor-container>
+kubectl -n <sandbox-namespace> logs <supervisor-pod> -c supervisor --follow
+```
+
+JSON stderr output works independently of writable log storage and the diagnostic log filter. Disabling the setting stops new JSON records. The console writer uses a bounded queue of 1,024 complete lines shared by diagnostics, shorthand, and JSON; when the queue is full, new lines are dropped rather than blocking enforcement. Delivery is best-effort, and retention depends on your runtime and external collector. The gateway log API and `openshell logs` continue to return shorthand.
+
+When file logging is available, supervisors also write plain JSONL to `/var/log/openshell-ocsf.YYYY-MM-DD.jsonl` in their own filesystem, separate from the workload. `openshell sandbox exec` cannot read those files. File output requires a writable `/var/log`; a missing file sink does not disable JSON stderr output.
+
+This file contains supervisor-originated events, not the [sandbox-runtime events](/observability/accessing-logs#main-process-output) emitted into workload container logs.
+
+Supervisor files rotate daily with an independent three-file limit per format. Docker and Podman store them on tmpfs; Kubernetes stores them in the supervisor pod's `emptyDir`. For durable retention, arrange external collection before rotation or teardown. See [supervisor file access](/observability/accessing-logs#direct-filesystem-access) for collection paths and best-effort limits.
+
+Windows MXC gateway records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCSF_LOG_DIR`. That sink also rotates daily and retains the three most recent files. The separate `[openshell.gateway.ocsf_log]` sink uses its configured path and retention.
+
+## JSON Record Structure
+
+Gateway-produced records use the `OpenShell Gateway` product identity; supervisor records use `OpenShell Sandbox Supervisor`. Gateway records keep the gateway host in `device` and use `unmapped.sandbox_id` and, when available, `unmapped.sandbox_name` for sandbox attribution from the event context. API Activity `resources` describe request targets and do not determine sandbox log routing or the OTLP `openshell.sandbox.id` attribute. Cross-sandbox authorization denials remain gateway-wide, even when a resource names the requested sandbox. Authentication records do not attach a sandbox container.
+
+For gateway-produced records, `device.os.name` and `device.os.type_id` identify the OS running the gateway process: Linux (200), Windows (100), or macOS (300). Linux supervisor records continue to report Linux, regardless of the gateway's OS. A native macOS gateway therefore reports macOS while its Linux sandboxes report Linux; a gateway running inside a Linux container reports Linux, even on a Mac host.
+
+`metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. For supervisor records, use `device.container.uid` to associate the event with its sandbox and `device.container.name` for the sandbox name. These records declare the `container` profile in `metadata.profiles`. Records without a sandbox association omit `device.container`.
+
+Docker and Podman supervisor records include `device.container.image.uid`, the immutable workload image ID resolved at launch, and `device.container.image.name` when the requested image reference is available. The UID identifies the workload image, even when a mutable tag later changes. When the driver has not supplied a resolved image UID, including Kubernetes, VM, and shared-supervisor records, events omit `device.container.image` and preserve any known image reference in `unmapped.container_image`.
+
+<Warning>
+Sandbox identity has moved from top-level `container` to `device.container` for supervisor records, and to `unmapped.sandbox_id` and `unmapped.sandbox_name` for gateway records, to conform to OCSF 1.8.0. Update SIEM mappings and parsers, including XSIAM content pack rules that read `container.uid` or `container.name`, to use the paths for the producing component. Image-based filters should also read `unmapped.container_image` when `device.container.image` is absent.
+</Warning>
+
+Some fields depend on the event class:
+
+- SSH Activity records name the supervisor's SSH server as `dst_endpoint`, with `svc_name: "ssh"` and the listen socket path in `name`, because the server listens on a Unix socket rather than a network address.
+- Process Activity records from the sandbox name the `openshell-sandbox` launcher as `actor.process`.
+- `connection_info` carries `direction_id` and `direction`. OpenShell reports Unknown (`0`) where it does not track the direction.
+
+Each JSONL file line, or the payload after the stderr marker, is a complete OCSF v1.8.0 JSON object. Supervisor records identify the sandbox under `device.container` and validate against OCSF v1.8.0 without a top-level `container` exception. Here is an example of a network connection event:
+
+```json
+{
+  "class_uid": 4001,
+  "class_name": "Network Activity",
+  "category_uid": 4,
+  "category_name": "Network Activity",
+  "activity_id": 1,
+  "activity_name": "Open",
+  "type_uid": 400101,
+  "type_name": "Network Activity: Open",
+  "severity_id": 1,
+  "severity": "Informational",
+  "status_id": 1,
+  "status": "Success",
+  "time": 1775014138811,
+  "message": "CONNECT allowed api.github.com:443",
+  "metadata": {
+    "product": {
+      "name": "OpenShell Sandbox Supervisor",
+      "vendor_name": "OpenShell",
+      "version": "0.1.4"
+    },
+    "version": "1.8.0"
+  },
+  "action_id": 1,
+  "action": "Allowed",
+  "disposition_id": 1,
+  "disposition": "Allowed",
+  "dst_endpoint": {
+    "domain": "api.github.com",
+    "port": 443
+  },
+  "src_endpoint": {
+    "ip": "10.42.0.31",
+    "port": 37494
+  },
+  "actor": {
+    "process": {
+      "name": "/usr/bin/curl",
+      "pid": 57
+    }
+  },
+  "firewall_rule": {
+    "name": "github_api",
+    "type": "opa"
+  }
+}
+```
+
+And a denied connection, produced when `curl https://github.com` runs in a sandbox without a network policy that allows `github.com`:
+
+```json
+{
+  "class_uid": 4001,
+  "class_name": "Network Activity",
+  "category_uid": 4,
+  "category_name": "Network Activity",
+  "activity_id": 1,
+  "activity_name": "Open",
+  "type_uid": 400101,
+  "type_name": "Network Activity: Open",
+  "time": 1791996125789,
+  "severity_id": 3,
+  "severity": "Medium",
+  "status_id": 2,
+  "status": "Failure",
+  "message": "Transparent TCP denied before relay: network connections not allowed by policy",
+  "status_detail": "transparent_tcp_policy_denied",
+  "metadata": {
+    "version": "1.8.0",
+    "product": {
+      "name": "OpenShell Sandbox Supervisor",
+      "vendor_name": "OpenShell",
+      "version": "0.1.4"
+    },
+    "profiles": [
+      "security_control",
+      "network_proxy",
+      "container",
+      "host"
+    ],
+    "uid": "b885957d-124a-4af7-9eef-75cc410ff070"
+  },
+  "device": {
+    "hostname": "docker-desktop",
+    "type_id": 99,
+    "type": "Sandbox",
+    "os": {
+      "name": "Linux",
+      "type_id": 200,
+      "type": "Linux"
+    },
+    "container": {
+      "name": "docs-deny",
+      "uid": "3949f6fc-2b84-45b2-a631-46debe41d84f"
+    }
+  },
+  "dst_endpoint": {
+    "domain": "github.com",
+    "ip": "198.18.0.2",
+    "port": 443
+  },
+  "proxy_endpoint": {
+    "ip": "127.0.0.1",
+    "port": 3128
+  },
+  "actor": {
+    "process": {
+      "name": "/usr/bin/curl",
+      "pid": 2187,
+      "cmd_line": "curl https://github.com"
+    }
+  },
+  "action_id": 2,
+  "action": "Denied",
+  "disposition_id": 2,
+  "disposition": "Blocked",
+  "is_src_dst_assignment_known": true
+}
+```
+
+<Note>
+The JSON examples above are formatted for readability. The actual JSONL file contains one JSON object per line with no whitespace formatting.
+</Note>
+
+## Refusal Records
+
+Every record that describes a refusal sets `action` to `Denied`. On Network and HTTP Activity, `disposition` is `Blocked`, except for FORWARD requests with an unsupported scheme, which report `Rejected`. Besides policy denials, this includes:
+
+- FORWARD requests the proxy rejects as unparsable, non-canonical, or invalid GraphQL or JSON-RPC.
+- L7 evaluation errors under `enforcement: enforce`. Under `enforcement: audit` they report `action` Other and `disposition` Allowed, because the request proceeds.
+- Google Cloud metadata server emulation responses with status 403 or 405.
+- Fail-closed request, response, and WebSocket middleware, including the HTTP Activity record for a fail-closed response stage and the Detection Findings for a fail-closed stage or chain or a failed post-middleware policy evaluation.
+- Response delivery the supervisor refuses because middleware stopped it, its preflight failed, or the upstream response head could not be normalized for it.
+
+Count these records when you track denials, for example with `select(.action == "Denied")`.
+
+## Follow a Deny Trace
+
+HTTP Activity and API Activity records emitted inside a sampled OpenTelemetry span carry `trace.uid` and list `trace` in `metadata.profiles`. These are the classes OCSF 1.8.0 declares the Trace profile for. The UID is the W3C trace ID, 32 lowercase hexadecimal characters. Search for it in your Jaeger or Tempo backend. A sampled ID does not guarantee export or retention in the trace backend.
+
+```json
+{
+  "metadata": { "profiles": ["container", "host", "network_proxy", "security_control", "trace"] },
+  "trace": { "uid": "0af7651916cd43dd8448eb211c80319c" }
+}
+```
+
+OTLP log export links every OCSF record, whatever its class, to the active sampled span through the log record's own trace and span ID fields. Use those fields for log-to-trace links in your backend.
+
+With OTLP trace export enabled on a dedicated supervisor, denied HTTP requests can create an INFO `supervisor.egress.deny` span around the audit records for that decision. The span records the policy, reason, and destination when available. At the default log level, every deny span is a root span. At debug level, FORWARD policy, destination, credential-binding, and request middleware denials can join the available connect trace and its authorization, resolve, and dial spans. Other deny spans, including L7 denials inside CONNECT tunnels and response middleware denials, remain root spans. Shared supervisor hosts do not initialize OTLP exporters, so their records carry no trace correlation. Workload `traceparent` headers never supply supervisor correlation.
+
+To bound telemetry volume when a workload retries blocked destinations, the supervisor creates at most 10 deny spans per destination at once and one more per second after that. A process-wide budget also allows at most 100 spans at once and refills at 100 per second across destinations. Rate-limited decisions create no additional deny span, while all audit records are still emitted. Records can retain correlation to an already active sampled span, including a connect span at debug level.
+
+Gateway records and their OTLP trace context can inherit the caller's incoming `traceparent`, including before authentication succeeds. The caller also decides whether they are correlated at all, because an unsampled `traceparent` suppresses `trace.uid`. Treat gateway trace IDs as correlation hints, not evidence of the caller's identity, and do not treat a missing `trace.uid` as meaningful.
+
+## OCSF Event Classes in JSON
+
+The `class_uid` field identifies the event type:
+
+| `class_uid` | Class | Shorthand prefix |
+|---|---|---|
+| 0 | Base Event | `EVENT` |
+| 4001 | Network Activity | `NET:` |
+| 4002 | HTTP Activity | `HTTP:` |
+| 4007 | SSH Activity | `SSH:` |
+| 1007 | Process Activity | `PROC:` |
+| 2004 | Detection Finding | `FINDING:` |
+| 3002 | Authentication | `AUTH:` |
+| 5019 | Device Config State Change | `CONFIG:` |
+| 6002 | Application Lifecycle | `LIFECYCLE:` |
+| 6003 | API Activity | `API:` |
+
+HTTP Activity records include request or response details. Rejections that have
+parsed a request, including early credential-binding failures, include safe
+method-only request context and the generated response.
+
+Connection-error records include the known peer or listening endpoint.
+
+Policy configuration warnings use Device Config State Change.
+
+Unix socket relay and relay-control notifications, and proxy or mediation
+failures without an observed network endpoint, use Base Event (`class_uid: 0`).
+Include these classes when filtering supervisor operational events. Relay-control
+records that previously appeared as `NET:*` now appear as `EVENT`.
+
+## Schema Version
+
+OpenShell emits OCSF v1.8.0 only. The `ocsf_schema_version` sandbox setting and the gateway `schema_version` fields under `[openshell.gateway.ocsf_log]` and `[openshell.gateway.otlp.ocsf]` are deprecated and ignored; remove them from your configuration. The gateway logs a warning at startup for each field that is set, and a sandbox reports a set `ocsf_schema_version` as a Device Config State Change event.
+
+## Integration with External Tools
+
+The JSONL file can be shipped to any tool that accepts OCSF-formatted data:
+
+| Tool | Integration Path |
+|---|---|
+| Splunk | Use the [Splunk OCSF Add-on](https://splunkbase.splunk.com/app/6943) to ingest OCSF JSONL files. |
+| Amazon Security Lake | OCSF is the native schema for Security Lake. |
+| CrowdStrike FDR | Ship JSONL files to Falcon Data Replicator. |
+| Elastic | Use Filebeat to ship JSONL files with the OCSF field mappings. |
+| Custom pipelines | Parse the JSONL file with `jq`, Python, or any JSON-capable tool. |
+
+After [copying supervisor files](/observability/accessing-logs#direct-filesystem-access) into `./supervisor-logs`, use `jq` to extract all denied connections:
+
+```shell
+jq -c 'select(.action == "Denied")' ./supervisor-logs/openshell-ocsf.*.jsonl
+```
+
+## Relationship to Shorthand Logs
+
+Sandbox events identify the sandbox environment with `device.type_id: 99` (Other) and `device.type: "Sandbox"`. The operating system is reported separately in `device.os.name`; the device type does not classify the underlying host or compute backend.
+
+The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.jsonl` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the full structured record. Both formats are generated at the same time from the same event data.
+
+Shorthand stderr output follows the diagnostic log filter; its local file is available when file logging starts successfully. JSON stderr and file export are opt-in through `ocsf_json_enabled`. File export requires the supervisor's JSONL sink to start successfully; stderr export is independent of that sink.
+
+## Next Steps
+
+- See the [Observability Overview](/observability/overview) to compare JSONL files with OTLP log export.
+- Learn how to [read the shorthand format](/observability/logging) for real-time monitoring.
+- Refer to the [OCSF specification](https://schema.ocsf.io/) for the full schema reference.
