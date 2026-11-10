@@ -18,8 +18,8 @@ pub enum Poll<T> {
 /// Fail unless `future` finishes within `timeout`. For a deadline shorter
 /// than the step's own, such as one that must fit inside the runner's kill.
 pub async fn with_deadline<T>(
-    timeout: Duration,
     what: &str,
+    timeout: Duration,
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     tokio::time::timeout(timeout, future)

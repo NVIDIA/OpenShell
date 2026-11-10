@@ -225,7 +225,7 @@ USER app
             );
             // Require the condition reason, so another provisioning failure
             // cannot pass as a workspace rejection.
-            let sandbox = oci.cx.sandbox_details(&name).await?;
+            let sandbox = oci.cx.adopt(&name).await?.get_json().await?;
             let reasons: Vec<&str> = sandbox["conditions"]
                 .as_array()
                 .into_iter()
@@ -284,7 +284,7 @@ impl Oci<'_> {
         );
         let mut builder = self.cx.cli_sandbox(short).image(&image.tag);
         if let Some(policy) = policy {
-            builder = builder.policy(policy);
+            builder = builder.policy_yaml(policy);
         }
         let name = builder
             .command(["sh", "-c", &main])

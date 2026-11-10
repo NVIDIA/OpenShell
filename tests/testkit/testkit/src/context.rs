@@ -105,6 +105,7 @@ impl Context {
         SandboxBuilder {
             client: self.client.clone(),
             grpc: self.grpc.clone(),
+            cli: self.cli.clone(),
             policy: None,
             cleanup: self.cleanup.clone(),
             spec: SandboxSpec {
@@ -120,16 +121,6 @@ impl Context {
     /// [`Context::sandbox`] otherwise.
     pub fn cli_sandbox(&self, suffix: &str) -> CliSandboxBuilder<'_> {
         CliSandboxBuilder::new(self, self.name(suffix))
-    }
-
-    /// `sandbox get --output json` for sandbox `name`. It reports fields the
-    /// SDK does not expose, such as `restart_count`, `restart_policy`,
-    /// `main_process_instance_id`, and `conditions`.
-    pub async fn sandbox_details(&self, name: &str) -> Result<serde_json::Value> {
-        self.cli(["sandbox", "get", name, "--output", "json"])
-            .await?
-            .success()?
-            .json()
     }
 
     /// Track a sandbox the test is about to create through the CLI, so cleanup
@@ -192,52 +183,11 @@ impl Context {
         Ok(Sandbox {
             client: self.client.clone(),
             grpc: self.grpc.clone(),
+            cli: self.cli.clone(),
             cleanup: self.cleanup.clone(),
             name: name.to_string(),
             id: found.id,
         })
-    }
-
-    /// Wait up to `timeout` for the gateway to remove the sandbox by itself,
-    /// for example after a `--no-keep` main command exits, then check it is
-    /// gone from both get and list.
-    pub async fn wait_absent(&self, sandbox: &Sandbox, timeout: Duration) -> Result {
-        self.client
-            .wait_deleted(sandbox.name(), timeout, Some(sandbox.id()))
-            .await
-            .context(format!("wait for sandbox {} to be removed", sandbox.name()))?;
-        self.expect_absent(sandbox).await
-    }
-
-    /// Delete the sandbox, then check it is gone from both get and list.
-    pub async fn delete_and_expect_absent(&self, sandbox: &Sandbox) -> Result {
-        sandbox.delete().await?;
-        self.expect_absent(sandbox).await
-    }
-
-    /// Fail unless the sandbox is gone from both get and list.
-    pub async fn expect_absent(&self, sandbox: &Sandbox) -> Result {
-        let name = sandbox.name();
-        match self.client.get_sandbox(name).await {
-            Err(SdkError::NotFound { .. }) => {}
-            Err(error) => return Err(Error::from(error).context(format!("get sandbox {name}"))),
-            Ok(found) => {
-                return Err(Error::msg(format!(
-                    "sandbox {name} still exists (id {}, phase {:?})",
-                    found.id, found.phase
-                )));
-            }
-        }
-        let listed = self
-            .client
-            .list_all_sandboxes(ListOptions::default())
-            .await
-            .context("list sandboxes")?;
-        crate::ensure!(
-            !listed.iter().any(|entry| entry.name == name),
-            "sandbox {name} is absent from get but still listed"
-        );
-        Ok(())
     }
 
     /// Fail unless the gateway runs exactly one compute driver, `name`, as
@@ -267,25 +217,6 @@ impl Context {
         crate::ensure!(
             matches!(drivers.as_slice(), [(configured, reported)] if *configured == name && *reported == name),
             "the gateway reports compute drivers (name, driver name) {drivers:?}; expected only {name}"
-        );
-        Ok(())
-    }
-
-    /// Fail unless `list` shows the sandbox in `phase`.
-    pub async fn expect_listed(&self, sandbox: &Sandbox, phase: SandboxPhase) -> Result {
-        let name = sandbox.name();
-        let listed = self
-            .client
-            .list_all_sandboxes(ListOptions::default())
-            .await
-            .context("list sandboxes")?;
-        let entry = listed.iter().find(|entry| entry.name == name);
-        crate::ensure!(entry.is_some(), "sandbox {name} is not listed");
-        let entry = entry.expect("checked above");
-        crate::ensure!(
-            entry.phase == phase,
-            "sandbox {name} is listed in phase {:?}; expected {phase:?}",
-            entry.phase
         );
         Ok(())
     }
@@ -344,6 +275,7 @@ impl Grpc {
 pub struct SandboxBuilder {
     client: WorkspaceScopedClient,
     grpc: Grpc,
+    cli: Cli,
     policy: Option<proto::SandboxPolicy>,
     cleanup: Cleanup,
     spec: SandboxSpec,
@@ -426,6 +358,7 @@ impl SandboxBuilder {
         Ok(Sandbox {
             client: self.client,
             grpc: self.grpc,
+            cli: self.cli,
             cleanup: self.cleanup,
             name,
             id,
@@ -481,6 +414,7 @@ fn policy_create_request(
 pub struct Sandbox {
     client: WorkspaceScopedClient,
     grpc: Grpc,
+    cli: Cli,
     cleanup: Cleanup,
     name: String,
     id: String,
@@ -506,6 +440,18 @@ impl ExecOutput {
             self.exit_code,
             self.stdout.trim(),
             self.stderr.trim()
+        );
+        Ok(self)
+    }
+
+    /// Fail unless the command exited non-zero, e.g. when a request must be
+    /// rejected.
+    pub fn failure(self) -> Result<Self> {
+        crate::ensure!(
+            self.exit_code != 0,
+            "{} succeeded but was expected to fail; stdout: {}",
+            self.command,
+            self.stdout.trim()
         );
         Ok(self)
     }
@@ -720,6 +666,72 @@ impl Sandbox {
             })
         })
         .await
+    }
+
+    /// `sandbox get --output json`. It reports fields the SDK does not
+    /// expose, such as `restart_count`, `restart_policy`,
+    /// `main_process_instance_id`, and `conditions`.
+    pub async fn get_json(&self) -> Result<serde_json::Value> {
+        self.cli
+            .run(["sandbox", "get", &self.name, "--output", "json"])
+            .await?
+            .success()?
+            .json()
+    }
+
+    /// Fail unless `list` shows the sandbox in `phase`.
+    pub async fn expect_listed(&self, phase: SandboxPhase) -> Result {
+        let name = &self.name;
+        let listed = self
+            .client
+            .list_all_sandboxes(ListOptions::default())
+            .await
+            .context("list sandboxes")?;
+        let entry = listed.iter().find(|entry| entry.name == *name);
+        crate::ensure!(entry.is_some(), "sandbox {name} is not listed");
+        let entry = entry.expect("checked above");
+        crate::ensure!(
+            entry.phase == phase,
+            "sandbox {name} is listed in phase {:?}; expected {phase:?}",
+            entry.phase
+        );
+        Ok(())
+    }
+
+    /// Fail unless the sandbox is gone from both get and list.
+    pub async fn expect_absent(&self) -> Result {
+        let name = &self.name;
+        match self.client.get_sandbox(name).await {
+            Err(SdkError::NotFound { .. }) => {}
+            Err(error) => return Err(Error::from(error).context(format!("get sandbox {name}"))),
+            Ok(found) => {
+                return Err(Error::msg(format!(
+                    "sandbox {name} still exists (id {}, phase {:?})",
+                    found.id, found.phase
+                )));
+            }
+        }
+        let listed = self
+            .client
+            .list_all_sandboxes(ListOptions::default())
+            .await
+            .context("list sandboxes")?;
+        crate::ensure!(
+            !listed.iter().any(|entry| entry.name == *name),
+            "sandbox {name} is absent from get but still listed"
+        );
+        Ok(())
+    }
+
+    /// Wait up to `timeout` for the gateway to remove the sandbox by itself,
+    /// for example after a `--no-keep` main command exits, then check it is
+    /// gone from both get and list.
+    pub async fn wait_absent(&self, timeout: Duration) -> Result {
+        self.client
+            .wait_deleted(&self.name, timeout, Some(&self.id))
+            .await
+            .context(format!("wait for sandbox {} to be removed", self.name))?;
+        self.expect_absent().await
     }
 
     /// Delete the sandbox and wait until it is gone.

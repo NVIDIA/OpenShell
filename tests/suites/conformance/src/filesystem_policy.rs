@@ -133,8 +133,8 @@ async fn replaced_policy_path_rejects_next_launch(cx: &mut Context) -> testkit::
         // The exec's own error is the rejection report, so keep it apart from
         // the deadline's.
         let next = with_deadline(
-            REJECTED_LAUNCH_TIMEOUT,
             &format!("({case}) the rejected launch"),
+            REJECTED_LAUNCH_TIMEOUT,
             async { Ok(sandbox.exec(["true"]).await) },
         )
         .await?;

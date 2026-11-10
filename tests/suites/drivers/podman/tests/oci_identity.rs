@@ -67,7 +67,7 @@ USER {OCI_IDENTITY}
     let sandbox = cx
         .cli_sandbox("oi")
         .image(&image.tag)
-        .policy(IMAGE_IDENTITY_POLICY)
+        .policy_yaml(IMAGE_IDENTITY_POLICY)
         .command(["sleep", "infinity"])
         .create()
         .await
