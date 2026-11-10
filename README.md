@@ -13,7 +13,7 @@
 [![Security Policy](https://img.shields.io/badge/Security-Report%20a%20Vulnerability-red)](SECURITY.md)
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen)](https://docs.nvidia.com/openshell/latest/index.html)
 
-> 🚧 OpenShell is now part of the CNCF! We’re in the process of moving development to [ai-openshell](https://github.com/ai-openshell) and governance to the CNCF. Until the move is complete, please continue to use the [NVIDIA/OpenShell](https://github.com/NVIDIA/OpenShell) repo for code, issues, and pull requests.
+🚧 OpenShell is now part of the CNCF! We’re in the process of moving development to [ai-openshell](https://github.com/ai-openshell) and governance to the CNCF. Until the move is complete, please continue to use the [NVIDIA/OpenShell](https://github.com/NVIDIA/OpenShell) repo for code, issues, and pull requests.
 
 > [!IMPORTANT]
 > **New in OpenShell 0.1.x:** a stable release cadence, new isolation primitives, an expanded extension surface, and new APIs. [Read the 0.1.0 upgrade guide](https://docs.nvidia.com/openshell/latest/upgrade/0-1-0).
