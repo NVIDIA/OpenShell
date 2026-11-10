@@ -169,9 +169,8 @@ images. Release Dev, Release, and Pre-release use the same package installers.
 The feature suites (`tests/suites/features`) and the Podman driver suite
 (`tests/suites/drivers/podman`) run the same way, on the package installers; the
 driver suite's environments merge their Podman settings into the packaged
-gateway's configuration (see `TESTING.md`). The `e2e-podman` lane retains the
-binary installer because its playbook assumes that installer's system service,
-local HTTP gateway, and CLI path. The driver suite and `e2e-podman` run
+gateway's configuration (see `TESTING.md`). The `e2e-podman` lane runs on the
+RPM installer as well. The driver suite and `e2e-podman` run
 only in `Branch E2E Checks`. The manual Integration Tests workflow runs the
 remaining tmachine testsuites, such as `e2e-podman`, and downloads the packages
 selected by its matrix.

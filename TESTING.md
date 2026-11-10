@@ -541,7 +541,7 @@ Run the portable subset in a disposable rootless Podman guest:
 
 ```shell
 nix run .#build-artifacts
-nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
+nix run .#tmachine -- test fedora-podman-rootless rpm e2e-podman
 ```
 
 Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:

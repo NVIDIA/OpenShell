@@ -462,8 +462,7 @@ jobs:
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-  # Run the Podman e2e suite on tmachine. It needs the binary installer's CLI
-  # path and local HTTP gateway.
+  # Run the Podman e2e suite on tmachine against the packaged gateway.
   podman-e2e-integration:
     needs: prepare-integration
     permissions:
@@ -477,7 +476,7 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"}
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"e2e-podman"}
         ]
 
   docker-e2e:
