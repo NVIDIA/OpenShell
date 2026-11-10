@@ -4,8 +4,6 @@
 //! Operator-owned external resource admission. GPU attachments are temporarily
 //! exempt; this policy must not be interpreted as permission to attach host paths.
 
-pub use openshell_driver_sdk::resource_admission::*;
-
 /// Reserved driver-owned runtime metadata; caller labels must never override it.
 pub const CONFIG_USED_LABEL: &str = "openshell.ai/caller-driver-config-used";
 

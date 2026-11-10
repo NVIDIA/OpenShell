@@ -5,17 +5,19 @@
 
 use crate::client::ImageInspect;
 use crate::config::PodmanComputeConfig;
-use openshell_core::ComputeDriverError;
-use openshell_core::driver_mounts::SelinuxLabel;
-use openshell_core::gpu::validate_cdi_device_names;
+use openshell_container_runtime::gpu::validate_cdi_device_names;
 #[cfg(test)]
-use openshell_core::gpu::{driver_gpu_requirements, validate_cdi_gpu_device_request};
-use openshell_core::network_trust::{
+use openshell_container_runtime::gpu::validate_cdi_gpu_device_request;
+use openshell_container_runtime::network_trust::{
     NETWORK_SUPERVISOR_TRUST_GENERATION_KEY, NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
 };
-use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
-use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
-use openshell_core::{NetworkSupervisorTrustBundle, driver_mounts, proto_struct};
+use openshell_container_runtime::proto_struct::deserialize_optional_non_empty_string_list;
+use openshell_driver_sdk::ComputeDriverError;
+use openshell_driver_sdk::driver_mounts::SelinuxLabel;
+#[cfg(test)]
+use openshell_driver_sdk::gpu::driver_gpu_requirements;
+use openshell_driver_sdk::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
+use openshell_driver_sdk::{NetworkSupervisorTrustBundle, driver_mounts, proto_struct};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -40,8 +42,9 @@ fn is_selinux_enabled() -> bool {
     false
 }
 
-pub use openshell_core::driver_utils::{
-    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
+pub use openshell_container_runtime::driver_utils::LABEL_SANDBOX_NAMESPACE;
+pub use openshell_driver_sdk::driver_utils::{
+    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_WORKSPACE,
 };
 
 /// Label applied to all managed containers.
@@ -66,20 +69,21 @@ const RESOLVER_SECRET_PREFIX: &str = "openshell-resolver-";
 const TLS_CA_SECRET_PREFIX: &str = "openshell-tls-ca-";
 
 /// Container-side mount paths for client TLS materials and the sandbox token.
-const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
-const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
+const TLS_CA_MOUNT_PATH: &str = openshell_driver_sdk::driver_utils::TLS_CA_MOUNT_PATH;
+const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_driver_sdk::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
 const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
-    openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
+    openshell_driver_sdk::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
-const PROXY_CA_MOUNT_PATH: &str = openshell_core::driver_utils::PROXY_CA_MOUNT_PATH;
-const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
+const PROXY_CA_MOUNT_PATH: &str = openshell_container_runtime::driver_utils::PROXY_CA_MOUNT_PATH;
+const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_driver_sdk::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
-    openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
+    openshell_container_runtime::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 
 /// Directory inside sandbox containers where the supervisor binary is mounted.
-const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
+const SUPERVISOR_MOUNT_DIR: &str = openshell_driver_sdk::driver_utils::SUPERVISOR_CONTAINER_DIR;
 /// Full path to the supervisor binary inside sandbox containers.
-const SUPERVISOR_BINARY_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+const SUPERVISOR_BINARY_PATH: &str =
+    openshell_driver_sdk::driver_utils::SUPERVISOR_CONTAINER_BINARY;
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -95,7 +99,7 @@ pub struct PodmanSandboxDriverConfig {
 impl PodmanSandboxDriverConfig {
     pub(crate) fn admit_mount_types(
         &self,
-        policy: &openshell_core::resource_admission::ResourceAdmissionConfig,
+        policy: &openshell_driver_sdk::resource_admission::ResourceAdmissionConfig,
     ) -> Result<(), ComputeDriverError> {
         for mount in &self.mounts {
             if matches!(
@@ -685,7 +689,7 @@ fn build_env(
     if let Some(s) = spec {
         if !s.log_level.is_empty() {
             env.insert(
-                openshell_core::sandbox_env::LOG_LEVEL.into(),
+                openshell_driver_sdk::sandbox_env::LOG_LEVEL.into(),
                 s.log_level.clone(),
             );
         }
@@ -698,7 +702,10 @@ fn build_env(
     if !user_env.is_empty() {
         let json = serde_json::to_string(&user_env)
             .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
-        env.insert(openshell_core::sandbox_env::USER_ENVIRONMENT.into(), json);
+        env.insert(
+            openshell_driver_sdk::sandbox_env::USER_ENVIRONMENT.into(),
+            json,
+        );
     }
 
     // 2. Required driver vars (highest priority -- always overwrite).
@@ -709,34 +716,35 @@ fn build_env(
     // and image ENV cannot influence.
 
     env.insert(
-        openshell_core::sandbox_env::SANDBOX.into(),
+        openshell_driver_sdk::sandbox_env::SANDBOX.into(),
         sandbox.name.clone(),
     );
     env.insert(
-        openshell_core::sandbox_env::SANDBOX_ID.into(),
+        openshell_driver_sdk::sandbox_env::SANDBOX_ID.into(),
         sandbox.id.clone(),
     );
     env.insert(
-        openshell_core::sandbox_env::ENDPOINT.into(),
+        openshell_driver_sdk::sandbox_env::ENDPOINT.into(),
         config.grpc_endpoint.clone(),
     );
     env.insert(
-        openshell_core::sandbox_env::SSH_SOCKET_PATH.into(),
+        openshell_driver_sdk::sandbox_env::SSH_SOCKET_PATH.into(),
         config.ssh_socket_path.clone(),
     );
     env.insert(
-        openshell_core::sandbox_env::CONTAINER_IMAGE.into(),
+        openshell_driver_sdk::sandbox_env::CONTAINER_IMAGE.into(),
         image.to_string(),
     );
-    let main_process = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(spec)
-        .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
+    let main_process =
+        openshell_driver_sdk::sandbox_env::MainProcessConfig::encode_driver_spec(spec)
+            .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
     env.insert(
-        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.into(),
+        openshell_driver_sdk::sandbox_env::MAIN_PROCESS_SPEC.into(),
         main_process,
     );
     env.insert(
-        openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
-        openshell_core::telemetry::enabled_env_value().into(),
+        openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED.into(),
+        openshell_driver_sdk::telemetry::enabled_env_value().into(),
     );
     env.extend(
         config
@@ -754,67 +762,67 @@ fn build_env(
     }
     if let Some(name) = &config.supervisor_gateway_name {
         env.insert(
-            openshell_core::sandbox_env::GATEWAY_NAME.into(),
+            openshell_driver_sdk::sandbox_env::GATEWAY_NAME.into(),
             name.clone(),
         );
     }
     // Runtime capabilities are driver-owned. Override image/user input with
     // only the substrate that this driver configures for the supervisor.
     env.insert(
-        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.into(),
-        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.into(),
+        openshell_driver_sdk::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.into(),
+        openshell_driver_sdk::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.into(),
     );
 
     // 3. Gateway CA path (when TLS is enabled).
     if config.tls_enabled() {
         env.insert(
-            openshell_core::sandbox_env::TLS_CA.into(),
+            openshell_driver_sdk::sandbox_env::TLS_CA.into(),
             TLS_CA_MOUNT_PATH.into(),
         );
     }
 
     if let Some(socket_path) = provider_spiffe_workload_api_socket_env_value(config) {
         env.insert(
-            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET.into(),
+            openshell_driver_sdk::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET.into(),
             socket_path,
         );
     }
 
-    env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
-    env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    env.remove(openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN);
+    env.remove(openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN_FILE);
     // Prevent user-supplied environment from overriding the TLS server name
     // the supervisor verifies — a sandbox user who can redirect the gateway
     // hostname could otherwise present a certificate for a name they control
     // and intercept the sandbox JWT.
-    env.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
+    env.remove(openshell_driver_sdk::sandbox_env::GATEWAY_TLS_SERVER_NAME);
     if oci_user.is_empty() {
         // The image declares no OCI USER (for example, a minimal base image). Assign a
         // numeric non-root identity like the Kubernetes and VM drivers so the
         // supervisor synthesizes the account instead of rejecting the image.
         env.insert(
-            openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
+            openshell_driver_sdk::sandbox_env::OCI_IMAGE_USER.into(),
             String::new(),
         );
         env.insert(
-            openshell_core::sandbox_env::SANDBOX_UID.into(),
-            openshell_core::sandbox_env::DEFAULT_SANDBOX_UID.to_string(),
+            openshell_driver_sdk::sandbox_env::SANDBOX_UID.into(),
+            openshell_driver_sdk::sandbox_env::DEFAULT_SANDBOX_UID.to_string(),
         );
         env.insert(
-            openshell_core::sandbox_env::SANDBOX_GID.into(),
-            openshell_core::sandbox_env::DEFAULT_SANDBOX_GID.to_string(),
+            openshell_driver_sdk::sandbox_env::SANDBOX_GID.into(),
+            openshell_driver_sdk::sandbox_env::DEFAULT_SANDBOX_GID.to_string(),
         );
     } else {
         // The image declares a USER; preserve the OCI resolution path.
         env.insert(
-            openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
+            openshell_driver_sdk::sandbox_env::OCI_IMAGE_USER.into(),
             oci_user.to_string(),
         );
         env.insert(
-            openshell_core::sandbox_env::SANDBOX_UID.into(),
+            openshell_driver_sdk::sandbox_env::SANDBOX_UID.into(),
             String::new(),
         );
         env.insert(
-            openshell_core::sandbox_env::SANDBOX_GID.into(),
+            openshell_driver_sdk::sandbox_env::SANDBOX_GID.into(),
             String::new(),
         );
     }
@@ -825,7 +833,7 @@ fn build_env(
         && !s.sandbox_token.is_empty()
     {
         env.insert(
-            openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.into(),
+            openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN_FILE.into(),
             SANDBOX_TOKEN_MOUNT_PATH.into(),
         );
     }
@@ -848,7 +856,7 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
     }
     // Managed labels (highest priority -- always overwrite).
     labels.insert(
-        openshell_core::resource_admission::CONFIG_USED_LABEL.into(),
+        openshell_container_runtime::resource_admission::CONFIG_USED_LABEL.into(),
         template
             .and_then(|t| t.driver_config.as_ref())
             .is_some_and(|config| !config.fields.is_empty())
@@ -1382,7 +1390,7 @@ fn build_base_spec(
                 format!(
                     "test -e /var/run/openshell-ssh-ready || test -S {} || ss -tlnp | grep -q :{}",
                     config.ssh_socket_path,
-                    openshell_core::config::DEFAULT_SSH_PORT
+                    openshell_container_runtime::config::DEFAULT_SSH_PORT
                 ),
             ],
             interval: config
@@ -1460,7 +1468,7 @@ fn build_base_spec(
             let mut m = vec![Mount {
                 kind: "tmpfs".into(),
                 source: "tmpfs".into(),
-                destination: openshell_core::container_paths::NETNS_MOUNT_ROOT.into(),
+                destination: openshell_driver_sdk::container_paths::NETNS_MOUNT_ROOT.into(),
                 options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
             }];
             // Deliver the gateway CA into the container when TLS is
@@ -1532,7 +1540,7 @@ fn build_base_spec(
         // the host, so we must use the published host port on 127.0.0.1 instead.
         portmappings: vec![PortMapping {
             host_port: 0,
-            container_port: openshell_core::config::DEFAULT_SSH_PORT,
+            container_port: openshell_container_runtime::config::DEFAULT_SSH_PORT,
             protocol: "tcp".into(),
         }],
         userns: config.userns.as_deref().map(|raw| {
@@ -1597,7 +1605,7 @@ impl IsolationSpecs {
         identities: &BTreeMap<String, Value>,
     ) -> Result<(), ComputeDriverError> {
         self.workload.labels.insert(
-            openshell_core::resource_admission::IDENTITIES_LABEL.into(),
+            openshell_container_runtime::resource_admission::IDENTITIES_LABEL.into(),
             serde_json::to_string(identities)
                 .map_err(|error| ComputeDriverError::Message(error.to_string()))?,
         );
@@ -1651,7 +1659,7 @@ pub fn build_isolation_specs(
         .config
         .app_armor_profile
         .as_ref()
-        .and_then(openshell_core::config::AppArmorProfile::oci_security_opt)
+        .and_then(openshell_driver_sdk::config::AppArmorProfile::oci_security_opt)
         .and_then(|option| option.strip_prefix("apparmor=").map(str::to_string));
     workload.seccomp_profile_path.clear();
     workload
@@ -1716,7 +1724,7 @@ pub fn build_isolation_specs(
     );
     supervisor.image.clone_from(&input.config.supervisor_image);
     supervisor.env.insert(
-        openshell_core::sandbox_env::CONTAINER_IMAGE_UID.into(),
+        openshell_driver_sdk::sandbox_env::CONTAINER_IMAGE_UID.into(),
         input.image.id.clone(),
     );
     supervisor.entrypoint = vec!["/openshell-supervisor".into()];
@@ -1735,14 +1743,14 @@ pub fn build_isolation_specs(
         supervisor.mounts.push(network_trust_mount(network_trust)?);
     }
     supervisor.env.insert(
-        openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND.into(),
+        openshell_driver_sdk::sandbox_env::ADMITTED_ISOLATION_BACKEND.into(),
         openshell_sandbox_backend::BACKEND_NAME.into(),
     );
     // The supervisor runs as the resolved non-root workload identity. Keep
     // generated interception CA material under its writable /run tmpfs rather
     // than the root-owned default at /etc/openshell-tls.
     supervisor.env.insert(
-        openshell_core::sandbox_env::PROXY_TLS_DIR.into(),
+        openshell_driver_sdk::sandbox_env::PROXY_TLS_DIR.into(),
         "/run/openshell/proxy-tls".into(),
     );
     supervisor.user = user;
@@ -1782,7 +1790,7 @@ pub fn build_isolation_specs(
     });
     supervisor.mounts.retain(|mount| {
         trusted_mount(&mount.destination)
-            && mount.destination != openshell_core::container_paths::NETNS_MOUNT_ROOT
+            && mount.destination != openshell_driver_sdk::container_paths::NETNS_MOUNT_ROOT
     });
     for destination in ["/run", "/var/log", "/tmp"] {
         supervisor.mounts.push(Mount {
@@ -1828,7 +1836,7 @@ fn trusted_mount(destination: &str) -> bool {
             | PROXY_CA_MOUNT_PATH
             | ADDITIONAL_CA_MOUNT_PATH
             | PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
-    ) || destination == openshell_core::container_paths::NETNS_MOUNT_ROOT
+    ) || destination == openshell_driver_sdk::container_paths::NETNS_MOUNT_ROOT
 }
 
 fn provider_spiffe_workload_api_socket_env_value(config: &PodmanComputeConfig) -> Option<String> {
@@ -1931,7 +1939,7 @@ fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::client::ImageConfig;
-    use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
+    use openshell_driver_sdk::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -2080,7 +2088,7 @@ mod tests {
             ..Default::default()
         };
         let mut config = PodmanComputeConfig::default();
-        config.app_armor_profile = Some(openshell_core::config::AppArmorProfile::Localhost(
+        config.app_armor_profile = Some(openshell_driver_sdk::config::AppArmorProfile::Localhost(
             "openshell-sandbox".into(),
         ));
         config.userns = Some("auto".into());
@@ -2129,7 +2137,7 @@ mod tests {
             specs
                 .supervisor
                 .env
-                .get(openshell_core::sandbox_env::CONTAINER_IMAGE_UID)
+                .get(openshell_driver_sdk::sandbox_env::CONTAINER_IMAGE_UID)
                 .map(String::as_str),
             Some("sha256:image")
         );
@@ -2137,7 +2145,7 @@ mod tests {
             specs
                 .supervisor
                 .env
-                .get(openshell_core::sandbox_env::CONTAINER_IMAGE)
+                .get(openshell_driver_sdk::sandbox_env::CONTAINER_IMAGE)
                 .map(String::as_str),
             Some("image:latest")
         );
@@ -2145,7 +2153,7 @@ mod tests {
             !specs
                 .workload
                 .env
-                .contains_key(openshell_core::sandbox_env::CONTAINER_IMAGE_UID)
+                .contains_key(openshell_driver_sdk::sandbox_env::CONTAINER_IMAGE_UID)
         );
         assert_eq!(specs.supervisor.groups, vec!["2000"]);
         assert!(specs.supervisor.cap_add.is_empty());
@@ -2272,7 +2280,7 @@ mod tests {
             specs
                 .supervisor
                 .env
-                .get(openshell_core::sandbox_env::PROXY_TLS_DIR)
+                .get(openshell_driver_sdk::sandbox_env::PROXY_TLS_DIR)
                 .map(String::as_str),
             Some("/run/openshell/proxy-tls")
         );
@@ -2379,7 +2387,7 @@ mod tests {
 
     #[test]
     fn container_spec_applies_cpu_and_memory_limits() {
-        use openshell_core::proto::compute::v1::{
+        use openshell_driver_sdk::proto::compute::v1::{
             DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
         };
 
@@ -2402,7 +2410,8 @@ mod tests {
         assert_eq!(limits.memory.limit, 2 * 1024 * 1024 * 1024);
         assert_eq!(
             limits.pids.as_ref().map(|pids| pids.limit),
-            openshell_core::config::default_sandbox_pids_limit().map(std::num::NonZeroI64::get)
+            openshell_container_runtime::config::default_sandbox_pids_limit()
+                .map(std::num::NonZeroI64::get)
         );
         let serialized = serde_json::to_string(&limits).unwrap();
         assert!(serialized.contains("\"pids\":{\"limit\":2048}"));
@@ -2432,9 +2441,9 @@ mod tests {
         let mut sandbox = test_sandbox("test-id", "test-name");
         let spec = sandbox.spec.get_or_insert_default();
         for (key, value) in [
-            (openshell_core::sandbox_env::OCI_IMAGE_USER, "spoofed"),
-            (openshell_core::sandbox_env::SANDBOX_UID, "9999"),
-            (openshell_core::sandbox_env::SANDBOX_GID, "9999"),
+            (openshell_driver_sdk::sandbox_env::OCI_IMAGE_USER, "spoofed"),
+            (openshell_driver_sdk::sandbox_env::SANDBOX_UID, "9999"),
+            (openshell_driver_sdk::sandbox_env::SANDBOX_GID, "9999"),
         ] {
             spec.environment.insert(key.to_string(), value.to_string());
         }
@@ -2473,15 +2482,15 @@ mod tests {
         );
         assert!(container["volumes"].as_array().is_some_and(Vec::is_empty));
         assert_eq!(
-            container["env"][openshell_core::sandbox_env::OCI_IMAGE_USER].as_str(),
+            container["env"][openshell_driver_sdk::sandbox_env::OCI_IMAGE_USER].as_str(),
             Some("app:staff")
         );
         assert_eq!(
-            container["env"][openshell_core::sandbox_env::SANDBOX_UID].as_str(),
+            container["env"][openshell_driver_sdk::sandbox_env::SANDBOX_UID].as_str(),
             Some("")
         );
         assert_eq!(
-            container["env"][openshell_core::sandbox_env::SANDBOX_GID].as_str(),
+            container["env"][openshell_driver_sdk::sandbox_env::SANDBOX_GID].as_str(),
             Some("")
         );
     }
@@ -2491,14 +2500,14 @@ mod tests {
         let mut sandbox = test_sandbox("test-id", "test-name");
         let spec = sandbox.spec.get_or_insert_default();
         spec.environment.insert(
-            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+            openshell_driver_sdk::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
             "evil.attacker.example.com".to_string(),
         );
 
         let container = build_container_spec(&sandbox, &test_config());
 
         assert_eq!(
-            container["env"].get(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME),
+            container["env"].get(openshell_driver_sdk::sandbox_env::GATEWAY_TLS_SERVER_NAME),
             None,
             "GATEWAY_TLS_SERVER_NAME must be stripped from the supervisor environment"
         );
@@ -2529,7 +2538,7 @@ mod tests {
 
     #[test]
     fn container_spec_maps_empty_gpu_request_to_selected_default_cdi_device() {
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_driver_sdk::proto::compute::v1::DriverSandboxSpec;
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -2554,7 +2563,7 @@ mod tests {
 
     #[test]
     fn container_spec_omits_devices_without_resolved_default_cdi_devices() {
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_driver_sdk::proto::compute::v1::DriverSandboxSpec;
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -2571,7 +2580,7 @@ mod tests {
 
     #[test]
     fn container_spec_accepts_non_nvidia_explicit_and_resolved_cdi_devices() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
             resource_requirements: Some(gpu_resources(None)),
@@ -2606,7 +2615,7 @@ mod tests {
 
     #[test]
     fn container_spec_rejects_host_paths_in_explicit_and_resolved_cdi_devices() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
             resource_requirements: Some(gpu_resources(None)),
@@ -2648,7 +2657,7 @@ mod tests {
 
     #[test]
     fn container_spec_passes_explicit_cdi_device_id_through() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -2670,7 +2679,7 @@ mod tests {
 
     #[test]
     fn container_spec_accepts_gpu_count_matching_cdi_devices() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -2700,7 +2709,7 @@ mod tests {
 
     #[test]
     fn container_spec_rejects_gpu_count_mismatched_cdi_devices() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -2723,7 +2732,7 @@ mod tests {
 
     #[test]
     fn container_spec_rejects_cdi_devices_without_gpu_request() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -2742,7 +2751,7 @@ mod tests {
 
     #[test]
     fn container_spec_rejects_empty_cdi_devices() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -2762,7 +2771,7 @@ mod tests {
 
     #[test]
     fn container_spec_rejects_unknown_driver_config_fields() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -2782,7 +2791,7 @@ mod tests {
 
     #[test]
     fn sandbox_driver_config_rejects_trusted_runtime_image_overrides() {
-        use openshell_core::proto::compute::v1::DriverSandboxTemplate;
+        use openshell_driver_sdk::proto::compute::v1::DriverSandboxTemplate;
 
         for field in ["sandbox_runtime_image", "supervisor_image"] {
             let template = DriverSandboxTemplate {
@@ -2820,7 +2829,7 @@ mod tests {
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
             env_map
-                .get(openshell_core::sandbox_env::SANDBOX)
+                .get(openshell_driver_sdk::sandbox_env::SANDBOX)
                 .and_then(|v| v.as_str()),
             Some("my-sandbox"),
         );
@@ -2875,7 +2884,7 @@ mod tests {
 
     #[test]
     fn container_spec_required_vars_cannot_be_overridden() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "legit-name");
         let mut env_overrides = std::collections::HashMap::new();
@@ -2920,7 +2929,7 @@ mod tests {
 
     #[test]
     fn container_spec_passes_the_gateway_otlp_endpoint_to_the_supervisor() {
-        use openshell_core::sandbox_env::{
+        use openshell_driver_sdk::sandbox_env::{
             OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
             OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol, SupervisorOtlp,
         };
@@ -3007,26 +3016,26 @@ mod tests {
         };
         let spec = build_container_spec(&sandbox, &config);
         assert_eq!(
-            spec["env"][openshell_core::sandbox_env::GATEWAY_NAME],
+            spec["env"][openshell_driver_sdk::sandbox_env::GATEWAY_NAME],
             "prod-west"
         );
     }
 
     #[test]
     fn container_spec_telemetry_toggle_comes_from_driver_env() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let _guard = ENV_LOCK.lock().unwrap();
         temp_env::with_vars(
             [(
-                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED,
                 Some("false"),
             )],
             || {
                 let mut sandbox = test_sandbox("test-id", "legit-name");
                 sandbox.spec = Some(DriverSandboxSpec {
                     environment: std::collections::HashMap::from([(
-                        openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+                        openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED.to_string(),
                         "true".to_string(),
                     )]),
                     template: Some(DriverSandboxTemplate::default()),
@@ -3038,7 +3047,7 @@ mod tests {
 
                 assert_eq!(
                     env_map
-                        .get(openshell_core::sandbox_env::TELEMETRY_ENABLED)
+                        .get(openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED)
                         .and_then(|v| v.as_str()),
                     Some("false"),
                     "telemetry toggle must come from the deployment environment"
@@ -3049,12 +3058,12 @@ mod tests {
 
     #[test]
     fn container_spec_keeps_network_capabilities_driver_controlled() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "legit-name");
         sandbox.spec = Some(DriverSandboxSpec {
             environment: std::collections::HashMap::from([(
-                openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+                openshell_driver_sdk::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
                 "spoofed".to_string(),
             )]),
             template: Some(DriverSandboxTemplate::default()),
@@ -3062,8 +3071,10 @@ mod tests {
         });
         let spec = build_container_spec(&sandbox, &test_config());
         assert_eq!(
-            spec["env"][openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES],
-            serde_json::json!(openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY)
+            spec["env"][openshell_driver_sdk::sandbox_env::NETWORK_RUNTIME_CAPABILITIES],
+            serde_json::json!(
+                openshell_driver_sdk::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+            )
         );
     }
 
@@ -3203,7 +3214,7 @@ mod tests {
 
     #[test]
     fn container_spec_sandbox_env_cannot_influence_proxy_argv() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         // A sandbox creator tries to steer the egress boundary through spec
         // and template environment (image-baked ENV behaves the same at the
@@ -3255,7 +3266,7 @@ mod tests {
 
     #[test]
     fn container_spec_required_labels_cannot_be_overridden() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("real-id", "real-name");
         sandbox.namespace = "real-namespace".to_string();
@@ -3419,7 +3430,7 @@ mod tests {
         let vol = &image_volumes[0];
         assert_eq!(
             vol["source"].as_str(),
-            Some(openshell_core::config::default_sandbox_runtime_image().as_str()),
+            Some(openshell_driver_sdk::config::default_sandbox_runtime_image().as_str()),
             "image volume source should be the sandbox runtime image"
         );
         assert_eq!(
@@ -3436,7 +3447,7 @@ mod tests {
 
     #[test]
     fn container_spec_includes_driver_config_mounts() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -3505,7 +3516,8 @@ mod tests {
         let image_volumes = spec["image_volumes"]
             .as_array()
             .expect("image_volumes should be an array");
-        let expected_sandbox_runtime = openshell_core::config::default_sandbox_runtime_image();
+        let expected_sandbox_runtime =
+            openshell_driver_sdk::config::default_sandbox_runtime_image();
         assert!(image_volumes.iter().any(|volume| {
             volume["source"].as_str() == Some(expected_sandbox_runtime.as_str())
                 && volume["destination"].as_str() == Some("/opt/openshell/bin")
@@ -3519,7 +3531,7 @@ mod tests {
 
     #[test]
     fn container_spec_defaults_volume_mounts_to_read_only() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -3553,7 +3565,7 @@ mod tests {
 
     #[test]
     fn container_spec_allows_explicit_writable_volume_mounts() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -3588,7 +3600,7 @@ mod tests {
 
     #[test]
     fn driver_config_rejects_duplicate_mount_targets() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -3669,7 +3681,7 @@ mod tests {
 
     #[test]
     fn driver_config_rejects_bind_mounts_unless_enabled() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -3694,7 +3706,7 @@ mod tests {
 
     #[test]
     fn container_spec_includes_bind_mounts_when_enabled() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -3734,7 +3746,7 @@ mod tests {
 
     #[test]
     fn container_spec_defaults_enabled_bind_mounts_to_read_only() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -3773,7 +3785,7 @@ mod tests {
 
     #[test]
     fn driver_config_rejects_relative_bind_sources_when_enabled() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -3802,7 +3814,7 @@ mod tests {
 
     #[test]
     fn container_spec_bind_mount_selinux_shared_label() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -3841,7 +3853,7 @@ mod tests {
 
     #[test]
     fn container_spec_bind_mount_selinux_private_label() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -3880,7 +3892,7 @@ mod tests {
 
     #[test]
     fn driver_config_rejects_reserved_mount_targets() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         for target in ["/etc/openshell/tls/client", ADDITIONAL_CA_MOUNT_PATH] {
             let mut sandbox = test_sandbox("test-id", "test-name");
@@ -4014,7 +4026,7 @@ mod tests {
 
     #[test]
     fn container_spec_uses_token_secret_mount_without_raw_token_env() {
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_driver_sdk::proto::compute::v1::DriverSandboxSpec;
 
         let mut sandbox = test_sandbox("token-id", "token-name");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -4029,13 +4041,13 @@ mod tests {
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
             env_map
-                .get(openshell_core::sandbox_env::SANDBOX_TOKEN)
+                .get(openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN)
                 .and_then(|v| v.as_str()),
             None
         );
         assert_eq!(
             env_map
-                .get(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
+                .get(openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN_FILE)
                 .and_then(|v| v.as_str()),
             Some("/etc/openshell/auth/sandbox.jwt")
         );
@@ -4167,7 +4179,7 @@ mod tests {
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
             env_map
-                .get(openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET)
+                .get(openshell_driver_sdk::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET)
                 .and_then(|v| v.as_str()),
             Some("/spiffe-workload-api/spire-agent.sock"),
         );

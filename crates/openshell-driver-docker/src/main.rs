@@ -6,10 +6,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
-use openshell_core::VERSION;
-use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_core::sandbox_env::SupervisorOtlpArgs;
 use openshell_driver_docker::{ComputeDriverService, DockerComputeConfig, DockerComputeDriver};
+use openshell_driver_sdk::VERSION;
+use openshell_driver_sdk::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_driver_sdk::sandbox_env::SupervisorOtlpArgs;
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -17,7 +17,7 @@ use tracing::info;
 struct Args {
     /// Override the operator admission policy in the driver TOML file.
     #[arg(long, env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON")]
-    admission_config_json: Option<openshell_core::resource_admission::DriverAdmissionConfig>,
+    admission_config_json: Option<openshell_driver_sdk::resource_admission::DriverAdmissionConfig>,
     /// Public compute-driver Unix socket used by the gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: PathBuf,
@@ -27,11 +27,11 @@ struct Args {
     config: PathBuf,
 
     /// OCI image containing the `openshell-sandbox` runtime binary.
-    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
+    #[arg(long, env = openshell_driver_sdk::config::SANDBOX_RUNTIME_IMAGE_ENV)]
     sandbox_runtime_image: Option<String>,
 
     /// OCI image containing the `openshell-supervisor` control binary.
-    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
+    #[arg(long, env = openshell_driver_sdk::config::SUPERVISOR_IMAGE_ENV)]
     supervisor_image: Option<String>,
 
     /// Gateway listener address used to derive the supervisor endpoint.
@@ -90,16 +90,16 @@ async fn main() -> Result<()> {
         .await
         .into_diagnostic()?;
 
-    let listener = openshell_core::external_driver_socket::bind_private(&args.bind_socket)
+    let listener = openshell_driver_sdk::external_driver_socket::bind_private(&args.bind_socket)
         .map_err(|err| miette::miette!("{err}"))?;
     let _cleanup =
-        openshell_core::external_driver_socket::SocketCleanup::new(args.bind_socket.clone());
+        openshell_driver_sdk::external_driver_socket::SocketCleanup::new(args.bind_socket.clone());
     info!(socket = %args.bind_socket.display(), "Starting Docker compute driver");
     tonic::transport::Server::builder()
         .layer(openshell_otel::compute_driver_rpc_layer())
         .add_service(ComputeDriverServer::new(ComputeDriverService::new(driver)))
         .serve_with_incoming_shutdown(
-            openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
+            openshell_driver_sdk::external_driver_socket::SameUidUnixIncoming::new(listener),
             shutdown_signal(),
         )
         .await

@@ -3,8 +3,6 @@
 
 //! Serde helpers for driver configuration read from `google.protobuf.Struct`.
 
-pub use openshell_driver_sdk::proto_struct::*;
-
 use serde::{Deserialize, Deserializer, de::Error as _};
 
 /// Deserialize a present field as a non-empty list of non-empty strings.

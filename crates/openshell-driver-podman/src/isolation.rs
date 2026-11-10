@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::PathBuf;
 
-use openshell_core::ComputeDriverError;
-use openshell_core::proto::compute::v1::DriverSandbox;
+use openshell_driver_sdk::ComputeDriverError;
+use openshell_driver_sdk::proto::compute::v1::DriverSandbox;
 use openshell_isolation_interface::contract::{ProvisioningEvidence, ResolvedWorkloadIdentity};
 use openshell_sandbox_backend::ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
@@ -127,8 +127,8 @@ pub fn resolve_identity(
         // policy requested no identity. Synthesize a numeric non-root identity
         // instead of rejecting the image, matching Docker, Kubernetes, and VM.
         return ResolvedWorkloadIdentity::new(
-            openshell_core::sandbox_env::DEFAULT_SANDBOX_UID,
-            openshell_core::sandbox_env::DEFAULT_SANDBOX_GID,
+            openshell_driver_sdk::sandbox_env::DEFAULT_SANDBOX_UID,
+            openshell_driver_sdk::sandbox_env::DEFAULT_SANDBOX_GID,
             Vec::new(),
             "default".into(),
             image_id.into(),
@@ -199,7 +199,7 @@ pub struct BootstrapArchivesInput<'a> {
     pub identity: &'a ResolvedWorkloadIdentity,
     pub allow_extra_supplementary_groups: bool,
     pub child_env: HashMap<String, String>,
-    pub launch_authentication: &'a openshell_core::jwt::SandboxLaunchAuthentication,
+    pub launch_authentication: &'a openshell_driver_sdk::jwt::SandboxLaunchAuthentication,
 }
 
 /// The shared volume contains only sandbox credentials. Supervisor credentials,
@@ -427,7 +427,7 @@ impl<'a> Archive<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::jwt::{
+    use openshell_driver_sdk::jwt::{
         CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
         SupervisorAuthBundle,
     };
@@ -459,12 +459,13 @@ mod tests {
     fn authentication() -> SandboxLaunchAuthentication {
         SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
-                session_id: openshell_core::SandboxSessionId::new(),
-                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
-                    "generation-1",
-                )
-                .unwrap(),
-                session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
+                session_id: openshell_driver_sdk::SandboxSessionId::new(),
+                runtime_generation:
+                    openshell_driver_sdk::sandbox_generation::SandboxGenerationId::parse(
+                        "generation-1",
+                    )
+                    .unwrap(),
+                session_rotation: openshell_driver_sdk::jwt::SessionRotation::new(1).unwrap(),
                 auth_epoch: CredentialEpoch::new(1).unwrap(),
                 gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
                 gateway_expires_at: i64::MAX,
@@ -515,8 +516,8 @@ mod tests {
         assert_eq!(
             (identity.uid, identity.gid),
             (
-                openshell_core::sandbox_env::DEFAULT_SANDBOX_UID,
-                openshell_core::sandbox_env::DEFAULT_SANDBOX_GID,
+                openshell_driver_sdk::sandbox_env::DEFAULT_SANDBOX_UID,
+                openshell_driver_sdk::sandbox_env::DEFAULT_SANDBOX_GID,
             )
         );
         assert_eq!(identity.source, "default");

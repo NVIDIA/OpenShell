@@ -2184,7 +2184,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "rustls",
  "serde",
  "serde_json",

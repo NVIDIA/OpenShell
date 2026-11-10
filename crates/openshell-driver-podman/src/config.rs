@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::num::{NonZeroI64, NonZeroU64};
 use std::path::PathBuf;
 
-use openshell_core::{AppArmorProfile, ImagePullPolicy};
+use openshell_driver_sdk::{AppArmorProfile, ImagePullPolicy};
 
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
@@ -30,7 +30,7 @@ pub struct PodmanComputeConfig {
     /// Permit caller-supplied driver JSON. Does not waive resource admission.
     pub allow_driver_config: bool,
     /// Operator-owned external attachment approval policy.
-    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
+    pub resource_admission: openshell_driver_sdk::resource_admission::ResourceAdmissionConfig,
     /// Podman API Unix socket. When unset, use the socket selected by
     /// gateway auto-detection.
     pub socket_path: Option<PathBuf>,
@@ -46,7 +46,7 @@ pub struct PodmanComputeConfig {
     /// OTLP exports passed to supervisors. The gateway supplies them from
     /// `[otlp]`; driver TOML cannot set them.
     #[serde(skip)]
-    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
+    pub supervisor_otlp: openshell_driver_sdk::sandbox_env::SupervisorOtlp,
 
     /// Gateway name passed to supervisors for their telemetry. The gateway
     /// supplies its own name; driver TOML cannot set it.
@@ -57,7 +57,7 @@ pub struct PodmanComputeConfig {
     /// Used by the driver's auto-detection fallback when `grpc_endpoint`
     /// is empty.  The server must set this to `config.bind_address.port()`
     /// so the correct port is used even when `--port` differs from the
-    /// default.  Defaults to [`openshell_core::config::DEFAULT_SERVER_PORT`].
+    /// default.  Defaults to [`openshell_driver_sdk::config::DEFAULT_SERVER_PORT`].
     pub gateway_port: u16,
     /// Unix socket path the in-container supervisor bridges relay traffic to.
     pub ssh_socket_path: String,
@@ -92,7 +92,7 @@ pub struct PodmanComputeConfig {
     /// Omit the field to use `OpenShell`'s 2048-process sandbox limit. Explicit
     /// zero is invalid.
     #[serde(
-        default = "openshell_core::config::default_sandbox_pids_limit",
+        default = "openshell_container_runtime::config::default_sandbox_pids_limit",
         skip_serializing_if = "Option::is_none"
     )]
     pub sandbox_pids_limit: Option<NonZeroI64>,
@@ -175,7 +175,7 @@ pub struct PodmanComputeConfig {
     ///
     /// A CA certificate is not secret, so the gateway bind-mounts this file
     /// read-only into the sandbox (at
-    /// [`PROXY_CA_MOUNT_PATH`](openshell_core::driver_utils::PROXY_CA_MOUNT_PATH))
+    /// [`PROXY_CA_MOUNT_PATH`](openshell_container_runtime::driver_utils::PROXY_CA_MOUNT_PATH))
     /// and passes its path to the supervisor via `--upstream-proxy-ca-bundle`.
     /// The supervisor trusts it for the TLS handshake with an `https://`
     /// proxy and, because a TLS-intercepting proxy re-signs tunneled server
@@ -193,7 +193,7 @@ pub struct PodmanComputeConfig {
     /// workload image, and therefore cannot inherit a private CA baked into
     /// the workload's system trust store. The gateway bind-mounts this file
     /// read-only into the supervisor container (at
-    /// [`ADDITIONAL_CA_MOUNT_PATH`](openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH))
+    /// [`ADDITIONAL_CA_MOUNT_PATH`](openshell_driver_sdk::driver_utils::ADDITIONAL_CA_MOUNT_PATH))
     /// and passes its path via `--additional-ca-bundle`. The supervisor folds
     /// it into its upstream TLS trust store alongside (not instead of) the
     /// system CA bundle. The bundle must exist and contain at least one
@@ -278,8 +278,10 @@ impl PodmanComputeConfig {
             // Preserve pass-through support for an explicitly configured
             // container-reachable Workload API TCP endpoint.
             if !raw.starts_with("tcp:") {
-                openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
-                    .map_err(crate::client::PodmanApiError::InvalidInput)?;
+                openshell_container_runtime::driver_utils::validate_provider_spiffe_unix_socket(
+                    socket,
+                )
+                .map_err(crate::client::PodmanApiError::InvalidInput)?;
             }
         }
         self.canonicalize_userns()?;
@@ -329,7 +331,7 @@ impl PodmanComputeConfig {
     /// Validate optional corporate proxy configuration.
     ///
     /// Shares validation semantics with the in-container supervisor through
-    /// [`openshell_core::driver_utils::parse_upstream_proxy_url`], so a value
+    /// [`openshell_driver_sdk::driver_utils::parse_upstream_proxy_url`], so a value
     /// accepted here can never be rejected by the supervisor at sandbox
     /// startup (or vice versa). The supervisor supports `http://` and
     /// `https://` forward proxies, so other schemes (SOCKS, etc.) are rejected
@@ -341,7 +343,7 @@ impl PodmanComputeConfig {
         // Keep the Podman-only CA-bundle behaviour below, but delegate the
         // shared URL, bypass-list, credential-file, and acknowledgement
         // contract to openshell-core so Docker and VM cannot drift.
-        openshell_core::UpstreamProxyConfig {
+        openshell_driver_sdk::UpstreamProxyConfig {
             https_proxy: self.https_proxy.clone(),
             no_proxy: self.no_proxy.clone(),
             proxy_auth_file: self.proxy_auth_file.as_ref().map(PathBuf::from),
@@ -372,7 +374,7 @@ impl PodmanComputeConfig {
         // error when the driver starts, not a failed/crash-looping sandbox
         // once the supervisor container starts and tries to read it.
         if let Some(path) = self.additional_ca_bundle.as_deref() {
-            openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+            openshell_driver_sdk::driver_utils::read_upstream_proxy_ca_bundle_file(
                 path,
                 "additional_ca_bundle",
             )
@@ -539,23 +541,23 @@ impl Default for PodmanComputeConfig {
             socket_path: None,
             allow_driver_config: false,
             resource_admission:
-                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
-            default_image: openshell_core::image::default_sandbox_image(),
+                openshell_driver_sdk::resource_admission::ResourceAdmissionConfig::default(),
+            default_image: openshell_driver_sdk::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
-            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
+            supervisor_otlp: openshell_driver_sdk::sandbox_env::SupervisorOtlp::default(),
             supervisor_gateway_name: None,
-            gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
-            ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
+            gateway_port: openshell_driver_sdk::config::DEFAULT_SERVER_PORT,
+            ssh_socket_path: openshell_driver_sdk::container_paths::SSH_SOCKET_PATH.to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
             host_gateway_ip: Self::default_host_gateway_ip(),
             stop_timeout_secs: DEFAULT_PODMAN_STOP_TIMEOUT_SECS,
-            sandbox_runtime_image: openshell_core::config::default_sandbox_runtime_image(),
-            supervisor_image: openshell_core::config::default_supervisor_image(),
+            sandbox_runtime_image: openshell_driver_sdk::config::default_sandbox_runtime_image(),
+            supervisor_image: openshell_driver_sdk::config::default_supervisor_image(),
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
-            sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
+            sandbox_pids_limit: openshell_container_runtime::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
             provider_spiffe_workload_api_socket: None,
             app_armor_profile: None,
@@ -707,7 +709,7 @@ mod tests {
         let cfg = PodmanComputeConfig::default();
         assert_eq!(
             cfg.sandbox_pids_limit.map(NonZeroI64::get),
-            Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+            Some(openshell_container_runtime::config::DEFAULT_SANDBOX_PIDS_LIMIT)
         );
         assert!(!cfg.enable_bind_mounts);
     }
@@ -718,7 +720,7 @@ mod tests {
             .expect("default Podman config should deserialize");
         assert_eq!(
             cfg.sandbox_pids_limit.map(NonZeroI64::get),
-            Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+            Some(openshell_container_runtime::config::DEFAULT_SANDBOX_PIDS_LIMIT)
         );
     }
 

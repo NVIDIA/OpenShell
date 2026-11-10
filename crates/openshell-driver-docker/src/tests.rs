@@ -2,20 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_core::driver_utils::{
+use openshell_container_runtime::driver_utils::LABEL_SANDBOX_NAMESPACE;
+use openshell_driver_sdk::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE,
 };
-use openshell_core::jwt::{
+use openshell_driver_sdk::jwt::{
     CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
     SupervisorAuthBundle,
 };
-use openshell_core::progress::{
+use openshell_driver_sdk::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
     PROGRESS_COMPLETE_STEP_KEY, PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
     PROGRESS_STEP_STARTING_SANDBOX,
 };
-use openshell_core::proto::compute::v1::{
+use openshell_driver_sdk::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate, GpuResourceRequirements,
     ResourceRequirements, WorkloadIdentityRequest,
 };
@@ -52,12 +52,11 @@ fn startup_error_log_tails_fit_grpc_header_budget() {
 fn test_launch_authentication() -> Vec<u8> {
     serde_json::to_vec(&SandboxLaunchAuthentication {
         supervisor: SupervisorAuthBundle {
-            session_id: openshell_core::SandboxSessionId::new(),
-            runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
-                "generation-1",
-            )
-            .unwrap(),
-            session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
+            session_id: openshell_driver_sdk::SandboxSessionId::new(),
+            runtime_generation:
+                openshell_driver_sdk::sandbox_generation::SandboxGenerationId::parse("generation-1")
+                    .unwrap(),
+            session_rotation: openshell_driver_sdk::jwt::SessionRotation::new(1).unwrap(),
             auth_epoch: CredentialEpoch::new(1).unwrap(),
             gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
             gateway_expires_at: i64::MAX,
@@ -84,7 +83,7 @@ fn test_launch_authentication() -> Vec<u8> {
 #[tokio::test]
 async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together() {
     let config = runtime_config();
-    let sandbox_id = format!("restart-{}", openshell_core::SandboxSessionId::new());
+    let sandbox_id = format!("restart-{}", openshell_driver_sdk::SandboxSessionId::new());
     let directory = docker_boundary_state_dir_by_id(&sandbox_id, &config).unwrap();
     fs::create_dir_all(&directory).unwrap();
     let mut authentication: SandboxLaunchAuthentication =
@@ -140,8 +139,9 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
     .unwrap();
     let previous_evidence = provisioned.boundary_config.provisioning_evidence;
     authentication.supervisor.runtime_generation =
-        openshell_core::sandbox_generation::SandboxGenerationId::parse("generation-2").unwrap();
-    authentication.supervisor.session_id = openshell_core::SandboxSessionId::new();
+        openshell_driver_sdk::sandbox_generation::SandboxGenerationId::parse("generation-2")
+            .unwrap();
+    authentication.supervisor.session_id = openshell_driver_sdk::SandboxSessionId::new();
     let encoded = serde_json::to_vec(&authentication).unwrap();
     refresh_docker_boundary_authentication(&sandbox_id, &config, &encoded)
         .await
@@ -157,11 +157,11 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
         .unwrap();
     assert!(image_env.contains(&format!(
         "{}=image-test",
-        openshell_core::sandbox_env::CONTAINER_IMAGE_UID
+        openshell_driver_sdk::sandbox_env::CONTAINER_IMAGE_UID
     )));
     assert!(image_env.contains(&format!(
         "{}={}",
-        openshell_core::sandbox_env::CONTAINER_IMAGE,
+        openshell_driver_sdk::sandbox_env::CONTAINER_IMAGE,
         sandbox_image(&sandbox).unwrap()
     )));
     let descriptor = read_docker_runtime_descriptor(&sandbox_id, &config)
@@ -245,7 +245,7 @@ fn admission_defaults_reject_even_gpu_driver_json_but_not_public_gpu_requests() 
     let mut config = runtime_config();
     config.allow_driver_config = false;
     config.resource_admission =
-        openshell_core::resource_admission::ResourceAdmissionConfig::default();
+        openshell_driver_sdk::resource_admission::ResourceAdmissionConfig::default();
     config.gpu.cdi_supported = true;
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
@@ -270,7 +270,7 @@ fn admission_blocks_unlabelable_bind_mount_even_when_bind_mounts_enabled() {
     let mut config = runtime_config();
     config.enable_bind_mounts = true;
     config.resource_admission =
-        openshell_core::resource_admission::ResourceAdmissionConfig::default();
+        openshell_driver_sdk::resource_admission::ResourceAdmissionConfig::default();
     let mut sandbox = test_sandbox();
     sandbox
         .spec
@@ -280,7 +280,7 @@ fn admission_blocks_unlabelable_bind_mount_even_when_bind_mounts_enabled() {
         .as_mut()
         .unwrap()
         .driver_config = Some(
-        openshell_core::proto_struct::json_object_to_struct(
+        openshell_driver_sdk::proto_struct::json_object_to_struct(
             serde_json::json!({"mounts":[{"type":"bind","source":"/srv/data","target":"/data"}]})
                 .as_object()
                 .unwrap()
@@ -333,7 +333,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
         // Existing lifecycle fixtures exercise the explicitly opted-out contract.
         allow_driver_config: true,
-        resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
+        resource_admission: openshell_driver_sdk::resource_admission::ResourceAdmissionConfig {
             enabled: false,
             ..Default::default()
         },
@@ -349,9 +349,9 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         supervisor_endpoint_explicit: true,
         bridge_default_endpoint: Some("https://host.docker.internal:8443".to_string()),
         host_gateway_ip: None,
-        supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
+        supervisor_otlp: openshell_driver_sdk::sandbox_env::SupervisorOtlp::default(),
         supervisor_gateway_name: None,
-        ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
+        ssh_socket_path: openshell_driver_sdk::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
         }),
@@ -359,7 +359,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             cdi_supported: false,
             wsl_all_gpu_fallback_enabled: false,
         },
-        sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
+        sandbox_pids_limit: openshell_container_runtime::config::default_sandbox_pids_limit(),
         enable_bind_mounts: false,
         upstream_proxy: UpstreamProxyConfig::default(),
         proxy_ca_bundle: None,
@@ -370,7 +370,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
 }
 
 fn write_test_proxy_ca_bundle(directory: &TempDir) -> PathBuf {
-    let tls = generate_sandbox_tls_material(openshell_core::SandboxSessionId::new())
+    let tls = generate_sandbox_tls_material(openshell_driver_sdk::SandboxSessionId::new())
         .expect("generate test proxy CA");
     let path = directory.path().join("proxy-ca.pem");
     fs::write(&path, tls.trust_anchor_pem).expect("write test proxy CA");
@@ -546,7 +546,7 @@ fn json_struct(value: serde_json::Value) -> prost_types::Struct {
     let serde_json::Value::Object(object) = value else {
         panic!("expected JSON object");
     };
-    openshell_core::proto_struct::json_object_to_struct(object)
+    openshell_driver_sdk::proto_struct::json_object_to_struct(object)
         .expect("test JSON must convert to a protobuf Struct")
 }
 
@@ -631,7 +631,7 @@ async fn live_docker_resource_admission_checks_native_volume_labels() {
     let suffix = temporary.path().file_name().unwrap().to_str().unwrap();
     let mut config = runtime_config();
     config.resource_admission =
-        openshell_core::resource_admission::ResourceAdmissionConfig::default();
+        openshell_driver_sdk::resource_admission::ResourceAdmissionConfig::default();
     let mut driver = test_driver_with_config(config);
     driver.docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
     for (index, (workspace, approved)) in [
@@ -695,7 +695,7 @@ async fn live_docker_resource_admission_checks_native_volume_labels() {
 }
 
 type TestDriverClient =
-    openshell_core::proto::compute::v1::compute_driver_client::ComputeDriverClient<
+    openshell_driver_sdk::proto::compute::v1::compute_driver_client::ComputeDriverClient<
         tonic::transport::Channel,
     >;
 
@@ -715,7 +715,7 @@ async fn standalone_traced_client() -> (
     oneshot::Sender<()>,
     JoinHandle<Result<(), tonic::transport::Error>>,
 ) {
-    use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+    use openshell_driver_sdk::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -757,8 +757,8 @@ async fn tracing_standalone_rpc_layer_propagates_context_and_records_errors() {
 
     client
         .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {
-            gateway: Some(openshell_core::extension_protocol::gateway_metadata(
-                openshell_core::extension_protocol::ExtensionFamily::Compute,
+            gateway: Some(openshell_driver_sdk::extension_protocol::gateway_metadata(
+                openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
             )),
         }))
         .await
@@ -916,8 +916,8 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
         ComputeDriver::get_capabilities(
             &service,
             Request::new(GetCapabilitiesRequest {
-                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
-                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                gateway: Some(openshell_driver_sdk::extension_protocol::gateway_metadata(
+                    openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
                 )),
             }),
         )
@@ -1469,7 +1469,7 @@ fn docker_resource_limits_applies_cpu_and_memory_limits() {
 
 #[test]
 fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
-    let default = openshell_core::config::default_sandbox_pids_limit();
+    let default = openshell_container_runtime::config::default_sandbox_pids_limit();
     assert_eq!(
         docker_pids_limit(default).unwrap(),
         default.map(std::num::NonZeroI64::get)
@@ -1503,7 +1503,8 @@ fn container_create_body_sets_driver_owned_pids_limit() {
     let host_config = body.host_config.expect("host config");
     assert_eq!(
         host_config.pids_limit,
-        openshell_core::config::default_sandbox_pids_limit().map(std::num::NonZeroI64::get)
+        openshell_container_runtime::config::default_sandbox_pids_limit()
+            .map(std::num::NonZeroI64::get)
     );
 }
 
@@ -1512,12 +1513,12 @@ fn docker_child_environment_strips_supervisor_control_keys() {
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     for key in [
-        openshell_core::sandbox_env::ENDPOINT,
-        openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
-        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
-        openshell_core::sandbox_env::OCI_IMAGE_USER,
-        openshell_core::sandbox_env::SANDBOX_TOKEN,
-        openshell_core::sandbox_env::SANDBOX_TOKEN_FILE,
+        openshell_driver_sdk::sandbox_env::ENDPOINT,
+        openshell_driver_sdk::sandbox_env::GATEWAY_TLS_SERVER_NAME,
+        openshell_driver_sdk::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        openshell_driver_sdk::sandbox_env::OCI_IMAGE_USER,
+        openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN,
+        openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN_FILE,
     ] {
         spec.environment
             .insert(key.to_string(), "spoofed".to_string());
@@ -1535,7 +1536,7 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 
 #[test]
 fn supervisor_otlp_environment_carries_only_configured_signals() {
-    use openshell_core::sandbox_env::{
+    use openshell_driver_sdk::sandbox_env::{
         GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
         OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol,
     };
@@ -1614,7 +1615,7 @@ fn boundary_environment_contains_only_driver_owned_values() {
     );
     assert!(env.iter().any(|entry| entry.starts_with(&format!(
         "{}=",
-        openshell_core::sandbox_env::TELEMETRY_ENABLED
+        openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED
     ))));
 }
 
@@ -1664,7 +1665,10 @@ fn container_creation_uses_inspected_immutable_image() {
         )
     );
     assert!(body.env.unwrap().iter().all(|entry| {
-        !entry.starts_with(&format!("{}=", openshell_core::sandbox_env::OCI_IMAGE_USER))
+        !entry.starts_with(&format!(
+            "{}=",
+            openshell_driver_sdk::sandbox_env::OCI_IMAGE_USER
+        ))
     }));
     let host = body.host_config.unwrap();
     assert_eq!(host.cap_add, None);
@@ -1883,8 +1887,8 @@ fn docker_identity_resolution_uses_numeric_default_for_userless_image() {
     assert_eq!(
         (resolved.uid, resolved.gid),
         (
-            openshell_core::sandbox_env::DEFAULT_SANDBOX_UID,
-            openshell_core::sandbox_env::DEFAULT_SANDBOX_GID,
+            openshell_driver_sdk::sandbox_env::DEFAULT_SANDBOX_UID,
+            openshell_driver_sdk::sandbox_env::DEFAULT_SANDBOX_GID,
         )
     );
     assert_eq!(resolved.source, "default");
@@ -4169,7 +4173,7 @@ fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
 
 #[test]
 fn default_docker_supervisor_image_uses_nvidia_ghcr_repo() {
-    let image = openshell_core::config::default_supervisor_image();
+    let image = openshell_driver_sdk::config::default_supervisor_image();
     assert!(
         image.starts_with("ghcr.io/nvidia/openshell/supervisor:"),
         "unexpected default image reference: {image}",
@@ -4178,7 +4182,7 @@ fn default_docker_supervisor_image_uses_nvidia_ghcr_repo() {
 
 #[test]
 fn docker_supervisor_image_tag_prefers_explicit_build_tags() {
-    use openshell_core::config::resolve_supervisor_image_tag;
+    use openshell_driver_sdk::config::resolve_supervisor_image_tag;
     assert_eq!(
         resolve_supervisor_image_tag(&["1.2.3", "sha", "0.0.0"]),
         "1.2.3"
@@ -4190,7 +4194,7 @@ fn docker_supervisor_image_tag_prefers_explicit_build_tags() {
 
 #[test]
 fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
-    use openshell_core::config::resolve_supervisor_image_tag;
+    use openshell_driver_sdk::config::resolve_supervisor_image_tag;
     assert_eq!(
         resolve_supervisor_image_tag(&["", "", "0.0.37-dev.156+g1d3b741ee"]),
         "0.0.37-dev.156-g1d3b741ee",
@@ -4509,7 +4513,7 @@ fn concurrent_container_removal_is_idempotent() {
 async fn missing_start_generation_is_adopted() {
     let directory = TempDir::new().expect("create temporary directory");
     let path = directory.path().join(START_GENERATION_FILE);
-    let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+    let generation = openshell_driver_sdk::sandbox_generation::SandboxGenerationId::parse(
         "generation-one".to_string(),
     )
     .expect("valid generation");
@@ -4532,7 +4536,7 @@ async fn different_start_generation_is_rejected() {
     let directory = TempDir::new().expect("create temporary directory");
     let path = directory.path().join(START_GENERATION_FILE);
     fs::write(&path, "generation-one").expect("write active marker");
-    let requested = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+    let requested = openshell_driver_sdk::sandbox_generation::SandboxGenerationId::parse(
         "generation-two".to_string(),
     )
     .expect("valid generation");

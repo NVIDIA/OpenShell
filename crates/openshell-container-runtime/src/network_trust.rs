@@ -4,8 +4,6 @@
 //! Resource-metadata markers for the destination-trust generation of a sandbox
 //! startup artifact, used by the local container drivers.
 
-pub use openshell_driver_sdk::network_trust::*;
-
 /// Protected resource metadata key recording the destination-trust generation
 /// used to build a sandbox startup artifact.
 ///

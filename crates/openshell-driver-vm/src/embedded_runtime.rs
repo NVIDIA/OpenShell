@@ -129,14 +129,14 @@ fn runtime_cache_key() -> String {
 }
 
 fn runtime_cache_dir() -> Result<PathBuf, String> {
-    let base =
-        openshell_core::paths::xdg_data_dir().map_err(|e| format!("resolve XDG data dir: {e}"))?;
+    let base = openshell_driver_sdk::paths::xdg_data_dir()
+        .map_err(|e| format!("resolve XDG data dir: {e}"))?;
     Ok(base.join("openshell").join("vm-runtime").join(VERSION))
 }
 
 fn runtime_cache_base() -> Result<PathBuf, String> {
-    let base =
-        openshell_core::paths::xdg_data_dir().map_err(|e| format!("resolve XDG data dir: {e}"))?;
+    let base = openshell_driver_sdk::paths::xdg_data_dir()
+        .map_err(|e| format!("resolve XDG data dir: {e}"))?;
     Ok(base.join("openshell").join("vm-runtime"))
 }
 

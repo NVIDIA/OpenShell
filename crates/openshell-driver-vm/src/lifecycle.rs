@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use openshell_core::proto::compute::v1::DriverSandbox as Sandbox;
-use openshell_core::settings::parse_bool_like;
+use openshell_driver_sdk::proto::compute::v1::DriverSandbox as Sandbox;
+use openshell_driver_sdk::settings::parse_bool_like;
 
 use crate::runtime::VmBackend;
 
@@ -782,7 +782,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
-    use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+    use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
     use super::*;
 

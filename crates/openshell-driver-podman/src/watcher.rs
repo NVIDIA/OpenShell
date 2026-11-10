@@ -11,8 +11,8 @@ use crate::container::{
     LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_WORKSPACE, short_id,
 };
 use futures::Stream;
-use openshell_core::ComputeDriverError;
-use openshell_core::proto::compute::v1::{
+use openshell_driver_sdk::ComputeDriverError;
+use openshell_driver_sdk::proto::compute::v1::{
     DriverCondition, DriverSandbox, DriverSandboxStatus, WatchSandboxesDeletedEvent,
     WatchSandboxesEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
@@ -26,10 +26,12 @@ use tracing::{debug, info, warn};
 // Condition reason constants shared across event-building paths.
 const CONDITION_RUNNING: &str = "ContainerRunning";
 const CONDITION_STARTING: &str = "ContainerStarting";
-use openshell_core::driver_utils::{
+use openshell_container_runtime::driver_utils::{
+    CONDITION_WORKSPACE_VALIDATION_FAILED, WORKSPACE_VALIDATION_FAILED_MESSAGE,
+};
+use openshell_driver_sdk::driver_utils::{
     CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_STOPPED,
-    CONDITION_WORKSPACE_VALIDATION_FAILED, SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED,
-    WORKSPACE_VALIDATION_FAILED_MESSAGE,
+    SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED,
 };
 
 pub type WatchStream =

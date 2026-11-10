@@ -4,7 +4,7 @@
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<_, tonic::Status>
 
 use futures::{Stream, StreamExt};
-use openshell_core::proto::compute::v1::{
+use openshell_driver_sdk::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
     EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
@@ -49,15 +49,17 @@ impl ComputeDriverService {
 }
 
 #[tonic::async_trait]
-impl openshell_core::compute::ComputeDriver for ComputeDriverService {}
+impl openshell_driver_sdk::compute::ComputeDriver for ComputeDriverService {}
 
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
     async fn authenticate_sandbox(
         &self,
-        _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
-    {
+        _request: Request<openshell_driver_sdk::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<
+        Response<openshell_driver_sdk::proto::compute::v1::AuthenticateSandboxResponse>,
+        Status,
+    > {
         self.rpc_tracer
             .trace(openshell_otel::rpc::AUTHENTICATE_SANDBOX, async {
                 Err(Status::unimplemented(
@@ -74,8 +76,8 @@ impl ComputeDriver for ComputeDriverService {
         self.rpc_tracer
             .trace(openshell_otel::rpc::GET_CAPABILITIES, async {
                 let capabilities = self.driver.capabilities().map_err(Status::from)?;
-                openshell_core::extension_protocol::validate_gateway_metadata(
-                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                openshell_driver_sdk::extension_protocol::validate_gateway_metadata(
+                    openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
                     "podman",
                     capabilities.extension.as_ref(),
                     request.into_inner().gateway,
@@ -279,11 +281,11 @@ mod tests {
     use crate::container;
     use crate::test_utils::{StubResponse, spawn_podman_stub, unique_socket_path};
     use hyper::StatusCode;
-    use openshell_core::ComputeDriverError;
+    use openshell_driver_sdk::ComputeDriverError;
     use std::path::PathBuf;
 
     type TestDriverClient =
-        openshell_core::proto::compute::v1::compute_driver_client::ComputeDriverClient<
+        openshell_driver_sdk::proto::compute::v1::compute_driver_client::ComputeDriverClient<
             tonic::transport::Channel,
         >;
 
@@ -303,7 +305,7 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     ) {
-        use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+        use openshell_driver_sdk::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -381,8 +383,8 @@ mod tests {
             ComputeDriver::get_capabilities(
                 &service,
                 Request::new(GetCapabilitiesRequest {
-                    gateway: Some(openshell_core::extension_protocol::gateway_metadata(
-                        openshell_core::extension_protocol::ExtensionFamily::Compute,
+                    gateway: Some(openshell_driver_sdk::extension_protocol::gateway_metadata(
+                        openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
                     )),
                 }),
             )
@@ -449,8 +451,8 @@ mod tests {
 
         client
             .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {
-                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
-                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                gateway: Some(openshell_driver_sdk::extension_protocol::gateway_metadata(
+                    openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
                 )),
             }))
             .await

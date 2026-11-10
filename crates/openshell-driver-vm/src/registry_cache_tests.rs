@@ -28,7 +28,7 @@ impl Registry {
         let server = tokio::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+                openshell_driver_sdk::net::set_tcp_nodelay_best_effort(&stream);
                 let mut request = Vec::new();
                 while !request.ends_with(b"\r\n\r\n") {
                     request.push(stream.read_u8().await.unwrap());
@@ -219,13 +219,13 @@ async fn rejects_unbound_manifest(bootstrap: bool) {
     let legacy_identity = if bootstrap {
         format!(
             "sandbox-bootstrap-rootfs-ext4-v5:openshell-{}:guest-{}:{trusted_digest}",
-            openshell_core::VERSION,
+            openshell_driver_sdk::VERSION,
             sandbox_guest_runtime_identity(),
         )
     } else {
         format!(
             "sandbox-prepared-rootfs-ext4-umoci-v3:openshell-{}:image-account:{trusted_digest}",
-            openshell_core::VERSION,
+            openshell_driver_sdk::VERSION,
         )
     };
     assert_ne!(legacy_identity, identity);
