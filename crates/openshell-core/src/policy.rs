@@ -11,6 +11,8 @@ use crate::proto::{
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+pub use openshell_driver_sdk::policy::{MAX_SANDBOX_UID, MIN_SANDBOX_UID};
+
 #[derive(Debug, Clone)]
 pub struct SandboxPolicy {
     pub version: u32,

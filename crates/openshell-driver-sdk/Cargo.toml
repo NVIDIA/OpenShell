@@ -11,9 +11,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+openshell-crypto = { workspace = true, optional = true }
 openshell-otel = { path = "../openshell-otel", optional = true }
 base64 = { workspace = true }
 clap = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 tonic = { workspace = true, features = ["channel"] }
@@ -37,6 +40,7 @@ libc = "0.2"
 
 [dev-dependencies]
 openshell-crypto = { workspace = true }
+rcgen = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"
 
@@ -45,6 +49,8 @@ default = []
 ## Report anonymous telemetry as enabled unless the environment disables it. When
 ## off, drivers always report it disabled.
 telemetry = []
+## Strict Ed25519 JWT issuance and verification for authenticated sandbox sessions.
+jwt = ["dep:openshell-crypto", "dep:jsonwebtoken", "dep:zeroize"]
 ## Conversions to `openshell-otel` types.
 otel = ["dep:openshell-otel"]
 ## Command-line flags shared by compute drivers.

@@ -21,8 +21,12 @@ pub mod extension_protocol;
 pub mod external_driver_socket;
 pub mod gpu;
 pub mod image;
+#[cfg(feature = "jwt")]
+pub mod jwt;
 pub mod net;
+pub mod network_trust;
 pub mod paths;
+pub mod policy;
 pub mod progress;
 pub mod proto;
 pub mod proto_struct;

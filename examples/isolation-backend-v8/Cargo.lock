@@ -2127,7 +2127,6 @@ dependencies = [
  "base64 0.22.1",
  "glob",
  "ipnet",
- "jsonwebtoken",
  "libc",
  "miette",
  "nix",
@@ -2153,7 +2152,6 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
@@ -2178,9 +2176,11 @@ name = "openshell-driver-sdk"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "jsonwebtoken",
  "libc",
  "miette",
  "nix",
+ "openshell-crypto",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
@@ -2198,6 +2198,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
