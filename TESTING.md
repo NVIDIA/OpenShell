@@ -541,7 +541,7 @@ Run the portable subset in a disposable rootless Podman guest:
 
 ```shell
 nix run .#build-artifacts
-nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
+nix run .#tmachine -- test fedora-podman-rootless rpm e2e-podman
 ```
 
 Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
@@ -566,14 +566,40 @@ matching lines in `branch-checks.yml`, and `ALIGNED_WORKSPACES`. The Podman
 driver suite (`tests/suites/drivers/podman`) compares OpenShell and direct
 Podman user-namespace mappings.
 Each `fedora-podman-{rootful,rootless}-userns-<mode>` environment configures
-the gateway with one mode (`default`, `auto`, `keep-id` or `private`); only the
-`binaries` installer applies it:
+the gateway with one mode (`default`, `auto`, `keep-id` or `private`) and works
+with every installer; CI runs it with `rpm`:
 
 ```shell
 nix run .#openshell-test-runner -- run \
-  --environment fedora-podman-rootless-userns-keep-id --installer binaries \
-  --gateway tmachine --family drivers/podman
+  --environment fedora-podman-rootless-userns-keep-id --installer rpm \
+  --family drivers/podman
 ```
+
+#### Gateway overrides in an environment
+
+An environment overrides gateway settings by writing the tables to change to
+`/etc/openshell-test/gateway-overrides.toml` in a playbook that runs before the
+installer. The file holds whole tables, such as `[openshell.gateway]` or
+`[openshell.drivers.podman]`, and is not a complete configuration. Each
+installer applies it to the gateway's own file:
+
+- `binaries` applies it to the `/etc/openshell/gateway.toml` it generates.
+- `deb` and `rpm` apply it to the service user's
+  `~/.config/openshell/gateway.toml`, the file the packaged service reads. The
+  file starts as a copy of the rpm's
+  `/usr/share/openshell-gateway/gateway.toml.default`, where the service would
+  seed it on first start, or as a minimal `version = 2` file when the package
+  has no default. No environment replaces the packaged file, and an environment
+  with no overrides leaves it untouched.
+- `k3s` installers ignore the file.
+
+`tests/tmachine/ansible/roles/openshell_gateway/files/merge-gateway-toml.py`
+does the work. Each key in the overrides replaces the same key in the table, or
+is added to it, and a table the file lacks is appended. The rest of the file,
+comments included, stays. The script parses the result and fails the setup,
+leaving the file unchanged, when it isn't valid TOML. It can't remove a key.
+Settings that the packaged service reads from `gateway.env` instead of the
+TOML are not covered.
 
 The `oci-image` feature suite (`tests/suites/features/oci-image`) checks OCI
 image identity and working-directory behavior shared by the Docker and Podman
