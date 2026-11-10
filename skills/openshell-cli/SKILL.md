@@ -633,7 +633,7 @@ repair the complete policy or provider set through the gateway. The workload
 has not started on its first activation, so static fields can also be replaced
 during this initial repair. A previously activated sandbox retains static-field
 restrictions while restart admission is pending or rejected.
-Before the gateway's 300-second repair window expires, successful validation
+Before the gateway's configured repair window expires (300 seconds by default), successful validation
 completes startup in place. Effective stored configuration changes and their
 first failed load reset that window; repeated failures do not. After
 `ProvisioningTimedOut`, inspect the retained record and cleanup status, repair

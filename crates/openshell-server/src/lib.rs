@@ -2362,6 +2362,10 @@ async fn build_compute_runtime(
         .and_then(|runtime| {
             runtime.with_image_preparation_timeout(config.image_preparation_timeout_seconds)
         })
+        .and_then(|runtime| {
+            runtime
+                .with_provisioning_repair_window_seconds(config.provisioning_repair_window_seconds)
+        })
         .map_err(Error::config)?;
     Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
 }
