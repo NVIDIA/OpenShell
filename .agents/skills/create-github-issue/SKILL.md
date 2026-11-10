@@ -137,11 +137,7 @@ GitHub built-in issue types (`Bug`, `Feature`, `Task`) should come from the matc
 
 Creating an issue does not accept it. Follow Label Discovery in `CONTRIBUTING.md` to retrieve every page of current `state:*` label definitions and resolve unclear meanings, then follow its triage → validation → human acceptance process. Agents may assess facts, but only humans decide whether to accept work or place it on the roadmap. A direct user request authorizes the requested planning or implementation phase without changing issue disposition.
 
-Follow [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications)
-for classification labels. Defer area/topic labels until the work is accepted;
-filing an issue or identifying its subject is not acceptance. Intake workflow
-labels may still record triage status. Classification can trigger subscribers'
-GitHub app in Slack and other integration notifications.
+Follow [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications) for classification labels. Defer area/topic labels until the work is accepted; filing an issue or identifying its subject is not acceptance. Intake workflow labels may still record triage status. Classification can trigger subscribers' GitHub app in Slack and other integration notifications.
 
 ## Useful Options
 

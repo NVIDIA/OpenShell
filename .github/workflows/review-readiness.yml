@@ -37,7 +37,7 @@ jobs:
             REVIEWERS.md
             MAINTAINERS.md
             tasks/scripts/check_review_readiness.py
-            tasks/scripts/accepted_work.py
+            tasks/scripts/label_accepted_work.py
             tasks/scripts/check_maintainer_approval.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
