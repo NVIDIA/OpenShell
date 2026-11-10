@@ -13,9 +13,8 @@ async fn explicit_image_is_used(cx: &mut Context) -> testkit::Result {
         .sandbox("ei")
         .command(["sleep", "infinity"])
         .spec(|spec| spec.image = Some(image.clone()))
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
     expect_ubuntu(&sandbox)
         .await
         .map_err(|error| error.context(format!("sandbox from image {image}")))

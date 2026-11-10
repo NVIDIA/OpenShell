@@ -136,7 +136,6 @@ impl Cli {
             .await
             .map_err(|_| Error::msg(format!("timed out after {CLI_TIMEOUT:?}")))
             .context(format!("run {command}"))?
-            .map_err(|error| Error::from_error(&error))
             .context(format!("run {command}"))?;
         Ok(CliOutput {
             command,
@@ -147,6 +146,10 @@ impl Cli {
         })
     }
 }
+
+/// The characters the CLI's error reports draw around wrapped lines: the
+/// gutter, the error marker, and the box corners.
+const REPORT_GUTTER: [char; 6] = ['│', '×', '╰', '─', '╭', '├'];
 
 impl CliOutput {
     /// Fail unless the command exited 0.
@@ -178,7 +181,7 @@ impl CliOutput {
     /// match against this rather than the raw output.
     pub fn message(&self) -> String {
         format!("{} {}", self.stdout, self.stderr)
-            .replace(['│', '×', '╰', '─', '╭', '├'], " ")
+            .replace(REPORT_GUTTER, " ")
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")

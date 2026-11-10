@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use testkit::sdk::{SandboxPhase, SandboxRestartPolicy};
-use testkit::{Context, Poll, ResultExt as _, Sandbox, poll_until};
+use testkit::{Context, Poll, ResultExt as _, Sandbox, poll_until, with_deadline};
 
 /// A long-running sandbox becomes ready, runs a command with exec, and is gone
 /// from get and list after delete.
@@ -19,25 +19,23 @@ async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
         .sandbox("lr")
         .command(["sleep", "infinity"])
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
 
     let marker = format!("openshell-e2e-{}", cx.run_id());
-    let output = sandbox.exec(["echo", marker.as_str()]).await?.success()?;
-    testkit::ensure!(
-        output.stdout == format!("{marker}\n"),
-        "exec stdout was {:?}; expected {:?}",
-        output.stdout,
-        format!("{marker}\n")
-    );
+    sandbox
+        .exec(["echo", marker.as_str()])
+        .await?
+        .expect_stdout(&format!("{marker}\n"))?;
 
-    sandbox.delete().await?;
-    cx.expect_absent(&sandbox).await
+    cx.delete_and_expect_absent(&sandbox).await
 }
 
 /// Longer than the supervisor's 30s startup recovery deadline.
 const PAST_RECOVERY_DEADLINE: Duration = Duration::from_secs(31);
+/// The exec's own timeout is the runner's two-minute kill, so fail sooner,
+/// with a message that says which step hung.
+const PAST_RECOVERY_EXEC_DEADLINE: Duration = Duration::from_mins(1);
 
 /// An exec admitted before the startup recovery deadline expires keeps
 /// running past it, and a new exec still works afterwards.
@@ -46,38 +44,27 @@ async fn exec_outlives_startup_recovery_deadline(cx: &mut Context) -> testkit::R
     let sandbox = cx
         .sandbox("rd")
         .command(["sleep", "infinity"])
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
 
     let script = format!(
         "sleep {}; printf past-recovery-deadline",
         PAST_RECOVERY_DEADLINE.as_secs()
     );
-    let output = tokio::time::timeout(
-        Duration::from_mins(1),
+    with_deadline(
+        PAST_RECOVERY_EXEC_DEADLINE,
+        "the exec past the recovery deadline",
         sandbox.exec(["sh", "-c", script.as_str()]),
     )
-    .await
-    .map_err(|_| testkit::Error::msg("exec past the recovery deadline did not finish in 60s"))??
-    .success()
+    .await?
+    .expect_stdout("past-recovery-deadline")
     .context("the recovery deadline must not end an admitted exec")?;
-    testkit::ensure!(
-        output.stdout == "past-recovery-deadline",
-        "the exec past the recovery deadline printed {:?}",
-        output.stdout
-    );
 
-    let next = sandbox
+    sandbox
         .exec(["printf", "fresh-exec"])
         .await?
-        .success()
+        .expect_stdout("fresh-exec")
         .context("exec after the recovery deadline")?;
-    testkit::ensure!(
-        next.stdout == "fresh-exec",
-        "exec after the recovery deadline printed {:?}",
-        next.stdout
-    );
     Ok(())
 }
 
@@ -106,45 +93,28 @@ async fn delete_is_prompt_when_workload_is_slow_to_handle_term(
     let sandbox = cx
         .sandbox("dt")
         .command(["sh", "-c", script.as_str()])
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
 
     // Ready alone does not prove that the workload has installed its trap.
-    testkit::poll_until(
-        "workload TERM handler readiness",
-        Duration::from_secs(10),
-        Duration::from_millis(100),
-        async || {
-            let output = sandbox
-                .exec(["sh", "-c", "test -f /tmp/delayed-term-ready"])
-                .await?;
-            Ok(if output.exit_code == 0 {
-                testkit::Poll::Ready(())
-            } else {
-                testkit::Poll::Pending(format!(
-                    "readiness check exited {}; stderr: {}",
-                    output.exit_code, output.stderr
-                ))
-            })
-        },
-    )
-    .await?;
+    sandbox
+        .poll_exec(
+            "workload TERM handler readiness",
+            Duration::from_secs(10),
+            ["test", "-f", "/tmp/delayed-term-ready"],
+            |output| output.exit_code == 0,
+        )
+        .await?;
 
     // Use one deadline starting before delete, not a fresh timeout per step.
     // Boundary containment may kill the workload before its handler finishes;
     // this asserts bounded deletion, not a graceful workload exit.
-    tokio::time::timeout(DELETE_DEADLINE, async {
-        sandbox.delete().await?;
-        cx.expect_absent(&sandbox).await
-    })
+    with_deadline(
+        DELETE_DEADLINE,
+        &format!("deleting sandbox {}", sandbox.name()),
+        cx.delete_and_expect_absent(&sandbox),
+    )
     .await
-    .map_err(|_| {
-        testkit::Error::msg(format!(
-            "sandbox {} was not fully deleted within {DELETE_DEADLINE:?}",
-            sandbox.name()
-        ))
-    })?
 }
 
 /// A sandbox whose main command exits 0, with restart policy Never, reaches
@@ -186,8 +156,7 @@ async fn run_to_completion_exit_delete(cx: &mut Context) -> testkit::Result {
         again.restart_count
     );
 
-    sandbox.delete().await?;
-    cx.expect_absent(&sandbox).await
+    cx.delete_and_expect_absent(&sandbox).await
 }
 
 /// A main command that exits during provisioning is reported as the
@@ -266,18 +235,14 @@ async fn default_command_sandbox_is_listed_ready(cx: &mut Context) -> testkit::R
     cx.expect_listed(&sandbox, SandboxPhase::Ready).await?;
 
     let marker = format!("openshell-e2e-{}", cx.run_id());
-    let output = sandbox.exec(["echo", marker.as_str()]).await?.success()?;
-    testkit::ensure!(
-        output.stdout == format!("{marker}\n"),
-        "exec stdout was {:?}; expected {:?}",
-        output.stdout,
-        format!("{marker}\n")
-    );
+    sandbox
+        .exec(["echo", marker.as_str()])
+        .await?
+        .expect_stdout(&format!("{marker}\n"))?;
     // The gateway's default image is OpenShell's Ubuntu base image.
     crate::image::expect_ubuntu(&sandbox).await?;
 
-    sandbox.delete().await?;
-    cx.expect_absent(&sandbox).await
+    cx.delete_and_expect_absent(&sandbox).await
 }
 
 /// A stopped sandbox rejects exec, accepts a second stop, and returns to
@@ -287,18 +252,15 @@ async fn restart_stopped_sandbox(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
         .sandbox("rs")
         .command(["sleep", "infinity"])
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
 
     sandbox.stop().await?;
-    match sandbox.exec(["true"]).await {
-        Err(_) => {}
-        Ok(output) => testkit::ensure!(
-            output.exit_code != 0,
-            "exec succeeded while the sandbox was stopped"
-        ),
-    }
+    let rejected = sandbox.exec(["true"]).await;
+    testkit::ensure!(
+        !matches!(&rejected, Ok(output) if output.exit_code == 0),
+        "exec succeeded while the sandbox was stopped"
+    );
     // Stop is idempotent.
     let again = sandbox.stop().await?;
     testkit::ensure!(
@@ -308,16 +270,11 @@ async fn restart_stopped_sandbox(cx: &mut Context) -> testkit::Result {
     );
 
     sandbox.start().await?;
-    let output = sandbox
+    sandbox
         .exec(["echo", "started"])
         .await?
-        .success()
+        .expect_stdout("started\n")
         .context("exec after start")?;
-    testkit::ensure!(
-        output.stdout == "started\n",
-        "exec after start printed {:?}; expected \"started\\n\"",
-        output.stdout
-    );
     Ok(())
 }
 
@@ -327,12 +284,10 @@ async fn stopped_sandbox_can_be_deleted(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
         .sandbox("sd")
         .command(["sleep", "infinity"])
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
     sandbox.stop().await?;
-    sandbox.delete().await?;
-    cx.expect_absent(&sandbox).await
+    cx.delete_and_expect_absent(&sandbox).await
 }
 
 /// Where the main command of [`canonical_main_environment`] records what it
@@ -376,15 +331,11 @@ async fn canonical_main_environment(cx: &mut Context) -> testkit::Result {
             field("declared")
         );
 
-        let exec = sandbox
+        sandbox
             .exec(["sh", "-c", "printf '%s' \"${REPRO_SENTINEL:-missing}\""])
             .await?
-            .success()?;
-        testkit::ensure!(
-            exec.stdout == declared,
-            "exec (tty {tty}) saw REPRO_SENTINEL={:?}; expected {declared:?}",
-            exec.stdout
-        );
+            .expect_stdout(&declared)
+            .context(format!("REPRO_SENTINEL in exec (tty {tty})"))?;
 
         if *tty {
             testkit::ensure!(
@@ -409,40 +360,31 @@ async fn canonical_main_environment(cx: &mut Context) -> testkit::Result {
 async fn main_environment(
     sandbox: &Sandbox,
 ) -> testkit::Result<std::collections::HashMap<String, String>> {
-    let contents = poll_until(
-        &format!(
-            "the main command of {} to record its environment",
-            sandbox.name()
-        ),
-        Duration::from_secs(30),
-        Duration::from_millis(250),
-        async || {
-            let output = sandbox.exec(["cat", MAIN_ENV_PATH]).await?;
-            Ok(
-                if output.exit_code == 0 && output.stdout.contains("term=") {
-                    Poll::Ready(output.stdout)
-                } else {
-                    Poll::Pending(format!(
-                        "cat exited {}; stderr: {}",
-                        output.exit_code, output.stderr
-                    ))
-                },
-            )
-        },
-    )
-    .await?;
-    Ok(contents
+    let output = sandbox
+        .poll_exec(
+            &format!(
+                "the main command of {} to record its environment",
+                sandbox.name()
+            ),
+            Duration::from_secs(30),
+            ["cat", MAIN_ENV_PATH],
+            |output| output.exit_code == 0 && output.stdout.contains("term="),
+        )
+        .await?;
+    Ok(output
+        .stdout
         .lines()
         .filter_map(|line| line.split_once('='))
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect())
 }
 
-/// How long a restart under the on-failure policy may take. The runner kills
-/// a test after two minutes, so the test's deadlines must add up to less.
-const RESTART_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long a Ready sandbox's main command may take to write its marker.
-const MARKER_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a restart under the on-failure policy may take to be reported.
+/// The runner kills a test after two minutes, so the test's deadlines must
+/// add up to less.
+const RESTART_TIMEOUT: Duration = Duration::from_secs(45);
+/// How long a running main command may take to write its workspace marker.
+const MARKER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Under the on-failure policy, a main command that fails is replaced by a new
 /// instance of it. The workspace survives the restart, the restart is counted,
@@ -465,29 +407,19 @@ fi
         .sandbox("of")
         .command(["sh", "-c", SCRIPT])
         .restart_policy(SandboxRestartPolicy::OnFailure)
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
-    poll_until(
-        "the initial main command to write its workspace marker",
-        MARKER_TIMEOUT,
-        Duration::from_millis(250),
-        async || {
-            let output = sandbox.exec(["cat", "/sandbox/initial-run"]).await?;
-            Ok(if output.stdout.contains("initial-") {
-                Poll::Ready(())
-            } else {
-                Poll::Pending(format!("cat exited {}", output.exit_code))
-            })
-        },
-    )
-    .await?;
+    sandbox
+        .poll_exec(
+            "the initial main command to write its workspace marker",
+            MARKER_TIMEOUT,
+            ["cat", "/sandbox/initial-run"],
+            |output| output.stdout.contains("initial-"),
+        )
+        .await?;
 
     let initial = cx.sandbox_details(sandbox.name()).await?;
-    let initial_instance = initial["main_process_instance_id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    let initial_instance = main_instance(&initial).to_string();
     testkit::ensure!(
         !initial_instance.is_empty(),
         "sandbox get reports no main process instance: {initial}"
@@ -503,38 +435,43 @@ fi
         Duration::from_millis(250),
         async || {
             let details = cx.sandbox_details(sandbox.name()).await?;
-            let instance = details["main_process_instance_id"]
-                .as_str()
-                .unwrap_or_default();
+            let instance = main_instance(&details);
             let replaced = !instance.is_empty() && instance != initial_instance;
-            if details["phase"] != "Ready" || details["restart_count"] != 1 || !replaced {
-                return Ok(Poll::Pending(format!(
-                    "phase {}, restart count {}, main process instance {instance:?}",
-                    details["phase"], details["restart_count"]
-                )));
-            }
-            let runs = sandbox
-                .exec(["cat", "/sandbox/initial-run", "/sandbox/replacement-run"])
-                .await?;
             Ok(
-                if runs.stdout.contains("initial-") && runs.stdout.contains("replacement-") {
+                if details["phase"] == "Ready" && details["restart_count"] == 1 && replaced {
                     Poll::Ready(details)
                 } else {
                     Poll::Pending(format!(
-                        "restarted, but the workspace has {:?}; stderr: {}",
-                        runs.stdout, runs.stderr
+                        "phase {}, restart count {}, main process instance {instance:?}",
+                        details["phase"], details["restart_count"]
                     ))
                 },
             )
         },
     )
     .await?;
+    sandbox
+        .poll_exec(
+            "the replacement main command to find the workspace and write its marker",
+            MARKER_TIMEOUT,
+            ["cat", "/sandbox/initial-run", "/sandbox/replacement-run"],
+            |output| output.stdout.contains("initial-") && output.stdout.contains("replacement-"),
+        )
+        .await?;
     testkit::ensure!(
         restarted["restart_policy"] == "on-failure",
         "the restart policy after the restart is {}; expected \"on-failure\"",
         restarted["restart_policy"]
     );
     Ok(())
+}
+
+/// The ID of the sandbox's current main process instance, from
+/// [`Context::sandbox_details`]. Empty if none is reported.
+fn main_instance(details: &serde_json::Value) -> &str {
+    details["main_process_instance_id"]
+        .as_str()
+        .unwrap_or_default()
 }
 
 /// How long the gateway may take to remove an ephemeral sandbox after its

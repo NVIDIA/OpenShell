@@ -79,18 +79,17 @@ impl<'a> CliSandboxBuilder<'a> {
     /// return the sandbox. It need not be Ready yet.
     pub async fn create(mut self) -> Result<Sandbox> {
         self.args.push("--detach".to_string());
-        let (cx, name) = (self.cx, self.name.clone());
         self.run()
             .await?
             .success()
-            .context(format!("create sandbox {name}"))?;
-        cx.adopt(&name).await
+            .context(format!("create sandbox {}", self.name))?;
+        self.cx.adopt(&self.name).await
     }
 
     /// Create the sandbox attached to its main command and return the CLI's
     /// output, whatever its exit code. For a test of the main command's
     /// result, or of a create that must fail.
-    pub async fn run(self) -> Result<CliOutput> {
+    pub async fn run(&self) -> Result<CliOutput> {
         self.cx.track(&self.name);
         let policy = self.policy.as_deref().map(PolicyFile::new).transpose()?;
         let mut args = vec!["sandbox", "create", "--name", &self.name, "--no-tty"];
@@ -111,11 +110,8 @@ struct PolicyFile(tempfile::NamedTempFile);
 
 impl PolicyFile {
     fn new(contents: &str) -> Result<Self> {
-        let file = tempfile::NamedTempFile::new()
-            .map_err(|error| Error::from_error(&error))
-            .context("create policy file")?;
+        let file = tempfile::NamedTempFile::new().context("create policy file")?;
         std::fs::write(file.path(), contents)
-            .map_err(|error| Error::from_error(&error))
             .context(format!("write {}", file.path().display()))?;
         Ok(Self(file))
     }

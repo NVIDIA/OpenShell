@@ -15,7 +15,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
-use testkit::{CliOutput, Context, Error, Sandbox};
+use testkit::{CliOutput, Context, Error, ResultExt as _, Sandbox};
 
 const LARGE_FILE_SIZE: usize = 512 * 1024;
 
@@ -78,8 +78,7 @@ async fn large_upload_backpressure(cx: &mut Context) -> testkit::Result {
             chunk.copy_from_slice(&splitmix64(&mut state).to_le_bytes()[..chunk.len()]);
         }
         let relative = format!("payload/{index:05}.bin");
-        fs::write(source.join(&relative), &payload)
-            .map_err(|error| Error::msg(format!("write {relative}: {error}")))?;
+        fs::write(source.join(&relative), &payload).context(format!("write {relative}"))?;
         checksums.push_str(&format!("{}  {relative}\n", sha256_hex(&payload)?));
     }
     write(&source.join("SHA256SUMS"), &checksums)?;
@@ -147,12 +146,10 @@ impl<'a> Transfer<'a> {
         let sandbox = cx
             .sandbox(suffix)
             .command(["sleep", "infinity"])
-            .create()
+            .create_ready()
             .await?;
-        sandbox.wait_ready().await?;
         let remote_root = format!("/sandbox/file-transfer-{}-{suffix}", cx.run_id());
-        let local = tempfile::tempdir()
-            .map_err(|error| Error::msg(format!("create a local scratch directory: {error}")))?;
+        let local = tempfile::tempdir().context("create a local scratch directory")?;
         let ft = Self {
             cx,
             sandbox,
@@ -256,14 +253,12 @@ impl<'a> Transfer<'a> {
         write(&source.join("payload/00000.bin"), "payload")?;
         let script = source.join("run.sh");
         write(&script, "#!/bin/sh\nprintf '%s\\n' upload-executable-ok\n")?;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o751))
-            .map_err(|error| Error::msg(format!("chmod run.sh: {error}")))?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o751)).context("chmod run.sh")?;
         for (target, link) in [
             ("payload/00000.bin", "payload-link"),
             ("missing-target", "dangling-link"),
         ] {
-            symlink(target, source.join(link))
-                .map_err(|error| Error::msg(format!("symlink {link}: {error}")))?;
+            symlink(target, source.join(link)).context(format!("symlink {link}"))?;
         }
         write(&source.join("conflict.txt"), "local-conflict")?;
 
@@ -302,8 +297,7 @@ impl<'a> Transfer<'a> {
         write(&source.join("greeting.txt"), "hello-from-local")?;
         write(&source.join("subdir/nested.txt"), "nested-content")?;
         let large: Vec<u8> = (0u8..=250).cycle().take(LARGE_FILE_SIZE).collect();
-        fs::write(source.join("large.bin"), &large)
-            .map_err(|error| Error::msg(format!("write large.bin: {error}")))?;
+        fs::write(source.join("large.bin"), &large).context("write large.bin")?;
 
         let remote = format!("{}/roundtrip", self.remote_root);
         let uploaded = self.upload(&source, &remote, false).await?.success()?;
@@ -321,8 +315,7 @@ impl<'a> Transfer<'a> {
             .success()?;
         require_text(&destination.join("greeting.txt"), "hello-from-local")?;
         require_text(&destination.join("subdir/nested.txt"), "nested-content")?;
-        let actual = fs::read(destination.join("large.bin"))
-            .map_err(|error| Error::msg(format!("read large.bin: {error}")))?;
+        let actual = fs::read(destination.join("large.bin")).context("read large.bin")?;
         testkit::ensure!(
             actual == large,
             "large file changed in the round trip: sent {} bytes, received {}",
@@ -492,7 +485,7 @@ fn git(repository: &Path, args: &[&str]) -> testkit::Result {
         .args(args)
         .current_dir(repository)
         .output()
-        .map_err(|error| Error::msg(format!("run git {}: {error}", args.join(" "))))?;
+        .context(format!("run git {}", args.join(" ")))?;
     testkit::ensure!(
         output.status.success(),
         "git {} failed in {}: {}",
@@ -504,18 +497,15 @@ fn git(repository: &Path, args: &[&str]) -> testkit::Result {
 }
 
 fn write(path: &Path, contents: &str) -> testkit::Result {
-    fs::write(path, contents)
-        .map_err(|error| Error::msg(format!("write {}: {error}", path.display())))
+    fs::write(path, contents).context(format!("write {}", path.display()))
 }
 
 fn create_dir_all(path: &Path) -> testkit::Result {
-    fs::create_dir_all(path)
-        .map_err(|error| Error::msg(format!("create {}: {error}", path.display())))
+    fs::create_dir_all(path).context(format!("create {}", path.display()))
 }
 
 fn require_text(path: &Path, expected: &str) -> testkit::Result {
-    let actual = fs::read_to_string(path)
-        .map_err(|error| Error::msg(format!("read {}: {error}", path.display())))?;
+    let actual = fs::read_to_string(path).context(format!("read {}", path.display()))?;
     testkit::ensure!(
         actual == expected,
         "{} contains {actual:?}; expected {expected:?}",

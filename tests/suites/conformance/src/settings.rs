@@ -18,16 +18,18 @@ const KEY: &str = "ocsf_json_enabled";
 /// How the CLI shows a setting with no value.
 const UNSET: &str = "<unset>";
 
-/// With no global value, a sandbox setting starts unset, reads back after it is set, and is unset
-/// again after it is deleted.
+/// With no global value, a sandbox setting starts unset, reads back after it
+/// is set, and is unset again after it is deleted.
 #[testkit::test]
 async fn sandbox_setting_round_trip(cx: &mut Context) -> testkit::Result {
     // A global value would hide the sandbox's own, so clear it for the test.
     restore_global_setting_on_cleanup(cx, KEY).await?;
-    cx.cli(["settings", "delete", "--global", "--key", KEY, "--yes"])
-        .await?
-        .success()?;
-    let sandbox = settings_sandbox(cx, "sr").await?;
+    delete_global_setting(&cx.cli_handle(), KEY).await?;
+    let sandbox = cx
+        .sandbox("sr")
+        .command(["sleep", "infinity"])
+        .create_ready()
+        .await?;
     expect_sandbox_setting(cx, &sandbox, UNSET, "unset").await?;
 
     set_sandbox_setting(cx, &sandbox, "true").await?.success()?;
@@ -44,22 +46,21 @@ async fn sandbox_setting_round_trip(cx: &mut Context) -> testkit::Result {
 /// controls the key again.
 #[testkit::test]
 async fn global_setting_overrides_sandbox_scope(cx: &mut Context) -> testkit::Result {
+    let cli = cx.cli_handle();
     restore_global_setting_on_cleanup(cx, KEY).await?;
-    cx.cli(["settings", "delete", "--global", "--key", KEY, "--yes"])
-        .await?
-        .success()?;
+    delete_global_setting(&cli, KEY).await?;
 
-    let sandbox = settings_sandbox(cx, "sg").await?;
+    let sandbox = cx
+        .sandbox("sg")
+        .command(["sleep", "infinity"])
+        .create_ready()
+        .await?;
     set_sandbox_setting(cx, &sandbox, "true").await?.success()?;
     expect_sandbox_setting(cx, &sandbox, "true", "sandbox").await?;
 
-    cx.cli([
-        "settings", "set", "--global", "--key", KEY, "--value", "false", "--yes",
-    ])
-    .await?
-    .success()?;
+    set_global_setting(&cli, KEY, "false").await?;
     testkit::ensure!(
-        global_setting(cx, KEY).await? == "false",
+        read_global_setting(&cli, KEY).await? == "false",
         "the global {KEY} does not read back as false"
     );
     expect_sandbox_setting(cx, &sandbox, "false", "global").await?;
@@ -74,10 +75,8 @@ async fn global_setting_overrides_sandbox_scope(cx: &mut Context) -> testkit::Re
         .await?
         .failure()?;
 
-    cx.cli(["settings", "delete", "--global", "--key", KEY, "--yes"])
-        .await?
-        .success()?;
-    let global = global_setting(cx, KEY).await?;
+    delete_global_setting(&cli, KEY).await?;
+    let global = read_global_setting(&cli, KEY).await?;
     testkit::ensure!(
         global == UNSET,
         "the global {KEY} is {global:?} after delete; expected {UNSET:?}"
@@ -87,16 +86,6 @@ async fn global_setting_overrides_sandbox_scope(cx: &mut Context) -> testkit::Re
         .await?
         .success()?;
     expect_sandbox_setting(cx, &sandbox, "false", "sandbox").await
-}
-
-async fn settings_sandbox(cx: &Context, suffix: &str) -> testkit::Result<Sandbox> {
-    let sandbox = cx
-        .sandbox(suffix)
-        .command(["sleep", "infinity"])
-        .create()
-        .await?;
-    sandbox.wait_ready().await?;
-    Ok(sandbox)
 }
 
 async fn set_sandbox_setting(
@@ -149,10 +138,6 @@ async fn expect_sandbox_setting(
 }
 
 /// The gateway-global value of `key` as the CLI shows it, [`UNSET`] if none.
-async fn global_setting(cx: &Context, key: &str) -> testkit::Result<String> {
-    read_global_setting(&cx.cli_handle(), key).await
-}
-
 async fn read_global_setting(cli: &testkit::Cli, key: &str) -> testkit::Result<String> {
     let settings: Value = cli
         .run(["settings", "get", "--global", "--json"])
@@ -163,6 +148,22 @@ async fn read_global_setting(cli: &testkit::Cli, key: &str) -> testkit::Result<S
         .as_str()
         .unwrap_or(UNSET)
         .to_string())
+}
+
+async fn set_global_setting(cli: &testkit::Cli, key: &str, value: &str) -> testkit::Result {
+    cli.run([
+        "settings", "set", "--global", "--key", key, "--value", value, "--yes",
+    ])
+    .await?
+    .success()?;
+    Ok(())
+}
+
+async fn delete_global_setting(cli: &testkit::Cli, key: &str) -> testkit::Result {
+    cli.run(["settings", "delete", "--global", "--key", key, "--yes"])
+        .await?
+        .success()?;
+    Ok(())
 }
 
 /// Record the gateway-global value of `key` and put it back after the test:
@@ -180,17 +181,10 @@ async fn restore_global_setting_on_cleanup(cx: &Context, key: &'static str) -> t
             return Ok(());
         }
         if prior == UNSET {
-            cli.run(["settings", "delete", "--global", "--key", key, "--yes"])
-                .await?
-                .success()?;
+            delete_global_setting(&cli, key).await
         } else {
-            cli.run([
-                "settings", "set", "--global", "--key", key, "--value", &prior, "--yes",
-            ])
-            .await?
-            .success()?;
+            set_global_setting(&cli, key, &prior).await
         }
-        Ok(())
     });
     Ok(())
 }

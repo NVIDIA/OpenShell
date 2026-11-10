@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use testkit::{Context, Poll, ResultExt as _};
+use testkit::{Context, ResultExt as _};
 
 /// Files in the workspace survive stop and start, and start runs the main
 /// command again.
@@ -26,9 +26,8 @@ async fn persistent_workspace_survives_stop_start(cx: &mut Context) -> testkit::
     let sandbox = cx
         .sandbox("kw")
         .command(["sh", "-c", main.as_str()])
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
 
     let sentinel = format!("openshell-stop-start-{}", cx.run_id());
     sandbox
@@ -44,28 +43,20 @@ async fn persistent_workspace_survives_stop_start(cx: &mut Context) -> testkit::
     sandbox.stop().await?;
     sandbox.start().await?;
 
-    let read = sandbox.exec(["cat", SENTINEL]).await?;
-    testkit::ensure!(
-        read.stdout == format!("{sentinel}\n"),
-        "sentinel after restart is {:?}; stderr: {}",
-        read.stdout,
-        read.stderr
-    );
+    sandbox
+        .exec(["cat", SENTINEL])
+        .await?
+        .expect_stdout(&format!("{sentinel}\n"))
+        .context("read the sentinel after restart")?;
     // The sandbox is Ready before the restarted main command has necessarily
     // rewritten the count, so wait for it to say it ran again.
-    testkit::poll_until(
-        "the main command to run again",
-        Duration::from_secs(30),
-        Duration::from_secs(1),
-        async || {
-            let runs = sandbox.exec(["cat", RUN_COUNT]).await?;
-            Ok(if runs.stdout == "2\n" {
-                Poll::Ready(())
-            } else {
-                Poll::Pending(format!("run count {:?}", runs.stdout.trim()))
-            })
-        },
-    )
-    .await?;
+    sandbox
+        .poll_exec(
+            "the main command to run again",
+            Duration::from_secs(30),
+            ["cat", RUN_COUNT],
+            |runs| runs.stdout == "2\n",
+        )
+        .await?;
     Ok(())
 }

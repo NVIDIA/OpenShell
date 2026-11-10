@@ -3,7 +3,7 @@
 
 //! Sandbox process suite: limits the sandbox applies to its processes.
 
-use testkit::Context;
+use testkit::{Context, ResultExt as _};
 
 /// Sandbox processes can't write core dumps: both the soft and the hard core
 /// file size limits are 0, so a process can't raise its own limit either.
@@ -12,22 +12,17 @@ async fn core_dumps_are_disabled(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
         .sandbox("cd")
         .command(["sleep", "infinity"])
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
 
-    let output = sandbox
+    sandbox
         .exec([
             "sh",
             "-c",
             "printf '%s %s' \"$(ulimit -c)\" \"$(ulimit -Hc)\"",
         ])
         .await?
-        .success()?;
-    testkit::ensure!(
-        output.stdout == "0 0",
-        "core file size limits (soft hard) are {:?}; expected \"0 0\"",
-        output.stdout
-    );
+        .expect_stdout("0 0")
+        .context("core file size limits (soft hard)")?;
     Ok(())
 }

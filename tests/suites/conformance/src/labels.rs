@@ -18,14 +18,7 @@ async fn labels_are_stored_and_filter_list(cx: &mut Context) -> testkit::Result 
     let staging = format!("staging-{run}");
     let backend = format!("backend-{run}");
     let data = format!("data-{run}");
-    let cases = [
-        ("ldb", dev.as_str(), backend.as_str()),
-        ("lsb", staging.as_str(), backend.as_str()),
-        ("ldd", dev.as_str(), data.as_str()),
-    ];
-
-    let mut names = Vec::new();
-    for (suffix, env, team) in cases {
+    let labeled = async |suffix: &str, env: &str, team: &str| -> testkit::Result<String> {
         let labels = HashMap::from([
             ("env".to_string(), env.to_string()),
             ("team".to_string(), team.to_string()),
@@ -44,32 +37,30 @@ async fn labels_are_stored_and_filter_list(cx: &mut Context) -> testkit::Result 
             sandbox.name(),
             got.labels
         );
-        names.push(sandbox.name().to_string());
-    }
-    let [dev_backend, staging_backend, dev_data] = names.as_slice() else {
-        unreachable!("one name per case");
+        Ok(sandbox.name().to_string())
     };
+    let dev_backend = labeled("ldb", &dev, &backend).await?;
+    let staging_backend = labeled("lsb", &staging, &backend).await?;
+    let dev_data = labeled("ldd", &dev, &data).await?;
 
     let checks = [
-        (format!("env={dev}"), vec![dev_backend, dev_data]),
+        (format!("env={dev}"), vec![&dev_backend, &dev_data]),
         (
             format!("team={backend}"),
-            vec![dev_backend, staging_backend],
+            vec![&dev_backend, &staging_backend],
         ),
-        (format!("env={dev},team={backend}"), vec![dev_backend]),
+        (format!("env={dev},team={backend}"), vec![&dev_backend]),
         (format!("team=qa-{run}"), vec![]),
     ];
     for (selector, expected) in checks {
-        let listed: BTreeSet<String> = cx
-            .client()
-            .list_all_sandboxes(ListOptions {
+        let listed = listed_names(
+            cx,
+            ListOptions {
                 label_selector: Some(selector.clone()),
                 ..ListOptions::default()
-            })
-            .await?
-            .into_iter()
-            .map(|sandbox| sandbox.name)
-            .collect();
+            },
+        )
+        .await?;
         let expected: BTreeSet<String> = expected.into_iter().cloned().collect();
         testkit::ensure!(
             listed == expected,
@@ -77,17 +68,25 @@ async fn labels_are_stored_and_filter_list(cx: &mut Context) -> testkit::Result 
         );
     }
 
-    let all: BTreeSet<String> = cx
-        .client()
-        .list_all_sandboxes(ListOptions::default())
-        .await?
+    let all = listed_names(cx, ListOptions::default()).await?;
+    let missing: Vec<&String> = [&dev_backend, &staging_backend, &dev_data]
         .into_iter()
-        .map(|sandbox| sandbox.name)
+        .filter(|name| !all.contains(*name))
         .collect();
-    let missing: Vec<&String> = names.iter().filter(|name| !all.contains(*name)).collect();
     testkit::ensure!(
         missing.is_empty(),
         "list without a selector is missing {missing:?}"
     );
     Ok(())
+}
+
+/// The names of the sandboxes `list` returns, across all pages.
+async fn listed_names(cx: &Context, options: ListOptions) -> testkit::Result<BTreeSet<String>> {
+    Ok(cx
+        .client()
+        .list_all_sandboxes(options)
+        .await?
+        .into_iter()
+        .map(|sandbox| sandbox.name)
+        .collect())
 }

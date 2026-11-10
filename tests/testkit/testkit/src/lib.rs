@@ -53,7 +53,7 @@ pub use error::{Error, Result, ResultExt};
 pub use gateway::Gateway;
 pub use image::{PYTHON_BINARIES, base_image, python_image};
 pub use openshell_sdk as sdk;
-pub use poll::{Poll, poll_until};
+pub use poll::{Poll, poll_until, with_deadline};
 pub use program::main;
 pub use ready::check as check_ready;
 pub use registry::Test;

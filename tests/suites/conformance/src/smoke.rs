@@ -12,19 +12,14 @@ async fn create_exec_delete(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
         .sandbox("smoke")
         .command(["sleep", "infinity"])
-        .create()
+        .create_ready()
         .await?;
-    sandbox.wait_ready().await?;
 
     let marker = format!("openshell-e2e-{}", cx.run_id());
-    let output = sandbox.exec(["echo", marker.as_str()]).await?.success()?;
-    testkit::ensure!(
-        output.stdout == format!("{marker}\n"),
-        "exec stdout was {:?}; expected {:?}",
-        output.stdout,
-        format!("{marker}\n")
-    );
+    sandbox
+        .exec(["echo", marker.as_str()])
+        .await?
+        .expect_stdout(&format!("{marker}\n"))?;
 
-    sandbox.delete().await?;
-    cx.expect_absent(&sandbox).await
+    cx.delete_and_expect_absent(&sandbox).await
 }

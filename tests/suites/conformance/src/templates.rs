@@ -6,16 +6,22 @@
 
 use std::collections::HashMap;
 
-use testkit::Context;
 use testkit::sdk::raw::proto::datamodel::v1::ObjectMeta;
 use testkit::sdk::{
     DeleteOptions, SandboxResources, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
     SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, SdkError,
 };
+use testkit::{Context, ResultExt as _};
 
-/// Delete template `name` after the test. Registered before the create, so it
-/// also covers a create the gateway applied but reported as failed.
-fn delete_template_on_cleanup(cx: &Context, name: &str) {
+/// Create template `name`, and delete it after the test. The cleanup is
+/// registered before the create, so it also covers a create the gateway
+/// applied but reported as failed.
+async fn create_template(
+    cx: &Context,
+    name: &str,
+    labels: HashMap<String, String>,
+    workload: SandboxWorkloadConfig,
+) -> Result<SandboxWorkloadTemplate, SdkError> {
     let client = cx.client().clone();
     let owned = name.to_string();
     cx.on_cleanup(format!("delete sandbox template {name}"), async move || {
@@ -29,24 +35,19 @@ fn delete_template_on_cleanup(cx: &Context, name: &str) {
             .await?;
         Ok(())
     });
-}
-
-fn template(
-    name: &str,
-    labels: HashMap<String, String>,
-    workload: SandboxWorkloadConfig,
-) -> SandboxWorkloadTemplate {
-    SandboxWorkloadTemplate {
-        metadata: Some(ObjectMeta {
-            name: name.to_string(),
-            labels,
-            ..ObjectMeta::default()
-        }),
-        spec: Some(SandboxWorkloadTemplateSpec {
-            workload: Some(workload),
-            ..SandboxWorkloadTemplateSpec::default()
-        }),
-    }
+    cx.client()
+        .create_sandbox_template(SandboxWorkloadTemplate {
+            metadata: Some(ObjectMeta {
+                name: name.to_string(),
+                labels,
+                ..ObjectMeta::default()
+            }),
+            spec: Some(SandboxWorkloadTemplateSpec {
+                workload: Some(workload),
+                ..SandboxWorkloadTemplateSpec::default()
+            }),
+        })
+        .await
 }
 
 /// A template stores its labels, environment and resources, is listed, and a
@@ -55,7 +56,6 @@ fn template(
 #[testkit::test]
 async fn sandbox_from_template_uses_its_workload(cx: &mut Context) -> testkit::Result {
     let template_name = cx.name("tp");
-    delete_template_on_cleanup(cx, &template_name);
     let labels = HashMap::from([("e2e".to_string(), "sandbox-template".to_string())]);
     let workload = SandboxWorkloadConfig {
         environment: HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
@@ -66,9 +66,7 @@ async fn sandbox_from_template_uses_its_workload(cx: &mut Context) -> testkit::R
         }),
         ..SandboxWorkloadConfig::default()
     };
-    cx.client()
-        .create_sandbox_template(template(&template_name, labels.clone(), workload))
-        .await?;
+    create_template(cx, &template_name, labels.clone(), workload.clone()).await?;
 
     let stored = cx.client().get_sandbox_template(&template_name).await?;
     let meta = stored.metadata.clone().unwrap_or_default();
@@ -83,16 +81,17 @@ async fn sandbox_from_template_uses_its_workload(cx: &mut Context) -> testkit::R
         .as_ref()
         .and_then(|spec| spec.workload.clone())
         .unwrap_or_default();
+    // Field by field: the gateway may fill in fields the template left unset.
+    let sent = workload.resources.clone().unwrap_or_default();
     let resources = stored_workload.resources.clone().unwrap_or_default();
     testkit::ensure!(
-        stored_workload
-            .environment
-            .get("FEATURE_FLAG")
-            .map(String::as_str)
-            == Some("on")
-            && resources.cpu == "500m"
-            && resources.memory == "512Mi",
-        "template get returned workload {stored_workload:?}; expected FEATURE_FLAG=on, cpu 500m, memory 512Mi"
+        stored_workload.environment == workload.environment
+            && resources.cpu == sent.cpu
+            && resources.memory == sent.memory,
+        "template get returned workload {stored_workload:?}; expected environment {:?}, cpu {:?}, memory {:?}",
+        workload.environment,
+        sent.cpu,
+        sent.memory
     );
 
     let listed = cx
@@ -125,15 +124,11 @@ async fn sandbox_from_template_uses_its_workload(cx: &mut Context) -> testkit::R
         "sandbox {sandbox_name} records template {provenance:?}; expected {template_name:?}"
     );
 
-    let output = sandbox
+    sandbox
         .exec(["sh", "-c", "printf '%s' \"${FEATURE_FLAG:-missing}\""])
         .await?
-        .success()?;
-    testkit::ensure!(
-        output.stdout == "on",
-        "FEATURE_FLAG in a sandbox from the template is {:?}; expected \"on\"",
-        output.stdout
-    );
+        .expect_stdout(&workload.environment["FEATURE_FLAG"])
+        .context("FEATURE_FLAG in a sandbox from the template")?;
     Ok(())
 }
 
@@ -143,35 +138,29 @@ async fn sandbox_from_template_uses_its_workload(cx: &mut Context) -> testkit::R
 #[testkit::test]
 async fn template_crud_errors(cx: &mut Context) -> testkit::Result {
     let name = cx.name("te");
-    delete_template_on_cleanup(cx, &name);
-    let empty = || template(&name, HashMap::new(), SandboxWorkloadConfig::default());
+    let empty =
+        async || create_template(cx, &name, HashMap::new(), SandboxWorkloadConfig::default()).await;
 
-    cx.client().create_sandbox_template(empty()).await?;
-    match cx.client().create_sandbox_template(empty()).await {
-        Err(SdkError::AlreadyExists { .. }) => {}
-        other => {
-            return Err(testkit::Error::msg(format!(
-                "creating template {name} again returned {other:?}; expected AlreadyExists"
-            )));
-        }
-    }
+    empty().await?;
+    let again = empty().await;
+    testkit::ensure!(
+        matches!(again, Err(SdkError::AlreadyExists { .. })),
+        "creating template {name} again returned {again:?}; expected AlreadyExists"
+    );
 
     cx.client()
         .delete_sandbox_template(&name, DeleteOptions::default())
         .await?;
-    match cx.client().get_sandbox_template(&name).await {
-        Err(SdkError::NotFound { .. }) => {}
-        other => {
-            return Err(testkit::Error::msg(format!(
-                "getting deleted template {name} returned {other:?}; expected NotFound"
-            )));
-        }
-    }
+    let deleted = cx.client().get_sandbox_template(&name).await;
+    testkit::ensure!(
+        matches!(deleted, Err(SdkError::NotFound { .. })),
+        "getting deleted template {name} returned {deleted:?}; expected NotFound"
+    );
 
     let sandbox_name = cx.name("tm");
     cx.track(&sandbox_name);
     let missing = cx.name("tx");
-    match cx
+    let from_missing = cx
         .client()
         .create_sandbox_from_template(SandboxTemplateCreateSpec {
             name: Some(sandbox_name),
@@ -179,11 +168,10 @@ async fn template_crud_errors(cx: &mut Context) -> testkit::Result {
             command: vec!["true".to_string()],
             ..SandboxTemplateCreateSpec::default()
         })
-        .await
-    {
-        Err(SdkError::NotFound { .. }) => Ok(()),
-        other => Err(testkit::Error::msg(format!(
-            "creating a sandbox from missing template {missing} returned {other:?}; expected NotFound"
-        ))),
-    }
+        .await;
+    testkit::ensure!(
+        matches!(from_missing, Err(SdkError::NotFound { .. })),
+        "creating a sandbox from missing template {missing} returned {from_missing:?}; expected NotFound"
+    );
+    Ok(())
 }
