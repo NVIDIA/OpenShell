@@ -9,7 +9,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from accepted_work import (
+from label_accepted_work import (
     ACCEPTED_LABEL,
     ClosingIssue,
     check_pr_accepted_work,
