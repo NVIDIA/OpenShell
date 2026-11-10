@@ -224,7 +224,7 @@ impl SocketTrustedResolver {
     ) -> Result<Vec<u8>, ResolveError> {
         let mut stream = timeout(
             self.exchange_timeout,
-            connect_tcp_nodelay_best_effort(&[server]),
+            connect_tcp_nodelay_best_effort(server),
         )
         .await
         .map_err(|_| ResolveError::Timeout)??;

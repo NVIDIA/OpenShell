@@ -21,27 +21,48 @@
 //!
 //! Tests find the gateway the same way the `openshell` CLI does (see
 //! [`gateway`]).
+//!
+//! `#[testkit::test]` also registers each test, so a binary that calls
+//! [`main`] is a test program that lists, runs, and reports its tests without
+//! Cargo (see [`program`]).
 
+mod cleanup;
 mod cli;
 mod context;
 mod error;
 pub mod gateway;
+mod image;
+pub mod policy;
 mod poll;
+pub mod program;
+mod provider;
+mod ready;
+mod registry;
 mod run;
+mod yaml_file;
 
-pub use cli::{BIN_ENV, CLI_TIMEOUT, Cli, CliOutput};
+pub use cleanup::CLEANUP_TIMEOUT;
+pub use cli::{CLI_TIMEOUT, Cli, CliOutput};
 pub use context::{
     Context, DELETE_TIMEOUT, EXEC_TIMEOUT, ExecOutput, READY_TIMEOUT, STOP_TIMEOUT, Sandbox,
     SandboxBuilder,
 };
 pub use error::{Error, Result, ResultExt};
 pub use gateway::Gateway;
+pub use image::{PYTHON_BINARIES, base_image, python_image};
 pub use openshell_sdk as sdk;
 pub use poll::{Poll, poll_until};
+pub use program::main;
+pub use ready::check as check_ready;
+pub use registry::Test;
 pub use run::{TestInfo, run};
 pub use testkit_macros::test;
+pub use tonic::Code as GrpcCode;
+pub use yaml_file::YamlFile;
 
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::registry::TESTS;
+    pub use linkme;
     pub use tokio;
 }

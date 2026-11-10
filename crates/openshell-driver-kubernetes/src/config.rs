@@ -346,6 +346,17 @@ pub struct KubernetesComputeConfig {
     pub supervisor_image_pull_policy: Option<KubernetesImagePullPolicy>,
     /// Cross-pod sandbox/supervisor settings.
     pub sandbox_runtime: KubernetesSandboxRuntimeConfig,
+    /// Bound on how long a crash-interrupted, fail-closed sandbox runtime
+    /// bootstrap may remain stranded before the driver reclaims it, in seconds. Slow
+    /// VM-backed runtimes (CoCo/peer-pods) need longer than the default.
+    pub runtime_bootstrap_grace_seconds: u64,
+    /// Supervisor attach/policy-discover request timeout, in seconds.
+    /// When set, the driver copies the value into the supervisor pod
+    /// environment (`OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS`) so slow VM-backed
+    /// runtimes have time to boot the remote boundary before the supervisor
+    /// gives up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_attach_request_timeout_seconds: Option<u64>,
     /// Corporate HTTP forward proxy used by the network supervisor for
     /// policy-approved TLS CONNECT egress.
     pub https_proxy: Option<String>,
@@ -409,6 +420,10 @@ pub struct KubernetesComputeConfig {
     /// Applied when a `CreateSandbox` request does not specify one.
     /// Empty string (default) = omit the field, using the cluster default.
     pub default_runtime_class_name: String,
+    /// Kubernetes `runtimeClassName` for dedicated supervisor pods. Set only
+    /// by the gateway administrator; sandbox creators cannot change it, and
+    /// it never inherits the workload class. Empty (default) = omit the field.
+    pub supervisor_runtime_class_name: String,
     /// Pod annotation keys that sandbox templates may set. Each entry is an
     /// exact key (`example.com/team`) or a prefix wildcard (`example.com/*`).
     /// Empty (default) rejects every caller-supplied pod annotation.
@@ -509,6 +524,8 @@ impl Default for KubernetesComputeConfig {
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: None,
             sandbox_runtime: KubernetesSandboxRuntimeConfig::default(),
+            runtime_bootstrap_grace_seconds: 300,
+            sandbox_attach_request_timeout_seconds: None,
             https_proxy: None,
             no_proxy: None,
             proxy_auth_secret_name: None,
@@ -526,6 +543,7 @@ impl Default for KubernetesComputeConfig {
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             workspace_storage_class: String::new(),
             default_runtime_class_name: String::new(),
+            supervisor_runtime_class_name: String::new(),
             allowed_pod_annotations: Vec::new(),
             allowed_pod_labels: Vec::new(),
             sa_token_ttl_secs: 3600,
@@ -539,6 +557,7 @@ impl Default for KubernetesComputeConfig {
 impl KubernetesComputeConfig {
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
+        self.validate_bootstrap_windows()?;
         self.validate_supervisor_topology()?;
         self.validate_workspace_mode()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;
@@ -547,6 +566,24 @@ impl KubernetesComputeConfig {
         self.validate_upstream_proxy_config()?;
         self.validate_allowed_pod_annotations()?;
         self.validate_allowed_pod_labels()
+    }
+
+    fn validate_bootstrap_windows(&self) -> Result<(), String> {
+        for (name, value) in [
+            (
+                "runtime_bootstrap_grace_seconds",
+                Some(self.runtime_bootstrap_grace_seconds),
+            ),
+            (
+                "sandbox_attach_request_timeout_seconds",
+                self.sandbox_attach_request_timeout_seconds,
+            ),
+        ] {
+            if value.is_some_and(|value| !(1..=86_400).contains(&value)) {
+                return Err(format!("{name} must be between 1 and 86400 seconds"));
+            }
+        }
+        Ok(())
     }
 
     /// The shared supervisor serves only sandbox instances it can isolate: it
@@ -1245,6 +1282,43 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_grace_defaults_and_parses_from_toml() {
+        assert_eq!(
+            KubernetesComputeConfig::default().runtime_bootstrap_grace_seconds,
+            300
+        );
+        assert!(
+            KubernetesComputeConfig::default()
+                .sandbox_attach_request_timeout_seconds
+                .is_none()
+        );
+        let config: KubernetesComputeConfig = toml::from_str(
+            "runtime_bootstrap_grace_seconds = 900\nsandbox_attach_request_timeout_seconds = 900\n",
+        )
+        .unwrap();
+        assert_eq!(config.runtime_bootstrap_grace_seconds, 900);
+        assert_eq!(config.sandbox_attach_request_timeout_seconds, Some(900));
+        assert!(config.validate_configuration().is_ok());
+        let partial: KubernetesComputeConfig = toml::from_str("namespace = 'custom'").unwrap();
+        assert_eq!(partial.runtime_bootstrap_grace_seconds, 300);
+        for field in [
+            "runtime_bootstrap_grace_seconds",
+            "sandbox_attach_request_timeout_seconds",
+        ] {
+            for value in [0, 86_401] {
+                let config: KubernetesComputeConfig =
+                    toml::from_str(&format!("{field} = {value}")).unwrap();
+                assert!(config.validate_configuration().unwrap_err().contains(field));
+            }
+            for value in [1, 86_400] {
+                let config: KubernetesComputeConfig =
+                    toml::from_str(&format!("{field} = {value}")).unwrap();
+                assert!(config.validate_configuration().is_ok());
+            }
+        }
+    }
+
+    #[test]
     fn published_kubernetes_example_is_valid_toml() {
         let docs = include_str!("../../../docs/how-it-works/gateways/configuration.mdx");
         let section = docs
@@ -1430,6 +1504,17 @@ mod tests {
     #[test]
     fn default_runtime_class_name_is_empty() {
         let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.default_runtime_class_name.is_empty());
+        assert!(cfg.supervisor_runtime_class_name.is_empty());
+    }
+
+    #[test]
+    fn serde_override_supervisor_runtime_class_name() {
+        let json = serde_json::json!({
+            "supervisor_runtime_class_name": "kata-supervisor"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.supervisor_runtime_class_name, "kata-supervisor");
         assert!(cfg.default_runtime_class_name.is_empty());
     }
 

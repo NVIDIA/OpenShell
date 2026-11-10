@@ -4388,6 +4388,7 @@ dependencies = [
  "openshell-bootstrap",
  "openshell-core",
  "openshell-crypto",
+ "openshell-otel",
  "openshell-policy",
  "openshell-providers",
  "openshell-sdk",
@@ -4411,17 +4412,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
-]
-
-[[package]]
-name = "openshell-conformance"
-version = "0.0.0"
-dependencies = [
- "rand 0.9.4",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -4468,6 +4459,36 @@ dependencies = [
  "url",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "openshell-credential-issuer"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-sts",
+ "futures",
+ "hyper-util",
+ "jsonwebtoken",
+ "openshell-core",
+ "openshell-crypto",
+ "openshell-driver-db-credstore",
+ "openshell-driver-kubernetes-secrets",
+ "openshell-driver-vault",
+ "prost-types",
+ "reqwest 0.12.28",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tonic",
+ "tower",
+ "tracing",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -5092,8 +5113,6 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
- "aws-config",
- "aws-sdk-sts",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -5122,10 +5141,8 @@ dependencies = [
  "notify",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-credential-issuer",
  "openshell-crypto",
- "openshell-driver-db-credstore",
- "openshell-driver-kubernetes-secrets",
- "openshell-driver-vault",
  "openshell-extension-core",
  "openshell-gateway-interceptors",
  "openshell-ocsf",
@@ -5154,6 +5171,7 @@ dependencies = [
  "russh",
  "rustix 1.1.4",
  "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5317,11 +5335,13 @@ dependencies = [
  "openshell-ocsf",
  "openshell-ocsf-validate",
  "openshell-otel",
+ "openshell-otel-test-support",
  "openshell-policy",
  "openshell-policy-schema",
  "openshell-sandbox-backend",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost-types",
  "rcgen",
@@ -6693,7 +6713,6 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
- "serde_yaml",
  "spin",
  "thiserror 2.0.20",
 ]

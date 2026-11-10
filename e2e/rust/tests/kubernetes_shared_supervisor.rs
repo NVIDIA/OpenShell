@@ -544,6 +544,10 @@ impl RuntimeListener {
     /// answered. A challenged connection is then sent `reply` in place of the
     /// pinned TLS identity and must be closed. Silence fails the test: a
     /// listener that hangs has not rejected anything.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the e2e workspace does not depend on openshell-core"
+    )]
     async fn probe(&mut self, route: &str, reply: &[u8]) -> RouteAnswer {
         let mut stream = TcpStream::connect(("127.0.0.1", self.port))
             .await

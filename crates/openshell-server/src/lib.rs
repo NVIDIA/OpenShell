@@ -20,6 +20,7 @@ mod compute;
 mod config_delivery;
 pub mod config_file;
 mod config_update_operation;
+mod credential_store;
 mod credentials;
 mod defaults;
 mod gateway_listener;
@@ -41,6 +42,8 @@ mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
 mod reflection;
+mod refresh_commit;
+mod refresh_store;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
@@ -61,12 +64,19 @@ mod tracing_setup;
 mod watch_cursor;
 mod ws_tunnel;
 
+use axum::Router;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder,
+    service::TowerToHyperService,
+};
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, NetworkSupervisorTrustBundle, ObjectLabels, Result};
 use openshell_extension_core::{
     BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
 };
+use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
@@ -76,9 +86,9 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -324,6 +334,9 @@ pub struct ServerState {
     /// Credential-driver selection and resolution runtime.
     pub credentials: credentials::CredentialRuntime,
 
+    /// Shared embedded refresh runtime (separate from storage-only consumers).
+    pub(crate) refresh: openshell_credential_issuer::refresh::RefreshRuntime,
+
     /// In-memory sandbox correlation index.
     pub sandbox_index: SandboxIndex,
 
@@ -341,6 +354,9 @@ pub struct ServerState {
 
     /// Active SSH tunnel connection counts per sandbox id.
     pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
+
+    /// Active service forward connection counts per sandbox id.
+    pub service_connections_by_sandbox: Mutex<HashMap<String, u32>>,
 
     /// Registry of active supervisor sessions and pending relay channels.
     ///
@@ -435,6 +451,136 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
     )
 }
 
+const METRICS_TLS_HANDSHAKE_WARNING_INTERVAL: Duration = Duration::from_mins(1);
+
+#[derive(Default)]
+struct MetricsTlsHandshakeLogState {
+    last_warning: Option<Instant>,
+    suppressed: u64,
+}
+
+struct MetricsTlsHandshakeLogLimiter {
+    interval: Duration,
+    state: Mutex<MetricsTlsHandshakeLogState>,
+    rejected: AtomicU64,
+}
+
+impl MetricsTlsHandshakeLogLimiter {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            state: Mutex::new(MetricsTlsHandshakeLogState::default()),
+            rejected: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, now: Instant) -> Option<u64> {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .last_warning
+            .is_none_or(|last_warning| now.duration_since(last_warning) >= self.interval)
+        {
+            state.last_warning = Some(now);
+            return Some(std::mem::take(&mut state.suppressed));
+        }
+        state.suppressed += 1;
+        None
+    }
+}
+
+/// Separate limiters for handshake rejections and timeouts so a burst of one
+/// kind cannot absorb the other's warnings, and each periodic WARN reports
+/// counts for a single event type.
+#[derive(Clone)]
+struct MetricsTlsHandshakeLogLimiters {
+    rejections: Arc<MetricsTlsHandshakeLogLimiter>,
+    timeouts: Arc<MetricsTlsHandshakeLogLimiter>,
+}
+
+impl MetricsTlsHandshakeLogLimiters {
+    fn new(interval: Duration) -> Self {
+        Self {
+            rejections: Arc::new(MetricsTlsHandshakeLogLimiter::new(interval)),
+            timeouts: Arc::new(MetricsTlsHandshakeLogLimiter::new(interval)),
+        }
+    }
+}
+
+fn log_metrics_tls_handshake_rejection(
+    limiter: &MetricsTlsHandshakeLogLimiter,
+    error: &std::io::Error,
+    client: SocketAddr,
+) {
+    debug!(
+        event = "metrics_tls_handshake_rejected",
+        error = %error,
+        client = %client,
+        "Rejected metrics TLS handshake"
+    );
+    if let Some(suppressed) = limiter.record(Instant::now()) {
+        warn!(
+            event = "metrics_tls_handshake_rejected",
+            suppressed,
+            total = limiter.rejected.load(Ordering::Relaxed),
+            "Rejected metrics TLS handshakes; verify that clients use HTTPS and, when client authentication is enabled, certificates trusted by the metrics client CA"
+        );
+    }
+}
+
+fn log_metrics_tls_handshake_timeout(limiter: &MetricsTlsHandshakeLogLimiter, client: SocketAddr) {
+    debug!(
+        event = "metrics_tls_handshake_timed_out",
+        client = %client,
+        "Metrics TLS handshake timed out"
+    );
+    if let Some(suppressed) = limiter.record(Instant::now()) {
+        warn!(
+            event = "metrics_tls_handshake_timed_out",
+            suppressed,
+            total = limiter.rejected.load(Ordering::Relaxed),
+            "Metrics TLS handshakes timed out"
+        );
+    }
+}
+
+fn metrics_tls_acceptor_or_disable(
+    metrics_tls: &openshell_core::MetricsTlsConfig,
+) -> Option<TlsAcceptor> {
+    match TlsAcceptor::from_files(
+        &metrics_tls.cert_path,
+        &metrics_tls.key_path,
+        metrics_tls.client_ca_path.as_deref(),
+        metrics_tls.require_client_auth,
+        None,
+        None,
+        Vec::new(),
+    ) {
+        Ok(acceptor) => Some(acceptor),
+        Err(error) => {
+            error!(
+                event = "metrics_tls_listener_disabled",
+                listener = "metrics",
+                error = %error,
+                "Metrics TLS listener disabled because its certificate material could not be loaded"
+            );
+            let event = ConfigStateChangeBuilder::new(&gateway_ocsf::context("", ""))
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .state(StateId::Disabled, "initialization_failed")
+                .message(format!(
+                    "metrics TLS listener disabled because certificate material could not be loaded: {error}"
+                ))
+                .build();
+            openshell_ocsf::ocsf_emit!(event);
+            None
+        }
+    }
+}
+
 fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool {
     openshell_core::transport_errors::is_expected_transport_close_error(error)
 }
@@ -500,17 +646,20 @@ impl ServerState {
             .map_or_else(String::new, |oidc| oidc.admin_role.clone());
         let config_delivery =
             config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
+        let refresh = provider_refresh::runtime(&store, Some(&credentials), Some(&compute));
         Self {
             config,
             store,
             compute,
             credentials,
+            refresh,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
             telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
+            service_connections_by_sandbox: Mutex::new(HashMap::new()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
             config_delivery,
@@ -682,14 +831,21 @@ pub(crate) async fn run_server(
         .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
     );
 
-    let store = Arc::new(
-        Store::connect_with_pool_sizes(
-            database_url,
-            config.database_max_connections,
-            config.database_lock_max_connections,
-        )
-        .await?,
-    );
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut health_listener = HealthListener::new(config.health_bind_address);
+    let Some(store) = connect_store(
+        &config,
+        database_url,
+        &mut health_listener,
+        shutdown.as_mut(),
+    )
+    .await?
+    else {
+        info!("Shutdown signal received while waiting for the database; stopping gateway");
+        return Ok(());
+    };
+    let store = Arc::new(store);
     let credentials = credentials::CredentialRuntime::from_config_file_with_store(
         &config,
         config_file.as_ref(),
@@ -843,6 +999,11 @@ pub(crate) async fn run_server(
             "shared supervisor assignment stream enabled; minting supervisor tokens"
         );
         info!("shared supervisor pool enabled; reconciling pool membership and ownership");
+        // Sandbox sessions dial this endpoint with their tokens.
+        if let Some(peer_endpoint) = state.peer_endpoint.as_deref() {
+            validate_peer_endpoint_scheme(&state.config, peer_endpoint)?;
+        }
+        controller.set_peer_endpoint(state.peer_endpoint.clone().unwrap_or_default());
         supervisor_pool::SupervisorPool::new(
             state.store.clone(),
             controller.clone(),
@@ -1003,45 +1164,52 @@ pub(crate) async fn run_server(
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
 
-    // Bind the unauthenticated health endpoint on a separate port when configured.
-    if let Some(health_bind_address) = config.health_bind_address {
-        let health_listener = TcpListener::bind(health_bind_address).await.map_err(|e| {
-            Error::transport(format!(
-                "failed to bind health port {health_bind_address}: {e}"
-            ))
-        })?;
-        info!(address = %health_bind_address, "Health server listening");
-        // `health_router` returns immediately; the listener serves
-        // `Initializing → 503` until the background monitor publishes the
-        // first real probe outcome, so the endpoint is always responsive.
-        let router = health_router(store.clone());
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(health_listener, router.into_make_service()).await {
-                error!("Health server error: {e}");
-            }
-        });
-    } else {
-        info!("Health server disabled");
-    }
+    health_listener.serve(store.clone()).await?;
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
     if let Some((metrics_bind_address, prometheus_handle)) = metrics_endpoint {
-        let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
-            Error::transport(format!(
-                "failed to bind metrics port {metrics_bind_address}: {e}",
-            ))
-        })?;
-        info!(address = %metrics_bind_address, "Metrics server listening");
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                metrics_listener,
-                metrics_router(prometheus_handle).into_make_service(),
-            )
-            .await
-            {
-                error!("Metrics server error: {e}");
+        if let Some(metrics_tls) = &config.metrics_tls {
+            if let Some(metrics_tls_acceptor) = metrics_tls_acceptor_or_disable(metrics_tls) {
+                let metrics_listener =
+                    TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+                        Error::transport(format!(
+                            "failed to bind metrics port {metrics_bind_address}: {e}",
+                        ))
+                    })?;
+                metrics_tls_acceptor
+                    .spawn_reload_worker_for_listener(shutdown_rx.clone(), "metrics");
+
+                info!(address = %metrics_bind_address, "Metrics TLS server listening");
+                tokio::spawn(serve_tls_metrics_listener(
+                    metrics_listener,
+                    metrics_router(prometheus_handle),
+                    metrics_tls_acceptor,
+                    shutdown_rx.clone(),
+                ));
+            } else {
+                warn!(
+                    listener = "metrics",
+                    "Metrics listener remains unavailable until valid TLS certificate material is provided"
+                );
             }
-        });
+        } else {
+            let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+                Error::transport(format!(
+                    "failed to bind metrics port {metrics_bind_address}: {e}",
+                ))
+            })?;
+            info!(address = %metrics_bind_address, "Metrics server listening");
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(
+                    metrics_listener,
+                    metrics_router(prometheus_handle).into_make_service(),
+                )
+                .await
+                {
+                    error!("Metrics server error: {e}");
+                }
+            });
+        }
     } else {
         info!("Metrics server disabled");
     }
@@ -1131,10 +1299,11 @@ pub(crate) async fn run_server(
     );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    grpc::service_advertisement::spawn_cleanup(state.clone(), shutdown_rx.clone());
     provider_profile_sources::spawn_refresh(state.clone());
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
-    shutdown_signal().await;
+    shutdown.await;
     info!("Shutdown signal received; stopping gateway");
     state.gateway_shutting_down.store(true, Ordering::Release);
     state.supervisor_sessions.close_admission();
@@ -1168,6 +1337,75 @@ pub(crate) async fn run_server(
     session_cleanup.map_err(Error::execution)?;
 
     Ok(())
+}
+
+/// Serve the metrics endpoint through a dedicated TLS listener.
+///
+/// This listener exists only when `metrics_tls` is configured. The default
+/// metrics listener remains plaintext for backwards compatibility.
+async fn serve_tls_metrics_listener(
+    listener: TcpListener,
+    router: Router,
+    tls_acceptor: TlsAcceptor,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let handshake_log_limiters =
+        MetricsTlsHandshakeLogLimiters::new(METRICS_TLS_HANDSHAKE_WARNING_INTERVAL);
+    loop {
+        let accepted = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+
+        let (stream, addr) = match accepted {
+            Ok(connection) => connection,
+            Err(error) => {
+                error!(error = %error, "Failed to accept metrics connection");
+                continue;
+            }
+        };
+        set_tcp_nodelay_best_effort(&stream);
+
+        let acceptor = tls_acceptor.clone();
+        let service = TowerToHyperService::new(router.clone());
+        let handshake_log_limiters = handshake_log_limiters.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(10), acceptor.acceptor().accept(stream))
+                .await
+            {
+                Ok(Ok(tls_stream)) => {
+                    if let Err(error) = Builder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(TokioIo::new(tls_stream), service)
+                        .await
+                    {
+                        if is_benign_connection_close(error.as_ref()) {
+                            debug!(error = %error, client = %addr, "Metrics connection closed");
+                        } else {
+                            error!(error = %error, client = %addr, "Metrics connection error");
+                        }
+                    }
+                }
+                Ok(Err(error)) if is_benign_tls_handshake_failure(&error) => {
+                    debug!(error = %error, client = %addr, "Metrics TLS handshake closed early");
+                }
+                Ok(Err(error)) => {
+                    log_metrics_tls_handshake_rejection(
+                        &handshake_log_limiters.rejections,
+                        &error,
+                        addr,
+                    );
+                }
+                Err(_) => {
+                    log_metrics_tls_handshake_timeout(&handshake_log_limiters.timeouts, addr);
+                }
+            }
+        });
+    }
 }
 
 async fn serve_gateway_listener(
@@ -1361,6 +1599,112 @@ fn spawn_gateway_connection(
     }
 }
 
+/// First delay between attempts to reach an unreachable database at startup.
+const DATABASE_CONNECT_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+
+/// Longest delay between attempts to reach an unreachable database at startup.
+const DATABASE_CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+
+/// Connect to the database, retrying while it is unreachable.
+///
+/// The first failed attempt binds the health endpoint and starts listening
+/// for `shutdown`; a gateway running as PID 1 ignores SIGTERM until then.
+/// Returns `None` if `shutdown` completes first.
+async fn connect_store(
+    config: &Config,
+    database_url: &str,
+    health_listener: &mut HealthListener,
+    mut shutdown: std::pin::Pin<&mut impl Future<Output = ()>>,
+) -> Result<Option<Store>> {
+    let mut delay = DATABASE_CONNECT_RETRY_INITIAL_DELAY;
+    let mut waiting = false;
+    loop {
+        let attempt = Store::try_connect_with_pool_sizes(
+            database_url,
+            config.database_max_connections,
+            config.database_lock_max_connections,
+        );
+        let result = if waiting {
+            tokio::select! {
+                () = &mut shutdown => return Ok(None),
+                result = attempt => result?,
+            }
+        } else {
+            attempt.await?
+        };
+        let error = match result {
+            Ok(store) => return Ok(Some(store)),
+            Err(error @ persistence::PersistenceError::Unavailable(_)) => error,
+            Err(error) => return Err(Error::execution(error.to_string())),
+        };
+        if !waiting {
+            health_listener.bind().await?;
+            waiting = true;
+        }
+        warn!(
+            error = %error,
+            retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            "database unreachable; retrying"
+        );
+        tokio::select! {
+            () = &mut shutdown => return Ok(None),
+            () = tokio::time::sleep(delay) => {}
+        }
+        delay = (delay * 2).min(DATABASE_CONNECT_RETRY_MAX_DELAY);
+    }
+}
+
+/// The unauthenticated health endpoint, served on its own port when
+/// configured.
+struct HealthListener {
+    address: Option<SocketAddr>,
+    state: Option<watch::Sender<readiness::HealthState>>,
+}
+
+impl HealthListener {
+    const fn new(address: Option<SocketAddr>) -> Self {
+        Self {
+            address,
+            state: None,
+        }
+    }
+
+    /// Start serving probes, with `/readyz` reporting `Initializing` until
+    /// [`Self::serve`] publishes the database's health.
+    async fn bind(&mut self) -> Result<()> {
+        let Some(address) = self.address else {
+            return Ok(());
+        };
+        if self.state.is_some() {
+            return Ok(());
+        }
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(|e| Error::transport(format!("failed to bind health port {address}: {e}")))?;
+        info!(address = %address, "Health server listening");
+        let (sender, receiver) = watch::channel(readiness::HealthState::Initializing);
+        let router = http::health_router_from_receiver(receiver);
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router.into_make_service()).await {
+                error!("Health server error: {e}");
+            }
+        });
+        self.state = Some(sender);
+        Ok(())
+    }
+
+    /// Bind if not yet serving and publish `store`'s health from now on.
+    async fn serve(mut self, store: Arc<Store>) -> Result<()> {
+        self.bind().await?;
+        if let Some(sender) = self.state {
+            readiness::DatabaseHealthMonitor::spawn_into(store, sender);
+        } else {
+            info!("Health server disabled");
+        }
+        Ok(())
+    }
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -1396,7 +1740,7 @@ async fn terminate_signal() {
 
 pub use compute::{
     AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess, SharedComputeDriver,
-    SharedComputeDriverConfigurationUpdates,
+    SharedComputeDriverAppEndpoints, SharedComputeDriverConfigurationUpdates,
 };
 
 /// Driver instance returned by a compiled compute-driver factory.
@@ -1533,31 +1877,11 @@ impl ComputeDriverRegistration {
         })
     }
 
-    /// Compatibility no-op retained for source compatibility with schema-v1
-    /// factory registrations. Schema v2 never inherits gateway keys into a
-    /// driver table; move every driver setting under
-    /// `[openshell.drivers.<name>]`.
-    #[deprecated(
-        since = "0.0.0",
-        note = "schema v2 does not inherit gateway keys into driver configuration"
-    )]
-    #[must_use]
-    pub fn with_inherited_config_keys(self, _keys: &'static [&'static str]) -> Self {
-        self
-    }
-
     /// Assign a bounded telemetry category chosen by the binary composition
     /// boundary. Runtime driver names are never used as telemetry values.
     #[must_use]
     pub fn with_telemetry_category(mut self, category: TelemetryComputeDriver) -> Self {
         self.telemetry_category = category;
-        self
-    }
-
-    /// Compatibility no-op retained for existing factory registrations.
-    /// Gateway mTLS user authentication is independent of compute drivers.
-    #[must_use]
-    pub fn with_local_singleplayer(self) -> Self {
         self
     }
 
@@ -1774,12 +2098,21 @@ pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
     shared_supervision: &'a OnceLock<openshell_supervisor_control::SharedSupervision>,
+    app_endpoint_resolver: &'a OnceLock<SharedComputeDriverAppEndpoints>,
     /// Recovery deadline from `[openshell.gateway.supervisor_pool]`, when
     /// configured.
     supervisor_recovery_timeout_secs: Option<u32>,
 }
 
 impl ComputeDriverBuildContext<'_> {
+    /// Register an optional in-process application endpoint resolver during build.
+    /// Existing factories need not provide this extension.
+    pub fn register_app_endpoints(&self, resolver: SharedComputeDriverAppEndpoints) -> Result<()> {
+        self.app_endpoint_resolver
+            .set(resolver)
+            .map_err(|_| Error::config("application endpoint resolver already registered"))
+    }
+
     /// The gateway's coordination of the shared supervisor pool, for an
     /// in-process driver whose configuration places new generations on it.
     /// The gateway owns the desired set and ownership durably, serves each
@@ -1934,6 +2267,7 @@ async fn build_compute_runtime(
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let shared_supervision = OnceLock::new();
+            let app_endpoint_resolver = OnceLock::new();
             let build_context = ComputeDriverBuildContext {
                 config: ComputeDriverConfigContext {
                     driver_name: &registration.name,
@@ -1944,6 +2278,7 @@ async fn build_compute_runtime(
                 },
                 shutdown_rx,
                 shared_supervision: &shared_supervision,
+                app_endpoint_resolver: &app_endpoint_resolver,
                 supervisor_recovery_timeout_secs: supervisor_pool
                     .and_then(|pool| pool.recovery_timeout_secs),
             };
@@ -1973,7 +2308,8 @@ async fn build_compute_runtime(
                     Error::execution(format!("failed to create compute runtime: {error}"))
                 })?
                 .with_supervisor_host(supervisor_host)
-                .with_image_update_driver(image_updates),
+                .with_image_update_driver(image_updates)
+                .with_app_endpoint_resolver(app_endpoint_resolver.into_inner()),
                 ComputeDriverInstance::ManagedRemote(_) if supervisor_host.is_some() => {
                     return Err(Error::config(
                         "only an in-process compute driver can use the gateway's shared supervision",
@@ -2025,6 +2361,10 @@ async fn build_compute_runtime(
         .and_then(|runtime| runtime.with_admission_policy(admission))
         .and_then(|runtime| {
             runtime.with_image_preparation_timeout(config.image_preparation_timeout_seconds)
+        })
+        .and_then(|runtime| {
+            runtime
+                .with_provisioning_repair_window_seconds(config.provisioning_repair_window_seconds)
         })
         .map_err(Error::config)?;
     Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
@@ -2255,26 +2595,35 @@ mod compute_factory_compatibility;
 mod tests {
     use super::{
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
-        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
-        bind_gateway_listener, classify_initial_bytes, configured_compute_driver,
-        extension_token_ttl, is_benign_tls_handshake_failure, mint_gateway_extension_credential,
-        serve_gateway_listener, validate_peer_endpoint_scheme,
+        MetricsTlsHandshakeLogLimiter, MetricsTlsHandshakeLogLimiters, MultiplexService,
+        ServerState, TlsAcceptor, allow_plaintext_service_http, bind_gateway_listener,
+        classify_initial_bytes, configured_compute_driver, extension_token_ttl,
+        is_benign_tls_handshake_failure, log_metrics_tls_handshake_rejection,
+        log_metrics_tls_handshake_timeout, metrics_tls_acceptor_or_disable,
+        mint_gateway_extension_credential, serve_gateway_listener, serve_tls_metrics_listener,
+        validate_peer_endpoint_scheme,
     };
+    use axum::{Router, routing::get};
     use openshell_core::{
-        Config, NetworkSupervisorTrustBundle,
+        Config, MetricsTlsConfig, NetworkSupervisorTrustBundle,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
+    use rcgen::{CertificateParams, KeyUsagePurpose};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use std::fs;
     use std::io::{Error, ErrorKind};
     use std::net::SocketAddr;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::{TempDir, tempdir};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     use tokio::sync::watch;
+    use tokio_rustls::TlsConnector;
 
     use crate::tls_test_utils::generate_test_certs_with_ca;
     use axum::body::Body;
@@ -2291,6 +2640,75 @@ mod tests {
             external_key_path: None,
             external_server_names: Vec::new(),
         }))
+    }
+
+    fn test_tls_connector(ca_path: &Path, client_auth: Option<(&Path, &Path)>) -> TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        let certificates =
+            CertificateDer::pem_file_iter(ca_path).expect("failed to open test CA certificate");
+        for certificate in certificates {
+            roots
+                .add(certificate.expect("failed to parse test CA certificate"))
+                .expect("failed to add test CA certificate");
+        }
+
+        let config = if let Some((cert_path, key_path)) = client_auth {
+            let cert_chain = CertificateDer::pem_file_iter(cert_path)
+                .expect("failed to open test client certificate")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("failed to parse test client certificate");
+            let private_key =
+                PrivateKeyDer::from_pem_file(key_path).expect("failed to parse test client key");
+
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(cert_chain, private_key)
+                    .expect("failed to configure test client certificate"),
+            )
+        } else {
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        };
+
+        TlsConnector::from(config)
+    }
+
+    fn write_test_client_certificate(
+        directory: &Path,
+        name: &str,
+        ca_cert: &openshell_crypto::pki::Certificate,
+        ca_key: &openshell_crypto::pki::KeyPair,
+    ) -> (PathBuf, PathBuf) {
+        let client_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate test client key");
+        let mut client_params =
+            CertificateParams::new(Vec::<String>::new()).expect("failed to create client params");
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        client_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        let client_cert =
+            openshell_crypto::pki::signed_by(client_params, &client_key, ca_cert, ca_key)
+                .expect("failed to sign test client certificate");
+
+        let cert_path = directory.join(format!("{name}-cert.pem"));
+        let key_path = directory.join(format!("{name}-key.pem"));
+        fs::write(&cert_path, client_cert.pem()).expect("failed to write test client certificate");
+        fs::write(
+            &key_path,
+            client_key
+                .serialize_pem()
+                .expect("failed to encode test client key"),
+        )
+        .expect("failed to write test client key");
+        (cert_path, key_path)
     }
 
     #[test]
@@ -2533,6 +2951,7 @@ mod tests {
                 },
                 shutdown_rx: shutdown_rx.clone(),
                 shared_supervision: &shared,
+                app_endpoint_resolver: &std::sync::OnceLock::new(),
                 supervisor_recovery_timeout_secs: configured,
             };
             // The driver asks for shared supervision as before; it is the
@@ -2752,7 +3171,7 @@ mod tests {
         let connect_addr: SocketAddr = format!("127.0.0.1:{}", addr.port())
             .parse()
             .expect("failed to build loopback connect addr");
-        let mut stream = TcpStream::connect(connect_addr)
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(connect_addr)
             .await
             .expect("failed to connect to test listener");
         stream
@@ -2791,6 +3210,379 @@ mod tests {
     async fn stop_listener(shutdown: watch::Sender<bool>, handle: tokio::task::JoinHandle<()>) {
         let _ = shutdown.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[derive(Clone)]
+    struct TraceBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn metrics_tls_handshake_rejection_logs_actionable_context() {
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_mins(1));
+
+        log_metrics_tls_handshake_rejection(
+            &limiter,
+            &Error::new(ErrorKind::InvalidData, "untrusted client certificate"),
+            "192.0.2.10:443".parse().expect("valid test client address"),
+        );
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(output.contains("WARN"), "log output: {output}");
+        assert!(
+            output.contains("metrics_tls_handshake_rejected"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("untrusted client certificate"),
+            "log output: {output}"
+        );
+        assert!(output.contains("192.0.2.10:443"), "log output: {output}");
+        assert!(
+            output.contains("Rejected metrics TLS handshake"),
+            "log output: {output}"
+        );
+    }
+
+    #[test]
+    fn metrics_tls_handshake_warnings_are_rate_limited() {
+        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_mins(1));
+        let start = Instant::now();
+
+        assert_eq!(limiter.record(start), Some(0));
+        assert_eq!(limiter.record(start + Duration::from_secs(1)), None);
+        assert_eq!(limiter.record(start + Duration::from_secs(2)), None);
+        assert_eq!(
+            limiter.record(start + Duration::from_mins(1)),
+            Some(2),
+            "the next warning reports the rejected handshakes suppressed during the interval"
+        );
+    }
+
+    #[test]
+    fn metrics_tls_handshake_timeout_warns_independently_of_rejections() {
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let limiters = MetricsTlsHandshakeLogLimiters::new(Duration::from_mins(1));
+        let client = "192.0.2.10:443".parse().expect("valid test client address");
+
+        // A rejected handshake warns once and suppresses further rejections
+        // for the interval; a timeout during that window must still warn with
+        // its own message and counts instead of being absorbed by the
+        // rejection limiter.
+        log_metrics_tls_handshake_rejection(
+            &limiters.rejections,
+            &Error::new(ErrorKind::InvalidData, "untrusted client certificate"),
+            client,
+        );
+        log_metrics_tls_handshake_timeout(&limiters.timeouts, client);
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(
+            output.contains("metrics_tls_handshake_rejected"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("Metrics TLS handshakes timed out"),
+            "the timeout still warns after a rejected handshake: {output}"
+        );
+        assert!(
+            output.matches("WARN").count() >= 2,
+            "both the rejection and the timeout warn: {output}"
+        );
+    }
+
+    #[test]
+    fn invalid_metrics_tls_material_disables_only_the_metrics_listener() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let tls = MetricsTlsConfig {
+            cert_path: PathBuf::from("/tmp/openshell-missing-metrics-cert.pem"),
+            key_path: PathBuf::from("/tmp/openshell-missing-metrics-key.pem"),
+            client_ca_path: None,
+            require_client_auth: false,
+        };
+
+        assert!(
+            metrics_tls_acceptor_or_disable(&tls).is_none(),
+            "invalid metrics TLS files must not produce a plaintext listener or abort startup"
+        );
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(
+            output.contains("metrics_tls_listener_disabled"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("listener=\"metrics\""),
+            "log output: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_metrics_listener_serves_https_and_rejects_plaintext() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind metrics listener");
+        let address = listener
+            .local_addr()
+            .expect("failed to read metrics listener address");
+        let (tls_dir, tls_acceptor) = test_tls_acceptor();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener_task = tokio::spawn(serve_tls_metrics_listener(
+            listener,
+            Router::new().route("/metrics", get(|| async { "metrics" })),
+            tls_acceptor,
+            shutdown_rx,
+        ));
+
+        let connector = test_tls_connector(&tls_dir.path().join("ca.pem"), None);
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .expect("failed to connect to metrics listener");
+        let mut tls_stream = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+            .expect("metrics TLS handshake failed");
+        tls_stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to request metrics over TLS");
+        let mut response = Vec::new();
+        tls_stream
+            .read_to_end(&mut response)
+            .await
+            .expect("failed to read metrics TLS response");
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "expected a successful HTTPS metrics response"
+        );
+
+        let mut plaintext = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .expect("failed to connect for plaintext request");
+        plaintext
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to write plaintext metrics request");
+        let mut plaintext_response = Vec::new();
+        let plaintext_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            plaintext.read_to_end(&mut plaintext_response),
+        )
+        .await
+        .expect("timed out waiting for plaintext metrics connection to close");
+        if let Err(error) = plaintext_result {
+            assert_eq!(error.kind(), ErrorKind::ConnectionReset);
+        }
+        assert!(
+            !String::from_utf8_lossy(&plaintext_response).starts_with("HTTP/"),
+            "TLS metrics listener must not serve plaintext HTTP"
+        );
+
+        stop_listener(shutdown_tx, listener_task).await;
+    }
+
+    #[tokio::test]
+    async fn metrics_mtls_trusts_only_the_metrics_client_ca() {
+        let directory = tempdir().expect("failed to create test directory");
+        let (_server_ca_cert, _server_ca_key) = generate_test_certs_with_ca(directory.path());
+
+        let metrics_ca_directory = directory.path().join("metrics-client-ca");
+        fs::create_dir(&metrics_ca_directory).expect("failed to create metrics CA directory");
+        let (metrics_ca_cert, metrics_ca_key) = generate_test_certs_with_ca(&metrics_ca_directory);
+
+        let gateway_ca_directory = directory.path().join("gateway-client-ca");
+        fs::create_dir(&gateway_ca_directory).expect("failed to create gateway CA directory");
+        let (gateway_ca_cert, gateway_ca_key) = generate_test_certs_with_ca(&gateway_ca_directory);
+
+        let (metrics_client_cert, metrics_client_key) = write_test_client_certificate(
+            directory.path(),
+            "metrics-client",
+            &metrics_ca_cert,
+            &metrics_ca_key,
+        );
+        let (gateway_client_cert, gateway_client_key) = write_test_client_certificate(
+            directory.path(),
+            "gateway-client",
+            &gateway_ca_cert,
+            &gateway_ca_key,
+        );
+        let metrics_tls_acceptor = TlsAcceptor::from_files(
+            &directory.path().join("server-cert.pem"),
+            &directory.path().join("server-key.pem"),
+            Some(&metrics_ca_directory.join("ca.pem")),
+            true,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("failed to configure metrics mTLS acceptor");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind metrics listener");
+        let address = listener
+            .local_addr()
+            .expect("failed to read metrics listener address");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener_task = tokio::spawn(serve_tls_metrics_listener(
+            listener,
+            Router::new().route("/metrics", get(|| async { "metrics" })),
+            metrics_tls_acceptor,
+            shutdown_rx,
+        ));
+
+        let metrics_connector = test_tls_connector(
+            &directory.path().join("ca.pem"),
+            Some((&metrics_client_cert, &metrics_client_key)),
+        );
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .expect("failed to connect with metrics client certificate");
+        let mut metrics_client = metrics_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+            .expect("metrics client TLS handshake failed");
+        metrics_client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to request metrics with metrics client certificate");
+        let mut authorized_response = Vec::new();
+        metrics_client
+            .read_to_end(&mut authorized_response)
+            .await
+            .expect("failed to read authorized metrics response");
+        assert!(
+            String::from_utf8_lossy(&authorized_response).starts_with("HTTP/1.1 200"),
+            "metrics client certificate should be authorized"
+        );
+
+        let gateway_connector = test_tls_connector(
+            &directory.path().join("ca.pem"),
+            Some((&gateway_client_cert, &gateway_client_key)),
+        );
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .expect("failed to connect with gateway client certificate");
+        let rejected_response = match gateway_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+        {
+            Ok(mut gateway_client) => {
+                let _ = gateway_client
+                    .write_all(
+                        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let mut response = Vec::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    gateway_client.read_to_end(&mut response),
+                )
+                .await;
+                response
+            }
+            Err(_) => Vec::new(),
+        };
+        assert!(
+            !String::from_utf8_lossy(&rejected_response).starts_with("HTTP/"),
+            "gateway client certificate must not authorize metrics scraping"
+        );
+
+        let anonymous_connector = test_tls_connector(&directory.path().join("ca.pem"), None);
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .expect("failed to connect without a client certificate");
+        let anonymous_response = match anonymous_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+        {
+            Ok(mut anonymous_client) => {
+                let _ = anonymous_client
+                    .write_all(
+                        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let mut response = Vec::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    anonymous_client.read_to_end(&mut response),
+                )
+                .await;
+                response
+            }
+            Err(_) => Vec::new(),
+        };
+        assert!(
+            !String::from_utf8_lossy(&anonymous_response).starts_with("HTTP/"),
+            "metrics mTLS must reject clients without a certificate"
+        );
+
+        stop_listener(shutdown_tx, listener_task).await;
     }
 
     #[test]
@@ -3267,6 +4059,158 @@ mod tests {
             !start_attempted.load(Ordering::SeqCst),
             "persisted sandbox start must not run before the gateway listener is bound"
         );
+    }
+
+    /// A loopback address where nothing listens until a test binds it.
+    async fn reserved_loopback_address() -> SocketAddr {
+        TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve a loopback port")
+            .local_addr()
+            .expect("loopback address")
+    }
+
+    /// Status code of `GET path`, or `None` when nothing answers.
+    async fn http_status(address: SocketAddr, path: &str) -> Option<u16> {
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .ok()?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .ok()?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.ok()?;
+        response.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    async fn wait_for_http_status(address: SocketAddr, path: &str, expected: u16) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while http_status(address, path).await != Some(expected) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{path} never returned {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_store_serves_probes_while_the_database_is_unreachable() {
+        let url = crate::persistence::PostgresStore::refusing_url_for_tests().await;
+        let health_address = reserved_loopback_address().await;
+        let mut health = super::HealthListener::new(Some(health_address));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _ = stopped.await;
+        };
+        tokio::pin!(shutdown);
+        let config = Config::new(None);
+
+        let probe = async {
+            wait_for_http_status(health_address, "/healthz", 200).await;
+            assert_eq!(http_status(health_address, "/readyz").await, Some(503));
+            stop.send(()).expect("connect_store is still waiting");
+        };
+        let (result, ()) = tokio::join!(
+            super::connect_store(&config, &url, &mut health, shutdown.as_mut()),
+            probe
+        );
+
+        assert!(
+            result.expect("shutdown is not an error").is_none(),
+            "shutdown ends the wait without a store"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_store_returns_a_configuration_error_without_retrying() {
+        let health_address = reserved_loopback_address().await;
+        let mut health = super::HealthListener::new(Some(health_address));
+        let shutdown = std::future::pending::<()>();
+        tokio::pin!(shutdown);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::connect_store(
+                &Config::new(None),
+                "postgres://openshell@127.0.0.1:1/openshell?sslmode=invalid",
+                &mut health,
+                shutdown.as_mut(),
+            ),
+        )
+        .await
+        .expect("a configuration error is not retried");
+
+        assert!(result.is_err());
+        assert_eq!(http_status(health_address, "/healthz").await, None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_connect_store_retries_until_the_database_answers() {
+        let schema = crate::persistence::test_postgres::TestSchema::create("startup").await;
+        let upstream = url::Url::parse(schema.url()).expect("parse the PostgreSQL URL");
+        let upstream_addresses: Vec<SocketAddr> = tokio::net::lookup_host((
+            upstream.host_str().expect("TCP PostgreSQL host"),
+            upstream.port().unwrap_or(5432),
+        ))
+        .await
+        .expect("resolve PostgreSQL")
+        .collect();
+        let late_address = reserved_loopback_address().await;
+        let mut url = upstream.clone();
+        url.set_host(Some("127.0.0.1")).expect("set host");
+        url.set_port(Some(late_address.port())).expect("set port");
+        let health_address = reserved_loopback_address().await;
+        let mut health = super::HealthListener::new(Some(health_address));
+        let shutdown = std::future::pending::<()>();
+        tokio::pin!(shutdown);
+        let config = Config::new(None);
+
+        // PostgreSQL becomes reachable only after the gateway reports that it
+        // is waiting.
+        let late_database = async {
+            wait_for_http_status(health_address, "/healthz", 200).await;
+            assert_eq!(http_status(health_address, "/readyz").await, Some(503));
+            let listener = TcpListener::bind(late_address)
+                .await
+                .expect("bind the late PostgreSQL address");
+            loop {
+                let (mut client, _) = listener.accept().await.expect("accept");
+                openshell_core::net::set_tcp_nodelay_best_effort(&client);
+                let mut upstream = openshell_core::net::connect_tcp_nodelay_best_effort(
+                    upstream_addresses.as_slice(),
+                )
+                .await
+                .expect("connect to PostgreSQL");
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        };
+        let store = tokio::select! {
+            result = tokio::time::timeout(
+                Duration::from_mins(1),
+                super::connect_store(&config, url.as_str(), &mut health, shutdown.as_mut()),
+            ) => result
+                .expect("connect_store finishes once PostgreSQL answers")
+                .expect("connect")
+                .expect("no shutdown"),
+            () = late_database => unreachable!("the forwarder runs until the store connects"),
+        };
+        store.ping().await.expect("ping the connected store");
+
+        health
+            .serve(Arc::new(store))
+            .await
+            .expect("keep serving the bound health listener");
+        wait_for_http_status(health_address, "/readyz", 200).await;
+
+        schema.drop_schema().await;
     }
 }
 

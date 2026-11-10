@@ -193,8 +193,9 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
-                        openshell_cli::oidc_auth::oidc_refresh_token(
+                        openshell_cli::oidc_auth::oidc_renew_token(
                             &bundle,
+                            meta.oidc_audience.as_deref(),
                             meta.oidc_scopes.as_deref(),
                             insecure,
                         ),
@@ -2191,8 +2192,8 @@ enum PolicyCommands {
         name: Option<String>,
 
         /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
-        /// Options include allowed-ip=..., credential rewrite flags, and
-        /// allow-uninspected-credentials.
+        /// Options include allowed-ip=..., allow-encoded-slash, credential
+        /// rewrite flags, and allow-uninspected-credentials.
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -2775,7 +2776,12 @@ async fn run_async() -> Result<()> {
         // Top-level status
         // -----------------------------------------------------------
         Some(Commands::Status { output }) => {
-            if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+            // A gateway named on the command line must be registered.
+            let resolved = match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                Err(err) if cli.gateway.is_some() => return Err(err),
+                resolved => resolved,
+            };
+            if let Ok(ctx) = resolved {
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
                 run::gateway_status(

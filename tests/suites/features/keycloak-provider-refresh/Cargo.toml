@@ -12,6 +12,6 @@ repository = "https://github.com/NVIDIA/OpenShell"
 publish = false
 
 [dependencies]
-keycloak = { path = "../../../support/keycloak" }
+keycloak-support = { path = "../../../support/keycloak" }
 openshell-testkit = { path = "../../../testkit/testkit" }
 tempfile = "3"

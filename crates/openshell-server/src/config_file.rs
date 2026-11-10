@@ -103,6 +103,8 @@ pub struct GatewayFileSection {
     pub health_bind_address: Option<SocketAddr>,
     #[serde(default)]
     pub metrics_bind_address: Option<SocketAddr>,
+    #[serde(default)]
+    pub metrics_tls: Option<MetricsTlsFileConfig>,
 
     // ── Logging ──────────────────────────────────────────────────────────
     #[serde(default)]
@@ -144,9 +146,19 @@ pub struct GatewayFileSection {
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
+    /// Per-sandbox cap on concurrent SSH relays; omit to keep the default of 20.
+    #[serde(default)]
+    pub max_ssh_connections_per_sandbox: Option<u32>,
+    /// Per-sandbox cap on concurrent service forward relays; omit to keep the
+    /// default of 20.
+    #[serde(default)]
+    pub max_service_connections_per_sandbox: Option<u32>,
     /// Absolute preparation budget for new attempts; existing deadlines persist.
     #[serde(default)]
     pub image_preparation_timeout_seconds: Option<u32>,
+    /// Admission repair window in seconds, between 1 and 86400.
+    #[serde(default)]
+    pub provisioning_repair_window_seconds: Option<i64>,
     /// Explicit activation only after the compatible deployment rollout ends.
     #[serde(default)]
     pub enable_sandbox_updates: Option<bool>,
@@ -320,6 +332,21 @@ impl TryFrom<RawOcsfLogConfig> for OcsfLogConfig {
                 .unwrap_or(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap()),
         })
     }
+}
+/// TLS fields for the dedicated metrics listener.
+///
+/// This is separate from [`GatewayTlsFileConfig`] so metrics clients can
+/// trust a dedicated client CA and cannot inherit the gateway listener's
+/// wider certificate and SNI configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsTlsFileConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    #[serde(default)]
+    pub client_ca_path: Option<PathBuf>,
+    #[serde(default)]
+    pub require_client_auth: bool,
 }
 /// `[openshell.gateway.otlp]` section and its per-signal tables.
 ///
@@ -1931,6 +1958,7 @@ version = 2
 [openshell.gateway]
 bind_address = "0.0.0.0:8080"
 health_bind_address = "0.0.0.0:8081"
+metrics_bind_address = "0.0.0.0:9090"
 log_level = "info"
 compute_driver = "kubernetes"
 credential_drivers = ["kubernetes-secrets"]
@@ -1942,6 +1970,12 @@ policy_validation_failure_mode = "retain_last_valid"
 cert_path = "/etc/openshell/certs/gateway.pem"
 key_path = "/etc/openshell/certs/gateway-key.pem"
 client_ca_path = "/etc/openshell/certs/client-ca.pem"
+
+[openshell.gateway.metrics_tls]
+cert_path = "/etc/openshell/metrics/server/tls.crt"
+key_path = "/etc/openshell/metrics/server/tls.key"
+client_ca_path = "/etc/openshell/metrics/client-ca/ca.crt"
+require_client_auth = true
 
 [openshell.gateway.oidc]
 issuer = "https://idp.example.com/realms/openshell"
@@ -1971,6 +2005,16 @@ namespace = "agents"
             Some(openshell_core::PolicyValidationFailureMode::RetainLastValid)
         );
         assert!(gw.tls.is_some());
+        let metrics_tls = gw.metrics_tls.as_ref().expect("metrics TLS config parses");
+        assert_eq!(
+            metrics_tls.cert_path,
+            Path::new("/etc/openshell/metrics/server/tls.crt")
+        );
+        assert_eq!(
+            metrics_tls.client_ca_path.as_deref(),
+            Some(Path::new("/etc/openshell/metrics/client-ca/ca.crt"))
+        );
+        assert!(metrics_tls.require_client_auth);
         let oidc = gw.oidc.as_ref().expect("OIDC config parses");
         assert!(!oidc.dangerously_allow_insecure_http);
         assert_eq!(
