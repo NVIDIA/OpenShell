@@ -170,6 +170,10 @@ ocsf_emit!(event);
   `openshell_core::net::set_tcp_nodelay_best_effort` on an accepted or
   already-connected stream, or `openshell_core::net::connect_tcp_nodelay_best_effort`
   when dialing.
+- Clippy rejects raw `TcpStream::connect` (`clippy.toml`). Dial with
+  `openshell_core::net::connect_tcp_nodelay_best_effort`, or
+  `connect_std_tcp_nodelay_best_effort` on blocking threads. The lint does not
+  cover accepted sockets, so keep setting nodelay on those by hand.
 - This applies to loopback/localhost TCP too — the delayed-ACK stall is a timer
   behavior, not wire latency.
 - You should skip it for unix domain sockets (no Nagle). It's not critical for

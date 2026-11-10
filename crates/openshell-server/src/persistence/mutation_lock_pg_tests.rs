@@ -220,7 +220,7 @@ impl StallingProxy {
                         let stalled = receiver.clone();
                         connections.spawn(async move {
                             let upstream = openshell_core::net::connect_tcp_nodelay_best_effort(
-                                &addresses,
+                                addresses.as_slice(),
                             ).await?;
                             let (mut client_read, mut client_write) = client.into_split();
                             let (mut upstream_read, mut upstream_write) = upstream.into_split();

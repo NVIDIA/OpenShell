@@ -680,7 +680,7 @@ impl super::BoundaryTransportConnector for Connector {
         _: &w::SandboxRuntimeDescriptor,
     ) -> Result<BoundaryDuplexStream, BackendError> {
         Ok(Box::new(
-            openshell_core::net::connect_tcp_nodelay_best_effort(&[self.address])
+            openshell_core::net::connect_tcp_nodelay_best_effort(self.address)
                 .await
                 .map_err(|e| BackendError::Unavailable(e.to_string()))?,
         ))
