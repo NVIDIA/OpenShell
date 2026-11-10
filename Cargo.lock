@@ -4705,13 +4705,26 @@ dependencies = [
 name = "openshell-driver-sdk"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "miette",
+ "nix 0.29.0",
+ "openshell-otel",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "rustix 1.1.4",
  "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

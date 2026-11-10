@@ -8,7 +8,22 @@
 //! re-exports every item defined here, so each item has exactly one definition.
 //! It depends only on workspace crates and crates.io.
 
+pub mod compute;
+pub mod container_paths;
+pub mod driver_mounts;
+#[cfg(unix)]
+pub mod e2fsprogs;
+pub mod error;
+pub mod extension_protocol;
+#[cfg(unix)]
+pub mod external_driver_socket;
+pub mod image;
+pub mod progress;
 pub mod proto;
+pub mod sandbox_env;
+pub mod sandbox_generation;
+pub mod sandbox_session;
+pub mod time;
 
 /// Build version string derived from git metadata.
 ///
