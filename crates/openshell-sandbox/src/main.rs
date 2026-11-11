@@ -29,6 +29,24 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
+const STAGE_WORKSPACE_SUBCOMMAND: &str = "stage-workspace";
+const SEED_STAGED_WORKSPACE_SUBCOMMAND: &str = "seed-staged-workspace";
+/// Sentinel written into the workspace PVC once it is seeded.
+#[cfg(target_os = "linux")]
+const KUBERNETES_WORKSPACE_SENTINEL: &str = ".openshell-initialized";
+/// Recorded when staging could not copy the image's `/sandbox`.
+#[cfg(target_os = "linux")]
+const KUBERNETES_WORKSPACE_STAGE_ERROR: &str = ".openshell-stage-error";
+/// Mount path of the staging volume shared by the two workspace init
+/// containers. Mirrors `WORKSPACE_STAGE_MOUNT_PATH` in the Kubernetes driver.
+#[cfg(target_os = "linux")]
+const KUBERNETES_WORKSPACE_STAGE_PATH: &str = "/mnt/openshell-workspace-stage";
+/// Subdirectory of the staging volume that holds the staged tree.
+#[cfg(target_os = "linux")]
+const KUBERNETES_WORKSPACE_STAGE_TREE: &str = "tree";
+/// Marker written beside the staged tree once it is complete.
+#[cfg(target_os = "linux")]
+const KUBERNETES_WORKSPACE_STAGE_MARKER: &str = ".openshell-staged";
 #[cfg(target_os = "linux")]
 const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 3] = ["boundary.json", "tls.crt", "tls.key"];
 #[cfg(target_os = "linux")]
@@ -1675,11 +1693,149 @@ fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<()>
     Ok(())
 }
 
+/// Copy the agent image's `/sandbox` into the staging volume as the final
+/// workload identity.
+///
+/// The container that writes the workspace PVC mounts it over `/sandbox`, the
+/// one path a VM-isolating sandbox runtime allows for it, so it cannot read
+/// the image's own `/sandbox`. This step runs first, without the PVC, and
+/// leaves the contents where that container can reach them.
+#[cfg(target_os = "linux")]
+fn stage_kubernetes_workspace() -> Result<()> {
+    stage_kubernetes_workspace_at(
+        Path::new("/sandbox"),
+        Path::new(KUBERNETES_WORKSPACE_STAGE_PATH),
+    )
+}
+
+/// Seed the persistent workspace from the staging volume as the final workload
+/// identity.
+///
+/// An already-seeded workspace never looks at the stage, so a sandbox whose
+/// image carries a `/sandbox` this identity cannot read still restarts.
+#[cfg(target_os = "linux")]
+fn seed_staged_kubernetes_workspace() -> Result<()> {
+    seed_staged_kubernetes_workspace_at(
+        Path::new(KUBERNETES_WORKSPACE_STAGE_PATH),
+        Path::new("/sandbox"),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn seed_staged_kubernetes_workspace_at(stage: &Path, destination: &Path) -> Result<()> {
+    if destination
+        .join(KUBERNETES_WORKSPACE_SENTINEL)
+        .try_exists()
+        .into_diagnostic()?
+    {
+        return Ok(());
+    }
+    if !stage
+        .join(KUBERNETES_WORKSPACE_STAGE_MARKER)
+        .try_exists()
+        .into_diagnostic()?
+    {
+        let reason = std::fs::read_to_string(stage.join(KUBERNETES_WORKSPACE_STAGE_ERROR))
+            .unwrap_or_else(|_| "no reason was recorded".to_string());
+        return Err(miette::miette!(
+            "workspace staging did not complete, so the workspace cannot be seeded: {}",
+            reason.trim()
+        ));
+    }
+    seed_kubernetes_workspace_at(&stage.join(KUBERNETES_WORKSPACE_STAGE_TREE), destination)
+}
+
 /// Seed the persistent workspace from the agent image as the final workload
-/// identity. This replaces the former root shell/tar init container.
+/// identity, with the PVC mounted away from `/sandbox`.
+///
+/// Sandbox objects created before the workspace moved to a single mount path
+/// keep their stored init container, which runs this binary from the current
+/// runtime image against the old mounts. Keep it working: only the pod spec
+/// decides which layout applies.
 #[cfg(target_os = "linux")]
 fn seed_kubernetes_workspace() -> Result<()> {
     seed_kubernetes_workspace_at(Path::new("/sandbox"), Path::new("/mnt/openshell-workspace"))
+}
+
+/// Copy `source` into the staging directory `destination`.
+///
+/// Writes a marker beside the staged tree, not inside it, so a container
+/// restart skips the work without the marker reaching the workspace. A partial
+/// tree from an earlier attempt is discarded first: the pod's `emptyDir`
+/// survives a restart of this container, and the copy refuses to overwrite.
+///
+/// A copy that fails records why and still exits cleanly, because the image's
+/// `/sandbox` does not matter to a workspace that was seeded on an earlier
+/// start. The seeding step refuses to seed an empty workspace from an
+/// incomplete stage, so a first start still fails loudly.
+#[cfg(target_os = "linux")]
+fn stage_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()> {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let write_marker = |name: &str, contents: &str| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(destination.join(name))
+            .into_diagnostic()?;
+        file.write_all(contents.as_bytes()).into_diagnostic()?;
+        file.sync_all().into_diagnostic()?;
+        Ok(())
+    };
+
+    let destination_metadata = fs::symlink_metadata(destination).into_diagnostic()?;
+    if !destination_metadata.is_dir() || destination_metadata.file_type().is_symlink() {
+        return Err(miette::miette!(
+            "workspace stage must be a real directory: {}",
+            destination.display()
+        ));
+    }
+    if destination
+        .join(KUBERNETES_WORKSPACE_STAGE_MARKER)
+        .try_exists()
+        .into_diagnostic()?
+    {
+        return Ok(());
+    }
+    let tree = destination.join(KUBERNETES_WORKSPACE_STAGE_TREE);
+    if tree.try_exists().into_diagnostic()? {
+        fs::remove_dir_all(&tree).into_diagnostic()?;
+    }
+    fs::create_dir(&tree).into_diagnostic()?;
+
+    // Everything about the image is recorded rather than raised: a workspace
+    // seeded on an earlier start does not need the image at all. Problems with
+    // the stage itself still fail, since nothing can proceed without it.
+    let staged = (|| -> Result<()> {
+        if !source.try_exists().into_diagnostic()? {
+            return Ok(());
+        }
+        let metadata = fs::symlink_metadata(source).into_diagnostic()?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(miette::miette!(
+                "image workspace must be a real directory: {}",
+                source.display()
+            ));
+        }
+        copy_workspace_tree(source, &tree)?;
+        // The sentinel means "this workspace was seeded", so an image that
+        // happens to carry the name must not hand one to the PVC: an
+        // interrupted copy would then look seeded on the next attempt.
+        let carried = tree.join(KUBERNETES_WORKSPACE_SENTINEL);
+        if carried.try_exists().into_diagnostic()? {
+            fs::remove_file(&carried).into_diagnostic()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        return write_marker(KUBERNETES_WORKSPACE_STAGE_ERROR, &format!("{error}"));
+    }
+
+    write_marker(KUBERNETES_WORKSPACE_STAGE_MARKER, "staged\n")
 }
 
 #[cfg(target_os = "linux")]
@@ -1741,7 +1897,7 @@ fn seed_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()>
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    let sentinel = destination.join(".openshell-initialized");
+    let sentinel = destination.join(KUBERNETES_WORKSPACE_SENTINEL);
     if sentinel.try_exists().into_diagnostic()? {
         return Ok(());
     }
@@ -1782,6 +1938,20 @@ fn seed_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()>
 
 #[cfg(not(target_os = "linux"))]
 fn seed_kubernetes_workspace() -> Result<()> {
+    Err(miette::miette!(
+        "Kubernetes workspace seeding is supported only on Linux"
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stage_kubernetes_workspace() -> Result<()> {
+    Err(miette::miette!(
+        "Kubernetes workspace staging is supported only on Linux"
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn seed_staged_kubernetes_workspace() -> Result<()> {
     Err(miette::miette!(
         "Kubernetes workspace seeding is supported only on Linux"
     ))
@@ -1832,6 +2002,22 @@ fn main() -> Result<()> {
             ));
         }
         return seed_kubernetes_workspace();
+    }
+    if raw_args.get(1).map(String::as_str) == Some(STAGE_WORKSPACE_SUBCOMMAND) {
+        if raw_args.len() != 2 {
+            return Err(miette::miette!(
+                "usage: openshell-sandbox {STAGE_WORKSPACE_SUBCOMMAND}"
+            ));
+        }
+        return stage_kubernetes_workspace();
+    }
+    if raw_args.get(1).map(String::as_str) == Some(SEED_STAGED_WORKSPACE_SUBCOMMAND) {
+        if raw_args.len() != 2 {
+            return Err(miette::miette!(
+                "usage: openshell-sandbox {SEED_STAGED_WORKSPACE_SUBCOMMAND}"
+            ));
+        }
+        return seed_staged_kubernetes_workspace();
     }
     if raw_args.get(1).map(String::as_str) == Some(CAPABILITY_PROBE_SUBCOMMAND) {
         return run_capability_probe();
@@ -1970,6 +2156,197 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// The image's `/sandbox` reaches the PVC in two hops, because no
+    /// container may mount the workspace PVC anywhere but `/sandbox`. What
+    /// arrives must match what a single copy used to produce.
+    #[test]
+    fn kubernetes_workspace_stage_then_seed_round_trips_the_image_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let image = root.path().join("image-sandbox");
+        let stage = root.path().join("stage");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(image.join("bin")).unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(image.join("README"), b"workspace").unwrap();
+        std::fs::write(image.join("bin/tool"), b"tool").unwrap();
+        let mut executable = std::fs::metadata(image.join("bin/tool"))
+            .unwrap()
+            .permissions();
+        executable.set_mode(0o755);
+        std::fs::set_permissions(image.join("bin/tool"), executable).unwrap();
+        std::os::unix::fs::symlink("README", image.join("latest")).unwrap();
+        // A self-referential symlink, the shape that made `cp -a` fail.
+        std::os::unix::fs::symlink("..", image.join("bin/self")).unwrap();
+        // An image that carries the sentinel name must not be able to mark a
+        // workspace seeded before its contents are actually there.
+        std::fs::write(image.join(KUBERNETES_WORKSPACE_SENTINEL), b"not mine").unwrap();
+
+        stage_kubernetes_workspace_at(&image, &stage).unwrap();
+        seed_staged_kubernetes_workspace_at(&stage, &workspace).unwrap();
+
+        assert_eq!(
+            std::fs::read(workspace.join("README")).unwrap(),
+            b"workspace"
+        );
+        assert_eq!(
+            std::fs::read_link(workspace.join("latest")).unwrap(),
+            Path::new("README")
+        );
+        assert_eq!(
+            std::fs::read_link(workspace.join("bin/self")).unwrap(),
+            Path::new("..")
+        );
+        assert_ne!(
+            std::fs::metadata(workspace.join("bin/tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o100,
+            0,
+            "the executable bit must survive both hops"
+        );
+        let sentinel = workspace.join(KUBERNETES_WORKSPACE_SENTINEL);
+        assert!(sentinel.is_file());
+        assert_ne!(
+            std::fs::read(&sentinel).unwrap(),
+            b"not mine",
+            "the sentinel must be ours, written after the copy, not one carried from the image"
+        );
+        // The staging marker is a detail of the stage, not of the workspace.
+        assert!(
+            !workspace
+                .join(KUBERNETES_WORKSPACE_STAGE_MARKER)
+                .try_exists()
+                .unwrap()
+        );
+    }
+
+    /// A sandbox created before the workspace moved to a single mount path
+    /// keeps its stored init container, which the current runtime image's
+    /// binary then runs against the old mounts. `seed-workspace` must keep
+    /// meaning what it meant, or those sandboxes stop restarting.
+    #[test]
+    fn kubernetes_workspace_seed_keeps_the_layout_stored_in_older_sandboxes() {
+        let root = tempfile::tempdir().unwrap();
+        let image = root.path().join("sandbox");
+        let legacy_pvc = root.path().join("mnt-openshell-workspace");
+        std::fs::create_dir(&image).unwrap();
+        std::fs::create_dir(&legacy_pvc).unwrap();
+        std::fs::write(image.join("README"), b"workspace").unwrap();
+
+        // The old pod spec's direction: image /sandbox into a PVC mounted away
+        // from /sandbox, with no staging volume in the pod at all.
+        seed_kubernetes_workspace_at(&image, &legacy_pvc).unwrap();
+
+        assert_eq!(
+            std::fs::read(legacy_pvc.join("README")).unwrap(),
+            b"workspace"
+        );
+        assert!(legacy_pvc.join(KUBERNETES_WORKSPACE_SENTINEL).is_file());
+    }
+
+    /// Staging reads the image, which a seeded workspace no longer needs. A
+    /// `/sandbox` this identity cannot read must not stop the sandbox.
+    #[test]
+    fn kubernetes_workspace_seeded_workspace_ignores_a_failed_stage() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join("stage");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        // An earlier start seeded the workspace.
+        std::fs::write(
+            workspace.join(KUBERNETES_WORKSPACE_SENTINEL),
+            b"initialized\n",
+        )
+        .unwrap();
+        // This start could not read the image, so no marker was written.
+        std::fs::write(
+            stage.join(KUBERNETES_WORKSPACE_STAGE_ERROR),
+            b"permission denied",
+        )
+        .unwrap();
+
+        seed_staged_kubernetes_workspace_at(&stage, &workspace).unwrap();
+
+        // The same holds when the image itself is the problem: staging records
+        // it rather than raising, so the seeded workspace still starts.
+        let odd_image = root.path().join("odd");
+        std::fs::create_dir(root.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", &odd_image).unwrap();
+        let second_stage = root.path().join("stage2");
+        std::fs::create_dir(&second_stage).unwrap();
+        stage_kubernetes_workspace_at(&odd_image, &second_stage).unwrap();
+        assert!(
+            !second_stage
+                .join(KUBERNETES_WORKSPACE_STAGE_MARKER)
+                .try_exists()
+                .unwrap(),
+            "a rejected image must not look like a complete stage"
+        );
+        seed_staged_kubernetes_workspace_at(&second_stage, &workspace).unwrap();
+
+        // An unseeded workspace, by contrast, refuses to come up empty and
+        // reports what staging hit.
+        let empty = root.path().join("empty-workspace");
+        std::fs::create_dir(&empty).unwrap();
+        let error = seed_staged_kubernetes_workspace_at(&stage, &empty).unwrap_err();
+        assert!(
+            format!("{error}").contains("permission denied"),
+            "the staging failure should say why: {error}"
+        );
+        assert!(
+            !empty
+                .join(KUBERNETES_WORKSPACE_SENTINEL)
+                .try_exists()
+                .unwrap()
+        );
+    }
+
+    /// Both init containers can be restarted by kubelet while the pod's
+    /// `emptyDir` survives, so staging has to tolerate running twice, and a
+    /// half-written tree from a killed attempt.
+    #[test]
+    fn kubernetes_workspace_stage_recovers_from_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let image = root.path().join("image-sandbox");
+        let stage = root.path().join("stage");
+        std::fs::create_dir(&image).unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(image.join("README"), b"workspace").unwrap();
+
+        // A previous attempt died after copying part of the tree.
+        let partial = stage.join(KUBERNETES_WORKSPACE_STAGE_TREE);
+        std::fs::create_dir(&partial).unwrap();
+        std::fs::write(partial.join("README"), b"half").unwrap();
+
+        stage_kubernetes_workspace_at(&image, &stage).unwrap();
+        stage_kubernetes_workspace_at(&image, &stage).unwrap();
+
+        assert_eq!(
+            std::fs::read(partial.join("README")).unwrap(),
+            b"workspace",
+            "a partial tree must be replaced, not merged into"
+        );
+    }
+
+    /// Custom images need not carry a `/sandbox`. The workspace is then empty
+    /// but still marked seeded, so later starts are instant.
+    #[test]
+    fn kubernetes_workspace_stage_handles_an_image_without_a_sandbox() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join("stage");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+
+        stage_kubernetes_workspace_at(&root.path().join("missing"), &stage).unwrap();
+        seed_staged_kubernetes_workspace_at(&stage, &workspace).unwrap();
+
+        assert!(workspace.join(KUBERNETES_WORKSPACE_SENTINEL).is_file());
     }
 
     #[test]

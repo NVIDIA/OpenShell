@@ -6,7 +6,7 @@
 use super::{
     KUBE_API_TIMEOUT, KubernetesComputeDriver, KubernetesDriverError, LABEL_SANDBOX_NAME,
     SANDBOX_POD_NAME_ANNOTATION, SANDBOX_VERSION_V1BETA1, WORKSPACE_INIT_CONTAINER_NAME,
-    accepts_auth_namespace, admission_error, annotation_or_label,
+    WORKSPACE_STAGE_CONTAINER_NAME, accepts_auth_namespace, admission_error, annotation_or_label,
     is_kube_resource_version_conflict, parse_kubernetes_runtime_identity, sandbox_id_from_object,
     sandbox_runtime_bootstrap_in_progress, select_expected_sandbox_runtime,
 };
@@ -477,10 +477,10 @@ fn prepare_update(
         .pointer_mut("/spec/podTemplate/spec/initContainers")
         .and_then(serde_json::Value::as_array_mut)
     {
-        for container in init
-            .iter_mut()
-            .filter(|container| container["name"] == WORKSPACE_INIT_CONTAINER_NAME)
-        {
+        for container in init.iter_mut().filter(|container| {
+            container["name"] == WORKSPACE_INIT_CONTAINER_NAME
+                || container["name"] == WORKSPACE_STAGE_CONTAINER_NAME
+        }) {
             if container["image"].as_str() != Some(expected) {
                 return Err(KubernetesDriverError::Precondition(
                     "Sandbox workspace seed image does not match its workload image".into(),

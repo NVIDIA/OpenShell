@@ -7,7 +7,7 @@ use super::super::{
     ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC, ANNOTATION_SANDBOX_RUNTIME_READINESS,
     KubernetesComputeConfig, LABEL_SANDBOX_ID, LABEL_SANDBOX_WORKSPACE, OperatorNamespaceAllowlist,
     SANDBOX_BOOTSTRAP_CONTAINER_NAME, SANDBOX_BOOTSTRAP_VOLUME_NAME, SANDBOX_GROUP,
-    SANDBOX_VERSION_V1ALPHA1, WORKSPACE_INIT_MOUNT_PATH, WorkspaceMode,
+    SANDBOX_VERSION_V1ALPHA1, WORKSPACE_MOUNT_PATH, WorkspaceMode,
 };
 use super::*;
 use http_body_util::BodyExt as _;
@@ -98,7 +98,7 @@ fn snapshot(version: &str) -> serde_json::Value {
                     ],
                     "initContainers": [
                         {"name":SANDBOX_BOOTSTRAP_CONTAINER_NAME, "image":"trusted-runtime:v3"},
-                        {"name":WORKSPACE_INIT_CONTAINER_NAME, "image":"registry.example/agent:v1", "command":["seed-workspace"], "volumeMounts":[{"name":"workspace", "mountPath":WORKSPACE_INIT_MOUNT_PATH}]},
+                        {"name":WORKSPACE_INIT_CONTAINER_NAME, "image":"registry.example/agent:v1", "command":["seed-workspace"], "volumeMounts":[{"name":"workspace", "mountPath":WORKSPACE_MOUNT_PATH}]},
                         {"name":"operator-init", "image":"registry.example/agent:v1"}
                     ]
                 }

@@ -847,12 +847,15 @@ const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
     SANDBOX_POD_IDENTITY_VOLUME_NAME,
     SANDBOX_PROXY_CA_VOLUME_NAME,
     WORKSPACE_VOLUME_NAME,
+    WORKSPACE_STAGE_VOLUME_NAME,
 ];
 
 const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[
     SERVICE_ACCOUNT_TOKEN_MOUNT_PATH,
     SANDBOX_CONTROL_ROOT,
     SANDBOX_PROXY_CA_MOUNT_PATH,
+    // A caller mount here would decide what the workspace is seeded with.
+    WORKSPACE_STAGE_MOUNT_PATH,
 ];
 
 fn validate_kubernetes_driver_volumes(
@@ -1047,10 +1050,29 @@ const WORKSPACE_VOLUME_NAME: &str = "workspace";
 /// contents into the PVC before the agent starts.
 const WORKSPACE_MOUNT_PATH: &str = "/sandbox";
 
-/// Mount path for the workspace PVC in the **init** container.  A temporary
-/// path so the init container can see the image's original `/sandbox` and
-/// copy it into the PVC.
-const WORKSPACE_INIT_MOUNT_PATH: &str = "/mnt/openshell-workspace";
+/// Volume name of the `emptyDir` that carries the image's `/sandbox` contents
+/// from the staging init container to the one that writes the PVC.
+const WORKSPACE_STAGE_VOLUME_NAME: &str = "workspace-stage";
+
+/// Mount path of the staging `emptyDir`.
+///
+/// Every container that mounts the workspace PVC mounts it at
+/// `WORKSPACE_MOUNT_PATH`, so the image's own `/sandbox` is readable only in a
+/// container that does not mount the PVC at all.  That container copies it
+/// here, and the seeding container copies it on into the PVC.
+const WORKSPACE_STAGE_MOUNT_PATH: &str = "/mnt/openshell-workspace-stage";
+
+/// Name of the init container that copies the image's `/sandbox` into the
+/// staging volume.
+const WORKSPACE_STAGE_CONTAINER_NAME: &str = "workspace-stage";
+
+/// Archive the root-mode staging container writes into the staging volume.
+/// The workload-identity path stages a plain tree instead.
+const WORKSPACE_STAGE_ARCHIVE: &str = "workspace-seed.tar";
+
+/// Marker the root-mode staging container writes once the archive is complete.
+/// Mirrors the one the sandbox binary writes on the workload-identity path.
+const WORKSPACE_STAGE_MARKER: &str = ".openshell-staged";
 
 /// Name of the init container that seeds the workspace PVC.
 const WORKSPACE_INIT_CONTAINER_NAME: &str = "workspace-init";
@@ -7647,7 +7669,8 @@ fn apply_supervisor_sandbox_runtime_boundary(
 ///
 /// This injects:
 ///   1. A volume mount on the agent container at `/sandbox`.
-///   2. An init container (same image) that seeds the PVC with the image's
+///   2. A staging `emptyDir` volume.
+///   3. Two init containers (same image) that seed the PVC with the image's
 ///      original `/sandbox` contents on first use.
 ///
 /// The PVC volume itself is **not** added here — the Sandbox CRD controller
@@ -7655,8 +7678,10 @@ fn apply_supervisor_sandbox_runtime_boundary(
 /// (following the `StatefulSet` convention).  Adding one here would create a
 /// duplicate volume name and fail pod validation.
 ///
-/// The init container mounts the PVC at a temporary path so it can still see
-/// the image's `/sandbox` directory.  It checks for a sentinel file and skips
+/// No container mounts the workspace PVC anywhere but `/sandbox`, because a
+/// VM-isolating sandbox runtime refuses a pod that mounts one PVC at two
+/// paths.  The image's own `/sandbox` therefore reaches the PVC through the
+/// staging volume.  The seeding container checks for a sentinel file and skips
 /// the copy if the PVC was already initialised.
 #[allow(clippy::similar_names)]
 fn apply_workspace_persistence(
@@ -7707,15 +7732,48 @@ fn apply_workspace_persistence(
         }
     }
 
-    // 3. Add the init container that seeds the PVC from the image
+    // 3. Add the staging volume shared by the two seeding init containers.
+    //
+    // A sandbox runtime that puts the pod in its own VM (AWS Nitro Sandboxes
+    // through the `isolated-sandbox` RuntimeClass, for example) refuses a pod
+    // that mounts one PVC at two paths, so the old layout — PVC at
+    // WORKSPACE_INIT_MOUNT_PATH in the init container and at
+    // WORKSPACE_MOUNT_PATH in the agent — could never start there.  Every
+    // container now mounts the workspace PVC at WORKSPACE_MOUNT_PATH or not
+    // at all, which costs us the trick of reading the image's `/sandbox` from
+    // a container that also holds the PVC.  Seeding is split in two instead:
+    //
+    //   workspace-stage  mounts only the staging emptyDir and copies the
+    //                    image's `/sandbox` into it.
+    //   workspace-init   mounts the PVC at `/sandbox` (shadowing the image)
+    //                    plus the stage, and copies the stage across when the
+    //                    sentinel is absent.
+    //
+    // An image volume would skip the second copy, but containerd's
+    // `image-volumes` path does not open inside a Nitro sandbox pod.  Reading
+    // the seed from a second path baked into the image would skip it too, but
+    // would silently stop seeding custom images that only carry `/sandbox`.
+    if let Some(volumes) = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        && !volumes.iter().any(|volume| {
+            volume.get("name").and_then(serde_json::Value::as_str)
+                == Some(WORKSPACE_STAGE_VOLUME_NAME)
+        })
+    {
+        volumes.push(serde_json::json!({
+            "name": WORKSPACE_STAGE_VOLUME_NAME,
+            "emptyDir": {}
+        }));
+    }
+
+    // 4. Add the init containers that seed the PVC from the image
     let init_containers = spec
         .entry("initContainers")
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut();
     if let Some(init_containers) = init_containers {
-        // The init container mounts the PVC at a temp path so it can still
-        // read the image's original /sandbox contents.  It copies them into
-        // the PVC only when the sentinel file is absent.
         //
         // Prefer a tar stream over `cp -a`: some sandbox images contain
         // self-referential symlinks under `/sandbox/.uv`, and GNU cp can
@@ -7729,54 +7787,106 @@ fn apply_workspace_persistence(
         // The inner `[ -d ... ]` guard handles custom images that don't have
         // a /sandbox directory — the copy is skipped but the sentinel is
         // still written so subsequent starts are instant.
+        // The stage runs before the PVC is in the picture, so it reads the
+        // image's `/sandbox` directly. Overwriting an archive left by an
+        // earlier attempt is fine: the pod's emptyDir outlives a restart of
+        // either init container.
+        //
+        // A failed archive leaves the marker absent and still exits cleanly,
+        // because the image's `/sandbox` does not matter to a workspace that
+        // was seeded on an earlier start. The seeding step refuses an
+        // unseeded workspace without the marker, so a first start still fails.
+        let stage_cmd = format!(
+            "if [ -f {WORKSPACE_STAGE_MOUNT_PATH}/{WORKSPACE_STAGE_MARKER} ]; then exit 0; fi; \
+             rm -f {WORKSPACE_STAGE_MOUNT_PATH}/{WORKSPACE_STAGE_ARCHIVE}; \
+             if [ -d {WORKSPACE_MOUNT_PATH} ]; then \
+               (cd {WORKSPACE_MOUNT_PATH} && \
+                 find . -mindepth 1 -maxdepth 1 ! -name {WORKSPACE_SENTINEL} \
+                   -exec tar -cf {WORKSPACE_STAGE_MOUNT_PATH}/{WORKSPACE_STAGE_ARCHIVE} {{}} +) \
+                 || exit 0; \
+             fi; \
+             touch {WORKSPACE_STAGE_MOUNT_PATH}/{WORKSPACE_STAGE_MARKER}"
+        );
         let copy_cmd = format!(
-            "if [ ! -f {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL} ]; then \
-               if [ -d {WORKSPACE_MOUNT_PATH} ]; then \
-                 tmp=$(mktemp) && rm -f \"$tmp\" && \
-                   (cd {WORKSPACE_MOUNT_PATH} && find . -mindepth 1 -maxdepth 1 -exec tar -cf \"$tmp\" {{}} +) && \
-                   if [ -f \"$tmp\" ]; then \
-                     tar -C {WORKSPACE_INIT_MOUNT_PATH} --no-same-owner --no-same-permissions --touch -xf \"$tmp\" && \
-                     rm -f \"$tmp\"; \
-                   fi; \
-               fi && \
-               touch {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL}; \
-             fi"
+            "if [ -f {WORKSPACE_MOUNT_PATH}/{WORKSPACE_SENTINEL} ]; then exit 0; fi; \
+             if [ ! -f {WORKSPACE_STAGE_MOUNT_PATH}/{WORKSPACE_STAGE_MARKER} ]; then \
+               echo 'workspace staging did not complete, so the workspace cannot be seeded' >&2; \
+               exit 1; \
+             fi; \
+             if [ -f {WORKSPACE_STAGE_MOUNT_PATH}/{WORKSPACE_STAGE_ARCHIVE} ]; then \
+               tar -C {WORKSPACE_MOUNT_PATH} --no-same-owner --no-same-permissions --touch \
+                 -xf {WORKSPACE_STAGE_MOUNT_PATH}/{WORKSPACE_STAGE_ARCHIVE}; \
+             fi && \
+             touch {WORKSPACE_MOUNT_PATH}/{WORKSPACE_SENTINEL}"
         );
 
-        let mut init_spec = if let Some((uid, gid)) = workspace_owner {
-            serde_json::json!({
-                "name": WORKSPACE_INIT_CONTAINER_NAME,
-                "image": image,
-                "command": [format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"), "seed-workspace"],
-                "securityContext": {
-                    "runAsUser": uid,
-                    "runAsGroup": gid,
-                    "runAsNonRoot": true,
-                    "readOnlyRootFilesystem": true,
-                    "allowPrivilegeEscalation": false,
-                    "capabilities": {"drop": ["ALL"]}
-                },
-                "volumeMounts": [
-                    {"name": WORKSPACE_VOLUME_NAME, "mountPath": WORKSPACE_INIT_MOUNT_PATH},
-                    {"name": SANDBOX_RUNTIME_VOLUME_NAME, "mountPath": SANDBOX_RUNTIME_MOUNT_PATH, "readOnly": true}
-                ]
-            })
+        let mut seed_specs = if let Some((uid, gid)) = workspace_owner {
+            let security_context = serde_json::json!({
+                "runAsUser": uid,
+                "runAsGroup": gid,
+                "runAsNonRoot": true,
+                "readOnlyRootFilesystem": true,
+                "allowPrivilegeEscalation": false,
+                "capabilities": {"drop": ["ALL"]}
+            });
+            let runtime_mount = serde_json::json!({
+                "name": SANDBOX_RUNTIME_VOLUME_NAME,
+                "mountPath": SANDBOX_RUNTIME_MOUNT_PATH,
+                "readOnly": true
+            });
+            vec![
+                serde_json::json!({
+                    "name": WORKSPACE_STAGE_CONTAINER_NAME,
+                    "image": image,
+                    "command": [format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"), "stage-workspace"],
+                    "securityContext": security_context,
+                    "volumeMounts": [
+                        {"name": WORKSPACE_STAGE_VOLUME_NAME, "mountPath": WORKSPACE_STAGE_MOUNT_PATH},
+                        runtime_mount
+                    ]
+                }),
+                serde_json::json!({
+                    "name": WORKSPACE_INIT_CONTAINER_NAME,
+                    "image": image,
+                    "command": [format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"), "seed-staged-workspace"],
+                    "securityContext": security_context,
+                    "volumeMounts": [
+                        {"name": WORKSPACE_VOLUME_NAME, "mountPath": WORKSPACE_MOUNT_PATH},
+                        {"name": WORKSPACE_STAGE_VOLUME_NAME, "mountPath": WORKSPACE_STAGE_MOUNT_PATH, "readOnly": true},
+                        runtime_mount
+                    ]
+                }),
+            ]
         } else {
-            serde_json::json!({
-                "name": WORKSPACE_INIT_CONTAINER_NAME,
-                "image": image,
-                "command": ["sh", "-c", copy_cmd],
-                "securityContext": {"runAsUser": 0},
-                "volumeMounts": [{
-                    "name": WORKSPACE_VOLUME_NAME,
-                    "mountPath": WORKSPACE_INIT_MOUNT_PATH
-                }]
-            })
+            vec![
+                serde_json::json!({
+                    "name": WORKSPACE_STAGE_CONTAINER_NAME,
+                    "image": image,
+                    "command": ["sh", "-c", stage_cmd],
+                    "securityContext": {"runAsUser": 0},
+                    "volumeMounts": [{
+                        "name": WORKSPACE_STAGE_VOLUME_NAME,
+                        "mountPath": WORKSPACE_STAGE_MOUNT_PATH
+                    }]
+                }),
+                serde_json::json!({
+                    "name": WORKSPACE_INIT_CONTAINER_NAME,
+                    "image": image,
+                    "command": ["sh", "-c", copy_cmd],
+                    "securityContext": {"runAsUser": 0},
+                    "volumeMounts": [
+                        {"name": WORKSPACE_VOLUME_NAME, "mountPath": WORKSPACE_MOUNT_PATH},
+                        {"name": WORKSPACE_STAGE_VOLUME_NAME, "mountPath": WORKSPACE_STAGE_MOUNT_PATH, "readOnly": true}
+                    ]
+                }),
+            ]
         };
-        if let Some(policy) = image_pull_policy {
-            init_spec["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
+        for init_spec in &mut seed_specs {
+            if let Some(policy) = image_pull_policy {
+                init_spec["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
+            }
         }
-        init_containers.push(init_spec);
+        init_containers.extend(seed_specs);
     }
 }
 
@@ -12052,7 +12162,7 @@ mod tests {
             workspace_init["command"],
             serde_json::json!([
                 format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
-                "seed-workspace"
+                "seed-staged-workspace"
             ])
         );
         assert_eq!(workspace_init["securityContext"]["runAsUser"], 1500);
@@ -12511,24 +12621,40 @@ mod tests {
             None,
         );
 
-        // Init container
+        // Init containers: stage the image's /sandbox, then seed the PVC.
         let init_containers = pod_template["spec"]["initContainers"]
             .as_array()
             .expect("initContainers should exist");
-        assert_eq!(init_containers.len(), 1);
-        assert_eq!(init_containers[0]["name"], WORKSPACE_INIT_CONTAINER_NAME);
-        assert_eq!(init_containers[0]["image"], "openshell/sandbox:latest");
-        assert_eq!(init_containers[0]["imagePullPolicy"], "IfNotPresent");
-        // init container always runs as root to handle PVC root directory permissions
-        assert_eq!(init_containers[0]["securityContext"]["runAsUser"], 0);
+        assert_eq!(init_containers.len(), 2);
+        assert_eq!(init_containers[0]["name"], WORKSPACE_STAGE_CONTAINER_NAME);
+        assert_eq!(init_containers[1]["name"], WORKSPACE_INIT_CONTAINER_NAME);
+        for init_container in init_containers {
+            assert_eq!(init_container["image"], "openshell/sandbox:latest");
+            assert_eq!(init_container["imagePullPolicy"], "IfNotPresent");
+            // These run as root to handle PVC root directory permissions.
+            assert_eq!(init_container["securityContext"]["runAsUser"], 0);
+        }
 
-        // Init container mounts PVC at temp path, not /sandbox
-        let init_mounts = init_containers[0]["volumeMounts"]
+        // The stage container does not touch the PVC at all: it reads the
+        // image's own /sandbox, which the PVC would otherwise shadow.
+        let stage_mounts = init_containers[0]["volumeMounts"]
+            .as_array()
+            .expect("stage volumeMounts should exist");
+        assert_eq!(stage_mounts.len(), 1);
+        assert_eq!(stage_mounts[0]["name"], WORKSPACE_STAGE_VOLUME_NAME);
+        assert_eq!(stage_mounts[0]["mountPath"], WORKSPACE_STAGE_MOUNT_PATH);
+
+        // The seeding container mounts the PVC at /sandbox, the same path the
+        // agent uses, plus the stage to read the seed from.
+        let init_mounts = init_containers[1]["volumeMounts"]
             .as_array()
             .expect("init volumeMounts should exist");
-        assert_eq!(init_mounts.len(), 1);
+        assert_eq!(init_mounts.len(), 2);
         assert_eq!(init_mounts[0]["name"], WORKSPACE_VOLUME_NAME);
-        assert_eq!(init_mounts[0]["mountPath"], WORKSPACE_INIT_MOUNT_PATH);
+        assert_eq!(init_mounts[0]["mountPath"], WORKSPACE_MOUNT_PATH);
+        assert_eq!(init_mounts[1]["name"], WORKSPACE_STAGE_VOLUME_NAME);
+        assert_eq!(init_mounts[1]["mountPath"], WORKSPACE_STAGE_MOUNT_PATH);
+        assert_eq!(init_mounts[1]["readOnly"], true);
 
         // Agent container mounts PVC at /sandbox
         let agent_mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
@@ -12550,6 +12676,119 @@ mod tests {
             !has_pvc_vol,
             "apply_workspace_persistence must NOT add a PVC volume (the CRD controller does that)"
         );
+    }
+
+    /// A sandbox runtime that puts the pod in its own VM refuses a pod that
+    /// mounts one PVC at two paths, so no container may mount the workspace
+    /// PVC anywhere but `/sandbox`.
+    #[test]
+    fn workspace_persistence_mounts_the_pvc_only_at_the_agent_path() {
+        for workspace_owner in [None, Some((1234, 5678))] {
+            let mut pod_template = serde_json::json!({
+                "spec": {
+                    "containers": [{"name": "agent", "image": "openshell/sandbox:latest"}]
+                }
+            });
+
+            apply_workspace_persistence(
+                &mut pod_template,
+                "openshell/sandbox:latest",
+                None,
+                Some(1000),
+                workspace_owner,
+            );
+
+            let containers = pod_template["spec"]["containers"]
+                .as_array()
+                .expect("containers should exist")
+                .iter()
+                .chain(
+                    pod_template["spec"]["initContainers"]
+                        .as_array()
+                        .expect("initContainers should exist"),
+                );
+            let mut mounted_in = 0;
+            for container in containers {
+                for mount in container["volumeMounts"].as_array().into_iter().flatten() {
+                    if mount["name"] == WORKSPACE_VOLUME_NAME {
+                        mounted_in += 1;
+                        assert_eq!(
+                            mount["mountPath"], WORKSPACE_MOUNT_PATH,
+                            "container {} mounts the workspace PVC at a second path, which a \
+                             VM-isolating sandbox runtime rejects",
+                            container["name"]
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                mounted_in, 2,
+                "the agent and the seeding init container should both mount the PVC"
+            );
+
+            // The seed reaches the PVC through an emptyDir instead.
+            let volumes = pod_template["spec"]["volumes"]
+                .as_array()
+                .expect("volumes should exist");
+            let stage = volumes
+                .iter()
+                .find(|volume| volume["name"] == WORKSPACE_STAGE_VOLUME_NAME)
+                .expect("staging volume should exist");
+            assert!(stage["emptyDir"].is_object());
+        }
+    }
+
+    /// The workload-identity path runs the sandbox binary rather than a root
+    /// shell, and both of its init containers need the staged binary.
+    #[test]
+    fn workspace_persistence_stages_before_seeding_as_the_workload_identity() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "agent", "image": "openshell/sandbox:latest"}]
+            }
+        });
+
+        apply_workspace_persistence(
+            &mut pod_template,
+            "openshell/sandbox:latest",
+            None,
+            Some(1000),
+            Some((1234, 5678)),
+        );
+
+        let init_containers = pod_template["spec"]["initContainers"]
+            .as_array()
+            .expect("initContainers should exist");
+        assert_eq!(init_containers.len(), 2);
+
+        // Staging must run first: the seeding container reads what it wrote.
+        assert_eq!(init_containers[0]["name"], WORKSPACE_STAGE_CONTAINER_NAME);
+        assert_eq!(init_containers[0]["command"][1], "stage-workspace");
+        assert_eq!(init_containers[1]["name"], WORKSPACE_INIT_CONTAINER_NAME);
+        assert_eq!(init_containers[1]["command"][1], "seed-staged-workspace");
+
+        for init_container in init_containers {
+            assert_eq!(init_container["securityContext"]["runAsUser"], 1234);
+            assert_eq!(init_container["securityContext"]["runAsGroup"], 5678);
+            assert_eq!(init_container["securityContext"]["runAsNonRoot"], true);
+            let mounts = init_container["volumeMounts"]
+                .as_array()
+                .expect("volumeMounts should exist");
+            assert!(
+                mounts
+                    .iter()
+                    .any(|mount| mount["name"] == SANDBOX_RUNTIME_VOLUME_NAME),
+                "{} runs the staged binary and must mount it",
+                init_container["name"]
+            );
+            assert!(
+                mounts
+                    .iter()
+                    .any(|mount| mount["name"] == WORKSPACE_STAGE_VOLUME_NAME),
+                "{} must reach the staging volume",
+                init_container["name"]
+            );
+        }
     }
 
     #[test]
@@ -12599,21 +12838,66 @@ mod tests {
             None,
         );
 
-        let cmd = pod_template["spec"]["initContainers"][0]["command"]
-            .as_array()
-            .expect("command should be an array");
-        let script = cmd[2].as_str().expect("third element should be the script");
+        let script_of = |index: usize| {
+            pod_template["spec"]["initContainers"][index]["command"]
+                .as_array()
+                .expect("command should be an array")[2]
+                .as_str()
+                .expect("third element should be the script")
+                .to_string()
+        };
+
+        // The stage container reads the image's /sandbox, which is also where
+        // the PVC lands in every other container, and archives it.
+        let stage = script_of(0);
+        assert!(
+            stage.contains("find . -mindepth 1 -maxdepth 1"),
+            "stage script must archive sandbox contents without the mount root entry"
+        );
+        assert!(
+            stage.contains(&format!("! -name {WORKSPACE_SENTINEL}")),
+            "an image carrying the sentinel must not mark a half-copied workspace seeded"
+        );
+        assert!(
+            stage.contains(&format!(
+                "tar -cf {WORKSPACE_STAGE_MOUNT_PATH}/{WORKSPACE_STAGE_ARCHIVE}"
+            )),
+            "stage script must write the archive to the staging volume"
+        );
+        assert!(
+            !stage.contains(&format!("{WORKSPACE_MOUNT_PATH}/{WORKSPACE_SENTINEL}")),
+            "the stage container holds the image, not the PVC, so it cannot read the sentinel"
+        );
+        assert!(
+            stage.contains("|| exit 0"),
+            "a failed archive must not stop a sandbox whose workspace is already seeded"
+        );
+        assert!(
+            stage.contains(&format!(
+                "if [ -f {WORKSPACE_STAGE_MOUNT_PATH}/{WORKSPACE_STAGE_MARKER} ]; then exit 0; fi"
+            )),
+            "stage script must skip a stage an earlier attempt already completed"
+        );
+        assert!(
+            stage.contains(&format!(
+                "rm -f {WORKSPACE_STAGE_MOUNT_PATH}/{WORKSPACE_STAGE_ARCHIVE}"
+            )),
+            "stage script must not leave a stale archive behind a stale marker"
+        );
+
+        // The seeding container holds the PVC and decides whether to write.
+        let script = script_of(1);
         assert!(
             script.contains(WORKSPACE_SENTINEL),
             "init script must check for sentinel file"
         );
         assert!(
-            script.contains("tar -C"),
-            "init script must seed image contents with a tar stream"
+            script.contains(WORKSPACE_STAGE_MARKER),
+            "init script must refuse to seed from an incomplete stage"
         );
         assert!(
-            script.contains("find . -mindepth 1 -maxdepth 1"),
-            "init script must archive sandbox contents without the mount root entry"
+            script.contains(&format!("tar -C {WORKSPACE_MOUNT_PATH}")),
+            "init script must extract the staged archive into the PVC"
         );
         assert!(
             script.contains("--no-same-owner")
