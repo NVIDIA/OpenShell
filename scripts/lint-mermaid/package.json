@@ -6,9 +6,9 @@
   "type": "module",
   "dependencies": {
     "jsdom": "^25.0.1",
-    "mermaid": "^11.16.1"
+    "mermaid": "^12.2.0"
   },
   "overrides": {
-    "dompurify": "3.4.15"
+    "dompurify": "3.4.17"
   }
 }

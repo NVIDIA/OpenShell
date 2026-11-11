@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::driver::DEFAULT_SANDBOX_UID;
+use crate::driver::{DEFAULT_SANDBOX_UID, PREPARED_IMAGE_ROOTFS_DIR};
 
 const SANDBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
 const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-supervisor.zst"));
@@ -552,7 +552,7 @@ fn prepare_sandbox_rootfs(
 
     let init_path = rootfs.join("srv/openshell-vm-sandbox-init.sh");
     if let Some(parent) = init_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        create_guest_dir_all(parent)?;
     }
     fs::write(
         &init_path,
@@ -572,7 +572,7 @@ fn prepare_sandbox_rootfs(
     ensure_umoci_binary(rootfs)?;
 
     let opt_dir = rootfs.join("opt/openshell");
-    fs::create_dir_all(&opt_dir).map_err(|e| format!("create {}: {e}", opt_dir.display()))?;
+    create_guest_dir_all(&opt_dir)?;
     fs::write(opt_dir.join(".rootfs-type"), "sandbox\n")
         .map_err(|e| format!("write sandbox rootfs marker: {e}"))?;
     ensure_sandbox_guest_user(rootfs, sandbox_uid, sandbox_gid)?;
@@ -606,7 +606,24 @@ pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
 }
 
 fn create_sandbox_mountpoint(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    create_guest_dir_all(path)?;
+    chmod_guest_dir(path)
+}
+
+/// Like `create_dir_all`, but each directory it makes is 0755 whatever the
+/// umask. The sandbox user must be able to traverse the guest rootfs.
+fn create_guest_dir_all(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        create_guest_dir_all(parent)?;
+    }
+    fs::create_dir(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    chmod_guest_dir(path)
+}
+
+fn chmod_guest_dir(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -614,6 +631,8 @@ fn create_sandbox_mountpoint(path: &Path) -> Result<(), String> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod {}: {e}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -808,6 +827,10 @@ fn debugfs_quote_argument(argument: &str) -> Option<String> {
 /// created them. Reading the matching old lower disk lets the driver preserve
 /// that overlay's real ownership contract during an upgrade.
 pub fn sandbox_guest_user_ids_from_image(image_path: &Path) -> Result<Option<(u32, u32)>, String> {
+    if ext4_image_has_directory(image_path, PREPARED_IMAGE_ROOTFS_DIR)? {
+        let passwd = format!("{PREPARED_IMAGE_ROOTFS_DIR}/etc/passwd");
+        return sandbox_guest_user_ids_from_image_path(image_path, &passwd);
+    }
     sandbox_guest_user_ids_from_image_path(image_path, "/etc/passwd")
 }
 
@@ -1100,7 +1123,7 @@ fn ensure_supervisor_binary(rootfs: &Path) -> Result<(), String> {
         }
     } else {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+            create_guest_dir_all(parent)?;
         }
 
         let sandbox = zstd::decode_all(Cursor::new(SANDBOX))
@@ -1130,7 +1153,7 @@ fn ensure_vm_init_binary(rootfs: &Path) -> Result<(), String> {
         }
     } else {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+            create_guest_dir_all(parent)?;
         }
         let helper = zstd::decode_all(Cursor::new(VM_INIT))
             .map_err(|e| format!("decompress VM guest init helper: {e}"))?;
@@ -1159,7 +1182,7 @@ fn ensure_umoci_binary(rootfs: &Path) -> Result<(), String> {
         }
     } else {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+            create_guest_dir_all(parent)?;
         }
 
         let umoci =
@@ -1332,6 +1355,146 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Runs the shipped guest init's `configure_hosts` against `root`.
+    ///
+    /// The function is cut out of the real script so the test exercises the
+    /// shell that boots the guest rather than a Rust reimplementation of it.
+    fn run_guest_configure_hosts(root: &Path) -> std::process::Output {
+        let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
+        let start = script
+            .find("configure_hosts() {\n")
+            .expect("guest init defines configure_hosts");
+        let tail = &script[start..];
+        let end = tail
+            .find("\n}\n")
+            .expect("configure_hosts closes at column zero")
+            + "\n}\n".len();
+        let program = format!(
+            "set -euo pipefail\n\
+             ts() {{ :; }}\n\
+             root_path() {{ printf '%s%s\\n' \"${{ROOT_PREFIX:-}}\" \"$1\"; }}\n\
+             {}\n\
+             configure_hosts\n",
+            &tail[..end]
+        );
+        Command::new("bash")
+            .arg("-c")
+            .arg(program)
+            .env("ROOT_PREFIX", root)
+            .output()
+            .expect("run configure_hosts")
+    }
+
+    #[test]
+    fn guest_init_populates_missing_or_empty_hosts_and_keeps_image_hosts() {
+        let dir = unique_temp_dir();
+        let etc = dir.join("etc");
+        fs::create_dir_all(&etc).expect("create etc");
+        let hosts = etc.join("hosts");
+        let loopback = "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n";
+
+        // An image that ships no hosts file at all.
+        let output = run_guest_configure_hosts(&dir);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(&hosts).expect("read hosts"), loopback);
+
+        // The usual OCI placeholder: present but empty.
+        fs::write(&hosts, "").expect("write empty hosts");
+        let output = run_guest_configure_hosts(&dir);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(&hosts).expect("read hosts"), loopback);
+
+        // A hosts file authored by the image is not rewritten.
+        let authored = "10.1.2.3 build-host\n";
+        fs::write(&hosts, authored).expect("write authored hosts");
+        let output = run_guest_configure_hosts(&dir);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(&hosts).expect("read hosts"), authored);
+
+        // An image-authored symlink is left alone, and an absolute target
+        // outside the workload root is never written through.
+        let outside = dir.join("outside-hosts");
+        fs::write(&outside, "").expect("write outside hosts");
+        fs::remove_file(&hosts).expect("remove hosts");
+        std::os::unix::fs::symlink(&outside, &hosts).expect("link hosts");
+        let output = run_guest_configure_hosts(&dir);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(&outside).expect("read outside"), "");
+        assert!(
+            fs::symlink_metadata(&hosts)
+                .expect("stat hosts")
+                .file_type()
+                .is_symlink()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_init_boot_path_configures_hosts_after_the_account_and_before_networking() {
+        // The step only helps if the boot function itself calls it, so look at
+        // the lines of `run_post_overlay_setup` rather than anywhere in the file.
+        let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
+        let start = script
+            .find("run_post_overlay_setup() {\n")
+            .expect("guest init defines run_post_overlay_setup");
+        let boot = &script[start..];
+        let network = boot
+            .find("openshell-vm-init prepare-network")
+            .expect("boot function brings up the loopback interface");
+        let lines: Vec<&str> = boot[..network].lines().map(str::trim).collect();
+        let position = |call: &str| lines.iter().position(|line| *line == call);
+        let account = position("reconcile_sandbox_account").expect("account reconciled");
+        let hosts = position("configure_hosts").expect("boot function calls configure_hosts");
+        assert!(
+            account < hosts,
+            "hosts are written after the root is set up"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guest_dirs_are_traversable_under_a_private_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // The umask is process-wide, so the check runs in a child.
+        const DIR: &str = "OPENSHELL_TEST_GUEST_DIR";
+        if let Ok(dir) = std::env::var(DIR) {
+            create_guest_dir_all(&Path::new(&dir).join("opt/openshell/bin")).expect("create dirs");
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let test = "rootfs::tests::guest_dirs_are_traversable_under_a_private_umask";
+        let status = Command::new("sh")
+            .args(["-c", "umask 077; exec \"$0\" --exact \"$1\""])
+            .arg(std::env::current_exe().expect("test binary"))
+            .arg(test)
+            .env(DIR, &dir)
+            .status()
+            .expect("run child");
+        assert!(status.success());
+
+        for path in ["opt", "opt/openshell", "opt/openshell/bin"] {
+            let mode = fs::metadata(dir.join(path)).expect("stat").permissions();
+            assert_eq!(mode.mode() & 0o777, 0o755, "{path}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_init_normalizes_the_overlay_root_before_mounting_it() {
+        // Overlayfs takes the root's owner and mode from upper, which the host
+        // creates under the gateway's umask. A private umask would make / 0700
+        // and unreadable to the sandbox user.
+        let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
+        let position = |needle: &str| script.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let chown = position("chown 0:0 /overlay/upper");
+        let chmod = position("chmod 0755 /overlay/upper");
+        let mount = position("mount -t overlay overlay");
+        assert!(chown < mount && chmod < mount);
     }
 
     #[test]
@@ -1672,5 +1835,57 @@ mod tests {
         )
         .expect("write openshell-vm-init");
         fs::write(rootfs.join("opt/openshell/bin/umoci"), b"umoci").expect("write umoci");
+    }
+
+    #[test]
+    fn sandbox_guest_user_ids_reads_prepared_image_rootfs() {
+        if e2fs_command("debugfs").is_err() {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        fs::create_dir_all(source.join("image-rootfs/etc")).expect("create etc");
+        fs::write(
+            source.join("image-rootfs/etc/passwd"),
+            "sandbox:x:10001:10001::/sandbox:/bin/sh\n",
+        )
+        .expect("write passwd");
+
+        let image = dir.join("prepared.ext4");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create ext4 image");
+
+        assert_eq!(
+            sandbox_guest_user_ids_from_image(&image).expect("read identity"),
+            Some((10001, 10001))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandbox_guest_user_ids_prepared_image_without_sandbox_user_is_none() {
+        if e2fs_command("debugfs").is_err() {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        fs::create_dir_all(source.join("image-rootfs/etc")).expect("create etc");
+        fs::write(
+            source.join("image-rootfs/etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\n",
+        )
+        .expect("write passwd");
+
+        let image = dir.join("prepared.ext4");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create ext4 image");
+
+        assert_eq!(
+            sandbox_guest_user_ids_from_image(&image).expect("read identity"),
+            None
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

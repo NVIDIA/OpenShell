@@ -2,15 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! gRPC transport stack: channel construction and the insecure-TLS connector.
-//!
-//! mTLS is intentionally out of scope here. Gateways that require client
-//! certificates are handled by `openshell-cli`'s legacy path until the auth
-//! method is retired.
 
 use crate::config::{AuthConfig, ClientConfig};
 use crate::edge_tunnel;
 use crate::error::{Result, SdkError};
-use openshell_core::net::set_tcp_nodelay_best_effort;
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
@@ -21,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
 
 /// Standard endpoint settings used by every dialed connection.
@@ -84,7 +79,7 @@ async fn edge_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
 /// | `http://` | (any)  | (any) | plaintext, ignore tls |
 /// | `https://` | `Some(EdgeJwt)` | (any) | tunnel proxy + plaintext to local proxy |
 /// | `https://` | (any) | `true` | `InsecureTlsConnector`, no verification |
-/// | `https://` | `Some(Oidc)` or `None` | `false` | tonic TLS, pin `ca_cert` if set, system roots otherwise |
+/// | `https://` | `Some(Oidc)` or `None` | `false` | tonic TLS, optionally pin `ca_cert` and present `client_identity` |
 pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
     let gateway = &config.gateway;
 
@@ -131,10 +126,16 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
     // is added by the gRPC interceptor at request time, not here —
     // `build_channel` only owns the TLS layer.
 
-    let tls_config = config.ca_cert.as_ref().map_or_else(
+    let mut tls_config = config.ca_cert.as_ref().map_or_else(
         || ClientTlsConfig::new().with_enabled_roots(),
         |ca_cert| ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_cert)),
     );
+    if let Some(identity) = &config.client_identity {
+        tls_config = tls_config.identity(Identity::from_pem(
+            identity.certificate.clone(),
+            identity.private_key.clone(),
+        ));
+    }
     standard_endpoint(gateway.clone())?
         .tls_config(tls_config)
         .map_err(|e| SdkError::tls(format!("{e}")))?
@@ -192,10 +193,11 @@ impl ServerCertVerifier for InsecureServerCertVerifier {
 /// rustls client config that disables server certificate verification.
 ///
 /// Pairs with [`InsecureTlsConnector`] for transports that need to skip
-/// verification (development, debug). Returns `Result` for symmetry with
-/// future verifying variants; the current implementation cannot fail.
+/// verification (development, debug). Returns an error if the selected crypto
+/// provider cannot support the TLS configuration.
 pub fn build_insecure_rustls_config() -> Result<rustls::ClientConfig> {
-    Ok(openshell_crypto::tls::client_builder()
+    Ok(openshell_crypto::tls::try_client_builder()
+        .map_err(|e| SdkError::invalid_config(format!("configure gateway TLS client: {e}")))?
         .dangerous()
         .with_custom_certificate_verifier(std::sync::Arc::new(InsecureServerCertVerifier))
         .with_no_client_auth())
@@ -232,8 +234,7 @@ impl tower::Service<hyper::Uri> for InsecureTlsConnector {
             let host = uri.host().unwrap_or("localhost").to_string();
             let port = uri.port_u16().unwrap_or(443);
             let addr = format!("{host}:{port}");
-            let tcp = tokio::net::TcpStream::connect(addr).await?;
-            set_tcp_nodelay_best_effort(&tcp);
+            let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(addr).await?;
             let server_name = ServerName::try_from(host)?;
             let tls_stream = tls_connector.connect(server_name, tcp).await?;
             Ok(hyper_util::rt::TokioIo::new(tls_stream))

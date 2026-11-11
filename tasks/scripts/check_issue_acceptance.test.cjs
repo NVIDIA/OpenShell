@@ -8,6 +8,7 @@ const checkIssueAcceptance = require('./check_issue_acceptance.cjs');
 async function check({
   permission = 'read', issues = [], body = '', permissionError,
   number = 7, headSha = 'pr-head', pullError, issueError, labelError,
+  author = 'contributor', actor = 'maintainer',
 } = {}) {
   const failures = [];
   const github = {
@@ -17,13 +18,13 @@ async function check({
           assert.equal(pull_number, number);
           if (pullError) throw new Error('PR lookup failed');
           return { data: {
-            number, user: { login: 'contributor' }, head: { sha: headSha }, body,
+            number, user: { login: author }, head: { sha: headSha }, body,
           } };
         },
       },
       repos: {
         getCollaboratorPermissionLevel: async ({ username }) => {
-          assert.equal(username, 'contributor');
+          assert.equal(username, author);
           if (permissionError) throw Object.assign(new Error('lookup failed'), { status: permissionError });
           return { data: { permission } };
         },
@@ -53,12 +54,30 @@ async function check({
     context: {
       repo: { owner: 'NVIDIA', repo: 'OpenShell' },
       payload: { pull_request: { number } },
-      actor: 'maintainer', sha: 'base-commit', serverUrl: 'https://github.com', runId: 42,
+      actor, sha: 'base-commit', serverUrl: 'https://github.com', runId: 42,
     },
     core: { info() {}, setFailed: message => failures.push(message) },
   });
   return failures;
 }
+
+test('Dependabot PRs pass without permission or issue lookups', async () => {
+  assert.deepEqual(await check({
+    author: 'dependabot[bot]', permissionError: 403, issueError: true,
+  }), []);
+});
+
+test('other bots still require an accepted issue', async () => {
+  const failures = await check({ author: 'renovate[bot]' });
+  assert.equal(failures.length, 1);
+  assert.match(failures[0], /must link an issue with state:accepted/);
+});
+
+test('Dependabot triggering another author\'s PR does not bypass acceptance', async () => {
+  const failures = await check({ actor: 'dependabot[bot]' });
+  assert.equal(failures.length, 1);
+  assert.match(failures[0], /must link an issue with state:accepted/);
+});
 
 for (const permission of ['write', 'maintain', 'admin']) {
   test(`${permission} access allows an issue-less PR`, async () => {

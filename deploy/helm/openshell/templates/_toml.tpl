@@ -106,9 +106,14 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{/* The Service and probes own listener ports, so keep runtime listeners aligned. */}}
 {{- $_ := set $gateway "bind_address" (printf "0.0.0.0:%v" .Values.service.port) -}}
 {{- if .Values.service.healthPort -}}{{- $_ := set $gateway "health_bind_address" (printf "0.0.0.0:%v" .Values.service.healthPort) -}}{{- else -}}{{- $_ := unset $gateway "health_bind_address" -}}{{- end -}}
-{{- if .Values.service.metricsPort -}}{{- $_ := set $gateway "metrics_bind_address" (printf "0.0.0.0:%v" .Values.service.metricsPort) -}}{{- else -}}{{- $_ := unset $gateway "metrics_bind_address" -}}{{- end -}}
+{{- if include "openshell.metricsEnabled" . -}}{{- $_ := set $gateway "metrics_bind_address" (printf "0.0.0.0:%v" .Values.service.metricsPort) -}}{{- else -}}{{- $_ := unset $gateway "metrics_bind_address" -}}{{- end -}}
 {{- range $legacyKey, $runtimeKey := dict "logLevel" "log_level" "enableLoopbackServiceHttp" "enable_loopback_service_http" "enableWebsocketTunnel" "enable_websocket_tunnel" "policyValidationFailureMode" "policy_validation_failure_mode" -}}
 {{- if not (hasKey $gateway $runtimeKey) -}}{{- $_ := set $gateway $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
+{{- end -}}
+{{/* An empty hostname format means "unset"; only translate it when set. The
+     discriminator is the gateway installation name, rendered above. */}}
+{{- if and (get $legacyServer "serviceHostnameFormat") (not (hasKey $gateway "service_hostname_format")) -}}
+{{- $_ := set $gateway "service_hostname_format" (get $legacyServer "serviceHostnameFormat") -}}
 {{- end -}}
 {{- if not (hasKey $gateway "compute_driver") -}}{{- $_ := set $gateway "compute_driver" "kubernetes" -}}{{- end -}}
 {{- $serverDnsNames := .Values.pkiInitJob.serverDnsNames | default list -}}
@@ -127,6 +132,9 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- $_ := set $config "openshell.gateway.gateway_jwt" $gatewayJwt -}}
 {{- $kubernetesCompat := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $_ := set $config "openshell.drivers.kubernetes" $kubernetesCompat -}}
+{{/* Runtime children are merged above: do not extend a sealed inline table. */}}
+{{- $_ := unset $config "openshell.drivers.kubernetes.sandbox_runtime" -}}
+{{- $_ := unset $config "openshell.drivers.kubernetes.sandbox_runtime.app_listener" -}}
 {{- $legacyDrivers := get $legacyServer "drivers" | default dict -}}
 {{- $legacyKubernetes := get $legacyDrivers "kubernetes" | default dict -}}
 {{- if hasKey $kubernetesCompat "resource_admission" -}}
@@ -178,7 +186,7 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- if not (hasKey $ocsfConfig "rotation") -}}{{- $rotation := get $legacyOcsf "rotation" | default "daily" -}}{{- if not (has $rotation (list "daily" "never")) -}}{{- fail "server.ocsfLog.rotation must be daily or never" -}}{{- end -}}{{- $_ := set $ocsfConfig "rotation" $rotation -}}{{- end -}}
 {{- if not (hasKey $ocsfConfig "queue_capacity") -}}{{- $queueCapacity := 10000 -}}{{- if and (hasKey $legacyOcsf "queueCapacity") (ne (get $legacyOcsf "queueCapacity") nil) -}}{{- $queueCapacity = get $legacyOcsf "queueCapacity" -}}{{- end -}}{{- if lt (int $queueCapacity) 1 -}}{{- fail "server.ocsfLog.queueCapacity and queueMaxBytes must be positive" -}}{{- end -}}{{- $_ := set $ocsfConfig "queue_capacity" (int $queueCapacity) -}}{{- end -}}
 {{- if not (hasKey $ocsfConfig "queue_max_bytes") -}}{{- $queueMaxBytes := 16777216 -}}{{- if and (hasKey $legacyOcsf "queueMaxBytes") (ne (get $legacyOcsf "queueMaxBytes") nil) -}}{{- $queueMaxBytes = get $legacyOcsf "queueMaxBytes" -}}{{- end -}}{{- if lt (int $queueMaxBytes) 1 -}}{{- fail "server.ocsfLog.queueCapacity and queueMaxBytes must be positive" -}}{{- end -}}{{- $_ := set $ocsfConfig "queue_max_bytes" (int $queueMaxBytes) -}}{{- end -}}
-{{- if not (hasKey $ocsfConfig "schema_version") -}}{{- $schemaVersion := get $legacyOcsf "schemaVersion" | default "" -}}{{- if not (has $schemaVersion (list "" "1.1" "1.3")) -}}{{- fail "server.ocsfLog.schemaVersion must be empty, 1.1, or 1.3" -}}{{- end -}}{{- if $schemaVersion -}}{{- $_ := set $ocsfConfig "schema_version" $schemaVersion -}}{{- end -}}{{- end -}}
+{{- if not (hasKey $ocsfConfig "schema_version") -}}{{- $schemaVersion := get $legacyOcsf "schemaVersion" | default "" -}}{{- if $schemaVersion -}}{{- $_ := set $ocsfConfig "schema_version" (toString $schemaVersion) -}}{{- end -}}{{- end -}}
 {{- if and (eq (get $ocsfConfig "rotation") "daily") (not (hasKey $ocsfConfig "max_files")) -}}{{- $maxFiles := 7 -}}{{- if and (hasKey $legacyOcsf "maxFiles") (ne (get $legacyOcsf "maxFiles") nil) -}}{{- $maxFiles = get $legacyOcsf "maxFiles" -}}{{- end -}}{{- if lt (int $maxFiles) 1 -}}{{- fail "server.ocsfLog.maxFiles must be positive when rotation is daily" -}}{{- end -}}{{- $_ := set $ocsfConfig "max_files" (int $maxFiles) -}}{{- end -}}
 {{- end -}}
 {{- $_ := set $config "openshell.gateway.ocsf_log" $ocsfConfig -}}
@@ -303,6 +311,64 @@ owner: server.*. Override any gatewayConfig copies before serializing TOML. */}}
 {{- $_ := unset $gatewayTls "external_server_names" -}}
 {{- end -}}
 {{- $_ := set $config "openshell.gateway.tls" $gatewayTls -}}
+{{- end -}}
+{{/* The chart owns the shared supervisor pool; see
+openshell.supervisorPoolConfig. */}}
+{{- $supervisorPool := include "openshell.supervisorPoolConfig" . | fromYaml -}}
+{{- if $supervisorPool -}}
+{{- $_ := set $config "openshell.gateway.supervisor_pool" $supervisorPool -}}
+{{- end -}}
+{{/* Additional destination CA trust is chart plumbing: the runtime table is
+owned by the chart, not gatewayConfig. Derive it only from the chart-owned
+operator ConfigMap reference. */}}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
+{{- if get $supervisorNetwork "additionalCaConfigMapName" -}}
+{{- if hasKey $config "openshell.supervisor.network" -}}
+{{- fail "gatewayConfig must not define openshell.supervisor.network; the chart derives it from supervisor.network.additionalCaConfigMapName" -}}
+{{- end -}}
+{{- $_ := set $config "openshell.supervisor.network" (dict "additional_ca_bundle" "/etc/openshell-tls/additional-ca-source/ca.crt") -}}
+{{- end -}}
+{{/* Metrics TLS is opt-in and deliberately uses a separate configuration
+boundary from the gateway listener so its client CA can stay independent. */}}
+{{- $metrics := .Values.metrics | default dict -}}
+{{- $metricsTls := get $metrics "tls" | default dict -}}
+{{- if get $metricsTls "enabled" -}}
+{{- if not (include "openshell.metricsEnabled" .) -}}
+{{- fail "metrics.tls.enabled requires metrics.enabled=true" -}}
+{{- end -}}
+{{- if and (get $metricsTls "requireClientCert") (not (get $metricsTls "clientCaSecretName")) -}}
+{{- fail "metrics.tls.requireClientCert requires metrics.tls.clientCaSecretName" -}}
+{{- end -}}
+{{- $gatewayClientCaSecretName := "" -}}
+{{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" -}}
+{{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) -}}
+{{- $gatewayClientCaSecretName = .Values.server.tls.certSecretName -}}
+{{- else -}}
+{{- $gatewayClientCaSecretName = .Values.server.tls.clientCaSecretName -}}
+{{- end -}}
+{{- end -}}
+{{- if and (get $metricsTls "clientCaSecretName") (eq (get $metricsTls "clientCaSecretName") $gatewayClientCaSecretName) -}}
+{{- fail "metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret" -}}
+{{- end -}}
+{{/* The sandbox client TLS Secret carries the gateway CA (certgen writes
+ca.crt into it), so trusting it as the metrics client CA would grant sandbox
+workloads scraping access even when its name differs from the client CA
+Secret. */}}
+{{- if and (get $metricsTls "clientCaSecretName") (eq (get $metricsTls "clientCaSecretName") .Values.server.tls.clientTlsSecretName) -}}
+{{- fail "metrics.tls.clientCaSecretName must not reuse the gateway client TLS Secret (server.tls.clientTlsSecretName)" -}}
+{{- end -}}
+{{- $metricsTlsConfig := get $config "openshell.gateway.metrics_tls" | default dict -}}
+{{- $_ := set $metricsTlsConfig "cert_path" "/etc/openshell-metrics/server/tls.crt" -}}
+{{- $_ := set $metricsTlsConfig "key_path" "/etc/openshell-metrics/server/tls.key" -}}
+{{- if get $metricsTls "clientCaSecretName" -}}
+{{- $_ := set $metricsTlsConfig "client_ca_path" "/etc/openshell-metrics/client-ca/ca.crt" -}}
+{{- else -}}
+{{- $_ := unset $metricsTlsConfig "client_ca_path" -}}
+{{- end -}}
+{{- $_ := set $metricsTlsConfig "require_client_auth" (get $metricsTls "requireClientCert") -}}
+{{- $_ := set $config "openshell.gateway.metrics_tls" $metricsTlsConfig -}}
+{{- else -}}
+{{- $_ := unset $config "openshell.gateway.metrics_tls" -}}
 {{- end -}}
 {{/* A nested YAML map and its dotted top-level table would serialize to
 conflicting TOML definitions. Fail before rendering an invalid ConfigMap. */}}

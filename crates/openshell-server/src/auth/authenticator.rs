@@ -19,6 +19,8 @@
 //!   gateway session JWTs
 //! - [`super::compute_driver::ComputeDriverAuthenticator`] — driver-native
 //!   sandbox bootstrap credentials (path-scoped to `IssueSandboxToken`)
+//! - [`super::supervisor_token::SupervisorTokenAuthenticator`] — the shared
+//!   supervisor's gateway-minted token for the assignment stream
 //! - [`super::oidc::OidcAuthenticator`] — user OIDC Bearer tokens
 use super::principal::Principal;
 use async_trait::async_trait;
@@ -91,6 +93,23 @@ pub enum AuthFailureReason {
     IdentityProviderUnavailable,
 }
 
+impl AuthFailureReason {
+    /// The category recorded in audit events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingCredential => "missing_credential",
+            Self::ConflictingCredentials => "conflicting_credentials",
+            Self::MalformedCredential => "malformed_credential",
+            Self::InvalidCredential => "invalid_credential",
+            Self::ExpiredCredential => "expired_credential",
+            Self::AudienceOrIssuerMismatch => "audience_or_issuer_mismatch",
+            Self::UnknownIdentity => "unknown_identity",
+            Self::StaleIdentity => "stale_identity",
+            Self::IdentityProviderUnavailable => "identity_provider_unavailable",
+        }
+    }
+}
+
 /// The mechanism a caller attempted to authenticate with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMechanism {
@@ -99,6 +118,26 @@ pub enum AuthMechanism {
     SandboxJwt,
     ComputeDriver,
     GatewayPeer,
+    /// The `CreateSshSession` token an SSH relay presents.
+    SshSessionToken,
+    /// The shared supervisor's gateway-minted supervisor token.
+    SupervisorToken,
+}
+
+impl AuthMechanism {
+    /// A stable label for the mechanism. Audit events record it as the
+    /// protocol, except OIDC, which they record as the OCSF `OpenID` protocol.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mtls => "mtls",
+            Self::Oidc => "oidc",
+            Self::SandboxJwt => "sandbox_jwt",
+            Self::ComputeDriver => "compute_driver",
+            Self::GatewayPeer => "k8s_service_account",
+            Self::SshSessionToken => "ssh_session_token",
+            Self::SupervisorToken => "supervisor_token",
+        }
+    }
 }
 
 /// A rejected authentication attempt: the status returned to the caller and
@@ -235,20 +274,8 @@ pub mod test_support {
 mod tests {
     use super::test_support::MockAuthenticator;
     use super::*;
-    use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::UserPrincipal;
 
-    fn user_principal(subject: &str) -> Principal {
-        Principal::User(UserPrincipal {
-            identity: Identity {
-                subject: subject.to_string(),
-                display_name: None,
-                roles: vec![],
-                scopes: vec![],
-                provider: IdentityProvider::Oidc,
-            },
-        })
-    }
+    use crate::auth::principal::test_support::user;
 
     #[test]
     fn bearer_credential_matches_scheme_case_insensitively() {
@@ -269,10 +296,10 @@ mod tests {
     #[tokio::test]
     async fn chain_returns_first_match() {
         let first = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-            user_principal("alice"),
+            user("alice"),
         ))));
         let second = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-            user_principal("bob"),
+            user("bob"),
         ))));
         let chain = AuthenticatorChain::new(vec![first.clone(), second.clone()]);
         let result = chain
@@ -299,7 +326,7 @@ mod tests {
             Authentication::NotApplicable,
         )));
         let second = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-            user_principal("bob"),
+            user("bob"),
         ))));
         let chain = AuthenticatorChain::new(vec![first.clone(), second.clone()]);
         let result = chain
@@ -324,7 +351,7 @@ mod tests {
             Status::unauthenticated("bad token"),
         ))));
         let second = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-            user_principal("bob"),
+            user("bob"),
         ))));
         let chain = AuthenticatorChain::new(vec![first.clone(), second.clone()]);
         let err = chain
@@ -382,7 +409,7 @@ mod tests {
             peer_decline(),
         ))));
         let second = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-            user_principal("bob"),
+            user("bob"),
         ))));
         let chain = AuthenticatorChain::new(vec![first, second]);
 

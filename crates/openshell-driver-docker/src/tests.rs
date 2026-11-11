@@ -64,7 +64,13 @@ fn test_launch_authentication() -> Vec<u8> {
             sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
             sandbox_expires_at: i64::MAX,
             ssh_host_private_key: None,
+            traces_otlp_headers: None,
             ocsf_otlp_headers: None,
+            agent_otlp_headers: None,
+            otlp_tls: Vec::new(),
+            traces_otlp_tls: None,
+            ocsf_otlp_tls: None,
+            agent_otlp_tls: None,
         },
         gateway_id: "gateway-test".to_string(),
         verification_keys: vec![SessionVerificationKey {
@@ -143,6 +149,21 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
 
     let bootstrap: BoundaryConfig =
         serde_json::from_slice(&fs::read(directory.join(BOUNDARY_CONFIG_FILE)).unwrap()).unwrap();
+    // A restart keeps the original image identity even if the mutable
+    // template reference now names another image in the registry.
+    let sandbox = test_sandbox();
+    let image_env = docker_workload_image_environment(&sandbox, &directory)
+        .await
+        .unwrap();
+    assert!(image_env.contains(&format!(
+        "{}=image-test",
+        openshell_core::sandbox_env::CONTAINER_IMAGE_UID
+    )));
+    assert!(image_env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::CONTAINER_IMAGE,
+        sandbox_image(&sandbox).unwrap()
+    )));
     let descriptor = read_docker_runtime_descriptor(&sandbox_id, &config)
         .await
         .unwrap()
@@ -324,12 +345,11 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
-        supervisor_otlp_endpoint: None,
         supervisor_network_mode: DockerSupervisorNetworkMode::Host,
         supervisor_endpoint_explicit: true,
         bridge_default_endpoint: Some("https://host.docker.internal:8443".to_string()),
         host_gateway_ip: None,
-        supervisor_ocsf_export: None,
+        supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
         supervisor_gateway_name: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
@@ -345,6 +365,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         proxy_ca_bundle: None,
         provider_spiffe_workload_api_socket: None,
         app_armor_profile: Some(AppArmorProfile::Unconfined),
+        network_trust: None,
     }
 }
 
@@ -428,7 +449,7 @@ async fn docker_constructor_rejects_proxy_ca_bundle_without_proxy() {
     config.upstream_proxy.https_proxy = None;
 
     let Err(error) =
-        DockerComputeDriver::new("127.0.0.1:17670".parse().unwrap(), "info", &config).await
+        DockerComputeDriver::new("127.0.0.1:17670".parse().unwrap(), "info", &config, None).await
     else {
         panic!("constructor must reject incoherent proxy CA configuration before Docker I/O");
     };
@@ -1037,6 +1058,7 @@ async fn start_sandbox_span_does_not_capture_launch_authentication() {
             "sandbox",
             "invalid-generation",
             b"secret-launch-authentication",
+            None,
         )
         .with_subscriber(subscriber)
         .await
@@ -1126,7 +1148,8 @@ async fn tracing_direct_start_exports_a_docker_start_span() {
     let driver = test_driver_with_config(runtime_config());
 
     Box::pin(
-        DockerComputeDriver::start_sandbox(&driver, "", "", "", &[]).with_subscriber(subscriber),
+        DockerComputeDriver::start_sandbox(&driver, "", "", "", &[], None)
+            .with_subscriber(subscriber),
     )
     .await
     .expect_err("missing identifier should fail");
@@ -1513,28 +1536,63 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 #[test]
 fn supervisor_otlp_environment_carries_only_configured_signals() {
     use openshell_core::sandbox_env::{
-        GATEWAY_NAME, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
+        GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
+        OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol,
+    };
+    let export = |endpoint: &str, protocol| {
+        Some(OtlpExport {
+            endpoint: endpoint.to_string(),
+            protocol,
+        })
     };
 
     let mut config = runtime_config();
     assert!(supervisor_otlp_environment(&config).is_empty());
 
-    config.supervisor_otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
+    config.supervisor_otlp.traces = export("http://127.0.0.1:4317", OtlpProtocol::Grpc);
     assert_eq!(
         supervisor_otlp_environment(&config),
         [format!("{OTLP_ENDPOINT}=http://127.0.0.1:4317")]
     );
 
-    config.supervisor_otlp_endpoint = None;
-    config.supervisor_ocsf_export = Some(OcsfOtlpExport {
-        endpoint: "http://siem:4317".to_string(),
-        schema_version: Some("1.3".to_string()),
-    });
+    config.supervisor_otlp.traces = export("http://127.0.0.1:4318", OtlpProtocol::HttpProtobuf);
     assert_eq!(
         supervisor_otlp_environment(&config),
         [
-            format!("{OTLP_OCSF_ENDPOINT}=http://siem:4317"),
-            format!("{OTLP_OCSF_SCHEMA_VERSION}=1.3"),
+            format!("{OTLP_ENDPOINT}=http://127.0.0.1:4318"),
+            format!("{OTLP_PROTOCOL}=http/protobuf"),
+        ]
+    );
+
+    config.supervisor_otlp.traces = None;
+    config.supervisor_otlp.ocsf = export("http://siem:4317", OtlpProtocol::Grpc);
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [format!("{OTLP_OCSF_ENDPOINT}=http://siem:4317")]
+    );
+
+    config.supervisor_otlp.ocsf = export("http://siem:4318", OtlpProtocol::HttpProtobuf);
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [
+            format!("{OTLP_OCSF_ENDPOINT}=http://siem:4318"),
+            format!("{OTLP_OCSF_PROTOCOL}=http/protobuf"),
+        ]
+    );
+
+    config.supervisor_otlp.ocsf = None;
+    config.supervisor_otlp.agent = export("http://agents:4317", OtlpProtocol::Grpc);
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [format!("{OTLP_AGENT_ENDPOINT}=http://agents:4317")]
+    );
+
+    config.supervisor_otlp.agent = export("http://agents:4318", OtlpProtocol::HttpProtobuf);
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [
+            format!("{OTLP_AGENT_ENDPOINT}=http://agents:4318"),
+            format!("{OTLP_AGENT_PROTOCOL}=http/protobuf"),
         ]
     );
 
@@ -2056,7 +2114,7 @@ fn build_container_create_body_includes_driver_config_mounts() {
         .mounts
         .expect("driver config mounts should be set");
 
-    assert_eq!(mounts.len(), 3);
+    assert_eq!(mounts.len(), 4);
     assert_eq!(mounts[0].typ, Some(MountTypeEnum::VOLUME));
     assert_eq!(mounts[0].source.as_deref(), Some("work-nfs"));
     assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/work"));
@@ -2579,6 +2637,15 @@ fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
             BOUNDARY_CONFIG_MOUNT_PATH.to_string(),
         ])
     );
+    assert!(
+        create_body
+            .host_config
+            .as_ref()
+            .and_then(|config| config.binds.as_ref())
+            .is_some_and(|binds| binds
+                .iter()
+                .all(|bind| !bind.contains(ADDITIONAL_CA_MOUNT_PATH)))
+    );
     assert_eq!(
         create_body
             .labels
@@ -2601,6 +2668,128 @@ fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
     assert_eq!(host_config.network_mode.as_deref(), Some("none"));
     assert_eq!(host_config.extra_hosts, None);
     assert!(create_body.networking_config.is_none());
+}
+
+#[test]
+fn additional_destination_trust_is_supervisor_only_and_digest_paired() {
+    let dir = TempDir::new().unwrap();
+    let artifact = dir.path().join("normalized-additional-ca.crt");
+    let pem = b"normalized certificate fixture";
+    fs::write(&artifact, pem).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        &artifact,
+        std::os::unix::fs::PermissionsExt::from_mode(0o444),
+    )
+    .unwrap();
+    let bundle = NetworkSupervisorTrustBundle::new(
+        pem.to_vec(),
+        1,
+        "sha256:paired-digest",
+        artifact.clone(),
+    );
+    let mut config = runtime_config();
+    config.network_trust = Some(bundle.clone());
+
+    let workload = build_container_create_body(&test_sandbox(), &config).unwrap();
+    assert!(
+        workload
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+            .is_some()
+    );
+    assert!(
+        workload
+            .cmd
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|argument| argument != "--additional-ca-bundle")
+    );
+    assert!(
+        workload
+            .host_config
+            .as_ref()
+            .and_then(|host| host.mounts.as_ref())
+            .unwrap()
+            .iter()
+            .all(|mount| mount.target.as_deref() != Some(ADDITIONAL_CA_MOUNT_PATH))
+    );
+
+    let args = docker_network_trust_supervisor_args(Some(&bundle));
+    assert!(
+        args.windows(2)
+            .any(|arguments| { arguments == ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH] })
+    );
+    let mount = docker_network_trust_supervisor_mount(&bundle).unwrap();
+    assert_eq!(mount.target.as_deref(), Some(ADDITIONAL_CA_MOUNT_PATH));
+    assert_eq!(mount.source.as_deref(), artifact.to_str());
+    assert_eq!(mount.read_only, Some(true));
+}
+
+#[test]
+fn tampered_additional_destination_trust_fails_closed_without_pem_contents() {
+    let dir = TempDir::new().unwrap();
+    let artifact = dir.path().join("normalized-additional-ca.crt");
+    fs::write(&artifact, b"expected").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        &artifact,
+        std::os::unix::fs::PermissionsExt::from_mode(0o444),
+    )
+    .unwrap();
+    let bundle = NetworkSupervisorTrustBundle::new(
+        b"expected".to_vec(),
+        1,
+        "sha256:expected",
+        artifact.clone(),
+    );
+    fs::remove_file(&artifact).unwrap();
+    fs::write(&artifact, b"BEGIN CERTIFICATE modified secret data").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        &artifact,
+        std::os::unix::fs::PermissionsExt::from_mode(0o444),
+    )
+    .unwrap();
+
+    let error = docker_network_trust_supervisor_mount(&bundle)
+        .expect_err("a changed gateway artifact must fail closed");
+    assert!(error.message().contains("network additional CA artifact"));
+    assert!(!error.message().contains("modified secret data"));
+}
+
+#[test]
+fn user_mount_cannot_replace_network_trust_destination() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("user-ca.crt");
+    fs::write(&source, b"user-controlled fixture").unwrap();
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": source,
+            "target": ADDITIONAL_CA_MOUNT_PATH
+        }]
+    })));
+
+    let error = build_container_create_body(&sandbox, &config)
+        .expect_err("user mount must not mask network trust material");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("reserved OpenShell path"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -3085,6 +3274,38 @@ fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
     );
 }
 
+fn engine_version(name: &str, version: &str) -> SystemVersion {
+    SystemVersion {
+        components: Some(vec![bollard::models::SystemVersionComponents {
+            name: name.to_string(),
+            version: version.to_string(),
+            details: None,
+        }]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn warns_on_docker_engine_older_than_minimum() {
+    let warning = unsupported_docker_engine_warning(&engine_version("Engine", "26.1.5+dfsg1"))
+        .expect("old engine warns");
+    assert!(warning.contains("26.1.5+dfsg1"), "{warning}");
+    assert!(warning.contains("28.0"), "{warning}");
+}
+
+#[test]
+fn no_warning_for_supported_unknown_or_other_engines() {
+    for version in [
+        engine_version("Engine", "28.0.0"),
+        engine_version("Engine", "29.9.3"),
+        engine_version("Engine", "garbage"),
+        engine_version("Other Engine", "5.8.2"),
+        SystemVersion::default(),
+    ] {
+        assert!(unsupported_docker_engine_warning(&version).is_none());
+    }
+}
+
 #[test]
 fn docker_info_reports_wsl2_from_kernel_version() {
     let info = SystemInfo {
@@ -3224,6 +3445,15 @@ fn docker_supervisor_leaves_named_gateway_hosts_to_dns() {
         docker_supervisor_host_address("https://gateway.example.com:17670"),
         None
     );
+}
+
+#[test]
+fn docker_supervisor_healthcheck_probes_fast_only_during_startup() {
+    let health = docker_supervisor_healthcheck();
+
+    assert_eq!(health.start_interval, Some(250_000_000));
+    assert_eq!(health.interval, Some(30_000_000_000));
+    assert_eq!(health.start_period, Some(60_000_000_000));
 }
 
 #[test]

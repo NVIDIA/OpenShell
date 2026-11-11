@@ -3,6 +3,7 @@
 
 //! Supervisor middleware registration and chain execution.
 
+mod binding_policy;
 pub mod headers;
 mod remote;
 mod response;
@@ -37,16 +38,19 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_server::Supervi
 use openshell_core::proto::{
     Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
     MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest, NetworkMiddlewareConfig,
-    RequestContext, SandboxPolicy, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
-    SupervisorMiddlewareService, ValidateConfigRequest, ValidateConfigResponse,
+    RequestContext, SandboxPolicy, SupervisorMiddlewareBinding, SupervisorMiddlewareOperation,
+    SupervisorMiddlewarePhase, SupervisorMiddlewareService, ValidateConfigRequest,
+    ValidateConfigResponse,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
+use binding_policy::BindingPolicy;
 pub use openshell_core::middleware::{
     HttpRequestView, HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
     WebSocketResponseStream,
 };
+
 pub type MiddlewareService =
     dyn SupervisorMiddleware<EvaluateWebSocketSessionStream = WebSocketResponseStream>;
 
@@ -776,7 +780,8 @@ impl Default for MiddlewareRegistry {
 
 /// Validate one external middleware registration without opening its transport.
 pub fn validate_registration_config(registration: &SupervisorMiddlewareService) -> Result<()> {
-    validate_registration(registration).map(|_| ())
+    validate_registration(registration)?;
+    BindingPolicy::try_from(registration).map(|_| ())
 }
 
 fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<Duration> {
@@ -860,14 +865,10 @@ fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<u
         .map_err(|_| miette!("{source} reports a payload limit too large for this platform"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SupportedBinding {
-    HttpPreCredentials,
-    HttpResponsePreReturn,
-    WebSocketPreCredentials,
-}
-
-fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<SupportedBinding> {
+fn supported_binding(
+    source: &str,
+    binding: &MiddlewareBinding,
+) -> Result<SupervisorMiddlewareBinding> {
     match (
         SupervisorMiddlewareOperation::try_from(binding.operation).ok(),
         SupervisorMiddlewarePhase::try_from(binding.phase).ok(),
@@ -875,15 +876,15 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
         (
             Some(SupervisorMiddlewareOperation::HttpRequest),
             Some(SupervisorMiddlewarePhase::PreCredentials),
-        ) => Ok(SupportedBinding::HttpPreCredentials),
+        ) => Ok(SupervisorMiddlewareBinding::HttpRequestPreCredentials),
         (
             Some(SupervisorMiddlewareOperation::HttpResponse),
             Some(SupervisorMiddlewarePhase::PreReturn),
-        ) => Ok(SupportedBinding::HttpResponsePreReturn),
+        ) => Ok(SupervisorMiddlewareBinding::HttpResponsePreReturn),
         (
             Some(SupervisorMiddlewareOperation::WebsocketMessage),
             Some(SupervisorMiddlewarePhase::PreCredentials),
-        ) => Ok(SupportedBinding::WebSocketPreCredentials),
+        ) => Ok(SupervisorMiddlewareBinding::WebsocketMessagePreCredentials),
         (
             Some(SupervisorMiddlewareOperation::WebsocketMessage),
             Some(SupervisorMiddlewarePhase::PreReturn),
@@ -899,38 +900,26 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
 fn validate_manifest_bindings(
     source: &str,
     manifest: &MiddlewareManifest,
-    operator_max_payload_bytes: Option<usize>,
-) -> Result<()> {
+) -> Result<BTreeMap<SupervisorMiddlewareBinding, MiddlewareBinding>> {
     if manifest.bindings.is_empty() {
         return Err(miette!("{source} describes no bindings"));
     }
 
-    let mut described_pairs = HashSet::with_capacity(manifest.bindings.len());
+    let mut bindings = BTreeMap::new();
     for binding in &manifest.bindings {
-        supported_binding(source, binding)?;
-        if !described_pairs.insert((binding.operation, binding.phase)) {
+        let selector = supported_binding(source, binding)?;
+        if bindings.insert(selector, *binding).is_some() {
             return Err(miette!(
                 "{source} describes a duplicate middleware operation/phase pair"
             ));
         }
-        let advertised = validate_payload_limit(source, binding)?;
+        validate_payload_limit(source, binding)?;
         if binding.request_timeout.is_some() {
             middleware_proto_timeout_or_default(binding.request_timeout.as_ref())
                 .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
         }
-        if operator_max_payload_bytes.is_some_and(|limit| limit > advertised) {
-            return Err(miette!(
-                "{source} max_payload_bytes ({}) exceeds the binding capability ({advertised})",
-                operator_max_payload_bytes.expect("operator limit checked above")
-            ));
-        }
-        if operator_max_payload_bytes == Some(0) {
-            return Err(miette!(
-                "{source} must configure max_payload_bytes for every payload-bearing binding"
-            ));
-        }
     }
-    Ok(())
+    Ok(bindings)
 }
 
 fn middleware_proto_timeout_or_default(
@@ -951,23 +940,38 @@ fn middleware_proto_timeout_or_default(
     Ok(timeout)
 }
 
-fn validate_external_manifest(
+/// The cached manifest is the only source of bindings for validation and dispatch.
+/// Store only authorized bindings, both in the gateway and after the supervisor's own Describe.
+fn authorize_external_manifest(
     registration: &SupervisorMiddlewareService,
     manifest: &MiddlewareManifest,
-    operator_max_payload_bytes: usize,
     authenticated: bool,
-) -> Result<()> {
-    validate_manifest_bindings(
-        &format!("external middleware registration '{}'", registration.name),
-        manifest,
-        Some(operator_max_payload_bytes),
-    )?;
+    policy: &BindingPolicy,
+) -> Result<Vec<MiddlewareBinding>> {
+    let source = format!("external middleware registration '{}'", registration.name);
+    let mut bindings = validate_manifest_bindings(&source, manifest)?;
+    policy.authorize(&source, &mut bindings)?;
+    let operator_max_payload_bytes = registration.max_payload_bytes;
+    for binding in bindings.values() {
+        let advertised = binding.max_payload_bytes;
+        if operator_max_payload_bytes > advertised {
+            return Err(miette!(
+                "{source} max_payload_bytes ({operator_max_payload_bytes}) exceeds the binding capability ({advertised})"
+            ));
+        }
+        if operator_max_payload_bytes == 0 {
+            return Err(miette!(
+                "{source} must configure max_payload_bytes for every payload-bearing binding"
+            ));
+        }
+    }
     validate_expected_audience(
         &registration.name,
         &registration.audience,
         &manifest.expected_audience,
         authenticated && !registration.allow_insecure_transport,
-    )
+    )?;
+    Ok(bindings.into_values().collect())
 }
 
 /// After authenticated Describe succeeds, reject a registration whose
@@ -1161,7 +1165,7 @@ impl MiddlewareRegistry {
                     manifest.name
                 ));
             }
-            validate_manifest_bindings(&source, &manifest, None)?;
+            validate_manifest_bindings(&source, &manifest)?;
             negotiated_extensions.push(
                 negotiate(
                     ExtensionFamily::SupervisorMiddleware,
@@ -1188,6 +1192,7 @@ impl MiddlewareRegistry {
 
         for registration in registrations {
             let operator_timeout = validate_registration(&registration)?;
+            let binding_policy = BindingPolicy::try_from(&registration)?;
             if !middleware_names.insert(registration.name.clone()) {
                 return Err(miette!(
                     "duplicate supervisor middleware registration name '{}'",
@@ -1227,7 +1232,7 @@ impl MiddlewareRegistry {
                 )
                 .await?,
             );
-            let manifest = call_with_timeout(operator_timeout, "Describe", service.describe())
+            let mut manifest = call_with_timeout(operator_timeout, "Describe", service.describe())
                 .await
                 .map(tonic::Response::into_inner)
                 .map_err(|error| {
@@ -1237,11 +1242,11 @@ impl MiddlewareRegistry {
                         safe_reason(&error.to_string())
                     )
                 })?;
-            validate_external_manifest(
+            manifest.bindings = authorize_external_manifest(
                 &registration,
                 &manifest,
-                operator_max_payload_bytes,
                 authenticated,
+                &binding_policy,
             )?;
             negotiated_extensions.push(
                 negotiate(
@@ -3556,7 +3561,7 @@ mod tests {
             .next()
             .expect("built-in middleware service");
         let builtin_manifest = builtin_service.describe().await;
-        validate_manifest_bindings("test built-in service", &builtin_manifest, None)
+        validate_manifest_bindings("test built-in service", &builtin_manifest)
             .expect("valid built-in manifest");
         let builtin_name = builtin_manifest.name.clone();
         let builtin_manifest_cell = OnceCell::new();
@@ -3564,7 +3569,7 @@ mod tests {
             .set(builtin_manifest)
             .expect("built-in manifest cache");
 
-        let manifest = service
+        let mut manifest = service
             .describe(Request::new(MiddlewareDescribeRequest {
                 gateway: Some(gateway_metadata(ExtensionFamily::SupervisorMiddleware)),
             }))
@@ -3573,8 +3578,13 @@ mod tests {
             .into_inner();
         let operator_max_payload_bytes = usize::try_from(registration.max_payload_bytes).unwrap();
         let operator_timeout = validate_registration(&registration).expect("valid registration");
-        validate_external_manifest(&registration, &manifest, operator_max_payload_bytes, false)
-            .expect("valid external manifest");
+        manifest.bindings = authorize_external_manifest(
+            &registration,
+            &manifest,
+            false,
+            &BindingPolicy::try_from(&registration).unwrap(),
+        )
+        .expect("valid external manifest");
         let manifest_cell = OnceCell::new();
         manifest_cell.set(manifest).expect("manifest cache");
         let registration_name = registration.name.clone();
@@ -3804,8 +3814,9 @@ mod tests {
                 [],
             )),
         };
-        let error = validate_external_manifest(&registration, &manifest, 4097, false)
-            .expect_err("operator limit must fit capability");
+        let error =
+            authorize_external_manifest(&registration, &manifest, false, &BindingPolicy::Dynamic)
+                .expect_err("operator limit must fit capability");
         assert!(error.to_string().contains("exceeds"));
     }
 
@@ -3837,8 +3848,9 @@ mod tests {
                 [],
             )),
         };
-        let error = validate_external_manifest(&registration, &manifest, 4096, false)
-            .expect_err("extreme advertised payload limit must be rejected");
+        let error =
+            authorize_external_manifest(&registration, &manifest, false, &BindingPolicy::Dynamic)
+                .expect_err("extreme advertised payload limit must be rejected");
         assert!(error.to_string().contains("platform maximum"));
     }
 
@@ -3864,8 +3876,9 @@ mod tests {
             )),
         };
 
-        let error = validate_external_manifest(&registration, &manifest, 4096, false)
-            .expect_err("one service cannot advertise two bindings for the same pair");
+        let error =
+            authorize_external_manifest(&registration, &manifest, false, &BindingPolicy::Dynamic)
+                .expect_err("one service cannot advertise two bindings for the same pair");
         assert!(
             error
                 .to_string()
@@ -3897,7 +3910,7 @@ mod tests {
             )),
         };
 
-        validate_external_manifest(&registration, &manifest, 4096, false)
+        authorize_external_manifest(&registration, &manifest, false, &BindingPolicy::Dynamic)
             .expect("HTTP response pre-return binding is supported");
     }
 
@@ -3921,11 +3934,11 @@ mod tests {
                 [],
             )),
         };
-        validate_manifest_bindings("test WebSocket service", &manifest, None)
+        validate_manifest_bindings("test WebSocket service", &manifest)
             .expect("forward WebSocket binding is supported");
 
         manifest.bindings = vec![binding(SupervisorMiddlewarePhase::PreReturn)];
-        let error = validate_manifest_bindings("test WebSocket service", &manifest, None)
+        let error = validate_manifest_bindings("test WebSocket service", &manifest)
             .expect_err("return-path WebSocket binding is not yet supported");
         assert!(error.to_string().contains("not yet supported"));
     }
@@ -3951,8 +3964,9 @@ mod tests {
             )),
         };
 
-        let error = validate_external_manifest(&registration, &manifest, 0, false)
-            .expect_err("WebSocket bindings require an operator payload ceiling");
+        let error =
+            authorize_external_manifest(&registration, &manifest, false, &BindingPolicy::Dynamic)
+                .expect_err("WebSocket bindings require an operator payload ceiling");
         assert!(
             error
                 .to_string()
@@ -3981,8 +3995,9 @@ mod tests {
             )),
         };
 
-        let error = validate_external_manifest(&registration, &manifest, 4097, false)
-            .expect_err("operator payload limit must fit WebSocket capability");
+        let error =
+            authorize_external_manifest(&registration, &manifest, false, &BindingPolicy::Dynamic)
+                .expect_err("operator payload limit must fit WebSocket capability");
         assert!(error.to_string().contains("exceeds"));
     }
 
@@ -4060,8 +4075,13 @@ mod tests {
                     [],
                 )),
             };
-            let error = validate_external_manifest(&registration, &manifest, 4096, false)
-                .expect_err("out-of-bounds binding timeout must be rejected");
+            let error = authorize_external_manifest(
+                &registration,
+                &manifest,
+                false,
+                &BindingPolicy::Dynamic,
+            )
+            .expect_err("out-of-bounds binding timeout must be rejected");
             assert!(error.to_string().contains("invalid timeout"));
         }
     }

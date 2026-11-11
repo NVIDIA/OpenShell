@@ -61,7 +61,7 @@
 //
 //   - [ErrGatewayNotFound]: no gateway directory found
 //   - [ErrConfigParse]: metadata.json missing or malformed
-//   - [ErrTokenLoad]: token file missing or unreadable
+//   - [ErrTokenLoad]: token file missing, unreadable, malformed, or expired; RPCs report it as Unauthenticated
 //   - [ErrUnsupportedAuthMode]: unrecognized auth_mode value
 //   - [ErrInvalidGatewayName]: name fails validation
 //   - [ErrNoActiveGateway]: no active gateway configured

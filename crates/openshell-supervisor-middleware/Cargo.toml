@@ -21,6 +21,7 @@ prost-types = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["channel", "server", "tls-native-roots"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }

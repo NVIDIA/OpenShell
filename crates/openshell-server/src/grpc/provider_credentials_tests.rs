@@ -722,7 +722,8 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
         MultiplexService, extract_peer_certificate_sha256, extract_peer_identity,
     };
     use openshell_core::proto::{
-        GetCurrentUserRequest, ListWorkspacesRequest, open_shell_client::OpenShellClient,
+        GetCurrentUserRequest, ListSandboxesRequest, ListWorkspacesRequest,
+        open_shell_client::OpenShellClient,
     };
     use tonic::transport::{ClientTlsConfig, Endpoint};
 
@@ -730,6 +731,7 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
     let config = &mut Arc::get_mut(&mut state).unwrap().config;
     config.mtls_auth.operator_enabled = true;
     config.mtls_auth.enabled = false;
+    config.auth.allow_unauthenticated_users = false;
     let dir = tempfile::tempdir().unwrap();
     let (ca, ca_key) = crate::tls_test_utils::generate_test_certs_with_ca(dir.path());
     let acceptor = crate::TlsAcceptor::from_files(
@@ -800,10 +802,17 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
             .await
             .unwrap();
         let mut client = OpenShellClient::new(channel);
+        let sandboxes = client
+            .list_sandboxes(ListSandboxesRequest {
+                workspace_scope: Some(workspace_selector("default")),
+                ..Default::default()
+            })
+            .await;
         let response = client
             .get_provider_credentials(request(&["STATIC_KEY"]))
             .await;
         if role == Some("operator") {
+            sandboxes.unwrap();
             assert_eq!(
                 response.unwrap().into_inner().credentials["STATIC_KEY"].value,
                 "static-secret"
@@ -846,7 +855,8 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
                 Code::Unauthenticated
             );
         } else {
-            assert_eq!(response.unwrap_err().code(), Code::PermissionDenied);
+            assert_eq!(sandboxes.unwrap_err().code(), Code::Unauthenticated);
+            assert_eq!(response.unwrap_err().code(), Code::Unauthenticated);
             let mut spoof = Request::new(request(&["STATIC_KEY"]));
             spoof
                 .metadata_mut()
@@ -857,9 +867,110 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
                     .await
                     .unwrap_err()
                     .code(),
-                Code::PermissionDenied
+                Code::Unauthenticated
             );
         }
     }
     server.abort();
+}
+
+#[tokio::test]
+async fn refresh_publication_stays_with_manual_callers_not_export_or_cancelled_rotations() {
+    let (mut state, mut provider) = fixture().await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .config
+        .config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Push;
+    state
+        .store
+        .put_message(&openshell_core::proto::Workspace {
+            metadata: Some(ObjectMeta {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "other".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    provider.credential_expiration_times.insert(
+        "ACCESS_TOKEN".into(),
+        openshell_core::time::timestamp_from_millis(1).unwrap(),
+    );
+    state.store.put_message(&provider).await.unwrap();
+    let issuer = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"access_token":"refreshed","expires_in":3600})),
+        )
+        .expect(3)
+        .mount(&issuer)
+        .await;
+    refresh_fixture(&state, &provider, issuer.uri()).await;
+    handle(&state, authenticated(request(&["ACCESS_TOKEN"])))
+        .await
+        .unwrap();
+    assert_eq!(
+        state.config_delivery.publications(),
+        0,
+        "export must not publish"
+    );
+
+    let rotation = || {
+        let mut request = Request::new(openshell_core::proto::RotateProviderCredentialRequest {
+            workspace_scope: Some(workspace_selector("other")),
+            provider: "provider".into(),
+            credential_key: "ACCESS_TOKEN".into(),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(operator());
+        request
+    };
+    crate::grpc::provider::handle_rotate_provider_credential(&state, rotation())
+        .await
+        .unwrap();
+    assert_eq!(
+        state.config_delivery.publications(),
+        1,
+        "completed manual RPC publishes once"
+    );
+
+    let (entered, release) = state.credentials.gate_next_store();
+    let caller_state = Arc::clone(&state);
+    let request = rotation();
+    let caller = tokio::spawn(async move {
+        crate::grpc::provider::handle_rotate_provider_credential(&caller_state, request).await
+    });
+    tokio::time::timeout(Duration::from_secs(10), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let refresh = crate::provider_refresh::get_refresh_state(
+                &state.store,
+                "other",
+                provider.object_id(),
+                "ACCESS_TOKEN",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if refresh.status == "refreshed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        state.config_delivery.publications(),
+        1,
+        "detached engine must not publish after RPC cancellation"
+    );
 }

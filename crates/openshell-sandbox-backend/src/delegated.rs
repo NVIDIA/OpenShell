@@ -12,9 +12,7 @@ use openshell_isolation_interface::contract::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::boundary_protocol::{
-    SandboxRuntimeDescriptor, SandboxTlsClientConfig, SandboxTransport,
-};
+use crate::boundary_protocol::{SandboxRuntimeDescriptor, SandboxTlsClientConfig};
 
 /// Delivered by the trusted driver separately from its opaque backend payload.
 /// Endpoint selection belongs to operator configuration, not launch data.
@@ -37,7 +35,7 @@ impl DelegatedLaunch {
     /// Combine driver-owned identity and TLS with the operator-owned endpoint.
     pub fn runtime_descriptor(
         self,
-        transport: SandboxTransport,
+        transport: openshell_core::isolation_registration::SandboxTransport,
     ) -> Result<SandboxRuntimeDescriptor, BackendError> {
         validate_backend_name(&self.backend_name)?;
         let descriptor = SandboxRuntimeDescriptor {
@@ -45,7 +43,7 @@ impl DelegatedLaunch {
             generation: self.generation,
             session_id: self.session_id,
             workload_identity: self.workload_identity,
-            transport,
+            transport: transport.into(),
             tls: self.tls,
             host_gateway_ip: self.host_gateway_ip,
             resource_claims: self.resource_claims,

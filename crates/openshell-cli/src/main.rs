@@ -193,8 +193,9 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
-                        openshell_cli::oidc_auth::oidc_refresh_token(
+                        openshell_cli::oidc_auth::oidc_renew_token(
                             &bundle,
+                            meta.oidc_audience.as_deref(),
                             meta.oidc_scopes.as_deref(),
                             insecure,
                         ),
@@ -1472,6 +1473,10 @@ enum SandboxCommands {
         /// Outside a Git work tree, uploads proceed unfiltered with a warning.
         /// Filtering errors or empty selections stop the upload; use
         /// `--no-git-ignore` to intentionally upload everything.
+        ///
+        /// Cannot be combined with a trailing command, because uploads finish
+        /// after the main process starts. Create the sandbox without a command,
+        /// then run the workload with `sandbox exec`.
         #[arg(
             long,
             value_hint = ValueHint::AnyPath,
@@ -1705,6 +1710,25 @@ enum SandboxCommands {
     /// Start a stopped sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Start {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Suspend a ready sandbox and retain its memory state.
+    ///
+    /// Requires a compute driver and isolation backend that support
+    /// suspend and resume. Use `sandbox resume` to restore the sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Suspend {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Resume a suspended sandbox from its retained memory state.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Resume {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
@@ -2168,8 +2192,8 @@ enum PolicyCommands {
         name: Option<String>,
 
         /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
-        /// Options include allowed-ip=..., credential rewrite flags, and
-        /// allow-uninspected-credentials.
+        /// Options include allowed-ip=..., allow-encoded-slash, credential
+        /// rewrite flags, and allow-uninspected-credentials.
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -2488,6 +2512,10 @@ enum WorkspaceCommands {
         /// Labels to attach to the workspace (KEY=VALUE).
         #[arg(long = "label", value_name = "KEY=VALUE")]
         labels: Vec<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Fetch a workspace by name.
@@ -2496,6 +2524,10 @@ enum WorkspaceCommands {
         /// Workspace name.
         #[arg(add = ArgValueCompleter::new(completers::complete_workspace_names))]
         name: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// List workspaces.
@@ -2752,7 +2784,12 @@ async fn run_async() -> Result<()> {
         // Top-level status
         // -----------------------------------------------------------
         Some(Commands::Status { output }) => {
-            if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+            // A gateway named on the command line must be registered.
+            let resolved = match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                Err(err) if cli.gateway.is_some() => return Err(err),
+                resolved => resolved,
+            };
+            if let Ok(ctx) = resolved {
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
                 run::gateway_status(
@@ -3594,6 +3631,14 @@ async fn run_async() -> Result<()> {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
                         }
+                        SandboxCommands::Suspend { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_suspend(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Resume { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_resume(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             if let Some(editor) = editor.map(Into::into) {
@@ -3827,11 +3872,15 @@ async fn run_async() -> Result<()> {
             apply_auth(&mut tls, &ctx.name)?;
 
             match command {
-                WorkspaceCommands::Create { name, labels } => {
-                    run::workspace_create(endpoint, &name, &labels, &tls).await?;
+                WorkspaceCommands::Create {
+                    name,
+                    labels,
+                    output,
+                } => {
+                    run::workspace_create(endpoint, &name, &labels, output.as_str(), &tls).await?;
                 }
-                WorkspaceCommands::Get { name } => {
-                    run::workspace_get(endpoint, &name, &tls).await?;
+                WorkspaceCommands::Get { name, output } => {
+                    run::workspace_get(endpoint, &name, output.as_str(), &tls).await?;
                 }
                 WorkspaceCommands::List {
                     page_size,
@@ -4879,6 +4928,35 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_upload_conflicts_with_command_and_help_says_so() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--upload",
+            ".",
+            "--",
+            "true",
+        ])
+        .expect_err("--upload with a trailing command should be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let cmd = Cli::command();
+        let create = cmd
+            .find_subcommand("sandbox")
+            .and_then(|c| c.find_subcommand("create"))
+            .expect("missing sandbox create subcommand");
+        let help = create
+            .get_arguments()
+            .find(|a| a.get_id() == "upload")
+            .and_then(|a| a.get_long_help())
+            .expect("--upload has long help")
+            .to_string();
+        assert!(help.contains("Cannot be combined with a trailing command"));
+        assert!(help.contains("sandbox exec"));
+    }
+
+    #[test]
     fn sandbox_create_no_git_ignore_requires_upload() {
         let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--no-git-ignore"]);
         assert!(
@@ -5506,6 +5584,38 @@ mod tests {
             Some(Commands::Sandbox {
                 command: Some(SandboxCommands::Start { name: None }),
             })
+        ));
+    }
+
+    #[test]
+    fn sandbox_suspend_and_resume_accept_optional_names() {
+        let suspend = Cli::try_parse_from(["openshell", "sandbox", "suspend", "demo"])
+            .expect("suspend command should parse");
+        assert!(matches!(
+            suspend.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Suspend { name: Some(ref name) }),
+            }) if name == "demo"
+        ));
+
+        let resume = Cli::try_parse_from(["openshell", "sandbox", "resume"])
+            .expect("resume command should parse");
+        assert!(matches!(
+            resume.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Resume { name: None }),
+            })
+        ));
+
+        let named = Cli::try_parse_from(["openshell", "sandbox", "resume", "demo"])
+            .expect("named resume should parse");
+        assert!(matches!(
+            named.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Resume {
+                    name: Some(ref name),
+                }),
+            }) if name == "demo"
         ));
     }
 
@@ -6661,6 +6771,35 @@ mod tests {
                 assert!(all_workspaces);
             }
             other => panic!("expected SandboxTemplateCommands::List, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_create_and_get_accept_output_format() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "workspace",
+            "create",
+            "--name",
+            "team-ml",
+            "--output",
+            "json",
+        ])
+        .expect("workspace create --output should parse");
+        match cli.command {
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Create { output, .. }),
+            }) => assert_eq!(output.as_str(), "json"),
+            other => panic!("expected workspace create, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "workspace", "get", "team-ml", "-o", "yaml"])
+            .expect("workspace get -o should parse");
+        match cli.command {
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Get { output, .. }),
+            }) => assert_eq!(output.as_str(), "yaml"),
+            other => panic!("expected workspace get, got {other:?}"),
         }
     }
 

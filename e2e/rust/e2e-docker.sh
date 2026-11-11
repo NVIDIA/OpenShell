@@ -18,6 +18,11 @@ RUN_WITH_GATEWAY_COMMAND="__openshell_run_docker_e2e"
 # shellcheck source=e2e/support/conformance.sh
 source "${ROOT}/e2e/support/conformance.sh"
 
+if [ "${E2E_TEST}" = "additional_ca" ]; then
+  export OPENSHELL_E2E_ADDITIONAL_CA=1
+  E2E_FEATURES="${E2E_FEATURES},e2e-additional-ca"
+fi
+
 run_e2e() {
   e2e_run_openshell_conformance "Docker"
 
@@ -49,9 +54,9 @@ if [ "${1:-}" = "${RUN_WITH_GATEWAY_COMMAND}" ]; then
   exit 0
 fi
 
-if [ "${E2E_FEATURES}" != "e2e-conformance-only" ]; then
-  CONTAINER_ENGINE=docker bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
-fi
+# The conformance suite runs on every lane, including e2e-conformance-only,
+# and creates sandboxes from this image (testkit::python_image()).
+CONTAINER_ENGINE=docker bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
 
 exec "${ROOT}/e2e/with-docker-gateway.sh" \
   bash "${BASH_SOURCE[0]}" "${RUN_WITH_GATEWAY_COMMAND}"

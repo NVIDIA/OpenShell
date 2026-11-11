@@ -1,0 +1,223 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install OpenShell on K3s
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Install OpenShell CLI
+      ansible.builtin.copy:
+        src: "{{ openshell_cli_binary }}"
+        dest: /usr/local/bin/openshell
+        mode: "0755"
+
+    - name: Create OpenShell artifact directory
+      ansible.builtin.file:
+        path: /var/lib/openshell/artifacts
+        state: directory
+        mode: "0700"
+
+    - name: Copy OpenShell images
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "/var/lib/openshell/artifacts/{{ item.name }}.tar"
+        mode: "0600"
+      loop:
+        - name: gateway
+          src: "{{ openshell_gateway_image }}"
+        - name: sandbox
+          src: "{{ openshell_sandbox_image }}"
+        - name: supervisor
+          src: "{{ openshell_supervisor_image }}"
+        # The testkit's python_image() sandbox workload.
+        - name: e2e-python
+          src: "{{ openshell_e2e_python_image }}"
+
+    - name: Import OpenShell images into K3s
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - ctr
+          - --namespace
+          - k8s.io
+          - images
+          - import
+          - "/var/lib/openshell/artifacts/{{ item }}.tar"
+      loop:
+        - gateway
+        - sandbox
+        - supervisor
+        - e2e-python
+
+    - name: Copy OpenShell Helm chart
+      ansible.builtin.copy:
+        src: "{{ openshell_helm_chart }}"
+        dest: /var/lib/openshell/artifacts/helm-chart.tgz
+        mode: "0600"
+
+    # Tests run in the guest, so host.openshell.internal must resolve to the
+    # node itself. A tmachine environment is one VM, so the cluster has one
+    # node; the check below fails if that stops being true, because then the
+    # address must be the one of the node the tests run on. QEMU user
+    # networking gives every boot the same guest address (10.0.2.15), so the
+    # value stays valid when the disk is reused.
+    # The node can also list an IPv6 address after it, so take the IPv4 one.
+    - name: Discover the K3s node address
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - --request-timeout=10s
+          - get
+          - nodes
+          - --output=jsonpath={.items[0].status.addresses[?(@.type=="InternalIP")].address}
+      register: k3s_node_address
+      changed_when: false
+      until: >-
+        k3s_node_address.rc == 0
+        and k3s_node_address.stdout.split() | select('match', '^[0-9.]+$') | list | length > 0
+      retries: 30
+      delay: 2
+
+    - name: Check the K3s cluster has a single node
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s, kubectl, --request-timeout=10s, get, nodes, --output=name]
+      register: k3s_nodes
+      changed_when: false
+      failed_when: k3s_nodes.rc != 0 or k3s_nodes.stdout_lines | length != 1
+
+    - name: Select the K3s node IPv4 address
+      ansible.builtin.set_fact:
+        k3s_node_ipv4: "{{ k3s_node_address.stdout.split() | select('match', '^[0-9.]+$') | first }}"
+
+    - name: Write OpenShell Helm values
+      ansible.builtin.copy:
+        dest: /var/lib/openshell/artifacts/values.yaml
+        mode: "0600"
+        content: |
+          global:
+            image:
+              registry: ""
+          gateway:
+            image:
+              repository: openshell/gateway
+              tag: tmachine
+              pullPolicy: Never
+          sandboxRuntime:
+            image:
+              repository: openshell/sandbox
+              tag: tmachine
+              pullPolicy: never
+          supervisor:
+            image:
+              repository: openshell/supervisor
+              tag: tmachine
+              pullPolicy: never
+          networkPolicy:
+            enabled: true
+          server:
+            auth:
+              allowUnauthenticatedUsers: true
+            disableTls: true
+            hostGatewayIP: "{{ k3s_node_ipv4 }}"
+            telemetryEnabled: false
+
+    - name: Write OpenShell Helm values overlay
+      ansible.builtin.copy:
+        dest: /var/lib/openshell/artifacts/values-overlay.yaml
+        mode: "0600"
+        content: "{{ openshell_k3s_helm_values_overlay | default('{}') }}"
+
+    - name: Install Agent Sandbox
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - apply
+          - --filename
+          - "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v{{ agent_sandbox_version }}/manifest.yaml"
+
+    - name: Wait for Agent Sandbox CRD
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - wait
+          - --for=condition=Established
+          - crd/sandboxes.agents.x-k8s.io
+          - --timeout=120s
+      changed_when: false
+
+    - name: Wait for Agent Sandbox controller
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - --namespace
+          - agent-sandbox-system
+          - rollout
+          - status
+          - deployment/agent-sandbox-controller
+          - --timeout=300s
+      changed_when: false
+
+    - name: Install OpenShell Helm chart
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/helm
+          - install
+          - openshell
+          - /var/lib/openshell/artifacts/helm-chart.tgz
+          - --namespace
+          - openshell
+          - --create-namespace
+          - --values
+          - /var/lib/openshell/artifacts/values.yaml
+          - --values
+          - /var/lib/openshell/artifacts/values-overlay.yaml
+          - --wait
+          - --timeout=5m
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Discover the gateway ClusterIP and gRPC port
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - --request-timeout=10s
+          - --namespace
+          - openshell
+          - get
+          - service
+          - openshell
+          - --output=jsonpath={.spec.clusterIP}:{.spec.ports[?(@.name=="grpc")].port}
+      register: k3s_gateway_address
+      changed_when: false
+
+    # Rejects headless Services (ClusterIP "None") and a missing grpc port.
+    - name: Require a gateway Service address
+      ansible.builtin.assert:
+        that:
+          - k3s_gateway_address.stdout is match('^[0-9.]+:[0-9]+$')
+        fail_msg: "Unexpected gateway Service address: {{ k3s_gateway_address.stdout }}"
+
+    # Deployment readiness doesn't establish that the controller reconciles
+    # Sandboxes. This checks the installed cluster; a booted guest restarts the
+    # controller, so the test runner checks again after it boots
+    # (tests/runner/src/wait-k3s-controller.sh). Tests don't wait.
+    - name: Verify Agent Sandbox reconciliation
+      ansible.builtin.include_tasks: k3s-controller-ready.yaml
+
+- name: Register OpenShell gateway for test client
+  hosts: all
+  gather_facts: false
+  vars:
+    openshell_client_gateway_endpoint: "http://{{ k3s_gateway_address.stdout }}"
+  roles:
+    - openshell_client

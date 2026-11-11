@@ -7,6 +7,13 @@ REST API over a Unix socket. Each sandbox has two independent containers:
 - `openshell-supervisor` evaluates policy, holds gateway credentials, and
   proxies approved egress in a separate companion container.
 
+New containers dial the supervisor over a separate private Unix socket volume
+at `/.openshell/channel/control/control.sock`; workload networking remains
+`none`. The supervisor's bootstrap-key mount stays read-only. Restart metadata
+records the direction, with missing metadata retaining the legacy runtime
+listener. Deploy matching supervisor and sandbox runtime binaries for new
+containers.
+
 The driver provisions placement, identity, credentials, transport, and lifecycle.
 The shared isolation interface supplies exec, attach, signal, terminate, binary
 identity, DNS, TCP, and loopback-forwarding semantics.
@@ -124,6 +131,9 @@ the consumed sandbox bootstrap from a copy in the supervisor's private
 filesystem, verifies the fence, and starts the same pair. A failed supervisor
 start stops the workload. Delete removes the companion first, then the workload,
 channel, workspace, and driver-owned secrets. User-owned volumes are retained.
+Delete keeps a channel, control, or workspace volume whose
+`openshell.ai/sandbox-id` label is missing or names another sandbox, and logs a
+warning.
 
 Only workload containers appear in sandbox list/watch results. Readiness uses
 the supervisor's private health socket; there is no shell, legacy marker, or
@@ -149,3 +159,8 @@ authenticated health signal.
 
 Gateway OTLP configuration continues to export compute-driver spans under the
 `openshell-driver-podman` service, preserving gateway trace context.
+When `[openshell.gateway.otlp.agent]` is enabled, the driver sets
+`OPENSHELL_OTLP_AGENT_ENDPOINT` on the supervisor container, plus
+`OPENSHELL_OTLP_AGENT_PROTOCOL` for a non-gRPC collector, which starts the
+agent trace relay. On Podman Machine it rewrites a loopback agent endpoint to
+the desktop host, as it does for the supervisor's trace endpoint.

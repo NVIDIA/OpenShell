@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::auth::audit::test_support::{assert_boundary_finding, assert_origin, audited};
 use crate::grpc::test_support::{authed_request, test_server_state};
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::open_shell_server::OpenShell;
@@ -1030,4 +1031,93 @@ async fn restart_after_effect_without_success_persistence_never_reexecutes() {
             .unwrap(),
         original
     );
+}
+
+#[tokio::test]
+async fn sandbox_request_with_a_request_id_records_the_denial() {
+    let state = test_server_state().await;
+    let mut request = Request::new(openshell_core::proto::UpdateConfigRequest {
+        global: true,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        ..Default::default()
+    });
+    request
+        .extensions_mut()
+        .insert(crate::auth::principal::test_support::sandbox("sb-a"));
+    let capture = openshell_ocsf::test_support::OcsfCapture::default();
+    let _guard = capture.install();
+
+    let err = run(&state, request).await.unwrap_err();
+
+    assert_eq!(err.code(), Code::PermissionDenied);
+    let events = capture.json_events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0]["status_detail"], "method_not_permitted");
+    assert_eq!(events[0]["actor"]["user"]["type"], "Sandbox");
+    assert_boundary_finding(&events[0], &events[1]);
+}
+
+/// Refuses its caller from inside the admission worker, as a handler whose
+/// authorization changed after admission would.
+#[derive(Clone, PartialEq, Message)]
+struct DeniedInWorker {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(string, tag = "3")]
+    request_id: String,
+}
+
+impl Mutation for DeniedInWorker {
+    type Output = CreateWorkspaceResponse;
+    const METHOD: &'static str = "CreateWorkspace";
+    fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    async fn authorize(&self, state: &ServerState, principal: &Principal) -> Result<Scope, Status> {
+        CreateWorkspaceRequest {
+            name: self.name.clone(),
+            ..Default::default()
+        }
+        .authorize(state, principal)
+        .await
+    }
+    async fn execute(
+        _state: &Arc<ServerState>,
+        request: Request<Self>,
+    ) -> Result<Response<Self::Output>, Status> {
+        let principal = request.extensions().get::<Principal>().unwrap();
+        Err(crate::auth::audit::deny(
+            principal,
+            crate::auth::audit::AuthzDenial::PlatformAdminRequired,
+            "membership revoked",
+        ))
+    }
+    fn capture(response: &Response<Self::Output>) -> Result<Success, Status> {
+        resource_success(response.get_ref().workspace.as_ref())
+    }
+    async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status> {
+        Ok(CreateWorkspaceResponse {
+            workspace: Some(restore_resource(store, success).await?),
+        })
+    }
+}
+
+#[tokio::test]
+async fn denial_in_the_admission_worker_keeps_the_request_context() {
+    let state = test_server_state().await;
+    let request = authed_request(DeniedInWorker {
+        name: "worker-denial".to_string(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+    });
+
+    let (result, events) = audited(
+        "/openshell.v1.OpenShell/CreateWorkspace",
+        run(&state, request),
+    )
+    .await;
+
+    assert_eq!(result.unwrap_err().code(), Code::PermissionDenied);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["api"]["operation"], "CreateWorkspace");
+    assert_origin(&events[0]);
 }

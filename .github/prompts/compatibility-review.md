@@ -143,6 +143,17 @@ state/migration compatibility. A surface can be marked reviewed without findings
 when inspection establishes that its public contract was not affected; naming
 every surface is not itself evidence of coverage.
 
+The `cli` surface includes the `openshell`, `openshell-gateway`, and
+`openshell-supervisor` CLIs. Compare flags and arguments accepted by every
+changed executable, including helper binaries launched by compute drivers or
+other extensions. Trace their callers at both revisions and check launch
+environment and standard-stream requirements when a flag changes. A hidden flag
+used by an external consumer can be a compatibility contract; do not dismiss it
+solely because it is hidden or used by a built-in driver. Report the old
+invocation, the new invocation, and the failure an existing external consumer
+would see. Do not treat an unused internal flag as public without evidence of an
+affected consumer.
+
 ## Findings and coverage
 
 For each concrete or uncertain incompatibility, state the surface, old versus

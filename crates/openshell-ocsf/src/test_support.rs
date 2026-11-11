@@ -40,6 +40,19 @@ impl OcsfCapture {
     pub fn events(&self) -> Vec<OcsfEvent> {
         self.0.lock().expect("capture lock").clone()
     }
+
+    /// Events captured so far, as their exported JSON.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an event does not serialize.
+    #[must_use]
+    pub fn json_events(&self) -> Vec<serde_json::Value> {
+        self.events()
+            .iter()
+            .map(|event| event.to_json().expect("serialize OCSF event"))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -68,5 +81,6 @@ mod tests {
         let events = capture.events();
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0].base().message.as_deref(), Some("captured"));
+        assert_eq!(capture.json_events()[0]["message"], "captured");
     }
 }

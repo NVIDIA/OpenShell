@@ -16,7 +16,7 @@ use notify::{Event, RecursiveMode, Watcher};
 use openshell_core::{Error, Result};
 use openshell_ocsf::{ConfigStateChangeBuilder, EventContext, SeverityId, StateId, StatusId};
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use tokio::sync::{mpsc, watch};
@@ -97,6 +97,10 @@ impl TlsAcceptor {
     /// Returns `Ok(())` when the new config was built and swapped successfully.
     /// Returns `Err(...)` if cert/key loading fails — the old config is preserved.
     pub fn reload(&self) -> Result<()> {
+        self.reload_for_listener("gateway")
+    }
+
+    fn reload_for_listener(&self, listener: &str) -> Result<()> {
         let new_config = build_server_config(
             &self.cert_path,
             &self.key_path,
@@ -112,7 +116,9 @@ impl TlsAcceptor {
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
             .state(StateId::Enabled, "reloaded")
-            .message("TLS certificate config reloaded successfully")
+            .message(format!(
+                "{listener} TLS certificate config reloaded successfully"
+            ))
             .build();
         openshell_ocsf::ocsf_emit!(event);
 
@@ -140,10 +146,25 @@ impl TlsAcceptor {
     /// tasks.
     pub fn spawn_reload_worker(
         &self,
+        shutdown: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        self.spawn_reload_worker_for_listener(shutdown, "gateway")
+    }
+
+    /// Spawn a certificate reload worker identified by the listener it serves.
+    ///
+    /// This is used when a process owns more than one TLS listener, so reload
+    /// logs and OCSF events identify the certificate trust boundary affected.
+    pub fn spawn_reload_worker_for_listener(
+        &self,
         mut shutdown: watch::Receiver<bool>,
+        listener: &'static str,
     ) -> tokio::task::JoinHandle<()> {
         if self.reload_spawned.swap(true, Ordering::Relaxed) {
-            warn!("TLS certificate reload worker already spawned, ignoring duplicate call");
+            warn!(
+                listener,
+                "TLS certificate reload worker already spawned, ignoring duplicate call"
+            );
             return tokio::spawn(async {});
         }
 
@@ -193,19 +214,19 @@ impl TlsAcceptor {
             ) {
                 Ok(w) => w,
                 Err(e) => {
-                    warn!(error = %e, "Failed to start TLS cert file watcher, hot-reload disabled");
+                    warn!(listener, error = %e, "Failed to start TLS cert file watcher, hot-reload disabled");
                     return;
                 }
             };
 
             for dir in &dirs {
                 if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
-                    warn!(error = %e, dir = %dir.display(), "Failed to watch TLS cert directory, hot-reload disabled");
+                    warn!(listener, error = %e, dir = %dir.display(), "Failed to watch TLS cert directory, hot-reload disabled");
                     return;
                 }
             }
 
-            info!(?dirs, "TLS certificate file watcher started");
+            info!(listener, ?dirs, "TLS certificate file watcher started");
 
             // Event loop with manual debounce.
             // When the watcher fires, we drain any follow-up events that
@@ -222,7 +243,10 @@ impl TlsAcceptor {
                 };
 
                 if !got_event {
-                    warn!("TLS cert file watcher disconnected, hot-reload stopping");
+                    warn!(
+                        listener,
+                        "TLS cert file watcher disconnected, hot-reload stopping"
+                    );
                     break 'outer;
                 }
 
@@ -231,17 +255,17 @@ impl TlsAcceptor {
                     tokio::select! {
                         () = tokio::time::sleep(debounce) => {
                             // Debounce window elapsed — reload now.
-                            if let Err(e) = this.reload() {
+                            if let Err(e) = this.reload_for_listener(listener) {
                                 let event = ConfigStateChangeBuilder::new(&tls_ocsf_ctx())
                                     .severity(SeverityId::Medium)
                                     .status(StatusId::Failure)
                                     .state(StateId::Enabled, "reload_failed")
                                     .message(format!(
-                                        "TLS certificate reload failed: {e}"
+                                        "{listener} TLS certificate reload failed: {e}"
                                     ))
                                     .build();
                                 openshell_ocsf::ocsf_emit!(event);
-                                warn!(error = %e, "TLS certificate reload failed, keeping existing config");
+                                warn!(listener, error = %e, "TLS certificate reload failed, keeping existing config");
                             }
                             break;
                         }
@@ -250,11 +274,11 @@ impl TlsAcceptor {
                                 // Another event arrived — reset debounce.
                                 continue;
                             }
-                            warn!("TLS cert file watcher disconnected, hot-reload stopping");
+                            warn!(listener, "TLS cert file watcher disconnected, hot-reload stopping");
                             break 'outer;
                         }
                         _ = shutdown.changed() => {
-                            debug!("TLS certificate reload worker stopped");
+                            debug!(listener, "TLS certificate reload worker stopped");
                             break 'outer;
                         }
                     }
@@ -408,7 +432,9 @@ fn build_server_config(
         .build()
         .map_err(|e| Error::tls(format!("failed to build client verifier: {e}")))?;
 
-        let builder = openshell_crypto::tls::server_builder().with_client_cert_verifier(verifier);
+        let builder = openshell_crypto::tls::try_server_builder()
+            .map_err(|e| Error::tls(format!("configure gateway TLS server: {e}")))?
+            .with_client_cert_verifier(verifier);
         if let Some(resolver) = resolver {
             builder.with_cert_resolver(resolver)
         } else {
@@ -417,7 +443,9 @@ fn build_server_config(
                 .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
         }
     } else {
-        let builder = openshell_crypto::tls::server_builder().with_no_client_auth();
+        let builder = openshell_crypto::tls::try_server_builder()
+            .map_err(|e| Error::tls(format!("configure gateway TLS server: {e}")))?
+            .with_no_client_auth();
         if let Some(resolver) = resolver {
             builder.with_cert_resolver(resolver)
         } else {
@@ -440,7 +468,7 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         File::open(path).map_err(|e| Error::tls(format!("failed to open cert file: {e}")))?;
     let mut reader = BufReader::new(file);
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+    let certs: Vec<_> = CertificateDer::pem_reader_iter(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::tls(format!("failed to parse certificates: {e}")))?;
 
@@ -456,20 +484,11 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(path).map_err(|e| Error::tls(format!("failed to open key file: {e}")))?;
     let mut reader = BufReader::new(file);
 
-    loop {
-        let item = rustls_pemfile::read_one(&mut reader)
-            .map_err(|e| Error::tls(format!("failed to parse key file: {e}")))?;
-
-        match item {
-            Some(rustls_pemfile::Item::Pkcs1Key(key)) => return Ok(key.into()),
-            Some(rustls_pemfile::Item::Pkcs8Key(key)) => return Ok(key.into()),
-            Some(rustls_pemfile::Item::Sec1Key(key)) => return Ok(key.into()),
-            None => break,
-            _ => {}
-        }
-    }
-
-    Err(Error::tls("no private key found in file"))
+    PrivateKeyDer::pem_reader_iter(&mut reader)
+        .next()
+        .transpose()
+        .map_err(|e| Error::tls(format!("failed to parse key file: {e}")))?
+        .ok_or_else(|| Error::tls("no private key found in file"))
 }
 
 /// Build an OCSF context for gateway-level (non-sandbox) events.
@@ -658,7 +677,7 @@ mod tests {
             let addr = listen_addr;
             client_handles.push(tokio::spawn(async move {
                 for _ in 0..cycles_per_client {
-                    let tcp = TcpStream::connect(addr)
+                    let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
                         .await
                         .expect("client connect failed");
                     let _tls = connector
@@ -728,7 +747,9 @@ mod tests {
                 .await
                 .expect("TLS accept failed");
         });
-        let tcp_1 = TcpStream::connect(addr1).await.expect("connect failed");
+        let tcp_1 = openshell_core::net::connect_tcp_nodelay_best_effort(addr1)
+            .await
+            .expect("connect failed");
         let tls_1 = connector
             .connect(server_name.clone(), tcp_1)
             .await
@@ -754,7 +775,9 @@ mod tests {
                 .await
                 .expect("TLS accept failed");
         });
-        let tcp_2 = TcpStream::connect(addr2).await.expect("connect failed");
+        let tcp_2 = openshell_core::net::connect_tcp_nodelay_best_effort(addr2)
+            .await
+            .expect("connect failed");
         let tls_2 = connector
             .connect(server_name.clone(), tcp_2)
             .await
@@ -853,7 +876,7 @@ mod tests {
                 acc.acceptor().accept(stream).await
             });
 
-            let tcp = TcpStream::connect(listen_addr)
+            let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(listen_addr)
                 .await
                 .expect("connect failed");
             let handshake_result = tokio::time::timeout(
@@ -985,7 +1008,7 @@ mod tests {
         let connector = tokio_rustls::TlsConnector::from(new_ca_client_config);
         let server_name =
             rustls::pki_types::ServerName::try_from("localhost").expect("invalid server name");
-        let tcp = TcpStream::connect(listen_addr)
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(listen_addr)
             .await
             .expect("connect failed");
         connector
@@ -1060,7 +1083,7 @@ mod tests {
         // server rejects the client cert (TLS 1.3 post-handshake auth),
         // so the authoritative check is the server-side accept result above.
         let connector = tokio_rustls::TlsConnector::from(old_ca_client_config);
-        let tcp = TcpStream::connect(listen_addr)
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(listen_addr)
             .await
             .expect("connect failed");
         let _ = connector.connect(server_name, tcp).await;
@@ -1277,7 +1300,7 @@ mod tests {
         });
 
         let connector = tokio_rustls::TlsConnector::from(client_config.clone());
-        let tcp = TcpStream::connect(listen_addr)
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(listen_addr)
             .await
             .expect("connect failed");
         let server_name = "external.example.com"
@@ -1313,7 +1336,7 @@ mod tests {
         });
 
         let connector = tokio_rustls::TlsConnector::from(client_config);
-        let tcp = TcpStream::connect(listen_addr)
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(listen_addr)
             .await
             .expect("connect failed");
         let server_name = "localhost".try_into().expect("invalid server name");

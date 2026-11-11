@@ -21,7 +21,7 @@ the sandbox record and driver-supported persistent storage.
 | [Podman](#podman-driver) | `podman` | Rootless Linux workstations without a Docker daemon. |
 | [MicroVM](#microvm-driver) | `vm` | Workloads need a VM boundary instead of a container boundary. |
 | [Kubernetes](#kubernetes-driver) | `kubernetes` | Shared clusters, remote compute, and GPU scheduling. |
-| Windows MXC | `mxc` | Coming soon. |
+| [Windows MXC](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md) | `mxc` | Native Windows workloads on x64 or ARM64. |
 
 ## Select a Compute Driver
 
@@ -107,7 +107,7 @@ To pin specific GPUs, pass `cdi_devices` for Docker or Podman, or `gpu_device_id
 
 ## Docker Driver
 
-[Docker](https://www.docker.com/get-started/) runs sandboxes as containers on the Docker daemon host. The gateway accesses the daemon through its configured Unix socket. Docker is also required to build sandbox images from local directories or Dockerfiles.
+[Docker](https://www.docker.com/get-started/) runs sandboxes as containers on the Docker daemon host. The gateway accesses the daemon through its configured Unix socket.
 
 ```toml
 [openshell.gateway]
@@ -238,6 +238,12 @@ VM sandboxes have no network interface. All traffic flows through the OpenShell 
 
 If the gateway is briefly unavailable while a VM starts, its supervisor retries the session connection. The sandbox stays in provisioning until the gateway accepts the session.
 
+### MicroVM Stop Durability
+
+When you run `openshell sandbox stop` while the main process is running, OpenShell terminates the workload and flushes the guest root filesystem before acknowledging termination. The guest waits up to three seconds for the flush. The host allows up to 22 seconds for supervisor shutdown, then up to five seconds to stop the VM.
+
+Flush errors and timeouts produce warnings while shutdown continues. If a signal kills the supervisor, the driver warns that the guest flush was not confirmed and recent writes may be lost. A completed stop does not guarantee persistence after a failed or timed-out flush. This flush does not cover stops after the main process has already exited.
+
 ### MicroVM Mounts
 
 The VM driver shares gateway-host directories into the guest with virtiofs. Each entry in `mounts` takes `source` (absolute host directory), `target`, optional `read_only` (default `true`), and optional `type`, which must be `bind` so Docker and Podman bind entries work unchanged:
@@ -356,7 +362,7 @@ On Docker and Podman, set `process.run_as_user` and `process.run_as_group` in th
 
 | Driver | Default identity |
 |---|---|
-| Docker, Podman | The image's `USER`. Images without `USER` must set both fields in policy. |
+| Docker, Podman | The image's `USER`, otherwise `1000`. |
 | Kubernetes | OpenShift SCC namespace annotations, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 | MicroVM | The image's `sandbox` account, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 

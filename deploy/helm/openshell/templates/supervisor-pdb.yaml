@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{{- include "openshell.validateValues" . }}
+{{- if and (include "openshell.supervisorEnabled" .) (eq (include "openshell.supervisorPodDisruptionBudgetEnabled" .) "true") }}
+# Voluntary disruptions, such as node drains, evict one member at a time, so
+# the remaining members can take over its instances.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "openshell.supervisorName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
+{{- end }}

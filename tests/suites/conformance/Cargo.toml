@@ -1,6 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# The conformance family is one crate; each module in `src/` is a suite.
+[package]
+name = "conformance"
+description = "Conformance suite: sandbox behavior on every compute driver"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/NVIDIA/OpenShell"
+publish = false
+
+# `openshell-conformance`: the suite as one program to run against a gateway.
+# No test target of its own: cargo test and nextest run the tests through the
+# library.
+[[bin]]
+name = "openshell-conformance"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+host-server-support = { path = "../../support/host-server" }
+openshell-testkit = { path = "../../testkit/testkit" }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["time"] }
+
 [workspace]
-resolver = "2"
-members = ["cli"]

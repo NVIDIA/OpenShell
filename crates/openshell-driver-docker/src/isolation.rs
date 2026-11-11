@@ -109,7 +109,7 @@ impl DockerBoundarySpec {
                 auth_epoch: self.auth_epoch,
                 gateway_id: self.gateway_id,
                 verification_keys: self.verification_keys,
-                listener: BoundaryListener::Unix {
+                listener: BoundaryListener::RuntimeInitiatedUnix {
                     socket_path: self.listener_socket,
                     tls: self.sandbox_tls,
                 },
@@ -124,7 +124,7 @@ impl DockerBoundarySpec {
                 generation: self.generation,
                 session_id: self.session_id,
                 workload_identity: self.workload_identity,
-                transport: SandboxTransport::Unix {
+                transport: SandboxTransport::RuntimeInitiatedUnix {
                     socket_path: self.control_socket,
                 },
                 tls: self.supervisor_tls,

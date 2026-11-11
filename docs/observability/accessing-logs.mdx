@@ -51,9 +51,9 @@ When the container runtime falls behind reading the log, the main process blocks
 
 ## Gateway Log Storage
 
-The supervisor pushes logs to the gateway over gRPC in real time. The gateway stores up to 2,000 recent log lines per sandbox in memory. This buffer is not persisted to disk and is lost when the gateway restarts or the sandbox's buffers are removed. The push channel is bounded and can drop events under load or during disconnection.
+The supervisor pushes logs to the gateway over gRPC in real time. The gateway stores up to 2,000 recent log lines per sandbox in memory. This buffer is not persisted to disk. It is lost when the gateway restarts and when the sandbox is deleted, so a `--no-keep` sandbox leaves no log in the gateway after it exits. Each gateway replica keeps its own buffer. The push channel is bounded and can drop events under load or during disconnection.
 
-For durable retention, collect supervisor output or files and workload container logs into an external log store. The local files rotate and use temporary storage on container drivers; they are not a durable archive. See [Direct Filesystem Access](#direct-filesystem-access) for locations and collection limits, and [OCSF JSON export](/observability/ocsf-json-export) for structured file output.
+For durable retention, collect supervisor output or files and workload container logs into an external log store, or export OCSF events with [OTLP log export](/observability/overview#otlp-log-export). The local files rotate and use temporary storage on container drivers; they are not a durable archive. See [Direct Filesystem Access](#direct-filesystem-access) for locations and collection limits, and [OCSF JSON export](/observability/ocsf-json-export) for structured file output.
 
 The gateway's separate `ocsf_log` configuration writes gateway-produced OCSF events to JSONL. It does not persist supervisor log lines received over gRPC or main process output.
 
@@ -107,6 +107,8 @@ podman logs --follow <supervisor-container>
 Shorthand and diagnostics follow the supervisor's diagnostic log filter. With `ocsf_json_enabled=true`, stderr also includes compact `OCSF-JSON` records independently of that filter and file storage. See [OCSF JSON collection](/observability/ocsf-json-export#output-location) for the collector format and delivery limits. A cluster or container log collector can ship this output for retention. Collect workload container logs separately for main process output and sandbox-runtime events.
 
 The default supervisor image has no shell or `tar`, so shell-based `kubectl exec` and `kubectl cp` examples do not work with that image. Reading Kubernetes supervisor files requires operator-managed access to its log volume, such as cluster debugging tooling. OpenShell does not configure a file collector for you.
+
+The shorthand and JSONL files each rotate daily in UTC and keep the three most recent files, so retention is a file count rather than a number of days. The Docker supervisor's `/var/log` is a 64 MiB tmpfs, and the Docker driver removes the supervisor container when the sandbox stops or is deleted or when the supervisor exits. A Kubernetes `emptyDir` has no size limit and is removed with the supervisor pod, which the driver also deletes when it stops the sandbox. OpenShell sets no log options for container stdout and stderr, so their retention follows the Docker daemon or kubelet configuration.
 
 Ship files before rotation or resource teardown and configure your collector to handle daily rotation. Local file writers are non-blocking and can also drop events under pressure. If the supervisor cannot open `/var/log`, it falls back to stderr-only logging and does not produce these files, even when `ocsf_json_enabled` is true. Neither the local files nor the gateway stream guarantees complete audit history.
 
