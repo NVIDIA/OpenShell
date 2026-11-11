@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Select explicit acceptance and authorized human labeling-agent invocations."""
 
 from __future__ import annotations
@@ -32,12 +35,7 @@ def item_number(item: str, repository: str) -> int:
     if re.fullmatch(r"[1-9][0-9]*", item):
         return int(item)
     url = urlsplit(item)
-    if (
-        url.scheme != "https"
-        or url.netloc != "github.com"
-        or url.query
-        or url.fragment
-    ):
+    if url.scheme != "https" or url.netloc != "github.com" or url.query or url.fragment:
         raise ValueError("expected an item number or a same-repository GitHub URL")
     match = re.fullmatch(r"/([^/]+/[^/]+)/(?:issues|pull)/([1-9][0-9]*)/?", url.path)
     if not match or match[1].casefold() != repository.casefold():
@@ -102,7 +100,7 @@ def select_invocation(
         force_input = inputs.get("force", False)
         if not (
             isinstance(force_input, bool)
-            or isinstance(force_input, str) and force_input in {"true", "false"}
+            or (isinstance(force_input, str) and force_input in {"true", "false"})
         ):
             raise ValueError("force must be true or false")
         force = force_input is True or force_input == "true"

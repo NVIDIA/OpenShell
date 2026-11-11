@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Offline tests for the managed labeling classifier's execution boundary."""
 
 import io
@@ -114,8 +117,9 @@ class CompletionTests(unittest.TestCase):
 
     def test_requires_action_and_budget_exhaustion_are_not_completion(self):
         for reason in ["requires_action", "budget_reached", None]:
-            events = proposal_events()[:1] + [
-                event("session.status_idle", "idle", stop_reason={"type": reason})
+            events = [
+                *proposal_events()[:1],
+                event("session.status_idle", "idle", stop_reason={"type": reason}),
             ]
             with self.subTest(reason=reason), self.assertRaises(ClassifierError):
                 completed_proposal(events)
@@ -128,7 +132,10 @@ class CompletionTests(unittest.TestCase):
             "agent.mcp_tool_use",
             "agent.custom_tool_use",
         ]:
-            with self.subTest(event_type=event_type), self.assertRaises(ClassifierError):
+            with (
+                self.subTest(event_type=event_type),
+                self.assertRaises(ClassifierError),
+            ):
                 completed_proposal([event(event_type, "bad")])
 
     def test_invalid_proposals_and_missing_messages_are_rejected(self):
@@ -163,7 +170,9 @@ class ExecutionTests(unittest.TestCase):
                 {"data": [done], "next_page": None},
             ]
         )
-        self.assertEqual(classify(transport, {})["proposal"], {"labels": ["area:build"]})
+        self.assertEqual(
+            classify(transport, {})["proposal"], {"labels": ["area:build"]}
+        )
         self.assertIn("page=cursor%2B1", transport.calls[2][1])
 
     def test_polling_waits_for_completion(self):
@@ -256,7 +265,9 @@ class TransportTests(unittest.TestCase):
                 patch("urllib.request.urlopen", return_value=io.BytesIO(payload)),
                 self.assertRaises(ClassifierError),
             ):
-                ManagedAgents("test-secret").request("GET", "/sessions/sesn_test", None, 5)
+                ManagedAgents("test-secret").request(
+                    "GET", "/sessions/sesn_test", None, 5
+                )
 
 
 class CliTests(unittest.TestCase):
@@ -268,11 +279,16 @@ class CliTests(unittest.TestCase):
             evidence.write_text('{"title": "Test evidence"}')
             arguments = [
                 "managed_label_classifier.py",
-                "--instructions", str(instructions),
-                "--evidence", str(evidence),
-                "--agent-id", "agent_test",
-                "--agent-version", "1",
-                "--environment-id", "env_test",
+                "--instructions",
+                str(instructions),
+                "--evidence",
+                str(evidence),
+                "--agent-id",
+                "agent_test",
+                "--agent-version",
+                "1",
+                "--environment-id",
+                "env_test",
             ]
             with (
                 patch("sys.argv", arguments),

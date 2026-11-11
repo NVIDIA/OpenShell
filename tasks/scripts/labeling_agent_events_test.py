@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Offline tests for labeling-agent dispatch selection and authorization."""
 
 import unittest
@@ -79,7 +82,9 @@ class EventTests(unittest.TestCase):
                     Invocation(REPO, 5151, force, "human"),
                 )
 
-    def test_automation_applied_acceptance_dispatches_drafts_before_classification(self):
+    def test_automation_applied_acceptance_dispatches_drafts_before_classification(
+        self,
+    ):
         payload = base_event(
             action="labeled",
             label={"name": "state:accepted"},
@@ -123,7 +128,7 @@ class EventTests(unittest.TestCase):
                         "issue_comment",
                         comment_event(),
                         REPO,
-                        permission=lambda _: permission,
+                        permission=lambda _, p=permission: p,
                     )
                 )
 

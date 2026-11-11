@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Run the classification phase of /label-issue in Claude Managed Agents."""
 
 from __future__ import annotations
@@ -112,7 +116,9 @@ class ManagedAgents:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as error:
-            raise ClassifierError(f"Managed Agents returned HTTP {error.code}") from None
+            raise ClassifierError(
+                f"Managed Agents returned HTTP {error.code}"
+            ) from None
         except OSError:
             raise ClassifierError(
                 "Managed Agents request failed; no automatic retry"
@@ -161,15 +167,21 @@ def completed_proposal(events: list[dict]) -> dict | None:
         if event_type == "session.status_idle":
             reason = (event.get("stop_reason") or {}).get("type")
             if reason != "end_turn":
-                raise ClassifierError(f"Classifier stopped without completion: {reason}")
+                raise ClassifierError(
+                    f"Classifier stopped without completion: {reason}"
+                )
             if message is None:
                 raise ClassifierError("Classifier completed without a proposal")
             try:
                 proposal = json.loads(message)
             except ValueError:
-                raise ClassifierError("Classifier proposal is not a JSON object") from None
+                raise ClassifierError(
+                    "Classifier proposal is not a JSON object"
+                ) from None
             if not isinstance(proposal, dict) or not proposal:
-                raise ClassifierError("Classifier proposal must be a nonempty JSON object")
+                raise ClassifierError(
+                    "Classifier proposal must be a nonempty JSON object"
+                )
             return proposal
     return None
 
@@ -197,7 +209,9 @@ def classify(
     if not isinstance(session_id, str) or not re.fullmatch(
         r"sesn_[A-Za-z0-9]+", session_id
     ):
-        raise ClassifierError("Managed Agents did not return a valid session identifier")
+        raise ClassifierError(
+            "Managed Agents did not return a valid session identifier"
+        )
     try:
         while clock() < deadline:
             events = []
@@ -213,7 +227,9 @@ def classify(
                 if not isinstance(batch, list) or any(
                     not isinstance(event, dict) for event in batch
                 ):
-                    raise ClassifierError("Managed Agents returned an invalid event page")
+                    raise ClassifierError(
+                        "Managed Agents returned an invalid event page"
+                    )
                 events.extend(batch)
                 if len(events) > 1000:
                     raise ClassifierError("Classifier exceeded the event limit")
