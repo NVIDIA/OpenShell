@@ -25,11 +25,8 @@ path = "src/bin/openshell-vm-init.rs"
 
 [dependencies]
 openshell-container-runtime = { path = "../openshell-container-runtime" }
-openshell-driver-sdk = { path = "../openshell-driver-sdk", features = ["jwt", "clap"] }
-openshell-isolation-interface = { path = "../openshell-isolation-interface" }
-openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
+openshell-driver-sdk = { path = "../openshell-driver-sdk", features = ["jwt", "clap", "legacy-contract"] }
 openshell-otel = { path = "../openshell-otel", optional = true }
-openshell-policy = { path = "../openshell-policy", optional = true }
 openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
 openshell-vfio = { path = "../openshell-vfio", optional = true }
 
@@ -82,7 +79,6 @@ compute-driver = [
     "dep:oci-client",
     "dep:openshell-otel",
     "openshell-driver-sdk/otel",
-    "dep:openshell-policy",
     "dep:openshell-driver-podman",
     "dep:openshell-vfio",
     "dep:opentelemetry",

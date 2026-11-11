@@ -9,14 +9,14 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use openshell_driver_sdk::ComputeDriverError;
-use openshell_driver_sdk::proto::compute::v1::DriverSandbox;
-use openshell_isolation_interface::contract::{ProvisioningEvidence, ResolvedWorkloadIdentity};
-use openshell_sandbox_backend::ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM;
-use openshell_sandbox_backend::boundary_protocol::{
+use openshell_driver_sdk::legacy_contract::ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM;
+use openshell_driver_sdk::legacy_contract::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
     generate_sandbox_tls_material,
 };
+use openshell_driver_sdk::legacy_contract::{ProvisioningEvidence, ResolvedWorkloadIdentity};
+use openshell_driver_sdk::proto::compute::v1::DriverSandbox;
 use serde::{Deserialize, Serialize};
 
 pub const LABEL_ROLE: &str = "openshell.ai/isolation-role";

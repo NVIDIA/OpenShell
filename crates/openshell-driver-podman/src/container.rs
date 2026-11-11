@@ -59,7 +59,7 @@ const CONTAINER_PREFIX: &str = "openshell-";
 const VOLUME_PREFIX: &str = "openshell-sandbox-";
 const PODMAN_WORKLOAD_CONTROL_PATHS: &[&str] = &[
     "/.openshell",
-    openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT,
+    openshell_driver_sdk::legacy_contract::SUPERVISOR_CA_RUNTIME_ROOT,
 ];
 
 /// Secret name prefix for per-sandbox gateway JWTs.
@@ -1591,7 +1591,7 @@ pub struct IsolationSpecInput<'a> {
     /// Gateway-owned immutable destination-trust artifact. It is deliberately
     /// mounted only into the trusted supervisor spec.
     pub network_trust: Option<&'a NetworkSupervisorTrustBundle>,
-    pub identity: &'a openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
+    pub identity: &'a openshell_driver_sdk::legacy_contract::ResolvedWorkloadIdentity,
 }
 
 pub struct IsolationSpecs {
@@ -1686,7 +1686,7 @@ pub fn build_isolation_specs(
     workload.mounts.push(Mount {
         kind: "tmpfs".into(),
         source: "tmpfs".into(),
-        destination: openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT.into(),
+        destination: openshell_driver_sdk::legacy_contract::SUPERVISOR_CA_RUNTIME_ROOT.into(),
         options: vec![
             "rw".into(),
             "noexec".into(),
@@ -1744,7 +1744,7 @@ pub fn build_isolation_specs(
     }
     supervisor.env.insert(
         openshell_driver_sdk::sandbox_env::ADMITTED_ISOLATION_BACKEND.into(),
-        openshell_sandbox_backend::BACKEND_NAME.into(),
+        openshell_driver_sdk::legacy_contract::BUILTIN_BACKEND_NAME.into(),
     );
     // The supervisor runs as the resolved non-root workload identity. Keep
     // generated interception CA material under its writable /run tmpfs rather
@@ -1986,7 +1986,7 @@ mod tests {
             name: "trust-pair".into(),
             ..Default::default()
         };
-        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+        let identity = openshell_driver_sdk::legacy_contract::ResolvedWorkloadIdentity::new(
             1000,
             1001,
             Vec::new(),
@@ -2092,7 +2092,7 @@ mod tests {
             "openshell-sandbox".into(),
         ));
         config.userns = Some("auto".into());
-        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+        let identity = openshell_driver_sdk::legacy_contract::ResolvedWorkloadIdentity::new(
             1000,
             1001,
             vec![2000],
@@ -2181,7 +2181,7 @@ mod tests {
         assert_eq!(specs.supervisor.apparmor_profile, None);
 
         let default_identity =
-            openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+            openshell_driver_sdk::legacy_contract::ResolvedWorkloadIdentity::new(
                 1000,
                 1000,
                 Vec::new(),
@@ -2247,7 +2247,8 @@ mod tests {
             .mounts
             .iter()
             .find(|mount| {
-                mount.destination == openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT
+                mount.destination
+                    == openshell_driver_sdk::legacy_contract::SUPERVISOR_CA_RUNTIME_ROOT
             })
             .expect("workload supervisor CA mount");
         assert_eq!(supervisor_ca_mount.kind, "tmpfs");

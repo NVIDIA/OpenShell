@@ -16,6 +16,7 @@ test-support = []
 [dependencies]
 openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false, features = ["jwt"] }
+openshell-driver-sdk = { path = "../openshell-driver-sdk", features = ["legacy-contract"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 async-trait = "0.1"
 bytes = { workspace = true }

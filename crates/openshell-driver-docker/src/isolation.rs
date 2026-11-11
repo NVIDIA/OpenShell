@@ -11,11 +11,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use openshell_isolation_interface::contract::{
+use openshell_driver_sdk::legacy_contract::GPU_RESOURCE_CLAIM;
+use openshell_driver_sdk::legacy_contract::{
     BackendError, ProvisioningEvidence, ResolvedWorkloadIdentity,
 };
-use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
-use openshell_sandbox_backend::boundary_protocol::{
+use openshell_driver_sdk::legacy_contract::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
@@ -167,9 +167,8 @@ mod tests {
     #[test]
     fn provisioning_binds_container_and_image_claims() {
         let session_id = openshell_driver_sdk::SandboxSessionId::new();
-        let tls =
-            openshell_sandbox_backend::boundary_protocol::generate_sandbox_tls_material(session_id)
-                .unwrap();
+        let tls = openshell_driver_sdk::legacy_contract::generate_sandbox_tls_material(session_id)
+            .unwrap();
         let provisioned = DockerBoundarySpec {
             boundary_id: "sandbox-1".to_string(),
             generation: "generation-1".to_string(),

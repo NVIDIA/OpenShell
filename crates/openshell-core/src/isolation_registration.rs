@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Reserved selection for drivers that launch the built-in sandbox runtime.
-pub const BUILTIN_BACKEND_NAME: &str = "openshell-sandbox";
+pub use openshell_driver_sdk::legacy_contract::BUILTIN_BACKEND_NAME;
 
 /// Trusted byte-stream endpoint. Generation-specific TLS is supplied by the driver.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

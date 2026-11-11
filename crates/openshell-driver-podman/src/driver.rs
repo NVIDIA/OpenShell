@@ -1670,7 +1670,7 @@ impl PodmanComputeDriver {
         sandbox: &DriverSandbox,
         image: &str,
         image_user: &str,
-    ) -> Result<openshell_isolation_interface::contract::ResolvedWorkloadIdentity, ComputeDriverError>
+    ) -> Result<openshell_driver_sdk::legacy_contract::ResolvedWorkloadIdentity, ComputeDriverError>
     {
         #[derive(serde::Serialize)]
         struct InspectionSpec<'a> {
@@ -4470,7 +4470,7 @@ mod tests {
 
     fn restart_responses() -> Vec<StubResponse> {
         let mut archive = tar::Builder::new(Vec::new());
-        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+        let identity = openshell_driver_sdk::legacy_contract::ResolvedWorkloadIdentity::new(
             1000,
             1001,
             vec![],
