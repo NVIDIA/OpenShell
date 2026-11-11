@@ -19,10 +19,11 @@ Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
 Reconciliation skips snapshots for sandboxes with an active local lifecycle
-operation or a durably pending driver operation on another replica. It refreshes
-the driver observation under the local lifecycle gate before applying it, so a
-stopped runtime cannot fail its replacement while start is in flight. Busy
-sandboxes are retried on a later sweep without blocking unrelated sandboxes.
+operation or a durably pending driver operation on another replica. It checks
+local lifecycle ownership before and after refreshing the driver observation,
+and resource versions fence intervening lifecycle changes. The lookup does not
+retain the lifecycle gate, so a concurrent deletion can still release driver
+resources. Busy sandboxes are retried on a later sweep.
 
 ## Shared supervisor pool
 
