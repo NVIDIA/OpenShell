@@ -71,7 +71,8 @@ let
   ) podmanModes;
   # fedora-podman-{rootful,rootless}-userns-{default,auto,keep-id,private}
   # configure the Podman gateway's user-namespace mode, for the Podman driver
-  # suite. Only the binaries installer applies the mode.
+  # suite. Every installer applies the mode through
+  # /etc/openshell-test/gateway-overrides.toml.
   podmanUsernsEnvironments = pkgs.lib.concatMap (
     podman:
     map (
@@ -274,7 +275,7 @@ let
   };
 
   # Runs a test family in a tmachine environment with tests/runner
-  # (`nix run .#openshell-test-runner -- --environment ubuntu-docker-rootful
+  # (`nix run .#openshell-test-runner -- run --environment ubuntu-docker-rootful
   # --installer deb --family conformance`). It cross-builds guest test bundles
   # and drives tmachine sessions, so it needs the toolchains and the VM tools.
   testRunner = pkgs.writeShellApplication {

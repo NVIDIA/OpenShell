@@ -113,8 +113,9 @@ needed.
 
 ## Required surfaces
 
-Account for every surface: `rust-sdk`, `python-sdk`, `go-sdk`, `typescript-sdk`,
-`api-behavior`, `cli`, `configuration`, `policy`, `helm`, and `state`.
+Account for every surface: `rust-sdk`, `python-sdk`, `typescript-sdk`,
+`api-behavior`, `cli`, `configuration`, `policy`, `helm`, and `state`. The Go
+SDK moved to ai-openshell/sdk-go and is not a surface of this repository.
 
 Scope `rust-sdk` to the public API reachable through `openshell-sdk`, including
 its `raw` module and transitive public re-exports. Trace the export path before
@@ -125,16 +126,6 @@ configuration compatibility through existing user-authored TOML. Include
 generated server-trait changes reachable through `raw::proto`, identifying
 mock/server implementers as affected consumers and distinguishing them from
 unaffected client callers.
-
-For `go-sdk`, adopt the [Go struct-literal compatibility convention](https://go.dev/doc/go1compat):
-adding fields to exported structs is additive when existing keyed literals remain
-valid and omitted fields preserve existing behavior. Do not report a break solely
-because unkeyed (positional) literals need updating, unless the baseline explicitly
-guarantees that construction form. Still inspect existing field names and types,
-zero-value behavior, comparability (equality and map keys), and serialization
-contracts; a field addition can break those independently. Follow the
-[Go module compatibility guidance](https://go.dev/blog/module-compatibility#maintaining-struct-compatibility)
-for these limits. This exception applies only to Go struct-field additions.
 
 Check exported signatures/types, generated and handwritten SDK behavior,
 serialization and error contracts, command flags and documented machine-readable

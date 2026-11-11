@@ -598,6 +598,9 @@ jobs:
       - name: Test
         run: mise run test:python
 
+      - name: Test Python scripts
+        run: mise run test:python-scripts
+
       - name: Test local gateway configuration helpers
         run: |
           bash tasks/scripts/test-gateway-pull-policy.sh
@@ -605,13 +608,14 @@ jobs:
 
       - name: Test release qualification summary
         run: mise run test:qualification-summary
-  sdk-go-freeze:
-    # The Go SDK moved to ai-openshell/sdk-go (#5031). Its directory stays only
-    # until the final deprecated sdk/go tag exists, so PRs must not add or change
-    # files in it. Deleting files is allowed (the removal PR), and so are the
-    # moved notice and the deprecation comment in README.md and go.mod.
+  python-sdk-freeze:
+    # The Python SDK moved to ai-openshell/sdk-python (#5287), which imported it
+    # at v0.1.7. Its files stay only until core removes them, so PRs must not
+    # add or change them. Deleting files is allowed (the removal PR). The paths
+    # are the ones the import moved: all of python/ plus the two SDK build
+    # scripts. The shared root pyproject.toml and uv.lock stay editable.
     # Merge queue runs skip this job; the PR already passed it on its mirror.
-    name: Go SDK Freeze
+    name: Python SDK Freeze
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true' && github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -622,19 +626,20 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Reject changes to sdk/go
+      - name: Reject changes to the Python SDK
         env:
           BASE_SHA: ${{ needs.pr_metadata.outputs.base_sha }}
         run: |
           set -euo pipefail
           changed=$(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- \
-            sdk/go ':!sdk/go/README.md' ':!sdk/go/go.mod')
+            python \
+            tasks/scripts/generate_python_proto.py)
           if [ -z "$changed" ]; then
-            echo "No added or changed files under sdk/go."
+            echo "No added or changed Python SDK files."
             exit 0
           fi
-          echo "::error title=Go SDK moved::The Go SDK moved to https://github.com/ai-openshell/sdk-go. Drop the sdk/go changes from this PR and open SDK changes there. Regenerated bindings are not needed here; sdk-go regenerates them from core releases."
-          echo "Changed files under sdk/go:"
+          echo "::error title=Python SDK moved::The Python SDK moved to https://github.com/ai-openshell/sdk-python. Drop the Python SDK changes from this PR and open SDK changes there. Regenerated bindings are not needed here; sdk-python regenerates them from core releases."
+          echo "Changed Python SDK files:"
           echo "$changed"
           exit 1
 
@@ -687,3 +692,19 @@ jobs:
         run: |
           OPENSHELL_NPM_VERSION="$(uv run python tasks/scripts/release.py get-version --npm)" \
             mise run sdk:ts:publish
+
+  install-script:
+    name: install.sh
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The RPM lookup test uses gawk when present; gawk warns on bad escapes.
+      - name: Install gawk
+        run: sudo apt-get install -y --no-install-recommends gawk
+
+      - name: Test install.sh
+        run: tasks/scripts/test-install-sh.sh

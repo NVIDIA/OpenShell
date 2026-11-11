@@ -1300,6 +1300,16 @@ async fn fetch_frozen_snapshot_on_channel(
 ) -> Result<FrozenSettingsPollResult> {
     use crate::proto::frozen_sandbox_policies_client::FrozenSandboxPoliciesClient;
 
+    if !frozen_policies_supported(channel.clone()).await? {
+        return fetch_settings_snapshot_with_client(
+            &mut OpenShellClient::new(channel),
+            sandbox,
+            workspace,
+        )
+        .await
+        .map(Into::into);
+    }
+
     let response = FrozenSandboxPoliciesClient::new(channel.clone())
         .get_config(crate::proto::GetFrozenSandboxConfigRequest {
             workspace_scope: workspace.map(crate::proto::workspace_selector),
@@ -1323,18 +1333,44 @@ async fn fetch_frozen_snapshot_on_channel(
                 frozen_requested: response.frozen_requested,
             })
         }
-        Err(status) if status.code() == tonic::Code::Unimplemented => {
-            // Older gateways cannot create frozen sandboxes. Preserve ordinary
-            // startup against them; errors from a supporting gateway fail closed.
-            fetch_settings_snapshot_with_client(
-                &mut OpenShellClient::new(channel),
-                sandbox,
-                workspace,
-            )
-            .await
-            .map(Into::into)
-        }
         Err(status) => Err(grpc_status_error(status)),
+    }
+}
+
+/// Negotiate the optional policy service before sending an authenticated RPC.
+/// Legacy authorization routers can deny unknown methods before dispatch.
+pub async fn frozen_policies_supported<I: tonic::service::Interceptor>(
+    channel: InterceptedService<Channel, I>,
+) -> Result<bool> {
+    use tonic_reflection::pb::v1::{
+        ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+        server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+    };
+
+    let response = ServerReflectionClient::new(channel)
+        .server_reflection_info(tokio_stream::iter([ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        }]))
+        .await;
+    let mut stream = match response {
+        Ok(response) => response.into_inner(),
+        Err(status) if status.code() == tonic::Code::Unimplemented => return Ok(false),
+        Err(status) => return Err(grpc_status_error(status)),
+    };
+    let response = stream
+        .message()
+        .await
+        .map_err(grpc_status_error)?
+        .ok_or_else(|| miette::miette!("gateway returned no service discovery response"))?;
+    match response.message_response {
+        Some(MessageResponse::ListServicesResponse(services)) => Ok(services
+            .service
+            .iter()
+            .any(|service| service.name == "openshell.v1.FrozenSandboxPolicies")),
+        _ => Err(miette::miette!(
+            "gateway returned invalid service discovery response"
+        )),
     }
 }
 
@@ -2666,21 +2702,28 @@ mod frozen_snapshot_tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let legacy = Arc::new(AtomicUsize::new(0));
         let frozen = Arc::new(AtomicUsize::new(0));
+        let mut reflection = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(crate::FILE_DESCRIPTOR_SET)
+            .with_service_name("openshell.v1.OpenShell");
+        if response.is_some() {
+            reflection = reflection.with_service_name("openshell.v1.FrozenSandboxPolicies");
+        }
         let router = tonic::transport::Server::builder()
             .tcp_nodelay(true)
-            .add_service(LegacyConfigService(legacy.clone()));
-        if let Some(response) = response {
-            tokio::spawn(
-                router
-                    .add_service(FrozenSandboxPoliciesServer::new(FrozenConfigService {
-                        response,
-                        calls: frozen.clone(),
-                    }))
-                    .serve_with_incoming(TcpListenerStream::new(listener)),
-            );
-        } else {
-            tokio::spawn(router.serve_with_incoming(TcpListenerStream::new(listener)));
-        }
+            .add_service(LegacyConfigService(legacy.clone()))
+            .add_service(reflection.build_v1().unwrap());
+        tokio::spawn(
+            router
+                .add_service(FrozenSandboxPoliciesServer::new(FrozenConfigService {
+                    // Legacy authorization routers deny unknown methods before
+                    // dispatch, rather than returning UNIMPLEMENTED.
+                    response: response.unwrap_or_else(|| {
+                        Err(Status::permission_denied("unknown sandbox method"))
+                    }),
+                    calls: frozen.clone(),
+                }))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
         (
             GatewayEndpoint::new(
                 endpoint,
@@ -2730,6 +2773,7 @@ mod frozen_snapshot_tests {
     async fn frozen_snapshot_denials_and_inconsistent_state_never_use_legacy_fallback() {
         for response in [
             Err(Status::permission_denied("denied")),
+            Err(Status::unimplemented("advertised service is unavailable")),
             Ok(FrozenSandboxConfigResponse {
                 config: Some(crate::proto::GetSandboxConfigResponse::default()),
                 frozen: true,

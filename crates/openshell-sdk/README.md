@@ -42,7 +42,7 @@ configuration, subsequent reads return that snapshot. Changing its access
 requires recreating the sandbox. `update_global_config(UpdateConfigRequest)`
 returns the mutation result and names of sandboxes retaining a frozen policy.
 
-Older gateways return `Unimplemented` before creation; the SDK never retries
+Older gateways reject frozen requests before creation; the SDK never retries
 through ordinary creation. `raw_frozen_policies` and
 `raw_frozen_policies_fresh` share the client's transport and live bearer slot,
 with the same refresh distinction as the main raw client.

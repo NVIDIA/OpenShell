@@ -121,6 +121,14 @@ For Kubernetes mount-path conflicts, move caller PVC mounts away from
 These driver-managed paths remain reserved even for approved resources and
 `sub_path` mounts; changing approval labels does not resolve a path conflict.
 
+For dedicated Kubernetes supervisor placement, inspect the administrator's
+`supervisor_runtime_class_name` in the Kubernetes driver configuration and the
+supervisor Pod's `spec.runtimeClassName`. The setting is independent of the
+workload RuntimeClass and defaults to unset; it does not configure shared
+supervisor Deployments. If startup fails, check that the named RuntimeClass
+exists and its handler is available on eligible nodes. OpenShell does not retry
+with an ordinary supervisor Pod when the configured class is unavailable.
+
 For out-of-tree compute drivers, also check that their versioned admission-policy
 acknowledgement matches the gateway's policy. Configure standalone driver policy
 through its administrator-owned `--admission-config-json` option.
@@ -249,7 +257,7 @@ the image/effective policy or provider configuration. The supervisor remains
 alive while the workload stays unstarted. Inspect `openshell sandbox get` and
 repair the desired configuration with a complete policy replacement or provider
 change; do not treat a healthy container as proof that the workload is ready.
-If the 300-second provisioning repair window expires, the gateway records
+If the provisioning repair window (default 300 seconds) expires, the gateway records
 `ProvisioningTimedOut` and stops workload and supervisor compute. Inspect
 `provisioning` in sandbox JSON and TUI NOTES to distinguish cleanup pending from
 complete. Repairing configuration after expiry does not restart compute: wait
@@ -262,6 +270,14 @@ launching the workload while configuration is repaired. An unavailable boundary
 fails discovery within its control-request deadline. Permanent
 gateway errors and exhausted transient retries terminate startup; inspect those
 errors as connectivity, authorization, or lifecycle failures.
+
+For slow Kubernetes isolation backends, increase `runtime_bootstrap_grace_seconds`
+and the dedicated supervisor's `sandbox_attach_request_timeout_seconds` together.
+Shared supervisor deployments instead need `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS`
+on each shared host. The default is 300 seconds; allowed values are 1 through
+86400. Restart affected components and explicitly start a timed-out sandbox
+after cleanup; changing settings does not reset a persisted admission deadline.
+See [gateway configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#slow-sandbox-startup).
 
 ### Step 4: Check Docker-Backed Gateways
 
@@ -853,8 +869,12 @@ kubectl -n openshell describe hpa openshell
 
 The JSONPath filter keeps only pods whose first container is the gateway
 (`openshell-gateway`). It skips certificate hook Job pods, which older charts
-labeled like gateway pods. The metrics port is `service.metricsPort` (default
-`9090`).
+labeled like gateway pods. Helm enables metrics with `metrics.enabled=true`
+(the default). Set it to `false` to omit the listener and its container and
+Service ports. `service.metricsPort` selects the port (default `9090`) and
+must remain between 1 and 65535 even when metrics are disabled. Migrate legacy
+port `0` or `false` to `metrics.enabled=false` and a valid port in the same
+upgrade; those legacy values fail rendering. Metrics TLS requires enablement.
 
 The API server proxy connects to each pod from the control plane. A
 NetworkPolicy that accepts the metrics port only from a monitoring namespace

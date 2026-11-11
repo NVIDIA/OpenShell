@@ -20,6 +20,7 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 tonic = { workspace = true, features = ["channel"] }
 tonic-prost = { workspace = true }
+tonic-reflection = { workspace = true }
 tonic-types = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

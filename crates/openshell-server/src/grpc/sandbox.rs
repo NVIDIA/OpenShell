@@ -56,7 +56,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -750,12 +750,14 @@ async fn handle_create_sandbox_inner(
         crate::compute::provisioning_deadline::new_preparation_record(
             now_ms,
             state.config.image_preparation_timeout_seconds,
+            state.config.provisioning_repair_window_seconds * 1000,
         ),
     );
     crate::compute::provisioning_deadline::refresh_configuration(
         &state.store,
         &mut sandbox,
         now_ms,
+        state.config.provisioning_repair_window_seconds * 1000,
     )
     .await
     .map_err(Status::internal)?;
@@ -2496,7 +2498,7 @@ pub(super) async fn handle_watch_sandbox(
             // Events drained above the publication watermark. They are held
             // back rather than emitted so the client's highest delivered cursor
             // is never above an event still queued on the other source.
-            let mut deferred: Vec<CursoredEvent> = Vec::new();
+            let mut deferred: Vec<Arc<CursoredEvent>> = Vec::new();
 
             loop {
                 // Events withheld by the previous round are already in hand, so
@@ -2685,7 +2687,11 @@ pub(super) async fn handle_watch_sandbox(
                             continue;
                         }
                     }
-                    if tx.send(Ok(cursored.event)).await.is_err() {
+                    if tx
+                        .send(Ok(Arc::unwrap_or_clone(cursored).event))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -2923,9 +2929,48 @@ pub(super) async fn handle_forward_tcp(
     Ok(Response::new(stream))
 }
 
+/// The per-sandbox relay budget a forward stream draws from. SSH relays and
+/// service forwards are counted apart so open forwards cannot starve SSH.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelayBudget {
+    Ssh,
+    Service,
+}
+
+impl RelayBudget {
+    fn of(init: &TcpForwardInit) -> Self {
+        match init.target {
+            Some(tcp_forward_init::Target::Tcp(_)) => Self::Service,
+            _ => Self::Ssh,
+        }
+    }
+
+    fn counts(self, state: &ServerState) -> &std::sync::Mutex<HashMap<String, u32>> {
+        match self {
+            Self::Ssh => &state.ssh_connections_by_sandbox,
+            Self::Service => &state.service_connections_by_sandbox,
+        }
+    }
+
+    fn limit(self, config: &openshell_core::Config) -> u32 {
+        match self {
+            Self::Ssh => config.max_ssh_connections_per_sandbox,
+            Self::Service => config.max_service_connections_per_sandbox,
+        }
+    }
+
+    const fn exhausted_message(self) -> &'static str {
+        match self {
+            Self::Ssh => "sandbox SSH connection limit reached",
+            Self::Service => "sandbox service forward connection limit reached",
+        }
+    }
+}
+
 struct ForwardConnectionGuard {
     state: Arc<ServerState>,
     token: Option<String>,
+    budget: RelayBudget,
     sandbox_id: String,
 }
 
@@ -2934,7 +2979,7 @@ impl Drop for ForwardConnectionGuard {
         if let Some(token) = self.token.as_deref() {
             decrement_ssh_connection_count(&self.state.ssh_connections_by_token, token);
         }
-        decrement_ssh_connection_count(&self.state.ssh_connections_by_sandbox, &self.sandbox_id);
+        decrement_ssh_connection_count(self.budget.counts(&self.state), &self.sandbox_id);
     }
 }
 
@@ -2943,7 +2988,8 @@ impl Drop for ForwardConnectionGuard {
 /// `target.tcp` streams are authorized by the caller's gateway principal, which
 /// `handle_forward_tcp` has already checked against the sandbox's workspace, so
 /// they carry no session token and touch no store: the only per-connection
-/// state is the in-memory per-sandbox connection count. `target.ssh` streams
+/// state is the in-memory per-sandbox connection count, kept in a budget apart
+/// from SSH relays (see [`RelayBudget`]). `target.ssh` streams
 /// keep requiring the `CreateSshSession` token because the process that opens
 /// them is an ssh `ProxyCommand` that holds nothing else. A token supplied with
 /// a TCP target (older clients) is still validated and counted per token.
@@ -2954,9 +3000,10 @@ async fn acquire_forward_connection_guard(
     sandbox: &Sandbox,
 ) -> Result<ForwardConnectionGuard, Status> {
     let sandbox_id = sandbox.object_id().to_string();
+    let budget = RelayBudget::of(init);
     let token = init.authorization_token.trim();
     if token.is_empty() {
-        if !matches!(init.target, Some(tcp_forward_init::Target::Tcp(_))) {
+        if budget == RelayBudget::Ssh {
             return Err(crate::auth::audit::reject_credential(
                 Some(principal),
                 AuthRejection::new(
@@ -2966,10 +3013,11 @@ async fn acquire_forward_connection_guard(
                 ),
             ));
         }
-        acquire_sandbox_connection_slot(&state.ssh_connections_by_sandbox, &sandbox_id)?;
+        acquire_sandbox_connection_slot(state, budget, &sandbox_id)?;
         return Ok(ForwardConnectionGuard {
             state: state.clone(),
             token: None,
+            budget,
             sandbox_id,
         });
     }
@@ -2978,16 +3026,12 @@ async fn acquire_forward_connection_guard(
         .await
         .map_err(|rejection| crate::auth::audit::reject_credential(Some(principal), rejection))?;
     crate::auth::audit::emit_ssh_session_logon(&state.logons, principal, token);
-    acquire_ssh_connection_slots(
-        &state.ssh_connections_by_token,
-        &state.ssh_connections_by_sandbox,
-        token,
-        &sandbox_id,
-    )?;
+    acquire_ssh_connection_slots(state, budget, token, &sandbox_id)?;
 
     Ok(ForwardConnectionGuard {
         state: state.clone(),
         token: Some(token.to_string()),
+        budget,
         sandbox_id,
     })
 }
@@ -3051,16 +3095,15 @@ async fn validate_ssh_forward_token(
 }
 
 const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
-const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
 
 fn acquire_ssh_connection_slots(
-    token_counts: &std::sync::Mutex<HashMap<String, u32>>,
-    sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
+    state: &ServerState,
+    budget: RelayBudget,
     token: &str,
     sandbox_id: &str,
 ) -> Result<(), Status> {
     {
-        let mut counts = token_counts.lock().unwrap();
+        let mut counts = state.ssh_connections_by_token.lock().unwrap();
         let count = counts.entry(token.to_string()).or_insert(0);
         if *count >= MAX_CONNECTIONS_PER_TOKEN {
             return Err(Status::resource_exhausted(
@@ -3070,26 +3113,24 @@ fn acquire_ssh_connection_slots(
         *count += 1;
     }
 
-    if let Err(status) = acquire_sandbox_connection_slot(sandbox_counts, sandbox_id) {
-        decrement_ssh_connection_count(token_counts, token);
+    if let Err(status) = acquire_sandbox_connection_slot(state, budget, sandbox_id) {
+        decrement_ssh_connection_count(&state.ssh_connections_by_token, token);
         return Err(status);
     }
 
     Ok(())
 }
 
-/// Reserve one of the per-sandbox relay slots shared by SSH sessions and
-/// service forwards.
+/// Reserve one of the sandbox's relay slots in the given budget.
 fn acquire_sandbox_connection_slot(
-    sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
+    state: &ServerState,
+    budget: RelayBudget,
     sandbox_id: &str,
 ) -> Result<(), Status> {
-    let mut counts = sandbox_counts.lock().unwrap();
+    let mut counts = budget.counts(state).lock().unwrap();
     let count = counts.entry(sandbox_id.to_string()).or_insert(0);
-    if *count >= MAX_CONNECTIONS_PER_SANDBOX {
-        return Err(Status::resource_exhausted(
-            "sandbox SSH connection limit reached",
-        ));
+    if *count >= budget.limit(&state.config) {
+        return Err(Status::resource_exhausted(budget.exhausted_message()));
     }
     *count += 1;
     Ok(())
@@ -3901,12 +3942,10 @@ async fn run_interactive_exec_with_russh(
         )));
     }
 
-    let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
-        .await
-        .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
-    // russh client end of the loopback exec bridge — disable Nagle so keystroke
-    // and PTY tinygrams don't stall on delayed ACKs.
-    set_tcp_nodelay_best_effort(&stream);
+    let stream =
+        openshell_core::net::connect_tcp_nodelay_best_effort(("127.0.0.1", local_proxy_port))
+            .await
+            .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
 
     let config = Arc::new(exec_ssh_client_config());
     let remote_sshid = Arc::new(std::sync::Mutex::new(None));
@@ -4161,12 +4200,10 @@ async fn run_exec_with_russh(
         )));
     }
 
-    let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
-        .await
-        .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
-    // russh client end of the loopback exec bridge — disable Nagle so keystroke
-    // and PTY tinygrams don't stall on delayed ACKs.
-    set_tcp_nodelay_best_effort(&stream);
+    let stream =
+        openshell_core::net::connect_tcp_nodelay_best_effort(("127.0.0.1", local_proxy_port))
+            .await
+            .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
 
     let config = Arc::new(exec_ssh_client_config());
     let remote_sshid = Arc::new(std::sync::Mutex::new(None));
@@ -4693,9 +4730,9 @@ mod tests {
         })
     }
 
-    fn sandbox_connection_count(state: &ServerState, sandbox_id: &str) -> u32 {
-        state
-            .ssh_connections_by_sandbox
+    fn sandbox_connection_count(state: &ServerState, budget: RelayBudget, sandbox_id: &str) -> u32 {
+        budget
+            .counts(state)
             .lock()
             .unwrap()
             .get(sandbox_id)
@@ -4722,10 +4759,13 @@ mod tests {
             "no per-token accounting without a token"
         );
         assert!(state.ssh_connections_by_token.lock().unwrap().is_empty());
-        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 1);
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
+            1
+        );
         drop(guard);
         assert_eq!(
-            sandbox_connection_count(&state, sandbox.object_id()),
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
             0,
             "dropping the guard releases the sandbox slot"
         );
@@ -4820,7 +4860,10 @@ mod tests {
             err.message(),
             "authorization_token is required for SSH targets"
         );
-        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Ssh, sandbox.object_id()),
+            0
+        );
         assert_ssh_token_failure(&events, "missing_credential", "");
     }
 
@@ -4839,7 +4882,10 @@ mod tests {
 
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
         assert_eq!(err.message(), "SSH session token not found");
-        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
+            0
+        );
         assert_ssh_token_failure(&events, "invalid_credential", "canary-ssh-token-unknown");
     }
 
@@ -4953,13 +4999,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_forwards_without_token_share_the_per_sandbox_connection_cap() {
+    async fn tcp_forwards_are_capped_per_sandbox() {
         let state = test_server_state().await;
         let sandbox = test_sandbox("fwd", Vec::new());
         let init = forward_init(loopback_tcp_target(), "");
+        let cap = openshell_core::config::DEFAULT_MAX_CONNECTIONS_PER_SANDBOX;
 
         let mut guards = Vec::new();
-        for _ in 0..MAX_CONNECTIONS_PER_SANDBOX {
+        for _ in 0..cap {
             guards.push(
                 acquire_forward_connection_guard(&state, &forward_caller(), &init, &sandbox)
                     .await
@@ -4971,10 +5018,13 @@ mod tests {
             .err()
             .expect("cap reached");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(err.message(), "sandbox SSH connection limit reached");
         assert_eq!(
-            sandbox_connection_count(&state, sandbox.object_id()),
-            MAX_CONNECTIONS_PER_SANDBOX
+            err.message(),
+            "sandbox service forward connection limit reached"
+        );
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
+            cap
         );
 
         guards.pop();
@@ -4983,7 +5033,65 @@ mod tests {
             .expect("slot freed by a closed connection");
         drop(guard);
         drop(guards);
-        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_and_service_budgets_are_independent() {
+        let mut state = test_server_state().await;
+        {
+            let config = &mut Arc::get_mut(&mut state).expect("sole state owner").config;
+            config.max_ssh_connections_per_sandbox = 1;
+            config.max_service_connections_per_sandbox = 2;
+        }
+        let sandbox = test_sandbox("fwd", Vec::new());
+        store_ssh_session(&state, "canary-ssh-token-a", "sandbox-fwd", false, 0).await;
+        store_ssh_session(&state, "canary-ssh-token-b", "sandbox-fwd", false, 0).await;
+        let tcp = forward_init(loopback_tcp_target(), "");
+        let ssh = |token: &str| {
+            forward_init(
+                tcp_forward_init::Target::Ssh(SshRelayTarget::default()),
+                token,
+            )
+        };
+        let acquire = |init: TcpForwardInit| {
+            let state = state.clone();
+            let sandbox = sandbox.clone();
+            async move {
+                acquire_forward_connection_guard(&state, &forward_caller(), &init, &sandbox).await
+            }
+        };
+
+        let _forwards = [
+            acquire(tcp.clone()).await.expect("first forward"),
+            acquire(tcp.clone()).await.expect("second forward"),
+        ];
+        let err = acquire(tcp).await.err().expect("forward budget spent");
+        assert_eq!(
+            err.message(),
+            "sandbox service forward connection limit reached"
+        );
+
+        let _ssh = acquire(ssh("canary-ssh-token-a"))
+            .await
+            .expect("open forwards leave the SSH budget alone");
+        let err = acquire(ssh("canary-ssh-token-b"))
+            .await
+            .err()
+            .expect("SSH budget spent");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(err.message(), "sandbox SSH connection limit reached");
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Ssh, sandbox.object_id()),
+            1
+        );
+        assert_eq!(
+            sandbox_connection_count(&state, RelayBudget::Service, sandbox.object_id()),
+            2
+        );
     }
 
     #[test]
@@ -5272,6 +5380,70 @@ mod tests {
             traced.spans_named("disconnected_watch_request").len(),
             1,
             "watch producer should release the request span after client disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_only_watch_ends_when_sweeper_frees_sandbox_deleted_elsewhere() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("swept", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                follow_logs: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stream = response.into_inner();
+
+        // A delivered log line proves the watch has subscribed.
+        seed_log_lines(&state, &id, 1);
+        loop {
+            let event = stream.next().await.unwrap().unwrap();
+            if !event.cursor.is_empty() {
+                break;
+            }
+        }
+
+        // Another replica deletes the record; this one never runs delete cleanup.
+        state
+            .store
+            .delete(Sandbox::object_type(), &id)
+            .await
+            .unwrap();
+        let mut suspects = HashSet::new();
+        for expected in [0, 1] {
+            let closed = crate::bus_sweeper::sweep_once(
+                &state.store,
+                &state.tracing_log_bus,
+                std::time::Duration::ZERO,
+                &mut suspects,
+            )
+            .await
+            .unwrap();
+            assert_eq!(closed, expected);
+        }
+
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(item) = stream.next().await {
+                if item.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "logs-only watch should end once its buffers are freed"
         );
     }
 

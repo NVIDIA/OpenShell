@@ -124,8 +124,7 @@ plugin through its Windows `.cmd` launcher, and installs the matching locked
 ARM64 Rolldown binding when Node itself is ARM64. The helper preserves lockfile
 resolution; it must not upgrade unrelated test dependencies.
 
-`mise run --skip-tools go:ci` retains race detection except on Windows ARM64,
-where Go does not support it. Windows token-file tests explicitly skip POSIX
+Windows token-file tests explicitly skip POSIX
 mode-bit assertions; those skips do not establish Windows ACL protection.
 Use a checkout with LF text files when running Unix-shell fixture checks.
 
@@ -224,7 +223,7 @@ Adapted from the handover notes in NVIDIA/OpenShell#4629 by Evan Lezar.
 
 ### Running suites in a tmachine environment (`tests/runner/`)
 
-`openshell-test-runner` runs a test family inside a tmachine VM, against the
+`openshell-test-runner run` runs a test family inside a tmachine VM, against the
 OpenShell that the VM's installer set up. `--family` is the path of the
 workspace under `tests/suites/`, such as `conformance` or `drivers/podman`, and
 `--package` narrows it to some of its packages. It must name a workspace, so
@@ -233,7 +232,7 @@ selects every row whose family is that name or lies under it, so `drivers`
 selects all the driver suites.
 
 ```shell
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful --installer deb \
   --family conformance --package conformance
 ```
@@ -248,7 +247,21 @@ complete, for example because the environment didn't come up. It writes
 `artifacts/test-results/` (`--results`), even when the run timed out.
 
 `--filter <filterset>` narrows the tests with a nextest filterset, and
-`--keep` leaves the VM running until you press Enter. Two runs on one host
+`--keep` leaves the VM running until you press Enter. `--program <path>` runs a
+prebuilt testkit program, such as a static `openshell-conformance` for the
+guest's architecture, instead of building the family's tests; it can't be
+combined with `--package`. With it, `--filter` (repeatable) takes parts of test
+names, as the program does, such as `--filter policy_advisor::`, rather than a
+nextest filterset. The runner runs the program's `ready`
+and `run` commands in the guest and still writes `junit.xml` and `nextest.log`
+(the program's output) to the results directory. Branch E2E builds
+`openshell-conformance` once and passes it to every conformance row this way.
+
+`openshell-test-runner build --family <family> --out <dir>` builds a family's
+test bundle for the guest without booting a VM, and `run --bundle <dir>` runs
+it instead of building one. `--package` then selects the tests to run from the
+bundle, which must hold those packages. Branch E2E builds the `features` and
+`drivers/podman` bundles once and passes them to their rows this way. Two runs on one host
 need different `TMACHINE_SSH_PORT` values (default 2222). The installer
 inputs, such as the Debian package and the images, come from `artifacts/`,
 built by `nix run .#build-artifacts` or downloaded by CI.
@@ -312,7 +325,7 @@ The Keycloak fixture is `tests/support/keycloak`. Run the suite that uses it
 with:
 
 ```shell
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful-keycloak --installer deb \
   --family features --package keycloak-provider-refresh
 ```
@@ -424,11 +437,14 @@ Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
 - Conformance (`tests/suites/conformance`) - the testkit `conformance` crate:
-  lifecycle, the CLI, persistent workspaces, file transfer, and the policy
-  advisor. Driver E2E runs it with `openshell-conformance` against the lane's
-  gateway and writes a JUnit report under `results/`; set
-  `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program, as Branch E2E does
-  with the static build it makes once per architecture. The
+  lifecycle, the CLI, persistent workspaces, file transfer, the policy
+  advisor, and credential gating. Driver E2E runs it with
+  `openshell-conformance` against the lane's gateway and writes a JUnit report
+  under `results/`; set `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program,
+  as Branch E2E does with the static build it makes once per architecture.
+  The Docker and Podman runners build `openshell/e2e-python:dev` for it; the
+  Kubernetes and VM runners set `OPENSHELL_TEST_PYTHON_IMAGE` to a pullable
+  Python image unless it is already set. The
   installed-artifact conformance lanes run the same crate through
   `openshell-test-runner` (see above).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
@@ -515,7 +531,7 @@ rebuilds only the RPMs. Run conformance against the installed RPMs:
 
 ```shell
 nix run .#build-artifacts
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment fedora-podman-rootful --installer rpm \
   --family conformance --package conformance
 ```
@@ -524,7 +540,7 @@ Run the portable subset in a disposable rootless Podman guest:
 
 ```shell
 nix run .#build-artifacts
-nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
+nix run .#tmachine -- test fedora-podman-rootless rpm e2e-podman
 ```
 
 Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
@@ -549,14 +565,40 @@ matching lines in `branch-checks.yml`, and `ALIGNED_WORKSPACES`. The Podman
 driver suite (`tests/suites/drivers/podman`) compares OpenShell and direct
 Podman user-namespace mappings.
 Each `fedora-podman-{rootful,rootless}-userns-<mode>` environment configures
-the gateway with one mode (`default`, `auto`, `keep-id` or `private`); only the
-`binaries` installer applies it:
+the gateway with one mode (`default`, `auto`, `keep-id` or `private`) and works
+with every installer; CI runs it with `rpm`:
 
 ```shell
-nix run .#openshell-test-runner -- \
-  --environment fedora-podman-rootless-userns-keep-id --installer binaries \
-  --gateway tmachine --family drivers/podman
+nix run .#openshell-test-runner -- run \
+  --environment fedora-podman-rootless-userns-keep-id --installer rpm \
+  --family drivers/podman
 ```
+
+#### Gateway overrides in an environment
+
+An environment overrides gateway settings by writing the tables to change to
+`/etc/openshell-test/gateway-overrides.toml` in a playbook that runs before the
+installer. The file holds whole tables, such as `[openshell.gateway]` or
+`[openshell.drivers.podman]`, and is not a complete configuration. Each
+installer applies it to the gateway's own file:
+
+- `binaries` applies it to the `/etc/openshell/gateway.toml` it generates.
+- `deb` and `rpm` apply it to the service user's
+  `~/.config/openshell/gateway.toml`, the file the packaged service reads. The
+  file starts as a copy of the rpm's
+  `/usr/share/openshell-gateway/gateway.toml.default`, where the service would
+  seed it on first start, or as a minimal `version = 2` file when the package
+  has no default. No environment replaces the packaged file, and an environment
+  with no overrides leaves it untouched.
+- `k3s` installers ignore the file.
+
+`tests/tmachine/ansible/roles/openshell_gateway/files/merge-gateway-toml.py`
+does the work. Each key in the overrides replaces the same key in the table, or
+is added to it, and a table the file lacks is appended. The rest of the file,
+comments included, stays. The script parses the result and fails the setup,
+leaving the file unchanged, when it isn't valid TOML. It can't remove a key.
+Settings that the packaged service reads from `gateway.env` instead of the
+TOML are not covered.
 
 The `oci-image` feature suite (`tests/suites/features/oci-image`) checks OCI
 image identity and working-directory behavior shared by the Docker and Podman
@@ -564,7 +606,7 @@ drivers against installed deb packages on Ubuntu and rpm packages on Fedora.
 CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
 
 ```shell
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful --installer deb \
   --family features --package oci-image
 ```
@@ -656,6 +698,10 @@ explains the isolation backend separation behind the capability-free runtime.
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
 on the sandbox-side `host.openshell.internal` alias reaching the machine running
 the tests, which is unreachable from pods on a remote cluster, so they fail.
+The conformance suite's `credential_gating` tests need the alias to reach that
+machine too, and the feature selection doesn't skip them, so they fail on a
+remote cluster. [#5409](https://github.com/NVIDIA/OpenShell/issues/5409)
+tracks handling that.
 Left enabled, the `host_gateway_alias` suite fails because
 `host.openshell.internal` does not resolve inside the pod, so the gateway
 SSRF-denies the request (`DNS resolution failed` / `ssrf_denied`) — a networking

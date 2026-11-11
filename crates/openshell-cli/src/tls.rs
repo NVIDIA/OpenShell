@@ -360,8 +360,10 @@ pub(crate) async fn frozen_policies_client(
     server: &str,
     tls: &TlsOptions,
 ) -> Result<
-    openshell_sdk::raw::FrozenSandboxPoliciesClient<
-        tonic::service::interceptor::InterceptedService<Channel, GatewayInterceptor>,
+    Option<
+        openshell_sdk::raw::FrozenSandboxPoliciesClient<
+            tonic::service::interceptor::InterceptedService<Channel, GatewayInterceptor>,
+        >,
     >,
 > {
     let client = sdk_client(server, tls).await?;
@@ -369,12 +371,14 @@ pub(crate) async fn frozen_policies_client(
         auth: client.auth_interceptor(),
         trace: EnvTraceContextInterceptor::from_env(),
     };
-    Ok(
-        openshell_sdk::raw::FrozenSandboxPoliciesClient::with_interceptor(
-            client.channel(),
-            interceptor,
-        ),
-    )
+    let channel =
+        tonic::service::interceptor::InterceptedService::new(client.channel(), interceptor);
+    if !openshell_core::grpc_client::frozen_policies_supported(channel.clone()).await? {
+        return Ok(None);
+    }
+    Ok(Some(openshell_sdk::raw::FrozenSandboxPoliciesClient::new(
+        channel,
+    )))
 }
 
 async fn sdk_client(server: &str, tls: &TlsOptions) -> Result<OpenShellClient> {

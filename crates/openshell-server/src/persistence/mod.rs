@@ -21,7 +21,7 @@ pub use crate::storage_proto::{
 use openshell_core::{Error as CoreError, Result as CoreResult};
 use prost::Message;
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 pub use mutation_lock::{LockMode, MutationLockKey, MutationLockSet};
@@ -40,6 +40,11 @@ pub type PersistenceResult<T> = Result<T, PersistenceError>;
 /// Keep this well below `SQLite`'s bind-variable limit. Backends split larger
 /// requests into independently retryable, bounded write statements.
 pub const DELETE_MANY_BATCH_SIZE: usize = 128;
+
+/// Maximum number of object ids sent in one existence lookup.
+///
+/// Keep this well below `SQLite`'s bind-variable limit.
+pub const EXISTING_IDS_BATCH_SIZE: usize = 500;
 
 /// Persistence-layer error type.
 #[derive(Debug, Error, Clone)]
@@ -829,6 +834,28 @@ impl Store {
     )]
     pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
         store_dispatch_traced!(self.delete_many(object_type, ids))
+    }
+
+    /// Return the subset of `ids` that exist for an object type, using bounded
+    /// primary-key lookups.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(
+            otel.name = "store.existing_ids",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            object_count = ids.len(),
+            batch_count = ids.len().div_ceil(EXISTING_IDS_BATCH_SIZE),
+        )
+    )]
+    pub async fn existing_ids(
+        &self,
+        object_type: &str,
+        ids: &[String],
+    ) -> PersistenceResult<HashSet<String>> {
+        store_dispatch_traced!(self.existing_ids(object_type, ids))
     }
 
     /// Count objects of a given type within a workspace.

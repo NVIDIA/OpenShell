@@ -1832,7 +1832,9 @@ mod tests {
         path: &str,
         headers: &[(&str, &str)],
     ) -> Response<Incoming> {
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
             .handshake(TokioIo::new(stream))
             .await

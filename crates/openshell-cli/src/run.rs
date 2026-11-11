@@ -753,7 +753,9 @@ async fn sandbox_create_with_mode(
 
     let created = if frozen {
         let mut frozen_client =
-            crate::tls::frozen_policies_client(&effective_server, &effective_tls).await?;
+            crate::tls::frozen_policies_client(&effective_server, &effective_tls)
+                .await?
+                .ok_or_else(|| miette!("this gateway does not support frozen sandbox policies"))?;
         frozen_client
             .create_sandbox(openshell_core::proto::CreateFrozenSandboxRequest {
                 workspace_scope: request.workspace_scope,
@@ -3116,20 +3118,17 @@ async fn frozen_policy_state(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<openshell_core::proto::FrozenSandboxPolicyState> {
-    let mut client = crate::tls::frozen_policies_client(server, tls).await?;
-    match client
+    let Some(mut client) = crate::tls::frozen_policies_client(server, tls).await? else {
+        return Ok(openshell_core::proto::FrozenSandboxPolicyState::default());
+    };
+    client
         .get_policy(openshell_core::proto::GetFrozenSandboxPolicyRequest {
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             name: name.to_string(),
         })
         .await
-    {
-        Ok(response) => Ok(response.into_inner()),
-        Err(status) if status.code() == Code::Unimplemented => {
-            Ok(openshell_core::proto::FrozenSandboxPolicyState::default())
-        }
-        Err(error) => Err(error).into_diagnostic(),
-    }
+        .map(tonic::Response::into_inner)
+        .into_diagnostic()
 }
 
 fn append_frozen_policy_json(
@@ -4872,6 +4871,7 @@ pub async fn workspace_create(
     server: &str,
     name: &str,
     label_args: &[String],
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     use openshell_core::proto::CreateWorkspaceRequest;
@@ -4899,6 +4899,10 @@ pub async fn workspace_create(
         .workspace
         .ok_or_else(|| miette!("workspace missing from response"))?;
 
+    if crate::output::print_output_single(output, &workspace, workspace_to_json)? {
+        return Ok(());
+    }
+
     println!(
         "{} Created workspace {}",
         "✓".green().bold(),
@@ -4908,7 +4912,7 @@ pub async fn workspace_create(
     Ok(())
 }
 
-pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn workspace_get(server: &str, name: &str, output: &str, tls: &TlsOptions) -> Result<()> {
     use openshell_core::proto::GetWorkspaceRequest;
 
     let mut client = grpc_client(server, tls).await?;
@@ -4923,6 +4927,10 @@ pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result
         .into_inner()
         .workspace
         .ok_or_else(|| miette!("workspace missing from response"))?;
+
+    if crate::output::print_output_single(output, &workspace, workspace_to_json)? {
+        return Ok(());
+    }
 
     println!("{}", "Workspace:".cyan().bold());
     println!();
@@ -5555,7 +5563,15 @@ async fn update_global_config_with_frozen_report(
     tls: &TlsOptions,
     request: UpdateConfigRequest,
 ) -> Result<(openshell_core::proto::UpdateConfigResponse, Vec<String>)> {
-    let mut client = crate::tls::frozen_policies_client(server, tls).await?;
+    let Some(mut client) = crate::tls::frozen_policies_client(server, tls).await? else {
+        let update = grpc_client(server, tls)
+            .await?
+            .update_config(request)
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        return Ok((update, Vec::new()));
+    };
     let response = client
         .update_global_config(openshell_core::proto::UpdateFrozenGlobalConfigRequest {
             workspace_scope: request.workspace_scope.clone(),
@@ -5578,17 +5594,6 @@ async fn update_global_config_with_frozen_report(
                 .update
                 .ok_or_else(|| miette!("gateway returned no global configuration result"))?;
             Ok((update, response.frozen_sandboxes))
-        }
-        Err(status) if status.code() == Code::Unimplemented => {
-            // Ordinary global commands keep working with pre-feature gateways;
-            // explicit frozen creation has no such fallback.
-            let update = grpc_client(server, tls)
-                .await?
-                .update_config(request)
-                .await
-                .into_diagnostic()?
-                .into_inner();
-            Ok((update, Vec::new()))
         }
         Err(status) => Err(status).into_diagnostic(),
     }

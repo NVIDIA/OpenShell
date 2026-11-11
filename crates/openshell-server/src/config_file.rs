@@ -146,9 +146,19 @@ pub struct GatewayFileSection {
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
+    /// Per-sandbox cap on concurrent SSH relays; omit to keep the default of 20.
+    #[serde(default)]
+    pub max_ssh_connections_per_sandbox: Option<u32>,
+    /// Per-sandbox cap on concurrent service forward relays; omit to keep the
+    /// default of 20.
+    #[serde(default)]
+    pub max_service_connections_per_sandbox: Option<u32>,
     /// Absolute preparation budget for new attempts; existing deadlines persist.
     #[serde(default)]
     pub image_preparation_timeout_seconds: Option<u32>,
+    /// Admission repair window in seconds, between 1 and 86400.
+    #[serde(default)]
+    pub provisioning_repair_window_seconds: Option<i64>,
     /// Explicit activation only after the compatible deployment rollout ends.
     #[serde(default)]
     pub enable_sandbox_updates: Option<bool>,

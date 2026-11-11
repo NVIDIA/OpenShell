@@ -1881,7 +1881,7 @@ async fn sandbox_create_frozen_rejects_unsupported_gateway_before_creation() {
 
             let message = error.to_string();
             assert!(
-                message.contains(tonic::Code::Unimplemented.description()),
+                message.contains("does not support frozen sandbox policies"),
                 "{message}"
             );
             assert!(create_requests(&server).await.is_empty());
@@ -3854,6 +3854,7 @@ fn write_oidc_test_credentials(
             expires_at: Some(expires_at),
             issuer: issuer.to_string(),
             client_id: "openshell-cli".to_string(),
+            client_credentials: false,
         })
         .unwrap(),
     )
@@ -4161,7 +4162,7 @@ async fn echo_through_local_forward<T>(
             !forward.is_finished(),
             "service forward exited before the local listener opened"
         );
-        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+        match openshell_core::net::connect_tcp_nodelay_best_effort(("127.0.0.1", port)).await {
             Ok(stream) => break stream,
             Err(err) => {
                 assert!(

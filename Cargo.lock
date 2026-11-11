@@ -128,7 +128,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -139,7 +139,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1421,7 +1421,7 @@ dependencies = [
  "document-features",
  "mio",
  "parking_lot",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "signal-hook",
  "signal-hook-mio",
  "winapi",
@@ -2032,7 +2032,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4067,7 +4067,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4412,6 +4412,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wiremock",
 ]
 
 [[package]]
@@ -4438,7 +4439,7 @@ dependencies = [
  "protoc-bin-vendored",
  "rcgen",
  "reqwest 0.12.28",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "rustls",
  "serde",
  "serde_json",
@@ -4452,6 +4453,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tonic-reflection",
  "tonic-types",
  "tracing",
  "tracing-subscriber",
@@ -4477,7 +4479,7 @@ dependencies = [
  "openshell-driver-vault",
  "prost-types",
  "reqwest 0.12.28",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "tempfile",
@@ -4550,7 +4552,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prost-types",
  "rand 0.9.4",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4680,7 +4682,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prost-types",
  "rcgen",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4755,7 +4757,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4809,7 +4811,7 @@ dependencies = [
  "openshell-policy",
  "openshell-server",
  "rcgen",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "tempfile",
@@ -5028,7 +5030,7 @@ dependencies = [
  "rand 0.10.2",
  "rcgen",
  "russh-sftp",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "rustls",
  "seccompiler",
  "serde",
@@ -5060,7 +5062,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "rustls",
  "serde",
  "serde_json",
@@ -5168,7 +5170,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rsa 0.9.10",
  "russh",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -5233,7 +5235,7 @@ dependencies = [
  "opentelemetry-proto",
  "prost",
  "prost-types",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "rustls",
  "serde",
  "serde_json",
@@ -5346,7 +5348,7 @@ dependencies = [
  "rcgen",
  "regorus",
  "reqwest 0.12.28",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "rustls",
  "rustls-native-certs",
  "serde",
@@ -5387,7 +5389,7 @@ dependencies = [
  "openshell-sandbox-backend",
  "rand 0.10.2",
  "russh",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -6027,7 +6029,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi",
  "pin-project-lite",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "windows-sys 0.61.2",
 ]
 
@@ -6712,7 +6714,6 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
- "serde_yaml",
  "spin",
  "thiserror 2.0.20",
 ]
@@ -7040,15 +7041,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7121,7 +7122,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7637,7 +7638,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8119,8 +8120,8 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.2",
  "once_cell",
- "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "rustix 1.1.6",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8131,9 +8132,9 @@ checksum = "9048a889effe34a5cddee0af7f53285198b16dca3be510858d38dfdb3e62a04e"
 dependencies = [
  "bitflags 2.13.2",
  "parking_lot",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "signal-hook",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8168,8 +8169,8 @@ version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
- "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "rustix 1.1.6",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9300,7 +9301,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9836,7 +9837,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
- "rustix 1.1.4",
+ "rustix 1.1.6",
 ]
 
 [[package]]

@@ -25,7 +25,7 @@ fn allowed_decision(intent: EgressIntent) -> EgressDecision {
 
 async fn tcp_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap())
+    let client = connect_tcp_nodelay_best_effort(listener.local_addr().unwrap())
         .await
         .unwrap();
     let (server, _) = listener.accept().await.unwrap();
@@ -471,7 +471,7 @@ async fn forward_https_absolute_form_rejection_is_snapshotted() {
 }
 
 async fn exercise_benchmark_request(proxy_addr: SocketAddr, target: SocketAddr, connect: bool) {
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut client = connect_tcp_nodelay_best_effort(proxy_addr).await.unwrap();
     let authority = target.to_string();
     let request = if connect {
         format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n")

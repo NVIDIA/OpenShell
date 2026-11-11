@@ -382,15 +382,14 @@ These are the primary `mise` tasks for day-to-day development:
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
-| `python/`       | Python SDK and bindings                       |
-| `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
+| `python/`       | Python SDK (frozen, moved to ai-openshell/sdk-python) |
 | `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `tests/testkit/` | Support library for SDK-driven end-to-end suites |
 | `tests/suites/` | End-to-end suites, grouped by test family |
 | `tests/tmachine/` | QEMU test machines provisioned with Ansible, and the `Session` API that drives them |
-| `tests/runner/` | `openshell-test-runner`: runs a test family in a tmachine environment and checks the results |
+| `tests/runner/` | `openshell-test-runner`: builds a test family for tmachine guests, runs it in a tmachine environment and checks the results |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |

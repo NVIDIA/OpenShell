@@ -540,7 +540,9 @@ mod tests {
         ));
 
         // Simulate a browser XHR POST.
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let body = r#"{"token":"test-jwt-123","code":"ABC-1234"}"#;
         let request = format!(
             "POST /callback HTTP/1.1\r\n\
@@ -571,7 +573,9 @@ mod tests {
             TEST_GATEWAY.to_string(),
         ));
 
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let body = r#"{"token":"jwt","code":"ABC-1234"}"#;
         let request = format!(
             "POST /callback HTTP/1.1\r\n\
@@ -616,7 +620,9 @@ mod tests {
             TEST_GATEWAY.to_string(),
         ));
 
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let body = r#"{"token":"jwt","code":"ABC-1234"}"#;
         let request = format!(
             "POST /callback HTTP/1.1\r\n\
@@ -663,7 +669,9 @@ mod tests {
         ));
 
         // POST without Origin header.
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let body = r#"{"token":"jwt","code":"ABC-1234"}"#;
         let request = format!(
             "POST /callback HTTP/1.1\r\n\
@@ -707,7 +715,9 @@ mod tests {
             TEST_GATEWAY.to_string(),
         ));
 
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let body = r#"{"token":"test-jwt","code":"WRONG-CODE"}"#;
         let request = format!(
             "POST /callback HTTP/1.1\r\n\
@@ -755,7 +765,9 @@ mod tests {
         ));
 
         // POST with no body.
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let request = format!(
             "POST /callback HTTP/1.1\r\n\
              Host: 127.0.0.1\r\n\
@@ -792,7 +804,9 @@ mod tests {
         ));
 
         // Send OPTIONS preflight with correct origin.
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let preflight = format!(
             "OPTIONS /callback HTTP/1.1\r\n\
              Host: 127.0.0.1\r\n\
@@ -816,7 +830,9 @@ mod tests {
         );
 
         // Now send the actual POST — the server should still be listening.
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let body = r#"{"token":"jwt-after-preflight","code":"ABC-1234"}"#;
         let request = format!(
             "POST /callback HTTP/1.1\r\n\
@@ -847,7 +863,9 @@ mod tests {
             TEST_GATEWAY.to_string(),
         ));
 
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let body = r#"{"token":"fragmented-jwt","code":"ABC-1234"}"#;
         let headers = format!(
             "POST /callback HTTP/1.1\r\n\
@@ -880,7 +898,9 @@ mod tests {
             TEST_GATEWAY.to_string(),
         ));
 
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let request = format!(
             "GET /callback?token=jwt&code=ABC-1234 HTTP/1.1\r\n\
              Host: 127.0.0.1\r\n\

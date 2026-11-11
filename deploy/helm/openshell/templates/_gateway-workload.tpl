@@ -234,7 +234,7 @@ spec:
         - name: health
           containerPort: {{ .Values.service.healthPort }}
           protocol: TCP
-        {{- if .Values.service.metricsPort }}
+        {{- if include "openshell.metricsEnabled" . }}
         - name: metrics
           containerPort: {{ .Values.service.metricsPort }}
           protocol: TCP
