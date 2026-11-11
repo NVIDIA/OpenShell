@@ -1,0 +1,28 @@
+{
+  "boundary_id": "sbx-0001",
+  "generation": "g0000000000000001",
+  "session_id": "7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14",
+  "workload_identity": {
+    "uid": 1000,
+    "gid": 1000,
+    "supplementary_gids": [],
+    "source": "image",
+    "resource_digest": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+  },
+  "transport": {
+    "kind": "runtime-initiated-unix",
+    "socket_path": "/run/openshell/supervisor.sock"
+  },
+  "tls": {
+    "server_name": "sandbox.7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14.openshell.internal",
+    "trust_anchor_pem": "-----BEGIN CERTIFICATE-----\nMIIBexample\n-----END CERTIFICATE-----\n"
+  },
+  "host_gateway_ip": "172.17.0.1",
+  "resource_claims": {
+    "docker.container_id": "c0ffee0123"
+  },
+  "provisioning_evidence": {
+    "generation": "g0000000000000001",
+    "evidence_digest": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+  }
+}

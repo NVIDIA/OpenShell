@@ -46,8 +46,9 @@ pub const ROUTE_PREFACE_VERSION: u8 = 1;
 /// [`RouteReply`] before the TLS handshake.
 pub const ROUTE_PREFACE_VERSION_V2: u8 = 2;
 /// Longest accepted route handle, in bytes.
-pub const MAX_ROUTE_HANDLE_LEN: usize = 64;
-const MIN_ROUTE_HANDLE_LEN: usize = 16;
+pub use openshell_driver_sdk::legacy_contract::{
+    MAX_ROUTE_HANDLE_LEN, MIN_ROUTE_HANDLE_LEN, validate_route_handle,
+};
 /// Status bytes of a version 2 reply. An accept and a redirect are followed
 /// by a length byte and a runtime listener address as ASCII `ip:port`: the
 /// accepting member's own (empty while it knows no directory) or the owner's.
@@ -65,23 +66,6 @@ const MAX_PENDING_HANDSHAKES_PER_ROUTE: usize = 4;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Authenticated connections queued for a sandbox instance but not yet claimed.
 const MAX_QUEUED_CONNECTIONS: usize = 2;
-
-/// Validate an opaque route handle: 16 to 64 lowercase ASCII letters, digits,
-/// or hyphens.
-pub fn validate_route_handle(handle: &str) -> Result<(), BackendError> {
-    let valid = (MIN_ROUTE_HANDLE_LEN..=MAX_ROUTE_HANDLE_LEN).contains(&handle.len())
-        && handle
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if valid {
-        Ok(())
-    } else {
-        Err(BackendError::Descriptor(
-            "runtime route handle must be 16 to 64 lowercase letters, digits, or hyphens"
-                .to_string(),
-        ))
-    }
-}
 
 /// Generate a fresh opaque route handle for one runtime generation.
 #[must_use]

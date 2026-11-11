@@ -42,6 +42,11 @@ use openshell_driver_sdk::driver_utils::{
     SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED,
 };
 use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
+use openshell_driver_sdk::legacy_contract::ResolvedWorkloadIdentity;
+use openshell_driver_sdk::legacy_contract::{
+    BoundaryConfig, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
+    SandboxTlsServerConfig, generate_sandbox_tls_material,
+};
 use openshell_driver_sdk::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -63,11 +68,6 @@ use openshell_driver_sdk::proto_struct::struct_to_json_value;
 use openshell_driver_sdk::{
     AppArmorProfile, Error, ImagePullPolicy, NetworkSupervisorTrustBundle, Result as CoreResult,
     UpstreamProxyConfig,
-};
-use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
-use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
-    SandboxTlsServerConfig, generate_sandbox_tls_material,
 };
 use opentelemetry::trace::TraceContextExt as _;
 use sha2::{Digest as _, Sha256};
@@ -127,9 +127,10 @@ const SUPERVISOR_PROXY_CA_BUNDLE_MOUNT_PATH: &str =
     "/.openshell/supervisor/upstream-proxy-ca-bundle.pem";
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_container_runtime::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
-const DRIVER_ADMITTED_BACKEND: &str = openshell_sandbox_backend::BACKEND_NAME;
+const DRIVER_ADMITTED_BACKEND: &str = openshell_driver_sdk::legacy_contract::BUILTIN_BACKEND_NAME;
 const LABEL_ISOLATION_BACKEND: &str = "openshell.ai/isolation-backend";
-const LABEL_ISOLATION_BACKEND_OPEN_SHELL: &str = openshell_sandbox_backend::BACKEND_NAME;
+const LABEL_ISOLATION_BACKEND_OPEN_SHELL: &str =
+    openshell_driver_sdk::legacy_contract::BUILTIN_BACKEND_NAME;
 const LABEL_ISOLATION_ROLE: &str = "openshell.ai/isolation-role";
 const LABEL_ISOLATION_ROLE_SANDBOX: &str = "sandbox";
 const LABEL_ISOLATION_ROLE_SUPERVISOR: &str = "supervisor";
@@ -5083,8 +5084,14 @@ async fn stage_docker_supervisor_bundle(
             Some(RemoveContainerOptionsBuilder::default().force(true).build()),
         )
         .await;
-    let runtime_initiated = read_docker_runtime_descriptor(&sandbox.id, config).await?
-        .is_some_and(|descriptor| matches!(descriptor.transport, openshell_sandbox_backend::boundary_protocol::SandboxTransport::RuntimeInitiatedUnix { .. }));
+    let runtime_initiated = read_docker_runtime_descriptor(&sandbox.id, config)
+        .await?
+        .is_some_and(|descriptor| {
+            matches!(
+                descriptor.transport,
+                openshell_driver_sdk::legacy_contract::SandboxTransport::RuntimeInitiatedUnix { .. }
+            )
+        });
     let mut mounts = vec![Mount {
         target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
         source: Some(docker_supervisor_volume_name(sandbox, config)),
@@ -5523,8 +5530,14 @@ async fn spawn_docker_control_process(
         &config.upstream_proxy,
         config.proxy_ca_bundle.is_some(),
     ));
-    let runtime_initiated = read_docker_runtime_descriptor(&sandbox.id, config).await?
-        .is_some_and(|descriptor| matches!(descriptor.transport, openshell_sandbox_backend::boundary_protocol::SandboxTransport::RuntimeInitiatedUnix { .. }));
+    let runtime_initiated = read_docker_runtime_descriptor(&sandbox.id, config)
+        .await?
+        .is_some_and(|descriptor| {
+            matches!(
+                descriptor.transport,
+                openshell_driver_sdk::legacy_contract::SandboxTransport::RuntimeInitiatedUnix { .. }
+            )
+        });
     command.extend(docker_network_trust_supervisor_args(
         config.network_trust.as_ref(),
     ));
@@ -6368,7 +6381,7 @@ fn build_container_create_body_for_image(
             // exactly as written so short names never expand to host domains.
             dns_search: Some(vec![".".to_string()]),
             tmpfs: Some(HashMap::from([(
-                openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR.to_string(),
+                openshell_driver_sdk::legacy_contract::SUPERVISOR_CA_RUNTIME_DIR.to_string(),
                 format!(
                     "rw,noexec,nosuid,nodev,size=1m,uid={},gid={},mode=0755",
                     workload_identity.uid, workload_identity.gid

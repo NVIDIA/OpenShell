@@ -2184,6 +2184,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "rcgen",
  "rustix 1.1.6",
  "rustls",
  "serde",
@@ -2218,6 +2219,7 @@ name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
  "openshell-core",
+ "openshell-driver-sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2246,6 +2248,7 @@ dependencies = [
  "libc",
  "openshell-core",
  "openshell-crypto",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "prost",
  "prost-types",

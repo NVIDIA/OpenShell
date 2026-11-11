@@ -3783,7 +3783,7 @@ fn build_container_create_body_limits_writable_runtime_storage_to_supervisor_ca(
 
     assert_eq!(tmpfs.len(), 1);
     assert_eq!(
-        tmpfs.get(openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR),
+        tmpfs.get(openshell_driver_sdk::legacy_contract::SUPERVISOR_CA_RUNTIME_DIR),
         Some(&"rw,noexec,nosuid,nodev,size=1m,uid=1000,gid=1000,mode=0755".to_string())
     );
     assert!(!tmpfs.contains_key("/run"));

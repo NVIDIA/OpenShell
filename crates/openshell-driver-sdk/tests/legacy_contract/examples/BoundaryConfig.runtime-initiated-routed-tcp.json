@@ -1,0 +1,52 @@
+{
+  "boundary_id": "sbx-0002",
+  "generation": "g0000000000000001",
+  "session_id": "7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14",
+  "session_rotation": 2,
+  "auth_epoch": 3,
+  "gateway_id": "gw-test",
+  "verification_keys": [
+    {
+      "key_id": "k1",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAexampleexampleexampleexampleexampleexample=\n-----END PUBLIC KEY-----\n"
+    },
+    {
+      "key_id": "k2",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAexampleexampleexampleexampleexampleexample=\n-----END PUBLIC KEY-----\n"
+    }
+  ],
+  "listener": {
+    "kind": "runtime-initiated-tls-tcp",
+    "authority": "supervisor.openshell.svc",
+    "addresses": [
+      "10.0.0.5:8443",
+      "[fd00::5]:8443"
+    ],
+    "tls": {
+      "certificate_chain_path": "/.openshell/tls/server.crt",
+      "private_key_path": "/.openshell/tls/server.key"
+    },
+    "route": "rt-0123456789abcdef0123456789abcdef"
+  },
+  "resource_claims": {
+    "kubernetes.pod_uid": "3f1c2d4e-0000-4000-8000-000000000001"
+  },
+  "resource_claim_files": {
+    "kubernetes.pod_uid": "/etc/podinfo/uid"
+  },
+  "workload_identity": {
+    "uid": 1000,
+    "gid": 1000,
+    "supplementary_gids": [
+      1001,
+      2000
+    ],
+    "source": "image",
+    "resource_digest": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+  },
+  "provisioning_evidence": {
+    "generation": "g0000000000000001",
+    "evidence_digest": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+  },
+  "child_env": {}
+}
