@@ -4,6 +4,7 @@
 //! gRPC service implementation.
 
 mod auth_rpc;
+mod mutation_audit;
 pub mod mutation_replay;
 pub mod policy;
 pub mod provider;
@@ -395,7 +396,14 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteSandboxTemplateRequest>,
     ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox_template", &request.name)],
+            )
+        };
+        mutation_audit::deletion(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn list_sandbox_providers(
@@ -437,7 +445,14 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.name)],
+            )
+        };
+        mutation_audit::deletion(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn stop_sandbox(
@@ -532,7 +547,21 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteServiceRequest>,
     ) -> Result<Response<DeleteServiceResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("service", &request.name),
+                ],
+            )
+        };
+        mutation_audit::deletion(
+            targets,
+            Box::pin(mutation_replay::run(&self.state, request)),
+        )
+        .await
     }
 
     async fn revoke_ssh_session(
@@ -639,21 +668,45 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteProviderRefreshRequest>,
     ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("provider", &request.provider),
+                    mutation_audit::requested("provider_credential", &request.credential_key),
+                ],
+            )
+        };
+        mutation_audit::deletion(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn delete_provider(
         &self,
         request: Request<DeleteProviderRequest>,
     ) -> Result<Response<DeleteProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("provider", &request.name)],
+            )
+        };
+        mutation_audit::deletion(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn delete_provider_profile(
         &self,
         request: Request<DeleteProviderProfileRequest>,
     ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("provider_profile", &request.id)],
+            )
+        };
+        mutation_audit::deletion(targets, mutation_replay::run(&self.state, request)).await
     }
 
     // --- Config / Policy ---
@@ -892,7 +945,11 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = vec![mutation_audit::requested(
+            "workspace",
+            &request.get_ref().name,
+        )];
+        mutation_audit::deletion(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn add_workspace_member(
@@ -906,7 +963,17 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<RemoveWorkspaceMemberRequest>,
     ) -> Result<Response<RemoveWorkspaceMemberResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested(
+                    "workspace_member",
+                    &request.principal_subject,
+                )],
+            )
+        };
+        mutation_audit::deletion(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn list_workspace_members(
