@@ -1,15 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preview-first label reconciliation, with no model invocation or ticket comments.
+"""Preview and apply labels with fresh evidence and verified phased writes.
 
-One coordinated manual executor per item is required. POSIX flock serializes local
-processes only; optimistic material/event checks detect other writers, without
-claiming cross-host locking or atomic GitHub transactions. Mutations batch
-one-label serial aliases by phase. Additions and their
-independent live-label/event/material verification precede the removals request.
-Approved temporary precleanup can precede additions inside the first phase.
-The mutations remain separate, non-atomic operations.
+One coordinated executor per item is required. POSIX flock is local; GitHub
+writes are non-atomic. Additions are independently verified before removals.
 """
 from __future__ import annotations
 import argparse
@@ -26,11 +21,9 @@ import label_issue_checkpoint as checkpoint
 import label_issue_evidence as evidence
 from label_issue_github import GitHubClient
 from label_issue_policy import format_report, is_inspected_source, plan_labels
-# Bump for classifier/skill/migration semantic changes; trusted document hashes
-# are bound separately, without binding unrelated repository HEAD changes.
-POLICY_VERSION = 'openshell-labeler-policy-v4'
+# Bump when classification or reconciliation semantics change.
+POLICY_VERSION = 'openshell-labeler-policy-v5'
 DEFAULT_BOOKKEEPING_LABEL = 'meta:labeler-checkpoint'
-# Configuration selects this reviewed authority; alternate names need code review.
 APPROVED_BOOKKEEPING_LABELS = frozenset({DEFAULT_BOOKKEEPING_LABEL})
 ADD_QUERY = 'mutation($input: AddLabelsToLabelableInput!) {\n apply: addLabelsToLabelable(input: $input) { labelable { __typename } }\n}'
 REMOVE_QUERY = 'mutation($input: RemoveLabelsFromLabelableInput!) {\n apply: removeLabelsFromLabelable(input: $input) { labelable { __typename } }\n}'
@@ -111,9 +104,7 @@ def _hydrate(snapshot, api):
     # Only content in the final packet is available for subsequent inspection.
     for source in snapshot['evidence_index'].values():
         source['inspected'] = False
-    # Authority is a fetched fact, independent of which source the model reads.
-    # Resolve each distinct actor once in this hydration pass; do not mark any
-    # new source inspected merely because deterministic checks fetched its role.
+    # Fetch authority once per actor without marking their content inspected.
     authorities = {}
     for source in snapshot['evidence_index'].values():
         user = source.get('source_user') or {}

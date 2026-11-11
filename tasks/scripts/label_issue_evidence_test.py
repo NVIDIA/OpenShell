@@ -143,58 +143,44 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(facts['eligibility']['lifecycle'], 'excluded')
         self.assertTrue(any('/collaborators/writer/permission' in path for path, _ in self.api.calls))
 
-    def test_verified_stale_bot_closure_does_not_resolve_work(self):
-        self.api.item.update(state='closed', state_reason='not_planned', closed_by={'login': 'stale[bot]', 'type': 'Bot'})
-        self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'eligible')
-
-    def github_actions_stale_fixture(self):
-        # Read-only observed NVIDIA/OpenShell#4300, closed 2026-11-06.
+    def stale_closure(self, login='github-actions[bot]'):
         timestamp = '2026-11-06T08:22:30Z'
-        actor = {'login': 'github-actions[bot]', 'type': 'Bot'}
-        self.api.item.update(number=4300, state='closed', state_reason='not_planned',
-                             closed_at=timestamp, closed_by=actor)
-        self.api.lifecycle_events = [{'__typename': 'ClosedEvent', 'id': 'closed-4300',
-            'actor': {'login': actor['login']}, 'createdAt': timestamp, 'closer': None}]
-        self.api.collections['comments'] = [{'id': 430001, 'user': actor,
-            'body': 'Closing this issue after 14 days with no activity since it was marked stale. Reopen it if the work is still relevant.',
-            'created_at': timestamp, 'updated_at': timestamp}]
-        def api(path, **kwargs):
-            return self.api(path.replace('/issues/4300', '/issues/3'), **kwargs)
-        return api
+        self.api.item.update(state='closed', state_reason='not_planned',
+            labels=[{'name': 'state:stale'}], closed_at=timestamp,
+            closed_by={'login': login, 'type': 'Bot'})
+        self.api.lifecycle_events = [{'__typename': 'ClosedEvent', 'id': 'closed-3',
+            'actor': {'login': login}, 'createdAt': timestamp, 'closer': None}]
 
-    def test_current_github_actions_stale_protocol_4300_remains_eligible(self):
-        api = self.github_actions_stale_fixture()
-        self.assertEqual(preflight(REPO, 4300, api=api)['eligibility']['lifecycle'], 'eligible')
+    def test_stale_closure_uses_metadata_without_reading_comments(self):
+        for login in ('github-actions[bot]', 'stale[bot]'):
+            with self.subTest(login=login):
+                self.stale_closure(login)
+                self.api.calls.clear()
+                self.api.collections['comments'] = [{'body': 'Arbitrary workflow wording.'}]
+                self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'eligible')
+                self.assertFalse(any('/comments?' in path for path, _ in self.api.calls))
 
-    def test_current_stale_protocol_allows_one_second_request_skew(self):
-        api = self.github_actions_stale_fixture()
-        self.api.collections['comments'][0].update(created_at='2026-11-06T08:22:29Z', updated_at='2026-11-06T08:22:29Z')
-        self.assertEqual(preflight(REPO, 4300, api=api)['eligibility']['lifecycle'], 'eligible')
+    def test_stale_closure_requires_current_stale_label(self):
+        for login in ('github-actions[bot]', 'stale[bot]'):
+            with self.subTest(login=login):
+                self.stale_closure(login)
+                self.api.item['labels'] = [{'name': 'state:accepted'}]
+                self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'hold')
 
-    def test_stale_protocol_rejects_intervening_comment_or_more_than_sixty_seconds(self):
-        for changed in ('intervening', 'expired'):
+    def test_stale_closure_requires_matching_bot_event(self):
+        for changed in ('missing_event', 'event_actor', 'event_time', 'missing_time', 'not_bot', 'other_bot', 'reason'):
             with self.subTest(changed=changed):
-                api = self.github_actions_stale_fixture()
-                if changed == 'intervening':
-                    self.api.collections['comments'].append({'id': 430002, 'body': 'Another decision.',
-                        'user': {'login': 'reader', 'type': 'User'}, 'created_at': '2026-11-06T08:22:30Z'})
-                else:
-                    self.api.collections['comments'][0].update(created_at='2026-11-06T08:21:29Z', updated_at='2026-11-06T08:21:29Z')
-                self.assertEqual(preflight(REPO, 4300, api=api)['eligibility']['lifecycle'], 'hold')
-
-    def test_github_actions_unknown_old_or_misattributed_closures_hold(self):
-        for changed in ('unrelated', 'old_comment', 'different_comment_actor', 'different_event_actor', 'edited_comment', 'wrong_reason', 'not_bot'):
-            with self.subTest(changed=changed):
-                api = self.github_actions_stale_fixture()
-                comment = self.api.collections['comments'][0]
-                if changed == 'unrelated': comment['body'] = 'Closing after another workflow decision.'
-                if changed == 'old_comment': comment['created_at'] = '2026-10-01T00:00:00Z'
-                if changed == 'different_comment_actor': comment['user'] = {'login': 'other[bot]', 'type': 'Bot'}
-                if changed == 'different_event_actor': self.api.lifecycle_events[0]['actor']['login'] = 'other[bot]'
-                if changed == 'edited_comment': comment['updated_at'] = '2026-11-07T00:00:00Z'
-                if changed == 'wrong_reason': self.api.item['state_reason'] = 'duplicate'
-                if changed == 'not_bot': self.api.item['closed_by'] = {'login': 'github-actions[bot]', 'type': 'User'}
-                self.assertEqual(preflight(REPO, 4300, api=api)['eligibility']['lifecycle'], 'hold')
+                self.stale_closure()
+                if changed == 'missing_event': self.api.lifecycle_events = []
+                if changed == 'event_actor': self.api.lifecycle_events[0]['actor']['login'] = 'other[bot]'
+                if changed == 'event_time': self.api.lifecycle_events[0]['createdAt'] = '2026-10-01T00:00:00Z'
+                if changed == 'missing_time': del self.api.item['closed_at']
+                if changed == 'not_bot': self.api.item['closed_by']['type'] = 'User'
+                if changed == 'other_bot':
+                    self.api.item['closed_by']['login'] = 'other[bot]'
+                    self.api.lifecycle_events[0]['actor']['login'] = 'other[bot]'
+                if changed == 'reason': self.api.item['state_reason'] = 'duplicate'
+                self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'hold')
 
     def test_unrelated_bot_with_write_permission_is_not_human_rejection(self):
         self.api.item.update(state='closed', state_reason='not_planned', closed_by={'login': 'other-bot', 'type': 'Bot'})
