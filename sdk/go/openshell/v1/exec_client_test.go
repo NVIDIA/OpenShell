@@ -24,15 +24,14 @@ import (
 // stubSandboxResolver implements SandboxInterface for testing name-to-ID resolution.
 // Get returns a Sandbox with ID = "sb-" + name. All other methods panic.
 type stubSandboxResolver struct {
-	getErr           error // if non-nil, Get returns this error
-	ingressAdmission *SandboxIngressAdmission
+	getErr error // if non-nil, Get returns this error
 }
 
 func (r *stubSandboxResolver) Get(_ context.Context, _, name string) (*Sandbox, error) {
 	if r.getErr != nil {
 		return nil, r.getErr
 	}
-	return &Sandbox{ID: "sb-" + name, Name: name, Status: SandboxStatus{IngressAdmission: r.ingressAdmission}}, nil
+	return &Sandbox{ID: "sb-" + name, Name: name}, nil
 }
 
 func (r *stubSandboxResolver) Create(context.Context, string, string, *SandboxSpec, ...CreateOption) (*Sandbox, error) {

@@ -516,15 +516,6 @@ class SandboxConditionRef:
 
 
 @dataclass(frozen=True)
-class SandboxIngressAdmissionRef:
-    """Compute-admitted loopback namespace and immutable target ports."""
-
-    scope: int
-    all_ports: bool
-    ports: tuple[int, ...]
-
-
-@dataclass(frozen=True)
 class SandboxStatusRef:
     phase: int
     current_policy_version: int
@@ -533,7 +524,6 @@ class SandboxStatusRef:
     next_restart_at_ms: int | None = None
     main_process_started_at_ms: int | None = None
     conditions: tuple[SandboxConditionRef, ...] = ()
-    ingress_admission: SandboxIngressAdmissionRef | None = None
 
 
 class ServiceAuthorizationMode(IntEnum):
@@ -940,7 +930,6 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
-        forward_ports: Sequence[int] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
@@ -950,7 +939,6 @@ class SandboxClient:
                 name=name or "",
                 labels=dict(labels) if labels else {},
                 service_exposures=_service_exposure_messages(service_exposures),
-                forward_ports=list(forward_ports or ()),
             ),
             timeout=self._timeout,
         )
@@ -968,7 +956,6 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
-        forward_ports: Sequence[int] | None = None,
     ) -> SandboxRef:
         if not workload_template.strip():
             raise SandboxError("workload_template is required")
@@ -981,7 +968,6 @@ class SandboxClient:
                 labels=dict(labels) if labels else {},
                 workload_template=workload_template,
                 service_exposures=_service_exposure_messages(service_exposures),
-                forward_ports=list(forward_ports or ()),
             ),
             timeout=self._timeout,
         )
@@ -998,7 +984,6 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
-        forward_ports: Sequence[int] | None = None,
     ) -> SandboxSession:
         return SandboxSession(
             self,
@@ -1008,7 +993,6 @@ class SandboxClient:
                 name=name,
                 labels=labels,
                 service_exposures=service_exposures,
-                forward_ports=forward_ports,
             ),
         )
 
@@ -1021,7 +1005,6 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
-        forward_ports: Sequence[int] | None = None,
     ) -> SandboxSession:
         return SandboxSession(
             self,
@@ -1032,7 +1015,6 @@ class SandboxClient:
                 name=name,
                 labels=labels,
                 service_exposures=service_exposures,
-                forward_ports=forward_ports,
             ),
         )
 
@@ -2055,13 +2037,6 @@ def _sandbox_ref(
             if status is not None and status.HasField("main_process_started_time")
             else None,
             conditions=_sandbox_conditions(status),
-            ingress_admission=SandboxIngressAdmissionRef(
-                scope=status.ingress_admission.scope,
-                all_ports=status.ingress_admission.all_ports,
-                ports=tuple(status.ingress_admission.ports),
-            )
-            if status is not None and status.HasField("ingress_admission")
-            else None,
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,

@@ -1137,17 +1137,16 @@ func TestTCPListen_TunnelFailureWithContextCancel(t *testing.T) {
 		srv.Stop()
 	}()
 
-	// Admit the listener, then fail its per-connection tunnel setup.
-	resolver := &flippableResolver{}
+	// Resolver always fails: Forward will error on every attempt.
+	resolver := &flippableResolver{
+		failErr: &StatusError{Code: ErrorUnavailable, Message: "permanent failure"},
+	}
 	client := newTCPClient(conn, resolver, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	ln, err := client.Listen(ctx, "default", "my-sandbox", 8080, 0)
 	require.NoError(t, err)
-	resolver.mu.Lock()
-	resolver.failErr = &StatusError{Code: ErrorUnavailable, Message: "permanent failure"}
-	resolver.mu.Unlock()
 
 	// Trigger a connection that will fail tunnel setup.
 	c, err := net.Dial("tcp", ln.Addr().String())
@@ -1207,11 +1206,7 @@ func TestTCPListen_ConcurrentTunnelSetup(t *testing.T) {
 	// Each setup waits for all the others, which only completes when the
 	// accept loop does not serialize tunnel setup.
 	resolver := &gatedResolver{gate: func(ctx context.Context) error {
-		count := arrived.Add(1)
-		if count == 1 {
-			return nil // Admit the listener before gating per-connection setup.
-		}
-		if count == numConns+1 {
+		if arrived.Add(1) == numConns {
 			close(allArrived)
 		}
 		select {
@@ -1262,7 +1257,7 @@ func requireEOF(t *testing.T, conn net.Conn, timeout time.Duration) {
 func TestTCPListen_HungSetupDoesNotBlockOthers(t *testing.T) {
 	var calls atomic.Int32
 	resolver := &gatedResolver{gate: func(ctx context.Context) error {
-		if calls.Add(1) == 2 { // The first call admits the listener.
+		if calls.Add(1) == 1 {
 			<-ctx.Done()
 			return ctx.Err()
 		}
@@ -1277,7 +1272,7 @@ func TestTCPListen_HungSetupDoesNotBlockOthers(t *testing.T) {
 	hung, err := net.Dial("tcp", ln.Addr().String())
 	require.NoError(t, err)
 	defer func() { _ = hung.Close() }()
-	require.Eventually(t, func() bool { return calls.Load() == 2 }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return calls.Load() == 1 }, 5*time.Second, 5*time.Millisecond)
 
 	require.NoError(t, echoOnce(ln.Addr().String(), "second"))
 
@@ -1294,7 +1289,9 @@ func TestTCPListen_HungSetupDoesNotBlockOthers(t *testing.T) {
 }
 
 func TestTCPListen_FailedSetupClosesConn(t *testing.T) {
-	resolver := &flippableResolver{}
+	resolver := &flippableResolver{
+		failErr: &StatusError{Code: ErrorUnavailable, Message: "sandbox unreachable"},
+	}
 	client, cleanup := setupTCPTestWithResolver(t, newMockTCPServer(), resolver)
 	defer cleanup()
 
@@ -1302,28 +1299,8 @@ func TestTCPListen_FailedSetupClosesConn(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = ln.Close() }()
 
-	resolver.mu.Lock()
-	resolver.failErr = &StatusError{Code: ErrorUnavailable, Message: "sandbox unreachable"}
-	resolver.mu.Unlock()
-
 	c, err := net.Dial("tcp", ln.Addr().String())
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 	requireEOF(t, c, 2*time.Second)
-}
-
-func TestTCPIngressAdmissionBeforeForwardOrListen(t *testing.T) {
-	mock := newMockTCPServer()
-	client, cleanup := setupTCPTest(t, mock)
-	defer cleanup()
-	client.sandboxes = &stubSandboxResolver{ingressAdmission: &SandboxIngressAdmission{Scope: IngressSharedHostLoopback, Ports: []uint32{8080}}}
-	conn, err := client.Forward(context.Background(), "default", "sb", 9090)
-	require.Error(t, err)
-	assert.Nil(t, conn)
-	listener, err := client.Listen(context.Background(), "default", "sb", 9090, 0)
-	require.Error(t, err)
-	assert.Nil(t, listener)
-	mock.mu.Lock()
-	assert.Nil(t, mock.lastInit)
-	mock.mu.Unlock()
 }

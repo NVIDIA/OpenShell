@@ -21,7 +21,7 @@ import pytest
 from google.protobuf.struct_pb2 import Struct
 
 import openshell.sandbox as sandbox_module
-from openshell._proto import openshell_pb2, openshell_pb2_grpc, sandbox_pb2
+from openshell._proto import openshell_pb2, openshell_pb2_grpc
 from openshell.mutations import DeletionOutcome
 from openshell.sandbox import (
     _OIDC_TOKEN_EXPIRY_GRACE_SECONDS,
@@ -2359,7 +2359,6 @@ def test_create_forwards_service_exposures() -> None:
     ref = client.create(
         workspace="default",
         name="app-server",
-        forward_ports=[8080],
         service_exposures=[
             ServiceExposure(target_port=4500),
             ServiceExposure(
@@ -2371,7 +2370,6 @@ def test_create_forwards_service_exposures() -> None:
     )
 
     assert stub.create_request is not None
-    assert list(stub.create_request.forward_ports) == [8080]
     assert [
         (exposure.service, exposure.target_port, exposure.authorization_mode)
         for exposure in stub.create_request.service_exposures
@@ -2922,19 +2920,6 @@ def test_sandbox_ref_exposes_host_identity_and_accepts_legacy_response() -> None
     assert _sandbox_ref(proto).host_key_fingerprint is None
     proto.host_key_fingerprint = "SHA256:expected"
     assert _sandbox_ref(proto).host_key_fingerprint == "SHA256:expected"
-    assert _sandbox_ref(proto).status.ingress_admission is None
-    proto.status.ingress_admission.scope = (
-        sandbox_pb2.INGRESS_SCOPE_SHARED_HOST_LOOPBACK
-    )
-    proto.status.ingress_admission.ports.append(8080)
-    admission = _sandbox_ref(proto).status.ingress_admission
-    assert (
-        admission is not None
-        and admission.ports == (8080,)
-        and admission.scope == sandbox_pb2.INGRESS_SCOPE_SHARED_HOST_LOOPBACK
-    )
-    proto.status.ingress_admission.ports[0] = 9090
-    assert admission.ports == (8080,)
 
 
 def test_sandbox_ref_includes_main_process_result() -> None:

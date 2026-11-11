@@ -234,11 +234,6 @@ func copySandboxStatus(s types.SandboxStatus) types.SandboxStatus {
 		s.Conditions = conds
 	}
 	// Callers may mutate endpoint snapshots without changing the fake's storage.
-	if s.IngressAdmission != nil {
-		admission := *s.IngressAdmission
-		admission.Ports = slices.Clone(admission.Ports)
-		s.IngressAdmission = &admission
-	}
 	s.EndpointStatuses = slices.Clone(s.EndpointStatuses)
 	for i := range s.EndpointStatuses {
 		s.EndpointStatuses[i].Ports = slices.Clone(s.EndpointStatuses[i].Ports)

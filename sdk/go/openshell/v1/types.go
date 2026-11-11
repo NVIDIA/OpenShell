@@ -57,17 +57,3 @@ const (
 
 // TLSConfig holds TLS connection settings.
 type TLSConfig = types.TLSConfig
-
-// SandboxIngressAdmission describes the admitted target ports and network scope.
-type SandboxIngressAdmission = types.SandboxIngressAdmission
-
-// IngressScope identifies the admitted loopback namespace.
-type IngressScope = types.IngressScope
-
-// IngressScope values identify the admitted loopback namespace.
-const (
-	IngressUnknown            = types.IngressUnknown
-	IngressUnsupported        = types.IngressUnsupported
-	IngressIsolatedLoopback   = types.IngressIsolatedLoopback
-	IngressSharedHostLoopback = types.IngressSharedHostLoopback
-)

@@ -19,21 +19,6 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-func TestSandboxIngressAdmissionFromProto(t *testing.T) {
-	for _, scope := range []sandboxpb.IngressScope{sandboxpb.IngressScope_INGRESS_SCOPE_ISOLATED_LOOPBACK, sandboxpb.IngressScope_INGRESS_SCOPE_SHARED_HOST_LOOPBACK, sandboxpb.IngressScope(99)} {
-		wire := &pb.SandboxStatus{IngressAdmission: &sandboxpb.SandboxIngressAdmission{Scope: scope, Ports: []uint32{8080}}}
-		got := sandboxStatusFromProto(wire).IngressAdmission
-		require.NotNil(t, got)
-		assert.Equal(t, []uint32{8080}, got.Ports)
-		if scope == sandboxpb.IngressScope(99) {
-			assert.Equal(t, v1.IngressUnknown, got.Scope)
-		}
-		wire.IngressAdmission.Ports[0] = 9090
-		assert.Equal(t, uint32(8080), got.Ports[0])
-	}
-	assert.Nil(t, sandboxStatusFromProto(&pb.SandboxStatus{}).IngressAdmission)
-}
-
 func TestSandboxConfigurationAdmissionFromProto(t *testing.T) {
 	for _, tc := range []struct {
 		wire pb.ConfigurationAdmissionState

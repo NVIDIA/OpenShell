@@ -208,11 +208,9 @@ func TestFakeClient_SandboxEndpointStatuses_DeepCopy(t *testing.T) {
 			LastReportedAt: "2026-09-11T10:00:00Z",
 		}}},
 	}
-	sb.Status.IngressAdmission = &types.SandboxIngressAdmission{Scope: types.IngressSharedHostLoopback, Ports: []uint32{8080}}
 	fc.AddSandbox("default", sb)
 
 	// Neither the seed object nor returned snapshots may mutate stored endpoints.
-	sb.Status.IngressAdmission.Ports[0] = 9090
 	sb.Status.EndpointStatuses[0].Host = "seed-changed.example.test"
 	sb.Status.EndpointStatuses[0].Ports[0] = 80
 	sb.Status.EndpointStatuses[0].LastResult = types.EndpointHTTPResponseReceived
@@ -222,8 +220,6 @@ func TestFakeClient_SandboxEndpointStatuses_DeepCopy(t *testing.T) {
 		EndpointID: "endpoint-one", Host: "tools.example.test", Ports: []uint32{443, 8443}, Path: "/mcp",
 		LastResult: types.EndpointTransportFailed, LastReportedAt: "2026-09-11T10:00:00Z",
 	}}, got.Status.EndpointStatuses)
-	assert.Equal(t, []uint32{8080}, got.Status.IngressAdmission.Ports)
-	got.Status.IngressAdmission.Ports[0] = 9091
 	got.Status.EndpointStatuses[0].Path = "/changed"
 	got.Status.EndpointStatuses[0].Ports[1] = 8080
 	got.Status.EndpointStatuses[0].LastReportedAt = "changed"
@@ -231,7 +227,6 @@ func TestFakeClient_SandboxEndpointStatuses_DeepCopy(t *testing.T) {
 	listed, err := fc.Sandboxes().ListAll(ctx, "default")
 	require.NoError(t, err)
 	require.Len(t, listed, 1)
-	assert.Equal(t, []uint32{8080}, listed[0].Status.IngressAdmission.Ports)
 	assert.Equal(t, "/mcp", listed[0].Status.EndpointStatuses[0].Path)
 	assert.Equal(t, []uint32{443, 8443}, listed[0].Status.EndpointStatuses[0].Ports)
 	assert.Equal(t, "2026-09-11T10:00:00Z", listed[0].Status.EndpointStatuses[0].LastReportedAt)

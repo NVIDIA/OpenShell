@@ -21,48 +21,23 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-func TestSandboxStatusMatchesNextMinorPublicShape(t *testing.T) {
-	// This intentionally advances the source baseline for the documented next
-	// minor release. Private image-operation state remains outside public status.
-	// Explicit tags preserve legacy identities and independently allocated gaps.
-	fields := []struct {
-		name   protoreflect.Name
-		number protoreflect.FieldNumber
-	}{
-		{"agent_pod", 2},
-		{"agent_fd", 3},
-		{"sandbox_fd", 4},
-		{"conditions", 5},
-		{"phase", 6},
-		{"current_policy_version", 7},
-		{"main_process_instance_id", 8},
-		{"exit_code", 9},
-		{"endpoint_statuses", 10},
-		{"configuration_admission", 11},
-		{"configuration_activated", 12},
-		{"provisioning", 13},
-		{"restart_count", 14},
-		{"next_restart_time", 15},
-		{"main_process_started_time", 16},
-		{"last_token_grant_failure", 17},
-		{"ingress_admission", 19},
+func TestSandboxStatusRetainsBaselinePublicShape(t *testing.T) {
+	// Freeze the pre-image-update fields and tags: private operation state must
+	// not enlarge the public Rust struct or leak into generated SDK messages.
+	fields := []string{
+		"agent_pod", "agent_fd", "sandbox_fd", "conditions", "phase",
+		"current_policy_version", "main_process_instance_id", "exit_code",
+		"endpoint_statuses", "configuration_admission", "configuration_activated",
+		"provisioning", "restart_count", "next_restart_time",
+		"main_process_started_time", "last_token_grant_failure",
 	}
 	descriptor := (&pb.SandboxStatus{}).ProtoReflect().Descriptor()
 	require.Equal(t, len(fields), descriptor.Fields().Len())
-	for _, expected := range fields {
-		field := descriptor.Fields().ByName(expected.name)
-		require.NotNil(t, field, expected.name)
-		require.Equal(t, expected.number, field.Number(), expected.name)
+	for i, name := range fields {
+		field := descriptor.Fields().ByName(protoreflect.Name(name))
+		require.NotNil(t, field, name)
+		require.Equal(t, protoreflect.FieldNumber(i+2), field.Number(), name)
 	}
-
-	// v0.1.x status bytes: phase field6, policy-version field7. Absence of the
-	// new readback is retained; decoding does not invent admission evidence.
-	var old pb.SandboxStatus
-	require.NoError(t, proto.Unmarshal([]byte{0x30, 0x03, 0x38, 0x07}, &old))
-	require.EqualValues(t, 3, old.GetPhase())
-	require.Equal(t, uint32(7), old.GetCurrentPolicyVersion())
-	require.Nil(t, old.IngressAdmission)
-
 	require.Nil(t, pb.File_openshell_proto.Messages().ByName("SandboxImageUpdate"))
 	legacy := pb.File_openshell_proto.Services().ByName("OpenShell")
 	require.Nil(t, legacy.Methods().ByName("UpdateSandbox"))

@@ -8,11 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"slices"
 	"strconv"
 	"sync"
-
-	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
@@ -40,18 +37,8 @@ func (t *tcpClient) Forward(ctx context.Context, workspace, sandboxName string, 
 			Message: fmt.Sprintf("port must be in range 1-65535, got %d", port),
 		}
 	}
-	var sandbox *Sandbox
-	var owner string
-	var err error
-	if g, ok := t.sandboxes.(ownerGetter); ok {
-		sandbox, owner, err = g.getWithOwner(ctx, workspace, sandboxName)
-	} else {
-		sandbox, err = t.sandboxes.Get(ctx, workspace, sandboxName)
-	}
+	owner, err := sandboxOwner(ctx, t.sandboxes, workspace, sandboxName)
 	if err != nil {
-		return nil, err
-	}
-	if err := admitSandboxIngress(sandbox.Status.IngressAdmission, port); err != nil {
 		return nil, err
 	}
 
@@ -117,14 +104,6 @@ func (t *tcpClient) Listen(ctx context.Context, workspace, sandboxName string, r
 			Code:    ErrorInvalidArgument,
 			Message: "WithSSHTunnel requires an SSH client, but none is available",
 		}
-	}
-
-	sandbox, err := t.sandboxes.Get(ctx, workspace, sandboxName)
-	if err != nil {
-		return nil, err
-	}
-	if err := admitSandboxIngress(sandbox.Status.IngressAdmission, remotePort); err != nil {
-		return nil, err
 	}
 
 	addr := net.JoinHostPort(cfg.bindAddress, strconv.FormatUint(uint64(localPort), 10))
@@ -367,22 +346,4 @@ func (c *tcpForwardConn) Close() error {
 	c.cancel()
 	<-c.done
 	return err
-}
-
-func admitSandboxIngress(admission *types.SandboxIngressAdmission, port uint32) error {
-	if admission == nil {
-		return nil
-	} // Explicit legacy absence from the gateway.
-	valid := admission.Scope == types.IngressIsolatedLoopback || admission.Scope == types.IngressSharedHostLoopback
-	seen := make(map[uint32]bool, len(admission.Ports))
-	for _, admitted := range admission.Ports {
-		if admitted == 0 || admitted > 65535 || seen[admitted] {
-			valid = false
-		}
-		seen[admitted] = true
-	}
-	if !valid || (admission.AllPorts && len(admission.Ports) != 0) || (!admission.AllPorts && !slices.Contains(admission.Ports, port)) {
-		return &StatusError{Code: ErrorPermissionDenied, Message: "target port was not admitted by the compute driver"}
-	}
-	return nil
 }
