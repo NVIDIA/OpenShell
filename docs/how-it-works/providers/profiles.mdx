@@ -71,8 +71,11 @@ A request can use a static credential only when all of these checks pass:
 | The calling binary and destination are allowed. | Effective sandbox network policy. |
 | The host, port, and canonical request path match the credential binding. | Provider profile endpoints, or an explicit sandbox policy binding for an endpointless profile. |
 | The request location matches declared placement, the default `Authorization` header, or an explicit body/WebSocket rewrite policy. | The credential's `auth_style` and its header, query parameter, or path template. |
-| The HTTP method, path, or protocol operation is allowed when L7 inspection is configured. | Effective sandbox network policy. |
+| The HTTP method, path, or protocol operation is allowed when L7 inspection uses `enforcement: enforce`. | Effective sandbox network policy. |
 | The credential has not expired. | Provider credential expiry metadata. |
+
+With `enforcement: audit`, request-rule violations are logged and forwarded.
+Credential binding, placement, and expiry checks still apply.
 
 Network policy and credential binding serve different purposes. Network policy
 authorizes traffic. A credential binding authorizes use of one provider
