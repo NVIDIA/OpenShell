@@ -518,6 +518,18 @@ aliases. Confirm the credential driver's namespace matches its Role and
 RoleBinding. An unset workload `image_pull_policy` uses Kubernetes defaults;
 the global Helm pull policy applies to runtime and supervisor images.
 
+For namespace workload identity failures, inspect `openshell.ai/sandbox-uid`
+and `openshell.ai/sandbox-gid` on the target namespace. Both must be non-root
+decimal IDs. They override driver defaults and SCC discovery. With
+`require_namespace_identity=true` under the Kubernetes driver table, missing
+annotations or failed namespace reads prevent creation; check the gateway
+ServiceAccount's namespace `get` access. Existing sandboxes keep their recorded
+pair through restart. Compare the `WorkloadIdentity` condition in
+`openshell sandbox get` with the stored pod template when restart reports a
+conflict; do not change namespace annotations to repair an existing identity.
+Use the published [namespace identity guide](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/runtimes#namespace-workload-identity)
+for configuration and lifecycle semantics.
+
 When multiple gateways share one service base domain, confirm each release
 sets `server.serviceHostnameFormat: hashed` and a `server.name` unique among
 those gateways — the installation name is the hash discriminator for

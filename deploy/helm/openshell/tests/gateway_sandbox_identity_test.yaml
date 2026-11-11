@@ -9,6 +9,26 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: renders the required namespace identity switch from the driver table
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          require_namespace_identity: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*require_namespace_identity\s*=\s*true$'
+
+  - it: preserves an explicit optional namespace identity switch
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          require_namespace_identity: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*require_namespace_identity\s*=\s*false$'
+
   - it: omits sandbox_uid and sandbox_gid by default
     asserts:
       - notMatchRegex:

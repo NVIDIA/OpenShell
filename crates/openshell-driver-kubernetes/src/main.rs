@@ -203,6 +203,14 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_K8S_SANDBOX_GID")]
     sandbox_gid: Option<u32>,
+
+    /// Require openshell.ai/sandbox-uid and sandbox-gid on each target namespace.
+    #[arg(
+        long,
+        env = "OPENSHELL_REQUIRE_NAMESPACE_IDENTITY",
+        default_value_t = false
+    )]
+    require_namespace_identity: bool,
 }
 
 async fn shutdown_signal() {
@@ -332,6 +340,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             sandbox_uid: args.sandbox_uid,
             sandbox_gid: args.sandbox_gid,
+            require_namespace_identity: args.require_namespace_identity,
         },
         shutdown_rx,
         None,

@@ -26,6 +26,7 @@ use crate::shared_supervisor::{
     ANNOTATION_SUPERVISOR_SESSION, ANNOTATION_SUPERVISOR_TOPOLOGY, GATEWAY_TOPOLOGY,
     SharedSupervisor, SupervisorPlacement, supervisor_placement,
 };
+use crate::workload_identity::{RESOLVED_IDENTITY, WorkloadIdentity};
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
@@ -2029,60 +2030,87 @@ impl KubernetesComputeDriver {
     async fn resolve_sandbox_identity_in_namespace(
         &self,
         namespace: &str,
-    ) -> (u32, u32, BTreeMap<String, String>) {
-        if self.config.sandbox_uid.is_some() {
-            let uid = self.config.resolve_sandbox_uid(None);
-            let gid = self.config.resolve_sandbox_gid(uid, None);
-            return (uid, gid, BTreeMap::new());
-        }
-
+    ) -> Result<(WorkloadIdentity, BTreeMap<String, String>), KubernetesDriverError> {
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
-        match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.get(namespace)).await {
-            Ok(Ok(ns)) => {
-                let anns = ns.metadata.annotations.unwrap_or_default();
-                tracing::info!(
-                    namespace = %namespace,
-                    uid_range = ?anns.get(crate::config::ANNOTATION_SCC_UID_RANGE),
-                    sup_groups = ?anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS),
-                    "Resolved namespace annotations for sandbox identity"
-                );
-                let uid = self.config.resolve_sandbox_uid(Some(&anns));
-                let baseline_gid = self.config.resolve_sandbox_gid(uid, None);
-                let gid = self.config.sandbox_gid.map_or_else(
-                    || {
-                        anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS)
-                            .and_then(|sup_range| {
-                                KubernetesComputeConfig::from_open_shift_supplemental_groups(
-                                    sup_range,
-                                )
-                            })
-                            .unwrap_or(baseline_gid)
-                    },
-                    |_| baseline_gid,
-                );
-                tracing::info!(uid, gid, "Resolved sandbox identity");
-                (uid, gid, anns)
+        let result = tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.get(namespace))
+            .await
+            .map_err(|_| "Kubernetes API timeout".to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+        let annotations = match result {
+            Ok(namespace) => namespace.metadata.annotations.unwrap_or_default(),
+            Err(reason) => {
+                if self.config.require_namespace_identity {
+                    return Err(KubernetesDriverError::Precondition(format!(
+                        "cannot read required identity for namespace '{namespace}': {reason}; grant namespace get access and configure openshell.ai/sandbox-uid and openshell.ai/sandbox-gid"
+                    )));
+                }
+                warn!(namespace, %reason, "Cannot read namespace identity; using configured or default sandbox identity");
+                BTreeMap::new()
             }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    namespace = %namespace,
-                    error = %e,
-                    "Failed to fetch namespace for SCC annotations, falling back to defaults"
-                );
-                let uid = DEFAULT_SANDBOX_UID;
-                let gid = self.config.resolve_sandbox_gid(uid, None);
-                (uid, gid, BTreeMap::new())
-            }
-            Err(_) => {
-                tracing::warn!(
-                    namespace = %namespace,
-                    "Namespace fetch timed out, falling back to defaults"
-                );
-                let uid = DEFAULT_SANDBOX_UID;
-                let gid = self.config.resolve_sandbox_gid(uid, None);
-                (uid, gid, BTreeMap::new())
-            }
+        };
+        let identity = WorkloadIdentity::resolve(&self.config, &annotations).map_err(|error| {
+            KubernetesDriverError::Precondition(format!("namespace '{namespace}': {error}"))
+        })?;
+        info!(
+            namespace,
+            uid = identity.uid,
+            gid = identity.gid,
+            "Resolved sandbox workload identity"
+        );
+        Ok((identity, annotations))
+    }
+
+    /// Upgrade a legacy object using its stored workload template, with a CAS
+    /// so a concurrent edit cannot change which identity is being adopted.
+    async fn persist_legacy_workload_identity(
+        &self,
+        sandbox_api_version: &str,
+        object: &mut DynamicObject,
+    ) -> Result<(), KubernetesDriverError> {
+        let identity =
+            WorkloadIdentity::from_object(object).map_err(KubernetesDriverError::Precondition)?;
+        if object
+            .metadata
+            .annotations
+            .as_ref()
+            .is_some_and(|annotations| annotations.contains_key(RESOLVED_IDENTITY))
+        {
+            return Ok(());
         }
+        let name = object.metadata.name.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Precondition("sandbox resource has no name".into())
+        })?;
+        let version = object.metadata.resource_version.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Precondition("sandbox resource has no resourceVersion".into())
+        })?;
+        let record = identity.encode().map_err(KubernetesDriverError::Message)?;
+        // Lookup may be cluster-wide in managed/operator mode, but mutations
+        // must always target the namespace of the selected Sandbox resource.
+        let namespace = object.metadata.namespace.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Precondition("sandbox resource has no namespace".into())
+        })?;
+        let sandbox_api =
+            Self::agent_sandbox_api(self.client.clone(), sandbox_api_version, namespace);
+        *object = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            sandbox_api.api.patch(
+                name,
+                &PatchParams::default(),
+                &Patch::Merge(serde_json::json!({
+                    "metadata": {
+                        "uid": object.metadata.uid,
+                        "resourceVersion": version,
+                        "annotations": { RESOLVED_IDENTITY: record }
+                    }
+                })),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message("timed out persisting legacy workload identity".into())
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        Ok(())
     }
 
     async fn has_gpu_capacity(&self) -> Result<bool, KubeError> {
@@ -2138,6 +2166,7 @@ impl KubernetesComputeDriver {
     async fn admit_requested_resources(
         &self,
         sandbox: &Sandbox,
+        params: &SandboxPodParams<'_>,
     ) -> Result<crate::resource_admission::Identities, tonic::Status> {
         openshell_core::resource_admission::check_sandbox_driver_config(
             self.config.allow_driver_config,
@@ -2150,14 +2179,7 @@ impl KubernetesComputeDriver {
             .config
             .namespace_for_workspace(&sandbox.workspace, self.operator_allowlist.as_ref())
             .map_err(tonic::Status::failed_precondition)?;
-        let params = SandboxPodParams {
-            default_image: &self.config.default_image,
-            image_pull_secrets: &self.config.image_pull_secrets,
-            default_runtime_class_name: &self.config.default_runtime_class_name,
-            service_account_name: &self.config.service_account_name,
-            ..Default::default()
-        };
-        let rendered = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
+        let rendered = sandbox_to_k8s_spec(sandbox.spec.as_ref(), params)
             .map_err(tonic::Status::invalid_argument)?;
         crate::resource_admission::admit(
             &self.client,
@@ -2606,11 +2628,6 @@ impl KubernetesComputeDriver {
             }
         };
 
-        let resource_identities = self
-            .admit_requested_resources(sandbox)
-            .await
-            .map_err(admission_error)?;
-
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %name,
@@ -2620,15 +2637,18 @@ impl KubernetesComputeDriver {
             "Creating sandbox in Kubernetes"
         );
 
-        let agent_sandbox_api = self
-            .supported_agent_sandbox_api(self.client.clone(), &target_namespace)
-            .await
-            .map_err(KubernetesDriverError::Message)?;
-
-        // Resolve sandbox UID/GID from config or OpenShift SCC namespace annotations.
-        let (resolved_user_id, resolved_group_id, ns_annotations) = self
+        let (identity, ns_annotations) = self
             .resolve_sandbox_identity_in_namespace(&target_namespace)
-            .await;
+            .await?;
+        identity
+            .validate_request(
+                sandbox
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.workload_identity.as_ref()),
+            )
+            .map_err(KubernetesDriverError::InvalidArgument)?;
+        let (resolved_user_id, resolved_group_id) = (identity.uid, identity.gid);
 
         let generation = random_sandbox_runtime_token()?;
         let placement = self.new_generation_placement();
@@ -2659,6 +2679,14 @@ impl KubernetesComputeDriver {
             sandbox_secret_name: &proxy_names.sandbox_secret,
         };
         let kube_name = self.config.kube_resource_name(workspace, name);
+        let resource_identities = self
+            .admit_requested_resources(sandbox, &params)
+            .await
+            .map_err(admission_error)?;
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone(), &target_namespace)
+            .await
+            .map_err(KubernetesDriverError::Message)?;
         let mut data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
         self.create_sandbox_runtime_fence(&target_namespace, &proxy_names)
@@ -2673,6 +2701,10 @@ impl KubernetesComputeDriver {
         }
         let mut obj = DynamicObject::new(&kube_name, &agent_sandbox_api.resource);
         let mut annotations = sandbox_annotations(sandbox);
+        annotations.insert(
+            RESOLVED_IDENTITY.into(),
+            identity.encode().map_err(KubernetesDriverError::Message)?,
+        );
         annotations.insert(
             crate::resource_admission::IDENTITIES.into(),
             serde_json::to_string(&resource_identities)
@@ -3831,6 +3863,13 @@ impl KubernetesComputeDriver {
             .get(cr_name)
             .await
             .map_err(KubernetesDriverError::from_kube)?;
+        let identity = WorkloadIdentity::from_object(&admission_object)
+            .map_err(KubernetesDriverError::Precondition)?;
+        if (identity.uid, identity.gid) != (agent_uid, agent_gid) {
+            return Err(KubernetesDriverError::Precondition(
+                "persisted workload identity changed during runtime installation".into(),
+            ));
+        }
         self.admit_stored_resources(&admission_object)
             .await
             .map_err(admission_error)?;
@@ -3879,7 +3918,7 @@ impl KubernetesComputeDriver {
             agent_uid,
             agent_gid,
             Vec::new(),
-            "kubernetes-config".to_string(),
+            identity.to_proto(cr_uid).source,
             format!("sandbox:{cr_uid}"),
         )
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
@@ -4258,6 +4297,8 @@ impl KubernetesComputeDriver {
         self.admit_stored_resources(&object)
             .await
             .map_err(admission_error)?;
+        self.persist_legacy_workload_identity(&lookup_api.resource.version, &mut object)
+            .await?;
         if sandbox_runtime_bootstrap_in_progress(&object) {
             let phase = sandbox_runtime_bootstrap_phase(&object);
             if phase != Some(SandboxRuntimeBootstrapPhase::Suspending)
@@ -4435,8 +4476,9 @@ impl KubernetesComputeDriver {
                 "Sandbox resource is missing its OpenShell sandbox name".to_string(),
             )
         })?;
-        let (agent_uid, agent_gid, _) =
-            self.resolve_sandbox_identity_in_namespace(&namespace).await;
+        let identity =
+            WorkloadIdentity::from_object(&object).map_err(KubernetesDriverError::Precondition)?;
+        let (agent_uid, agent_gid) = (identity.uid, identity.gid);
         let mut init_containers = object
             .data
             .pointer("/spec/podTemplate/spec/initContainers")
@@ -8500,10 +8542,29 @@ fn condition_observes_current_generation(
 }
 
 fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
-    let status = obj.data.get("status")?;
-    let status_obj = status.as_object()?;
+    let resolution = WorkloadIdentity::from_object(obj);
+    let identity_error = obj
+        .metadata
+        .annotations
+        .as_ref()
+        .filter(|annotations| annotations.contains_key(RESOLVED_IDENTITY))
+        .and_then(|_| resolution.as_ref().err().cloned());
+    let identity = resolution
+        .ok()
+        .zip(obj.metadata.uid.as_deref())
+        .map(|(identity, uid)| identity.to_proto(uid));
+    let empty = serde_json::Map::new();
+    let status_obj = match obj
+        .data
+        .get("status")
+        .and_then(serde_json::Value::as_object)
+    {
+        Some(status) => status,
+        None if identity.is_some() || identity_error.is_some() => &empty,
+        None => return None,
+    };
 
-    let conditions = status_obj
+    let mut conditions = status_obj
         .get("conditions")
         .and_then(|val| val.as_array())
         .map(|items| {
@@ -8514,6 +8575,19 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+
+    // An invalid durable record blocks launch, but must not turn an existing
+    // Sandbox into NotFound or hide it from list/watch and operator recovery.
+    if let Some(message) = identity_error {
+        conditions.retain(|condition| condition.r#type != "WorkloadIdentity");
+        conditions.push(SandboxCondition {
+            r#type: "WorkloadIdentity".into(),
+            status: "False".into(),
+            reason: "InvalidWorkloadIdentity".into(),
+            message,
+            transition_time: None,
+        });
+    }
 
     Some(SandboxStatus {
         name: status_obj
@@ -8537,6 +8611,7 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
             .unwrap_or_default()
             .to_string(),
         conditions,
+        resolved_identity: identity,
         deleting: obj.metadata.deletion_timestamp.is_some(),
         ..Default::default()
     })
@@ -9330,7 +9405,7 @@ mod tests {
         };
         assert!(
             driver
-                .admit_requested_resources(&sandbox)
+                .admit_requested_resources(&sandbox, &SandboxPodParams::default())
                 .await
                 .unwrap()
                 .is_empty()
@@ -13597,6 +13672,468 @@ mod tests {
             shared_supervisor: None,
         };
         (driver, steps, bodies)
+    }
+
+    fn identity_test_object(version: &str) -> DynamicObject {
+        let resource =
+            ApiResource::from_gvk(&GroupVersionKind::gvk(SANDBOX_GROUP, version, SANDBOX_KIND));
+        let mut object = DynamicObject::new("tenant-sandbox", &resource);
+        object.metadata.uid = Some("sandbox-uid".into());
+        object.metadata.namespace = Some("tenant-a".into());
+        object.metadata.resource_version = Some("42".into());
+        object.data = sandbox_to_k8s_spec(
+            None,
+            &SandboxPodParams {
+                sandbox_uid: 1500,
+                sandbox_gid: 1600,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        object
+    }
+
+    #[test]
+    fn workload_identity_survives_stopped_status_and_legacy_recovery_in_both_api_versions() {
+        for version in SANDBOX_VERSIONS {
+            let mut object = identity_test_object(version);
+            let legacy = WorkloadIdentity::from_object(&object).unwrap();
+            assert_eq!((legacy.uid, legacy.gid), (1500, 1600));
+            let identity = WorkloadIdentity::resolve(
+                &KubernetesComputeConfig::default(),
+                &BTreeMap::from([
+                    (
+                        crate::workload_identity::NAMESPACE_UID.into(),
+                        "1500".into(),
+                    ),
+                    (
+                        crate::workload_identity::NAMESPACE_GID.into(),
+                        "1600".into(),
+                    ),
+                ]),
+            )
+            .unwrap();
+            object.metadata.annotations = Some(BTreeMap::from([(
+                RESOLVED_IDENTITY.into(),
+                identity.encode().unwrap(),
+            )]));
+            // Controller status may not exist yet, and stopped workloads have
+            // no live Pod. Both still report their durable identity.
+            for status in [
+                serde_json::Value::Null,
+                serde_json::json!({"conditions": [{"type": "Suspended", "status": "True"}]}),
+            ] {
+                if status.is_null() {
+                    object.data.as_object_mut().unwrap().remove("status");
+                } else {
+                    object.data["status"] = status;
+                }
+                let status = status_from_object(&object).unwrap();
+                let resolved = status.resolved_identity.unwrap();
+                assert_eq!((resolved.uid, resolved.gid), (1500, 1600));
+                assert_eq!(resolved.source, "kubernetes-namespace");
+                assert_eq!(resolved.resource_digest, "sandbox:sandbox-uid");
+            }
+            // A newly resolved assignment does not replace an existing record.
+            let changed = WorkloadIdentity::resolve(
+                &KubernetesComputeConfig::default(),
+                &BTreeMap::from([
+                    (
+                        crate::workload_identity::NAMESPACE_UID.into(),
+                        "1700".into(),
+                    ),
+                    (
+                        crate::workload_identity::NAMESPACE_GID.into(),
+                        "1800".into(),
+                    ),
+                ]),
+            )
+            .unwrap();
+            assert_eq!((changed.uid, changed.gid), (1700, 1800));
+            assert_eq!(WorkloadIdentity::from_object(&object).unwrap(), identity);
+            let template = &object.data["spec"]["podTemplate"]["spec"];
+            assert_eq!(template["securityContext"]["fsGroup"], 1600);
+            let init = template["initContainers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|container| container["name"] == WORKSPACE_INIT_CONTAINER_NAME)
+                .unwrap();
+            assert_eq!(init["securityContext"]["runAsUser"], 1500);
+            assert_eq!(init["securityContext"]["runAsGroup"], 1600);
+        }
+    }
+
+    #[test]
+    fn workload_identity_rejects_invalid_records_and_template_changes() {
+        let mut object = identity_test_object(SANDBOX_VERSION_V1BETA1);
+        let identity = WorkloadIdentity::from_object(&object).unwrap();
+        object.metadata.annotations = Some(BTreeMap::from([(
+            RESOLVED_IDENTITY.into(),
+            identity.encode().unwrap(),
+        )]));
+        for record in [
+            "{}",
+            "not-json",
+            r#"{"version":2,"uid":1500,"gid":1600,"source":"namespace"}"#,
+            r#"{"version":1,"uid":0,"gid":1600,"source":"namespace"}"#,
+        ] {
+            let mut invalid = object.clone();
+            invalid
+                .metadata
+                .annotations
+                .as_mut()
+                .unwrap()
+                .insert(RESOLVED_IDENTITY.into(), record.into());
+            assert!(WorkloadIdentity::from_object(&invalid).is_err());
+        }
+        for pointer in [
+            "/spec/podTemplate/spec/securityContext/runAsUser",
+            "/spec/podTemplate/spec/securityContext/fsGroup",
+            "/spec/podTemplate/spec/containers/0/securityContext/runAsGroup",
+        ] {
+            let mut changed = object.clone();
+            *changed.data.pointer_mut(pointer).unwrap() = serde_json::json!(9999);
+            assert!(
+                WorkloadIdentity::from_object(&changed).is_err(),
+                "accepted changed {pointer}"
+            );
+        }
+        let mut legacy = identity_test_object(SANDBOX_VERSION_V1BETA1);
+        legacy.data["spec"]["podTemplate"]["spec"]["securityContext"] = serde_json::Value::Null;
+        assert!(WorkloadIdentity::from_object(&legacy).is_err());
+    }
+
+    #[test]
+    fn invalid_workload_identity_stays_visible_with_an_error_condition() {
+        for version in SANDBOX_VERSIONS {
+            let mut object = identity_test_object(version);
+            object.metadata.labels = Some(BTreeMap::from([
+                (LABEL_MANAGED_BY.into(), LABEL_MANAGED_BY_VALUE.into()),
+                (LABEL_SANDBOX_ID.into(), "sandbox-1".into()),
+                (LABEL_SANDBOX_NAME.into(), "tenant-sandbox".into()),
+                (LABEL_SANDBOX_WORKSPACE.into(), "tenant-a".into()),
+            ]));
+            object.metadata.annotations =
+                Some(BTreeMap::from([(RESOLVED_IDENTITY.into(), "{}".into())]));
+            let (_, sandbox) = sandbox_from_object("tenant-a", object.clone()).unwrap();
+            assert_eq!(sandbox.id, "sandbox-1");
+            let status = sandbox.status.unwrap();
+            assert!(status.resolved_identity.is_none());
+            let condition = status
+                .conditions
+                .iter()
+                .find(|condition| condition.r#type == "WorkloadIdentity")
+                .unwrap();
+            assert_eq!(condition.status, "False");
+            assert_eq!(condition.reason, "InvalidWorkloadIdentity");
+            // Visibility does not authorize launch or reinterpret corruption
+            // as a legacy object that can adopt another identity.
+            assert!(WorkloadIdentity::from_object(&object).is_err());
+        }
+    }
+
+    #[test]
+    fn caller_templates_cannot_inject_namespace_or_persisted_identity() {
+        let config = KubernetesComputeConfig {
+            allowed_pod_annotations: vec!["openshell.ai/*".into()],
+            ..Default::default()
+        };
+        for key in [
+            crate::workload_identity::NAMESPACE_UID,
+            crate::workload_identity::NAMESPACE_GID,
+            RESOLVED_IDENTITY,
+        ] {
+            let template = SandboxTemplate {
+                platform_config: Some(json_struct(
+                    serde_json::json!({"annotations": {key: "9999"}}),
+                )),
+                ..Default::default()
+            };
+            let error = validate_pod_metadata(&template, &config).unwrap_err();
+            assert!(error.contains(key), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn start_legacy_tenant_sandbox_patches_its_namespace_after_global_lookup() {
+        for &version in SANDBOX_VERSIONS {
+            for workspace_mode in [WorkspaceMode::Managed, WorkspaceMode::Operator] {
+                let mut object = identity_test_object(version);
+                object.metadata.annotations = Some(BTreeMap::from([
+                    (
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.into(),
+                        "true".into(),
+                    ),
+                    (
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.into(),
+                        "create".into(),
+                    ),
+                ]));
+                let mut upgraded = object.clone();
+                upgraded.metadata.annotations.as_mut().unwrap().insert(
+                    RESOLVED_IDENTITY.into(),
+                    WorkloadIdentity::from_object(&object)
+                        .unwrap()
+                        .encode()
+                        .unwrap(),
+                );
+                upgraded.metadata.resource_version = Some("43".into());
+                let list_path = if version == SANDBOX_VERSION_V1ALPHA1 {
+                    "/apis/agents.x-k8s.io/v1alpha1/sandboxes"
+                } else {
+                    "/apis/agents.x-k8s.io/v1beta1/sandboxes"
+                };
+                let patch_path = if version == SANDBOX_VERSION_V1ALPHA1 {
+                    "/apis/agents.x-k8s.io/v1alpha1/namespaces/tenant-a/sandboxes/tenant-sandbox"
+                } else {
+                    "/apis/agents.x-k8s.io/v1beta1/namespaces/tenant-a/sandboxes/tenant-sandbox"
+                };
+                let mut config = KubernetesComputeConfig {
+                    workspace_mode,
+                    allow_driver_config: true,
+                    require_namespace_identity: true,
+                    ..Default::default()
+                };
+                config.resource_admission.enabled = false;
+                let (driver, steps, bodies) = scripted_driver(
+                    config,
+                    vec![
+                        (
+                            http::Method::GET,
+                            list_path,
+                            kube_test_response(
+                                http::StatusCode::OK,
+                                serde_json::json!({
+                                    "apiVersion": format!("{SANDBOX_GROUP}/{version}"), "kind": "SandboxList", "items": [object]
+                                }),
+                            ),
+                        ),
+                        (
+                            http::Method::PATCH,
+                            patch_path,
+                            kube_test_response(
+                                http::StatusCode::OK,
+                                serde_json::to_value(upgraded).unwrap(),
+                            ),
+                        ),
+                    ],
+                );
+                driver.sandbox_api_version.set(version).unwrap();
+                let authentication = serde_json::to_vec(&serde_json::json!({
+                    "gateway_id": "gateway-test", "verification_keys": [{"key_id": "test-key", "public_key_pem": [1]}],
+                    "supervisor": {
+                        "session_id": "00000000-0000-4000-8000-000000000001", "runtime_generation": "test-generation",
+                        "session_rotation": 1, "auth_epoch": 1,
+                        "gateway_token": "test-only", "gateway_expires_at": 1,
+                        "sandbox_token": "test-only", "sandbox_expires_at": 1
+                    }
+                })).unwrap();
+                let error = driver
+                    .start_sandbox_runtime_generation(
+                        "sandbox-1",
+                        "test-generation",
+                        &authentication,
+                        "kubernetes://tenant-a/sandbox-uid/old-pod",
+                    )
+                    .await
+                    .unwrap_err();
+                // Stop deliberately before resource provisioning; reaching
+                // this guard proves the namespaced migration succeeded.
+                assert!(
+                    error
+                        .to_string()
+                        .contains("initial sandbox bootstrap has not completed"),
+                    "{error}"
+                );
+                assert!(steps.lock().unwrap().is_empty());
+                assert_eq!(bodies.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_identity_read_is_not_skipped_for_driver_overrides() {
+        let (driver, steps, _) = scripted_driver(
+            KubernetesComputeConfig {
+                sandbox_uid: Some(5000),
+                sandbox_gid: Some(6000),
+                ..Default::default()
+            },
+            vec![(
+                http::Method::GET,
+                "/api/v1/namespaces/tenant-a",
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "tenant-a", "annotations": {
+                            "openshell.ai/sandbox-uid": "1500", "openshell.ai/sandbox-gid": "1600"
+                        }}
+                    }),
+                ),
+            )],
+        );
+        let (identity, _) = driver
+            .resolve_sandbox_identity_in_namespace("tenant-a")
+            .await
+            .unwrap();
+        assert_eq!((identity.uid, identity.gid), (1500, 1600));
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn namespace_identity_conflicts_and_invalid_assignments_create_no_resources() {
+        use openshell_core::proto::compute::v1::WorkloadIdentityRequest;
+        for (uid, gid, user, expected) in [
+            ("1500", "1600", "1501", "run_as_user"),
+            ("1500", "0", "sandbox", "sandbox-gid"),
+        ] {
+            let (driver, steps, bodies) = scripted_driver(
+                KubernetesComputeConfig::default(),
+                vec![(
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell",
+                    kube_test_response(
+                        http::StatusCode::OK,
+                        serde_json::json!({
+                            "apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "openshell", "annotations": {
+                                "openshell.ai/sandbox-uid": uid, "openshell.ai/sandbox-gid": gid
+                            }}
+                        }),
+                    ),
+                )],
+            );
+            let sandbox = Sandbox {
+                id: "sandbox-1".into(),
+                name: "identity".into(),
+                workspace: "team-a".into(),
+                spec: Some(SandboxSpec {
+                    workload_identity: Some(WorkloadIdentityRequest {
+                        user: user.into(),
+                        group: "sandbox".into(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let error = driver.create_sandbox_inner(&sandbox).await.unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(steps.lock().unwrap().is_empty());
+            assert!(
+                bodies.lock().unwrap().is_empty(),
+                "identity failure wrote Kubernetes resources"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_identity_is_persisted_once_with_resource_version_and_without_namespace_reads() {
+        for version in SANDBOX_VERSIONS {
+            let mut object = identity_test_object(version);
+            let identity = WorkloadIdentity::from_object(&object).unwrap();
+            let mut upgraded = object.clone();
+            upgraded.metadata.annotations = Some(BTreeMap::from([(
+                RESOLVED_IDENTITY.into(),
+                identity.encode().unwrap(),
+            )]));
+            upgraded.metadata.resource_version = Some("43".into());
+            let path = if *version == SANDBOX_VERSION_V1ALPHA1 {
+                "/apis/agents.x-k8s.io/v1alpha1/namespaces/tenant-a/sandboxes/tenant-sandbox"
+            } else {
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/tenant-a/sandboxes/tenant-sandbox"
+            };
+            let (driver, steps, bodies) = scripted_driver(
+                KubernetesComputeConfig {
+                    sandbox_uid: Some(9000),
+                    sandbox_gid: Some(9100),
+                    require_namespace_identity: true,
+                    ..Default::default()
+                },
+                vec![(
+                    http::Method::PATCH,
+                    path,
+                    kube_test_response(
+                        http::StatusCode::OK,
+                        serde_json::to_value(&upgraded).unwrap(),
+                    ),
+                )],
+            );
+            driver
+                .persist_legacy_workload_identity(version, &mut object)
+                .await
+                .unwrap();
+            assert_eq!(WorkloadIdentity::from_object(&object).unwrap(), identity);
+            driver
+                .persist_legacy_workload_identity(version, &mut object)
+                .await
+                .unwrap();
+            assert!(steps.lock().unwrap().is_empty());
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1);
+            assert_eq!(bodies[0]["metadata"]["resourceVersion"], "42");
+            assert_eq!(bodies[0]["metadata"]["uid"], "sandbox-uid");
+            assert_eq!(
+                bodies[0]["metadata"]["annotations"][RESOLVED_IDENTITY],
+                identity.encode().unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn required_namespace_identity_rejects_unreadable_configuration() {
+        for required in [false, true] {
+            let (driver, steps, _) = scripted_driver(
+                KubernetesComputeConfig {
+                    sandbox_uid: Some(1500),
+                    sandbox_gid: Some(1600),
+                    require_namespace_identity: required,
+                    ..Default::default()
+                },
+                vec![(
+                    http::Method::GET,
+                    "/api/v1/namespaces/tenant-a",
+                    kube_test_response(
+                        http::StatusCode::FORBIDDEN,
+                        serde_json::json!({
+                            "apiVersion": "v1", "kind": "Status", "status": "Failure", "message": "forbidden", "reason": "Forbidden", "code": 403
+                        }),
+                    ),
+                )],
+            );
+            let result = driver
+                .resolve_sandbox_identity_in_namespace("tenant-a")
+                .await;
+            if required {
+                assert!(
+                    matches!(result, Err(KubernetesDriverError::Precondition(message)) if message.contains("tenant-a") && message.contains("get access"))
+                );
+            } else {
+                let (identity, _) = result.unwrap();
+                assert_eq!((identity.uid, identity.gid), (1500, 1600));
+            }
+            assert!(steps.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn required_namespace_identity_rejects_timeout() {
+        let service = tower::service_fn(|_: http::Request<kube::client::Body>| async {
+            std::future::pending::<
+                Result<http::Response<kube::client::Body>, std::convert::Infallible>,
+            >()
+            .await
+        });
+        let mut driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            require_namespace_identity: true,
+            ..Default::default()
+        });
+        driver.client = Client::new(service, "openshell");
+        let result = driver
+            .resolve_sandbox_identity_in_namespace("tenant-a")
+            .await;
+        assert!(
+            matches!(result, Err(KubernetesDriverError::Precondition(message)) if message.contains("timeout"))
+        );
     }
 
     fn pod_owner(name: &str, uid: &str) -> OwnerReference {

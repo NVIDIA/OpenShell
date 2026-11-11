@@ -456,6 +456,7 @@ pub struct KubernetesComputeConfig {
     pub provider_spiffe_workload_api_socket_path: String,
     /// Exact UID shared by `openshell-sandbox`, its agent children, the trusted
     /// workspace/bootstrap init containers, and `openshell-supervisor`.
+    /// An explicit `OpenShell` namespace UID/GID assignment overrides this default.
     /// When empty, the driver auto-detects from `OpenShift` SCC annotations on
     /// the target namespace; if those are also absent, falls back to `10001`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -464,6 +465,10 @@ pub struct KubernetesComputeConfig {
     /// When empty and `sandbox_uid` is set, defaults to the resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
+    /// Require an explicit operator-assigned UID/GID pair on the target namespace.
+    /// Driver defaults and `OpenShift` SCC discovery do not satisfy this requirement.
+    #[serde(default)]
+    pub require_namespace_identity: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -550,6 +555,7 @@ impl Default for KubernetesComputeConfig {
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
             sandbox_gid: None,
+            require_namespace_identity: false,
         }
     }
 }
@@ -783,7 +789,8 @@ impl KubernetesComputeConfig {
         Ok(())
     }
 
-    /// Resolve the sandbox UID/GID pair.
+    /// Resolve the fallback sandbox UID/GID pair after the workload identity
+    /// resolver has checked explicit `OpenShell` namespace assignments.
     ///
     /// Resolution order:
     /// 1. Configured `sandbox_uid` / `sandbox_gid` (explicit override)
