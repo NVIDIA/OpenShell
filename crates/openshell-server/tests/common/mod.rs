@@ -9,6 +9,9 @@
 
 #![allow(dead_code)]
 
+#[path = "../../../../tests/support/unused_gateway_rpcs.rs"]
+mod unused_gateway_rpcs;
+
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
@@ -16,9 +19,8 @@ use hyper_util::{
 use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
-    ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest, GatewayMessage,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     IssueSandboxTokenRequest, IssueSandboxTokenResponse, ListProvidersRequest,
@@ -141,33 +143,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(SandboxResponse::default()))
     }
 
-    async fn create_sandbox_template(
-        &self,
-        _request: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
-    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn get_sandbox_template(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
-    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn list_sandbox_templates(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListSandboxTemplatesResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn delete_sandbox_template(
-        &self,
-        _request: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
-    ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
+    crate::unused_gateway_rpcs!(sandbox_templates);
 
     async fn stop_sandbox(
         &self,
@@ -331,19 +307,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(RevokeSshSessionResponse::default()))
     }
 
-    async fn mint_provider_client_assertion(
-        &self,
-        _: tonic::Request<openshell_core::proto::MintProviderClientAssertionRequest>,
-    ) -> Result<Response<openshell_core::proto::MintProviderClientAssertionResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn exchange_provider_subject_token(
-        &self,
-        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
-    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
+    crate::unused_gateway_rpcs!(provider_token_grants);
 
     async fn create_provider(
         &self,

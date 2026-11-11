@@ -5323,7 +5323,6 @@ dependencies = [
  "hex",
  "hickory-proto",
  "http 1.4.0",
- "hyper-util",
  "ipnet",
  "jsonwebtoken",
  "libc",

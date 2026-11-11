@@ -487,8 +487,12 @@ impl Connection {
         } else {
             ""
         };
+        self.send_with_headers(method, path, authorization).await;
+    }
+
+    async fn send_with_headers(&mut self, method: &str, path: &str, headers: &str) {
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n{authorization}Content-Length: 0\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n{headers}Content-Length: 0\r\n\r\n"
         );
         timeout(WAIT, self.app.write_all(request.as_bytes()))
             .await
@@ -546,6 +550,14 @@ impl Connection {
 }
 
 fn assert_authorization(request: &str, audience: &str) {
+    assert_bearer_token(request, &format!("inert-{audience}"));
+    assert!(
+        !request.contains("stale-inert-value"),
+        "stale header removed"
+    );
+}
+
+fn assert_bearer_token(request: &str, token: &str) {
     let values = request
         .lines()
         .filter_map(|line| line.split_once(':'))
@@ -554,12 +566,8 @@ fn assert_authorization(request: &str, audience: &str) {
         .collect::<Vec<_>>();
     assert_eq!(values.len(), 1, "exactly one Authorization replacement");
     assert!(
-        values[0] == format!("Bearer inert-{audience}"),
+        values[0] == format!("Bearer {token}"),
         "expected owner token"
-    );
-    assert!(
-        !request.contains("stale-inert-value"),
-        "stale header removed"
     );
 }
 

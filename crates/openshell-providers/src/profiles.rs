@@ -5533,7 +5533,7 @@ credentials:
     }
 
     #[test]
-    fn openshell_token_grant_profile_round_trips_and_rejects_unsafe_endpoints() {
+    fn token_grant_discriminators_round_trip_without_serializing_defaults() {
         let document = |fields: &str| {
             format!(
                 r"
@@ -5583,42 +5583,17 @@ credentials:
             assert_eq!(parse_profile_json(&json).unwrap().to_proto(), wire);
         }
         assert_eq!(token_grant_from_proto(&token_grant_to_proto(grant)), *grant);
-        let diagnostics = |profile: ProviderTypeProfile| {
-            validate_profile_set(&[("test.yaml".to_string(), profile)])
-                .into_iter()
-                .filter(|d| d.field == "credentials.token_grant")
-                .count()
-        };
-        assert_eq!(diagnostics(profile.clone()), 0);
-        for endpoint in [
-            "http://localhost/token",
-            "https://u:p@issuer.example/token",
-            "https://issuer.example/token?x=1",
-            "https://issuer.example/token#x",
-            "https://issuer.example/other/../token",
-        ] {
-            let mut bad = profile.clone();
-            bad.credentials[0]
-                .token_grant
-                .as_mut()
-                .unwrap()
-                .token_endpoint = endpoint.into();
-            assert_eq!(diagnostics(bad), 1);
-        }
-        let mut invalid_combination = profile.clone();
-        invalid_combination.credentials[0]
-            .token_grant
-            .as_mut()
-            .unwrap()
-            .grant_type = ProviderCredentialTokenGrantType::TokenExchange;
+        let invalid_combination =
+            parse_profile_yaml(&yaml.replace("client_credentials", "token_exchange")).unwrap();
         assert!(
             !invalid_combination
                 .validate_before_lowering("test.yaml")
                 .is_empty()
         );
+        let invalid_wire = invalid_combination.to_proto();
         assert!(
             ProviderCredentialTokenGrantType::try_from(
-                invalid_combination.to_proto().credentials[0]
+                invalid_wire.credentials[0]
                     .token_grant
                     .as_ref()
                     .unwrap()
@@ -5626,19 +5601,27 @@ credentials:
             )
             .is_err()
         );
-        assert_eq!(diagnostics(invalid_combination), 1);
+        for invalid in [
+            invalid_combination,
+            parse_profile_yaml(&document(&format!(
+                "{gateway}, jwt_svid_audience: elsewhere"
+            )))
+            .unwrap(),
+        ] {
+            let diagnostics = validate_profile_set(&[("test.yaml".into(), invalid)]);
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|d| d.field == "credentials.token_grant")
+                    .count(),
+                1
+            );
+        }
         assert!(parse_profile_yaml(&yaml.replace("openshell_gateway", "unknown_issuer")).is_err());
         assert!(
             parse_profile_yaml(&yaml.replace("client_credentials", "openshell_client_credentials"))
                 .is_err()
         );
-        let mut bad = profile;
-        bad.credentials[0]
-            .token_grant
-            .as_mut()
-            .unwrap()
-            .jwt_svid_audience = "elsewhere".into();
-        assert_eq!(diagnostics(bad), 1);
     }
 
     #[test]
@@ -5900,16 +5883,14 @@ credentials:
         );
     }
 
-    #[test]
-    fn validate_profile_set_rejects_plain_http_token_endpoint() {
-        for token_endpoint in [
-            "http://auth.example.com/token",
-            "http://token-issuer.default.svc.evil.com/token",
-        ] {
-            let profile = parse_profile_yaml(&format!(
-                r"
-id: insecure-token-grant
-display_name: Insecure Token Grant
+    fn token_endpoint_diagnostics(
+        token_endpoint: &str,
+        assertion_source: super::TokenGrantAssertionSource,
+    ) -> Vec<super::ProfileValidationDiagnostic> {
+        let mut profile = parse_profile_yaml(&format!(
+            r"
+id: token-grant
+display_name: Token Grant
 credentials:
   - name: access_token
     auth_style: bearer
@@ -5918,15 +5899,28 @@ credentials:
       token_endpoint: {token_endpoint}
       audience: api://default
 "
-            ))
-            .expect("profile should parse");
+        ))
+        .unwrap();
+        profile.credentials[0]
+            .token_grant
+            .as_mut()
+            .unwrap()
+            .assertion_source = assertion_source;
+        validate_profile_set(&[("grant.yaml".into(), profile)])
+    }
 
-            let diagnostics = validate_profile_set(&[("insecure.yaml".to_string(), profile)]);
+    #[test]
+    fn validate_profile_set_rejects_plain_http_token_endpoint() {
+        for endpoint in [
+            "http://auth.example.com/token",
+            "http://token-issuer.default.svc.evil.com/token",
+        ] {
+            let diagnostics =
+                token_endpoint_diagnostics(endpoint, super::TokenGrantAssertionSource::Spiffe);
             let diagnostic = diagnostics
                 .iter()
-                .find(|diagnostic| diagnostic.field == "credentials.token_grant.token_endpoint")
-                .expect("token endpoint diagnostic should be reported");
-
+                .find(|d| d.field == "credentials.token_grant.token_endpoint")
+                .unwrap();
             assert_eq!(
                 diagnostic.message,
                 "token_endpoint must use https, except http for loopback or in-cluster service hosts"
@@ -5935,32 +5929,36 @@ credentials:
     }
 
     #[test]
-    fn validate_profile_set_allows_https_loopback_and_in_cluster_token_endpoints() {
-        for token_endpoint in [
-            "https://auth.example.com/token",
-            "http://127.0.0.1:8180/token",
-            "http://token-issuer.default.svc.cluster.local/token",
+    fn validate_profile_set_checks_token_endpoints_for_the_assertion_source() {
+        use super::TokenGrantAssertionSource::{OpenshellGateway, Spiffe};
+        for (source, endpoint) in [
+            (Spiffe, "https://auth.example.com/token"),
+            (Spiffe, "http://127.0.0.1:8180/token"),
+            (
+                Spiffe,
+                "http://token-issuer.default.svc.cluster.local/token",
+            ),
+            (OpenshellGateway, "https://auth.example.com/token"),
         ] {
-            let profile = parse_profile_yaml(&format!(
-                r"
-id: secure-token-grant
-display_name: Secure Token Grant
-credentials:
-  - name: access_token
-    auth_style: bearer
-    header_name: Authorization
-    token_grant:
-      token_endpoint: {token_endpoint}
-      audience: api://default
-"
-            ))
-            .expect("profile should parse");
-
-            let diagnostics = validate_profile_set(&[("secure.yaml".to_string(), profile)]);
+            let diagnostics = token_endpoint_diagnostics(endpoint, source);
             assert!(
                 diagnostics.is_empty(),
-                "unexpected diagnostics for {token_endpoint}: {diagnostics:?}"
+                "{source:?} {endpoint}: {diagnostics:?}"
             );
+        }
+        for endpoint in [
+            "http://localhost/token",
+            "https://u:p@issuer.example/token",
+            "https://issuer.example/token?x=1",
+            "https://issuer.example/token#x",
+            "https://issuer.example/other/../token",
+        ] {
+            let diagnostics = token_endpoint_diagnostics(endpoint, OpenshellGateway);
+            let rejected = diagnostics
+                .iter()
+                .filter(|d| d.field == "credentials.token_grant")
+                .count();
+            assert_eq!(rejected, 1, "{endpoint}: {diagnostics:?}");
         }
     }
 

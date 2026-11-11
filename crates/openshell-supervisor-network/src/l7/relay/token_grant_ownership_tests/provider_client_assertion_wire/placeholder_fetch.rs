@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicU32;
 use axum::body::{Body, to_bytes};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use openshell_core::policy::ProxyPolicy;
-use tokio::process::Command as AsyncCommand;
+use tokio::{io::AsyncWriteExt, process::Command as AsyncCommand};
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config};
@@ -52,8 +52,6 @@ fn run_placeholder_test(name: &str, raw: bool) {
 
 async fn exercise(cert_dir: &Path, raw: bool) {
     openshell_crypto::tls::ensure_default_provider();
-    let tls = gateway_tls(cert_dir);
-    let (broker_listener, broker_url) = bind_broker().await;
 
     let repo_root = tempfile::tempdir().unwrap();
     let server_repo = repo_root.path().join("team/repo.git");
@@ -67,7 +65,11 @@ async fn exercise(cert_dir: &Path, raw: bool) {
     } else {
         git_ok(
             repo_root.path(),
-            &["init", "--bare", server_repo.to_str().unwrap()],
+            &[
+                "init",
+                "--initial-branch=main",
+                server_repo.to_str().unwrap(),
+            ],
         )
         .await;
         let exec_path = git_ok(repo_root.path(), &["--exec-path"]).await;
@@ -81,14 +83,14 @@ async fn exercise(cert_dir: &Path, raw: bool) {
     };
     let origin = Origin::start(repo_root.path().to_path_buf(), raw).await;
     let url = format!("https://{ORIGIN_HOST}:{}{path}", origin.port);
-    let mut profile = profile(&broker_url, &binary, "placeholder", &route, &[]);
-    profile.endpoints[0].host = ORIGIN_HOST.into();
-    profile.endpoints[0].port = origin.port.into();
-    profile.credentials[0].env_vars = vec![ENV_KEY.into()];
-    profile.credentials[0].header_name = header_name.into();
-    let gateway =
-        ProviderGrantGateway::start(tls.clone(), profile, CREDENTIAL, &broker_url, &[]).await;
-    let broker = Broker::start(broker_listener, tls.acceptor(), &broker_url, &gateway).await;
+    let (gateway, broker) = start_gateway(cert_dir, &[], |url| {
+        let mut profile = profile(url, &binary, "placeholder", &route);
+        profile.endpoints[0].host = ORIGIN_HOST.into();
+        profile.endpoints[0].port = origin.port.into();
+        profile.credentials[0].header_name = header_name.into();
+        profile
+    })
+    .await;
 
     let policy = gateway_policy(&gateway.sandbox, SANDBOX).await;
     let delivery = fetch_provider_environment(&gateway.sandbox, SANDBOX)
@@ -287,23 +289,22 @@ async fn has_commit(directory: &Path, oid: &str) -> bool {
 }
 
 async fn publish_commit(repository: &Path, message: &str) -> String {
-    let tree = git_ok(repository, &["mktree"]).await;
-    let oid = git_ok(
+    std::fs::write(repository.join("fixture.txt"), message).unwrap();
+    git_ok(repository, &["add", "fixture.txt"]).await;
+    git_ok(
         repository,
         &[
             "-c",
             "user.name=Fixture",
             "-c",
             "user.email=fixture@example.test",
-            "commit-tree",
-            &tree,
+            "commit",
             "-m",
             message,
         ],
     )
     .await;
-    git_ok(repository, &["update-ref", "refs/heads/main", &oid]).await;
-    oid
+    git_ok(repository, &["rev-parse", "HEAD"]).await
 }
 
 fn git_fetch(url: &str, oid: &str, handle: &str, proxy: &str, ca: &Path) -> AsyncCommand {
@@ -357,7 +358,7 @@ struct Origin {
     port: u16,
     ca_pem: String,
     state: Arc<OriginState>,
-    _server: TlsServer,
+    _server: JoinSet<()>,
 }
 
 struct OriginState {
@@ -370,24 +371,8 @@ impl Origin {
     async fn start(root: PathBuf, raw: bool) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
-        let mut ca_params = rcgen::CertificateParams::default();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
-        let leaf_key = openshell_crypto::pki::generate_keypair().unwrap();
-        let leaf = openshell_crypto::pki::signed_by(
-            rcgen::CertificateParams::new(vec![ORIGIN_HOST.to_string()]).unwrap(),
-            &leaf_key,
-            &ca,
-            &ca_key,
-        )
-        .unwrap();
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der().unwrap());
-        let config = openshell_crypto::tls::server_builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![leaf.der().clone()], key.into())
-            .unwrap();
-        let tls = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let pki = openshell_otel_test_support::TestPki::for_server(ORIGIN_HOST);
+        let tls = openshell_otel_test_support::ServerTls::server_only(&pki).rustls_config();
         let state = Arc::new(OriginState {
             root,
             raw,
@@ -398,9 +383,9 @@ impl Origin {
             .with_state(state.clone());
         Self {
             port,
-            ca_pem: ca.pem(),
+            ca_pem: pki.ca_pem,
             state,
-            _server: TlsServer::start(listener, tls, router),
+            _server: TlsListener(listener, tls.into()).serve(router),
         }
     }
 

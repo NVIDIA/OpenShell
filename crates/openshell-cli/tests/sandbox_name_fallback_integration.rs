@@ -13,8 +13,7 @@ use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse,
-    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
@@ -196,7 +195,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ListSandboxesResponse::default()))
     }
 
-    unimplemented_sandbox_template_rpcs!();
+    unused_gateway_rpcs!(sandbox_templates);
 
     async fn list_sandbox_providers(
         &self,
@@ -364,19 +363,7 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
-    async fn mint_provider_client_assertion(
-        &self,
-        _: tonic::Request<openshell_core::proto::MintProviderClientAssertionRequest>,
-    ) -> Result<Response<openshell_core::proto::MintProviderClientAssertionResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn exchange_provider_subject_token(
-        &self,
-        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
-    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
+    unused_gateway_rpcs!(provider_token_grants);
 
     async fn create_provider(
         &self,

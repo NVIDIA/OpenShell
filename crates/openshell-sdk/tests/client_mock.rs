@@ -8,6 +8,9 @@
 //! TLS and auth code paths are skipped — those are exercised by the CLI's
 //! `mtls_integration` and OIDC tests.
 
+#[path = "../../../tests/support/unused_gateway_rpcs.rs"]
+mod unused_gateway_rpcs;
+
 use openshell_core::proto;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::sandbox_updates_server::{SandboxUpdates, SandboxUpdatesServer};
@@ -871,19 +874,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::GetGatewayConfigResponse::default()))
     }
 
-    async fn mint_provider_client_assertion(
-        &self,
-        _: tonic::Request<proto::MintProviderClientAssertionRequest>,
-    ) -> Result<Response<proto::MintProviderClientAssertionResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn exchange_provider_subject_token(
-        &self,
-        _: tonic::Request<proto::ExchangeProviderSubjectTokenRequest>,
-    ) -> Result<Response<proto::ExchangeProviderSubjectTokenResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
+    unused_gateway_rpcs!(provider_token_grants);
 
     async fn update_config(
         &self,

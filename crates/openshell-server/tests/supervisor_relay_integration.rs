@@ -15,6 +15,9 @@
 //! wire layer that unit tests can't see and that are expensive to catch in
 //! E2E.
 
+#[path = "../../../tests/support/unused_gateway_rpcs.rs"]
+mod unused_gateway_rpcs;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,33 +131,7 @@ impl OpenShell for RelayGateway {
 
     // ------ unused stubs ------
 
-    async fn create_sandbox_template(
-        &self,
-        _request: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
-    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn get_sandbox_template(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
-    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn list_sandbox_templates(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListSandboxTemplatesResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn delete_sandbox_template(
-        &self,
-        _request: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
-    ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
+    unused_gateway_rpcs!(sandbox_templates);
 
     type PeerRelayStream =
         std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send>>;
@@ -362,19 +339,7 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::RevokeSshSessionResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
-    async fn mint_provider_client_assertion(
-        &self,
-        _: tonic::Request<openshell_core::proto::MintProviderClientAssertionRequest>,
-    ) -> Result<Response<openshell_core::proto::MintProviderClientAssertionResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn exchange_provider_subject_token(
-        &self,
-        _: tonic::Request<openshell_core::proto::ExchangeProviderSubjectTokenRequest>,
-    ) -> Result<Response<openshell_core::proto::ExchangeProviderSubjectTokenResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
+    unused_gateway_rpcs!(provider_token_grants);
     async fn create_provider(
         &self,
         _: tonic::Request<openshell_core::proto::CreateProviderRequest>,

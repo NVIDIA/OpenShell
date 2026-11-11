@@ -13,7 +13,7 @@ pub struct PemIdentity {
     pub key_pem: String,
 }
 
-/// A CA with a `localhost` server certificate and a client certificate, all
+/// A CA with a server certificate and a client certificate, all
 /// freshly generated.
 #[derive(Clone, Debug)]
 pub struct TestPki {
@@ -25,6 +25,12 @@ pub struct TestPki {
 impl TestPki {
     #[must_use]
     pub fn generate() -> Self {
+        Self::for_server("localhost")
+    }
+
+    /// Issue the server certificate for a particular DNS name.
+    #[must_use]
+    pub fn for_server(host: &str) -> Self {
         let ca_key = pki::generate_keypair().unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -34,7 +40,7 @@ impl TestPki {
             server: issue(
                 &ca,
                 &ca_key,
-                vec!["localhost".to_string()],
+                vec![host.to_owned()],
                 ExtendedKeyUsagePurpose::ServerAuth,
             ),
             client: issue(
@@ -91,7 +97,9 @@ impl ServerTls {
         }
     }
 
-    pub(crate) fn rustls_config(&self) -> std::sync::Arc<rustls::ServerConfig> {
+    /// Configure a rustls server with this identity and client trust.
+    #[must_use]
+    pub fn rustls_config(&self) -> std::sync::Arc<rustls::ServerConfig> {
         use rustls::pki_types::pem::PemObject as _;
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 

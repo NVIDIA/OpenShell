@@ -15,11 +15,6 @@ use axum::{
     http::{Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
-    server::conn::auto::Builder,
-    service::TowerToHyperService,
-};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use openshell_core::{
     grpc_client::{
@@ -41,12 +36,11 @@ use openshell_server::{
 };
 use serde::Deserialize;
 use tokio::{
-    io::AsyncWriteExt,
-    net::TcpListener,
-    task::{JoinHandle, JoinSet},
+    net::{TcpListener, TcpStream},
+    task::JoinSet,
 };
 
-use super::{Connection, HOST, PORT, WAIT};
+use super::{Connection, HOST, PORT, WAIT, assert_bearer_token};
 use crate::l7::relay::L7EvalContext;
 use crate::l7::token_grant_injection::SpiffeTokenGrantResolver;
 use crate::opa::{NetworkAction, NetworkInput, OpaEngine};
@@ -122,18 +116,11 @@ async fn run(cert_dir: &Path) {
     openshell_crypto::tls::ensure_default_provider();
     let target = "/wire";
     let environment = &[(ENV_KEY, PLACEHOLDER_VALUE)];
-    let tls = gateway_tls(cert_dir);
-    let (listener, broker_url) = bind_broker().await;
     let binary = crate::test_support::executable_path("/usr/bin/curl");
-    let gateway = ProviderGrantGateway::start(
-        tls.clone(),
-        profile(&broker_url, &binary, "bearer", target, environment),
-        CREDENTIAL,
-        &broker_url,
-        environment,
-    )
+    let (gateway, broker) = start_gateway(cert_dir, environment, |url| {
+        profile(url, &binary, "bearer", target)
+    })
     .await;
-    let broker = Broker::start(listener, tls.acceptor(), &broker_url, &gateway).await;
 
     let policy = gateway_policy(&gateway.sandbox, SANDBOX).await;
     let engine = Arc::new(OpaEngine::from_proto(&policy).expect("provider policy compiles"));
@@ -182,11 +169,8 @@ async fn run(cert_dir: &Path) {
         panic!("expected one provider endpoint");
     };
     let config = crate::l7::parse_l7_config(endpoint).unwrap();
-    let request = format!(
-        "GET {target} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n\
-                 Authorization: Bearer {workload_header}\r\n\
-                 authorization: Bearer stale-value\r\nContent-Length: 0\r\n\r\n"
-    );
+    let headers =
+        format!("Authorization: Bearer {workload_header}\r\nauthorization: Bearer stale-value\r\n");
     let exchange = async |caller: &GatewayEndpoint, expected_status: &str| {
         let ctx = L7EvalContext {
             host: HOST.into(),
@@ -209,7 +193,7 @@ async fn run(cert_dir: &Path) {
             ctx,
             None,
         );
-        connection.app.write_all(request.as_bytes()).await.unwrap();
+        connection.send_with_headers("GET", target, &headers).await;
         let response = connection.response().await;
         assert!(response.starts_with(expected_status));
         assert!(response.contains("Content-Length: 0\r\n"));
@@ -232,23 +216,13 @@ async fn run(cert_dir: &Path) {
     let [origin] = capture.requests.as_slice() else {
         panic!("expected one request at the origin");
     };
-    let values = origin
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-        .map(|(_, value)| value.trim())
-        .collect::<Vec<_>>();
     assert!(origin.starts_with(&format!("GET {target} HTTP/1.1\r\n")));
-    let expected = format!("Bearer {ACCESS_TOKEN}");
-    assert!(
-        values == [expected],
-        "exactly one Authorization header carries the granted access token"
-    );
+    assert_bearer_token(origin, ACCESS_TOKEN);
     assert!(!origin.contains(workload_header));
     assert!(!origin.contains(PLACEHOLDER_VALUE));
     broker.assert_outcomes(&[Outcome::Issued]);
 
-    *broker.state.audience.lock().unwrap() = format!("{broker_url}/other");
+    *broker.state.audience.lock().unwrap() = "https://other.example.test/token".into();
     assert_eq!(
         exchange(&gateway.sandbox, "HTTP/1.1 502 ").await.bytes_seen,
         0
@@ -269,13 +243,27 @@ fn gateway_tls(cert_dir: &Path) -> TlsAcceptor {
     .expect("fixture Gateway TLS")
 }
 
-async fn bind_broker() -> (TcpListener, String) {
+async fn start_gateway(
+    cert_dir: &Path,
+    environment: &[(&str, &str)],
+    build_profile: impl FnOnce(&str) -> ProviderProfile,
+) -> (ProviderGrantGateway, Broker) {
+    let tls = gateway_tls(cert_dir);
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let url = format!(
         "https://localhost:{}/token",
         listener.local_addr().unwrap().port()
     );
-    (listener, url)
+    let gateway = ProviderGrantGateway::start(
+        tls.clone(),
+        build_profile(&url),
+        CREDENTIAL,
+        &url,
+        environment,
+    )
+    .await;
+    let broker = Broker::start(listener, tls.acceptor(), &url, &gateway).await;
+    (gateway, broker)
 }
 
 async fn gateway_policy(gateway: &GatewayEndpoint, sandbox: &str) -> SandboxPolicy {
@@ -303,20 +291,14 @@ fn provider_state(delivery: ProviderEnvironmentResult) -> ProviderCredentialStat
     .expect("provider installation accepted by supervisor")
 }
 
-fn profile(
-    broker_url: &str,
-    binary: &Path,
-    auth_style: &str,
-    path: &str,
-    environment: &[(&str, &str)],
-) -> ProviderProfile {
+fn profile(broker_url: &str, binary: &Path, auth_style: &str, path: &str) -> ProviderProfile {
     ProviderProfile {
         id: "wire-grant".into(),
         display_name: "Local wire grant".into(),
         category: ProviderProfileCategory::Other as i32,
         credentials: vec![ProviderProfileCredential {
             name: CREDENTIAL.into(),
-            env_vars: environment.iter().map(|(key, _)| (*key).into()).collect(),
+            env_vars: vec![ENV_KEY.into()],
             auth_style: auth_style.into(),
             header_name: "Authorization".into(),
             token_grant: Some(ProviderCredentialTokenGrant {
@@ -354,7 +336,7 @@ enum Outcome {
 
 struct Broker {
     state: Arc<BrokerState>,
-    _server: TlsServer,
+    _server: JoinSet<()>,
 }
 
 struct BrokerState {
@@ -398,7 +380,7 @@ impl Broker {
             .with_state(state.clone());
         Self {
             state,
-            _server: TlsServer::start(listener, tls, router),
+            _server: TlsListener(listener, tls).serve(router),
         }
     }
 
@@ -407,38 +389,28 @@ impl Broker {
     }
 }
 
-struct TlsServer(JoinHandle<()>);
+struct TlsListener(TcpListener, tokio_rustls::TlsAcceptor);
 
-impl Drop for TlsServer {
-    fn drop(&mut self) {
-        self.0.abort();
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let (stream, addr) = self.0.accept().await.expect("fixture accept");
+        openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+        (self.1.accept(stream).await.expect("fixture TLS"), addr)
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
     }
 }
 
-impl TlsServer {
-    fn start(listener: TcpListener, tls: tokio_rustls::TlsAcceptor, router: Router) -> Self {
-        Self(tokio::spawn(async move {
-            let mut connections = JoinSet::new();
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let (stream, _) = accepted.expect("fixture accept");
-                        openshell_core::net::set_tcp_nodelay_best_effort(&stream);
-                        let tls = tls.clone();
-                        let service = TowerToHyperService::new(router.clone());
-                        connections.spawn(async move {
-                            let stream = tls.accept(stream).await.expect("fixture TLS");
-                            Builder::new(TokioExecutor::new())
-                                .serve_connection(TokioIo::new(stream), service)
-                                .await
-                        });
-                    }
-                    completed = connections.join_next(), if !connections.is_empty() => {
-                        let _ = completed.expect("fixture connection").expect("fixture task");
-                    }
-                }
-            }
-        }))
+impl TlsListener {
+    fn serve(self, router: Router) -> JoinSet<()> {
+        let mut server = JoinSet::new();
+        server.spawn(async move { axum::serve(self, router).await.unwrap() });
+        server
     }
 }
 
