@@ -5373,6 +5373,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn logs_only_watch_ends_when_sweeper_frees_sandbox_deleted_elsewhere() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("swept", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                follow_logs: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stream = response.into_inner();
+
+        // A delivered log line proves the watch has subscribed.
+        seed_log_lines(&state, &id, 1);
+        loop {
+            let event = stream.next().await.unwrap().unwrap();
+            if !event.cursor.is_empty() {
+                break;
+            }
+        }
+
+        // Another replica deletes the record; this one never runs delete cleanup.
+        state
+            .store
+            .delete(Sandbox::object_type(), &id)
+            .await
+            .unwrap();
+        let mut suspects = HashSet::new();
+        for expected in [0, 1] {
+            let closed = crate::bus_sweeper::sweep_once(
+                &state.store,
+                &state.tracing_log_bus,
+                std::time::Duration::ZERO,
+                &mut suspects,
+            )
+            .await
+            .unwrap();
+            assert_eq!(closed, expected);
+        }
+
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(item) = stream.next().await {
+                if item.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "logs-only watch should end once its buffers are freed"
+        );
+    }
+
     /// Seed `n` log lines onto the log bus; cursors run 1..=n.
     fn seed_log_lines(state: &ServerState, sandbox_id: &str, n: usize) {
         for i in 0..n {

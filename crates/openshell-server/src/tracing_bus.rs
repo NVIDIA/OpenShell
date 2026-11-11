@@ -80,12 +80,10 @@ impl PerSandbox {
             .subscribe()
     }
 
-    /// No live receivers and no activity for at least `min_idle`.
+    /// No publish or subscribe for at least `min_idle`. Live receivers don't
+    /// count: a logs-only watch never learns of a deletion served elsewhere.
     fn is_idle(&self, min_idle: Duration) -> bool {
-        self.sender
-            .as_ref()
-            .is_none_or(|sender| sender.receiver_count() == 0)
-            && self.last_active.elapsed() >= min_idle
+        self.last_active.elapsed() >= min_idle
     }
 
     fn push(&mut self, cursored: CursoredEvent, tail_cap: usize) {
@@ -383,7 +381,7 @@ impl TracingLogBus {
     }
 
     /// Sandboxes buffered on either bus that are idle on every bus holding
-    /// them: no live receivers and no publish or subscribe for `min_idle`.
+    /// them: no publish or subscribe for `min_idle`.
     pub(crate) fn idle_sandbox_ids(&self, min_idle: Duration) -> Vec<String> {
         let mut idle: HashMap<String, bool> = self
             .inner
