@@ -261,6 +261,41 @@ The chart renders one Service per replica and a GRPCRoute rule that matches the 
 
 If the release uses `workload.kind=deployment`, this upgrade replaces the Deployment with a StatefulSet, so every gateway pod restarts at once. The StatefulSet also requests a 1Gi PersistentVolumeClaim per replica, which stays `Pending` on clusters without a default StorageClass.
 
+## Publish the Gateway Service as a LoadBalancer
+
+Without a Gateway API implementation, you can publish the chart's gateway Service through the cluster's load balancer instead. The gateway terminates TLS itself, as it does behind a port-forward. Set the Service values in a values file:
+
+```yaml
+service:
+  type: LoadBalancer
+  servicePort: 443
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+  loadBalancerClass: service.k8s.aws/nlb
+  loadBalancerSourceRanges:
+    - 203.0.113.0/24
+pkiInitJob:
+  serverDnsNames:
+    - gateway.example.com
+```
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  -f load-balancer-values.yaml
+```
+
+- `service.servicePort` is the port the Service exposes. The gateway keeps listening on `service.port` (`8080`), which the Service targets, so it doesn't bind a privileged port. Leave `service.servicePort` unset to expose `service.port`.
+- Sandboxes and the GRPCRoute also reach the gateway Service on `service.servicePort`. Sandboxes receive that endpoint when they're created, so set `service.servicePort` before creating sandboxes: an existing sandbox keeps the port it was created with.
+- `service.annotations` selects and tunes the load balancer. Annotation names depend on your cloud provider or load-balancer controller.
+- `service.loadBalancerSourceRanges` and `service.loadBalancerClass` require `service.type=LoadBalancer`. Source ranges limit only the load balancer: by default, Kubernetes also allocates a node port for a LoadBalancer Service, which they don't cover, and load-balancer implementations differ in whether they enforce them.
+- The gateway certificate must name the address clients dial. Add it to `pkiInitJob.serverDnsNames` or `pkiInitJob.serverIpAddresses`, or to `certManager.serverDnsNames` with cert-manager.
+- Sandbox service URLs that the gateway prints name its listening port, `service.port`. With a different `service.servicePort`, those URLs don't open through the load balancer as printed.
+
+After the Service gets an external address, register `https://gateway.example.com` with the CLI using the authentication mode you configured, as in [Register over HTTPS](#register-over-https).
+
 ## SSH Relay
 
 Sandbox SSH uses the gateway endpoint registered with the CLI. No separate Helm SSH host or port values are required.

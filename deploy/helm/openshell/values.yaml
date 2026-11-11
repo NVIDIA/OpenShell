@@ -264,8 +264,16 @@ securityContext:
 service:
   # -- Kubernetes Service type for the gateway.
   type: ClusterIP
-  # -- Gateway gRPC/HTTP service port.
+  # -- Gateway gRPC/HTTP listener port. The gateway Service also exposes this port unless service.servicePort is set.
   port: 8080
+  # -- (int) Port the gateway Service exposes, forwarding to the gateway's service.port listener. Null exposes service.port. Use it to publish a LoadBalancer on a port such as 443 without the gateway binding it. Sandbox service URLs that the gateway prints keep service.port.
+  servicePort: null
+  # -- Annotations for the gateway Service, such as a cloud provider's load balancer settings.
+  annotations: {}
+  # -- Load balancer implementation for the gateway Service (spec.loadBalancerClass). Requires service.type=LoadBalancer.
+  loadBalancerClass: ""
+  # -- Client CIDR ranges the load balancer admits (spec.loadBalancerSourceRanges). Requires service.type=LoadBalancer. It doesn't restrict the node port Kubernetes also allocates for a LoadBalancer Service.
+  loadBalancerSourceRanges: []
   # -- Gateway health service port.
   healthPort: 8081
   # -- Gateway metrics service port (1-65535). Disable the endpoint with metrics.enabled, not port 0 or false.
