@@ -117,10 +117,7 @@ hide = true
 
 ["test:labeling-agent"]
 description = "Test managed labeling classifier and invocation routing offline"
-run = [
-  "uv run --no-project python -m unittest discover -s tasks/scripts -p managed_label_classifier_test.py",
-  "uv run --no-project python -m unittest discover -s tasks/scripts -p labeling_agent_events_test.py",
-]
+run = "uv run --no-project python -m unittest discover -s tasks/scripts -p '*label*_test.py'"
 hide = true
 
 [e2e]
