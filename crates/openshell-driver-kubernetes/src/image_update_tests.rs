@@ -7,7 +7,8 @@ use super::super::{
     ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC, ANNOTATION_SANDBOX_RUNTIME_READINESS,
     KubernetesComputeConfig, LABEL_SANDBOX_ID, LABEL_SANDBOX_WORKSPACE, OperatorNamespaceAllowlist,
     SANDBOX_BOOTSTRAP_CONTAINER_NAME, SANDBOX_BOOTSTRAP_VOLUME_NAME, SANDBOX_GROUP,
-    SANDBOX_VERSION_V1ALPHA1, WORKSPACE_INIT_MOUNT_PATH, WorkspaceMode,
+    SANDBOX_VERSION_V1ALPHA1, WORKSPACE_MOUNT_PATH, WORKSPACE_STAGE_CONTAINER_NAME,
+    WORKSPACE_STAGE_MOUNT_PATH, WorkspaceMode,
 };
 use super::*;
 use http_body_util::BodyExt as _;
@@ -98,7 +99,8 @@ fn snapshot(version: &str) -> serde_json::Value {
                     ],
                     "initContainers": [
                         {"name":SANDBOX_BOOTSTRAP_CONTAINER_NAME, "image":"trusted-runtime:v3"},
-                        {"name":WORKSPACE_INIT_CONTAINER_NAME, "image":"registry.example/agent:v1", "command":["seed-workspace"], "volumeMounts":[{"name":"workspace", "mountPath":WORKSPACE_INIT_MOUNT_PATH}]},
+                        {"name":WORKSPACE_STAGE_CONTAINER_NAME, "image":"registry.example/agent:v1", "command":["seed-workspace", WORKSPACE_MOUNT_PATH, WORKSPACE_STAGE_MOUNT_PATH], "volumeMounts":[{"name":"workspace-stage", "mountPath":WORKSPACE_STAGE_MOUNT_PATH}]},
+                        {"name":WORKSPACE_INIT_CONTAINER_NAME, "image":"registry.example/agent:v1", "command":["seed-workspace", WORKSPACE_STAGE_MOUNT_PATH, WORKSPACE_MOUNT_PATH], "volumeMounts":[{"name":"workspace", "mountPath":WORKSPACE_MOUNT_PATH}, {"name":"workspace-stage", "mountPath":WORKSPACE_STAGE_MOUNT_PATH}]},
                         {"name":"operator-init", "image":"registry.example/agent:v1"}
                     ]
                 }
@@ -346,7 +348,10 @@ async fn image_update_preserves_resource_storage_and_operator_bootstrap_annotati
             );
             expected["spec"]["podTemplate"]["spec"]["containers"][0]["image"] =
                 serde_json::json!(request().image);
+            // Both workspace init containers run the agent image.
             expected["spec"]["podTemplate"]["spec"]["initContainers"][1]["image"] =
+                serde_json::json!(request().image);
+            expected["spec"]["podTemplate"]["spec"]["initContainers"][2]["image"] =
                 serde_json::json!(request().image);
             // Whole-object equality proves claim templates, mounts, owner UID,
             // launch state, operator annotations, and trusted/sidecar images
@@ -724,6 +729,8 @@ async fn image_update_can_repair_a_legacy_invalid_image_reference() {
         state.sandbox["spec"]["podTemplate"]["spec"]["containers"][0]["image"] =
             serde_json::json!(invalid_image);
         state.sandbox["spec"]["podTemplate"]["spec"]["initContainers"][1]["image"] =
+            serde_json::json!(invalid_image);
+        state.sandbox["spec"]["podTemplate"]["spec"]["initContainers"][2]["image"] =
             serde_json::json!(invalid_image);
     }
     let mut update = request();

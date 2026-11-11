@@ -295,9 +295,13 @@ errors, avoiding a gateway-side watch restart and its associated watch gap.
 
 ## Workspace Persistence
 
-Sandbox pods use a PVC-backed `/sandbox` workspace. An init container seeds the
-PVC from the image's original `/sandbox` contents on first start and writes a
-sentinel so subsequent starts skip the copy.
+Sandbox pods use a PVC-backed `/sandbox` workspace. Two init containers seed
+the PVC from the image's original `/sandbox` contents on first start: a
+`workspace-stage` container copies the image contents into a staging
+`emptyDir`, and a `workspace-init` container copies the staging directory
+into the PVC and writes a sentinel so subsequent starts skip the copy. The
+workspace PVC is mounted at `/sandbox` in every container of the pod that
+mounts it.
 
 This is a stopgap persistence model. It preserves user files across pod
 rescheduling but duplicates the base workspace and does not automatically apply

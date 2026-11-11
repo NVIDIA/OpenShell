@@ -29,6 +29,10 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
+
+/// Marker file written into a seeded workspace after the image's `/sandbox`
+/// contents have been copied in. A later start sees it and skips the copy.
+const WORKSPACE_SEED_SENTINEL: &str = ".openshell-initialized";
 #[cfg(target_os = "linux")]
 const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 3] = ["boundary.json", "tls.crt", "tls.key"];
 #[cfg(target_os = "linux")]
@@ -1677,9 +1681,16 @@ fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<()>
 
 /// Seed the persistent workspace from the agent image as the final workload
 /// identity. This replaces the former root shell/tar init container.
+///
+/// `seed-workspace` accepts an optional source and destination:
+/// `seed-workspace [SOURCE] [DESTINATION]`, defaulting to the image's
+/// `/sandbox` and the workspace PVC mount. The Kubernetes driver passes
+/// explicit paths so the image contents are first staged into an `emptyDir`
+/// and then copied into the PVC, which is mounted at `/sandbox` in every
+/// container of the pod.
 #[cfg(target_os = "linux")]
-fn seed_kubernetes_workspace() -> Result<()> {
-    seed_kubernetes_workspace_at(Path::new("/sandbox"), Path::new("/mnt/openshell-workspace"))
+fn seed_kubernetes_workspace(source: &Path, destination: &Path) -> Result<()> {
+    seed_kubernetes_workspace_at(source, destination)
 }
 
 #[cfg(target_os = "linux")]
@@ -1690,6 +1701,13 @@ fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<()> {
 
     for entry in fs::read_dir(source).into_diagnostic()? {
         let entry = entry.into_diagnostic()?;
+        // The seed marker is driver state, not workspace content. Skipping it
+        // keeps a staged copy (which already carries the marker from the
+        // staging pass) from colliding with the marker this pass writes into
+        // the destination with `create_new` below.
+        if entry.file_name().as_encoded_bytes() == WORKSPACE_SEED_SENTINEL.as_bytes() {
+            continue;
+        }
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
         let metadata = fs::symlink_metadata(&source_path).into_diagnostic()?;
@@ -1741,7 +1759,7 @@ fn seed_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()>
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    let sentinel = destination.join(".openshell-initialized");
+    let sentinel = destination.join(WORKSPACE_SEED_SENTINEL);
     if sentinel.try_exists().into_diagnostic()? {
         return Ok(());
     }
@@ -1781,7 +1799,7 @@ fn seed_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()>
 }
 
 #[cfg(not(target_os = "linux"))]
-fn seed_kubernetes_workspace() -> Result<()> {
+fn seed_kubernetes_workspace(_source: &Path, _destination: &Path) -> Result<()> {
     Err(miette::miette!(
         "Kubernetes workspace seeding is supported only on Linux"
     ))
@@ -1826,12 +1844,16 @@ fn main() -> Result<()> {
         return run_kubernetes_bootstrap();
     }
     if raw_args.get(1).map(String::as_str) == Some(SEED_WORKSPACE_SUBCOMMAND) {
-        if raw_args.len() != 2 {
+        if raw_args.len() > 4 {
             return Err(miette::miette!(
-                "usage: openshell-sandbox {SEED_WORKSPACE_SUBCOMMAND}"
+                "usage: openshell-sandbox {SEED_WORKSPACE_SUBCOMMAND} [SOURCE] [DESTINATION]"
             ));
         }
-        return seed_kubernetes_workspace();
+        let source = raw_args.get(2).map_or("/sandbox", String::as_str);
+        let destination = raw_args
+            .get(3)
+            .map_or("/mnt/openshell-workspace", String::as_str);
+        return seed_kubernetes_workspace(Path::new(source), Path::new(destination));
     }
     if raw_args.get(1).map(String::as_str) == Some(CAPABILITY_PROBE_SUBCOMMAND) {
         return run_capability_probe();
@@ -2006,6 +2028,46 @@ mod tests {
                 .mode()
                 & 0o100,
             0
+        );
+        assert!(destination.join(".openshell-initialized").is_file());
+    }
+
+    #[test]
+    fn kubernetes_workspace_seed_supports_two_phase_staging() {
+        // Models the Kubernetes driver's two init containers: the first
+        // stages the image's /sandbox into an emptyDir, the second copies
+        // that staging directory into the PVC mounted at /sandbox. The
+        // staging pass writes its own seed marker into the staging
+        // directory, so the second pass must not fail creating the PVC's
+        // marker, and the marker must not leak into the workspace as data.
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let stage = root.path().join("stage");
+        let destination = root.path().join("destination");
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(source.join("README"), b"workspace").unwrap();
+        std::fs::write(source.join("bin/tool"), b"tool").unwrap();
+        std::os::unix::fs::symlink("README", source.join("latest")).unwrap();
+
+        seed_kubernetes_workspace_at(&source, &stage).unwrap();
+        seed_kubernetes_workspace_at(&stage, &destination).unwrap();
+        // A restart re-stages from the image and skips the PVC copy.
+        seed_kubernetes_workspace_at(&source, &stage).unwrap();
+        seed_kubernetes_workspace_at(&stage, &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("README")).unwrap(),
+            b"workspace"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("bin/tool")).unwrap(),
+            b"tool"
+        );
+        assert_eq!(
+            std::fs::read_link(destination.join("latest")).unwrap(),
+            Path::new("README")
         );
         assert!(destination.join(".openshell-initialized").is_file());
     }
