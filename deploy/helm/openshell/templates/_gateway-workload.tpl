@@ -192,6 +192,16 @@ spec:
           readOnly: true
         {{- end }}
         {{- end }}
+        {{- if .Values.metrics.tls.enabled }}
+        - name: metrics-tls-cert
+          mountPath: /etc/openshell-metrics/server
+          readOnly: true
+        {{- if .Values.metrics.tls.clientCaSecretName }}
+        - name: metrics-tls-client-ca
+          mountPath: /etc/openshell-metrics/client-ca
+          readOnly: true
+        {{- end }}
+        {{- end }}
         {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
@@ -224,7 +234,7 @@ spec:
         - name: health
           containerPort: {{ .Values.service.healthPort }}
           protocol: TCP
-        {{- if .Values.service.metricsPort }}
+        {{- if include "openshell.metricsEnabled" . }}
         - name: metrics
           containerPort: {{ .Values.service.metricsPort }}
           protocol: TCP
@@ -303,6 +313,19 @@ spec:
         {{- end }}
     {{- end }}
     {{- end }}
+    {{- if .Values.metrics.tls.enabled }}
+    - name: metrics-tls-cert
+      secret:
+        secretName: {{ .Values.metrics.tls.certSecretName | default .Values.server.tls.certSecretName }}
+    {{- if .Values.metrics.tls.clientCaSecretName }}
+    - name: metrics-tls-client-ca
+      secret:
+        secretName: {{ .Values.metrics.tls.clientCaSecretName }}
+        items:
+          - key: ca.crt
+            path: ca.crt
+    {{- end }}
+    {{- end }}
     {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
     - name: oidc-ca
       configMap:
@@ -335,6 +358,9 @@ spec:
     {{- end }}
     - name: gateway-state
       emptyDir: {}
+  {{- with .Values.priorityClassName }}
+  priorityClassName: {{ . }}
+  {{- end }}
   {{- with .Values.nodeSelector }}
   nodeSelector:
     {{- toYaml . | nindent 4 }}
@@ -345,6 +371,10 @@ spec:
   {{- end }}
   {{- with .Values.tolerations }}
   tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.topologySpreadConstraints }}
+  topologySpreadConstraints:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 {{- end }}

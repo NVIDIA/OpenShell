@@ -20,6 +20,12 @@ pub const ENDPOINT: &str = "OPENSHELL_ENDPOINT";
 /// Unique identifier of the sandbox being supervised.
 pub const SANDBOX_ID: &str = "OPENSHELL_SANDBOX_ID";
 
+/// Requested workload image reference, recorded in supervisor OCSF events.
+pub const CONTAINER_IMAGE: &str = "OPENSHELL_CONTAINER_IMAGE";
+
+/// Immutable workload image ID resolved by the compute driver at launch.
+pub const CONTAINER_IMAGE_UID: &str = "OPENSHELL_CONTAINER_IMAGE_UID";
+
 /// Filesystem path to the UNIX socket used for the in-sandbox SSH server.
 pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 

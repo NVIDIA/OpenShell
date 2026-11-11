@@ -70,8 +70,12 @@ A request can use a static credential only when all of these checks pass:
 | The placeholder belongs to the current attached provider state. | Sandbox provider attachment and current provider record. |
 | The calling binary and destination are allowed. | Effective sandbox network policy. |
 | The host, port, and canonical request path match the credential binding. | Provider profile endpoints, or an explicit sandbox policy binding for an endpointless profile. |
-| The HTTP method, path, or protocol operation is allowed when L7 inspection is configured. | Effective sandbox network policy. |
+| The request location matches declared placement, the default `Authorization` header, or an explicit body/WebSocket rewrite policy. | The credential's `auth_style` and its header, query parameter, or path template. |
+| The HTTP method, path, or protocol operation is allowed when L7 inspection uses `enforcement: enforce`. | Effective sandbox network policy. |
 | The credential has not expired. | Provider credential expiry metadata. |
+
+With `enforcement: audit`, request-rule violations are logged and forwarded.
+Credential binding, placement, and expiry checks still apply.
 
 Network policy and credential binding serve different purposes. Network policy
 authorizes traffic. A credential binding authorizes use of one provider
@@ -93,6 +97,52 @@ The path `/v1/**` matches `/v1` and its descendants. An empty path, `**`, or
 glob matching. OpenShell removes the query string and uses a canonical,
 secret-redacted path for this check, so a credential embedded in a request path
 does not need to be revealed before authorization.
+
+The supervisor automatically enforces usable static credential auth metadata.
+No additional profile flag is required. Header credentials resolve only in the
+declared header, query credentials only in the declared parameter, and path
+credentials only in the `{credential}` slot of their path template. Header names
+are case-insensitive. An `Authorization` binding accepts Bearer, token, and Basic
+authentication.
+
+The credential's `auth_style` selects its placement. Fields for other styles are
+ignored, so a bearer credential with unused `query_param` or `path_template`
+fields still resolves only in its declared header. An invalid selected placement
+is rejected.
+
+Existing endpoint policies that enable request-body or WebSocket text rewriting
+continue to authorize those locations. Those flags do not authorize arbitrary
+query parameters, URL paths, or unrelated headers. Trusted AWS signing retains
+its existing endpoint authorization.
+
+Without placement metadata, the supervisor resolves static credentials only in
+the `Authorization` header, or through the explicit body/WebSocket policies above.
+It rejects malformed placement metadata. A client using `x-api-key`, another
+header, a query parameter, or a path slot needs an explicit credential declaration.
+For example:
+
+```yaml showLineNumbers={false}
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: header
+    header_name: x-api-key
+```
+
+<Warning>
+Upgrade the gateway before the supervisor when clients use locations other than
+`Authorization`. An older gateway does not forward placement metadata, so a new
+supervisor applies the `Authorization` default even if the imported profile
+declares another location. Older supervisors keep their previous behavior.
+</Warning>
+
+Export and update existing imported profiles with the required placement before
+upgrading the supervisor. Updating example YAML files does not change profiles
+already stored on the gateway. The Codex reference profile declares its access
+token and account header; OAuth tokens sent in request bodies still require the
+endpoint's explicit body rewrite policy. Trusted AWS signing does not require an
+HTTP placement declaration. Credential delivery, wire identities, placeholder
+lifecycles, and update behavior remain unchanged.
 
 Use an explicit sandbox policy binding when the profile intentionally defines
 credentials without defining service endpoints. The policy names the concrete
@@ -202,7 +252,6 @@ The following provider profile design items are not part of the current behavior
 
 | Roadmap item | Current behavior |
 |---|---|
-| General profile-driven credential placement | Static `auth_style`, `header_name`, `query_param`, and `path_template` placement metadata is stored and validated, but static credential injection still depends on environment placeholders generated from provider credentials. Dynamic `token_grant` credentials support `bearer` and `header` placement for matching HTTP endpoints. |
 | Binary-scoped credential injection | Static placeholder resolution is endpoint-scoped. Dynamic grants in single-route REST and multi-route inspection also require admission by their owning endpoint's policy, including its binary restrictions. L4-only credential forwarding retains endpoint-selector matching. |
 | Credential verification on create | `openshell provider create` does not yet probe provider verification endpoints or expose `--no-verify`. |
 | Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
@@ -372,12 +421,11 @@ credentials:
     stable_placeholder: false
 
     # Accepted values: basic, bearer, header, query, path.
-    # These fields describe static credential placement.
-    # Static runtime injection still uses env placeholder resolution.
+    # These fields restrict where a static placeholder can resolve.
     auth_style: bearer
     header_name: authorization
-    query_param: api_key
-    path_template: /v1/{credential}/resources
+    # For auth_style: query, set query_param: api_key instead.
+    # For auth_style: path, set path_template: /v1/{credential}/resources instead.
 
     refresh:
       # Accepted values:
@@ -1186,9 +1234,23 @@ Running sandboxes periodically check for provider and policy changes. Use `--wai
 
 The policy effect applies to future effective policy reads after the sandbox observes the update. The credential environment effect applies only to new process launches after the update is observed, such as later SSH, exec, or SFTP sessions.
 
-Already-running processes keep the placeholder environment they started with. For ordinary static credentials, an existing reference retains its selected revision after a value update; readiness does not retarget that reference to the replacement value. After an update wait succeeds, launch a new process to receive the updated credential reference. Gateway-managed refresh follows its own reference lifecycle. Expiry, endpoint authorization, and acknowledged detach continue to apply when the proxy resolves retained references.
+Already-running processes keep the placeholder environment they started with.
+For ordinary static credentials, a retained revision can continue to resolve its
+previous value. After that revision leaves retained history, its reference can
+fall back to the current value only while it remains authorized for the same
+provider identity epoch. A revision-scoped reference is therefore not a
+permanent pin to one credential value. After an update wait succeeds, launch a
+new process to receive the updated credential reference. Expiry, endpoint
+authorization, and acknowledged detach continue to apply to retained references.
 
-For a static provider, the sequence is attach, wait, then launch client A; update, wait, then launch client B. B's first request uses the newly installed credential. Readiness does not establish that A has stopped using its retained revision or that an old upstream key can be retired.
+For credentials configured with
+[`stable_placeholder: true`](#keep-an-externally-updated-placeholder-stable), a
+process already holding a stable reference uses the current value after the
+supervisor installs a value-only update. Enabling the setting does not convert
+references in an existing process's environment. Gateway-managed refresh
+follows its own reference lifecycle.
+
+For an ordinary static provider, the sequence is attach, wait, then launch client A; update, wait, then launch client B. B's first request uses the newly installed credential. Readiness does not establish that A has stopped using the previous credential value or that an old upstream key can be retired.
 
 An acknowledged detachment removes its provider policy layer from the active effective policy, revokes future resolution for its existing placeholders, and removes its credential placeholders from future process environments. It does not remove strings from already-running process environments or undo requests already forwarded upstream.
 

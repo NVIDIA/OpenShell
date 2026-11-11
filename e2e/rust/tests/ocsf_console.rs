@@ -69,6 +69,18 @@ async fn network_events_are_json_on_supervisor_stderr_only() {
     let ids: Vec<_> = containers.lines().collect();
     assert_eq!(ids.len(), 1, "expected one supervisor: {containers}");
     let supervisor = ids[0];
+    let (workload, _) = docker(&[
+        "ps",
+        "-q",
+        "--filter",
+        &filter,
+        "--filter",
+        "label=openshell.ai/isolation-role=sandbox",
+    ])
+    .await;
+    let workload_ids: Vec<_> = workload.lines().collect();
+    assert_eq!(workload_ids.len(), 1, "expected one workload: {workload}");
+    let (image_uid, _) = docker(&["inspect", "--format", "{{.Image}}", workload_ids[0]]).await;
     let (_, before) = docker(&["logs", supervisor]).await;
     assert!(json_records(&before).is_empty(), "JSON must be opt-in");
 
@@ -126,7 +138,15 @@ async fn network_events_are_json_on_supervisor_stderr_only() {
                 .as_str()
                 .is_some_and(|uid| !uid.is_empty())
         );
-        assert_eq!(record["container"]["name"], sandbox.name);
+        assert_eq!(record["device"]["container"]["name"], sandbox.name);
+        assert_eq!(
+            record["device"]["container"]["image"]["uid"],
+            image_uid.trim()
+        );
+        assert_eq!(
+            record["device"]["container"]["image"]["name"],
+            "nvcr.io/nvidia/base/ubuntu:24.04"
+        );
     }
     // Allow the existing best-effort push batch to reach the gateway.
     sleep(Duration::from_secs(2)).await;

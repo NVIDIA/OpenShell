@@ -2056,6 +2056,9 @@ mod tests {
             state
                 .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "Authorization".into(),
+                ))
                 .resolve_placeholder(reference),
             Some("initial"),
         );
@@ -2127,6 +2130,9 @@ mod tests {
             state
                 .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "Authorization".into(),
+                ))
                 .resolve_placeholder(reference),
             Some("initial"),
         );
@@ -2679,7 +2685,14 @@ mod tests {
                     let resolved = state
                         .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                         .and_then(|resolver| {
-                            resolver.resolve_placeholder(&reference).map(str::to_owned)
+                            resolver
+                                .with_request_location(
+                                    openshell_core::secrets::RequestCredentialLocation::Header(
+                                        "Authorization".into(),
+                                    ),
+                                )
+                                .resolve_placeholder(&reference)
+                                .map(str::to_owned)
                         });
                     let observed = tracker.observation(&state);
                     if state.revision() == revision
@@ -2701,6 +2714,11 @@ mod tests {
                         state
                             .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                             .unwrap()
+                            .with_request_location(
+                                openshell_core::secrets::RequestCredentialLocation::Header(
+                                    "Authorization".into(),
+                                )
+                            )
                             .resolve_placeholder(old_reference),
                         Some("initial")
                     );
@@ -2773,7 +2791,14 @@ mod tests {
                     let resolved = state
                         .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                         .and_then(|resolver| {
-                            resolver.resolve_placeholder(&reference).map(str::to_owned)
+                            resolver
+                                .with_request_location(
+                                    openshell_core::secrets::RequestCredentialLocation::Header(
+                                        "Authorization".into(),
+                                    ),
+                                )
+                                .resolve_placeholder(&reference)
+                                .map(str::to_owned)
                         });
                     let observed = tracker.observation(&state);
                     if state.revision() == revision

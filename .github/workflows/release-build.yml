@@ -20,9 +20,6 @@ on:
         required: true
         type: boolean
     outputs:
-      python_version:
-        description: Python package version
-        value: ${{ jobs.compute-versions.outputs.python_version }}
       npm_version:
         description: TypeScript package version
         value: ${{ jobs.compute-versions.outputs.npm_version }}
@@ -56,7 +53,6 @@ jobs:
       run:
         shell: nix develop -c bash -euo pipefail {0}
     outputs:
-      python_version: ${{ steps.v.outputs.python }}
       cargo_version: ${{ steps.v.outputs.cargo }}
       npm_version: ${{ steps.v.outputs.npm }}
       deb_version: ${{ steps.v.outputs.deb }}
@@ -106,7 +102,6 @@ jobs:
           fi
           {
             echo "is_prerelease=${is_prerelease}"
-            echo "python=$(uv run --no-project python tasks/scripts/release.py get-version --python)"
             echo "cargo=$(uv run --no-project python tasks/scripts/release.py get-version --cargo)"
             echo "npm=$(uv run --no-project python tasks/scripts/release.py get-version --npm)"
             echo "deb=$(uv run --no-project python tasks/scripts/release.py get-version --deb)"
@@ -116,11 +111,11 @@ jobs:
             echo "source_sha=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
 
-  build-binaries:
+  build-binaries-linux:
     needs: compute-versions
     permissions:
       contents: read
-    uses: ./.github/workflows/build-binaries.yml
+    uses: ./.github/workflows/build-binaries-linux.yml
     with:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
@@ -128,11 +123,35 @@ jobs:
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-  build-vm-driver:
-    needs: [compute-versions, build-binaries]
+  build-binaries-macos:
+    needs: compute-versions
     permissions:
       contents: read
-    uses: ./.github/workflows/build-vm-driver.yml
+    uses: ./.github/workflows/build-binaries-macos.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  build-vm-driver-linux:
+    needs: [compute-versions, build-binaries-linux]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-vm-driver-linux.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  build-vm-driver-macos:
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-vm-driver-macos.yml
     with:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
@@ -141,7 +160,7 @@ jobs:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   package-binaries:
-    needs: [compute-versions, build-binaries, build-vm-driver]
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos, build-vm-driver-linux, build-vm-driver-macos]
     permissions:
       actions: read
       contents: read
@@ -150,7 +169,7 @@ jobs:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
   build-images:
-    needs: [compute-versions, build-binaries]
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos]
     permissions:
       contents: read
       packages: write
@@ -160,49 +179,9 @@ jobs:
       push-images: ${{ inputs.is-prerelease }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
-  build-python-wheel:
-    name: Build Python Wheel
-    needs: [compute-versions]
-    runs-on: linux-amd64-cpu8
-    timeout-minutes: 20
-    defaults:
-      run:
-        shell: nix develop -c bash -euo pipefail {0}
-    env:
-      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL: ${{ needs.compute-versions.outputs.python_version }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ needs.compute-versions.outputs.source_sha }}
-
-      - uses: ./.github/actions/setup-nix
-        with:
-          prepare-shell: "true"
-
-      - name: Sync Python dependencies
-        run: uv sync --frozen
-
-      - name: Build Python wheel
-        run: |
-          set -euo pipefail
-          uv run --frozen python tasks/scripts/generate_python_proto.py
-          uv build --wheel --out-dir target/wheels
-          uv run --no-project python tasks/scripts/verify-python-wheel.py target/wheels \
-            --expected-version "${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL}"
-          ls -la target/wheels/*.whl
-
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: python-wheel
-          path: target/wheels/*.whl
-          retention-days: 5
-
   build-deb:
     name: Build Debian Packages
-    needs: [compute-versions, build-binaries, build-vm-driver]
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos, build-vm-driver-linux, build-vm-driver-macos]
     uses: ./.github/workflows/deb-package.yml
     with:
       deb-version: ${{ needs.compute-versions.outputs.deb_version }}
@@ -210,14 +189,14 @@ jobs:
 
   build-snap:
     name: Build Snap
-    needs: [compute-versions, build-binaries]
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos]
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
   build-rpm:
     name: Build RPM Packages
-    needs: [compute-versions, build-binaries]
+    needs: [compute-versions, build-binaries-linux, build-binaries-macos]
     uses: ./.github/workflows/rpm-package.yml
     with:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}

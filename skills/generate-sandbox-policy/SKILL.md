@@ -246,6 +246,7 @@ Only needed for the **Moderate** and **Full** tiers. Translate API path paramete
 | All sub-paths under `/api/v1/` | `/api/v1/**` |
 
 In REST rule paths, `*` stops at `/`, while a whole-segment `**` crosses `/`.
+REST endpoints refuse HTTP upgrades in both enforce and audit modes. For WebSocket traffic, use a separate `protocol: websocket` endpoint with explicit upgrade and message rules; `websocket_credential_rewrite` requires that protocol.
 For example, `/api/v1/**` covers descendants but not `/api/v1` itself; add an
 explicit rule for that path when needed. `?` matches one character except `/`,
 and bracket classes such as `[0-9]` are supported.
@@ -519,12 +520,19 @@ network_policies:
 ```
 
 The `filesystem_policy` and `landlock` sections above are sensible defaults.
+Use actual target paths for symlinks inside writable workspaces. Policy paths
+that traverse symlinks beneath workload-owned or writable directories fail
+launch even in `best_effort` mode; system aliases through protected directories
+remain supported. A policy with no usable filesystem paths also fails launch.
 Process identity is omitted so the selected compute driver can choose it. For
 Docker and Podman, each omitted identity field falls back to the image's OCI
 `USER`. Tell the user these are defaults and may need adjustment for their
-environment. Gateway inference is configured separately through `openshell
-inference set/get`. The generated `network_policies` block is the primary
-output.
+environment. Inference access uses provider profiles and sandbox attachments;
+the workload calls the provider's native endpoint and selects its model and
+timeout. Inspect the effective policy with `openshell policy get <sandbox>
+--full`, including provider-derived rules, and follow the published
+[inference guide](https://docs.nvidia.com/openshell/latest/how-it-works/inference).
+The generated `network_policies` block is the primary output.
 
 When the user explicitly requests `process.run_as_user` or
 `process.run_as_group`, accept `sandbox` or a numeric UID/GID from `1` through
