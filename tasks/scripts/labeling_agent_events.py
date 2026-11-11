@@ -19,6 +19,12 @@ class Invocation:
     source: str
 
 
+def positive_number(value, message: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(message)
+    return value
+
+
 def item_number(item: str, repository: str) -> int:
     """Resolve one number or same-repository issue/PR URL without network access."""
     if not REPOSITORY.fullmatch(repository):
@@ -62,9 +68,9 @@ def select_invocation(
         and (event.get("label") or {}).get("name") == "state:accepted"
     ):
         item = event.get("issue" if event_name == "issues" else "pull_request") or {}
-        number = item.get("number")
-        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
-            raise ValueError("acceptance event has no valid item number")
+        number = positive_number(
+            item.get("number"), "acceptance event has no valid item number"
+        )
         return Invocation(repository, number, False, "acceptance")
     if event_name not in {"issue_comment", "workflow_dispatch"}:
         return None
@@ -86,9 +92,9 @@ def select_invocation(
         command = COMMENT_COMMAND.fullmatch((comment.get("body") or "").strip())
         if not command:
             return None
-        number = issue.get("number")
-        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
-            raise ValueError("comment event has no valid PR number")
+        number = positive_number(
+            issue.get("number"), "comment event has no valid PR number"
+        )
         force = command[1] is not None
     else:
         inputs = event.get("inputs") or {}
