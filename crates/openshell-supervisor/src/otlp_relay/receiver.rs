@@ -28,14 +28,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tracing::{debug, warn};
 
 use super::buffer::{BatchSender, SendError};
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message as _;
 use tonic_types::Status as RpcStatus;
 
 use super::{
     BODY_READ_TIMEOUT, ENRICHMENT_CONCURRENCY, HEADER_READ_TIMEOUT, MAX_BODY_BYTES,
     MAX_CONCURRENT_CONNECTIONS, MAX_ENRICHED_BYTES, RECEIVER_SHUTDOWN_TIMEOUT, RETRY_AFTER_SECS,
-    RelayCounters, enrichment,
+    RelayCounters, enrichment, json,
 };
 
 /// Reservation for one relay connection.
@@ -58,7 +57,7 @@ pub struct OtlpConnectionServer {
     counters: Arc<RelayCounters>,
     connections: Arc<Semaphore>,
     /// Bounds how many bodies are being enriched at once.
-    enrichment_slots: Semaphore,
+    enrichment_slots: Arc<Semaphore>,
     accepting: AtomicBool,
     /// `None` once shutdown has started. Watchers are minted under this lock,
     /// so none can be created after the shutdown signal is sent.
@@ -89,7 +88,7 @@ impl OtlpConnectionServer {
             sandbox_id,
             counters,
             connections: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
-            enrichment_slots: Semaphore::new(ENRICHMENT_CONCURRENCY),
+            enrichment_slots: Arc::new(Semaphore::new(ENRICHMENT_CONCURRENCY)),
             accepting: AtomicBool::new(true),
             graceful: Mutex::new(Some(GracefulShutdown::new())),
             abort_rx,
@@ -182,9 +181,27 @@ impl OtlpConnectionServer {
         &self,
         request: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
+        let response = self.respond(request).await?;
+        if matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST
+                | StatusCode::PAYLOAD_TOO_LARGE
+                | StatusCode::UNSUPPORTED_MEDIA_TYPE
+        ) {
+            self.counters
+                .record_invalid_request(response.status().as_u16());
+        }
+        Ok(response)
+    }
+
+    async fn respond(
+        &self,
+        request: Request<Incoming>,
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
         let encoding = Encoding::of(&request);
-        // Errors answer in the request's encoding, protobuf when it has none.
-        let reply = encoding.unwrap_or(Encoding::Protobuf);
+        // Every response, success or error, uses the request's encoding,
+        // protobuf when it has none.
+        let response_encoding = encoding.unwrap_or(Encoding::Protobuf);
         // The relay forwards traces only. Agents whose SDK also exports
         // metrics or logs to the generic endpoint get an OTLP success, so they
         // do not retry forever, and the body is drained without being kept.
@@ -195,11 +212,11 @@ impl OtlpConnectionServer {
             // the connection because the request was not consumed.
             let _ = tokio::time::timeout(BODY_READ_TIMEOUT, drain_body(request.into_body())).await;
             self.counters.record_discarded_signal(signal);
-            return Ok(success(encoding.unwrap_or(Encoding::Protobuf)));
+            return Ok(success(response_encoding));
         }
         if request.method() != Method::POST || request.uri().path() != "/v1/traces" {
             return Ok(rejected(
-                reply,
+                response_encoding,
                 StatusCode::NOT_FOUND,
                 "not found",
                 "not found; the relay serves POST /v1/traces only",
@@ -217,7 +234,7 @@ impl OtlpConnectionServer {
             });
         if compressed {
             return Ok(rejected(
-                reply,
+                response_encoding,
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "compressed body",
                 "compression is not supported; send an uncompressed body",
@@ -225,7 +242,7 @@ impl OtlpConnectionServer {
         }
         let Some(encoding) = encoding else {
             return Ok(rejected(
-                reply,
+                response_encoding,
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported content type",
                 "unsupported content type; send application/x-protobuf or application/json",
@@ -246,7 +263,7 @@ impl OtlpConnectionServer {
             Ok(BodyRead::Complete(body)) => body,
             Ok(BodyRead::TooLarge) => {
                 return Ok(rejected(
-                    reply,
+                    response_encoding,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "body exceeds limit",
                     "request body exceeds the 2 MiB limit",
@@ -255,7 +272,7 @@ impl OtlpConnectionServer {
             Ok(BodyRead::Failed(error)) => {
                 debug!(%error, "OTLP relay failed to read a request body");
                 return Ok(rejected(
-                    reply,
+                    response_encoding,
                     StatusCode::BAD_REQUEST,
                     "unreadable body",
                     "failed to read request body",
@@ -265,7 +282,7 @@ impl OtlpConnectionServer {
             // because the request was not consumed, which frees the slot.
             Err(_) => {
                 return Ok(rejected(
-                    reply,
+                    response_encoding,
                     StatusCode::REQUEST_TIMEOUT,
                     "body read timed out",
                     "request body was not received in time",
@@ -273,27 +290,30 @@ impl OtlpConnectionServer {
             }
         };
 
-        let enriched = {
-            let _slot = self
-                .enrichment_slots
-                .acquire()
-                .await
-                .expect("the enrichment semaphore is never closed");
+        // Transcoding and enrichment are CPU-bound and take milliseconds on a
+        // large body, so they run off the async workers. The slot moves into
+        // the task, which keeps the concurrency bound when this request is
+        // cancelled while the task runs; the body is dropped there too.
+        let slot = Arc::clone(&self.enrichment_slots)
+            .acquire_owned()
+            .await
+            .expect("the enrichment semaphore is never closed");
+        let sandbox_id = self.sandbox_id.clone();
+        let enriched = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
             match encoding {
-                Encoding::Protobuf => enrichment::enrich(&body, &self.sandbox_id),
-                Encoding::Json => match transcode_json(&body) {
-                    Ok(protobuf) => enrichment::enrich(&protobuf, &self.sandbox_id),
-                    Err(error) => Err(error),
-                },
+                Encoding::Protobuf => enrichment::enrich(&body, &sandbox_id),
+                Encoding::Json => json::transcode(&body)
+                    .and_then(|protobuf| enrichment::enrich(&protobuf, &sandbox_id)),
             }
-        };
-        // The raw body is no longer needed once the enriched copy exists.
-        drop(body);
+        })
+        .await
+        .expect("the enrichment task neither panics nor is cancelled");
         let enriched = match enriched {
             Ok(enriched) => enriched,
             Err(error @ enrichment::EnrichError::Malformed(_)) => {
                 return Ok(rejected(
-                    reply,
+                    response_encoding,
                     StatusCode::BAD_REQUEST,
                     "decode failed",
                     &error.to_string(),
@@ -302,10 +322,11 @@ impl OtlpConnectionServer {
             Err(
                 error @ (enrichment::EnrichError::TooManyResourceSpans
                 | enrichment::EnrichError::TooManyResourceAttributes
-                | enrichment::EnrichError::ResourceTooLarge),
+                | enrichment::EnrichError::ResourceTooLarge
+                | enrichment::EnrichError::JsonTooComplex),
             ) => {
                 return Ok(rejected(
-                    reply,
+                    response_encoding,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request exceeds structural limits",
                     &error.to_string(),
@@ -318,7 +339,7 @@ impl OtlpConnectionServer {
         // assumption.
         if enriched.len() > MAX_ENRICHED_BYTES {
             return Ok(rejected(
-                reply,
+                response_encoding,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "enriched body exceeds limit",
                 "request exceeds the relay's batch limit after attribution",
@@ -331,18 +352,18 @@ impl OtlpConnectionServer {
         match sent {
             Ok(()) => {
                 self.counters.record_accepted();
-                Ok(success(encoding))
+                Ok(success(response_encoding))
             }
             Err(SendError::BufferFull) => {
                 self.counters.record_rejection();
                 Ok(unavailable(
-                    reply,
+                    response_encoding,
                     "relay buffer is full; retry after the Retry-After interval",
                 ))
             }
             Err(SendError::BufferClosed) => {
                 debug!("OTLP relay refused an export: relay is shutting down");
-                Ok(unavailable(reply, "relay is shutting down"))
+                Ok(unavailable(response_encoding, "relay is shutting down"))
             }
         }
     }
@@ -470,22 +491,6 @@ impl Encoding {
             Self::Json => "application/json",
         }
     }
-}
-
-/// Most `{` bytes a JSON body may hold, give or take the first. Decoding builds a full message tree,
-/// so this bounds what a body of tiny objects can allocate; protobuf bodies
-/// are enriched without decoding spans and need no such bound.
-const MAX_JSON_OBJECTS: usize = 100_000;
-
-/// Converts an OTLP/HTTP JSON body to the protobuf wire format that
-/// enrichment works on.
-fn transcode_json(body: &[u8]) -> Result<Vec<u8>, enrichment::EnrichError> {
-    if body.split(|byte| *byte == b'{').count() > MAX_JSON_OBJECTS {
-        return Err(enrichment::EnrichError::TooManyResourceSpans);
-    }
-    serde_json::from_slice::<ExportTraceServiceRequest>(body)
-        .map(|request| request.encode_to_vec())
-        .map_err(|error| enrichment::EnrichError::Malformed(error.to_string()))
 }
 
 /// The empty OTLP success: no bytes for protobuf, an empty object for JSON.
@@ -723,6 +728,7 @@ mod tests {
     use super::super::enrichment::test_util::{
         encoded_request, encoded_request_with_large_span, resource_attributes,
     };
+    use super::super::json::test_util::nested_attribute_body;
     use super::super::{BUFFER_CAPACITY, enrichment};
     use super::test_util::{connect, read_head, request, request_with_headers, send};
     use super::*;
@@ -806,7 +812,26 @@ mod tests {
     const JSON: &str = "application/json";
 
     fn json_body() -> Vec<u8> {
-        br#"{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"json-agent"}}]},"scopeSpans":[{"spans":[{"traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"b7ad6b7169203331","name":"json-span","kind":1,"startTimeUnixNano":"1","endTimeUnixNano":"2"}]}]}]}"#.to_vec()
+        br#"{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"json-agent"}}]},"scopeSpans":[{"spans":[{"traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"b7ad6b7169203331","name":"json-span","kind":1,"startTimeUnixNano":"1","endTimeUnixNano":"2","attributes":[{"key":"tokens","value":{"intValue":"7"}}]}]}]}]}"#.to_vec()
+    }
+
+    /// A valid JSON export of `spans` empty spans, which holds `2 * spans + 5`
+    /// values.
+    fn empty_spans_body(spans: usize) -> String {
+        format!(
+            "{{\"resourceSpans\":[{{\"scopeSpans\":[{{\"spans\":[{}]}}]}}]}}",
+            vec!["{}"; spans].join(",")
+        )
+    }
+
+    /// Decodes the JSON `google.rpc.Status` of an error response.
+    fn json_status(head: &test_util::Head) -> (i64, String) {
+        assert_eq!(head.header("content-type"), Some(JSON));
+        let status: serde_json::Value = serde_json::from_slice(&head.body).expect("json status");
+        (
+            status["code"].as_i64().expect("code"),
+            status["message"].as_str().expect("message").to_string(),
+        )
     }
 
     #[tokio::test]
@@ -838,6 +863,17 @@ mod tests {
         let decoded = ExportTraceServiceRequest::decode(&buffered[..]).expect("protobuf");
         let span = &decoded.resource_spans[0].scope_spans[0].spans[0];
         assert_eq!(span.name, "json-span");
+        // 64-bit integers arrive as strings in OTLP/JSON.
+        assert_eq!(span.kind, 1);
+        assert_eq!(span.start_time_unix_nano, 1);
+        assert_eq!(span.end_time_unix_nano, 2);
+        assert_eq!(
+            span.attributes[0]
+                .value
+                .as_ref()
+                .and_then(|v| v.value.clone()),
+            Some(opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(7))
+        );
         assert_eq!(
             span.trace_id,
             [
@@ -861,10 +897,9 @@ mod tests {
         )
         .await;
         assert_eq!(head.status, 400);
-        assert_eq!(head.header("content-type"), Some(JSON));
-        let status: serde_json::Value = serde_json::from_slice(&head.body).expect("json status");
-        assert_eq!(status["code"], tonic::Code::InvalidArgument as i32);
-        assert!(status["message"].is_string());
+        let (code, _message) = json_status(&head);
+        assert_eq!(code, i64::from(tonic::Code::InvalidArgument as i32));
+        assert_eq!(server.counters.invalid_requests(), 1);
         assert!(
             tokio::time::timeout(Duration::from_millis(100), rx.recv())
                 .await
@@ -874,19 +909,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_body_of_tiny_objects_is_too_large_and_never_buffered() {
+    async fn json_body_is_accepted_up_to_the_value_limit() {
+        // 49,997 empty spans hold 99,999 values and 49,998 hold 100,001, one
+        // either side of the limit.
+        let under = (json::MAX_VALUES - 5) / 2;
         let (server, _handle, mut rx) = start(BUFFER_CAPACITY);
         let mut client = connect(&server);
-        let objects = vec!["{}"; MAX_JSON_OBJECTS + 1].join(",");
-        let body =
-            format!("{{\"resourceSpans\":[{{\"scopeSpans\":[{{\"spans\":[{objects}]}}]}}]}}");
+        let head = send(
+            &mut client,
+            &request(
+                "POST",
+                "/v1/traces",
+                JSON,
+                empty_spans_body(under).as_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(head.status, 200);
+        assert!(rx.recv().await.is_some(), "the batch is buffered");
+
+        let head = send(
+            &mut client,
+            &request(
+                "POST",
+                "/v1/traces",
+                JSON,
+                empty_spans_body(under + 1).as_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(head.status, 413);
+        let (code, message) = json_status(&head);
+        assert_eq!(code, i64::from(tonic::Code::ResourceExhausted as i32));
+        assert!(
+            message.contains("JSON body") && message.contains("100000 values"),
+            "{message}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "nothing more is buffered"
+        );
+        assert_eq!(server.counters.invalid_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn deeply_nested_json_is_too_large_and_never_buffered() {
+        let body = nested_attribute_body(39, 20_000);
+        let (server, _handle, mut rx) = start(BUFFER_CAPACITY);
+        let mut client = connect(&server);
         let head = send(
             &mut client,
             &request("POST", "/v1/traces", JSON, body.as_bytes()),
         )
         .await;
         assert_eq!(head.status, 413);
-        assert_eq!(head.header("content-type"), Some(JSON));
+        let (_code, message) = json_status(&head);
+        assert!(message.contains("nests more than 32 levels"), "{message}");
         assert!(
             tokio::time::timeout(Duration::from_millis(100), rx.recv())
                 .await
@@ -897,12 +977,21 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_and_logs_json_are_acknowledged_with_an_empty_object() {
-        let (server, _handle, _rx) = start(BUFFER_CAPACITY);
+        let (server, _handle, mut rx) = start(BUFFER_CAPACITY);
         let mut client = connect(&server);
-        let head = send(&mut client, &request("POST", "/v1/logs", JSON, b"{}")).await;
-        assert_eq!(head.status, 200);
-        assert_eq!(head.header("content-type"), Some(JSON));
-        assert_eq!(head.body, b"{}");
+        for path in ["/v1/metrics", "/v1/logs"] {
+            let head = send(&mut client, &request("POST", path, JSON, b"{}")).await;
+            assert_eq!(head.status, 200, "{path}");
+            assert_eq!(head.header("content-type"), Some(JSON));
+            assert_eq!(head.body, b"{}");
+        }
+        assert_eq!(server.counters.discarded_signals(), 2);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "metrics and logs are not buffered"
+        );
     }
 
     #[tokio::test]

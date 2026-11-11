@@ -70,7 +70,7 @@ tracing-appender = "0.2"
 
 # OpenTelemetry — OTLP/gRPC export. Kept in lockstep with the workspace's
 # tonic 0.14 / prost 0.14 via opentelemetry-proto's `grpc-tonic` feature.
-opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "trace", "with-serde"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "trace"] }
 opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 opentelemetry-http = { version = "0.33", default-features = false }
