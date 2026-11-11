@@ -266,13 +266,13 @@ service:
   type: ClusterIP
   # -- Gateway gRPC/HTTP listener port. The gateway Service also exposes this port unless service.servicePort is set.
   port: 8080
-  # -- (int) Port the gateway Service exposes, forwarding to the gateway's service.port listener. Null exposes service.port. Use it to publish a LoadBalancer on a port such as 443 without the gateway binding it. Sandbox service URLs that the gateway prints keep service.port.
+  # -- (int) Port the gateway Service exposes, forwarding to the gateway's service.port listener. Null exposes service.port. Use it to publish a LoadBalancer on a port such as 443 without the gateway binding it. Sandboxes receive this endpoint when they're created, so changing it strands existing sandboxes. The gateway API reports sandbox service URLs with service.port; the CLI rewrites them to the registered endpoint's port.
   servicePort: null
   # -- Annotations for the gateway Service, such as a cloud provider's load balancer settings.
   annotations: {}
-  # -- Load balancer implementation for the gateway Service (spec.loadBalancerClass). Requires service.type=LoadBalancer.
+  # -- Load balancer implementation for the gateway Service (spec.loadBalancerClass). Requires service.type=LoadBalancer. Kubernetes doesn't allow changing it once set.
   loadBalancerClass: ""
-  # -- Client CIDR ranges the load balancer admits (spec.loadBalancerSourceRanges). Requires service.type=LoadBalancer. It doesn't restrict the node port Kubernetes also allocates for a LoadBalancer Service.
+  # -- Client CIDR ranges the load balancer admits (spec.loadBalancerSourceRanges). Requires service.type=LoadBalancer. It doesn't restrict the node port Kubernetes also allocates for a LoadBalancer Service, and enforcement depends on the load-balancer implementation.
   loadBalancerSourceRanges: []
   # -- Gateway health service port.
   healthPort: 8081

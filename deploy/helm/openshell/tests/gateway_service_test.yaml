@@ -95,6 +95,13 @@ tests:
           value: grpc
       - notExists:
           path: spec.ports[0].nodePort
+      - equal:
+          path: spec.ports[1]
+          value:
+            port: 9090
+            targetPort: metrics
+            protocol: TCP
+            name: metrics
 
   - it: keeps the gateway listening on service.port when servicePort differs
     template: templates/statefulset.yaml
@@ -221,3 +228,33 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "service.loadBalancerClass requires service.type=LoadBalancer"
+
+  - it: keeps replica backends on the listener port while the main backend uses servicePort
+    template: templates/grpcroute.yaml
+    set:
+      replicaCount: 2
+      server.externalDbSecret: openshell-db
+      workload.kind: statefulset
+      workload.allowMultiReplicaStatefulSet: true
+      grpcRoute.enabled: true
+      grpcRoute.replicaRouting.enabled: true
+      service.servicePort: 443
+    asserts:
+      - lengthEqual:
+          path: spec.rules
+          count: 3
+      - equal:
+          path: spec.rules[0].backendRefs[0]
+          value:
+            name: openshell-replica-0
+            port: 8080
+      - equal:
+          path: spec.rules[1].backendRefs[0]
+          value:
+            name: openshell-replica-1
+            port: 8080
+      - equal:
+          path: spec.rules[2].backendRefs[0]
+          value:
+            name: openshell
+            port: 443

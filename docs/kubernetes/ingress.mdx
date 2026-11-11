@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Ingress"
 sidebar-title: "Ingress"
-description: "Expose the OpenShell gateway externally using the Kubernetes Gateway API and a GRPCRoute."
-keywords: "Generative AI, Cybersecurity, Kubernetes, Gateway API, Envoy Gateway, GRPCRoute, Ingress, External Access"
+description: "Expose the OpenShell gateway externally using the Kubernetes Gateway API and a GRPCRoute, or a LoadBalancer Service."
+keywords: "Generative AI, Cybersecurity, Kubernetes, Gateway API, Envoy Gateway, GRPCRoute, LoadBalancer, Ingress, External Access"
 position: 5
 ---
 
-By default, the OpenShell gateway is only reachable inside the cluster. To let CLI clients connect without a `kubectl port-forward`, expose the gateway through an ingress.
+By default, the OpenShell gateway is only reachable inside the cluster. To let CLI clients connect without a `kubectl port-forward`, expose the gateway through an ingress, or [publish the gateway Service as a LoadBalancer](#publish-the-gateway-service-as-a-loadbalancer).
 
 OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart creates a `GRPCRoute` that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. The examples use [Envoy Gateway](https://gateway.envoyproxy.io), but you can select another implementation through `grpcRoute.gateway.className`.
 
@@ -263,7 +263,7 @@ If the release uses `workload.kind=deployment`, this upgrade replaces the Deploy
 
 ## Publish the Gateway Service as a LoadBalancer
 
-Without a Gateway API implementation, you can publish the chart's gateway Service through the cluster's load balancer instead. The gateway terminates TLS itself, as it does behind a port-forward. Set the Service values in a values file:
+Publish the chart's gateway Service through the cluster's load balancer. The gateway terminates TLS itself, as it does behind a port-forward. Set the Service values in a values file:
 
 ```yaml
 service:
@@ -273,7 +273,9 @@ service:
     service.beta.kubernetes.io/aws-load-balancer-scheme: internal
   loadBalancerClass: service.k8s.aws/nlb
   loadBalancerSourceRanges:
-    - 203.0.113.0/24
+    - 10.0.0.0/8
+metrics:
+  enabled: false
 pkiInitJob:
   serverDnsNames:
     - gateway.example.com
@@ -288,11 +290,12 @@ helm upgrade --install openshell \
 ```
 
 - `service.servicePort` is the port the Service exposes. The gateway keeps listening on `service.port` (`8080`), which the Service targets, so it doesn't bind a privileged port. Leave `service.servicePort` unset to expose `service.port`.
-- Sandboxes and the GRPCRoute also reach the gateway Service on `service.servicePort`. Sandboxes receive that endpoint when they're created, so set `service.servicePort` before creating sandboxes: an existing sandbox keeps the port it was created with.
+- The sandbox callback endpoint and the GRPCRoute also use `service.servicePort`. Sandboxes receive the callback endpoint when they're created, so set `service.servicePort` before creating sandboxes. If you change it on an existing release, existing sandboxes can't reach the gateway until you recreate them. The shared supervisor Deployment, when enabled, rolls out with the new endpoint.
 - `service.annotations` selects and tunes the load balancer. Annotation names depend on your cloud provider or load-balancer controller.
-- `service.loadBalancerSourceRanges` and `service.loadBalancerClass` require `service.type=LoadBalancer`. Source ranges limit only the load balancer: by default, Kubernetes also allocates a node port for a LoadBalancer Service, which they don't cover, and load-balancer implementations differ in whether they enforce them.
-- The gateway certificate must name the address clients dial. Add it to `pkiInitJob.serverDnsNames` or `pkiInitJob.serverIpAddresses`, or to `certManager.serverDnsNames` with cert-manager.
-- Sandbox service URLs that the gateway prints name its listening port, `service.port`. With a different `service.servicePort`, those URLs don't open through the load balancer as printed.
+- `service.loadBalancerSourceRanges` and `service.loadBalancerClass` require `service.type=LoadBalancer`, and Kubernetes doesn't allow changing `loadBalancerClass` once it's set. Source ranges limit only the load balancer: by default, Kubernetes also allocates a node port for a LoadBalancer Service, which they don't cover, and load-balancer implementations differ in whether they enforce them.
+- While `metrics.enabled` is `true`, the Service, and so the load balancer, also publishes the plaintext, unauthenticated metrics port. The example disables it. To keep metrics, restrict that port as described in [Gateway Metrics](/observability/gateway-metrics).
+- The gateway certificate must name the address clients dial. With the chart's built-in PKI, set `pkiInitJob.serverDnsNames` or `pkiInitJob.serverIpAddresses` at first install: the certificate hook writes the server TLS, client TLS and sandbox JWT Secrets (by default `openshell-server-tls`, `openshell-client-tls` and `<fullname>-jwt-keys`) only when they don't exist, so changing these values later doesn't reissue the certificate. On an existing release, use cert-manager with `certManager.serverDnsNames`, or delete those three Secrets before upgrading. Deleting them replaces the CA and the sandbox signing keys, so reinstall the [client bundle](/kubernetes/setup#install-the-tls-client-bundle) and recreate existing sandboxes.
+- The gateway API reports sandbox service URLs with `service.port`, and the CLI rewrites them to the registered endpoint's port. To open them remotely, add a wildcard SAN for the service domain, such as `*.apps.example.com`, and point wildcard DNS for that domain at the load balancer.
 
 After the Service gets an external address, register `https://gateway.example.com` with the CLI using the authentication mode you configured, as in [Register over HTTPS](#register-over-https).
 

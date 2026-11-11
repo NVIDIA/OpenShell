@@ -740,11 +740,11 @@ discovery endpoint or its TLS CA.
 | server.workspaceStorageClass | string | `""` | Kubernetes StorageClass for the workspace PVC in sandbox pods. Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the workspace PVC stays Pending and the sandbox never starts. |
 | service.annotations | object | `{}` | Annotations for the gateway Service, such as a cloud provider's load balancer settings. |
 | service.healthPort | int | `8081` | Gateway health service port. |
-| service.loadBalancerClass | string | `""` | Load balancer implementation for the gateway Service (spec.loadBalancerClass). Requires service.type=LoadBalancer. |
-| service.loadBalancerSourceRanges | list | `[]` | Client CIDR ranges the load balancer admits (spec.loadBalancerSourceRanges). Requires service.type=LoadBalancer. It doesn't restrict the node port Kubernetes also allocates for a LoadBalancer Service. |
+| service.loadBalancerClass | string | `""` | Load balancer implementation for the gateway Service (spec.loadBalancerClass). Requires service.type=LoadBalancer. Kubernetes doesn't allow changing it once set. |
+| service.loadBalancerSourceRanges | list | `[]` | Client CIDR ranges the load balancer admits (spec.loadBalancerSourceRanges). Requires service.type=LoadBalancer. It doesn't restrict the node port Kubernetes also allocates for a LoadBalancer Service, and enforcement depends on the load-balancer implementation. |
 | service.metricsPort | int | `9090` | Gateway metrics service port (1-65535). Disable the endpoint with metrics.enabled, not port 0 or false. |
 | service.port | int | `8080` | Gateway gRPC/HTTP listener port. The gateway Service also exposes this port unless service.servicePort is set. |
-| service.servicePort | int | `nil` | Port the gateway Service exposes, forwarding to the gateway's service.port listener. Null exposes service.port. Use it to publish a LoadBalancer on a port such as 443 without the gateway binding it. Sandbox service URLs that the gateway prints keep service.port. |
+| service.servicePort | int | `nil` | Port the gateway Service exposes, forwarding to the gateway's service.port listener. Null exposes service.port. Use it to publish a LoadBalancer on a port such as 443 without the gateway binding it. Sandboxes receive this endpoint when they're created, so changing it strands existing sandboxes. The gateway API reports sandbox service URLs with service.port; the CLI rewrites them to the registered endpoint's port. |
 | service.type | string | `"ClusterIP"` | Kubernetes Service type for the gateway. |
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
