@@ -193,14 +193,14 @@ tests:
       - failedTemplate:
           errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client TLS Secret (server.tls.clientTlsSecretName)'
 
-  - it: rejects metrics TLS when the metrics port is disabled
+  - it: rejects metrics TLS when metrics are disabled
     template: templates/statefulset.yaml
     set:
-      service.metricsPort: 0
+      metrics.enabled: false
       metrics.tls.enabled: true
     asserts:
       - failedTemplate:
-          errorMessage: 'metrics.tls.enabled requires service.metricsPort to be non-zero'
+          errorMessage: 'metrics.tls.enabled requires metrics.enabled=true'
 
   - it: defaults to label admission with caller driver config disabled
     template: templates/gateway-config.yaml

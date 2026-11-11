@@ -526,7 +526,19 @@ Secret that is missing entirely, or a client CA Secret without a `ca.crt`
 key, never reaches the gateway, because kubelet fails the non-optional volume
 mounts and the pod does not start (`FailedMount`).
 
-For a Helm installation, set `metrics.tls.enabled=true` and provide the
+For Helm installations, `metrics.enabled` defaults to `true` and
+`service.metricsPort` defaults to `9090`. Set `metrics.enabled=false` to disable
+the dedicated listener and its container and Service ports while retaining
+the configured port. This does not disable OpenTelemetry export. The port
+must remain an integer from 1 to 65535, even when metrics are disabled.
+
+To migrate from `service.metricsPort: 0` or `false`, set
+`metrics.enabled=false` and restore a valid port such as `9090` in the same
+upgrade. The chart rejects legacy disable values with migration guidance,
+even when `metrics.enabled` is explicitly set, rather than silently enabling
+the endpoint. Metrics TLS requires `metrics.enabled=true`.
+
+Set `metrics.tls.enabled=true` and provide the
 operator-managed Secret names through `metrics.tls.certSecretName` and, for
 mTLS, `metrics.tls.clientCaSecretName`. The chart does not create
 metrics-specific PKI or monitoring resources. It rejects a
