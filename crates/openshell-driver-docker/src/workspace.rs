@@ -300,7 +300,7 @@ pub async fn remove(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::tests::{
         runtime_config, test_driver_with_config, test_sandbox, test_workload_identity,
@@ -308,7 +308,7 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     // Exercise the real Bollard request/response path, without a Docker engine.
-    async fn docker_api(
+    pub async fn docker_api(
         replies: Vec<(&'static str, String, u16, serde_json::Value)>,
     ) -> (Docker, tokio::task::JoinHandle<Vec<serde_json::Value>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -376,8 +376,13 @@ mod tests {
     }
 
     fn fixture() -> (ContainerInspectResponse, Volume, DockerDriverRuntimeConfig) {
-        let config = runtime_config();
-        let sandbox = test_sandbox();
+        fixture_for(test_sandbox(), runtime_config())
+    }
+
+    pub fn fixture_for(
+        sandbox: DriverSandbox,
+        config: DockerDriverRuntimeConfig,
+    ) -> (ContainerInspectResponse, Volume, DockerDriverRuntimeConfig) {
         let identity = test_workload_identity();
         let mut labels = ownership_labels(&sandbox.id, &config);
         labels.insert(LABEL_SANDBOX_WORKSPACE.into(), sandbox.workspace.clone());

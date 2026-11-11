@@ -49,7 +49,7 @@ fn startup_error_log_tails_fit_grpc_header_budget() {
     assert!(format_log_tail("").is_empty());
 }
 
-fn test_launch_authentication() -> Vec<u8> {
+pub fn test_launch_authentication() -> Vec<u8> {
     serde_json::to_vec(&SandboxLaunchAuthentication {
         supervisor: SupervisorAuthBundle {
             session_id: openshell_core::SandboxSessionId::new(),
@@ -568,6 +568,7 @@ pub fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerCompu
         lifecycle_event_fences: DockerLifecycleEventFences::default(),
         control_processes: Arc::new(Mutex::new(HashMap::new())),
         runtime_failures: Arc::new(Mutex::new(HashMap::new())),
+        image_update_gates: Arc::new(image_update::Gates::default()),
     }
 }
 

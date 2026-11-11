@@ -5,6 +5,7 @@
 
 #![allow(clippy::result_large_err)]
 
+mod image_update;
 mod isolation;
 pub mod otel_tracing;
 mod workspace;
@@ -396,6 +397,7 @@ pub struct DockerComputeDriver {
     lifecycle_event_fences: DockerLifecycleEventFences,
     control_processes: Arc<Mutex<HashMap<String, DockerControlProcess>>>,
     runtime_failures: Arc<Mutex<HashMap<String, DockerRuntimeFailure>>>,
+    image_update_gates: Arc<image_update::Gates>,
 }
 
 struct DockerControlProcess {
@@ -1056,6 +1058,7 @@ impl DockerComputeDriver {
             lifecycle_event_fences: DockerLifecycleEventFences::default(),
             control_processes: Arc::new(Mutex::new(HashMap::new())),
             runtime_failures: Arc::new(Mutex::new(HashMap::new())),
+            image_update_gates: Arc::new(image_update::Gates::default()),
         };
 
         Box::pin(driver.reconcile_runtime_resources_at_startup())
