@@ -16,14 +16,16 @@ from urllib.parse import quote, urlsplit
 from label_accepted_work import CLOSING_ISSUES_QUERY, check_issue_accepted_work, check_pr_accepted_work
 from check_maintainer_approval import parse_maintainers
 from label_issue_policy import load_taxonomy
+from stale_closure import is_stale_closed
 
 LIMIT = 2 * 1024 * 1024
 CLOSED_EVENTS_QUERY = '''query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
  repository(owner: $owner, name: $repo) { issue(number: $number) {
-  timelineItems(itemTypes: [CLOSED_EVENT, REOPENED_EVENT], last: 100, before: $cursor) {
+  timelineItems(itemTypes: [CLOSED_EVENT, REOPENED_EVENT, ISSUE_COMMENT], last: 100, before: $cursor) {
    nodes { __typename ... on ClosedEvent { id createdAt actor { login }
     closer { __typename ... on PullRequest { number merged mergedAt repository { nameWithOwner } } }
-   } ... on ReopenedEvent { id createdAt actor { login } } }
+   } ... on ReopenedEvent { id createdAt actor { login } }
+    ... on IssueComment { id body createdAt updatedAt author { login __typename } } }
    pageInfo { hasPreviousPage startCursor }
   }
  } }
@@ -80,9 +82,9 @@ def _authority(repository, user, author, maintainers, api):
             'is_author': bool(login) and login.lower() == author.lower(), 'verified': True}
 
 
-def _closed_event(repository, number, api):
+def _closure_evidence(repository, number, api):
     owner, repo = repository.split('/')
-    cursor, seen = None, set()
+    cursor, seen, closure = None, set(), None
     for _ in range(100):
         result = api('graphql', method='POST', data={'query': CLOSED_EVENTS_QUERY,
             'variables': {'owner': owner, 'repo': repo, 'number': number, 'cursor': cursor}})
@@ -90,30 +92,22 @@ def _closed_event(repository, number, api):
             raise ValueError('Could not resolve closure provenance')
         connection = result['data']['repository']['issue']['timelineItems']
         for event in reversed(connection['nodes']):
+            if closure is not None:
+                # Only the preceding comment in the current close/reopen cycle
+                # can establish provenance; never reuse a previous closure marker.
+                return closure, event if event['__typename'] == 'IssueComment' else None
             if event['__typename'] == 'ClosedEvent':
-                return event
+                closure = event
+            elif event['__typename'] == 'ReopenedEvent':
+                return None, None
         page = connection['pageInfo']
         if not page['hasPreviousPage']:
-            return None
+            return closure, None
         cursor = page['startCursor']
         if not cursor or cursor in seen:
             raise ValueError('Invalid closure-event cursor')
         seen.add(cursor)
     raise ValueError('Closure-event page budget exhausted')
-
-
-def is_stale_closed(issue: dict, event: dict | None) -> bool:
-    """Recognize stale closure from current labels and matching bot/event metadata."""
-    actor = issue.get('closed_by') or {}
-    login = actor.get('login', '').lower()
-    labels = {label['name'] for label in issue.get('labels', [])}
-    return bool(issue.get('state') == 'closed'
-        and issue.get('state_reason') == 'not_planned' and 'state:stale' in labels
-        and actor.get('type') == 'Bot' and login in {'github-actions[bot]', 'stale[bot]'}
-        and issue.get('closed_at') and event
-        and event.get('__typename') == 'ClosedEvent'
-        and event.get('createdAt') == issue['closed_at']
-        and (event.get('actor') or {}).get('login', '').lower() == login)
 
 
 def preflight(repository: str, number: int, *, api, force: bool = False) -> dict:
@@ -130,6 +124,7 @@ def preflight(repository: str, number: int, *, api, force: bool = False) -> dict
     accepted = (check_pr_accepted_work(repository, item, maintainers, api=api)
                 if kind == 'pull_request' else check_issue_accepted_work(repository, issue, maintainers, api=api))
     lifecycle, reason, event, authority = 'eligible', 'Open work', None, None
+    closure_comment = None
     if kind == 'pull_request' and (item.get('merged_at') or item.get('merged')):
         lifecycle, reason = 'excluded', 'Pull request merged (including reverted merges)'
     elif issue.get('state') == 'closed':
@@ -137,7 +132,7 @@ def preflight(repository: str, number: int, *, api, force: bool = False) -> dict
         if kind == 'issue' and issue.get('state_reason') == 'completed':
             lifecycle, reason = 'excluded', 'Issue completed'
         elif kind == 'issue':
-            event = _closed_event(repository, number, api)
+            event, closure_comment = _closure_evidence(repository, number, api)
             closer = (event or {}).get('closer') or {}
             if closer.get('__typename') == 'PullRequest' and closer.get('merged'):
                 lifecycle, reason = 'excluded', 'Issue resolved by merged closing pull request'
@@ -148,12 +143,12 @@ def preflight(repository: str, number: int, *, api, force: bool = False) -> dict
                 if (issue.get('state_reason') in {'not_planned', 'duplicate'}
                         and actor.get('type') != 'Bot' and authority['role'] == 'maintainer'):
                     lifecycle, reason = 'excluded', 'Deliberate maintainer closure'
-                elif is_stale_closed(issue, event):
+                elif is_stale_closed(issue, event, closure_comment):
                     lifecycle, reason = 'eligible', 'Verified stale-bot closure alone is not resolution'
     return {'repository': repository, 'number': number, 'kind': kind,
             'item_id': issue['node_id'], 'revision': revision, 'item': item, 'issue': issue,
             'maintainers': sorted(maintainers), 'maintainers_text': maintainers_text,
-            'closure_event': event, 'closure_authority': authority,
+            'closure_event': event, 'closure_comment': closure_comment, 'closure_authority': authority,
             'eligibility': {'accepted': accepted, 'lifecycle': lifecycle, 'reason': reason}}
 
 
@@ -419,7 +414,8 @@ def prepare_snapshot(repository: str, number: int, directory: Path, *, api,
                 'malformed_classification_labels': _malformed(labels, taxonomy), 'eligibility': facts['eligibility'],
                 'head': (item.get('head') or {}).get('sha'), 'changed_paths': [],
                 'linked_closing_issues': linked, 'item_material': _semantic('item', item),
-                'lifecycle_facts': {'closure_event': facts['closure_event'], 'closure_authority': facts['closure_authority']},
+                'lifecycle_facts': {'closure_event': facts['closure_event'],
+                    'closure_comment': facts['closure_comment'], 'closure_authority': facts['closure_authority']},
                 'evidence_index': index, '_directory': str(directory)}
     if facts['closure_event']:
         index['closure'] = _artifact('lifecycle', facts['closure_event'], actor_authority=facts['closure_authority'])

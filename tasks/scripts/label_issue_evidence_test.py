@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from label_issue_evidence import expand_evidence, material_state, preflight, prepare_snapshot
+from stale_closure import STALE_CLOSURE_MARKER
 
 REPO = 'Owner/Repo'
 ROOT = f'repos/{REPO}'
@@ -148,39 +149,67 @@ class EvidenceTests(unittest.TestCase):
         self.api.item.update(state='closed', state_reason='not_planned',
             labels=[{'name': 'state:stale'}], closed_at=timestamp,
             closed_by={'login': login, 'type': 'Bot'})
-        self.api.lifecycle_events = [{'__typename': 'ClosedEvent', 'id': 'closed-3',
+        self.api.lifecycle_events = [self.marker_comment(), {'__typename': 'ClosedEvent', 'id': 'closed-3',
             'actor': {'login': login}, 'createdAt': timestamp, 'closer': None}]
 
-    def test_stale_closure_uses_metadata_without_reading_comments(self):
-        for login in ('github-actions[bot]', 'stale[bot]'):
-            with self.subTest(login=login):
-                self.stale_closure(login)
-                self.api.calls.clear()
-                self.api.collections['comments'] = [{'body': 'Arbitrary workflow wording.'}]
-                self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'eligible')
-                self.assertFalse(any('/comments?' in path for path, _ in self.api.calls))
+    @staticmethod
+    def marker_comment():
+        return {'__typename': 'IssueComment', 'id': 'marker-3',
+            'body': 'Any wording or day count.\n' + STALE_CLOSURE_MARKER,
+            'author': {'login': 'github-actions[bot]', '__typename': 'Bot'},
+            'createdAt': '2026-11-06T08:22:29Z', 'updatedAt': '2026-11-06T08:22:29Z'}
 
-    def test_stale_closure_requires_current_stale_label(self):
-        for login in ('github-actions[bot]', 'stale[bot]'):
-            with self.subTest(login=login):
-                self.stale_closure(login)
-                self.api.item['labels'] = [{'name': 'state:accepted'}]
-                self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'hold')
+    def test_stale_closure_uses_shared_marker_validation(self):
+        self.stale_closure()
+        self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'eligible')
+        query = next(kw['data']['query'] for path, kw in self.api.calls if path == 'graphql')
+        self.assertIn('ISSUE_COMMENT', query)
 
-    def test_stale_closure_requires_matching_bot_event(self):
-        for changed in ('missing_event', 'event_actor', 'event_time', 'missing_time', 'not_bot', 'other_bot', 'reason'):
+    def test_stale_closure_rejects_missing_or_copied_marker_and_mismatches(self):
+        for changed in ('missing_comment', 'copied_marker', 'missing_event', 'event_actor',
+                        'event_time', 'missing_time', 'not_bot', 'other_bot', 'reason', 'label'):
             with self.subTest(changed=changed):
                 self.stale_closure()
-                if changed == 'missing_event': self.api.lifecycle_events = []
-                if changed == 'event_actor': self.api.lifecycle_events[0]['actor']['login'] = 'other[bot]'
-                if changed == 'event_time': self.api.lifecycle_events[0]['createdAt'] = '2026-10-01T00:00:00Z'
+                if changed == 'missing_comment': self.api.lifecycle_events.pop(0)
+                if changed == 'copied_marker': self.api.lifecycle_events[0]['author']['login'] = 'reader'
+                if changed == 'missing_event': self.api.lifecycle_events.pop()
+                if changed == 'event_actor': self.api.lifecycle_events[-1]['actor']['login'] = 'other[bot]'
+                if changed == 'event_time': self.api.lifecycle_events[-1]['createdAt'] = '2026-10-01T00:00:00Z'
                 if changed == 'missing_time': del self.api.item['closed_at']
                 if changed == 'not_bot': self.api.item['closed_by']['type'] = 'User'
-                if changed == 'other_bot':
-                    self.api.item['closed_by']['login'] = 'other[bot]'
-                    self.api.lifecycle_events[0]['actor']['login'] = 'other[bot]'
+                if changed == 'other_bot': self.api.item['closed_by']['login'] = 'stale[bot]'
                 if changed == 'reason': self.api.item['state_reason'] = 'duplicate'
+                if changed == 'label': self.api.item['labels'] = []
                 self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'hold')
+
+    def test_old_marker_cannot_cross_reopen_or_later_comment(self):
+        for intervening in ({'__typename': 'ReopenedEvent'}, {'__typename': 'ClosedEvent'},
+                            {**self.marker_comment(), 'body': 'An unrelated comment'}):
+            with self.subTest(intervening=intervening):
+                self.stale_closure()
+                self.api.lifecycle_events.insert(1, intervening)
+                self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'hold')
+
+    def test_comments_after_closure_do_not_replace_closure_evidence(self):
+        self.stale_closure()
+        self.api.lifecycle_events.append({**self.marker_comment(), 'body': 'Later discussion'})
+        self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'eligible')
+
+    def test_more_recent_reopen_does_not_reuse_old_closure(self):
+        self.stale_closure()
+        self.api.lifecycle_events.append({'__typename': 'ReopenedEvent'})
+        self.assertEqual(preflight(REPO, 3, api=self.api)['eligibility']['lifecycle'], 'hold')
+
+    def test_marker_lookup_crosses_page_boundary(self):
+        self.stale_closure()
+        comment, event = self.api.lifecycle_events
+        def paginated(path, **kwargs):
+            if path != 'graphql': return self.api(path, **kwargs)
+            cursor = kwargs['data']['variables']['cursor']
+            return {'data': {'repository': {'issue': {'timelineItems': {
+                'nodes': [event] if cursor is None else [comment],
+                'pageInfo': {'hasPreviousPage': cursor is None, 'startCursor': 'older' if cursor is None else None}}}}}}
+        self.assertEqual(preflight(REPO, 3, api=paginated)['eligibility']['lifecycle'], 'eligible')
 
     def test_unrelated_bot_with_write_permission_is_not_human_rejection(self):
         self.api.item.update(state='closed', state_reason='not_planned', closed_by={'login': 'other-bot', 'type': 'Bot'})
