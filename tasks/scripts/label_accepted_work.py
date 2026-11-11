@@ -146,22 +146,28 @@ def check_pr_accepted_work(
     )
 
 
-def check_issue_accepted_work(repository: str, issue: dict, maintainers: set[str], *, api: Callable) -> bool:
+def check_issue_accepted_work(
+    repository: str, issue: dict, maintainers: set[str], *, api: Callable
+) -> bool:
     """Check recorded acceptance or the issue author's trusted authority."""
     if "pull_request" in issue:
         raise ValueError("Use the PR adapter for pull requests")
     if not maintainers:
         raise ValueError("Could not parse any maintainers from MAINTAINERS.md")
-    labels = api(f"repos/{repository}/issues/{issue['number']}/labels?per_page=100", pages=True)
-    if any(label['name'] == ACCEPTED_LABEL for label in labels):
+    labels = api(
+        f"repos/{repository}/issues/{issue['number']}/labels?per_page=100", pages=True
+    )
+    if any(label["name"] == ACCEPTED_LABEL for label in labels):
         return True
-    author = issue['user']['login']
+    author = issue["user"]["login"]
     if author.lower() in {login.lower() for login in maintainers}:
         return True
     try:
-        permission = api(f"repos/{repository}/collaborators/{quote(author, safe='')}/permission")['permission']
+        permission = api(
+            f"repos/{repository}/collaborators/{quote(author, safe='')}/permission"
+        )["permission"]
     except subprocess.CalledProcessError as exc:
-        if '(HTTP 404)' not in (exc.stderr or ''):
+        if "(HTTP 404)" not in (exc.stderr or ""):
             raise
-        permission = 'none'
+        permission = "none"
     return permission in WRITE_PERMISSIONS
