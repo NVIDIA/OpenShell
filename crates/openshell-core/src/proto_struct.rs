@@ -3,7 +3,10 @@
 
 //! Helpers for converting `google.protobuf.Struct` values to and from JSON.
 
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::{
+    Deserialize, Deserializer,
+    de::{DeserializeOwned, Error as _},
+};
 
 /// Errors converting JSON values into protobuf well-known types.
 #[derive(Debug, thiserror::Error)]
@@ -13,10 +16,16 @@ pub enum ProtoStructError {
     UnrepresentableNumber(serde_json::Number),
 }
 
-/// A non-finite protobuf number cannot be used as typed configuration.
+/// Errors decoding protobuf configuration into a Rust type.
 #[derive(Debug, thiserror::Error)]
-#[error("protobuf configuration contains a non-finite number")]
-pub struct TypedProtoStructError;
+pub enum StructDecodeError {
+    /// A non-finite protobuf number cannot be used as typed configuration.
+    #[error("protobuf configuration contains a non-finite number")]
+    NonFiniteNumber,
+    /// The configuration does not match the requested Rust type.
+    #[error(transparent)]
+    Deserialize(#[from] serde_json::Error),
+}
 
 /// Convert a JSON object into a protobuf Struct.
 pub fn json_object_to_struct(
@@ -74,7 +83,10 @@ fn integer_is_exact_in_f64(integer: u64) -> bool {
             <= f64::MANTISSA_DIGITS
 }
 
-/// Convert a protobuf Struct into a JSON object for typed serde decoding.
+/// Convert a protobuf Struct into a JSON object with lossy numeric conversion.
+///
+/// All numbers become floats, and non-finite numbers become null. Use
+/// [`from_struct`] to decode typed configuration while preserving integers.
 #[must_use]
 pub fn struct_to_json_object(
     config: &prost_types::Struct,
@@ -86,31 +98,41 @@ pub fn struct_to_json_object(
         .collect()
 }
 
-/// Convert a protobuf Struct into a JSON value for typed serde decoding.
+/// Convert a protobuf Struct into a JSON value with lossy numeric conversion.
+///
+/// All numbers become floats, and non-finite numbers become null. Use
+/// [`from_struct`] to decode typed configuration while preserving integers.
 #[must_use]
 pub fn struct_to_json_value(config: &prost_types::Struct) -> serde_json::Value {
     serde_json::Value::Object(struct_to_json_object(config))
 }
 
-/// Convert protobuf configuration into JSON for typed serde decoding.
+/// Deserialize protobuf configuration into a Rust type, preserving integers.
 ///
 /// Finite integral doubles in the JSON integer range become integers; fractions
 /// and larger finite numbers remain floats. This preserves exactly represented
 /// large integers accepted by [`json_value_to_proto`]. A receiver cannot detect
 /// precision already lost before transport; the producer must enforce exactness.
-/// General-purpose conversions keep their existing float and null behavior.
+/// Use `from_struct::<serde_json::Value>` to obtain the intermediate JSON.
 ///
 /// # Errors
 ///
-/// Reject non-finite numbers anywhere in the configuration instead of turning
-/// them into null, which could silently clear an optional constraint.
-pub fn struct_to_typed_json_value(
+/// Return [`StructDecodeError::NonFiniteNumber`] for non-finite numbers anywhere
+/// in the configuration, or [`StructDecodeError::Deserialize`] if the
+/// configuration does not match the requested type.
+pub fn from_struct<T: DeserializeOwned>(
     config: &prost_types::Struct,
-) -> Result<serde_json::Value, TypedProtoStructError> {
+) -> Result<T, StructDecodeError> {
+    Ok(serde_json::from_value(struct_to_exact_json(config)?)?)
+}
+
+fn struct_to_exact_json(
+    config: &prost_types::Struct,
+) -> Result<serde_json::Value, StructDecodeError> {
     config
         .fields
         .iter()
-        .map(|(key, value)| typed_value_to_json(value).map(|value| (key.clone(), value)))
+        .map(|(key, value)| value_to_exact_json(value).map(|value| (key.clone(), value)))
         .collect::<Result<serde_json::Map<_, _>, _>>()
         .map(serde_json::Value::Object)
 }
@@ -121,16 +143,14 @@ pub fn struct_to_typed_json_value(
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn typed_value_to_json(
-    value: &prost_types::Value,
-) -> Result<serde_json::Value, TypedProtoStructError> {
+fn value_to_exact_json(value: &prost_types::Value) -> Result<serde_json::Value, StructDecodeError> {
     use prost_types::value::Kind;
     use serde_json::{Number, Value};
 
     Ok(match value.kind.as_ref() {
         Some(Kind::NumberValue(number)) => {
             if !number.is_finite() {
-                return Err(TypedProtoStructError);
+                return Err(StructDecodeError::NonFiniteNumber);
             }
             // Exclusive upper bounds are intentional: u64::MAX and i64::MAX
             // round UP when converted to f64. Guard before any integer cast.
@@ -148,14 +168,14 @@ fn typed_value_to_json(
             Value::Number(
                 integer
                     .or_else(|| Number::from_f64(*number))
-                    .ok_or(TypedProtoStructError)?,
+                    .ok_or(StructDecodeError::NonFiniteNumber)?,
             )
         }
-        Some(Kind::StructValue(config)) => struct_to_typed_json_value(config)?,
+        Some(Kind::StructValue(config)) => struct_to_exact_json(config)?,
         Some(Kind::ListValue(list)) => Value::Array(
             list.values
                 .iter()
-                .map(typed_value_to_json)
+                .map(value_to_exact_json)
                 .collect::<Result<_, _>>()?,
         ),
         // Only numeric values differ from the compatible general conversion.
@@ -163,7 +183,10 @@ fn typed_value_to_json(
     })
 }
 
-/// Convert a protobuf Value into a JSON value for typed serde decoding.
+/// Convert a protobuf Value into a JSON value with lossy numeric conversion.
+///
+/// All numbers become floats, and non-finite numbers become null. Use
+/// [`from_struct`] to decode typed configuration while preserving integers.
 #[must_use]
 pub fn value_to_json(value: &prost_types::Value) -> serde_json::Value {
     match value.kind.as_ref() {
@@ -273,8 +296,7 @@ mod tests {
         });
         let expected: Config = serde_json::from_value(json.clone()).unwrap();
         let proto = json_object_to_struct(json.as_object().unwrap().clone()).unwrap();
-        let actual: Config =
-            serde_json::from_value(struct_to_typed_json_value(&proto).unwrap()).unwrap();
+        let actual: Config = from_struct(&proto).unwrap();
         assert_eq!(actual, expected);
         // The general-purpose conversion retains its existing float semantics.
         assert!(struct_to_json_value(&proto)["service_ports"][0].is_f64());
@@ -301,13 +323,21 @@ mod tests {
             };
             limits.fields.get_mut("max_processes").unwrap().kind =
                 Some(prost_types::value::Kind::NumberValue(number));
-            assert!(struct_to_typed_json_value(&proto).is_err());
+            assert!(matches!(
+                from_struct::<serde_json::Value>(&proto),
+                Err(StructDecodeError::NonFiniteNumber)
+            ));
             assert!(struct_to_json_value(&proto)["limits"][0]["max_processes"].is_null());
         }
     }
 
     #[test]
     fn typed_configuration_preserves_numeric_boundaries() {
+        #[derive(Debug, Deserialize)]
+        struct Limit<T> {
+            limit: T,
+        }
+
         for integer in [
             0,
             9_007_199_254_740_992,
@@ -322,11 +352,8 @@ mod tests {
                     .clone(),
             )
             .unwrap();
-            let value = struct_to_typed_json_value(&proto).unwrap();
-            assert_eq!(
-                serde_json::from_value::<u64>(value["limit"].clone()).unwrap(),
-                integer
-            );
+            let config: Limit<u64> = from_struct(&proto).unwrap();
+            assert_eq!(config.limit, integer);
         }
         let proto = json_object_to_struct(
             serde_json::json!({"limit": i64::MIN})
@@ -335,11 +362,8 @@ mod tests {
                 .clone(),
         )
         .unwrap();
-        let value = struct_to_typed_json_value(&proto).unwrap();
-        assert_eq!(
-            serde_json::from_value::<i64>(value["limit"].clone()).unwrap(),
-            i64::MIN
-        );
+        let config: Limit<i64> = from_struct(&proto).unwrap();
+        assert_eq!(config.limit, i64::MIN);
         // Fractions and doubles outside the integer range must not be truncated
         // or saturated into a valid integer configuration value.
         for number in [1.5, -1.0, 18_446_744_073_709_551_616.0, f64::MAX] {
@@ -352,8 +376,10 @@ mod tests {
                 )]
                 .into(),
             };
-            let value = struct_to_typed_json_value(&proto).unwrap();
-            assert!(serde_json::from_value::<u64>(value["limit"].clone()).is_err());
+            assert!(matches!(
+                from_struct::<Limit<u64>>(&proto),
+                Err(StructDecodeError::Deserialize(_))
+            ));
         }
         let below_i64_min = prost_types::Struct {
             fields: [(
@@ -366,8 +392,10 @@ mod tests {
             )]
             .into(),
         };
-        let value = struct_to_typed_json_value(&below_i64_min).unwrap();
-        assert!(serde_json::from_value::<i64>(value["limit"].clone()).is_err());
+        assert!(matches!(
+            from_struct::<Limit<i64>>(&below_i64_min),
+            Err(StructDecodeError::Deserialize(_))
+        ));
     }
 
     #[derive(Debug, Default, Deserialize)]

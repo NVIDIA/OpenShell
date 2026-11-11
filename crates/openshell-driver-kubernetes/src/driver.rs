@@ -69,7 +69,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
     WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
-use openshell_core::proto_struct::{struct_to_typed_json_value, value_to_json};
+use openshell_core::proto_struct::{from_struct, value_to_json};
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
     GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
@@ -711,9 +711,7 @@ impl KubernetesSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        let json = struct_to_typed_json_value(config)
-            .map_err(|err| format!("invalid kubernetes driver_config: {err}"))?;
-        let config: Self = serde_json::from_value(json)
+        let config: Self = from_struct(config)
             .map_err(|err| format!("invalid kubernetes driver_config: {err}"))?;
         config
             .validate()
