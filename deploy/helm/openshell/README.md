@@ -462,6 +462,59 @@ explicitly. Existing sandboxes stay on their owners when scaling up, and
 memory-based scaling does not guarantee spare capacity for handoff. See the
 [shared supervisor autoscaling guide](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#autoscale-shared-supervisors-by-memory).
 
+## Secure metrics scraping
+
+Metrics are enabled by default on `service.metricsPort: 9090`. Set
+`metrics.enabled=false` to disable the dedicated listener and its container
+and Service ports while retaining the configured port. This does not disable
+OpenTelemetry export. `service.metricsPort` must remain an integer from 1 to
+65535, even when metrics are disabled.
+
+The dedicated metrics endpoint is plaintext by default for compatibility with
+existing Prometheus deployments. Enable `metrics.tls.enabled` to serve it over
+HTTPS; this requires `metrics.enabled=true`. The initial implementation uses
+operator-provided Kubernetes Secrets; it does not generate metrics PKI or
+create a `ServiceMonitor`.
+
+A metrics TLS Secret that exists with malformed contents leaves the metrics
+listener disabled at startup while the gateway keeps serving; it never falls
+back to plaintext. A Secret that is missing entirely, or a client CA Secret
+without a `ca.crt` key, never reaches the gateway: kubelet fails the
+non-optional volume mounts and the pod does not start (`FailedMount`).
+Correct the Secret and restart the gateway to restore scraping.
+
+```yaml
+metrics:
+  tls:
+    enabled: true
+    # Empty uses server.tls.certSecretName instead.
+    certSecretName: openshell-metrics-server-tls
+    clientCaSecretName: openshell-metrics-scraper-ca
+    requireClientCert: true
+```
+
+The server Secret must provide `tls.crt` and `tls.key`; the scraper CA Secret
+must provide `ca.crt`. When `requireClientCert` is true, the chart rejects a
+render without `clientCaSecretName`. The metrics client CA must be separate
+from the gateway client credentials: sandbox workloads receive them for the
+control plane, and trusting that CA on the metrics listener would grant those
+workloads scraping access. The chart fails the render when
+`metrics.tls.clientCaSecretName` reuses `server.tls.clientCaSecretName` or
+`server.tls.clientTlsSecretName` (the sandbox client Secret; certgen seeds it
+with the gateway CA when the chart manages PKI). The comparison is by Secret
+name only; the chart cannot detect a different Secret holding the same CA.
+
+The metrics server certificate may reuse the gateway server TLS Secret when its
+SANs cover the Service DNS name used by the scraper. The gateway reloads valid
+certificate changes in place and preserves the last known-good configuration on
+an invalid replacement. Logs and OCSF events identify these reloads with
+`listener=metrics`.
+
+Configure your monitoring resource separately. A Prometheus Operator
+`ServiceMonitor` or `PodMonitor` that uses mTLS must reference its client
+certificate, key, and CA from Secrets in the monitoring resource's namespace.
+Do not disable server verification with `insecureSkipVerify`.
+
 ## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
@@ -544,6 +597,11 @@ discovery endpoint or its TLS CA.
 | grpcRoute.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
 | grpcRoute.replicaRouting.enabled | bool | `false` | Route requests carrying an `x-openshell-replica` header straight to that gateway replica. The CLI sets the header on long-lived sandbox connections (SSH, port forwards, exec) using the owner the gateway reports, so they skip the relay through a peer replica. Renders one Service per replica. Requires workload.kind=statefulset, workload.allowMultiReplicaStatefulSet=true, and at most 15 replicas. |
 | imagePullSecrets | list | `[]` | Image pull secrets attached to gateway and helper pods. |
+| metrics.enabled | bool | `true` | Enable the dedicated Prometheus metrics listener and its container and Service ports. |
+| metrics.tls.certSecretName | string | `""` | Kubernetes TLS Secret with tls.crt and tls.key. Empty reuses server.tls.certSecretName. |
+| metrics.tls.clientCaSecretName | string | `""` | Secret with ca.crt for verifying metrics scraper client certificates. It must not contain the gateway client CA. The chart rejects reusing the gateway client CA and client TLS Secret names; the check is by name only and cannot detect a different Secret holding the same CA. Required when requireClientCert is true. |
+| metrics.tls.enabled | bool | `false` | Enable TLS for the dedicated metrics listener. |
+| metrics.tls.requireClientCert | bool | `false` | Require a client certificate signed by clientCaSecretName to scrape metrics. |
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Restrict SSH ingress on sandbox pods to the gateway. In managed mode, the driver applies the equivalent policy to each workspace namespace. |
 | nodeSelector | object | `{}` | Node selector for the gateway pod. |
@@ -565,6 +623,7 @@ discovery endpoint or its TLS CA.
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
 | podLifecycle.terminationGracePeriodSeconds | int | `30` | Maximum time, in seconds, Kubernetes waits for the gateway to exit before killing it. The gateway exits as soon as shutdown completes; the limit covers supervisor session cleanup and draining queued OCSF records. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
+| priorityClassName | string | `""` | PriorityClass for the gateway pod. The gateway is a control-plane component; when it shares nodes with the workloads it serves, the default priority gives it no advantage under node pressure. Empty = omit the field. |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
 | probes.liveness.periodSeconds | int | `5` | Liveness probe period, in seconds. |
@@ -680,7 +739,7 @@ discovery endpoint or its TLS CA.
 | server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
 | server.workspaceStorageClass | string | `""` | Kubernetes StorageClass for the workspace PVC in sandbox pods. Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the workspace PVC stays Pending and the sandbox never starts. |
 | service.healthPort | int | `8081` | Gateway health service port. |
-| service.metricsPort | int | `9090` | Gateway metrics service port. |
+| service.metricsPort | int | `9090` | Gateway metrics service port (1-65535). Disable the endpoint with metrics.enabled, not port 0 or false. |
 | service.port | int | `8080` | Gateway gRPC/HTTP service port. |
 | service.type | string | `"ClusterIP"` | Kubernetes Service type for the gateway. |
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
@@ -708,6 +767,7 @@ discovery endpoint or its TLS CA.
 | supervisor.replicas | int | `1` | Shared supervisor pool members, used only when gatewayConfig selects supervisor_topology = "gateway". The gateway always coordinates the shared supervisor as a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. 1 has no failover; use 2 or more to survive losing a member. Only the supervisor Deployment's replica count depends on this value, so changing it neither restarts the gateway nor replaces running members. Ignored when supervisor.autoscaling.enabled is true. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
+| topologySpreadConstraints | list | `[]` | Topology spread constraints for the gateway pod, used to spread replicas across zones or nodes. Empty = omit the field. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"caBundle":{"configMapName":"","key":"ca.crt"},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |
 | upstreamProxy.authAllowInsecure | bool | `false` | Required when authSecret is configured because Basic auth to an HTTP proxy is cleartext. |
 | upstreamProxy.authSecret.key | string | `""` | Secret key containing the proxy credential. |

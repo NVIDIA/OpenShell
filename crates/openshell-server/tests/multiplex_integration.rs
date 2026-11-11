@@ -48,7 +48,9 @@ async fn serves_grpc_and_http_on_same_port() {
     let response = client.health(HealthRequest {}).await.unwrap();
     assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
 
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+        .await
+        .unwrap();
     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(stream))
         .await

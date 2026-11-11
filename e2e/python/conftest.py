@@ -56,7 +56,10 @@ def cluster_name() -> str | None:
 
 @pytest.fixture(scope="session")
 def sandbox_client(cluster_name: str | None) -> Iterator[SandboxClient]:
-    with SandboxClient.from_active_cluster(cluster=cluster_name) as client:
+    # Direct deletes can wait out the Kubernetes pod grace period.
+    with SandboxClient.from_active_cluster(
+        cluster=cluster_name, timeout=120.0
+    ) as client:
         yield client
 
 
@@ -95,6 +98,9 @@ def sandbox(cluster_name: str | None) -> Callable[..., Sandbox]:
             delete_on_exit=delete_on_exit,
             # Allow time to pull an explicitly supplied workload fixture.
             ready_timeout_seconds=300.0,
+            # Kubernetes holds DeleteSandbox open until the pod terminates
+            # (30s grace plus API headroom), which can exceed the 30s default.
+            delete_timeout_seconds=120.0,
         )
 
     return _create

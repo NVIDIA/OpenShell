@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Configure the Podman gateway's user-namespace mode and publish it.
+#
+# `podman_userns_mode` is default, auto, keep-id or private. Every mode except
+# default writes its `[openshell.drivers.podman]` settings to
+# `/etc/openshell-test/gateway-overrides.toml`, which every installer applies to the active
+# gateway-overrides.toml (the openshell_gateway role for `binaries`, the
+# openshell_packaged_gateway role for the packages); default removes the file. The
+# Podman support crate (tests/support/podman) reads the published mode and
+# runs Podman's own reference container in it.
+---
+- name: Podman user namespaces for tests
+  hosts: all
+  gather_facts: false
+  vars:
+    podman_userns_driver_config: /etc/openshell-test/gateway-overrides.toml
+    podman_userns_settings:
+      default: ""
+      auto: |
+        [openshell.drivers.podman]
+        userns = "auto"
+      keep-id: |
+        [openshell.drivers.podman]
+        userns = "keep-id"
+      private: |
+        [openshell.drivers.podman]
+        userns = "private"
+        uidmap = ["0:0:1", "1:1:65535"]
+        gidmap = ["0:0:1", "1:1:65535"]
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Require a known user-namespace mode
+      ansible.builtin.assert:
+        that:
+          - podman_userns_mode is defined
+          - podman_userns_mode in podman_userns_settings
+        fail_msg: >-
+          podman_userns_mode must be one of
+          {{ podman_userns_settings.keys() | join(', ') }}, not
+          {{ podman_userns_mode | default('unset') }}
+
+    - name: Create the test configuration directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ podman_userns_driver_config | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Write the Podman driver user-namespace settings
+      become: true
+      ansible.builtin.copy:
+        dest: "{{ podman_userns_driver_config }}"
+        content: "{{ podman_userns_settings[podman_userns_mode] }}"
+        owner: root
+        group: root
+        mode: "0644"
+      when: podman_userns_mode != "default"
+
+    # The fragment is the only source of userns, uidmap and gidmap settings in
+    # the gateway's configuration, so default mode leaves them unset.
+    - name: Remove Podman driver user-namespace settings for default mode
+      become: true
+      ansible.builtin.file:
+        path: "{{ podman_userns_driver_config }}"
+        state: absent
+      when: podman_userns_mode == "default"
+
+    - name: Publish Podman user-namespace test variables
+      ansible.builtin.include_tasks: ../../test-env.yaml
+      vars:
+        test_env_name: podman-userns
+        test_env_vars:
+          OPENSHELL_TEST_PODMAN_USERNS: "{{ podman_userns_mode }}"

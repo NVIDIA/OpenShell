@@ -37,6 +37,14 @@ policy inputs, auth bundle, backend descriptor, and file locations.
 settings, the log sink, and the denial history served by `policy.local`.
 `SandboxInstanceControls` carries the owner's stop signal, suspension requests,
 and readiness.
+Dedicated Docker and Podman drivers pass the workload image reference and its
+resolved immutable ID through `OPENSHELL_CONTAINER_IMAGE` and
+`OPENSHELL_CONTAINER_IMAGE_UID`. The binary carries these into
+`SandboxInstanceConfig` and the instance's `EventContext`; OCSF builders emit
+`device.container.image` only when the ID is nonempty. Without an ID, known
+workload image references are preserved in `unmapped.container_image`. Hosted
+Kubernetes instances currently carry only the image reference and omit the image
+object.
 Everything else, including credential renewal, policy, provider credentials and
 token grants, middleware credentials, the backend connection, and the access
 plane, is created by the instance. Gateway clients receive a `GatewayEndpoint`,
@@ -49,7 +57,13 @@ loads the launch configuration from its arguments and environment and prepares
 push and the OCSF JSON settings with its logging layers, so renewal by either
 gateway client keeps both current. `run_sandbox_with_backend` sets the
 process-wide OCSF context, binds the readiness socket and port to instance
-readiness, and stops the instance on SIGTERM or SIGINT.
+readiness, and stops the instance on SIGTERM or SIGINT. Stopping gives the
+workload 5 seconds to exit after TERM, and the instance stops, including its
+exit report and trace flush, within 8 seconds. Telemetry exporters shut down
+after that and are not covered by this bound. A boundary connection lost while
+the process stops is not recovered; the workload's exit status is reported
+when the boundary returned it, otherwise the workload is reported as
+terminated.
 
 `sandbox_instance_host::SandboxInstanceHost` runs several sandbox instances in
 one process. Each instance gets its own Tokio runtime; every thread of that
@@ -295,3 +309,26 @@ URL selection. Dedicated and shared supervisors expose the app listener on their
 Pod IPs without app Services. Clients must select the member owning their
 sandbox. HA takeover may preserve the workload generation; existing ingress streams
 are not migrated. Runtime ownership fencing must reject stale connectors.
+
+### Installed-route evidence
+
+An enabled listener offers an installation view to the existing authenticated
+sandbox supervisor session. The gateway issues a single-use lease challenge
+every five seconds. The instance reports the complete installed allowlist only
+when its remaining serving freshness covers the challenge's fifteen-second
+lease. Expiry starts at gateway challenge issuance, so transport delay cannot
+extend publication past confirmed listener freshness. Empty reports withdraw
+installation evidence; suspended, expired, stopped, or not-yet-serving instances
+cannot report live routes.
+
+Reports contain declaration identities/revisions and configuration identity,
+not backend addresses. The gateway obtains endpoints from the compute driver
+and validates runtime identity, declarations, and session ownership before
+persisting ephemeral records. Shared Kubernetes pools resolve the acknowledged
+owner's Pod IP and app port. Durable pool ownership, credential epoch, membership,
+and acknowledged reports fence installation acceptance and discovery. Shared
+listeners additionally require a gateway-issued serving lease, capped at fifteen
+seconds from issuance, independently of configuration freshness. Expiry closes
+streams; later renewal cannot revive them. Takeover preserves the workload and
+public hostname while replacing the app endpoint. Clients reconnect after an
+interruption; sockets are not migrated.

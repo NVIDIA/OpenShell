@@ -18,7 +18,6 @@ use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_isolation_interface::contract::BackendDescriptor;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 mod logging;
@@ -238,6 +237,17 @@ struct Args {
     /// Stdin is a driver-owned liveness pipe. EOF means the driver exited.
     #[arg(long, hide = true)]
     parent_liveness_stdin: bool,
+
+    /// Attach and policy-discover request timeout, in seconds. Slow
+    /// VM-backed runtimes (CoCo/peer-pods) need longer than the default for
+    /// the remote boundary to boot before the supervisor gives up.
+    #[arg(
+        long,
+        env = "OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS",
+        default_value = "300",
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    attach_request_timeout_seconds: u64,
 }
 
 #[cfg(unix)]
@@ -455,6 +465,10 @@ fn main() -> Result<()> {
         return openshell_supervisor::check_control_readiness(&args.socket);
     }
 
+    openshell_ocsf::register_trace_correlation_extractor(
+        openshell_otel::current_ocsf_trace_correlation,
+    );
+
     let args = Args::parse();
     if args.mode == SupervisorMode::Shared {
         return shared::run(args);
@@ -563,7 +577,7 @@ fn main() -> Result<()> {
                 otlp_layer_provider
                     .as_ref()
                     .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
-                    .with_filter(otlp_span_filter(&args.log_level)),
+                    .with_filter(openshell_otel::supervisor_span_filter(&args.log_level)),
             )
             .init();
         if !file_available {
@@ -638,8 +652,15 @@ fn main() -> Result<()> {
                     await_main_process_attachment,
                     sandbox_id: args.sandbox_id,
                     sandbox: args.sandbox,
-                    container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+                    container_image: std::env::var(openshell_core::sandbox_env::CONTAINER_IMAGE)
+                        .unwrap_or_default(),
+                    container_image_uid: std::env::var(
+                        openshell_core::sandbox_env::CONTAINER_IMAGE_UID,
+                    )
+                    .ok()
+                    .filter(|uid| !uid.trim().is_empty()),
                     openshell_endpoint: args.openshell_endpoint,
+                    gateway_home: None,
                     policy_rules: args.policy_rules,
                     policy_data: args.policy_data,
                     ssh_socket_path: args.ssh_socket_path,
@@ -650,6 +671,9 @@ fn main() -> Result<()> {
                     auth_bundle,
                     admitted_isolation_backend: Some(admitted_backend),
                     main_exit_marker: args.main_exit_marker,
+                    attach_request_timeout: std::time::Duration::from_secs(
+                        args.attach_request_timeout_seconds,
+                    ),
                     trace_context: openshell_supervisor::trace_context_from_environment(),
                     provider_workload_api_socket: std::env::var_os(
                         openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
@@ -838,16 +862,6 @@ fn supervisor_resource_attributes(
         .collect()
 }
 
-/// A more verbose log level raises `openshell*` spans; dependency spans stay at
-/// INFO so they do not flood the exporter queue.
-fn otlp_span_filter(log_level: &str) -> EnvFilter {
-    let level = log_level
-        .parse::<LevelFilter>()
-        .unwrap_or(LevelFilter::INFO)
-        .max(LevelFilter::INFO);
-    EnvFilter::new(format!("info,openshell={level}"))
-}
-
 /// Choose the supervisor's exit status for a sandbox run.
 ///
 /// The reserved status tells the compute driver that the sandbox rejected the
@@ -873,6 +887,37 @@ fn supervisor_exit(result: Result<i32>) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_timeout_arguments_reject_invalid_values() {
+        assert_eq!(
+            Args::try_parse_from(["openshell-supervisor"])
+                .unwrap()
+                .attach_request_timeout_seconds,
+            300
+        );
+        for value in ["0", "86401", "invalid"] {
+            assert!(
+                Args::try_parse_from([
+                    "openshell-supervisor",
+                    "--attach-request-timeout-seconds",
+                    value
+                ])
+                .is_err()
+            );
+        }
+        for value in ["1", "900", "86400"] {
+            let args = Args::try_parse_from([
+                "openshell-supervisor",
+                "--attach-request-timeout-seconds",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(
+                args.attach_request_timeout_seconds,
+                value.parse::<u64>().unwrap()
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -949,15 +994,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn otlp_span_filter_raises_only_openshell_targets() {
-        let directives = |log_level: &str| otlp_span_filter(log_level).to_string();
-        assert_eq!(directives("warn"), "openshell=info,info");
-        assert_eq!(directives("info"), "openshell=info,info");
-        assert_eq!(directives("debug"), "openshell=debug,info");
-        assert_eq!(directives("info,h2=debug"), "openshell=info,info");
-    }
 
     #[test]
     fn only_workspace_validation_failure_exits_with_reserved_status() {
