@@ -1388,7 +1388,7 @@ image_pull_policy  = "if_not_present"
 # Value assigned to the openshell.sandbox_namespace label on sandbox containers.
 sandbox_label      = "docker-dev"
 # Opt in newly created /sandbox workspaces to driver-owned persistent storage.
-# Does not migrate existing workspaces or enable workload image updates.
+# Does not migrate existing workspaces. Updates also need enable_sandbox_updates.
 persist_workspace = false
 # host (default) or bridge networking for the supervisor.
 # Operator-owned; sandbox driver config cannot override this choice.
@@ -1435,8 +1435,11 @@ Use `sandbox_label` for Docker configurations.
 using the default `/sandbox` directory receive a driver-owned local volume.
 Stop/start retains its data; deleting the sandbox removes the owned volume.
 Custom working directories and image-declared volumes overlapping `/sandbox`
-are rejected. Existing writable-layer workspaces remain unchanged. This option
-does not enable Docker workload image updates.
+are rejected. Existing writable-layer workspaces remain unchanged. The driver
+advertises image-only updates for persistent workspaces; the gateway also
+requires `enable_sandbox_updates` before accepting them. See
+[stopped sandbox image updates](/how-it-works/sandboxes/overview#update-the-image-of-a-stopped-sandbox)
+for the supported image layout and update sequence.
 
 `supervisor_network_mode` accepts `host` (the default), `bridge`, or `auto`.
 `auto` also selects host; the driver does not infer a mode from the workload runtime.

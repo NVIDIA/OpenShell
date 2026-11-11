@@ -264,6 +264,49 @@ impl Fixture {
         let result = Box::pin(driver.update_workload_image(request)).await;
         (result, server.await.unwrap())
     }
+
+    async fn grpc_call(
+        &self,
+        config: DockerDriverRuntimeConfig,
+        replies: Vec<Reply>,
+        request: UpdateSandboxConfigurationRequest,
+    ) -> Result<(), Status> {
+        use openshell_core::proto::compute::v1::{
+            compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient,
+            compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer,
+        };
+        let (docker, api) = docker_api(replies).await;
+        let mut driver = test_driver_with_config(config);
+        driver.docker = Arc::new(docker);
+        let service = ComputeDriverService::new_in_process(driver);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, stopped) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(ComputeDriverConfigurationUpdatesServer::new(service))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+                .unwrap();
+        });
+        let mut client =
+            ComputeDriverConfigurationUpdatesClient::connect(format!("http://{address}"))
+                .await
+                .unwrap();
+        let result = client
+            .update_sandbox_configuration(request)
+            .await
+            .map(|_| ());
+        let _ = shutdown.send(());
+        server.await.unwrap();
+        api.await.unwrap();
+        result
+    }
 }
 
 impl Drop for Fixture {
@@ -571,5 +614,228 @@ async fn replacement_cannot_substitute_another_persistent_volume_record() {
     assert_eq!(
         verify_replacement(&target, &intent).unwrap_err().code(),
         tonic::Code::FailedPrecondition
+    );
+}
+
+#[tokio::test]
+async fn pending_update_survives_driver_restart_and_blocks_start_by_id_or_name() {
+    let fixture = Fixture::new();
+    let (docker, server) = docker_api(fixture.preflight()).await;
+    let mut driver = test_driver_with_config(fixture.config.clone());
+    driver.docker = Arc::new(docker);
+    let intent = driver.prepare_image_update(fixture.p()).await.unwrap();
+    server.await.unwrap();
+    save(&fixture.config, &intent).unwrap();
+    let snapshots = pending_snapshots(&fixture.config).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].id, fixture.p().sandbox_id);
+    assert_eq!(
+        snapshots[0].status.as_ref().unwrap().conditions[0].reason,
+        openshell_core::driver_utils::CONDITION_STOPPED
+    );
+    assert_eq!(
+        pending_ids(&fixture.config).unwrap(),
+        vec![fixture.p().sandbox_id.clone()]
+    );
+    let (docker, server) = docker_api(vec![]).await;
+    let mut reopened = test_driver_with_config(fixture.config.clone());
+    reopened.docker = Arc::new(docker);
+    let observed = reopened
+        .get_sandbox_snapshot("", &fixture.p().name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.id, fixture.p().sandbox_id);
+    for id in [fixture.p().sandbox_id.as_str(), ""] {
+        let error = Box::pin(reopened.start_sandbox(
+            id,
+            &fixture.p().name,
+            "generation-2",
+            &test_launch_authentication(),
+            None,
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+    server.await.unwrap();
+    assert!(
+        read(&fixture.config, &fixture.p().sandbox_id)
+            .unwrap()
+            .unwrap()
+            .phase
+            == Phase::Prepared
+    );
+}
+
+#[tokio::test]
+async fn completed_update_clears_pending_inventory_and_keeps_start_bound_to_target() {
+    let fixture = Fixture::new();
+    fixture
+        .call(fixture.apply_replies(), &fixture.request)
+        .await
+        .0
+        .unwrap();
+    assert!(pending_ids(&fixture.config).unwrap().is_empty());
+    assert!(
+        pending_snapshot(&fixture.config, &fixture.p().sandbox_id, &fixture.p().name)
+            .unwrap()
+            .is_none()
+    );
+    require_settled(&fixture.config, &fixture.p().sandbox_id).unwrap();
+    let mut target = fixture.target();
+    validate_committed_resource(&fixture.config, &fixture.p().sandbox_id, &target).unwrap();
+    target.id = Some("same-name-foreign-container".into());
+    assert!(
+        validate_committed_resource(&fixture.config, &fixture.p().sandbox_id, &target).is_err()
+    );
+}
+
+async fn prepared_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    let (docker, server) = docker_api(fixture.preflight()).await;
+    let mut driver = test_driver_with_config(fixture.config.clone());
+    driver.docker = Arc::new(docker);
+    let intent = driver.prepare_image_update(fixture.p()).await.unwrap();
+    server.await.unwrap();
+    save(&fixture.config, &intent).unwrap();
+    fixture
+}
+
+#[tokio::test]
+async fn startup_cleanup_and_stop_preserve_pending_update_without_a_workload() {
+    let fixture = prepared_fixture().await;
+    let mut channel = fixture.volume.clone();
+    channel.name = docker_channel_volume_name_by_id(&fixture.p().sandbox_id, &fixture.config);
+    channel.labels.remove(workspace::ROLE_LABEL);
+    // All three list operations are read-only. Any removal during startup or
+    // Stop would fail the fixture's next expected method.
+    let replies = vec![
+        ("GET", String::new(), 200, serde_json::json!([])),
+        ("GET", String::new(), 200, serde_json::json!([])),
+        (
+            "GET",
+            String::new(),
+            200,
+            serde_json::json!({"Volumes":[fixture.volume, channel]}),
+        ),
+        ("GET", String::new(), 200, serde_json::json!([])),
+        ("GET", String::new(), 200, serde_json::json!([])),
+    ];
+    let (docker, server) = docker_api(replies).await;
+    let mut reopened = test_driver_with_config(fixture.config.clone());
+    reopened.docker = Arc::new(docker);
+    reopened
+        .reconcile_runtime_resources_at_startup()
+        .await
+        .unwrap();
+    ComputeDriver::stop_sandbox(
+        &reopened,
+        Request::new(StopSandboxRequest {
+            sandbox_id: String::new(),
+            name: fixture.p().name.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        pending_ids(&fixture.config).unwrap(),
+        vec![fixture.p().sandbox_id.clone()]
+    );
+    assert!(fixture.directory.join(RUNTIME_DESCRIPTOR_FILE).is_file());
+}
+
+#[tokio::test]
+async fn explicit_delete_clears_pending_gap_and_reports_the_deleted_native_resource() {
+    let fixture = prepared_fixture().await;
+    let mut replies = vec![
+        ("GET", String::new(), 200, serde_json::json!([])),
+        ("GET", String::new(), 200, serde_json::json!([])),
+        fixture.volume_reply(),
+        (
+            "DELETE",
+            format!("/volumes/{}", fixture.volume.name),
+            204,
+            serde_json::Value::Null,
+        ),
+    ];
+    for name in [
+        docker_channel_volume_name_by_id(&fixture.p().sandbox_id, &fixture.config),
+        docker_supervisor_volume_name_by_id(&fixture.p().sandbox_id, &fixture.config),
+        docker_control_volume_name_by_id(&fixture.p().sandbox_id, &fixture.config),
+    ] {
+        replies.push((
+            "DELETE",
+            format!("/volumes/{name}"),
+            204,
+            serde_json::Value::Null,
+        ));
+    }
+    let (docker, server) = docker_api(replies).await;
+    let mut reopened = test_driver_with_config(fixture.config.clone());
+    reopened.docker = Arc::new(docker);
+    let response = ComputeDriver::delete_sandbox(
+        &reopened,
+        Request::new(DeleteSandboxRequest {
+            sandbox_id: String::new(),
+            name: fixture.p().name.clone(),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    server.await.unwrap();
+    assert!(response.deleted);
+    assert!(pending_ids(&fixture.config).unwrap().is_empty());
+    assert!(!fixture.directory.exists());
+}
+
+#[tokio::test]
+async fn optional_rpc_remains_disabled_without_persistent_storage() {
+    let fixture = Fixture::new();
+    let mut config = fixture.config.clone();
+    config.workspace_storage = workspace::Storage::WritableLayer;
+    let capability = openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION;
+    let advertised = test_driver_with_config(config.clone())
+        .capabilities()
+        .extension
+        .unwrap()
+        .supported_capabilities;
+    assert!(!advertised.iter().any(|value| value == capability));
+    let error = fixture
+        .grpc_call(config, vec![], fixture.request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unimplemented);
+    assert!(
+        read(&fixture.config, &fixture.p().sandbox_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn optional_rpc_uses_the_existing_preflight_contract_when_enabled() {
+    let fixture = Fixture::new();
+    let capability = openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION;
+    let advertised = test_driver_with_config(fixture.config.clone())
+        .capabilities()
+        .extension
+        .unwrap()
+        .supported_capabilities;
+    assert!(advertised.iter().any(|value| value == capability));
+    let mut request = fixture.request.clone();
+    request.preconditions.as_mut().unwrap().validate_only = true;
+    let mut replies = fixture.preflight();
+    replies.extend([fixture.source_reply(), fixture.volume_reply()]);
+    fixture
+        .grpc_call(fixture.config.clone(), replies, request)
+        .await
+        .unwrap();
+    assert!(
+        read(&fixture.config, &fixture.p().sandbox_id)
+            .unwrap()
+            .is_none()
     );
 }

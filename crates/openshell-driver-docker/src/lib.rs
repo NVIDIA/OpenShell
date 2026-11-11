@@ -1109,7 +1109,14 @@ impl DockerComputeDriver {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/docker",
                 openshell_core::VERSION,
-                [],
+                if self.config.workspace_storage == workspace::Storage::Persistent {
+                    vec![
+                        openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
+                            .to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                },
             )),
         }
     }
@@ -1506,6 +1513,11 @@ impl DockerComputeDriver {
         if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await? {
             return Ok(Some(pending));
         }
+        if let Some(pending) =
+            image_update::pending_snapshot(&self.config, sandbox_id, sandbox_name)?
+        {
+            return Ok(Some(pending));
+        }
         let container = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?;
@@ -1517,6 +1529,16 @@ impl DockerComputeDriver {
         }
 
         Ok(None)
+    }
+
+    async fn resolve_lifecycle_id(&self, id: &str, name: &str) -> Result<Option<String>, Status> {
+        if !id.is_empty() {
+            return Ok(Some(id.to_string()));
+        }
+        Ok(self
+            .get_sandbox_snapshot(id, name)
+            .await?
+            .map(|sandbox| sandbox.id))
     }
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
@@ -1575,6 +1597,9 @@ impl DockerComputeDriver {
         // attached to both the sandbox and gateway. A running workload
         // container alone is not a usable sandbox.
         by_id.extend(self.pending_snapshot_map().await);
+        for pending in image_update::pending_snapshots(&self.config)? {
+            by_id.insert(pending.id.clone(), pending);
+        }
         let mut sandboxes = by_id.into_values().collect::<Vec<_>>();
         sandboxes.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(sandboxes)
@@ -2144,7 +2169,7 @@ impl DockerComputeDriver {
         // leave a trusted supervisor eligible for launch.
         self.verify_network_trust()?;
         let sandboxes = self.list_managed_container_summaries().await?;
-        let sandbox_ids = sandboxes
+        let mut sandbox_ids = sandboxes
             .iter()
             .filter_map(|container| {
                 container
@@ -2154,6 +2179,9 @@ impl DockerComputeDriver {
                     .cloned()
             })
             .collect::<HashSet<_>>();
+        // A valid accepted update can temporarily have no workload container.
+        // Its runtime channel/key resources are not orphans during that gap.
+        sandbox_ids.extend(image_update::pending_ids(&self.config)?);
 
         let filters = managed_resource_label_filters(&self.config.sandbox_namespace, []);
         let auxiliary = self
@@ -2377,6 +2405,9 @@ impl DockerComputeDriver {
                 }
             }
             if !sandbox_id.is_empty() {
+                let removed_update =
+                    image_update::pending_snapshot(&self.config, sandbox_id, sandbox_name)?
+                        .is_some();
                 self.stop_control_process(sandbox_id).await;
                 let removed = self
                     .remove_auxiliary_containers_for_sandbox(sandbox_id)
@@ -2384,7 +2415,7 @@ impl DockerComputeDriver {
                 remove_docker_owned_storage_by_id(&self.docker, sandbox_id, &self.config).await?;
                 cleanup_docker_boundary_state_by_id(sandbox_id, &self.config);
                 self.clear_runtime_failure(sandbox_id).await;
-                return Ok(removed);
+                return Ok(removed || removed_update);
             }
             return Ok(false);
         };
@@ -2457,6 +2488,9 @@ impl DockerComputeDriver {
                 self.remove_auxiliary_containers_for_sandbox(sandbox_id)
                     .await?;
             }
+            if image_update::pending_snapshot(&self.config, sandbox_id, sandbox_name)?.is_some() {
+                return Ok(());
+            }
             return Err(Status::not_found("sandbox not found"));
         };
         let Some(target) = summary_container_target(&container) else {
@@ -2526,18 +2560,28 @@ impl DockerComputeDriver {
             generation_id.to_string(),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let resolved_id = self
+            .resolve_lifecycle_id(sandbox_id, sandbox_name)
+            .await?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let _lifecycle = self
+            .image_update_gates
+            .gate_for(&resolved_id)
+            .lock_owned()
+            .await;
+        image_update::require_settled(&self.config, &resolved_id)?;
         self.lifecycle_event_fences
-            .clear_stop(sandbox_id, sandbox_name);
-        self.lifecycle_event_fences.begin_start(sandbox_id);
+            .clear_stop(&resolved_id, sandbox_name);
+        self.lifecycle_event_fences.begin_start(&resolved_id);
         let result = Box::pin(self.start_sandbox_with_lifecycle_fence(
-            sandbox_id,
+            &resolved_id,
             sandbox_name,
             &generation,
             launch_authentication,
             durable_sandbox,
         ))
         .await;
-        self.lifecycle_event_fences.finish_start(sandbox_id);
+        self.lifecycle_event_fences.finish_start(&resolved_id);
         span_status.finish(result)
     }
 
@@ -2566,6 +2610,7 @@ impl DockerComputeDriver {
             .map_err(|error| internal_status("inspect Docker sandbox outer fence", error))?;
         validate_docker_outer_fence(&inspected)?;
         self.admit_container_resources(&inspected).await?;
+        image_update::validate_committed_resource(&self.config, sandbox_id, &inspected)?;
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
         let previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
             inspected
@@ -2804,16 +2849,7 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<(), Status> {
-        if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await? {
-            self.publish_sandbox_snapshot(pending);
-            return Ok(());
-        }
-        if let Some(summary) = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
-            .await?
-            && let Some(mut sandbox) = sandbox_from_container_summary(&summary)
-        {
-            self.apply_runtime_failure(&mut sandbox).await;
+        if let Some(sandbox) = self.get_sandbox_snapshot(sandbox_id, sandbox_name).await? {
             self.publish_sandbox_snapshot(sandbox);
         }
         Ok(())
@@ -3024,7 +3060,7 @@ impl DockerComputeDriver {
             .await
             .map_err(|err| internal_status("find Docker sandbox container", err))?;
 
-        Ok(containers.into_iter().find(|summary| {
+        let mut matches = containers.into_iter().filter(|summary| {
             let Some(labels) = summary.labels.as_ref() else {
                 return false;
             };
@@ -3040,7 +3076,14 @@ impl DockerComputeDriver {
                     .get(LABEL_SANDBOX_NAME)
                     .is_some_and(|value| value == sandbox_name);
             namespace_matches && id_matches && name_matches
-        }))
+        });
+        let selected = matches.next();
+        if matches.next().is_some() {
+            return Err(Status::failed_precondition(
+                "multiple managed Docker workloads match the native identity",
+            ));
+        }
+        Ok(selected)
     }
 
     async fn ensure_image_available(
@@ -3193,9 +3236,6 @@ fn validate_docker_outer_fence(
     }
     Ok(())
 }
-#[tonic::async_trait]
-impl openshell_core::compute::ComputeDriver for ComputeDriverService {}
-
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
     type WatchSandboxesStream = WatchStream;
@@ -3359,7 +3399,51 @@ impl ComputeDriver for ComputeDriverService {
 }
 
 #[tonic::async_trait]
-impl openshell_core::compute::ComputeDriver for DockerComputeDriver {}
+impl openshell_core::compute::ComputeDriver for DockerComputeDriver {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let result = Box::pin(self.update_workload_image(&request.into_inner())).await;
+        span_status.finish(result.map(|()| {
+            Response::new(openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse {})
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for ComputeDriverService {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::UPDATE_SANDBOX_CONFIGURATION,
+                openshell_core::compute::ComputeDriver::update_sandbox_configuration(
+                    &self.driver,
+                    request,
+                ),
+            )
+            .await
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates for ComputeDriverService {
+    async fn update_sandbox_configuration(
+        &self, request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>, Status> {
+        openshell_core::compute::ComputeDriver::update_sandbox_configuration(self, request).await
+    }
+}
 
 #[tonic::async_trait]
 impl ComputeDriver for DockerComputeDriver {
@@ -3490,9 +3574,21 @@ impl ComputeDriver for DockerComputeDriver {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let request = request.into_inner();
+        let mut request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.name)?;
 
+        let Some(id) = self
+            .resolve_lifecycle_id(&request.sandbox_id, &request.name)
+            .await?
+        else {
+            return Err(Status::not_found("sandbox not found"));
+        };
+        request.sandbox_id = id;
+        let _lifecycle = self
+            .image_update_gates
+            .gate_for(&request.sandbox_id)
+            .lock_owned()
+            .await;
         self.lifecycle_event_fences
             .request_stop(&request.sandbox_id, &request.name);
         if let Err(error) = self
@@ -3551,9 +3647,21 @@ impl ComputeDriver for DockerComputeDriver {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let request = request.into_inner();
+        let mut request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.name)?;
 
+        let Some(id) = self
+            .resolve_lifecycle_id(&request.sandbox_id, &request.name)
+            .await?
+        else {
+            return Ok(Response::new(DeleteSandboxResponse { deleted: false }));
+        };
+        request.sandbox_id = id;
+        let _lifecycle = self
+            .image_update_gates
+            .gate_for(&request.sandbox_id)
+            .lock_owned()
+            .await;
         let event_sandbox_id = request.sandbox_id.clone();
         let deleted = self
             .delete_sandbox_inner(&request.sandbox_id, &request.name)

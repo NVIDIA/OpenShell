@@ -413,8 +413,8 @@ fn decode_boundary(intent: &Intent, target_id: &str) -> Result<(Vec<u8>, Vec<u8>
 }
 
 impl DockerComputeDriver {
-    /// Local prototype entry point. Capability negotiation/registration remains
-    /// disabled until driver-wide interruption handling is qualified.
+    /// Stopped image-only mutation for explicitly enabled persistent workspaces.
+    /// The gateway owns acceptance, retries and public lifecycle state.
     pub async fn update_workload_image(
         &self,
         request: &UpdateSandboxConfigurationRequest,
@@ -754,7 +754,7 @@ pub struct Gates {
 }
 
 impl Gates {
-    fn gate_for(&self, id: &str) -> Arc<Mutex<()>> {
+    pub fn gate_for(&self, id: &str) -> Arc<Mutex<()>> {
         let mut values = self
             .values
             .lock()
@@ -767,6 +767,148 @@ impl Gates {
         values.insert(id.into(), Arc::downgrade(&gate));
         gate
     }
+}
+
+fn record_ids(config: &DockerDriverRuntimeConfig) -> Result<Vec<String>, Status> {
+    let sample = docker_boundary_state_dir_by_id("discovery", config)?;
+    let root = sample
+        .parent()
+        .ok_or_else(|| invalid("Docker native state root is missing"))?;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(invalid("Docker pending update inventory cannot be read")),
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| invalid("Docker pending update inventory is incomplete"))?;
+        if !entry
+            .file_type()
+            .map_err(|_| invalid("Docker native state type is unavailable"))?
+            .is_dir()
+        {
+            continue;
+        }
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if valid_native_id(&id)
+            && read(config, &id)?.is_some_and(|intent| intent.phase != Phase::Applied)
+        {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn valid_native_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_'))
+}
+
+fn snapshot(intent: &Intent) -> DriverSandbox {
+    pending_sandbox_snapshot(
+        &DriverSandbox {
+            id: intent.sandbox_id.clone(),
+            name: intent.sandbox_name.clone(),
+            namespace: intent.namespace.clone(),
+            workspace: intent
+                .body
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(LABEL_SANDBOX_WORKSPACE))
+                .cloned()
+                .unwrap_or_default(),
+            ..Default::default()
+        },
+        &intent.namespace,
+        DriverCondition {
+            r#type: "Ready".into(),
+            status: "False".into(),
+            reason: openshell_core::driver_utils::CONDITION_STOPPED.into(),
+            message: "Stopped; an accepted workload image update awaits recovery".into(),
+            transition_time: None,
+        },
+        false,
+    )
+}
+
+pub fn pending_ids(config: &DockerDriverRuntimeConfig) -> Result<Vec<String>, Status> {
+    record_ids(config)
+}
+
+pub fn pending_snapshots(config: &DockerDriverRuntimeConfig) -> Result<Vec<DriverSandbox>, Status> {
+    record_ids(config)?
+        .iter()
+        .map(|id| {
+            read(config, id)?
+                .map(|intent| snapshot(&intent))
+                .ok_or_else(|| invalid("Docker pending update changed during observation"))
+        })
+        .collect()
+}
+
+pub fn pending_snapshot(
+    config: &DockerDriverRuntimeConfig,
+    id: &str,
+    name: &str,
+) -> Result<Option<DriverSandbox>, Status> {
+    if !id.is_empty() {
+        if !valid_native_id(id) {
+            return Ok(None);
+        }
+        let Some(intent) = read(config, id)? else {
+            return Ok(None);
+        };
+        if !name.is_empty() && name != intent.sandbox_name {
+            return Err(invalid(
+                "Docker update name does not match its native identity",
+            ));
+        }
+        return Ok((intent.phase != Phase::Applied).then(|| snapshot(&intent)));
+    }
+    let matches = pending_snapshots(config)?
+        .into_iter()
+        .filter(|value| value.name == name)
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => Err(invalid(
+            "Docker pending update name is ambiguous; use its native ID",
+        )),
+    }
+}
+
+pub fn require_settled(config: &DockerDriverRuntimeConfig, id: &str) -> Result<(), Status> {
+    if valid_native_id(id) && read(config, id)?.is_some_and(|intent| intent.phase != Phase::Applied)
+    {
+        return Err(invalid(
+            "resume the accepted Docker image update before starting the workload",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_committed_resource(
+    config: &DockerDriverRuntimeConfig,
+    id: &str,
+    container: &ContainerInspectResponse,
+) -> Result<(), Status> {
+    if !valid_native_id(id) {
+        return Ok(());
+    }
+    if let Some(intent) = read(config, id)? {
+        if intent.phase != Phase::Applied {
+            return Err(invalid("Docker image update is not settled"));
+        }
+        verify_replacement(container, &intent)?;
+        verify_published_boundary(&intent, config)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

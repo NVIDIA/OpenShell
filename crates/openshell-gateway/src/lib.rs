@@ -377,6 +377,18 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
+        self.build_with_configuration_updates(context)
+            .await
+            .map(|(instance, _)| instance)
+    }
+
+    async fn build_with_configuration_updates(
+        &self,
+        context: openshell_server::ComputeDriverBuildContext<'_>,
+    ) -> openshell_core::Result<(
+        openshell_server::ComputeDriverInstance,
+        Option<openshell_server::SharedComputeDriverConfigurationUpdates>,
+    )> {
         let mut config = docker_config(context.config_context())?;
         config.supervisor_otlp = context
             .otlp_config()
@@ -393,9 +405,18 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         )
         .await
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
-        let driver = openshell_driver_docker::ComputeDriverService::new_in_process(driver);
-        Ok(openshell_server::ComputeDriverInstance::InProcess(
-            std::sync::Arc::new(driver),
+        let driver = std::sync::Arc::new(
+            openshell_driver_docker::ComputeDriverService::new_in_process(driver),
+        );
+        let updates: Option<openshell_server::SharedComputeDriverConfigurationUpdates> =
+            if config.persist_workspace {
+                Some(driver.clone())
+            } else {
+                None
+            };
+        Ok((
+            openshell_server::ComputeDriverInstance::InProcess(driver),
+            updates,
         ))
     }
 }

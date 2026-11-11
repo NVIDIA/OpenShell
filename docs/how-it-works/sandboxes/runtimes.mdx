@@ -122,7 +122,8 @@ Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint
 Set `persist_workspace = true` for driver-owned persistent storage in newly
 created default `/sandbox` workspaces. Stop/start retains data; sandbox deletion
 removes the owned volume. It defaults to `false`, does not migrate existing
-workspaces, and does not enable Docker workload image updates. See
+workspaces. Image-only updates additionally require the gateway's
+`enable_sandbox_updates` setting. See
 [Docker configuration](/how-it-works/gateways/configuration#docker).
 
 `supervisor_network_mode` defaults to `host`. Set `bridge` to use Docker bridge networking; `auto` also selects host. The workload always retains `network=none`.

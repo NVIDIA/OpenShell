@@ -140,7 +140,24 @@ restart, including when external resource admission is disabled. Stop retains
 the data. Explicit sandbox deletion removes the owned workspace volume and
 reports removal failures. Startup orphan cleanup retains workspace volumes
 without a workload; an interrupted create requires explicit recovery/removal.
-This storage option alone does not enable workload image updates.
+This option advertises the optional workload update capability. The gateway's
+separate `enable_sandbox_updates` setting must also be enabled to accept updates.
+
+### Stopped Workload Image Updates
+
+The Docker updater implements the existing configuration-update RPC for
+image-only changes on stopped, persistent `/sandbox` workspaces. Source and
+target images must already be cached locally, have the same non-root UID/GID,
+and declare no image volumes. Command and environment changes are unsupported.
+
+The update replaces the stopped workload container while preserving the native
+sandbox ID and owned workspace volume. It refreshes the private runtime evidence
+for the replacement; it does not change the trusted sandbox or supervisor images.
+A private operation record lets the same accepted operation resume after an
+interruption. Start refuses an unfinished update. Stop and startup reconciliation
+retain its data and runtime resources; explicit Delete removes its owned storage.
+Retry through the gateway to finish the accepted update before starting it.
+The operation never starts the workload or rolls back workspace data implicitly.
 
 Stop terminates the supervisor companion and stops the workload container
 without removing it. Docker retains the workload writable layer and attached

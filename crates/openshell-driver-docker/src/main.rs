@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
+use openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
 use openshell_driver_docker::{ComputeDriverService, DockerComputeConfig, DockerComputeDriver};
@@ -95,9 +96,11 @@ async fn main() -> Result<()> {
     let _cleanup =
         openshell_core::external_driver_socket::SocketCleanup::new(args.bind_socket.clone());
     info!(socket = %args.bind_socket.display(), "Starting Docker compute driver");
+    let service = ComputeDriverService::new(driver);
     tonic::transport::Server::builder()
         .layer(openshell_otel::compute_driver_rpc_layer())
-        .add_service(ComputeDriverServer::new(ComputeDriverService::new(driver)))
+        .add_service(ComputeDriverServer::new(service.clone()))
+        .add_service(ComputeDriverConfigurationUpdatesServer::new(service))
         .serve_with_incoming_shutdown(
             openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
             shutdown_signal(),
