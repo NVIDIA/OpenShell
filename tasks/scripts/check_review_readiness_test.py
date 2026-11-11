@@ -53,6 +53,39 @@ def event(number, login, *, human=False, removed=False):
 
 
 class RegistryTests(unittest.TestCase):
+    def test_nested_sdk_subscription_topics_use_the_broad_sdk_roster(self):
+        text = DOCUMENT + "\n### topic:sdk\n\n" + TABLE + ALICE
+        for language in ("go", "python", "rust", "typescript"):
+            text += f"\n### topic:sdk:{language}\n\n" + TABLE
+        categories = routing.parse_reviewers(text)
+        for language in ("go", "python", "rust", "typescript"):
+            with self.subTest(language=language):
+                self.assertEqual(categories[f"topic:sdk:{language}"], set())
+                self.assertEqual(
+                    routing.select_reviewers(
+                        categories,
+                        {"area:runtime", "topic:sdk", f"topic:sdk:{language}"},
+                    ),
+                    {"alice"},
+                )
+                with self.assertRaisesRegex(ValueError, "require topic:sdk"):
+                    routing.select_reviewers(
+                        categories, {"area:runtime", f"topic:sdk:{language}"}
+                    )
+
+    def test_malformed_nested_headings_are_not_active_categories(self):
+        for label in (
+            "topic:sdk:",
+            "topic:sdk::go",
+            "topic:sdk:-go",
+            "retired:topic:sdk:go",
+        ):
+            with self.subTest(label=label):
+                text = DOCUMENT + f"\n### {label}\n\n" + TABLE
+                self.assertEqual(
+                    routing.parse_reviewers(text), {"area:runtime": {"alice"}}
+                )
+
     def test_reads_only_membership_rows_and_allows_empty_categories(self):
         text = DOCUMENT.replace(
             "Scope.", "Thanks [@outside](https://github.com/outside)."

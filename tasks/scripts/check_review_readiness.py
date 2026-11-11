@@ -30,7 +30,7 @@ from check_maintainer_approval import parse_maintainers
 from label_accepted_work import ACCEPTED_LABEL, check_pr_accepted_work
 
 HEADER = ["Name", "GitHub ID", "Company/Organization"]
-LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:-[a-z0-9]+)*")
+LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:[-:][a-z0-9]+)*")
 PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)", re.I)
 
 
@@ -96,6 +96,11 @@ def select_reviewers(categories: dict[str, set[str]], labels: set[str]) -> set[s
     unknown = relevant - categories.keys()
     if unknown:
         raise ValueError("unknown area/topic labels: " + ", ".join(sorted(unknown)))
+    if (
+        any(label.startswith("topic:sdk:") for label in relevant)
+        and "topic:sdk" not in relevant
+    ):
+        raise ValueError("language-specific SDK topics require topic:sdk")
     return set().union(*(categories[label] for label in relevant))
 
 
