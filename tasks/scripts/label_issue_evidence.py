@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
-from accepted_work import CLOSING_ISSUES_QUERY, check_issue_accepted_work, check_pr_accepted_work
+from label_accepted_work import CLOSING_ISSUES_QUERY, check_issue_accepted_work, check_pr_accepted_work
 from check_maintainer_approval import parse_maintainers
 from label_issue_policy import load_taxonomy
 
