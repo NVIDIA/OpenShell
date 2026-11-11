@@ -1,21 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Stateless checkpoint codec, bounded discovery and deterministic verification.
+"""Encode, discover and verify checkpoints in GitHub label-event metadata.
 
-V2 binds fetched source facts, final labels and an exact ordered label-operation
-transcript after a recorded event boundary. Fetched source digests detect changes;
-they never assert that a model read every source. V1 is decoded for audit only.
+Proofs bind substantive facts, final labels and ordered operations after an
+event boundary. Collections require complete member coverage; source digests
+establish freshness, not reading. The caller supplies filtered CLOSED/REOPENED
+facts as ``relevant_timeline``. V1 metadata is decode-only.
 
-The caller hydrates relevant collections and supplies ``relevant_timeline`` as a
-complete digest/byte-count artifact of filtered CLOSED/REOPENED event facts (IDs,
-actors, timestamps and lifecycle fields). Raw unfiltered timeline artifacts are
-then redundant. Parent collections require ``members`` IDs and their complete
-child source artifacts. No constant unresolved marker establishes unchanged.
-
-Operation proofs require one coordinated executor per item. GitHub removals have
-no protocol nonce: an identical same-actor coincident removal is indistinguishable
-from the planned removal. Other interleaved/extra events conservatively fail.
-This module has no mutation, classifier, provisioning or comment-posting API.
+One coordinated executor is required: GitHub removals have no nonce, so identical
+same-actor removals are indistinguishable. Extra/interleaved events fail proof.
 """
 
 from __future__ import annotations
@@ -184,10 +177,7 @@ def fingerprint(material: dict, final_labels: set[str], policy_version: str) -> 
 
 def encode_checkpoint(fingerprint: str, *, boundary_id: str,
                       operations_digest: str, event_count: int) -> str:
-    """Encode a complete v2 operation proof in at most 280 ASCII bytes.
-
-    All proof fields are required. Legacy v1 metadata is decode-only for audit.
-    """
+    """Encode a v2 operation proof in at most 280 ASCII bytes."""
     if not _is_digest(fingerprint):
         raise ValueError('Checkpoint fingerprint must be a SHA-256 hex digest')
     if (not isinstance(boundary_id, str) or not _is_digest(operations_digest)

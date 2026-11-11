@@ -1,17 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Pure validation and desired-state label planning. No GitHub mutations.
+"""Validate evidence-backed classifications and plan label differences.
 
-Taxonomy scopes come from the trusted roster. Legacy associations are removed
-as classification state, never used to infer replacement labels: documentation
-requires a content-derived area and topic, compatibility may concern drivers or
-API contracts, and L7 may concern networking, policy, or both. The classifier
-must support its chosen replacements with inspected substantive evidence.
-
-Trusted label definitions may mark assessment labels with ``assessment: true``;
-only that prepared subset is available to a separately authorized triage caller.
-Explicit removals require membership in the trusted snapshot
-``malformed_classification_labels`` allowlist, never a classifier-supplied list.
+Taxonomy comes from the trusted roster. Malformed removals and assessment
+labels require prepared allowlists; the classifier cannot grant authority.
 """
 
 from __future__ import annotations

@@ -10,7 +10,6 @@ import json
 import re
 import subprocess
 import uuid
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -19,9 +18,6 @@ from check_maintainer_approval import parse_maintainers
 from label_issue_policy import load_taxonomy
 
 LIMIT = 2 * 1024 * 1024
-# Literal close-issue-message from .github/workflows/stale.yml (actions/stale).
-STALE_CLOSE_MESSAGE = ('Closing this issue after 14 days with no activity since it was marked stale. '
-                       'Reopen it if the work is still relevant.')
 CLOSED_EVENTS_QUERY = '''query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
  repository(owner: $owner, name: $repo) { issue(number: $number) {
   timelineItems(itemTypes: [CLOSED_EVENT, REOPENED_EVENT], last: 100, before: $cursor) {
@@ -106,36 +102,18 @@ def _closed_event(repository, number, api):
     raise ValueError('Closure-event page budget exhausted')
 
 
-def _actions_stale_closure(repository, issue, event, actor, api):
-    """Recognize the maintained automation protocol, never arbitrary bot intent."""
+def is_stale_closed(issue: dict, event: dict | None) -> bool:
+    """Recognize stale closure from current labels and matching bot/event metadata."""
+    actor = issue.get('closed_by') or {}
     login = actor.get('login', '').lower()
-    closed_at = issue.get('closed_at')
-    if (actor.get('type') != 'Bot' or login != 'github-actions[bot]'
-            or issue.get('state_reason') != 'not_planned' or not closed_at
-            or not event or event.get('__typename') != 'ClosedEvent'
-            or event.get('createdAt') != closed_at
-            or (event.get('actor') or {}).get('login', '').lower() != login):
-        return False
-    comments = api(f'repos/{repository}/issues/{issue["number"]}/comments?per_page=100', pages=True)
-    if not comments:
-        return False
-    # REST issue comments are paginated oldest first. A later comment makes
-    # this narrow automation inference uncertain, including a same-second one.
-    comment = comments[-1]
-    created_at = comment.get('created_at')
-    if (comment.get('body') != STALE_CLOSE_MESSAGE
-            or (comment.get('user') or {}).get('login', '').lower() != login
-            or (comment.get('user') or {}).get('type') != 'Bot'
-            or not created_at or comment.get('updated_at', created_at) != created_at):
-        return False
-    try:
-        elapsed = (datetime.fromisoformat(closed_at.replace('Z', '+00:00'))
-                   - datetime.fromisoformat(created_at.replace('Z', '+00:00'))).total_seconds()
-    except (ValueError, TypeError):
-        return False
-    # Comment creation and closure are separate requests; recognize a bounded
-    # literal protocol window, without claiming proof of workflow identity.
-    return 0 <= elapsed <= 60
+    labels = {label['name'] for label in issue.get('labels', [])}
+    return bool(issue.get('state') == 'closed'
+        and issue.get('state_reason') == 'not_planned' and 'state:stale' in labels
+        and actor.get('type') == 'Bot' and login in {'github-actions[bot]', 'stale[bot]'}
+        and issue.get('closed_at') and event
+        and event.get('__typename') == 'ClosedEvent'
+        and event.get('createdAt') == issue['closed_at']
+        and (event.get('actor') or {}).get('login', '').lower() == login)
 
 
 def preflight(repository: str, number: int, *, api, force: bool = False) -> dict:
@@ -170,8 +148,7 @@ def preflight(repository: str, number: int, *, api, force: bool = False) -> dict
                 if (issue.get('state_reason') in {'not_planned', 'duplicate'}
                         and actor.get('type') != 'Bot' and authority['role'] == 'maintainer'):
                     lifecycle, reason = 'excluded', 'Deliberate maintainer closure'
-                elif ((actor.get('type') == 'Bot' and actor.get('login', '').lower() == 'stale[bot]')
-                        or _actions_stale_closure(repository, issue, event, actor, api)):
+                elif is_stale_closed(issue, event):
                     lifecycle, reason = 'eligible', 'Verified stale-bot closure alone is not resolution'
     return {'repository': repository, 'number': number, 'kind': kind,
             'item_id': issue['node_id'], 'revision': revision, 'item': item, 'issue': issue,
@@ -446,9 +423,7 @@ def prepare_snapshot(repository: str, number: int, directory: Path, *, api,
                 'evidence_index': index, '_directory': str(directory)}
     if facts['closure_event']:
         index['closure'] = _artifact('lifecycle', facts['closure_event'], actor_authority=facts['closure_authority'])
-    # Classification preparation may read discussion metadata even on open
-    # items: recorded author abandonment or maintainer rejection must remain
-    # available for the caller's restricting lifecycle interpretation.
+    # Open items can contain human abandonment or rejection statements.
     _refresh_collection(snapshot, 'comments', api)
     index['comments']['inspected'] = False
     author = (facts['issue'].get('user') or {}).get('login', '').lower()
@@ -628,12 +603,7 @@ def expand_evidence(snapshot: dict, evidence_ids: list[str], *, api) -> dict:
 
 
 def material_state(snapshot: dict) -> dict:
-    """Actual prepared/inspected facts and unseen-source markers, never updatedAt.
-
-    Source identities/digests are retained even when not inspected: checkpoints
-    must not claim that unseen source content was examined. Local paths and
-    trusted-read commit provenance are not semantic policy changes.
-    """
+    """Project substantive facts and source digests, excluding local paths and updatedAt."""
     keys = ('repository', 'number', 'kind', 'item_id', 'policy_version', 'taxonomy',
             'existing_labels', 'eligibility', 'head', 'changed_paths', 'item_material',
             'linked_closing_issues', 'lifecycle_facts', 'malformed_classification_labels', 'stale')

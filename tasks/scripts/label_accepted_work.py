@@ -1,13 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared accepted-work classification; see CONTRIBUTING.md#accepted-work.
+"""Shared accepted-work checks; see CONTRIBUTING.md#accepted-work.
 
-Use is_accepted_work with supplied facts, or check_pr_accepted_work and
-check_issue_accepted_work with a GitHub API callable. These accept the same
-path/method/data/pages arguments
-as check_review_readiness._api. Both return a bool; API errors propagate.
-This library has no CLI, label writes, or workflow lifecycle of its own.
+Use is_accepted_work for supplied facts or check_pr_accepted_work and
+check_issue_accepted_work with an API callable. Adapters return bools and
+propagate API errors; they do not write labels.
 """
 
 from __future__ import annotations
