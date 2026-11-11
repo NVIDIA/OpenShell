@@ -72,7 +72,7 @@ Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTA
 
 Pull requests that touch the enforcement machinery or reviewer routing — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `REVIEWERS.md`, `.github/CODEOWNERS`, or the enforcement and reviewer-routing scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
 
-Use exactly one `area:` label and any relevant `topic:` labels on your pull request. The [reviewer routing workflow](.github/workflows/review-readiness.yml) requests all matching members of [REVIEWERS.md](REVIEWERS.md), excluding the author, when a PR opens ready for review, leaves draft status, or gains or loses an area/topic label. Reviewers do not need repository write access to receive requests or review PRs. Manual reviewer choices and people who have commented or reviewed are preserved. Propose roster membership changes through a reviewed PR.
+Once your pull request represents [accepted work](#accepted-work), apply exactly one `area:` label and any relevant `topic:` labels. Follow [Labeling and Notifications](#labeling-and-notifications) before applying classification labels. The [reviewer routing workflow](.github/workflows/review-readiness.yml) requests all matching members of [REVIEWERS.md](REVIEWERS.md), excluding the author, when a PR opens ready for review, leaves draft status, or gains or loses an area/topic label. Reviewers do not need repository write access to receive requests or review PRs. Manual reviewer choices and people who have commented or reviewed are preserved. Propose roster membership changes through a reviewed PR.
 
 If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
 
@@ -130,6 +130,29 @@ Community issues move through triage, technical validation, and human acceptance
 A direct request to an agent authorizes the requested planning or implementation. A request to plan alone does not authorize implementation. For unattended work, inspect current state descriptions, maintainer assignments, and comments to determine the authorized phase. Technical validation alone does not authorize implementation. Check for an existing owner, branch, or PR before starting.
 
 Do not file suspected vulnerabilities as public issues. Follow [SECURITY.md](SECURITY.md). Use the specialized security skills for authorized review or remediation.
+
+### Accepted Work
+
+Accepted work is work the project intends to pursue. Work submitted by a maintainer listed in the merged [MAINTAINERS.md](MAINTAINERS.md), or someone with repository `WRITE`, `MAINTAIN`, or `ADMIN` access, qualifies immediately. Other issues require a maintainer's acceptance, recorded with `state:accepted`.
+
+A PR represents accepted work when either:
+
+- Its author is a maintainer or has repository write access as described above.
+- It closes at least one issue in this repository that has `state:accepted`, and the PR author is that issue's submitter or a current assignee.
+
+Use GitHub closing references such as `Closes #123` or `Fixes #123`. Merely mentioning an accepted issue does not qualify. Acceptance and the author relationship must hold on the same issue. The PR author determines eligibility, not the person triggering a workflow. Other tools and contributor skills use this shared definition; the importable `tasks/scripts/accepted_work.py` library implements the PR check.
+
+Acceptance classifies work, not implementation quality or approval to merge. Existing issue-linking rules, the separate `PR Issue Acceptance` check (which requires every linked issue to be accepted for community authors), and maintainer/code-owner approvals still apply. Acceptance does not certify that the diff implements the issue, and the existing Dependabot gate exemption does not automatically qualify a PR as accepted work.
+
+### Labeling and Notifications
+
+Labels drive notification streams as well as classification. Contributors use the GitHub app in Slack, and other integrations, to follow issues and PRs filtered by area or topic. Applying those labels can notify subscribers immediately, before they have chosen to follow the individual item.
+
+Apply `area:` and `topic:` classification labels only after the issue or PR meets the shared [accepted-work definition](#accepted-work). Once accepted, apply the relevant classification labels so subscribers can find the work.
+
+Do not classify an issue merely because it was filed or its subject is clear. Waiting until acceptance keeps label-filtered streams focused on work the project intends to pursue and avoids sending unaccepted intake to subscribers. Workflow labels such as `state:triage-needed` still record intake status; they do not establish acceptance.
+
+Automatic classification at issue creation and filters that exclude unaccepted work are being discussed separately in [#5261](https://github.com/NVIDIA/OpenShell/issues/5261). Until that policy changes, defer classification labels until acceptance.
 
 ### Label Discovery
 
@@ -457,6 +480,12 @@ The `PR Issue Acceptance` workflow reports the native `OpenShell / PR Issue Acce
 Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not bypass `PR Issue Acceptance` for authors without repository write access or change applicable verification, review, or private vulnerability disclosure requirements.
 
 Authors with `WRITE`, `MAINTAIN`, or `ADMIN` access may open a PR that only fixes a broken build or flaky tests without a separate issue. Describe the failure in the PR instead. Authors without write access follow the normal issue and acceptance requirements.
+
+### Automatic Acceptance Labeling
+
+The existing [review-readiness workflow](.github/workflows/review-readiness.yml) checks [accepted work](#accepted-work) when a PR is opened and adds `state:accepted` if it qualifies. This includes drafts and PRs awaiting area/topic classification. Reviewer requests still wait until a PR is ready and has an area label.
+
+This is an additive check at creation, not continuous reconciliation: later edits, permission changes, and issue-label or assignment changes do not refresh or remove the PR label. The shared library is read-only; review-readiness applies the label. The label does not replace the issue-acceptance gate or merge approvals.
 
 ### Branch Names
 
