@@ -114,6 +114,7 @@ is migrated or deleted.
 | `sha2`, `hmac` | `openshell-server` | Naming, coordination, request matching, and tests, plus security-sensitive bearer-cache keys, launch-session derivation, policy/review bindings, credential handles, and protected mutation fingerprints. The security-sensitive uses must migrate; the HMAC exception is for `grpc::mutation_replay`'s protection against offline guessing. |
 | `rsa` | `openshell-server` | Development dependency for OIDC test keys. Cargo-deny cannot restrict a wrapper exception to development dependencies. |
 | `sha1` | `openshell-supervisor-network` | WebSocket accept-handshake hashing, a protocol requirement rather than cryptographic authentication. |
+| `sha1` | `openshell-credential-issuer` | OCI X.509 federation key id (`<tenancy>/fed-x509/<fingerprint>`): the certificate fingerprint OCI's SDKs compute to name the federating certificate, a protocol identifier rather than cryptographic authentication. |
 
 The other wrappers in `deny.toml` cover dependency-owned operations: SSH,
 TLS/X.509/JWT, AWS SigV4, OAuth PKCE, database protocols, archive handling,

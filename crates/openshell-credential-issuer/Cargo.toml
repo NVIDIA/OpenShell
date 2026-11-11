@@ -19,8 +19,11 @@ openshell-driver-vault = { path = "../openshell-driver-vault" }
 async-trait = "0.1"
 aws-config = { workspace = true }
 aws-sdk-sts = { workspace = true }
+base64 = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
+sha1 = "0.10"
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
@@ -38,6 +41,7 @@ tracing = { workspace = true }
 test-support = []
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tempfile = "3"
 wiremock = "0.6"
 

@@ -177,10 +177,14 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // ProviderCredentialRefreshStrategy gains the three OCI principal values.
+    // The enum is stored in refresh state, so the durable inventory moves with
+    // the public one; the overlap set is unchanged. Prior payloads carry only
+    // the earlier values and decode exactly as before.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3b4c2af6cf22e7ed1d84279ff865acb0db7199717bee9bc041caef791334104d";
+        "9e989d81c16d49f099ba1001b2e14dccd4bb613f719ba5aacd2a57434ec95a66";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "cc84f9e22c4c5fb03c2973f959e2df04c8fdc15d3c11962ec6d9bf61ca280385";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
