@@ -533,10 +533,9 @@ async fn inject_selected(
         let header = if let Some(placeholder) = placeholder {
             let name = token_grant_header_name(cred).map_err(refused)?;
             let value = SecretResolver::rewrite_grant_header_value(
-                name,
                 &placeholder.value,
                 &placeholder.handle,
-                access_token,
+                &access_token,
             )
             .ok()
             .flatten()
@@ -814,34 +813,13 @@ fn token_grant_header_name(
 }
 
 fn validate_header_name(header_name: &str) -> Result<(), TokenGrantFailure> {
-    let valid = !header_name.is_empty()
-        && header_name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        });
+    let name = http::HeaderName::from_bytes(header_name.as_bytes())
+        .map_err(|_| injection_configuration_failure())?;
     // A grant may not override HTTP framing or connection headers.
-    if !valid
-        || matches!(
-            header_name.to_ascii_lowercase().as_str(),
-            "host" | "content-length" | "transfer-encoding" | "connection"
-        )
-    {
+    if matches!(
+        name.as_str(),
+        "host" | "content-length" | "transfer-encoding" | "connection"
+    ) {
         return Err(injection_configuration_failure());
     }
     Ok(())
@@ -1450,10 +1428,18 @@ mod tests {
     }
 
     #[test]
-    fn token_grant_header_rejects_framing_and_connection_headers() {
-        for header_name in ["Host", "Content-Length", "Transfer-Encoding", "Connection"] {
+    fn token_grant_header_rejects_invalid_framing_and_connection_headers() {
+        for header_name in [
+            "Host",
+            "Content-Length",
+            "Transfer-Encoding",
+            "Connection",
+            "Bad Name",
+            "Bad:Name",
+            &"x".repeat(65536),
+        ] {
             let err = token_grant_header(&credential("header", header_name), "grant-token")
-                .expect_err("framing header override should be rejected");
+                .expect_err("invalid or reserved header name");
             assert_eq!(err, injection_configuration_failure());
         }
     }

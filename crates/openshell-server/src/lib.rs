@@ -404,7 +404,7 @@ pub struct ServerState {
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
     /// Operator registrations for outbound provider client assertions.
-    pub provider_assertions: Vec<config_file::ProviderAssertionRegistration>,
+    pub(crate) provider_assertions: Vec<config_file::ProviderAssertionRegistration>,
     /// Separate per-sandbox budget for provider assertions before catalog lookup.
     pub(crate) provider_assertion_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter,
     /// Signing authority and public verification metadata for outbound JWTs.

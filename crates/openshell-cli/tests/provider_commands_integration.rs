@@ -990,6 +990,22 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
+        if request
+            .get_ref()
+            .profiles
+            .iter()
+            .filter_map(|item| item.profile.as_ref())
+            .any(openshell_providers::profile_uses_gateway_assertion)
+            && request
+                .metadata()
+                .get(openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY)
+                .and_then(|value| value.to_str().ok())
+                != Some("1")
+        {
+            return Err(Status::failed_precondition(
+                "missing gateway assertion capability",
+            ));
+        }
         let mut profiles = self.state.profiles.lock().await;
         let imported = request
             .into_inner()
@@ -4528,7 +4544,7 @@ async fn provider_profile_gateway_assertion_negotiates_support_and_round_trips()
     )
     .await
     .unwrap();
-    assert!(exported.contains("grant_type: client_credentials"));
+    assert!(!exported.contains("grant_type"));
     assert!(exported.contains("assertion_source: openshell_gateway"));
     let profile = openshell_providers::parse_profile_yaml(&exported)
         .unwrap()

@@ -3,7 +3,6 @@
 
 //! Runtime provider credential snapshots.
 
-use crate::proto::ProviderProfileCredential;
 use crate::secrets::{CredentialPlacement, SecretResolver, grant_placeholder_for_env_key};
 use crate::{
     endpoint_path::EndpointPathPattern,
@@ -22,12 +21,15 @@ pub struct ProviderCredentialSnapshot {
     pub installation_id: String,
     pub revision: u64,
     pub child_env: HashMap<String, String>,
-    pub dynamic_credentials: HashMap<String, ProviderProfileCredential>,
+    pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
 }
 
 impl ProviderCredentialSnapshot {
     /// Return the exact workload handle installed for this admitted grant.
-    pub fn grant_placeholder(&self, credential: &ProviderProfileCredential) -> Option<&str> {
+    pub fn grant_placeholder(
+        &self,
+        credential: &crate::proto::ProviderProfileCredential,
+    ) -> Option<&str> {
         let (key, expected) = grant_placeholder(credential)?;
         self.child_env
             .get(key)
@@ -36,7 +38,9 @@ impl ProviderCredentialSnapshot {
     }
 }
 
-fn grant_placeholder(credential: &ProviderProfileCredential) -> Option<(&str, String)> {
+fn grant_placeholder(
+    credential: &crate::proto::ProviderProfileCredential,
+) -> Option<(&str, String)> {
     if !credential
         .auth_style
         .trim()
@@ -60,7 +64,7 @@ fn grant_placeholder(credential: &ProviderProfileCredential) -> Option<(&str, St
 /// resolver snapshots and never override another provider's environment.
 fn project_grant_placeholders(
     child_env: &mut HashMap<String, String>,
-    credentials: &HashMap<String, ProviderProfileCredential>,
+    credentials: &HashMap<String, crate::proto::ProviderProfileCredential>,
 ) {
     let mut by_key = HashMap::<&str, Option<String>>::new();
     for (key, handle) in credentials.values().filter_map(grant_placeholder) {
@@ -176,10 +180,10 @@ pub const STATIC_CREDENTIAL_METADATA_PREFIX: &str = "static-env:";
 const CREDENTIAL_PATH_SLOT: &str = "{credential}";
 
 fn split_static_credential_metadata(
-    credentials: HashMap<String, ProviderProfileCredential>,
+    credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
 ) -> (
-    HashMap<String, ProviderProfileCredential>,
-    HashMap<String, ProviderProfileCredential>,
+    HashMap<String, crate::proto::ProviderProfileCredential>,
+    HashMap<String, crate::proto::ProviderProfileCredential>,
 ) {
     let mut metadata = HashMap::new();
     let mut grants = HashMap::new();
@@ -198,7 +202,7 @@ impl ProviderCredentialState {
         revision: u64,
         env: HashMap<String, String>,
         credential_expires_at_ms: HashMap<String, i64>,
-        dynamic_credentials: HashMap<String, ProviderProfileCredential>,
+        dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     ) -> Self {
         let (_, dynamic_credentials) = split_static_credential_metadata(dynamic_credentials);
         let (mut child_env, generation_resolver, current_resolver) =
@@ -241,7 +245,7 @@ impl ProviderCredentialState {
         revision: u64,
         env: HashMap<String, String>,
         credential_expires_at_ms: HashMap<String, i64>,
-        dynamic_credentials: HashMap<String, ProviderProfileCredential>,
+        dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
         static_credential_bindings: HashMap<String, StaticCredentialBinding>,
         non_secret_environment_keys: Vec<String>,
     ) -> Result<Self, StaticCredentialBindingError> {
@@ -266,7 +270,7 @@ impl ProviderCredentialState {
         revision: u64,
         env: HashMap<String, String>,
         credential_expires_at_ms: HashMap<String, i64>,
-        dynamic_credentials: HashMap<String, ProviderProfileCredential>,
+        dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
         static_credential_bindings: HashMap<String, StaticCredentialBinding>,
         non_secret_environment_keys: Vec<String>,
         stable_placeholder_environment_keys: Vec<String>,
@@ -816,7 +820,7 @@ impl ProviderCredentialState {
         revision: u64,
         env: HashMap<String, String>,
         credential_expires_at_ms: HashMap<String, i64>,
-        dynamic_credentials: HashMap<String, ProviderProfileCredential>,
+        dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     ) -> usize {
         let (_, dynamic_credentials) = split_static_credential_metadata(dynamic_credentials);
         let (mut child_env, generation_resolver, current_resolver) =
@@ -869,7 +873,7 @@ impl ProviderCredentialState {
         revision: u64,
         env: HashMap<String, String>,
         credential_expires_at_ms: HashMap<String, i64>,
-        dynamic_credentials: HashMap<String, ProviderProfileCredential>,
+        dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
         static_credential_bindings: HashMap<String, StaticCredentialBinding>,
         non_secret_environment_keys: Vec<String>,
     ) -> Result<usize, StaticCredentialBindingError> {
@@ -895,7 +899,7 @@ impl ProviderCredentialState {
         revision: u64,
         env: HashMap<String, String>,
         credential_expires_at_ms: HashMap<String, i64>,
-        dynamic_credentials: HashMap<String, ProviderProfileCredential>,
+        dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
         static_credential_bindings: HashMap<String, StaticCredentialBinding>,
         non_secret_environment_keys: Vec<String>,
         stable_placeholder_environment_keys: Vec<String>,
@@ -1061,7 +1065,7 @@ impl ProviderCredentialState {
     fn revoke_static_provider_environment_inner(
         &self,
         revision: u64,
-        dynamic_credentials: Option<HashMap<String, ProviderProfileCredential>>,
+        dynamic_credentials: Option<HashMap<String, crate::proto::ProviderProfileCredential>>,
     ) {
         let mut inner = self
             .inner
@@ -1090,7 +1094,7 @@ fn compile_static_credential_bindings(
     bindings: HashMap<String, StaticCredentialBinding>,
     non_secret_environment_keys: &[String],
     stable_placeholder_environment_keys: &[String],
-    placement_metadata: &HashMap<String, ProviderProfileCredential>,
+    placement_metadata: &HashMap<String, crate::proto::ProviderProfileCredential>,
 ) -> Result<HashMap<String, CompiledStaticCredentialBinding>, StaticCredentialBindingError> {
     for (key, metadata) in placement_metadata {
         if !env.contains_key(key)
@@ -1225,7 +1229,7 @@ fn compile_static_credential_bindings(
 }
 
 fn compile_credential_placement(
-    metadata: &ProviderProfileCredential,
+    metadata: &crate::proto::ProviderProfileCredential,
 ) -> Result<CredentialPlacement, StaticCredentialBindingError> {
     let style = metadata.auth_style.trim().to_ascii_lowercase();
     // Authored profiles may retain fields for other auth styles. Only the
@@ -1390,7 +1394,7 @@ mod tests {
 
     #[test]
     fn grant_placeholder_projects_only_current_unambiguous_handle_without_a_secret() {
-        let credential = ProviderProfileCredential {
+        let credential = crate::proto::ProviderProfileCredential {
             auth_style: "placeholder".into(),
             env_vars: vec!["API_TOKEN".into()],
             token_grant_provider_id: "provider-id".into(),
@@ -1632,10 +1636,10 @@ mod tests {
         binding
     }
 
-    fn placement_metadata(style: &str) -> HashMap<String, ProviderProfileCredential> {
+    fn placement_metadata(style: &str) -> HashMap<String, crate::proto::ProviderProfileCredential> {
         HashMap::from([(
             format!("{STATIC_CREDENTIAL_METADATA_PREFIX}API_KEY"),
-            ProviderProfileCredential {
+            crate::proto::ProviderProfileCredential {
                 name: "api_key".into(),
                 env_vars: vec!["API_KEY".into()],
                 auth_style: style.into(),
@@ -1872,7 +1876,7 @@ mod tests {
             }
             metadata.insert(
                 "real-grant".into(),
-                ProviderProfileCredential {
+                crate::proto::ProviderProfileCredential {
                     token_grant: Some(crate::proto::ProviderCredentialTokenGrant::default()),
                     ..Default::default()
                 },
@@ -2686,8 +2690,10 @@ mod tests {
         )
         .expect("initial bindings");
 
-        let dynamic_credentials =
-            HashMap::from([("dynamic".to_string(), ProviderProfileCredential::default())]);
+        let dynamic_credentials = HashMap::from([(
+            "dynamic".to_string(),
+            crate::proto::ProviderProfileCredential::default(),
+        )]);
         let result = state.install_bound_environment(
             2,
             HashMap::from([("API_KEY".to_string(), "new".to_string())]),

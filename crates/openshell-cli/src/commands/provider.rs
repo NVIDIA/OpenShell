@@ -814,11 +814,11 @@ pub async fn fetch_provider_profile_catalog(
     let mut profiles = Vec::new();
     loop {
         let response = client
-            .list_provider_profiles(assertion_profile_request(ListProviderProfilesRequest {
+            .list_provider_profiles(ListProviderProfilesRequest {
                 page_size: 100,
                 page_token,
                 workspace_scope: provider_profile_workspace_scope(workspace),
-            }))
+            })
             .await
             .into_diagnostic()?
             .into_inner();
@@ -866,10 +866,10 @@ async fn fetch_provider_profile_exact(
     workspace: &str,
 ) -> std::result::Result<ProviderProfile, Status> {
     client
-        .get_provider_profile(assertion_profile_request(GetProviderProfileRequest {
+        .get_provider_profile(GetProviderProfileRequest {
             id: provider_type.to_string(),
             workspace_scope: provider_profile_workspace_scope(workspace),
-        }))
+        })
         .await
         .and_then(|response| {
             let profile = response.into_inner().profile.ok_or_else(|| {
@@ -1761,11 +1761,11 @@ pub async fn provider_profile_import(
     if !items.is_empty() {
         check_profile_write_capabilities(&mut client, &items, workspace).await?;
         let response = client
-            .import_provider_profiles(assertion_profile_request(ImportProviderProfilesRequest {
+            .import_provider_profiles(ImportProviderProfilesRequest {
                 request_id: String::new(),
                 profiles: items,
                 workspace_scope: provider_profile_workspace_scope(workspace),
-            }))
+            })
             .await
             .into_diagnostic()?
             .into_inner();
@@ -1813,13 +1813,13 @@ pub async fn provider_profile_update(
             .as_ref()
             .map_or(0, |profile| profile.resource_version);
         let response = client
-            .update_provider_profiles(assertion_profile_request(UpdateProviderProfilesRequest {
+            .update_provider_profiles(UpdateProviderProfilesRequest {
                 request_id: String::new(),
                 profile: Some(item),
                 expected_resource_version,
                 id: id.to_string(),
                 workspace_scope: provider_profile_workspace_scope(workspace),
-            }))
+            })
             .await
             .into_diagnostic()?
             .into_inner();
@@ -2175,15 +2175,6 @@ fn profiles_require_gateway_assertion(items: &[ProviderProfileImportItem]) -> bo
         .iter()
         .filter_map(|item| item.profile.as_ref())
         .any(openshell_providers::profile_uses_gateway_assertion)
-}
-
-fn assertion_profile_request<T>(body: T) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(body);
-    request.metadata_mut().insert(
-        openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
-        tonic::metadata::MetadataValue::from_static("1"),
-    );
-    request
 }
 
 // Older gateways can accept a profile write without preserving the opt-in.

@@ -4529,7 +4529,6 @@ pub(super) async fn handle_mint_provider_client_assertion(
     state: &ServerState,
     request: Request<openshell_core::proto::MintProviderClientAssertionRequest>,
 ) -> Result<Response<openshell_core::proto::MintProviderClientAssertionResponse>, Status> {
-    use crate::auth::principal::SandboxIdentitySource;
     let req = request.get_ref();
     let denied = || token_grant_configuration_status(tonic::Code::PermissionDenied);
     let Some(Principal::Sandbox(principal)) = request.extensions().get::<Principal>() else {
@@ -4537,13 +4536,7 @@ pub(super) async fn handle_mint_provider_client_assertion(
     };
     if req.expected_provider_id.is_empty()
         || principal.sandbox_id != req.sandbox_id
-        || !matches!(
-            principal.source,
-            SandboxIdentitySource::BootstrapJwt {
-                auth_epoch: Some(_),
-                ..
-            }
-        )
+        || principal.auth_epoch().is_none()
     {
         return Err(denied());
     }

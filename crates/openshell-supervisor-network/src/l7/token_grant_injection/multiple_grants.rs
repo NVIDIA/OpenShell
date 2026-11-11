@@ -110,53 +110,31 @@ async fn placeholder_grant_requires_the_current_handle_and_an_admitted_https_rou
             .unwrap();
     let config = crate::l7::parse_l7_config(&endpoint).unwrap();
     let eligible = format!("Authorization: Bearer {handle}\r\n");
+    let inject = async |req,
+                        context: &L7EvalContext,
+                        admitted: &HashSet<String>,
+                        route: &L7EndpointConfig| {
+        inject_for_admitted_owners(req, context, &snapshot, admitted, route, REQUEST_ID, None).await
+    };
     let mut unguarded = config.clone();
     unguarded.provider_credentialed = false;
-    assert!(
-        inject_for_admitted_owners(
-            request(&eligible),
-            &ctx,
-            &snapshot,
-            &owners,
-            &unguarded,
-            REQUEST_ID,
-            None,
-        )
-        .await
-        .is_err()
-    );
+    let mut plaintext = ctx.clone();
+    plaintext.request_default_port = Some(80);
+    for (context, admitted, route) in [
+        (&ctx, &owners, &unguarded),
+        (&ctx, &HashSet::new(), &config),
+        (&plaintext, &owners, &config),
+    ] {
+        assert!(
+            inject(request(&eligible), context, admitted, route)
+                .await
+                .is_err()
+        );
+    }
     assert!(
         inject_if_needed(request(&eligible), &ctx, REQUEST_ID)
             .await
             .is_err()
-    );
-    assert!(
-        inject_for_admitted_owners(
-            request(&eligible),
-            &ctx,
-            &snapshot,
-            &HashSet::new(),
-            &config,
-            REQUEST_ID,
-            None,
-        )
-        .await
-        .is_err()
-    );
-    let mut plaintext = ctx.clone();
-    plaintext.request_default_port = Some(80);
-    assert!(
-        inject_for_admitted_owners(
-            request(&eligible),
-            &plaintext,
-            &snapshot,
-            &owners,
-            &config,
-            REQUEST_ID,
-            None,
-        )
-        .await
-        .is_err()
     );
     for headers in [
         format!("X-Unrelated: {handle}\r\n"),
@@ -168,17 +146,9 @@ async fn placeholder_grant_requires_the_current_handle_and_an_admitted_https_rou
         ),
     ] {
         assert!(
-            inject_for_admitted_owners(
-                request(&headers),
-                &ctx,
-                &snapshot,
-                &owners,
-                &config,
-                REQUEST_ID,
-                None,
-            )
-            .await
-            .is_err()
+            inject(request(&headers), &ctx, &owners, &config)
+                .await
+                .is_err()
         );
     }
     let mut misplaced_query = request(&eligible);
@@ -187,45 +157,18 @@ async fn placeholder_grant_requires_the_current_handle_and_an_admitted_https_rou
     )
     .into_bytes();
     assert!(
-        inject_for_admitted_owners(
-            misplaced_query,
-            &ctx,
-            &snapshot,
-            &owners,
-            &config,
-            REQUEST_ID,
-            None,
-        )
-        .await
-        .is_err()
+        inject(misplaced_query, &ctx, &owners, &config)
+            .await
+            .is_err()
     );
-
     let challenge = request("").raw_header;
-    let forwarded = inject_for_admitted_owners(
-        request(""),
-        &ctx,
-        &snapshot,
-        &owners,
-        &config,
-        REQUEST_ID,
-        None,
-    )
-    .await
-    .unwrap();
+    let forwarded = inject(request(""), &ctx, &owners, &config).await.unwrap();
     assert_eq!(forwarded.raw_header, challenge);
     fixture.assert_no_requests();
 
-    let admitted = inject_for_admitted_owners(
-        request(&eligible),
-        &ctx,
-        &snapshot,
-        &owners,
-        &config,
-        REQUEST_ID,
-        None,
-    )
-    .await
-    .unwrap();
+    let admitted = inject(request(&eligible), &ctx, &owners, &config)
+        .await
+        .unwrap();
     let headers = String::from_utf8(admitted.raw_header).unwrap();
     assert!(headers.contains("Authorization: Bearer service-token\r\n"));
     assert!(!headers.contains(handle));

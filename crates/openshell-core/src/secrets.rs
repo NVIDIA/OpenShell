@@ -126,10 +126,8 @@ pub fn valid_grant_placeholder_header(name: &str) -> bool {
 }
 
 fn basic_auth_token(value: &str) -> Option<&str> {
-    value
-        .strip_prefix("Basic ")
-        .or_else(|| value.strip_prefix("basic "))
-        .map(str::trim)
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("Basic").then(|| token.trim())
 }
 
 fn decode_basic_auth_value(value: &str) -> Option<String> {
@@ -754,27 +752,15 @@ impl SecretResolver {
 
     /// Bind exactly one installed handle for a single HTTP header rewrite.
     pub fn rewrite_grant_header_value(
-        name: &str,
         value: &str,
         handle: &str,
-        access_token: String,
+        access_token: &str,
     ) -> Result<Option<String>, UnresolvedPlaceholderError> {
-        let key = placeholder_env_key(handle).ok_or_else(|| unresolved("header"))?;
-        let resolver = Self {
-            placements: HashMap::from([(
-                key.to_string(),
-                CredentialPlacement::Header(name.to_string()),
-            )]),
-            by_placeholder: HashMap::from([(
-                handle.to_string(),
-                SecretValue {
-                    value: Arc::from(access_token),
-                    expires_at_ms: 0,
-                },
-            )]),
-            ..Self::default()
-        };
-        resolver.rewrite_header_value_for_name(name, value)
+        placeholder_env_key(handle).ok_or_else(|| unresolved("header"))?;
+        let token = validate_resolved_secret(access_token).map_err(|_| unresolved("header"))?;
+        Self::default().rewrite_header_value_with(value, &mut |candidate| {
+            (candidate == handle).then_some(token)
+        })
     }
 
     fn rewrite_header_value_with<'a>(
@@ -1805,7 +1791,7 @@ mod tests {
             (current.clone(), "issued".to_string()),
             (format!("Bearer {current}"), "Bearer issued".to_string()),
             (
-                basic(&format!("client-name:{current}")),
+                basic(&format!("client-name:{current}")).replacen("Basic", "bAsIc", 1),
                 basic("client-name:issued"),
             ),
         ] {
@@ -1813,27 +1799,14 @@ mod tests {
                 &value, &current
             ));
             assert_eq!(
-                SecretResolver::rewrite_grant_header_value(
-                    "Authorization",
-                    &value,
-                    &current,
-                    "issued".to_string()
-                )
-                .unwrap()
-                .as_deref(),
+                SecretResolver::rewrite_grant_header_value(&value, &current, "issued")
+                    .unwrap()
+                    .as_deref(),
                 Some(expected.as_str()),
             );
         }
-        assert_eq!(
-            SecretResolver::rewrite_grant_header_value(
-                "X-Service-Key",
-                &current,
-                &current,
-                "issued".to_string(),
-            )
-            .unwrap()
-            .as_deref(),
-            Some("issued"),
+        assert!(
+            SecretResolver::rewrite_grant_header_value(&current, &current, "bad\rvalue").is_err()
         );
         for value in [
             stale.clone(),
@@ -1863,7 +1836,7 @@ mod tests {
         let encoded =
             base64::engine::general_purpose::STANDARD.encode(format!("client-name:{handle}"));
         let request = format!(
-            "GET /resource HTTP/1.1\r\nHost: api.example\r\nAuthorization: Basic {encoded}\r\n\r\n"
+            "GET /resource HTTP/1.1\r\nHost: api.example\r\nAuthorization: bAsIc {encoded}\r\n\r\n"
         );
         assert!(rewrite_http_header_block(request.as_bytes(), None).is_err());
     }
