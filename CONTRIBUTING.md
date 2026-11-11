@@ -141,7 +141,7 @@ A PR represents accepted work when either:
 - Its author is a maintainer or has repository write access as described above.
 - It closes at least one issue in this repository that has `state:accepted`, and the PR author is that issue's submitter or a current assignee.
 
-Use GitHub closing references such as `Closes #123` or `Fixes #123`. Merely mentioning an accepted issue does not qualify. Acceptance and the author relationship must hold on the same issue. The PR author determines eligibility, not the person triggering a workflow. Other tools and contributor skills use this shared definition; the importable `tasks/scripts/accepted_work.py` library implements the shared issue and PR checks.
+Use GitHub closing references such as `Closes #123` or `Fixes #123`. Merely mentioning an accepted issue does not qualify. Acceptance and the author relationship must hold on the same issue. The PR author determines eligibility, not the person triggering a workflow. Other tools and contributor skills use this shared definition; the importable `tasks/scripts/label_accepted_work.py` library implements the shared issue and PR checks.
 
 Acceptance classifies work, not implementation quality or approval to merge. Existing issue-linking rules, the separate `PR Issue Acceptance` check (which requires every linked issue to be accepted for community authors), and maintainer/code-owner approvals still apply. Acceptance does not certify that the diff implements the issue, and the existing Dependabot gate exemption does not automatically qualify a PR as accepted work.
 
