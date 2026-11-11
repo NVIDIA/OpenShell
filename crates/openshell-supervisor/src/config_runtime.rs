@@ -210,12 +210,27 @@ impl ConfigRuntime {
     }
 
     fn validate_live_filesystem_policy(
-        &self,
+        installed: Option<&openshell_core::proto::SandboxPolicy>,
         candidate: Option<&openshell_core::proto::SandboxPolicy>,
     ) -> Result<()> {
-        let (Some(applied), Some(candidate)) = (&self.endpoint_policy, candidate) else {
+        let (Some(applied), Some(candidate)) = (installed, candidate) else {
             return Ok(());
         };
+        let mut candidate = candidate.clone();
+        if !applied.network_policies.is_empty() {
+            let (ro, rw) = crate::proxy_baseline_paths();
+            // Global policies retain their raw gateway form. Restore only the
+            // proxy prerequisites that startup actually installed.
+            crate::enrich_proto_baseline_paths_with(&mut candidate, &ro, &rw, |path| {
+                applied.filesystem.as_ref().is_some_and(|filesystem| {
+                    filesystem
+                        .read_only
+                        .iter()
+                        .chain(&filesystem.read_write)
+                        .any(|installed| installed == path)
+                })
+            });
+        }
         let same_paths = |left: &[String], right: &[String]| {
             left.iter().collect::<std::collections::HashSet<_>>() == right.iter().collect()
         };
@@ -458,8 +473,10 @@ impl ConfigRuntime {
         let mut runtime_error = String::new();
         if policy_runtime_changed {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
-            let runtime_result = match self.validate_live_filesystem_policy(result.policy.as_ref())
-            {
+            let runtime_result = match Self::validate_live_filesystem_policy(
+                ctx.endpoint_policy.as_ref(),
+                result.policy.as_ref(),
+            ) {
                 Ok(()) => {
                     reload_gateway_configuration_runtime(
                         &ctx.opa_engine,
@@ -3492,6 +3509,87 @@ mod tests {
                     original_generation + u64::from(fail_closed)
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn global_policy_retry_uses_installed_filesystem_after_missing_initial_acknowledgement() {
+        use openshell_core::proto::{ConfigApplyOutcome, FilesystemPolicy, PolicySource};
+
+        for acknowledged in [false, true] {
+            let mut policy = proto_tcp_policy_fixture();
+            policy.filesystem = Some(FilesystemPolicy {
+                include_workdir: true,
+                read_only: vec!["/usr".into(), "/tmp".into()],
+                ..Default::default()
+            });
+            let initial = settings_poll_result(Some(policy.clone()), 1, PolicySource::Global);
+            let mut installed = policy.clone();
+            let (ro, rw) = proxy_baseline_paths();
+            assert!(enrich_proto_baseline_paths_with(
+                &mut installed,
+                &ro,
+                &rw,
+                |path| matches!(path, "/proc" | "/dev/null"),
+            ));
+            let engine = Arc::new(OpaEngine::from_proto(&installed).unwrap());
+            let mut ctx = policy_poll_test_context(
+                engine.clone(),
+                LoadedPolicyOrigin::Gateway {
+                    revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                    has_last_valid_policy: true,
+                },
+                default_middleware_connector(),
+            );
+            ctx.endpoint_policy = Some(installed.clone());
+            let (client, _polls, _reports) = scripted_policy_gateway();
+            // A failed first fetch leaves the runtime unacknowledged; a normal
+            // acknowledgement instead replaces its endpoint policy with the raw one.
+            let mut runtime = if acknowledged {
+                let mut runtime = started_runtime(&ctx, &initial);
+                runtime.endpoint_policy.clone_from(&initial.policy);
+                runtime
+            } else {
+                ConfigRuntime::new(&ctx)
+            };
+
+            let result = apply_with_provider(&mut runtime, &ctx, &client, &initial).await;
+            assert!(matches!(
+                result.outcome,
+                ConfigApplyOutcome::Applied | ConfigApplyOutcome::IgnoredDuplicate
+            ));
+            assert!(engine.fail_closed_reason().is_none());
+
+            let mut network_only = policy;
+            network_only
+                .network_policies
+                .values_mut()
+                .next()
+                .unwrap()
+                .endpoints[0]
+                .port = 6380;
+            let network_only = settings_poll_result(Some(network_only), 2, PolicySource::Global);
+            let result = apply_with_provider(&mut runtime, &ctx, &client, &network_only).await;
+            assert_eq!(result.outcome, ConfigApplyOutcome::Applied);
+            assert_eq!(runtime.endpoint_policy, network_only.policy);
+            assert_eq!(ctx.endpoint_policy, Some(installed));
+            assert!(engine.fail_closed_reason().is_none());
+
+            let mut changed = network_only.policy.clone().unwrap();
+            changed
+                .filesystem
+                .as_mut()
+                .unwrap()
+                .read_only
+                .push("/app".into());
+            let changed = settings_poll_result(Some(changed), 3, PolicySource::Global);
+            let result = apply_with_provider(&mut runtime, &ctx, &client, &changed).await;
+            assert_eq!(result.outcome, ConfigApplyOutcome::FailedClosed);
+            assert_eq!(
+                runtime.applied_revision,
+                Some(sandbox_config_revision(&network_only))
+            );
+            assert!(engine.fail_closed_reason().is_some());
         }
     }
 
