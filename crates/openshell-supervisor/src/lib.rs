@@ -4230,6 +4230,9 @@ fn enqueue_policy_status(sender: &UnboundedSender<PolicyStatusUpdate>, update: P
     }
 }
 
+const ATTACH_REFUSAL_MESSAGE: &str =
+    "The isolation backend refused the admitted configuration before workload execution";
+
 /// The report that the backend refused, at Attach, the configuration this start
 /// accepted. Only a refusal qualifies: `Unavailable` can succeed on the next start.
 fn attach_refusal_report(
@@ -4259,7 +4262,7 @@ fn attach_refusal_report(
             policy_hash: revision.policy_hash.clone(),
             config_revision: revision.config_revision,
             provider_env_revision: revision.provider_env_revision,
-            error: error.to_string(),
+            error: ATTACH_REFUSAL_MESSAGE.to_string(),
         }),
         expected_instance_id: String::new(),
         refused_before_start: true,
@@ -4268,7 +4271,7 @@ fn attach_refusal_report(
 
 /// Report an Attach refusal before the supervisor exits. The gateway records
 /// the accepted configuration as refused, and a revision this start wrote ends
-/// Failed with the backend's message. Both reports are best effort, and the
+/// Failed with a safe refusal message. Both reports are best effort, and the
 /// refusal report gets a single bounded attempt so exit is not held up.
 async fn report_attach_refusal(
     gateway: &openshell_core::grpc_client::GatewayEndpoint,
@@ -4286,7 +4289,8 @@ async fn report_attach_refusal(
         warn!(error = %report_error, "Failed to report the isolation backend refusal");
     }
     if let Some(revision) = refused_startup_revision(origin, error) {
-        report_initial_policy_failure(gateway, sandbox_id, Some(revision), error).await;
+        let safe_error = miette::miette!(ATTACH_REFUSAL_MESSAGE);
+        report_initial_policy_failure(gateway, sandbox_id, Some(revision), &safe_error).await;
     }
 }
 
@@ -6740,12 +6744,14 @@ network_policies:
             has_last_valid_policy: true,
             written_at_startup: false,
         };
-        let refusal = miette::miette!(code = backend_setup::ATTACH_REFUSED, "refused");
+        let refusal = miette::miette!(code = backend_setup::ATTACH_REFUSED, "PRIVATE-SENTINEL");
 
         let request = attach_refusal_report("sandbox-id", &origin(&revision), &refusal)
             .expect("a refusal of the accepted generation is reported");
         assert!(request.refused_before_start);
         let admission = request.admission.unwrap();
+        assert_eq!(admission.error, ATTACH_REFUSAL_MESSAGE);
+        assert_eq!(refusal.to_string(), "PRIVATE-SENTINEL");
         assert_eq!(
             admission.state,
             i32::from(ConfigurationAdmissionState::Rejected)

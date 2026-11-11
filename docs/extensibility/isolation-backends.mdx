@@ -36,8 +36,9 @@ runs before StartAgent.
 
 A backend refuses a policy it cannot enforce by returning `Denied` from Attach.
 The sandbox then reports `ConfigurationReady: False (ConfigurationInvalid)`.
-Transport and backend availability failures remain infrastructure failures. The
-backend's reason is in the supervisor log. Delete the sandbox and create it
+Transport and backend availability failures remain infrastructure failures.
+Configuration status and policy history omit backend details; the backend's
+reason is in the supervisor log. Delete the sandbox and create it
 again with a policy the backend accepts.
 
 External compute drivers advertise `openshell.compute.isolation-backend` to

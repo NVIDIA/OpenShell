@@ -27,6 +27,7 @@ struct LegacyReadyProbe {
     premature_ready: Arc<AtomicBool>,
     discovered: Arc<AtomicBool>,
     policy_sync: Arc<std::sync::Mutex<Option<PolicySyncCase>>>,
+    policy_reports: Arc<std::sync::Mutex<Vec<ReportPolicyStatusRequest>>>,
 }
 
 #[derive(Clone)]
@@ -80,6 +81,22 @@ impl tonic::server::StreamingService<SupervisorMessage> for LegacyConnect {
 }
 
 struct FixedUnary<R>(R);
+
+struct PolicyStatusRecorder(LegacyReadyProbe);
+
+impl tonic::server::UnaryService<ReportPolicyStatusRequest> for PolicyStatusRecorder {
+    type Response = ReportPolicyStatusResponse;
+    type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+
+    fn call(&mut self, request: tonic::Request<ReportPolicyStatusRequest>) -> Self::Future {
+        self.0
+            .policy_reports
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        Box::pin(async { Ok(tonic::Response::new(ReportPolicyStatusResponse {})) })
+    }
+}
 
 impl<Q, R> tonic::server::UnaryService<Q> for FixedUnary<R>
 where
@@ -178,10 +195,11 @@ where
                     .await
                 }
                 "/openshell.v1.OpenShell/ReportPolicyStatus" => {
-                    legacy_unary::<B, ReportPolicyStatusRequest, _>(
-                        request,
-                        ReportPolicyStatusResponse::default(),
-                    )
+                    tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+                        ReportPolicyStatusResponse,
+                        ReportPolicyStatusRequest,
+                    >::default())
+                    .unary(PolicyStatusRecorder(probe), request)
                     .await
                 }
                 "/openshell.v1.OpenShell/UpdateConfig" => {
@@ -205,6 +223,61 @@ where
             Ok(response)
         })
     }
+}
+
+#[tokio::test]
+async fn attach_refusal_policy_history_omits_private_backend_diagnostics() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let probe = LegacyReadyProbe::default();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(LegacyGateway {
+                probe: probe.clone(),
+            })
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let gateway = openshell_core::grpc_client::GatewayEndpoint::new(
+        endpoint,
+        openshell_core::grpc_client::GatewayCredentials::from_gateway_token("test-token").unwrap(),
+    );
+    let origin = LoadedPolicyOrigin::Gateway {
+        revision: Some(LoadedPolicyRevision {
+            version: 3,
+            policy_hash: "admitted-policy".into(),
+            config_revision: 7,
+            policy_source: openshell_core::proto::PolicySource::Sandbox,
+            admission_instance_id: Some("instance-1".into()),
+            provider_env_revision: 1,
+        }),
+        has_last_valid_policy: true,
+        written_at_startup: true,
+    };
+    let refusal = miette::miette!(code = backend_setup::ATTACH_REFUSED, "PRIVATE-SENTINEL");
+
+    timeout(
+        Duration::from_secs(5),
+        report_attach_refusal(&gateway, "sandbox-id", &origin, &refusal),
+    )
+    .await
+    .expect("report the startup-owned policy failure");
+
+    {
+        let reports = probe.policy_reports.lock().unwrap();
+        let [report] = reports.as_slice() else {
+            panic!("expected one policy failure report, got {reports:?}");
+        };
+        assert_eq!(report.sandbox_id, "sandbox-id");
+        assert_eq!(report.version, 3);
+        assert_eq!(
+            report.status,
+            i32::from(openshell_core::proto::PolicyStatus::Failed)
+        );
+        assert_eq!(report.load_error, ATTACH_REFUSAL_MESSAGE);
+    }
+    assert_eq!(refusal.to_string(), "PRIVATE-SENTINEL");
+    server.abort();
+    let _ = server.await;
 }
 
 struct HeldBackendSetup {
