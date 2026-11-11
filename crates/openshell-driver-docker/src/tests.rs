@@ -192,7 +192,7 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
     fs::remove_dir_all(directory).unwrap();
 }
 
-fn test_sandbox() -> DriverSandbox {
+pub fn test_sandbox() -> DriverSandbox {
     // Mirrors the gateway-supplied request: the public `Sandbox` API no
     // longer carries `namespace`, so the gateway elides the field and the
     // driver must source it from its own runtime config.
@@ -314,7 +314,7 @@ fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
     }
 }
 
-fn runtime_config() -> DockerDriverRuntimeConfig {
+pub fn runtime_config() -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
         // Existing lifecycle fixtures exercise the explicitly opted-out contract.
         allow_driver_config: true,
@@ -346,6 +346,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         },
         sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
         enable_bind_mounts: false,
+        workspace_storage: workspace::Storage::WritableLayer,
         upstream_proxy: UpstreamProxyConfig::default(),
         proxy_ca_bundle: None,
         provider_spiffe_workload_api_socket: None,
@@ -516,7 +517,7 @@ fn sandbox_driver_config_cannot_override_proxy_ca_bundle() {
     assert!(error.message().contains("proxy_ca_bundle"), "{error}");
 }
 
-fn test_workload_identity() -> ResolvedWorkloadIdentity {
+pub fn test_workload_identity() -> ResolvedWorkloadIdentity {
     ResolvedWorkloadIdentity::new(
         1234,
         1235,
@@ -550,7 +551,7 @@ fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::
     }
 }
 
-fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDriver {
+pub fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDriver {
     let wsl_all_gpu_fallback_enabled = config.gpu.wsl_all_gpu_fallback_enabled;
     DockerComputeDriver {
         docker: Arc::new(
@@ -2605,6 +2606,56 @@ fn managed_container_label_filters_include_gateway_namespace() {
         "{LABEL_ISOLATION_ROLE}={LABEL_ISOLATION_ROLE_SANDBOX}"
     )));
     assert!(labels.contains(&format!("{LABEL_SANDBOX_ID}=sbx-123")));
+}
+
+#[test]
+fn persistent_workspace_config_defaults_off_and_round_trips() {
+    let default: DockerComputeConfig = toml::from_str("").unwrap();
+    assert!(!default.persist_workspace);
+    let enabled: DockerComputeConfig = toml::from_str("persist_workspace = true").unwrap();
+    assert!(enabled.persist_workspace);
+    let saved = toml::to_string(&enabled).unwrap();
+    assert!(
+        toml::from_str::<DockerComputeConfig>(&saved)
+            .unwrap()
+            .persist_workspace
+    );
+}
+
+#[test]
+fn persistent_workspace_create_mounts_only_the_owned_default_workspace() {
+    let sandbox = test_sandbox();
+    let mut config = runtime_config();
+    let old = build_container_create_body(&sandbox, &config).unwrap();
+    assert!(
+        old.host_config
+            .unwrap()
+            .mounts
+            .unwrap()
+            .iter()
+            .all(|mount| mount.target.as_deref() != Some("/sandbox"))
+    );
+    config.workspace_storage = workspace::Storage::Persistent;
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let mounts = body.host_config.unwrap().mounts.unwrap();
+    let mounts = mounts
+        .iter()
+        .filter(|mount| mount.target.as_deref() == Some("/sandbox"))
+        .collect::<Vec<_>>();
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].typ, Some(MountTypeEnum::VOLUME));
+    assert_eq!(mounts[0].read_only, Some(false));
+    assert_eq!(
+        mounts[0].volume_options.as_ref().unwrap().no_copy,
+        Some(true)
+    );
+    assert!(
+        mounts[0]
+            .source
+            .as_ref()
+            .unwrap()
+            .starts_with("openshell-workspace-")
+    );
 }
 
 #[test]

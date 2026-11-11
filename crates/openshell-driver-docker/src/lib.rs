@@ -7,6 +7,7 @@
 
 mod isolation;
 pub mod otel_tracing;
+mod workspace;
 
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -258,6 +259,10 @@ pub struct DockerComputeConfig {
     #[serde(default)]
     pub enable_bind_mounts: bool,
 
+    /// Give newly created default /sandbox workspaces dedicated persistent storage.
+    /// Existing writable-layer workspaces are not migrated by this setting.
+    pub persist_workspace: bool,
+
     /// Corporate forward-proxy settings supplied to the supervisor.
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
@@ -328,6 +333,7 @@ impl Default for DockerComputeConfig {
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
+            persist_workspace: false,
             upstream_proxy: UpstreamProxyConfig::default(),
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_socket: None,
@@ -364,6 +370,7 @@ struct DockerDriverRuntimeConfig {
     gpu: DockerGpuRuntimeCapabilities,
     sandbox_pids_limit: Option<std::num::NonZeroI64>,
     enable_bind_mounts: bool,
+    workspace_storage: workspace::Storage,
     upstream_proxy: UpstreamProxyConfig,
     proxy_ca_bundle: Option<PathBuf>,
     provider_spiffe_workload_api_socket: Option<PathBuf>,
@@ -1025,6 +1032,11 @@ impl DockerComputeDriver {
                 gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
+                workspace_storage: if docker_config.persist_workspace {
+                    workspace::Storage::Persistent
+                } else {
+                    workspace::Storage::WritableLayer
+                },
                 allow_driver_config: docker_config.allow_driver_config,
                 resource_admission: docker_config.resource_admission.clone(),
                 upstream_proxy: docker_config.upstream_proxy.clone(),
@@ -1269,6 +1281,9 @@ impl DockerComputeDriver {
         &self,
         container: &bollard::models::ContainerInspectResponse,
     ) -> Result<(), Status> {
+        // Driver-owned state remains checked even when caller resource
+        // admission is explicitly disabled by an operator.
+        workspace::admit(&self.docker, container, &self.config).await?;
         if self.config.allow_driver_config && !self.config.resource_admission.enabled {
             return Ok(());
         }
@@ -1328,6 +1343,12 @@ impl DockerComputeDriver {
                                 "sandbox-private volume ownership changed",
                             ));
                         }
+                    } else if mount.destination.as_deref()
+                        == Some(driver_mounts::DEFAULT_WORKSPACE_ROOT)
+                        && labels.contains_key(workspace::IDENTITY_LABEL)
+                    {
+                        // Independently checked above, including exact volume
+                        // identity and the admitted workload UID/GID.
                     } else if !expected.contains_key(name)
                         && mount
                             .destination
@@ -1760,6 +1781,34 @@ impl DockerComputeDriver {
                     DockerProvisioningFailure::new("ResourceAdmissionDenied", error.to_string())
                 })?,
             );
+        match workspace::prepare(
+            &self.docker,
+            sandbox,
+            &self.config,
+            &image,
+            &workload_identity,
+        )
+        .await
+        {
+            Ok(Some(volume)) => {
+                create_body
+                    .labels
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        workspace::IDENTITY_LABEL.into(),
+                        docker_volume_identity(&volume).to_string(),
+                    );
+            }
+            Ok(None) => {}
+            Err(status) => {
+                cleanup_runtime_volumes().await;
+                cleanup_docker_boundary_state(sandbox, &self.config);
+                return Err(DockerProvisioningFailure::from_status(
+                    "WorkspaceStorageFailed",
+                    status,
+                ));
+            }
+        }
         let create_result = async {
             openshell_otel::record_error_result(
                 self.docker
@@ -2167,6 +2216,12 @@ impl DockerComputeDriver {
             .await
             .map_err(|error| internal_status("list Docker startup volumes", error))?;
         for volume in volumes.volumes.unwrap_or_default() {
+            // Workspace storage is retained independently of disposable runtime
+            // resources, including a future interrupted replacement gap.
+            if volume.labels.get(workspace::ROLE_LABEL).map(String::as_str) == Some(workspace::ROLE)
+            {
+                continue;
+            }
             let sandbox_id = volume.labels.get(LABEL_SANDBOX_ID);
             if sandbox_id.is_some_and(|id| sandbox_ids.contains(id)) {
                 continue;
@@ -2293,7 +2348,7 @@ impl DockerComputeDriver {
                 {
                     Ok(()) => {
                         self.clear_runtime_failure(&record.sandbox.id).await;
-                        remove_docker_channel_volume_by_id(
+                        remove_docker_owned_storage_by_id(
                             &self.docker,
                             &record.sandbox.id,
                             &self.config,
@@ -2304,12 +2359,12 @@ impl DockerComputeDriver {
                     }
                     Err(err) if is_not_found_error(&err) => {
                         self.clear_runtime_failure(&record.sandbox.id).await;
-                        let _ = remove_docker_channel_volume_by_id(
+                        remove_docker_owned_storage_by_id(
                             &self.docker,
                             &record.sandbox.id,
                             &self.config,
                         )
-                        .await;
+                        .await?;
                         cleanup_docker_boundary_state(&record.sandbox, &self.config);
                         return Ok(true);
                     }
@@ -2323,7 +2378,7 @@ impl DockerComputeDriver {
                 let removed = self
                     .remove_auxiliary_containers_for_sandbox(sandbox_id)
                     .await?;
-                remove_docker_channel_volume_by_id(&self.docker, sandbox_id, &self.config).await?;
+                remove_docker_owned_storage_by_id(&self.docker, sandbox_id, &self.config).await?;
                 cleanup_docker_boundary_state_by_id(sandbox_id, &self.config);
                 self.clear_runtime_failure(sandbox_id).await;
                 return Ok(removed);
@@ -2352,19 +2407,15 @@ impl DockerComputeDriver {
         {
             Ok(()) => {
                 self.clear_runtime_failure(resolved_sandbox_id).await;
-                remove_docker_channel_volume_by_id(&self.docker, resolved_sandbox_id, &self.config)
+                remove_docker_owned_storage_by_id(&self.docker, resolved_sandbox_id, &self.config)
                     .await?;
                 cleanup_docker_boundary_state_by_id(resolved_sandbox_id, &self.config);
                 Ok(true)
             }
             Err(err) if is_not_found_error(&err) => {
                 self.clear_runtime_failure(resolved_sandbox_id).await;
-                let _ = remove_docker_channel_volume_by_id(
-                    &self.docker,
-                    resolved_sandbox_id,
-                    &self.config,
-                )
-                .await;
+                remove_docker_owned_storage_by_id(&self.docker, resolved_sandbox_id, &self.config)
+                    .await?;
                 cleanup_docker_boundary_state_by_id(resolved_sandbox_id, &self.config);
                 Ok(pending.is_some())
             }
@@ -4266,6 +4317,15 @@ async fn create_docker_runtime_volume(
     Ok(())
 }
 
+async fn remove_docker_owned_storage_by_id(
+    docker: &Docker,
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<(), Status> {
+    workspace::remove(docker, sandbox_id, config).await?;
+    remove_docker_channel_volume_by_id(docker, sandbox_id, config).await
+}
+
 async fn remove_docker_channel_volume_by_id(
     docker: &Docker,
     sandbox_id: &str,
@@ -6134,6 +6194,9 @@ fn build_container_create_body_for_image(
     )
     .map_err(Status::failed_precondition)?;
     let mut user_mounts = docker_driver_mounts(driver_config)?;
+    if let Some(mount) = workspace::mount(sandbox, config, image)? {
+        user_mounts.push(mount);
+    }
     user_mounts.push(Mount {
         target: Some(BOUNDARY_MOUNT_PATH.to_string()),
         source: Some(docker_channel_volume_name(sandbox, config)),
@@ -6167,6 +6230,15 @@ fn build_container_create_body_for_image(
         }]
     });
     let mut labels = template.labels.clone();
+    // Storage layout and attachment evidence are driver-owned facts.
+    labels.remove(workspace::MODE_LABEL);
+    labels.remove(workspace::IDENTITY_LABEL);
+    if config.workspace_storage == workspace::Storage::Persistent {
+        labels.insert(
+            workspace::MODE_LABEL.into(),
+            workspace::PERSISTENT_MODE.into(),
+        );
+    }
     labels.insert(
         "openshell.ai/private-image-volume-targets".into(),
         serde_json::to_string(&image.volumes)

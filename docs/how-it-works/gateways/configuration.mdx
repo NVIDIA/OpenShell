@@ -1387,6 +1387,9 @@ default_image      = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy  = "if_not_present"
 # Value assigned to the openshell.sandbox_namespace label on sandbox containers.
 sandbox_label      = "docker-dev"
+# Opt in newly created /sandbox workspaces to driver-owned persistent storage.
+# Does not migrate existing workspaces or enable workload image updates.
+persist_workspace = false
 # host (default) or bridge networking for the supervisor.
 # Operator-owned; sandbox driver config cannot override this choice.
 supervisor_network_mode = "host"
@@ -1427,6 +1430,13 @@ provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 ```
 
 Use `sandbox_label` for Docker configurations.
+
+`persist_workspace` defaults to `false`. When enabled, newly created workspaces
+using the default `/sandbox` directory receive a driver-owned local volume.
+Stop/start retains its data; deleting the sandbox removes the owned volume.
+Custom working directories and image-declared volumes overlapping `/sandbox`
+are rejected. Existing writable-layer workspaces remain unchanged. This option
+does not enable Docker workload image updates.
 
 `supervisor_network_mode` accepts `host` (the default), `bridge`, or `auto`.
 `auto` also selects host; the driver does not infer a mode from the workload runtime.

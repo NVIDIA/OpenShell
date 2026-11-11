@@ -128,6 +128,20 @@ New generations require matching supervisor and sandbox runtime binaries.
 
 ## Stop, Start, and Delete
 
+Set `persist_workspace = true` in `[openshell.drivers.docker]` to give newly
+created default `/sandbox` workspaces a driver-owned local volume. The setting
+defaults to false and does not migrate existing writable-layer workspaces.
+Custom working directories and image-declared volumes overlapping `/sandbox`
+are rejected when enabled. Initialization prepares the workspace ownership;
+it does not copy the image's workspace contents into the volume.
+
+The driver records and rechecks the volume identity and workload UID/GID before
+restart, including when external resource admission is disabled. Stop retains
+the data. Explicit sandbox deletion removes the owned workspace volume and
+reports removal failures. Startup orphan cleanup retains workspace volumes
+without a workload; an interrupted create requires explicit recovery/removal.
+This storage option alone does not enable workload image updates.
+
 Stop terminates the supervisor companion and stops the workload container
 without removing it. Docker retains the workload writable layer and attached
 volumes. Start stages a fresh sandbox bootstrap bundle, restarts that workload,
