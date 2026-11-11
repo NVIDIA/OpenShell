@@ -17,6 +17,7 @@ base64 = { workspace = true }
 clap = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 tonic = { workspace = true, features = ["channel"] }
@@ -51,6 +52,9 @@ default = []
 telemetry = []
 ## Strict Ed25519 JWT issuance and verification for authenticated sandbox sessions.
 jwt = ["dep:openshell-crypto", "dep:jsonwebtoken", "dep:zeroize"]
+## The Rust-defined form of the documents a driver hands to the supervisor and the
+## sandbox boundary. Legacy: removed when its replacement ships.
+legacy-contract = ["jwt", "dep:rcgen"]
 ## Conversions to `openshell-otel` types.
 otel = ["dep:openshell-otel"]
 ## Command-line flags shared by compute drivers.

@@ -8,11 +8,11 @@
 //! VM claims; `openshell-isolation-interface` and `openshell-sandbox` provide
 //! the common control and boundary behavior.
 
-use openshell_isolation_interface::contract::{
+use openshell_driver_sdk::legacy_contract::GPU_RESOURCE_CLAIM;
+use openshell_driver_sdk::legacy_contract::{
     BackendError, ProvisioningEvidence, ResolvedWorkloadIdentity,
 };
-use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
-use openshell_sandbox_backend::boundary_protocol::{
+use openshell_driver_sdk::legacy_contract::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
@@ -145,7 +145,7 @@ impl VmBoundarySpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_sandbox_backend::boundary_protocol::{
+    use openshell_driver_sdk::legacy_contract::{
         SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
         generate_sandbox_tls_material,
     };

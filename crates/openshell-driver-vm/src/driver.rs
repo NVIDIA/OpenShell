@@ -50,6 +50,11 @@ use openshell_driver_sdk::UpstreamProxyConfig;
 use openshell_driver_sdk::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_driver_sdk::driver_mounts;
 use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
+use openshell_driver_sdk::legacy_contract::{
+    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
+    SandboxTlsClientConfig, SandboxTlsMaterial, SandboxTlsServerConfig, SandboxTransport,
+    generate_sandbox_tls_material,
+};
 use openshell_driver_sdk::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -72,11 +77,6 @@ use openshell_driver_sdk::proto::compute::v1::{
 use openshell_driver_sdk::proto_struct::struct_to_json_value;
 use openshell_driver_sdk::{
     NetworkSupervisorTrustBundle, network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES,
-};
-use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
-    SandboxTlsClientConfig, SandboxTlsMaterial, SandboxTlsServerConfig, SandboxTransport,
-    generate_sandbox_tls_material,
 };
 use openshell_vfio::SysfsRoot;
 use opentelemetry::trace::TraceContextExt as _;
@@ -225,7 +225,7 @@ const HOST_ADDITIONAL_CA_TEMP_PREFIX: &str = ".additional-ca.";
 const HOST_ADDITIONAL_CA_TEMP_SUFFIX: &str = ".tmp";
 /// The backend this driver admits. VM-specific placement remains inside the
 /// opaque runtime descriptor.
-const DRIVER_ADMITTED_BACKEND: &str = openshell_sandbox_backend::BACKEND_NAME;
+const DRIVER_ADMITTED_BACKEND: &str = openshell_driver_sdk::legacy_contract::BUILTIN_BACKEND_NAME;
 const HOST_SUPERVISOR_BINARY: &str = "host-runtime/openshell-supervisor";
 const VM_CONTROL_SOCKET: &str = "control.sock";
 const VM_CONTROL_PORT: u32 = 5500;
@@ -588,14 +588,15 @@ impl VmDriverConfig {
     }
 
     pub fn validate_sandbox_identity(&self) -> Result<(), String> {
-        let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
+        let range = openshell_driver_sdk::policy::MIN_SANDBOX_UID
+            ..=openshell_driver_sdk::policy::MAX_SANDBOX_UID;
         if let Some(uid) = self.sandbox_uid
             && !range.contains(&uid)
         {
             return Err(format!(
                 "sandbox_uid {uid} is outside the allowed range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
+                openshell_driver_sdk::policy::MIN_SANDBOX_UID,
+                openshell_driver_sdk::policy::MAX_SANDBOX_UID,
             ));
         }
         if let Some(gid) = self.sandbox_gid
@@ -603,8 +604,8 @@ impl VmDriverConfig {
         {
             return Err(format!(
                 "sandbox_gid {gid} is outside the allowed range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
+                openshell_driver_sdk::policy::MIN_SANDBOX_UID,
+                openshell_driver_sdk::policy::MAX_SANDBOX_UID,
             ));
         }
         Ok(())
@@ -7111,19 +7112,20 @@ async fn write_sandbox_owner_state(
 }
 
 fn validate_sandbox_owner_identity(uid: u32, gid: u32) -> Result<(), String> {
-    let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
+    let range = openshell_driver_sdk::policy::MIN_SANDBOX_UID
+        ..=openshell_driver_sdk::policy::MAX_SANDBOX_UID;
     if !range.contains(&uid) {
         return Err(format!(
             "uid {uid} is outside the allowed range [{}, {}]",
-            openshell_policy::MIN_SANDBOX_UID,
-            openshell_policy::MAX_SANDBOX_UID
+            openshell_driver_sdk::policy::MIN_SANDBOX_UID,
+            openshell_driver_sdk::policy::MAX_SANDBOX_UID
         ));
     }
     if !range.contains(&gid) {
         return Err(format!(
             "gid {gid} is outside the allowed range [{}, {}]",
-            openshell_policy::MIN_SANDBOX_UID,
-            openshell_policy::MAX_SANDBOX_UID
+            openshell_driver_sdk::policy::MIN_SANDBOX_UID,
+            openshell_driver_sdk::policy::MAX_SANDBOX_UID
         ));
     }
     Ok(())

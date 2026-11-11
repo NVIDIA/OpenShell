@@ -31,26 +31,10 @@ pub use runtime::{
 };
 pub use runtime::{BoundaryTransport, BoundaryTransportConnector, validate_runtime_coordinates};
 
-/// Stable isolation backend name implemented by `openshell-sandbox`.
-pub const BACKEND_NAME: &str = openshell_core::isolation_registration::BUILTIN_BACKEND_NAME;
-
-/// Resource claim set by compute drivers when the workload requests GPU access.
-pub const GPU_RESOURCE_CLAIM: &str = "openshell.gpu";
-
-/// Resource claim set when the runtime may retain supplementary groups in
-/// addition to the image-derived workload identity.
-pub const ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM: &str =
-    "openshell.identity.allow_extra_supplementary_groups";
-
-/// Memory-backed parent used for supervisor CA material.
-pub const SUPERVISOR_CA_RUNTIME_ROOT: &str = "/run/openshell-supervisor-ca";
-
-/// Workload-visible directory for the supervisor's public HTTPS interception
-/// certificate and combined trust bundle.
-///
-/// Keeping the material below the mount root lets runtimes that cannot assign
-/// tmpfs ownership create this child as the unprivileged sandbox identity.
-pub const SUPERVISOR_CA_RUNTIME_DIR: &str = "/run/openshell-supervisor-ca/material";
+pub use openshell_driver_sdk::legacy_contract::{
+    ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM, BUILTIN_BACKEND_NAME as BACKEND_NAME,
+    GPU_RESOURCE_CLAIM, SUPERVISOR_CA_RUNTIME_DIR, SUPERVISOR_CA_RUNTIME_ROOT,
+};
 
 /// Generated gRPC transport envelope for the `OpenShell` Sandbox Protocol.
 pub mod proto {
