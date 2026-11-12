@@ -39,6 +39,13 @@ accept an operator-selected `IsolationBackendRegistration`, including its Unix,
 TCP, or vsock endpoint. The driver provisions the resource and delivers the
 backend's trusted launch metadata to the supervisor.
 
+Drivers advertising `openshell.compute.proxy-filesystem-baseline` must provide
+a `ProxyFilesystemBaseline` descriptor and the same baseline in `BackendSetup`.
+Use paths in the workload's namespace; they need not exist on the gateway host.
+An explicitly empty baseline disables legacy Linux defaults. Required paths
+contribute to effective proxy-mode policy without widening authored read-only
+grants.
+
 ## Who Owns What
 
 | Component | Owns |
