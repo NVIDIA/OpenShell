@@ -33,7 +33,9 @@ pub(crate) use store::{
 };
 
 use crate::opa::OpaEngine;
-use crate::proxy::destination::{build_validation_plan, filter_resolved_addresses};
+use crate::proxy::destination::{
+    DestinationDenialKind, build_validation_plan, filter_resolved_addresses,
+};
 use crate::proxy::is_host_gateway_alias;
 use crate::telemetry::egress_emit;
 use openshell_core::host_pattern::HostSelector;
@@ -378,15 +380,18 @@ fn eligible_endpoints(
             && pattern == name.as_str()
             && value_field(&endpoint.endpoint, "advisor_proposed")
                 != Some(&regorus::Value::Bool(true));
-        let destination_plan = build_validation_plan(
+        let destination_plan = match build_validation_plan(
             name.as_str(),
             name.as_str(),
             trusted_host_gateway,
             None,
             &raw_allowed_ips,
             exact_declared_host,
-        )
-        .map_err(|error| PolicyDnsError::Policy(error.reason))?;
+        ) {
+            Ok(plan) => plan,
+            Err(error) if error.kind == DestinationDenialKind::InternalAddress => continue,
+            Err(error) => return Err(PolicyDnsError::Policy(error.reason)),
+        };
         eligible.push(EligibleEndpoint {
             endpoint_id: PolicyEndpointId {
                 policy_name: endpoint.policy_name.clone(),
