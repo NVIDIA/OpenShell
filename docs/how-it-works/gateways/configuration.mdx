@@ -2022,11 +2022,14 @@ collections and 16 unary requests run concurrently. Collections wait for a free
 slot within the ten-second timeout; unary requests are limited
 to four per principal and eight per workspace. Watches are limited to 32 total,
 four per principal, and 16 per workspace. Capacity and size limits return
-`RESOURCE_EXHAUSTED`; storage failures and timeouts return `UNAVAILABLE`; corrupt
+`RESOURCE_EXHAUSTED`; storage failures, configuration changes during collection,
+and timeouts return `UNAVAILABLE`; corrupt
 records return `INTERNAL`. Disabling the app listener returns `FAILED_PRECONDITION`.
 
 Consumers share a one-second collection cache, bounded to 16 workspaces. Cache reuse adds at most one refresh interval to collection freshness;
-cached routes never outlive their advertised expiry. Watches recheck bearer
+cached routes never outlive their advertised expiry. Collections publish the
+latest accepted renewal for an unchanged, revalidated installation; the gateway
+does not create a new lease when serving discovery. Watches recheck bearer
 credentials and workspace access every second and terminate if either is lost.
 OIDC token revocation follows the configured verifier's semantics; offline JWT
 verification cannot detect issuer-side revocation before token expiry.
