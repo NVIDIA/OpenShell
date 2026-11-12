@@ -11,11 +11,13 @@
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
 mod config_inputs;
+mod discovery_inputs;
 mod endpoint_status;
 mod provisioning_clock;
 #[cfg(test)]
 mod token_grant_owners_tests;
 pub use config_inputs::{SandboxConfigInputs, load_sandbox_config_inputs};
+pub(super) use discovery_inputs::DiscoveryConfigInputs;
 pub use provisioning_clock::configuration_change;
 
 pub(super) use endpoint_status::{
@@ -2924,19 +2926,35 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
     state: &ServerState,
     inputs: &SandboxConfigInputs,
 ) -> Result<SandboxConfigSnapshot, Status> {
-    let sandbox = &inputs.sandbox;
+    build_sandbox_config_snapshot_with_sources(
+        state,
+        &inputs.sandbox,
+        &inputs.catalog,
+        &inputs.provider_records,
+        &inputs.global_settings,
+        inputs.latest_policy.as_ref(),
+        None,
+    )
+    .await
+}
+
+async fn build_sandbox_config_snapshot_with_sources(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    provider_profile_catalog: &EffectiveProviderProfileCatalog,
+    provider_records: &[super::provider::ProviderEnvironmentRecord],
+    global_settings: &StoredSettings,
+    latest: Option<&PolicyRecord>,
+    service_routes: Option<Vec<openshell_core::proto::SandboxServiceRoute>>,
+) -> Result<SandboxConfigSnapshot, Status> {
     let sandbox_id = sandbox.object_id().to_string();
     let workspace = sandbox.object_workspace().to_string();
-    let provider_profile_catalog = &inputs.catalog;
-    let provider_records = &inputs.provider_records;
-    let global_settings = &inputs.global_settings;
 
     let global_policy = decode_policy_from_global_settings(global_settings)?;
     let mut global_policy_version: u32 = 0;
 
     // Under a global override, only the sandbox version metadata is observed;
     // the dormant payload is neither decoded nor validated.
-    let latest = inputs.latest_policy.as_ref();
 
     let (mut policy, version, mut policy_hash, policy_source) =
         if let Some(global_policy) = global_policy {
@@ -3084,7 +3102,10 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
             .filter(|_| matches!(policy_source, PolicySource::Global)),
     )?;
 
-    let service_routes = super::service::configured_app_routes(state, sandbox).await?;
+    let service_routes = match service_routes {
+        Some(routes) => routes,
+        None => super::service::configured_app_routes(state, sandbox).await?,
+    };
     // Include the allowlist in delivery identity so a service edit is not
     // coalesced away as a duplicate policy/settings snapshot.
     if !service_routes.is_empty() {

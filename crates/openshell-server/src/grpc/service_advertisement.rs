@@ -99,7 +99,7 @@ impl LeaseWindow {
 
 /// One record per immutable sandbox identity. These records are ephemeral:
 /// reads revalidate owner, configuration, generation, and expiry.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Installation {
     pub sandbox_id: String,
     pub session_id: String,
@@ -118,6 +118,16 @@ pub struct Installation {
     pub port: u32,
     pub expires_at_ms: i64,
     pub routes: Vec<Vec<u8>>,
+}
+
+impl Installation {
+    /// Lease-only renewals do not change serving identity or declarations.
+    pub(super) fn same_identity(&self, other: &Self) -> bool {
+        let mut identity = self.clone();
+        identity.sequence = other.sequence;
+        identity.expires_at_ms = other.expires_at_ms;
+        identity == *other
+    }
 }
 
 fn runtime_identity(sandbox: &Sandbox) -> Result<&str, Status> {
@@ -475,6 +485,17 @@ pub(super) async fn current_routes(
     state: &ServerState,
     record: &Installation,
 ) -> Result<Option<Vec<SandboxServiceRoute>>, Status> {
+    Ok(validated_routes(state, record, None)
+        .await?
+        .map(|(_, routes)| routes))
+}
+
+/// Recheck the live sandbox, owner and shared-pool authority without rebuilding
+/// configuration. Callers may not treat this as configuration validation.
+pub(super) async fn current_sandbox(
+    state: &ServerState,
+    record: &Installation,
+) -> Result<Option<Sandbox>, Status> {
     if !state.config.supervisor_app_listener.enabled
         || record.expires_at_ms <= current_time_ms()
         || record.service_domain != state.config.supervisor_app_listener.domain
@@ -532,7 +553,21 @@ pub(super) async fn current_routes(
             return Ok(None);
         }
     }
-    let config = super::policy::build_sandbox_config_snapshot(state, &sandbox).await?;
+    Ok(Some(sandbox))
+}
+
+pub(super) async fn validated_routes(
+    state: &ServerState,
+    record: &Installation,
+    inputs: Option<&super::policy::DiscoveryConfigInputs>,
+) -> Result<Option<(Sandbox, Vec<SandboxServiceRoute>)>, Status> {
+    let Some(sandbox) = current_sandbox(state, record).await? else {
+        return Ok(None);
+    };
+    let config = match inputs {
+        Some(inputs) => inputs.build(state, &sandbox).await?,
+        None => super::policy::build_sandbox_config_snapshot(state, &sandbox).await?,
+    };
     if !config.configuration_admitted
         || config.configuration_instance_id != record.configuration_instance_id
         || config.config_revision != record.config_revision
@@ -551,7 +586,7 @@ pub(super) async fn current_routes(
     };
     Ok(validate_routes(&report, &config.service_routes)
         .is_ok()
-        .then_some(report.routes))
+        .then_some((sandbox, report.routes)))
 }
 
 const CLEANUP_PAGE_SIZE: u16 = 128;

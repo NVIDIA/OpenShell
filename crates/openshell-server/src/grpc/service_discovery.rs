@@ -3,6 +3,9 @@
 
 //! Bounded, full-replacement workspace views of accepted app installations.
 
+#[cfg(test)]
+mod freshness_tests;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +19,8 @@ use prost::Message as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use super::service_advertisement::{Installation, OBJECT_TYPE, current_routes};
+use super::policy::DiscoveryConfigInputs;
+use super::service_advertisement::{Installation, OBJECT_TYPE, current_sandbox, validated_routes};
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
@@ -393,25 +397,92 @@ pub async fn snapshot(
 }
 
 async fn collect(state: &ServerState, workspace: &str) -> Result<ServiceRouteSnapshot, Status> {
-    // A bounded per-installation validated view, not a cross-resource transaction.
-    // Lease renewals must not invalidate an otherwise current installation.
     let before = records(state, workspace).await?;
-    let mut routes = Vec::new();
-    for object in &before {
+    if before.is_empty() {
+        return finish_snapshot(Vec::new());
+    }
+    let inputs = DiscoveryConfigInputs::load(state, workspace).await?;
+    let validated = validate_installations(state, workspace, &inputs, before).await?;
+    publish_installations(state, workspace, &inputs, validated).await
+}
+
+struct ValidatedInstallation {
+    id: String,
+    installation: Installation,
+    sandbox: Sandbox,
+    routes: Vec<openshell_core::proto::SandboxServiceRoute>,
+}
+
+async fn validate_installations(
+    state: &ServerState,
+    workspace: &str,
+    inputs: &DiscoveryConfigInputs,
+    before: Vec<ObjectRecord>,
+) -> Result<Vec<ValidatedInstallation>, Status> {
+    let mut validated = Vec::new();
+    for object in before {
         let installation: Installation = serde_json::from_slice(&object.payload)
             .map_err(|_| Status::internal("invalid service installation record"))?;
-        let Some(installed_routes) = current_routes(state, &installation).await? else {
+        let Some((sandbox, routes)) = validated_routes(state, &installation, Some(inputs)).await?
+        else {
             continue;
         };
-        let sandbox = state
-            .store
-            .get_message::<Sandbox>(&installation.sandbox_id)
-            .await
-            .map_err(|_| Status::unavailable("sandbox storage unavailable"))?
-            .ok_or_else(|| Status::unavailable("sandbox changed during discovery"))?;
         if sandbox.object_workspace() != workspace {
             return Err(Status::internal("installation workspace mismatch"));
         }
+        validated.push(ValidatedInstallation {
+            id: object.id,
+            installation,
+            sandbox,
+            routes,
+        });
+    }
+    Ok(validated)
+}
+
+async fn publish_installations(
+    state: &ServerState,
+    workspace: &str,
+    inputs: &DiscoveryConfigInputs,
+    validated: Vec<ValidatedInstallation>,
+) -> Result<ServiceRouteSnapshot, Status> {
+    // Refresh receipts after expensive validation. Lease resource-version churn
+    // is expected: compare serving identity, not a transaction-wide row version.
+    let mut latest: std::collections::HashMap<_, _> = records(state, workspace)
+        .await?
+        .into_iter()
+        .map(|r| (r.id.clone(), r))
+        .collect();
+    let mut routes = Vec::new();
+    for previous in validated {
+        let Some(record) = latest.remove(&previous.id) else {
+            continue;
+        };
+        let installation: Installation = serde_json::from_slice(&record.payload)
+            .map_err(|_| Status::internal("invalid service installation record"))?;
+        if !previous.installation.same_identity(&installation)
+            || installation.sequence < previous.installation.sequence
+            || (installation.sequence == previous.installation.sequence
+                && installation.expires_at_ms != previous.installation.expires_at_ms)
+        {
+            continue;
+        }
+        let Some(sandbox) = current_sandbox(state, &installation).await? else {
+            continue;
+        };
+        let installed_routes = if installation.sequence != previous.installation.sequence
+            || sandbox.metadata != previous.sandbox.metadata
+        {
+            // A renewed lease is reused only after checking its configuration
+            // and live authority too. Never manufacture a new expiry at read time.
+            let Some((_, routes)) = validated_routes(state, &installation, Some(inputs)).await?
+            else {
+                continue;
+            };
+            routes
+        } else {
+            previous.routes
+        };
         for (bytes, route) in installation.routes.iter().zip(installed_routes) {
             let label = crate::service_routing::service_route_readable_label(
                 workspace,
@@ -443,6 +514,9 @@ async fn collect(state: &ServerState, workspace: &str) -> Result<ServiceRouteSna
             }
         }
     }
+    // Shared catalog, global settings and bulk declarations are collection-local.
+    // Changes invalidate the view; normal serving-lease renewal does not.
+    inputs.ensure_current(state).await?;
     finish_snapshot(routes)
 }
 
