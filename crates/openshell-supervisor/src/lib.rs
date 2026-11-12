@@ -769,7 +769,7 @@ async fn run_sandbox_with_backend(
     } = config;
     // The current client attachment adapter is SSH; retaining a process's I/O
     // internally does not make it reachable by a foreground client.
-    if await_main_process_attachment && (!cfg!(unix) || ssh_socket_path.is_none()) {
+    if await_main_process_attachment && ssh_socket_path.is_none() {
         return Err(miette::miette!(
             "foreground attachment to the main process requires a supported SSH access adapter; create the sandbox with --detach"
         ));
@@ -819,21 +819,11 @@ async fn run_sandbox_with_backend(
         &auth_bundle,
     )?;
     let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
-    #[cfg(unix)]
     let ssh_host_key = if ssh_socket_path.is_some() {
         Some(openshell_supervisor_process::ssh::parse_host_key(
             auth_bundle.ssh_host_private_key.as_ref(),
         )?)
     } else {
-        None
-    };
-    #[cfg(not(unix))]
-    let ssh_host_key = {
-        if ssh_socket_path.is_some() {
-            return Err(miette::miette!(
-                "SSH access sockets are unsupported on this host"
-            ));
-        }
         None
     };
     // Startup joins the trace that created the sandbox when the driver passes

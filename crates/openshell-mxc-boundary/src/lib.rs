@@ -16,6 +16,8 @@ pub mod backend;
 mod identity;
 #[cfg(target_os = "windows")]
 pub mod launch;
+#[cfg(any(target_os = "windows", test))]
+mod posix_command;
 #[cfg(target_os = "windows")]
 pub mod socket_owner;
 

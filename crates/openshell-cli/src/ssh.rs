@@ -14,8 +14,9 @@ use miette::{IntoDiagnostic, Report, Result, WrapErr};
 use nix::sys::signal::Signal;
 use openshell_core::driver_mounts;
 use openshell_core::forward::{
-    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, sandbox_ssh_args,
-    shell_escape, validate_ssh_session_response, write_forward_pid,
+    ForwardSpec, build_proxy_command, format_gateway_url, proxy_command_escape,
+    resolve_ssh_gateway, sandbox_ssh_args, shell_escape, validate_ssh_session_response,
+    write_forward_pid,
 };
 use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SandboxPhase, SshRelayTarget, TcpForwardFrame,
@@ -1334,8 +1335,11 @@ fn ssh_upload_command(proxy_command: &str) -> Command {
 ///   `"/sandbox/sub/file"` -> `("/sandbox/sub", "file")`
 ///   `"file.txt"`          -> `(".", "file.txt")`
 fn split_sandbox_path(path: &str) -> (&str, &str) {
-    match path.rfind('/') {
-        Some(0) => ("/", &path[1..]),
+    match path.rfind(['/', '\\']) {
+        Some(0) => (&path[..1], &path[1..]),
+        Some(pos) if pos == 2 && path.as_bytes().get(1) == Some(&b':') => {
+            (&path[..=pos], &path[pos + 1..])
+        }
         Some(pos) => (&path[..pos], &path[pos + 1..]),
         None => (".", path),
     }
@@ -2126,13 +2130,13 @@ fn host_alias(name: &str, workspace: &str) -> String {
 
 fn render_ssh_config(gateway: &str, name: &str, workspace: &str) -> String {
     let exe = std::env::current_exe().expect("failed to resolve OpenShell executable");
-    let exe = shell_escape(&exe.to_string_lossy());
+    let exe = proxy_command_escape(&exe.to_string_lossy());
 
     let proxy_cmd = format!(
         "{exe} ssh-proxy --gateway-name {} --name {} --workspace {}",
-        shell_escape(gateway),
-        shell_escape(name),
-        shell_escape(workspace),
+        proxy_command_escape(gateway),
+        proxy_command_escape(name),
+        proxy_command_escape(workspace),
     );
     let host_alias = host_alias(name, workspace);
     format!(
