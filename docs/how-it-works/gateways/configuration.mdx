@@ -131,14 +131,15 @@ sandbox again. CLI wait and image-preparation timeouts are separate settings.
 Clients that send a `request_id` get a durable admission for each mutation, such
 as sandbox create, start, exec, or delete. A successful admission keeps its slot
 until its replay window ends, and an unresolved one keeps it until an operator
-reconciles it. Admissions are counted per caller identity across every replica
+reconciles it. The gateway deletes expired admissions in the background about
+once a minute. Admissions are counted per caller identity across every replica
 that shares the database. When a caller's admissions reach the limit, the gateway
 rejects new requests with `RESOURCE_EXHAUSTED`. Requests without a `request_id`
 do not use this capacity.
 
 | Setting | Default | Allowed values |
 |---|---|---|
-| `mutation_admission_limit_per_caller` | `1000` | `1` through `20000` |
+| `mutation_admission_limit_per_caller` | `1000` | `1` through `1000000` |
 | `mutation_replay_window_seconds` | `86400` (24 hours) | `60` through `604800` (7 days) |
 
 Set both under `[openshell.gateway]`, using the same values on every replica.
@@ -333,7 +334,7 @@ image_preparation_timeout_seconds = 1800
 # Admission repair window in seconds; existing deadlines are preserved.
 provisioning_repair_window_seconds = 300
 
-# Request-ID admissions one caller identity can hold, 1 through 20000, and the
+# Request-ID admissions one caller identity can hold, 1 through 1000000, and the
 # seconds a successful request ID stays replayable, 60 through 604800. Every
 # replica sharing the database must use the same values.
 mutation_admission_limit_per_caller = 1000

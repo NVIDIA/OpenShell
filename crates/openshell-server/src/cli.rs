@@ -5096,11 +5096,11 @@ mem_mib = "not-a-number"
         for (gateway, message) in [
             (
                 "mutation_admission_limit_per_caller = 0",
-                "mutation_admission_limit_per_caller must be between 1 and 20000",
+                "mutation_admission_limit_per_caller must be between 1 and 1000000",
             ),
             (
-                "mutation_admission_limit_per_caller = 20001",
-                "mutation_admission_limit_per_caller must be between 1 and 20000",
+                "mutation_admission_limit_per_caller = 1000001",
+                "mutation_admission_limit_per_caller must be between 1 and 1000000",
             ),
             (
                 "mutation_replay_window_seconds = 59",

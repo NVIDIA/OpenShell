@@ -159,7 +159,7 @@ pub struct GatewayFileSection {
     /// Admission repair window in seconds, between 1 and 86400.
     #[serde(default)]
     pub provisioning_repair_window_seconds: Option<i64>,
-    /// Durable mutation admissions per caller, between 1 and 20000.
+    /// Durable mutation admissions per caller, between 1 and 1000000.
     #[serde(default)]
     pub mutation_admission_limit_per_caller: Option<u32>,
     /// Mutation replay window in seconds, between 60 and 604800.

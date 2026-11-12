@@ -6,6 +6,7 @@
 mod image_activation;
 mod legacy_time_wire;
 pub mod lock_order;
+mod mutation_admission;
 pub mod mutation_lock;
 mod postgres;
 #[cfg(test)]
@@ -16,6 +17,7 @@ mod sqlite;
 pub use crate::storage_proto::{
     StoredDraftChunk as DraftChunkRecord, StoredPolicyRevision as PolicyRecord,
 };
+pub use mutation_admission::ADMISSION_OBJECT_TYPE as MUTATION_ADMISSION_OBJECT_TYPE;
 
 use openshell_core::{Error as CoreError, Result as CoreResult};
 use prost::Message;

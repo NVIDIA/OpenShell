@@ -52,9 +52,9 @@ pub const DEFAULT_MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
 /// Default durable mutation admissions one caller identity can hold.
 pub const DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER: u32 = 1000;
 
-/// Accepted per-caller admission limits. Expired-success cleanup loads a full
-/// bucket in one query, so the ceiling bounds that read.
-pub const MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE: std::ops::RangeInclusive<u32> = 1..=20_000;
+/// Accepted per-caller admission limits. The ceiling bounds the rows one caller
+/// can retain.
+pub const MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE: std::ops::RangeInclusive<u32> = 1..=1_000_000;
 
 /// Default replay window for successful durable mutation admissions.
 pub const DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS: u32 = 24 * 60 * 60;

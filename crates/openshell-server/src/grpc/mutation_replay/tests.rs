@@ -485,14 +485,9 @@ async fn exercise_expiry_and_uncertainty(state: &Arc<ServerState>) {
         "REQUEST_OUTCOME_UNCERTAIN"
     );
     assert!(
-        !prune_expired(
-            &state.store,
-            &row.workspace,
-            state.config.mutation_admission_limit_per_caller,
-            replay_window_ms(&state.config),
-        )
-        .await
-        .unwrap()
+        !sweep_expired(&state.store, replay_window_ms(&state.config))
+            .await
+            .unwrap()
     );
 }
 
@@ -771,15 +766,7 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
         let id = format!("quota-{i}");
         state
             .store
-            .create_if_workspace_count_below(
-                OBJECT_TYPE,
-                &id,
-                &id,
-                &original.workspace,
-                &payload,
-                None,
-                u64::from(limit),
-            )
+            .create_mutation_admission(&id, &id, &original.workspace, &payload, limit)
             .await
             .unwrap()
             .unwrap();
@@ -823,6 +810,11 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
             None,
             WriteCondition::MatchResourceVersion(original.resource_version),
         )
+        .await
+        .unwrap();
+    state
+        .store
+        .backdate_mutation_admission(&original.id, 0)
         .await
         .unwrap();
     run(&state, authed_request(new_req)).await.unwrap();
@@ -875,6 +867,108 @@ async fn age_success(state: &Arc<ServerState>, req: &CreateWorkspaceRequest, age
         )
         .await
         .unwrap();
+    state
+        .store
+        .backdate_mutation_admission(&row.id, current_time_ms() - age_ms)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn expiry_sweeper_removes_only_expired_successes() {
+    let state = test_server_state().await;
+    let window_ms = replay_window_ms(&state.config);
+    let expired = create("sweep-expired");
+    let fresh = create("sweep-fresh");
+    run(&state, authed_request(expired.clone())).await.unwrap();
+    run(&state, authed_request(fresh.clone())).await.unwrap();
+    let bucket = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, None, 1)
+        .await
+        .unwrap()
+        .remove(0)
+        .workspace;
+    let pending = Admission {
+        protection: None,
+        format_version: 1,
+        payload_hash: "unused".into(),
+        workspace_id: None,
+        target_id: None,
+        success: None,
+        completed_at_ms: None,
+    };
+    state
+        .store
+        .create_mutation_admission(
+            "sweep-pending",
+            "sweep-pending",
+            &bucket,
+            &serde_json::to_vec(&pending).unwrap(),
+            state.config.mutation_admission_limit_per_caller,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .store
+        .backdate_mutation_admission("sweep-pending", 0)
+        .await
+        .unwrap();
+    age_success(&state, &expired, window_ms + 1).await;
+
+    assert!(sweep_expired(&state.store, window_ms).await.unwrap());
+    assert!(!sweep_expired(&state.store, window_ms).await.unwrap());
+    assert_eq!(
+        state
+            .store
+            .count_in_workspace(OBJECT_TYPE, &bucket)
+            .await
+            .unwrap(),
+        2
+    );
+    let replay = run(&state, authed_request(fresh)).await.unwrap();
+    assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+    assert!(
+        state
+            .store
+            .get(OBJECT_TYPE, "sweep-pending")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn admission_counter_recounts_after_deletions() {
+    let mut state = test_server_state().await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .config
+        .mutation_admission_limit_per_caller = 2;
+    run(&state, authed_request(create("counter-a")))
+        .await
+        .unwrap();
+    run(&state, authed_request(create("counter-b")))
+        .await
+        .unwrap();
+    let removed = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, None, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(state.store.delete(OBJECT_TYPE, &removed.id).await.unwrap());
+    run(&state, authed_request(create("counter-c")))
+        .await
+        .unwrap();
+    assert_eq!(
+        run(&state, authed_request(create("counter-d")))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
 }
 
 #[tokio::test]
