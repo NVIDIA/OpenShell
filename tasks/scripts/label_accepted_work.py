@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared accepted-work classification; see CONTRIBUTING.md#accepted-work.
+"""Shared accepted-work checks; see CONTRIBUTING.md#accepted-work.
 
-Use is_accepted_work with supplied facts, or check_pr_accepted_work with a
-GitHub API callable. The latter accepts the same path/method/data/pages arguments
-as check_review_readiness._api. Both return a bool; API errors propagate.
-This library has no CLI, label writes, or workflow lifecycle of its own.
+Use is_accepted_work for supplied facts or check_pr_accepted_work and
+check_issue_accepted_work with an API callable. Adapters return bools and
+propagate API errors; they do not write labels.
 """
 
 from __future__ import annotations
@@ -145,3 +144,30 @@ def check_pr_accepted_work(
         permission=permission,
         closing_issues=_closing_issue_facts(repository, pr["number"], api),
     )
+
+
+def check_issue_accepted_work(
+    repository: str, issue: dict, maintainers: set[str], *, api: Callable
+) -> bool:
+    """Check recorded acceptance or the issue author's trusted authority."""
+    if "pull_request" in issue:
+        raise ValueError("Use the PR adapter for pull requests")
+    if not maintainers:
+        raise ValueError("Could not parse any maintainers from MAINTAINERS.md")
+    labels = api(
+        f"repos/{repository}/issues/{issue['number']}/labels?per_page=100", pages=True
+    )
+    if any(label["name"] == ACCEPTED_LABEL for label in labels):
+        return True
+    author = issue["user"]["login"]
+    if author.lower() in {login.lower() for login in maintainers}:
+        return True
+    try:
+        permission = api(
+            f"repos/{repository}/collaborators/{quote(author, safe='')}/permission"
+        )["permission"]
+    except subprocess.CalledProcessError as exc:
+        if "(HTTP 404)" not in (exc.stderr or ""):
+            raise
+        permission = "none"
+    return permission in WRITE_PERMISSIONS
