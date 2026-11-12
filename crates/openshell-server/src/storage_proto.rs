@@ -132,9 +132,6 @@ mod tests {
     // legacy payload decoding. The provider-environment file map and peer
     // configuration notification are public-only. Older supervisors ignore the
     // additive file map while retaining the rest of the response.
-    // ProviderProfile's adapter requirement is removed with its field number
-    // and name reserved. Prior payloads ignore that field while preserving
-    // environment declarations at field 15; storage.v1 remains unchanged.
     // Preparation timing adds two optional timestamps to SandboxProvisioning.
     // Existing rows decode with both absent and retain their active deadline;
     // no stored attempt gains another phase or time budget on upgrade.
@@ -181,9 +178,9 @@ mod tests {
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "82bafb2d6761f931bd61d779c138bd87029d1616a952671eccce92a15e99d21b";
+        "91c5efe4b1825b2c0726d7e66e99c708a106a5446876242fb6e4daa79e61f9a2";
     const DURABLE_SCHEMA_SHA256: &str =
-        "0428468afb6a08ed0fb2d8c66dbc3c601771c3744f1fd4016b055d5c1a546a6f";
+        "92603ee0e9a998dacc11d937c4d6fd0d7844d18fdef3edd82e7eb647d826b64b";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "324526d75a8d523328a4c902f867400105826e6f540123f88a3ba1bbe8925958";
     // Encoded with the schema that omitted stable_placeholder. Keep these

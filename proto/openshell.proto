@@ -2637,9 +2637,6 @@ enum ProviderProfileCategory {
 
 // Provider type profile metadata exposed to clients.
 message ProviderProfile {
-  reserved 16;
-  reserved "required_platform_adapter";
-
   string id = 1;
   string display_name = 2;
   string description = 3;
