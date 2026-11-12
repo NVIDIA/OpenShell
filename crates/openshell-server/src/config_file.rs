@@ -159,6 +159,14 @@ pub struct GatewayFileSection {
     /// Admission repair window in seconds, between 1 and 86400.
     #[serde(default)]
     pub provisioning_repair_window_seconds: Option<i64>,
+    /// Durable mutation admissions per caller identity, shared by every
+    /// replica on the database; omit to keep the default of 1000.
+    #[serde(default)]
+    pub mutation_admission_limit_per_caller: Option<u32>,
+    /// Seconds a successful request ID stays replayable; omit to keep the
+    /// default of 86400. Replicas sharing a database must agree.
+    #[serde(default)]
+    pub mutation_replay_window_seconds: Option<u32>,
     /// Explicit activation only after the compatible deployment rollout ends.
     #[serde(default)]
     pub enable_sandbox_updates: Option<bool>,

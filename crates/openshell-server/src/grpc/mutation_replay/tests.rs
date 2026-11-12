@@ -417,7 +417,7 @@ async fn exercise_expiry_and_uncertainty(state: &Arc<ServerState>) {
         })
         .unwrap();
     let mut expired: Admission = serde_json::from_slice(&row.payload).unwrap();
-    expired.completed_at_ms = Some(current_time_ms() - SUCCESS_TTL_MS);
+    expired.completed_at_ms = Some(current_time_ms() - replay_window_ms(&state.config));
     state
         .store
         .put_if(
@@ -484,7 +484,16 @@ async fn exercise_expiry_and_uncertainty(state: &Arc<ServerState>) {
         reason(&run(state, authed_request(req)).await.unwrap_err()),
         "REQUEST_OUTCOME_UNCERTAIN"
     );
-    assert!(!prune_expired(&state.store, &row.workspace).await.unwrap());
+    assert!(
+        !prune_expired(
+            &state.store,
+            &row.workspace,
+            state.config.mutation_admission_limit_per_caller,
+            replay_window_ms(&state.config),
+        )
+        .await
+        .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -735,6 +744,11 @@ async fn cancellation_keeps_owned_work_and_duplicate_cannot_take_over() {
 #[tokio::test]
 async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work() {
     let state = test_server_state().await;
+    let limit = state.config.mutation_admission_limit_per_caller;
+    assert_eq!(
+        limit,
+        openshell_core::config::DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER
+    );
     let req = create("quota-replay");
     run(&state, authed_request(req.clone())).await.unwrap();
     let original = state
@@ -753,7 +767,7 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
         completed_at_ms: None,
     };
     let payload = serde_json::to_vec(&pending).unwrap();
-    for i in 1..MAX_ADMISSIONS_PER_CALLER - 1 {
+    for i in 1..limit - 1 {
         let id = format!("quota-{i}");
         state
             .store
@@ -764,7 +778,7 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
                 &original.workspace,
                 &payload,
                 None,
-                u64::from(MAX_ADMISSIONS_PER_CALLER),
+                u64::from(limit),
             )
             .await
             .unwrap()
@@ -818,12 +832,105 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
             .count_in_workspace(OBJECT_TYPE, &original.workspace)
             .await
             .unwrap(),
-        u64::from(MAX_ADMISSIONS_PER_CALLER)
+        u64::from(limit)
     );
     assert!(
         state
             .store
             .get(OBJECT_TYPE, "quota-1")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+async fn age_success(state: &Arc<ServerState>, req: &CreateWorkspaceRequest, age_ms: i64) {
+    let hash = fingerprint(req).unwrap();
+    let row = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, None, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            serde_json::from_slice::<Admission>(&row.payload)
+                .unwrap()
+                .payload_hash
+                == hash
+        })
+        .unwrap();
+    let mut admission: Admission = serde_json::from_slice(&row.payload).unwrap();
+    assert!(admission.success.is_some());
+    admission.completed_at_ms = Some(current_time_ms() - age_ms);
+    state
+        .store
+        .put_if(
+            OBJECT_TYPE,
+            &row.id,
+            &row.name,
+            &row.workspace,
+            &serde_json::to_vec(&admission).unwrap(),
+            None,
+            WriteCondition::MatchResourceVersion(row.resource_version),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn configured_limit_and_replay_window_govern_admission() {
+    let mut state = test_server_state().await;
+    {
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.mutation_admission_limit_per_caller = 2;
+        config.mutation_replay_window_seconds = 60;
+    }
+    let first = create("configured-first");
+    run(&state, authed_request(first.clone())).await.unwrap();
+    run(&state, authed_request(create("configured-second")))
+        .await
+        .unwrap();
+    let third = create("configured-third");
+    assert_eq!(
+        run(&state, authed_request(third.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+
+    age_success(&state, &first, 30_000).await;
+    let replay = run(&state, authed_request(first.clone())).await.unwrap();
+    assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+    assert_eq!(
+        run(&state, authed_request(third.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+
+    age_success(&state, &first, 60_000).await;
+    run(&state, authed_request(third.clone())).await.unwrap();
+    let bucket = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, None, 1)
+        .await
+        .unwrap()
+        .remove(0)
+        .workspace;
+    assert_eq!(
+        state
+            .store
+            .count_in_workspace(OBJECT_TYPE, &bucket)
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(
+        state
+            .store
+            .get_message_by_name::<Workspace>("", &third.name)
             .await
             .unwrap()
             .is_some()

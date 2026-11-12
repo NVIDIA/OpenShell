@@ -718,6 +718,36 @@ fn prepare_server_config_with_drivers(
         config.image_preparation_timeout_seconds = seconds;
     }
 
+    if let Some(limit) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.mutation_admission_limit_per_caller)
+    {
+        let range = openshell_core::config::MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE;
+        if !range.contains(&limit) {
+            return Err(miette::miette!(
+                "mutation_admission_limit_per_caller must be between {} and {}",
+                range.start(),
+                range.end()
+            ));
+        }
+        config.mutation_admission_limit_per_caller = limit;
+    }
+
+    if let Some(seconds) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.mutation_replay_window_seconds)
+    {
+        let range = openshell_core::config::MUTATION_REPLAY_WINDOW_SECONDS_RANGE;
+        if !range.contains(&seconds) {
+            return Err(miette::miette!(
+                "mutation_replay_window_seconds must be between {} and {}",
+                range.start(),
+                range.end()
+            ));
+        }
+        config.mutation_replay_window_seconds = seconds;
+    }
+
     if let Some(raw) = std::env::var_os("OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS") {
         let raw = raw.to_str().ok_or_else(|| {
             miette::miette!(
@@ -5011,6 +5041,83 @@ mem_mib = "not-a-number"
             );
         }
             });
+    }
+
+    fn with_gateway_toml(
+        gateway: &str,
+        check: impl FnOnce(miette::Result<super::ServerStartupConfig>),
+    ) {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    format!("[openshell]\nversion = 2\n[openshell.gateway]\n{gateway}\n"),
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "podman",
+                    "--disable-tls",
+                ]);
+                check(super::prepare_server_config(&mut args, &matches));
+            });
+    }
+
+    #[test]
+    fn server_config_prepares_mutation_admission_settings_from_toml() {
+        with_gateway_toml("", |prepared| {
+            let config = prepared.expect("defaults are accepted").config;
+            assert_eq!(config.mutation_admission_limit_per_caller, 1000);
+            assert_eq!(config.mutation_replay_window_seconds, 86_400);
+        });
+        with_gateway_toml(
+            "mutation_admission_limit_per_caller = 5000\nmutation_replay_window_seconds = 3600",
+            |prepared| {
+                let config = prepared.expect("bounded settings are accepted").config;
+                assert_eq!(config.mutation_admission_limit_per_caller, 5000);
+                assert_eq!(config.mutation_replay_window_seconds, 3600);
+            },
+        );
+    }
+
+    #[test]
+    fn server_config_rejects_unbounded_mutation_admission_settings() {
+        for (gateway, message) in [
+            (
+                "mutation_admission_limit_per_caller = 0",
+                "mutation_admission_limit_per_caller must be between 1 and 20000",
+            ),
+            (
+                "mutation_admission_limit_per_caller = 20001",
+                "mutation_admission_limit_per_caller must be between 1 and 20000",
+            ),
+            (
+                "mutation_replay_window_seconds = 59",
+                "mutation_replay_window_seconds must be between 60 and 604800",
+            ),
+            (
+                "mutation_replay_window_seconds = 604801",
+                "mutation_replay_window_seconds must be between 60 and 604800",
+            ),
+        ] {
+            with_gateway_toml(gateway, |prepared| {
+                let Err(error) = prepared else {
+                    panic!("{gateway} must be rejected");
+                };
+                assert!(error.to_string().contains(message), "{error}");
+            });
+        }
     }
 
     #[test]

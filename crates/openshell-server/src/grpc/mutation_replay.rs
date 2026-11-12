@@ -38,8 +38,6 @@ use crate::persistence::{
 };
 
 const OBJECT_TYPE: &str = "mutation_admission_v1";
-const SUCCESS_TTL_MS: i64 = 24 * 60 * 60 * 1000;
-const MAX_ADMISSIONS_PER_CALLER: u32 = 1000;
 // Bound work detached from request cancellation across all service instances.
 static EXECUTORS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(64)));
 static DESCRIPTORS: LazyLock<DescriptorPool> = LazyLock::new(|| {
@@ -258,6 +256,8 @@ async fn execute_owned<M: Mutation>(
     protection: Option<Protection>,
     scope: Scope,
 ) -> Result<Response<M::Output>, Status> {
+    let limit = state.config.mutation_admission_limit_per_caller;
+    let window_ms = replay_window_ms(&state.config);
     let admission = Admission {
         format_version: 1,
         payload_hash,
@@ -282,7 +282,7 @@ async fn execute_owned<M: Mutation>(
             }
             if previous.success.is_some()
                 && previous.completed_at_ms.is_some_and(|completed| {
-                    current_time_ms() >= completed.saturating_add(SUCCESS_TTL_MS)
+                    current_time_ms() >= completed.saturating_add(window_ms)
                 })
             {
                 match state
@@ -335,13 +335,13 @@ async fn execute_owned<M: Mutation>(
                 bucket,
                 &payload,
                 None,
-                u64::from(MAX_ADMISSIONS_PER_CALLER),
+                u64::from(limit),
             )
             .await;
         let version = match write {
             Ok(Some(write)) => write.resource_version,
             Ok(None) => {
-                if prune_expired(&state.store, bucket).await? {
+                if prune_expired(&state.store, bucket, limit, window_ms).await? {
                     continue;
                 }
                 return Err(Status::resource_exhausted(
@@ -436,10 +436,21 @@ impl Completion {
     }
 }
 
-async fn prune_expired(store: &Store, bucket: &str) -> Result<bool, Status> {
+fn replay_window_ms(config: &openshell_core::Config) -> i64 {
+    i64::from(config.mutation_replay_window_seconds) * 1000
+}
+
+async fn prune_expired(
+    store: &Store,
+    bucket: &str,
+    limit: u32,
+    window_ms: i64,
+) -> Result<bool, Status> {
     // The bucket is atomically bounded, so this scan cannot grow without limit.
+    // A replica configured with a lower limit than its peers still scans only
+    // its own limit; every replica must use the same value.
     let rows = store
-        .list(OBJECT_TYPE, bucket, MAX_ADMISSIONS_PER_CALLER, 0)
+        .list(OBJECT_TYPE, bucket, limit, 0)
         .await
         .map_err(storage_error)?;
     let mut removed = false;
@@ -449,9 +460,9 @@ async fn prune_expired(store: &Store, bucket: &str) -> Result<bool, Status> {
         };
         if admission.format_version == 1
             && admission.success.is_some()
-            && admission.completed_at_ms.is_some_and(|completed| {
-                current_time_ms() >= completed.saturating_add(SUCCESS_TTL_MS)
-            })
+            && admission
+                .completed_at_ms
+                .is_some_and(|completed| current_time_ms() >= completed.saturating_add(window_ms))
         {
             match store
                 .delete_if(OBJECT_TYPE, &row.id, row.resource_version)
