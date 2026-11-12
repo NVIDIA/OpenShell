@@ -96,11 +96,6 @@ def select_reviewers(categories: dict[str, set[str]], labels: set[str]) -> set[s
     unknown = relevant - categories.keys()
     if unknown:
         raise ValueError("unknown area/topic labels: " + ", ".join(sorted(unknown)))
-    if (
-        any(label.startswith("topic:sdk:") for label in relevant)
-        and "topic:sdk" not in relevant
-    ):
-        raise ValueError("language-specific SDK topics require topic:sdk")
     return set().union(*(categories[label] for label in relevant))
 
 

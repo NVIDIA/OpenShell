@@ -53,25 +53,22 @@ def event(number, login, *, human=False, removed=False):
 
 
 class RegistryTests(unittest.TestCase):
-    def test_nested_sdk_subscription_topics_use_the_broad_sdk_roster(self):
+    def test_nested_sdk_subscription_topics_route_without_the_parent_topic(self):
         text = DOCUMENT + "\n### topic:sdk\n\n" + TABLE + ALICE
+        language_member = "| Bob | [@bob](https://github.com/bob) | Example |\n"
         for language in ("go", "python", "rust", "typescript"):
-            text += f"\n### topic:sdk:{language}\n\n" + TABLE
+            text += f"\n### topic:sdk:{language}\n\n" + TABLE + language_member
         categories = routing.parse_reviewers(text)
         for language in ("go", "python", "rust", "typescript"):
             with self.subTest(language=language):
-                self.assertEqual(categories[f"topic:sdk:{language}"], set())
+                self.assertEqual(categories[f"topic:sdk:{language}"], {"bob"})
                 self.assertEqual(
                     routing.select_reviewers(
                         categories,
-                        {"area:runtime", "topic:sdk", f"topic:sdk:{language}"},
+                        {"area:runtime", f"topic:sdk:{language}"},
                     ),
-                    {"alice"},
+                    {"alice", "bob"},
                 )
-                with self.assertRaisesRegex(ValueError, "require topic:sdk"):
-                    routing.select_reviewers(
-                        categories, {"area:runtime", f"topic:sdk:{language}"}
-                    )
 
     def test_malformed_nested_headings_are_not_active_categories(self):
         for label in (

@@ -156,9 +156,7 @@ Automatic classification at issue creation and filters that exclude unaccepted w
 
 ### Label Discovery
 
-SDK language topics (`topic:sdk:go`, `topic:sdk:python`, `topic:sdk:rust`, and `topic:sdk:typescript`) accompany `topic:sdk`. The broad topic retains shared reviewer coverage; the language topics let subscribers follow individual SDKs. Only apply a topic after its live definition and routing support are available.
-
-For repository label-definition preparation, follow [the taxonomy rollout runbook](tasks/labels/README.md). That workflow previews global definition changes; it does not classify or relabel individual issues or PRs.
+SDK language topics (`topic:sdk:go`, `topic:sdk:python`, `topic:sdk:rust`, and `topic:sdk:typescript`) route independently; they do not require `topic:sdk`. Each language roster starts with the broad SDK reviewers; propose individual membership changes through review. Use the broad topic for SDK-wide concerns. Only apply a topic after its live definition and routing support are available.
 
 Retrieve every page of repository labels and their descriptions:
 
