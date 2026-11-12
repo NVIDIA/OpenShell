@@ -619,7 +619,7 @@ message HttpRequestTarget {
 message Process {
   // Executable path for the originating process.
   string binary = 1;
-  // Process id within the sandbox.
+  // Process id within the sandbox, or zero if unavailable or ambiguous.
   uint32 pid = 2;
   // Executable paths for ancestor processes, nearest parent first.
   repeated string ancestors = 3;
