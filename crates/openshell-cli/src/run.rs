@@ -702,6 +702,11 @@ pub async fn sandbox_create(
         )),
         await_main_process_attachment,
         workload_template: template.unwrap_or_default().to_string(),
+        forward_ports: forward
+            .as_ref()
+            .map(|spec| u32::from(spec.port))
+            .into_iter()
+            .collect(),
         service_exposures: expose
             .map(|target_port| SandboxServiceExposure {
                 service: String::new(),
@@ -1688,6 +1693,33 @@ where
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
+    if let Some(ingress) = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.ingress_admission.as_ref())
+    {
+        let ports = if ingress.all_ports {
+            "all".to_string()
+        } else {
+            ingress
+                .ports
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "  {} {}; ports: {ports}",
+            "Ingress:".dimmed(),
+            ingress_scope_name(ingress.scope)
+        );
+    } else {
+        println!(
+            "  {} legacy driver (admission unavailable)",
+            "Ingress:".dimmed()
+        );
+    }
+
     if let Some(status) = sandbox.status.as_ref() {
         for condition in &status.conditions {
             if matches!(
@@ -2169,8 +2201,12 @@ pub async fn service_forward_tcp(
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
-    let mut replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+    let (mut replica, scope) =
+        fetch_ready_sandbox_for_forward(&mut client, name, workspace, target_port).await?;
 
+    if scope == openshell_core::proto::IngressScope::SharedHostLoopback {
+        eprintln!("Target is an admitted shared-host loopback service.");
+    }
     let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
         .await
         .into_diagnostic()
@@ -2203,7 +2239,7 @@ pub async fn service_forward_tcp(
             }
 
             _ = health_check.tick() => {
-                replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+                replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace, target_port).await?.0;
             }
 
             accepted = listener.accept() => {
@@ -2274,7 +2310,11 @@ async fn fetch_ready_sandbox_for_forward(
     client: &mut crate::tls::GrpcClient,
     name: &str,
     workspace: &str,
-) -> Result<Option<AsciiMetadataValue>> {
+    target_port: u16,
+) -> Result<(
+    Option<AsciiMetadataValue>,
+    openshell_core::proto::IngressScope,
+)> {
     let response = match client
         .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
@@ -2307,7 +2347,17 @@ async fn fetch_ready_sandbox_for_forward(
         ));
     }
 
-    Ok(replica)
+    let scope = openshell_core::ingress::admit_port(
+        sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.ingress_admission.as_ref()),
+        u32::from(target_port),
+        false,
+    )
+    .map_err(|error| miette::miette!("{error}"))?;
+
+    Ok((replica, scope))
 }
 
 #[derive(Debug)]
@@ -3012,6 +3062,16 @@ fn configuration_failure_message(sandbox: &Sandbox) -> Option<&str> {
         .filter(|message| !message.is_empty())
 }
 
+fn ingress_scope_name(scope: i32) -> &'static str {
+    use openshell_core::proto::IngressScope;
+    match IngressScope::try_from(scope) {
+        Ok(IngressScope::IsolatedLoopback) => "isolated_loopback",
+        Ok(IngressScope::SharedHostLoopback) => "shared_host_loopback",
+        Ok(IngressScope::Unsupported) => "unsupported",
+        Ok(IngressScope::Unspecified) | Err(_) => "unknown",
+    }
+}
+
 fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
     use openshell_core::proto::ConfigurationAdmissionState;
 
@@ -3123,6 +3183,11 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "conditions": conditions,
         "endpoint_statuses": endpoint_statuses,
         "last_token_grant_failure": last_token_grant_failure,
+        "ingress_admission": sandbox.status.as_ref().and_then(|status| status.ingress_admission.as_ref()).map(|ingress| serde_json::json!({
+            "scope": ingress_scope_name(ingress.scope),
+            "all_ports": ingress.all_ports,
+            "ports": ingress.ports,
+        })),
         "configuration_admission": admission,
         "provisioning": provisioning,
         "created_from_workload_template": created_from_workload_template,
@@ -8838,6 +8903,37 @@ mod tests {
             .error
             .clear();
         assert_eq!(super::configuration_failure_message(&sandbox), None);
+        assert!(super::sandbox_to_json(&sandbox)["ingress_admission"].is_null());
+        for (scope, expected) in [
+            (
+                openshell_core::proto::IngressScope::IsolatedLoopback as i32,
+                "isolated_loopback",
+            ),
+            (
+                openshell_core::proto::IngressScope::SharedHostLoopback as i32,
+                "shared_host_loopback",
+            ),
+            (
+                openshell_core::proto::IngressScope::Unsupported as i32,
+                "unsupported",
+            ),
+            (0, "unknown"),
+            (99, "unknown"),
+        ] {
+            sandbox.status.as_mut().unwrap().ingress_admission =
+                Some(openshell_core::proto::SandboxIngressAdmission {
+                    scope,
+                    ports: vec![8080],
+                    all_ports: false,
+                });
+            let output = super::sandbox_to_json(&sandbox);
+            assert_eq!(output["ingress_admission"]["scope"], expected);
+            assert_eq!(
+                output["ingress_admission"]["ports"],
+                serde_json::json!([8080])
+            );
+            assert_eq!(output["ingress_admission"]["all_ports"], false);
+        }
     }
 
     #[test]

@@ -411,12 +411,14 @@ fn policy_create_request(
         command,
         tty,
         service_exposures: _,
+        forward_ports,
         restart_policy,
     } = spec;
     proto::CreateSandboxRequest {
         name: name.unwrap_or_default(),
         labels,
         workspace_scope,
+        forward_ports: forward_ports.into_iter().map(u32::from).collect(),
         spec: Some(proto::SandboxSpec {
             environment,
             template: image.map(|image| proto::SandboxTemplate {
@@ -679,13 +681,14 @@ mod tests {
         let spec = SandboxSpec {
             image: Some("python:3".to_string()),
             providers: vec!["provider".to_string()],
+            forward_ports: vec![8080, 9090],
             ..SandboxSpec::default()
         };
         let policy = crate::policy::base();
 
-        let spec = policy_create_request(spec, policy.clone(), None)
-            .spec
-            .expect("spec");
+        let request = policy_create_request(spec, policy.clone(), None);
+        assert_eq!(request.forward_ports, [8080, 9090]);
+        let spec = request.spec.expect("spec");
 
         assert_eq!(spec.template.expect("template").image, "python:3");
         assert_eq!(spec.providers, ["provider"]);

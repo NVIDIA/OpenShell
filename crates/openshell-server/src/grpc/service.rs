@@ -115,6 +115,7 @@ pub(super) async fn expose_service_endpoint(
         })
         .ok_or_else(|| Status::not_found("sandbox removed"))?;
     let sandbox = &current;
+    state.compute.admit_ingress_port(sandbox, target_port)?;
     let sandbox_name = sandbox.object_name();
 
     let now = crate::persistence::current_time_ms();

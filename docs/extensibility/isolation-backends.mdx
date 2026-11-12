@@ -39,6 +39,10 @@ accept an operator-selected `IsolationBackendRegistration`, including its Unix,
 TCP, or vsock endpoint. The driver provisions the resource and delivers the
 backend's trusted launch metadata to the supervisor.
 
+Compute drivers that advertise `openshell.compute.ingress-admission` return
+the supported forwarding scope and allowed ports from `ValidateSandboxCreate`.
+The isolation backend must enforce those limits when connecting to a service.
+
 ## Who Owns What
 
 | Component | Owns |
@@ -50,3 +54,8 @@ backend's trusted launch metadata to the supervisor.
 For how `openshell-sandbox` enforces the boundary, refer to [Inside the Sandbox
 Boundary](/about/architecture#inside-the-sandbox-boundary). For driver-specific
 workload behavior, refer to [Runtimes](/how-it-works/sandboxes/runtimes).
+
+## Release compatibility
+
+Upgrade gateway replicas together. For source compatibility changes, see the
+[SDK migration notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-sdk/README.md#next-minor-api-migration).

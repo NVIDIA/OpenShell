@@ -384,7 +384,7 @@ impl compute_driver_server::ComputeDriver for DriverService {
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("sandbox required"))?,
         )?;
-        Ok(Response::new(ValidateSandboxCreateResponse {}))
+        Ok(Response::new(ValidateSandboxCreateResponse::default()))
     }
     async fn create_sandbox(
         &self,

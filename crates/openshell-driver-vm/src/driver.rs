@@ -1539,7 +1539,7 @@ impl VmDriver {
             openshell_core::extension_protocol::ExtensionFamily::Compute,
             "openshell/vm",
             openshell_core::VERSION,
-            [],
+            [openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.to_string()],
         );
         extension
             .required_capabilities
@@ -5334,7 +5334,13 @@ impl ComputeDriver for VmDriver {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.validate_sandbox(&sandbox)?;
-        Ok(Response::new(ValidateSandboxCreateResponse {}))
+        Ok(Response::new(ValidateSandboxCreateResponse {
+            ingress_admission: Some(openshell_core::proto::SandboxIngressAdmission {
+                scope: openshell_core::proto::IngressScope::IsolatedLoopback as i32,
+                all_ports: true,
+                ports: Vec::new(),
+            }),
+        }))
     }
 
     async fn create_sandbox(

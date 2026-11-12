@@ -449,7 +449,12 @@ message ValidateSandboxCreateRequest {
   DriverSandbox sandbox = 1;
 }
 
-message ValidateSandboxCreateResponse {}
+message ValidateSandboxCreateResponse {
+  // Required when openshell.compute.ingress-admission is negotiated. Complete
+  // immutable envelope, including an explicit unsupported result. Create/start
+  // must enforce this envelope from the same retained template/configuration.
+  openshell.sandbox.v1.SandboxIngressAdmission ingress_admission = 1;
+}
 
 message GetSandboxRequest {
   // Stable sandbox ID stored by the gateway.

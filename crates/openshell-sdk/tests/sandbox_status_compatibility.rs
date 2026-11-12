@@ -1,14 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compile-time source-compatibility fixture for the v0.1.5 public status shape.
+//! Exhaustive raw status fixture for the documented next-minor API transition.
+//!
+//! This intentionally advances the v0.1.5 source baseline. Legacy wire payloads
+//! still decode; complete raw Rust literals need the new optional field.
+//! See the SDK README migration notice. Do not backport into a 0.1.x patch train.
 
 use openshell_sdk::raw::proto::SandboxStatus;
 
 #[test]
-fn baseline_exhaustive_sandbox_status_literal_still_compiles() {
-    // Intentionally no `..Default::default()`: adding even an optional public
-    // field breaks existing downstream Rust exhaustive struct literals.
+fn next_minor_exhaustive_sandbox_status_literal_compiles() {
+    // Intentionally no `..Default::default()`: future shape changes must be
+    // reviewed against this declared minor baseline, never silently accepted.
     let status = SandboxStatus {
         agent_pod: String::new(),
         agent_fd: String::new(),
@@ -26,6 +30,7 @@ fn baseline_exhaustive_sandbox_status_literal_still_compiles() {
         next_restart_time: None,
         main_process_started_time: None,
         last_token_grant_failure: None,
+        ingress_admission: None,
     };
     assert_eq!(status, SandboxStatus::default());
 }
