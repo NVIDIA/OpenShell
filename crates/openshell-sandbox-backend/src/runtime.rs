@@ -3731,6 +3731,10 @@ mod tests {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
                                 message: "a mediation session is already active".to_string(),
                             },
+                            Request::Wait { process_id } if hold_test_wait(&process_id) => {
+                                // Keep the wait in flight until its transport fails.
+                                std::future::pending().await
+                            }
                             Request::Wait { .. } => Response::Exited {
                                 status: ExitStatusWire::Exited(23),
                             },
@@ -4005,6 +4009,88 @@ mod tests {
         assert_eq!(client.connection_generation().await, recovered_generation);
         assert_eq!(accepted.load(Ordering::Acquire), 2);
         assert_eq!(requests.load(Ordering::Acquire), 5);
+    }
+
+    #[tokio::test]
+    async fn wait_survives_a_second_transport_loss_after_recovery() {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_accepted = accepted.clone();
+        let server_config = certificate.server_config.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream = tokio_rustls::TlsAcceptor::from(server_config.clone())
+                    .accept(stream)
+                    .await
+                    .unwrap();
+                server_accepted.fetch_add(1, Ordering::AcqRel);
+                tokio::spawn(serve_test_grpc(Box::new(stream), "a".repeat(32)));
+            }
+        });
+        let client = Arc::new(BoundaryClient::new(
+            tls_runtime_descriptor(address, certificate.client_tls),
+            test_bearer(&"a".repeat(32)),
+        ));
+        let attach = Request::Attach {
+            supervisor_instance_id: client.supervisor_instance_id,
+            policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+            supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: None,
+        };
+        assert!(matches!(
+            client.call_idempotent(attach).await.unwrap(),
+            Response::Attached { .. }
+        ));
+        assert!(matches!(
+            client.call_idempotent(Request::Confirm).await.unwrap(),
+            Response::Confirmed { .. }
+        ));
+        let process = BoundaryProcess {
+            exec: false,
+            adopted: false,
+            client: client.clone(),
+            process_id: HELD_WAIT_PROCESS_ID.to_string(),
+        };
+        let waiting = tokio::spawn(async move { process.wait().await });
+        held_waits_reach(1).await;
+
+        // First outage: the wait reattaches on a replacement connection.
+        abort_current_transport(&client).await;
+        held_waits_reach(2).await;
+        assert_eq!(accepted.load(Ordering::Acquire), 2);
+        assert!(
+            !waiting.is_finished(),
+            "the first transport loss is recovered"
+        );
+
+        // The workload keeps running well past the first outage's recovery
+        // window. Step virtual time so real I/O, such as HTTP/2 keepalive
+        // pings, still completes on the live replacement connection.
+        for _ in 0..=CONNECT_RETRY_TIMEOUT.as_secs() {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::time::resume();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !waiting.is_finished(),
+            "the replacement connection stays live"
+        );
+
+        // Second outage on the replacement connection: the boundary is still
+        // reachable, so the wait must reattach again rather than report loss.
+        abort_current_transport(&client).await;
+        let status = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("wait finishes once the boundary answers")
+            .expect("wait task")
+            .expect("a second transport loss must be recovered, not reported as boundary loss");
+        assert_eq!(status, BoundaryExitStatus::Exited(23));
+        assert_eq!(accepted.load(Ordering::Acquire), 3);
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -4449,6 +4535,39 @@ mod tests {
             openshell_core::jwt::CredentialEpoch::new(1).expect("test epoch"),
         )
         .expect("test bearer slot")
+    }
+
+    /// Waits for this process are held open by `TestGrpcBoundary` for the
+    /// first `HELD_WAITS` arrivals, then answered with `Exited(23)`.
+    const HELD_WAIT_PROCESS_ID: &str = "test-generation:held-wait:0";
+    const HELD_WAITS: usize = 2;
+    static HELD_WAIT_ARRIVALS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn hold_test_wait(process_id: &str) -> bool {
+        process_id == HELD_WAIT_PROCESS_ID
+            && HELD_WAIT_ARRIVALS.fetch_add(1, Ordering::AcqRel) < HELD_WAITS
+    }
+
+    async fn held_waits_reach(count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while HELD_WAIT_ARRIVALS.load(Ordering::Acquire) < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("held wait reaches the test boundary");
+    }
+
+    async fn abort_current_transport(client: &BoundaryClient) {
+        client
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .expect("cached channel")
+            .transport
+            .abort();
     }
 
     async fn spawn_tls_boundary(
