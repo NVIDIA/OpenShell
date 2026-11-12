@@ -81,6 +81,7 @@ pub fn supports_suspend_resume(peer: &PeerMetadata) -> bool {
 pub fn validate_open(
     request: &OpenBoundaryRequest,
     config: &BoundaryConfig,
+    principal: &crate::sandbox_auth::SandboxProtocolPrincipal,
 ) -> Result<(), tonic::Status> {
     if request.backend_name != crate::BACKEND_NAME
         || request.session_id != config.session_id.to_string()
@@ -92,7 +93,8 @@ pub fn validate_open(
     let descriptor: SandboxRuntimeDescriptor =
         serde_json::from_slice(&request.driver_descriptor)
             .map_err(|_| tonic::Status::invalid_argument("invalid OpenShell runtime descriptor"))?;
-    if descriptor.boundary_id != config.boundary_id
+    if descriptor.boundary_id != principal.session().sandbox_id.as_str()
+        || (!config.boundary_id.is_empty() && descriptor.boundary_id != config.boundary_id)
         || descriptor.generation != config.generation
         || descriptor.session_id != config.session_id
         || descriptor.workload_identity != config.workload_identity

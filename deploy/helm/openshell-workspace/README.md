@@ -32,6 +32,11 @@ Keep `sandboxServiceAccount.name` aligned with the gateway chart's
 `gateway.allowDriverConfig=true` in every workspace release so caller-selected
 PVCs can be admitted.
 
+`gateway.warmPoolSecretReads` defaults to true for template-driven warm pools.
+Recovery reads immutable bootstrap and claim
+Secrets by name. This grants `get` on all Secrets in this namespace, because
+Kubernetes RBAC cannot match generated name prefixes; it adds no list/watch access.
+
 ## Values
 
 | Key | Type | Default | Description |
@@ -41,6 +46,7 @@ PVCs can be admitted.
 | gateway.networkPolicy.podSelector | object | `{"app.kubernetes.io/instance":"openshell","app.kubernetes.io/name":"openshell"}` | Labels selecting gateway pods allowed to reach sandbox SSH. |
 | gateway.serviceAccount.name | string | `"openshell"` | Name of the shared gateway ServiceAccount. |
 | gateway.serviceAccount.namespace | string | `"openshell"` | Namespace containing the shared gateway ServiceAccount. |
+| gateway.warmPoolSecretReads | bool | `true` | Grant namespace-scoped Secret reads for warm-pool bootstrap and claim recovery. Defaults on for template-driven pools; no list/watch permission is added. |
 | nameOverride | string | `""` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Restrict sandbox SSH ingress to the shared gateway pods. |
 | sandboxServiceAccount.annotations | object | `{}` | Annotations added to the generated sandbox ServiceAccount. |

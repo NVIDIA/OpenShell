@@ -286,9 +286,68 @@ fn is_dns_label(value: &str) -> bool {
         && !value.ends_with('-')
 }
 
+/// Operator limits for template-driven spare capacity. Templates supply the
+/// workload and desired count; this switch only disables the optimization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WarmPoolSettings {
+    pub enabled: bool,
+    /// Increment when changing driver configuration or runtime trust.
+    pub revision: u64,
+    /// Per-template bound, including provisioning and deleting spares.
+    pub max_size: u32,
+    pub max_age_secs: u64,
+    pub preparation_timeout_secs: u64,
+}
+
+impl Default for WarmPoolSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            revision: 1,
+            max_size: 16,
+            max_age_secs: 3600,
+            preparation_timeout_secs: 300,
+        }
+    }
+}
+
+/// Internal plan derived from a persisted workload template, never TOML input.
+#[derive(Debug, Clone)]
+pub struct WarmPoolConfig {
+    pub name: String,
+    pub workspace: String,
+    pub revision: u64,
+    pub target_size: u32,
+    pub max_size: u32,
+    pub max_age_secs: u64,
+    pub preparation_timeout_secs: u64,
+    pub spec: openshell_core::proto::compute::v1::DriverSandboxSpec,
+}
+
+impl WarmPoolConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_dns_label(&self.name)
+            || !is_dns_label(&self.workspace)
+            || self.revision == 0
+            || self.max_size == 0
+            || self.max_size > 256
+            || self.target_size > self.max_size
+            || !(60..=86_400).contains(&self.max_age_secs)
+            || !(30..=3600).contains(&self.preparation_timeout_secs)
+            || self.preparation_timeout_secs > self.max_age_secs
+        {
+            return Err("invalid template warm-pool plan".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
+    /// Template-driven spare capacity, enabled by default.
+    pub warm_pool: WarmPoolSettings,
     /// Supervise new sandbox generations with one supervisor shared by the
     /// gateway instead of a supervisor Pod per sandbox. Existing generations
     /// keep the topology recorded when they started.
@@ -500,6 +559,7 @@ pub const ANNOTATION_SCC_SUPPLEMENTAL_GROUPS: &str = "openshift.io/sa.scc.supple
 impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
+            warm_pool: WarmPoolSettings::default(),
             supervisor_topology: None,
             shared_supervisor: None,
             workspace_mode: WorkspaceMode::default(),
@@ -555,9 +615,24 @@ impl Default for KubernetesComputeConfig {
 }
 
 impl KubernetesComputeConfig {
+    pub fn validate_warm_pools(&self) -> Result<(), String> {
+        let pool = &self.warm_pool;
+        if pool.revision == 0
+            || pool.revision == u64::MAX
+            || pool.max_size == 0
+            || pool.max_size > 256
+            || !(60..=86_400).contains(&pool.max_age_secs)
+            || !(30..=3600).contains(&pool.preparation_timeout_secs)
+            || pool.preparation_timeout_secs > pool.max_age_secs
+        {
+            return Err("warm_pool requires a positive revision below u64::MAX, max_size 1..256, age 60..86400s, and preparation timeout 30..3600s <= age".into());
+        }
+        Ok(())
+    }
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
         self.validate_bootstrap_windows()?;
+        self.validate_warm_pools()?;
         self.validate_supervisor_topology()?;
         self.validate_workspace_mode()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;

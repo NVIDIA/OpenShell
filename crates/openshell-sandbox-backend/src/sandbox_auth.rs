@@ -69,7 +69,8 @@ impl SandboxProtocolPrincipal {
 /// Validates Sandbox Protocol metadata without depending on its byte transport.
 pub struct SandboxProtocolAuthenticator {
     verifier: SessionJwtVerifier,
-    expected_sandbox_id: SandboxId,
+    expected_sandbox_id: Mutex<Option<SandboxId>>,
+    resource_binding: std::collections::BTreeMap<String, String>,
     expected_runtime_generation: SandboxGenerationId,
     /// Epoch the runtime was launched with. No credential below it is ever
     /// valid; [`SandboxConnectionRegistry`] holds the owner term in force.
@@ -101,10 +102,40 @@ impl SandboxProtocolAuthenticator {
     ) -> Self {
         Self {
             verifier,
-            expected_sandbox_id,
+            expected_sandbox_id: Mutex::new(Some(expected_sandbox_id)),
+            resource_binding: std::collections::BTreeMap::new(),
             expected_runtime_generation,
             launch_auth_epoch,
         }
+    }
+
+    /// Wait for a gateway-signed assignment to the protected physical runtime.
+    /// Transport authentication alone must never select a logical sandbox.
+    pub fn unassigned(
+        verifier: SessionJwtVerifier,
+        resource_binding: std::collections::BTreeMap<String, String>,
+        expected_runtime_generation: SandboxGenerationId,
+        launch_auth_epoch: CredentialEpoch,
+    ) -> Result<Self, SandboxAuthError> {
+        if resource_binding.is_empty() || resource_binding.values().any(String::is_empty) {
+            return Err(SandboxAuthError::WrongSandbox);
+        }
+        Ok(Self {
+            verifier,
+            expected_sandbox_id: Mutex::new(None),
+            resource_binding,
+            expected_runtime_generation,
+            launch_auth_epoch,
+        })
+    }
+
+    /// Whether a valid gateway credential has fixed the logical identity.
+    #[must_use]
+    pub fn is_assigned(&self) -> bool {
+        self.expected_sandbox_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
     }
 
     /// Verify a supervisor takeover grant for this runtime generation. The
@@ -114,7 +145,11 @@ impl SandboxProtocolAuthenticator {
         grant: &str,
     ) -> Result<VerifiedSupervisorTakeover, SandboxAuthError> {
         let verified = self.verifier.verify_supervisor_takeover(grant)?;
-        if verified.takeover.sandbox_id != self.expected_sandbox_id {
+        let assigned = self
+            .expected_sandbox_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if assigned.as_ref() != Some(&verified.takeover.sandbox_id) {
             return Err(SandboxAuthError::WrongSandbox);
         }
         if verified.takeover.runtime_generation != self.expected_runtime_generation {
@@ -143,14 +178,28 @@ impl SandboxProtocolAuthenticator {
             .filter(|token| !token.is_empty() && !token.chars().any(char::is_whitespace))
             .ok_or(SandboxAuthError::InvalidBearer)?;
         let session = self.verifier.verify(token)?;
-        if session.sandbox_id != self.expected_sandbox_id {
-            return Err(SandboxAuthError::WrongSandbox);
-        }
         if session.runtime_generation != self.expected_runtime_generation {
             return Err(SandboxAuthError::WrongRuntimeGeneration);
         }
         if session.auth_epoch < self.launch_auth_epoch {
             return Err(SandboxAuthError::StaleCredentialEpoch);
+        }
+        let mut assigned = self
+            .expected_sandbox_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(expected) = assigned.as_ref() {
+            if &session.sandbox_id != expected {
+                return Err(SandboxAuthError::WrongSandbox);
+            }
+        } else {
+            if session.auth_epoch != self.launch_auth_epoch {
+                return Err(SandboxAuthError::StaleCredentialEpoch);
+            }
+            if session.resource_binding != self.resource_binding {
+                return Err(SandboxAuthError::WrongSandbox);
+            }
+            *assigned = Some(session.sandbox_id.clone());
         }
         Ok(SandboxProtocolPrincipal {
             connection_id,
@@ -597,6 +646,164 @@ mod tests {
         authenticator: SandboxProtocolAuthenticator,
     }
 
+    #[test]
+    fn late_assignment_requires_signed_binding_and_is_permanent() {
+        use std::collections::BTreeMap;
+        let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).unwrap();
+        let clock: Arc<dyn JwtClock> = Arc::new(FixedClock);
+        let issuer = SessionJwtIssuer::from_ed25519_pem(
+            key.serialize_pem().unwrap().as_bytes(),
+            "key",
+            "gateway",
+            Some(DEFAULT_SESSION_TOKEN_TTL),
+            clock.clone(),
+        )
+        .unwrap();
+        let verifier = SessionJwtVerifier::new(
+            "gateway",
+            SessionTokenProfile::Sandbox,
+            [SessionVerificationKey {
+                key_id: "key".into(),
+                public_key_pem: key.public_key_pem().into_bytes(),
+            }],
+            clock,
+        )
+        .unwrap();
+        let binding = BTreeMap::from([
+            (
+                "kubernetes.sandbox_resource_uid".into(),
+                "sandbox-uid".into(),
+            ),
+            ("kubernetes.workload_pod_uid".into(), "pod-uid".into()),
+        ]);
+        let identity = SandboxRuntimeIdentity {
+            sandbox_id: SandboxId::parse("logical-a").unwrap(),
+            runtime_generation: SandboxGenerationId::parse("generation-a").unwrap(),
+            auth_epoch: CredentialEpoch::new(1).unwrap(),
+        };
+        let auth = SandboxProtocolAuthenticator::unassigned(
+            verifier,
+            binding.clone(),
+            identity.runtime_generation.clone(),
+            identity.auth_epoch,
+        )
+        .unwrap();
+        let authenticate = |token: &openshell_core::jwt::MintedSessionToken| {
+            auth.authenticate(
+                SandboxConnectionId::new(),
+                &metadata(token.token.expose_secret()),
+            )
+        };
+        assert!(!auth.is_assigned());
+        // Even a valid gateway-issued operational token cannot win first assignment.
+        assert!(authenticate(&issuer.mint_pair(&identity).unwrap().sandbox).is_err());
+        for field in binding.keys() {
+            let mut wrong = binding.clone();
+            wrong.insert(field.clone(), "replacement-uid".into());
+            assert!(
+                authenticate(&issuer.mint_bound_sandbox_token(&identity, wrong).unwrap()).is_err()
+            );
+        }
+        let mut wrong = identity.clone();
+        wrong.runtime_generation = SandboxGenerationId::parse("old-generation").unwrap();
+        assert!(
+            authenticate(
+                &issuer
+                    .mint_bound_sandbox_token(&wrong, binding.clone())
+                    .unwrap()
+            )
+            .is_err()
+        );
+        wrong = identity.clone();
+        wrong.auth_epoch = CredentialEpoch::new(2).unwrap();
+        assert!(
+            authenticate(
+                &issuer
+                    .mint_bound_sandbox_token(&wrong, binding.clone())
+                    .unwrap()
+            )
+            .is_err()
+        );
+        let token = issuer
+            .mint_bound_sandbox_token(&identity, binding.clone())
+            .unwrap();
+        assert!(
+            !auth.is_assigned(),
+            "rejected tokens cannot assign the runtime"
+        );
+        let first = authenticate(&token).unwrap();
+        assert!(auth.is_assigned());
+        assert_eq!(first.session().sandbox_id, identity.sandbox_id);
+        assert!(authenticate(&token).is_ok());
+        // Ordinary refreshed tokens work only after the identity was assigned.
+        assert!(authenticate(&issuer.mint_pair(&identity).unwrap().sandbox).is_ok());
+        wrong = identity;
+        wrong.sandbox_id = SandboxId::parse("logical-b").unwrap();
+        assert!(authenticate(&issuer.mint_bound_sandbox_token(&wrong, binding).unwrap()).is_err());
+    }
+
+    #[test]
+    fn concurrent_initial_credentials_cannot_assign_two_sandboxes() {
+        let gateway = Gateway::new();
+        let binding = std::collections::BTreeMap::from([("pod_uid".into(), "pod-1".into())]);
+        let generation = SandboxGenerationId::parse("generation-1").unwrap();
+        let tokens = ["sandbox-a", "sandbox-b"].map(|sandbox| {
+            gateway
+                .issuer
+                .mint_bound_sandbox_token(
+                    &SandboxRuntimeIdentity {
+                        sandbox_id: SandboxId::parse(sandbox).unwrap(),
+                        runtime_generation: generation.clone(),
+                        auth_epoch: CredentialEpoch::new(1).unwrap(),
+                    },
+                    binding.clone(),
+                )
+                .unwrap()
+        });
+        let auth = SandboxProtocolAuthenticator::unassigned(
+            gateway.authenticator.verifier,
+            binding,
+            generation,
+            CredentialEpoch::new(1).unwrap(),
+        )
+        .unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let accepted = std::thread::scope(|scope| {
+            let threads = tokens
+                .iter()
+                .map(|token| {
+                    let auth = &auth;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        auth.authenticate(
+                            SandboxConnectionId::new(),
+                            &metadata(token.token.expose_secret()),
+                        )
+                        .is_ok()
+                    })
+                })
+                .collect::<Vec<_>>();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .filter(|accepted| *accepted)
+                .count()
+        });
+        assert_eq!(accepted, 1);
+        let accepted = tokens
+            .iter()
+            .filter(|token| {
+                auth.authenticate(
+                    SandboxConnectionId::new(),
+                    &metadata(token.token.expose_secret()),
+                )
+                .is_ok()
+            })
+            .count();
+        assert_eq!(accepted, 1);
+    }
+
     impl Gateway {
         fn new() -> Self {
             Self::launched_at(1)
@@ -706,14 +913,16 @@ mod tests {
     fn bearer_identity_must_match_the_provisioned_runtime() {
         let mut gateway = Gateway::new();
         let metadata = metadata(&gateway.token(1));
-        gateway.authenticator.expected_sandbox_id = SandboxId::parse("sandbox-b").unwrap();
+        *gateway.authenticator.expected_sandbox_id.get_mut().unwrap() =
+            Some(SandboxId::parse("sandbox-b").unwrap());
         assert_eq!(
             gateway
                 .authenticator
                 .authenticate(SandboxConnectionId::new(), &metadata),
             Err(SandboxAuthError::WrongSandbox)
         );
-        gateway.authenticator.expected_sandbox_id = SandboxId::parse("sandbox-a").unwrap();
+        *gateway.authenticator.expected_sandbox_id.get_mut().unwrap() =
+            Some(SandboxId::parse("sandbox-a").unwrap());
         gateway.authenticator.expected_runtime_generation =
             SandboxGenerationId::parse("generation-2").unwrap();
         assert_eq!(

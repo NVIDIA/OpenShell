@@ -29,7 +29,10 @@ pub use runtime::{
     MAX_RESTORE_REFERENCE_BYTES, NetworkMediationSource, OpenShellRuntimeBackend,
     ProcessAttachment, ReadyBoundary, ResumeLaunch, RunningBoundary,
 };
-pub use runtime::{BoundaryTransport, BoundaryTransportConnector, validate_runtime_coordinates};
+pub use runtime::{
+    BoundaryTransport, BoundaryTransportConnector, validate_prepared_runtime_coordinates,
+    validate_runtime_coordinates,
+};
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.
 pub const BACKEND_NAME: &str = openshell_core::isolation_registration::BUILTIN_BACKEND_NAME;

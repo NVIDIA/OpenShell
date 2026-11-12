@@ -64,9 +64,10 @@ rules:
     verbs: ["create", "get"]
   - apiGroups: [""]
     resources: ["secrets"]
-    # Bootstrap Secrets are generation-scoped. Recovery deletes them by exact
-    # name.
-    verbs: ["create", "delete"]
+    # Warm-pool recovery reads immutable generation-specific bootstrap and
+    # claim Secrets. RBAC cannot restrict GET by a generated name prefix.
+    # Keep reads when pooling is disabled so existing spares can drain.
+    verbs: ["create", "delete", "get"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]

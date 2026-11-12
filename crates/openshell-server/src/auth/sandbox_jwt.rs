@@ -16,6 +16,7 @@
 use super::authenticator::{AuthFailureReason, AuthMechanism};
 use super::authenticator::{AuthRejection, Authentication, Authenticator, bearer_credential};
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
+use super::sandbox_session::PreparedRuntimeIdentity;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header};
@@ -128,6 +129,17 @@ impl std::fmt::Debug for SandboxSessionJwtAuthority {
 }
 
 impl SandboxSessionJwtAuthority {
+    pub(crate) fn warm_runtime_trust(
+        &self,
+    ) -> openshell_supervisor_control::warm_pool::WarmRuntimeTrust {
+        openshell_supervisor_control::warm_pool::WarmRuntimeTrust {
+            gateway_id: self.gateway_id.clone(),
+            verification_keys: self.verification_keys.clone(),
+            auth_epoch: CredentialEpoch::new(1).expect("nonzero epoch"),
+            session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                .expect("nonzero rotation"),
+        }
+    }
     pub fn from_pem(
         signing_key_pem: &[u8],
         public_key_pem: &[u8],
@@ -185,6 +197,7 @@ impl SandboxSessionJwtAuthority {
             identity.auth_epoch,
             identity.gateway_token_id,
             token_metadata,
+            identity.prepared_runtime.as_ref(),
         )
     }
 
@@ -202,6 +215,7 @@ impl SandboxSessionJwtAuthority {
             auth_epoch,
             gateway_token_id,
             None,
+            None,
         )
     }
 
@@ -213,6 +227,7 @@ impl SandboxSessionJwtAuthority {
         auth_epoch: CredentialEpoch,
         gateway_token_id: uuid::Uuid,
         token_metadata: Option<(uuid::Uuid, i64)>,
+        prepared: Option<&PreparedRuntimeIdentity>,
     ) -> Result<SandboxLaunchAuthentication, Status> {
         // Derive the session from durable launch identity, not token IDs or
         // minting time. Retries and credential renewal retain this session;
@@ -224,30 +239,29 @@ impl SandboxSessionJwtAuthority {
         digest.update(runtime_generation.as_str().as_bytes());
         let mut session_bytes = [0_u8; 16];
         session_bytes.copy_from_slice(&digest.finalize()[..16]);
-        let session_id = uuid::Uuid::from_bytes(session_bytes)
+        let derived_session_id = uuid::Uuid::from_bytes(session_bytes)
             .to_string()
             .parse::<SandboxSessionId>()
             .map_err(|_| Status::internal("invalid derived sandbox session identity"))?;
+        let session_id = prepared.map_or(derived_session_id, PreparedRuntimeIdentity::session_id);
         let identity = SandboxRuntimeIdentity {
             sandbox_id: SandboxId::parse(sandbox_id)
                 .map_err(|_| Status::invalid_argument("sandbox ID is invalid"))?,
             runtime_generation: runtime_generation.clone(),
             auth_epoch,
         };
-        let pair = token_metadata
-            .map_or_else(
-                || {
-                    self.issuer
-                        .mint_pair_with_gateway_token_id(&identity, gateway_token_id)
-                },
-                |(sandbox_token_id, issued_at)| {
-                    self.issuer.mint_pair_with_token_metadata(
-                        &identity,
-                        gateway_token_id,
-                        sandbox_token_id,
-                        issued_at,
-                    )
-                },
+        let (sandbox_token_id, issued_at) =
+            token_metadata.unwrap_or_else(|| (uuid::Uuid::new_v4(), now_secs()));
+        let pair = self
+            .issuer
+            .mint_bound_pair_with_token_metadata(
+                &identity,
+                gateway_token_id,
+                sandbox_token_id,
+                issued_at,
+                prepared
+                    .map(|prepared| prepared.resource_claims().clone())
+                    .unwrap_or_default(),
             )
             .map_err(|error| {
                 warn!(%error, "failed to mint launch-scoped sandbox credentials");
@@ -646,6 +660,105 @@ mod tests {
         assert_ne!(
             first.supervisor.session_id,
             next_launch.supervisor.session_id
+        );
+    }
+
+    #[test]
+    fn prepared_launch_binding_survives_refresh_replay_and_new_generation_clears_it() {
+        use crate::auth::sandbox_session::{
+            PersistedSandboxIdentity, PreparedRuntimeIdentity, RefreshRequestHash,
+        };
+        let key = generate_jwt_key().unwrap();
+        let authority = SandboxSessionJwtAuthority::from_pem(
+            key.signing_key_pem.as_bytes(),
+            key.public_key_pem.as_bytes(),
+            key.kid,
+            "test-gateway",
+            Some(Duration::from_mins(15)),
+        )
+        .unwrap();
+        let verifier = SessionJwtVerifier::new(
+            "test-gateway",
+            SessionTokenProfile::Sandbox,
+            authority.verification_keys.clone(),
+            Arc::new(SystemJwtClock),
+        )
+        .unwrap();
+        let mut identity = PersistedSandboxIdentity::new().unwrap();
+        let session = SandboxSessionId::new();
+        let claims = std::collections::BTreeMap::from([(
+            "kubernetes.workload_pod_uid".into(),
+            "pod-uid".into(),
+        )]);
+        identity.prepared_runtime =
+            Some(PreparedRuntimeIdentity::new(session, claims.clone()).unwrap());
+        let launch = authority
+            .mint_persisted_launch("sandbox-a", &identity)
+            .unwrap();
+        assert_eq!(launch.supervisor.session_id, session);
+        assert_eq!(
+            verifier
+                .verify(launch.supervisor.sandbox_token.expose_secret())
+                .unwrap()
+                .resource_binding,
+            claims
+        );
+        assert!(
+            authority
+                .verify_gateway_token(launch.supervisor.gateway_token.expose_secret())
+                .unwrap()
+                .resource_binding
+                .is_empty()
+        );
+
+        let successor = identity
+            .next_gateway_token(
+                RefreshRequestHash::from_extension_services(&[]).unwrap(),
+                now_secs(),
+                60,
+            )
+            .unwrap();
+        let mut annotations = std::collections::HashMap::new();
+        successor.write(&mut annotations);
+        let reloaded = PersistedSandboxIdentity::read(&annotations).unwrap();
+        let refreshed = authority
+            .mint_persisted_launch("sandbox-a", &reloaded)
+            .unwrap();
+        let replay = authority
+            .mint_persisted_launch("sandbox-a", &reloaded)
+            .unwrap();
+        assert_eq!(refreshed.supervisor.session_id, session);
+        assert_eq!(
+            refreshed.supervisor.sandbox_token.expose_secret(),
+            replay.supervisor.sandbox_token.expose_secret()
+        );
+        assert_eq!(
+            refreshed.supervisor.gateway_token.expose_secret(),
+            replay.supervisor.gateway_token.expose_secret()
+        );
+        assert_eq!(
+            verifier
+                .verify(refreshed.supervisor.sandbox_token.expose_secret())
+                .unwrap()
+                .resource_binding,
+            claims
+        );
+
+        PersistedSandboxIdentity::new()
+            .unwrap()
+            .write(&mut annotations);
+        let restarted = PersistedSandboxIdentity::read(&annotations).unwrap();
+        assert!(restarted.prepared_runtime.is_none());
+        let cold = authority
+            .mint_persisted_launch("sandbox-a", &restarted)
+            .unwrap();
+        assert_ne!(cold.supervisor.session_id, session);
+        assert!(
+            verifier
+                .verify(cold.supervisor.sandbox_token.expose_secret())
+                .unwrap()
+                .resource_binding
+                .is_empty()
         );
     }
 

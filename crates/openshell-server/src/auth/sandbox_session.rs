@@ -3,7 +3,7 @@
 
 //! Durable sandbox runtime identity used to authorize session JWTs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use openshell_core::jwt::{AuthenticatedSandboxSession, CredentialEpoch, SessionJwtError};
 use openshell_core::proto::{Sandbox, SandboxPhase};
@@ -25,6 +25,69 @@ const REFRESH_REPLAY_UNTIL_ANNOTATION: &str = "internal.openshell.ai/refresh-rep
 const REFRESH_REQUEST_HASH_ANNOTATION: &str = "internal.openshell.ai/refresh-request-hash";
 const REFRESH_ISSUED_AT_ANNOTATION: &str = "internal.openshell.ai/refresh-issued-at";
 const REFRESH_ROTATION_ID_ANNOTATION: &str = "internal.openshell.ai/refresh-rotation-id";
+const PREPARED_RUNTIME_ANNOTATION: &str = "internal.openshell.ai/prepared-runtime-identity";
+
+/// Physical identity retained across renewal and supervisor takeover. It is
+/// installed only by a successful prepared-runtime claim, and cleared when a
+/// new runtime generation is created.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedRuntimeIdentity {
+    session_id: openshell_core::SandboxSessionId,
+    resource_claims: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) claimed_from: Option<(SandboxGenerationId, CredentialEpoch)>,
+}
+
+impl PreparedRuntimeIdentity {
+    pub fn new(
+        session_id: openshell_core::SandboxSessionId,
+        resource_claims: BTreeMap<String, String>,
+    ) -> Result<Self, SessionJwtError> {
+        let identity = Self {
+            session_id,
+            resource_claims,
+            claimed_from: None,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn validate(&self) -> Result<(), SessionJwtError> {
+        if self.resource_claims.is_empty()
+            || self
+                .resource_claims
+                .iter()
+                .any(|(key, value)| key.is_empty() || value.is_empty())
+            || self.encode().len() > 64 * 1024
+        {
+            return Err(SessionJwtError::InvalidRuntimeIdentity);
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> String {
+        // Only strings and string-keyed maps; serialization cannot fail.
+        serde_json::to_string(self).expect("serialize prepared runtime identity")
+    }
+
+    pub fn session_id(&self) -> openshell_core::SandboxSessionId {
+        self.session_id
+    }
+
+    pub fn resource_claims(&self) -> &BTreeMap<String, String> {
+        &self.resource_claims
+    }
+
+    pub(crate) fn set_claim_source(
+        &mut self,
+        generation: SandboxGenerationId,
+        epoch: CredentialEpoch,
+    ) -> Result<(), SessionJwtError> {
+        self.claimed_from = Some((generation, epoch));
+        self.validate()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefreshRequestHash(String);
@@ -101,6 +164,7 @@ pub struct PersistedSandboxIdentity {
     pub auth_epoch: CredentialEpoch,
     pub gateway_token_id: Uuid,
     pub refresh_replay: Option<GatewayRefreshReplay>,
+    pub prepared_runtime: Option<PreparedRuntimeIdentity>,
 }
 
 impl PersistedSandboxIdentity {
@@ -111,10 +175,23 @@ impl PersistedSandboxIdentity {
             auth_epoch: CredentialEpoch::new(1)?,
             gateway_token_id: Uuid::new_v4(),
             refresh_replay: None,
+            prepared_runtime: None,
         })
     }
 
     pub fn read(annotations: &HashMap<String, String>) -> Result<Self, SessionJwtError> {
+        let prepared_runtime = annotations
+            .get(PREPARED_RUNTIME_ANNOTATION)
+            .map(|value| {
+                if value.len() > 64 * 1024 {
+                    return Err(SessionJwtError::InvalidRuntimeIdentity);
+                }
+                let identity: PreparedRuntimeIdentity = serde_json::from_str(value)
+                    .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
+                identity.validate()?;
+                Ok(identity)
+            })
+            .transpose()?;
         let runtime_generation = annotations
             .get(RUNTIME_GENERATION_ANNOTATION)
             .ok_or(SessionJwtError::MissingRuntimeIdentity)
@@ -174,10 +251,16 @@ impl PersistedSandboxIdentity {
             auth_epoch,
             gateway_token_id,
             refresh_replay,
+            prepared_runtime,
         })
     }
 
     pub fn write(&self, annotations: &mut HashMap<String, String>) {
+        if let Some(prepared) = &self.prepared_runtime {
+            annotations.insert(PREPARED_RUNTIME_ANNOTATION.into(), prepared.encode());
+        } else {
+            annotations.remove(PREPARED_RUNTIME_ANNOTATION);
+        }
         annotations.insert(
             RUNTIME_GENERATION_ANNOTATION.to_string(),
             self.runtime_generation.to_string(),
@@ -235,6 +318,7 @@ impl PersistedSandboxIdentity {
             runtime_generation: self.runtime_generation.clone(),
             auth_epoch: self.auth_epoch,
             gateway_token_id: derive_token_id(rotation_id, b"gateway")?,
+            prepared_runtime: self.prepared_runtime.clone(),
             refresh_replay: Some(GatewayRefreshReplay {
                 previous_gateway_token_id: self.gateway_token_id,
                 request_hash,
@@ -492,6 +576,7 @@ pub async fn advance_identity_for_takeover(
             auth_epoch,
             gateway_token_id,
             refresh_replay: None,
+            prepared_runtime: current.prepared_runtime.clone(),
         };
         match store
             .update_message_cas::<Sandbox, _>(sandbox_id, metadata.resource_version, |sandbox| {
@@ -511,10 +596,47 @@ pub async fn advance_identity_for_takeover(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claim_source_must_fit_the_persisted_identity_limit() {
+        let session = openshell_core::SandboxSessionId::new();
+        let small =
+            PreparedRuntimeIdentity::new(session, [("pod".into(), "x".into())].into()).unwrap();
+        let overhead = small.encode().len() - 1;
+        let mut full = PreparedRuntimeIdentity::new(
+            session,
+            [("pod".into(), "x".repeat(64 * 1024 - overhead))].into(),
+        )
+        .unwrap();
+        let identity = PersistedSandboxIdentity::new().unwrap();
+        assert!(
+            full.set_claim_source(identity.runtime_generation, identity.auth_epoch)
+                .is_err()
+        );
+    }
     use openshell_core::jwt::SandboxId;
     use openshell_core::proto::SandboxStatus;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use uuid::Uuid;
+
+    #[test]
+    fn prepared_identity_rejects_corrupt_or_incomplete_annotations() {
+        let mut annotations = HashMap::new();
+        PersistedSandboxIdentity::new()
+            .unwrap()
+            .write(&mut annotations);
+        for invalid in [
+            "null".to_string(),
+            "{}".to_string(),
+            serde_json::json!({"session_id": openshell_core::SandboxSessionId::new(), "resource_claims": {}}).to_string(),
+            serde_json::json!({"session_id": openshell_core::SandboxSessionId::new(), "resource_claims": {"pod": ""}}).to_string(),
+            serde_json::json!({"session_id": "invalid", "resource_claims": {"pod": "uid"}}).to_string(),
+            "x".repeat(64 * 1024 + 1),
+        ] {
+            annotations.insert(PREPARED_RUNTIME_ANNOTATION.into(), invalid);
+            assert!(PersistedSandboxIdentity::read(&annotations).is_err());
+        }
+    }
 
     #[test]
     fn refresh_hashes_and_token_ids_preserve_legacy_bytes() {
@@ -553,6 +675,7 @@ mod tests {
             auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
             gateway_token_id: Uuid::from_u128(1),
             refresh_replay: None,
+            prepared_runtime: None,
         };
         let mut metadata = ObjectMeta {
             id: "sandbox-a".to_string(),
@@ -574,6 +697,7 @@ mod tests {
 
     fn principal(auth_epoch: u64, token_id: Uuid) -> AuthenticatedSandboxSession {
         AuthenticatedSandboxSession {
+            resource_binding: BTreeMap::new(),
             sandbox_id: SandboxId::parse("sandbox-a").expect("sandbox ID"),
             runtime_generation: SandboxGenerationId::parse("generation-a")
                 .expect("runtime generation"),
@@ -610,6 +734,7 @@ mod tests {
                     auth_epoch: CredentialEpoch::new(2).expect("auth epoch"),
                     gateway_token_id: Uuid::from_u128(2),
                     refresh_replay: None,
+                    prepared_runtime: None,
                 };
                 next.write(&mut sandbox.metadata.as_mut().expect("metadata").annotations);
             })

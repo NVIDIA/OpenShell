@@ -32,5 +32,10 @@ Keep `sandboxServiceAccount.name` aligned with the gateway chart's
 `gateway.allowDriverConfig=true` in every workspace release so caller-selected
 PVCs can be admitted.
 
+`gateway.warmPoolSecretReads` defaults to true for template-driven warm pools.
+Recovery reads immutable bootstrap and claim
+Secrets by name. This grants `get` on all Secrets in this namespace, because
+Kubernetes RBAC cannot match generated name prefixes; it adds no list/watch access.
+
 {{ template "chart.valuesSection" . }}
 {{ template "helm-docs.versionFooter" . }}

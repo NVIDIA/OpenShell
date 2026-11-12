@@ -11,6 +11,35 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: retains bootstrap Secret reads to drain disabled pools
+    template: templates/role.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          warm_pool:
+            enabled: false
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "delete", "get"]
+
+  - it: grants only namespaced Secret get for template pools by default
+    template: templates/role.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "delete", "get"]
+
   - it: creates the namespaced sandbox Role by default
     template: templates/role.yaml
     asserts:

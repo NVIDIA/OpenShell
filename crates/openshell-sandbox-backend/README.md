@@ -80,6 +80,28 @@ supervisor nor runs workload code. Policy discovery is followed by the existing
 attach, mediation setup, confirm, and explicit start sequence. The existing
 connection registry continues to govern supervisor replacement and recovery.
 
+## Delayed sandbox assignment
+
+A runtime may bootstrap with an empty logical sandbox ID and nonempty physical
+resource claims. Its TLS identity and runtime generation are fixed at creation.
+TLS alone cannot assign it: its first accepted Sandbox Protocol bearer must be
+gateway-signed, carry the exact `resource_binding` claims, and match both the
+generation and launch credential epoch. `mint_bound_sandbox_token` creates this
+initial credential. Authentication permanently fixes the sandbox ID; subsequent
+renewals may omit the physical binding and must retain that logical identity.
+The usual epoch and supervisor takeover checks continue to apply.
+
+`OpenBoundary` additionally checks the descriptor's sandbox ID against the
+authenticated principal, including when the bootstrap has no logical ID.
+The runtime's physical coordinates must still match the protected bootstrap.
+Assignment does not start a workload: attach, policy installation, confirmation,
+and start retain their existing checks.
+
+An unassigned routed runtime keeps its authenticated spare connection idle and
+does not probe pool members while awaiting assignment. Connection failures still
+trigger transport recovery. Once assigned, normal owner discovery resumes.
+There is no runtime-to-gateway connection in this flow.
+
 ## Supervisor takeover
 
 `sandbox_auth::SandboxConnectionRegistry` pins the first supervisor process

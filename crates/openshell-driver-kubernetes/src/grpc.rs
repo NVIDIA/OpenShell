@@ -58,15 +58,25 @@ impl ComputeDriver for ComputeDriverService {
     ) -> Result<Response<AuthenticateSandboxResponse>, Status> {
         self.rpc_tracer
             .trace(openshell_otel::rpc::AUTHENTICATE_SANDBOX, async {
-                let credential = request.into_inner().credential;
+                let request = request.into_inner();
+                let credential = request.credential;
                 if credential.is_empty() {
                     return Err(Status::invalid_argument("credential is required"));
+                }
+                if request.supervisor_registration {
+                    let identity =
+                        Box::pin(self.driver.authenticate_warm_supervisor(&credential)).await?;
+                    return Ok(Response::new(AuthenticateSandboxResponse {
+                        supervisor_registration: Some(identity),
+                        ..Default::default()
+                    }));
                 }
                 let (sandbox_id, runtime_identity) =
                     self.driver.authenticate_sandbox(&credential).await?;
                 Ok(Response::new(AuthenticateSandboxResponse {
                     sandbox_id,
                     runtime_identity,
+                    supervisor_registration: None,
                 }))
             })
             .await
