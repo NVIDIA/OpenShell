@@ -14,7 +14,7 @@ use crate::sandbox_runtime::SandboxRuntimeNames;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
 use kube::api::{DynamicObject, ListParams, Patch, PatchParams};
-use openshell_core::proto::compute::v1::SandboxUpdatePreconditions;
+use openshell_driver_sdk::proto::compute::v1::SandboxUpdatePreconditions;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
@@ -57,7 +57,7 @@ impl KubernetesComputeDriver {
         request: &SandboxUpdatePreconditions,
     ) -> Result<(), KubernetesDriverError> {
         self.update_sandbox_configuration(
-            &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest {
+            &openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationRequest {
                 preconditions: Some(request.clone()),
                 ..Default::default()
             },
@@ -67,7 +67,7 @@ impl KubernetesComputeDriver {
 
     pub async fn update_sandbox_configuration(
         &self,
-        request: &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+        request: &openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationRequest,
     ) -> Result<(), KubernetesDriverError> {
         let image = request.preconditions.as_ref().ok_or_else(|| {
             KubernetesDriverError::InvalidArgument("preconditions are required".into())
@@ -80,7 +80,7 @@ impl KubernetesComputeDriver {
         &self,
         request: &SandboxUpdatePreconditions,
         configuration: Option<
-            &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+            &openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationRequest,
         >,
     ) -> Result<(), KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
@@ -108,7 +108,7 @@ impl KubernetesComputeDriver {
         &self,
         request: &SandboxUpdatePreconditions,
         configuration: Option<
-            &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+            &openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationRequest,
         >,
     ) -> Result<(), KubernetesDriverError> {
         let expected = parse_kubernetes_runtime_identity(&request.expected_runtime_identity)?;
@@ -404,7 +404,9 @@ fn require_stopped_for_image_update(
 fn prepare_update(
     object: &mut DynamicObject,
     request: &SandboxUpdatePreconditions,
-    configuration: Option<&openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    configuration: Option<
+        &openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationRequest,
+    >,
 ) -> Result<bool, KubernetesDriverError> {
     let evidence = object
         .metadata
@@ -501,7 +503,7 @@ fn prepare_update(
 }
 
 fn validate_configuration(
-    request: &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+    request: &openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationRequest,
 ) -> Result<(), KubernetesDriverError> {
     let invalid = |message: &str| KubernetesDriverError::InvalidArgument(message.into());
     if let Some(spec) = &request.main_process
@@ -539,13 +541,13 @@ fn validate_configuration(
 
 fn prepare_configuration(
     object: &mut DynamicObject,
-    request: &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+    request: &openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationRequest,
     repeat: bool,
 ) -> Result<(), KubernetesDriverError> {
     if let Some(spec) = &request.main_process {
         let key = super::ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC;
         let encoded = super::required_sandbox_annotation(object, key)?;
-        let mut main = openshell_core::sandbox_env::MainProcessConfig::decode(&encoded)
+        let mut main = openshell_driver_sdk::sandbox_env::MainProcessConfig::decode(&encoded)
             .map_err(KubernetesDriverError::Precondition)?;
         let original = main.clone();
         main.command.clone_from(&spec.command);

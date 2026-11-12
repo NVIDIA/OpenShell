@@ -8,14 +8,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
 
-use openshell_core::VERSION;
-use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_core::sandbox_env::SupervisorOtlpArgs;
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesImagePullPolicy,
     KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode,
 };
+use openshell_driver_sdk::VERSION;
+use openshell_driver_sdk::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_driver_sdk::sandbox_env::SupervisorOtlpArgs;
 
 #[derive(Parser, Debug)]
 #[command(name = "openshell-driver-kubernetes")]
@@ -28,7 +28,7 @@ struct Args {
         env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON",
         default_value = "{}"
     )]
-    admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
+    admission_config_json: openshell_driver_sdk::resource_admission::DriverAdmissionConfig,
     /// Runtime bootstrap budget in seconds.
     #[arg(long, env = "OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_SECONDS", default_value = "300",
         value_parser = clap::value_parser!(u64).range(1..=86_400))]
@@ -125,7 +125,7 @@ struct Args {
     #[arg(
         long,
         env = "OPENSHELL_SANDBOX_SSH_SOCKET_PATH",
-        default_value = openshell_core::container_paths::SSH_SOCKET_PATH
+        default_value = openshell_driver_sdk::container_paths::SSH_SOCKET_PATH
     )]
     sandbox_ssh_socket_path: String,
 
@@ -135,13 +135,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
-    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
+    #[arg(long, env = openshell_driver_sdk::config::SANDBOX_RUNTIME_IMAGE_ENV)]
     sandbox_runtime_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE_PULL_POLICY")]
     sandbox_runtime_image_pull_policy: Option<KubernetesImagePullPolicy>,
 
-    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
+    #[arg(long, env = openshell_driver_sdk::config::SUPERVISOR_IMAGE_ENV)]
     supervisor_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")]
@@ -283,11 +283,11 @@ async fn main() -> Result<()> {
             },
             sandbox_runtime_image: args
                 .sandbox_runtime_image
-                .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
+                .unwrap_or_else(openshell_driver_sdk::config::default_sandbox_runtime_image),
             sandbox_runtime_image_pull_policy: args.sandbox_runtime_image_pull_policy,
             supervisor_image: args
                 .supervisor_image
-                .unwrap_or_else(openshell_core::config::default_supervisor_image),
+                .unwrap_or_else(openshell_driver_sdk::config::default_supervisor_image),
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
                 app_listener:
@@ -340,18 +340,18 @@ async fn main() -> Result<()> {
     .into_diagnostic()?;
 
     let driver_service = ComputeDriverService::new(driver);
-    let configuration_updates_service = openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver_service.clone());
-    let app_endpoints_service = openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpointsServer::new(driver_service.clone());
+    let configuration_updates_service = openshell_driver_sdk::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver_service.clone());
+    let app_endpoints_service = openshell_driver_sdk::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpointsServer::new(driver_service.clone());
     let service = ComputeDriverServer::new(driver_service);
     let shutdown = async move {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     };
     if let Some(socket_path) = args.bind_socket {
-        let listener = openshell_core::external_driver_socket::bind_private(&socket_path)
+        let listener = openshell_driver_sdk::external_driver_socket::bind_private(&socket_path)
             .map_err(|err| miette::miette!("{err}"))?;
         let _cleanup =
-            openshell_core::external_driver_socket::SocketCleanup::new(socket_path.clone());
+            openshell_driver_sdk::external_driver_socket::SocketCleanup::new(socket_path.clone());
         info!(socket = %socket_path.display(), "Starting Kubernetes compute driver");
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
@@ -359,7 +359,7 @@ async fn main() -> Result<()> {
             .add_service(configuration_updates_service)
             .add_service(app_endpoints_service)
             .serve_with_incoming_shutdown(
-                openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
+                openshell_driver_sdk::external_driver_socket::SameUidUnixIncoming::new(listener),
                 shutdown,
             )
             .await

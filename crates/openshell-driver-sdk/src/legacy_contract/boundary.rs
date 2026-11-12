@@ -22,6 +22,12 @@ pub const MIN_ROUTE_HANDLE_LEN: usize = 16;
 /// Longest accepted route handle, in bytes.
 pub const MAX_ROUTE_HANDLE_LEN: usize = 64;
 
+/// Generate a fresh opaque route handle for one runtime generation.
+#[must_use]
+pub fn new_route_handle() -> String {
+    format!("rt-{}", uuid::Uuid::new_v4().simple())
+}
+
 /// Validate an opaque route handle: 16 to 64 lowercase ASCII letters, digits,
 /// or hyphens.
 pub fn validate_route_handle(handle: &str) -> Result<(), BackendError> {
