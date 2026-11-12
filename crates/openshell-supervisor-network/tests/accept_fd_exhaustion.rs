@@ -61,7 +61,8 @@ fn accept_fd_exhaustion_child() {
     let addr = listener.local_addr().unwrap();
 
     // Place a connection in the kernel backlog before exhausting FDs.
-    let backlog_conn = std::net::TcpStream::connect(addr).expect("backlog connect");
+    let backlog_conn =
+        openshell_core::net::connect_std_tcp_nodelay_best_effort(addr).expect("backlog connect");
 
     // Exhaust remaining FDs.
     #[allow(clippy::collection_is_never_read)]
@@ -86,7 +87,8 @@ fn accept_fd_exhaustion_child() {
     drop(backlog_conn);
 
     // Make a fresh connection now that FDs are available.
-    let client = std::net::TcpStream::connect(addr).expect("connect after FD release");
+    let client = openshell_core::net::connect_std_tcp_nodelay_best_effort(addr)
+        .expect("connect after FD release");
 
     // Accept should succeed, proving that an accept loop retrying on
     // EMFILE (like the proxy does) will recover once FDs are available.

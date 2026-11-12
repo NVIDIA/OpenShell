@@ -601,6 +601,22 @@ Booleans are rejected because they would otherwise convert to 1 or 0.
 {{- end }}
 
 {{/*
+Whether the dedicated metrics listener is enabled. Missing legacy values
+default to enabled; an explicit false must not be replaced by that default.
+*/}}
+{{- define "openshell.metricsEnabled" -}}
+{{- $metrics := .Values.metrics | default dict -}}
+{{- $enabled := true -}}
+{{- if hasKey $metrics "enabled" -}}
+{{- if not (kindIs "bool" $metrics.enabled) -}}
+{{- fail "metrics.enabled must be a boolean" -}}
+{{- end -}}
+{{- $enabled = $metrics.enabled -}}
+{{- end -}}
+{{- if $enabled -}}true{{- end -}}
+{{- end }}
+
+{{/*
 Validate a non-empty, user-provided Kubernetes Secret name. Secret data never
 passes through Helm values into gateway.toml; only this reference is rendered.
 */}}
@@ -743,6 +759,7 @@ like user-supplied schema-v2 fields during compatibility resolution. */}}
 Validate chart values that Helm would otherwise accept silently.
 */}}
 {{- define "openshell.validateValues" -}}
+{{- $metricsEnabled := include "openshell.metricsEnabled" . -}}
 {{- $kubernetes := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- if hasKey $kubernetes "supervisor_topology" -}}
 {{- $topology := get $kubernetes "supervisor_topology" -}}
@@ -807,6 +824,33 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- if and (eq $workloadKind "statefulset") (gt $maxReplicas 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail (printf "%s > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." $maxReplicasSource) -}}
+{{- end -}}
+{{- $servicePortValue := toString .Values.service.port -}}
+{{- $healthPortValue := toString .Values.service.healthPort -}}
+{{- $metricsPortValue := toString .Values.service.metricsPort -}}
+{{- if not (regexMatch `^-?[0-9]+$` $servicePortValue) -}}
+{{- fail "service.port must be an integer." -}}
+{{- end -}}
+{{- if not (regexMatch `^-?[0-9]+$` $healthPortValue) -}}
+{{- fail "service.healthPort must be an integer." -}}
+{{- end -}}
+{{- $servicePort := int $servicePortValue -}}
+{{- $healthPort := int $healthPortValue -}}
+{{- $metricsPort := int $metricsPortValue -}}
+{{- if or (lt $servicePort 1) (gt $servicePort 65535) -}}
+{{- fail "service.port must be between 1 and 65535." -}}
+{{- end -}}
+{{- if or (lt $healthPort 1) (gt $healthPort 65535) -}}
+{{- fail "service.healthPort must be between 1 and 65535 because gateway probes require it." -}}
+{{- end -}}
+{{- if eq $servicePort $healthPort -}}
+{{- fail "service.port and service.healthPort must be different." -}}
+{{- end -}}
+{{- if or (not (regexMatch `^[0-9]+$` $metricsPortValue)) (lt $metricsPort 1) (gt $metricsPort 65535) -}}
+{{- fail "service.metricsPort must be an integer between 1 and 65535; to disable metrics, set metrics.enabled=false and keep a valid service.metricsPort (default 9090)" -}}
+{{- end -}}
+{{- if and $metricsEnabled (or (eq $metricsPort $servicePort) (eq $metricsPort $healthPort)) -}}
+{{- fail "service.metricsPort must differ from service.port and service.healthPort when metrics.enabled=true" -}}
 {{- end -}}
 {{- if and .Values.grpcRoute.enabled (dig "replicaRouting" "enabled" false .Values.grpcRoute) -}}
 {{- if ne $workloadKind "statefulset" -}}

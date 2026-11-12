@@ -72,7 +72,7 @@ Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTA
 
 Pull requests that touch the enforcement machinery or reviewer routing — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `REVIEWERS.md`, `.github/CODEOWNERS`, or the enforcement and reviewer-routing scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
 
-Use exactly one `area:` label and any relevant `topic:` labels on your pull request. The [reviewer routing workflow](.github/workflows/review-readiness.yml) requests all matching members of [REVIEWERS.md](REVIEWERS.md), excluding the author, when a PR opens ready for review, leaves draft status, or gains or loses an area/topic label. Reviewers do not need repository write access to receive requests or review PRs. Manual reviewer choices and people who have commented or reviewed are preserved. Propose roster membership changes through a reviewed PR.
+Once your pull request represents [accepted work](#accepted-work), apply exactly one `area:` label and any relevant `topic:` labels. Follow [Labeling and Notifications](#labeling-and-notifications) before applying classification labels. The [reviewer routing workflow](.github/workflows/review-readiness.yml) requests all matching members of [REVIEWERS.md](REVIEWERS.md), excluding the author, when a PR opens ready for review, leaves draft status, or gains or loses an area/topic label. Reviewers do not need repository write access to receive requests or review PRs. Manual reviewer choices and people who have commented or reviewed are preserved. Propose roster membership changes through a reviewed PR.
 
 If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
 
@@ -106,13 +106,15 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Contributing    | `create-security-advisory` | Prepare structured vulnerability reports and authorized private GitHub advisory drafts             |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
+| Reviewing       | `omit-needless-words`     | Flag wordy, historical, duplicated, or out-of-spec prose and code in a change                       |
 | Reviewing       | `review-security-issue`   | Assess security issues and private advisories for severity and remediation                           |
 | Reviewing       | `fix-security-issue`      | Implement an approved security remediation plan                                                     |
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
 | Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Maintenance     | `release-openshell`       | Pick the latest qualified prerelease and tag its commit as stable                                   |
-| Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
+| Triage          | `triage-issue`            | Assess and route community-filed issues                                                  |
+| Triage          | `label-issue`             | Classify accepted issues and PRs, correct labels, and migrate legacy associations                   |
 | Triage          | `review-triage-queue`     | Create a local, read-only queue report from GitHub intake                                           |
 | Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
@@ -131,7 +133,34 @@ A direct request to an agent authorizes the requested planning or implementation
 
 Do not file suspected vulnerabilities as public issues. Follow [SECURITY.md](SECURITY.md). Use the specialized security skills for authorized review or remediation.
 
+### Accepted Work
+
+Accepted work is work the project intends to pursue. Work submitted by a maintainer listed in the merged [MAINTAINERS.md](MAINTAINERS.md), or someone with repository `WRITE`, `MAINTAIN`, or `ADMIN` access, qualifies immediately. Other issues require a maintainer's acceptance, recorded with `state:accepted`.
+
+A PR represents accepted work when either:
+
+- Its author is a maintainer or has repository write access as described above.
+- It closes at least one issue in this repository that has `state:accepted`, and the PR author is that issue's submitter or a current assignee.
+
+Use GitHub closing references such as `Closes #123` or `Fixes #123`.
+
+The definition of accepted work is encoded in `tasks/scripts/label_accepted_work.py` and should be directly imported where needed.
+
+Acceptance classifies work, not implementation quality or approval to merge. Existing issue-linking rules, the separate `PR Issue Acceptance` check (which requires every linked issue to be accepted for community authors), and maintainer/code-owner approvals still apply. Acceptance does not certify that the diff implements the issue, and the existing Dependabot gate exemption does not automatically qualify a PR as accepted work.
+
+### Labeling and Notifications
+
+Labels drive notification streams as well as classification. Contributors use the GitHub app in Slack, and other integrations, to follow issues and PRs filtered by area or topic. Applying those labels can notify subscribers immediately, before they have chosen to follow the individual item.
+
+Apply `area:` and `topic:` classification labels only after the issue or PR meets the shared [accepted-work definition](#accepted-work). Once accepted, apply the relevant classification labels using the [label-issue skill](.agents/skills/label-issue/SKILL.md) so subscribers can find the work.
+
+Do not classify an issue merely because it was filed or its subject is clear. Waiting until acceptance keeps label-filtered streams focused on work the project intends to pursue and avoids sending unaccepted intake to subscribers. Workflow labels such as `state:triage-needed` still record intake status; they do not establish acceptance.
+
+Automatic classification at issue creation and filters that exclude unaccepted work are being discussed separately in [#5261](https://github.com/NVIDIA/OpenShell/issues/5261). Until that policy changes, defer classification labels until acceptance.
+
 ### Label Discovery
+
+Classify SDK work with `topic:sdk:go`, `topic:sdk:python`, `topic:sdk:rust`, or `topic:sdk:typescript`. For work spanning SDKs, apply each supported language topic. Propose individual reviewer membership changes through review. Only apply a topic after its live definition and routing support are available.
 
 Retrieve every page of repository labels and their descriptions:
 
@@ -383,7 +412,6 @@ These are the primary `mise` tasks for day-to-day development:
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK (frozen, moved to ai-openshell/sdk-python) |
-| `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
 | `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
@@ -458,6 +486,12 @@ The `PR Issue Acceptance` workflow reports the native `OpenShell / PR Issue Acce
 Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not bypass `PR Issue Acceptance` for authors without repository write access or change applicable verification, review, or private vulnerability disclosure requirements.
 
 Authors with `WRITE`, `MAINTAIN`, or `ADMIN` access may open a PR that only fixes a broken build or flaky tests without a separate issue. Describe the failure in the PR instead. Authors without write access follow the normal issue and acceptance requirements.
+
+### Automatic Acceptance Labeling
+
+The existing [review-readiness workflow](.github/workflows/review-readiness.yml) checks [accepted work](#accepted-work) when a PR is opened and adds `state:accepted` if it qualifies. This includes drafts and PRs awaiting area/topic classification. Reviewer requests still wait until a PR is ready and has an area label.
+
+This is an additive check at creation, not continuous reconciliation: later edits, permission changes, and issue-label or assignment changes do not refresh or remove the PR label. The shared library is read-only; review-readiness applies the label. The label does not replace the issue-acceptance gate or merge approvals.
 
 ### Branch Names
 

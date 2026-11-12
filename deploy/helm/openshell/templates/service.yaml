@@ -18,7 +18,7 @@ spec:
       {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
       nodePort: {{ .Values.service.nodePort }}
       {{- end }}
-    {{- if .Values.service.metricsPort }}
+    {{- if include "openshell.metricsEnabled" . }}
     - port: {{ .Values.service.metricsPort }}
       targetPort: metrics
       protocol: TCP

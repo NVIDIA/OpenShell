@@ -152,11 +152,13 @@ Filtering only returns workspaces you are authorized to view.
 openshell workspace list --label-selector env=dev,team=ml
 ```
 
-Inspect a workspace to see its labels, or use structured list output for
-automation.
+Inspect a workspace to see its labels. Pass `--output json` or `--output yaml`
+to `workspace create`, `workspace get`, or `workspace list` for structured
+output in automation.
 
 ```shell
 openshell workspace get team-research
+openshell workspace get team-research --output json
 openshell workspace list --label-selector env=dev --output json
 ```
 

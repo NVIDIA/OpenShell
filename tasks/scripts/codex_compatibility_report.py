@@ -11,7 +11,6 @@ from pathlib import Path
 SURFACES = (
     "rust-sdk",
     "python-sdk",
-    "go-sdk",
     "typescript-sdk",
     "api-behavior",
     "cli",

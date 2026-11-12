@@ -57,6 +57,16 @@ Override with env vars before running `helm:k3s:create`:
   `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
 - `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
 
+### Gateway metrics
+
+The chart enables its dedicated Prometheus endpoint by default. Set
+`metrics.enabled=false` to omit the listener and its container and Service
+ports without changing `service.metricsPort` (default `9090`). The port must
+remain between 1 and 65535 even when disabled. Legacy `metricsPort: 0` or
+`false` values fail rendering; migrate them to `metrics.enabled=false` and a
+valid port in the same upgrade. `metrics.tls.enabled=true` requires
+`metrics.enabled=true`. This setting does not disable OpenTelemetry export.
+
 ### Shared supervisor plumbing
 
 Set `gatewayConfig.openshell.drivers.kubernetes.supervisor_topology`

@@ -74,7 +74,7 @@ SDKs connect applications to an OpenShell gateway. They do not install the CLI. 
 |---|---|---|
 | Python | `uv add openshell` | [README](python/openshell/) |
 | TypeScript | `npm install @nvidia/openshell-sdk` (GitHub Packages) | [README](sdk/typescript/README.md) |
-| Go | `go get github.com/NVIDIA/OpenShell/sdk/go@latest` | [README](sdk/go/README.md) |
+| Go | `go get github.com/ai-openshell/sdk-go@vX.Y.Z` | [ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go) |
 | Rust | `cargo add openshell-sdk --git https://github.com/NVIDIA/OpenShell --tag <release-tag>` | [Installation and usage](docs/sdk/rust.mdx) |
 
 ## Community

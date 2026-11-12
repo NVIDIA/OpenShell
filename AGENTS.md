@@ -172,6 +172,10 @@ ocsf_emit!(event);
   `openshell_core::net::set_tcp_nodelay_best_effort` on an accepted or
   already-connected stream, or `openshell_core::net::connect_tcp_nodelay_best_effort`
   when dialing.
+- Clippy rejects raw `TcpStream::connect` (`clippy.toml`). Dial with
+  `openshell_core::net::connect_tcp_nodelay_best_effort`, or
+  `connect_std_tcp_nodelay_best_effort` on blocking threads. The lint does not
+  cover accepted sockets, so keep setting nodelay on those by hand.
 - This applies to loopback/localhost TCP too — the delayed-ACK stall is a timer
   behavior, not wire latency.
 - You should skip it for unix domain sockets (no Nagle). It's not critical for
@@ -194,10 +198,9 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 - Sign off on each commit for DCO compliance. Use the `--signoff` option to `git commit` to add the `Signed-off-by` footer to ensure the user's configured email address is used.
 - Never mention Claude or any AI agent in commits, PR descriptions, or issues (no author attribution, no Co-Authored-By, no "Generated with" footers)
 
-## Go SDK (`sdk/go/`)
+## Go SDK
 
-- The Go SDK moved to [ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go) (module `github.com/ai-openshell/sdk-go`). Open SDK changes there.
-- `sdk/go/` is frozen until it is removed; Branch Checks fails PRs that change it. Proto changes do not need regenerated Go bindings.
+- The Go SDK lives in [ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go) (module `github.com/ai-openshell/sdk-go`). Open SDK changes, including dependency and security updates, there; proto changes here need no Go bindings.
 
 ## Python SDK (`python/openshell/`)
 
