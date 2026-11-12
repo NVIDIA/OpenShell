@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/oci-object-storage.yaml
+#   openshell provider profile import -f providers/oci-object-storage.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   curl and the OCI CLI. Add python for the OCI SDK if the
+#                    workload uses it. `binaries` also matches a process's
+#                    ancestors; keep the list narrow.
+# Reference layout:  /usr/bin/curl and an OCI CLI installed at
+#                    /usr/local/bin/oci (the pip/uv installer default). The
+#                    CLI must be told not to sign: run it with
+#                    `--auth none`-style behaviour is not available, so prefer
+#                    curl or an SDK client configured with a no-op signer; the
+#                    proxy adds the real signature.
+# Credential scope:  OCI_KEY_ID and OCI_PRIVATE_KEY, signed by the proxy. The
+#                    sandbox never holds a usable key.
+# Endpoint access:   the regional Object Storage hosts in the commercial realm,
+#                    read-write (GET, HEAD, POST, PUT, PATCH), TLS terminated
+#                    so the proxy can sign each request. PUT and POST bodies
+#                    are buffered for hashing. DELETE is not in read-write:
+#                    grant it in your copy with `access: full` or explicit
+#                    `rules`, as with aws-s3.yaml.
+#                    Attach one OCI signing profile per sandbox: two attached
+#                    profiles may not both provide OCI_KEY_ID. To reach several
+#                    OCI services from one sandbox, attach the endpointless
+#                    oci.yaml profile and bind it from a sandbox policy.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      curl -sS https://objectstorage.us-chicago-1.oraclecloud.com/n/<namespace>/b/<bucket>/o
+
+id: oci-object-storage
+display_name: OCI Object Storage
+description: OCI Object Storage via proxy-side OCI request signing
+category: data
+credentials:
+  - name: key_id
+    description: OCI signing key id (tenancy/user/fingerprint for an API key, or ST$<token> for a principal)
+    env_vars: [OCI_KEY_ID]
+    required: true
+  - name: private_key
+    description: Base64 of the unencrypted RSA private key PEM that pairs with the key id (single line, `base64 -w0 < key.pem`)
+    env_vars: [OCI_PRIVATE_KEY]
+    required: true
+endpoints:
+  # `*` matches exactly one DNS label, which is the region identifier.
+  - host: "objectstorage.*.oraclecloud.com"
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+    credential_signing: oci
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl
+  - /usr/local/bin/oci
