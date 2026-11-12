@@ -548,6 +548,12 @@ service OpenShell {
     };
   }
 
+  // Mint a short-lived client assertion for one attached provider credential.
+  rpc MintProviderClientAssertion(MintProviderClientAssertionRequest)
+      returns (MintProviderClientAssertionResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "sandbox" };
+  }
+
   // Exchange a stored provider subject token for an intermediate token scoped
   // to the calling supervisor's SPIFFE identity.
   rpc ExchangeProviderSubjectToken(ExchangeProviderSubjectTokenRequest)
@@ -2398,6 +2404,14 @@ enum ProviderCredentialTokenGrantType {
   PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_UNSPECIFIED = 0;
   PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_CLIENT_CREDENTIALS = 1;
   PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE = 2;
+  // Wire discriminator for OAuth2 client_credentials with assertion_source
+  // openshell_gateway. Keep it distinct from CLIENT_CREDENTIALS so an older
+  // receiver cannot ignore the identity selection and use SPIFFE instead.
+  // Profile clients preserving this selection send gRPC metadata
+  // openshell-profile-openshell-gateway-assertion-source: 1 on list, get,
+  // import, and update calls. Before importing or updating, check the
+  // LintProviderProfilesResponse capability acknowledgment.
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_OPENSHELL_CLIENT_CREDENTIALS = 3;
 }
 
 message ProviderCredentialTokenGrantSubjectToken {
@@ -2449,6 +2463,11 @@ message ProviderCredentialTokenGrant {
   // OAuth2 requested_token_type. If omitted for token_exchange, OpenShell uses
   // urn:ietf:params:oauth:token-type:access_token.
   string requested_token_type = 10;
+
+  // Output-only handle for auth_style placeholder. The gateway binds it to
+  // the sandbox, attachment epoch, provider identity and profile revision.
+  // Profile-authored values are ignored.
+  string workload_credential_handle = 11;
 }
 
 // Provider credential declaration.
@@ -2475,6 +2494,11 @@ message ProviderProfileCredential {
   // Gateway-managed refresh and token-grant credentials cannot opt in because
   // they require identity-bearing handles for authorization-epoch revocation.
   bool stable_placeholder = 12;
+  // Output-only immutable provider identity derived by the gateway for a
+  // resolved token grant in an installed provider environment snapshot.
+  // Profile-authored values are ignored. Supervisors must use this value,
+  // never a workload-supplied identity, when requesting a gateway assertion.
+  string token_grant_provider_id = 13;
 }
 
 enum ProviderCredentialRefreshStrategy {
@@ -2729,6 +2753,9 @@ message LintProviderProfilesResponse {
   // Clients enabling stable_placeholder check this before import or update,
   // since older gateways silently discard unknown credential fields.
   bool supports_stable_placeholder = 3;
+  // Clients must observe this before importing or updating a profile that
+  // selects the openshell_gateway assertion source.
+  bool supports_openshell_gateway_assertion_source = 4;
 }
 
 // Delete provider response.
@@ -2873,6 +2900,28 @@ message ProviderEnvironmentSnapshot {
   ProviderReadinessReason readiness_reason = 6;
   // Complete desired set of non-secret managed files, keyed by absolute path.
   map<string, string> files = 7;
+}
+
+message MintProviderClientAssertionRequest {
+  // The per-sandbox supervisor's authenticated, immutable sandbox ID.
+  string sandbox_id = 1;
+  string provider = 2;
+  string credential_key = 3;
+  // Expected value from the supervisor's snapshot. The gateway checks its
+  // current profile and operator registration before minting.
+  string token_endpoint = 4;
+  // Immutable provider ID from the supervisor's installed credential snapshot.
+  // The gateway refuses if the provider currently attached under the name has
+  // a different ID, even when the replacement is independently registered.
+  string expected_provider_id = 5;
+}
+
+message MintProviderClientAssertionResponse {
+  string client_assertion = 1 [(openshell.options.v1.secret) = true];
+  // Acknowledges the immutable provider identity that the gateway checked.
+  // The supervisor must compare this to the installed snapshot before using
+  // the assertion. An absent value identifies an unsupported gateway.
+  string bound_provider_id = 2;
 }
 
 message ExchangeProviderSubjectTokenRequest {

@@ -1,21 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `OAuth2` JWT client assertion token grant using SPIFFE JWT-SVID.
+//! `OAuth2` token acquisition for endpoint-bound provider credentials.
 //!
-//! When a provider profile includes a `token_grant` configuration, the
-//! supervisor obtains `OAuth2` access tokens on-demand by authenticating to the
-//! token service using the sandbox's SPIFFE JWT-SVID as the client assertion.
-//!
-//! ## Flow
-//!
-//! 1. HTTP proxy intercepts outbound request to provider endpoint
-//! 2. Check token cache for unexpired access token
-//! 3. On cache miss or expiry:
-//!    a. Fetch JWT-SVID from SPIRE agent (via Workload API)
-//!    b. POST to token service with JWT client assertion grant
-//!    c. Cache the returned access token with TTL
-//! 4. Inject `Authorization: Bearer <access_token>` header
+//! The supervisor normally authenticates using the sandbox's SPIFFE JWT-SVID.
+//! A `client_credentials` profile with `assertion_source: openshell_gateway` uses a dedicated, gateway-signed
+//! assertion for its registered token endpoint. Each grant returns an access
+//! token for injection at the matching provider endpoint.
 //!
 //! ## Configuration
 //!
@@ -32,7 +23,7 @@
 //! Each sandbox instance owns a [`SandboxInstanceTokenGrants`]: its token cache,
 //! HTTP client, gateway credentials, sandbox ID, and SPIFFE Workload API
 //! socket. A token is never served to another sandbox. Without a configured
-//! Workload API socket, grants fail closed with a configuration failure.
+//! Workload API socket, SPIFFE-based grants fail closed.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -116,7 +107,7 @@ pub struct SandboxInstanceTokenGrants {
 
 impl SandboxInstanceTokenGrants {
     /// Grants authenticated as `sandbox_id` through `gateway`. A missing
-    /// Workload API socket makes every grant fail closed.
+    /// Workload API socket disables SPIFFE-based grants.
     #[must_use]
     pub fn new(
         gateway: Option<GatewayEndpoint>,
@@ -134,10 +125,8 @@ impl SandboxInstanceTokenGrants {
 
     /// Obtain an `OAuth2` access token for a provider using JWT client assertion grant.
     ///
-    /// This fetches the sandbox's SPIFFE JWT-SVID from the instance's Workload
-    /// API socket, then exchanges it for an access token with a POST request to
-    /// the provider's token endpoint with the JWT client assertion grant flow
-    /// (RFC 7523).
+    /// The selected grant determines whether the assertion comes from the
+    /// sandbox's Workload API socket or the gateway signing authority.
     ///
     /// Tokens are cached per provider name with TTL in this instance's cache.
     /// Subsequent calls return the cached token if it has not expired.
@@ -145,7 +134,7 @@ impl SandboxInstanceTokenGrants {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - SPIFFE Workload API socket is not configured
+    /// - The selected identity source is unavailable or refuses the request
     /// - SPIRE agent is unreachable
     /// - JWT-SVID fetch fails
     /// - Token service request fails
@@ -156,6 +145,17 @@ impl SandboxInstanceTokenGrants {
     ) -> Result<String, TokenGrantFailure> {
         let grant_type = ProviderCredentialTokenGrantType::try_from(request.grant_type)
             .map_err(|_| configuration_failure())?;
+        if grant_type == ProviderCredentialTokenGrantType::OpenshellClientCredentials
+            && (request.provider_id.is_empty()
+                || !request.jwt_svid_audience.is_empty()
+                || !request.client_assertion_type.is_empty()
+                || !request.requested_token_type.is_empty()
+                || !openshell_core::provider_credentials::provider_assertion_endpoint(
+                    request.token_endpoint,
+                ))
+        {
+            return Err(configuration_failure());
+        }
         obtain_provider_token_with_grant(
             ObtainProviderTokenInput {
                 cache: &self.cache,
@@ -170,10 +170,41 @@ impl SandboxInstanceTokenGrants {
                 requested_token_type: request.requested_token_type,
             },
             |jwt_audience| async move {
+                let http_client = self.http_client.as_ref().map_err(|failure| *failure)?;
                 // Resolve local exchange prerequisites before fetching any workload credential.
                 let exchange_context = match grant_type {
                     ProviderCredentialTokenGrantType::ClientCredentials
                     | ProviderCredentialTokenGrantType::Unspecified => None,
+                    ProviderCredentialTokenGrantType::OpenshellClientCredentials => {
+                        let (provider, credential_key) =
+                            parse_provider_credential_key(request.provider_name)?;
+                        let gateway = self.gateway.as_ref().ok_or_else(configuration_failure)?;
+                        let sandbox_id =
+                            self.sandbox_id.as_ref().ok_or_else(configuration_failure)?;
+                        let assertion =
+                            openshell_core::grpc_client::mint_provider_client_assertion(
+                                gateway,
+                                openshell_core::proto::MintProviderClientAssertionRequest {
+                                    sandbox_id: sandbox_id.clone(),
+                                    provider: provider.into(),
+                                    credential_key: credential_key.into(),
+                                    token_endpoint: request.token_endpoint.into(),
+                                    expected_provider_id: request.provider_id.into(),
+                                },
+                                request.request_id,
+                            )
+                            .await?;
+                        return perform_token_grant(
+                            http_client,
+                            request.token_endpoint,
+                            &assertion,
+                            "",
+                            request.audience,
+                            request.scopes,
+                            request.request_id,
+                        )
+                        .await;
+                    }
                     ProviderCredentialTokenGrantType::TokenExchange => {
                         let (provider, credential_key) =
                             parse_provider_credential_key(request.provider_name)?;
@@ -186,7 +217,6 @@ impl SandboxInstanceTokenGrants {
                         Some((provider, credential_key, gateway, sandbox_id))
                     }
                 };
-                let http_client = self.http_client.as_ref().map_err(|failure| *failure)?;
                 let socket_path = self
                     .workload_api_socket
                     .as_deref()
@@ -250,6 +280,8 @@ impl SandboxInstanceTokenGrants {
 /// One provider token request; see [`SandboxInstanceTokenGrants::obtain_provider_token`].
 pub struct ObtainProviderTokenRequest<'a> {
     pub provider_name: &'a str,
+    /// Immutable identity from gateway-delivered installed credential metadata.
+    pub provider_id: &'a str,
     pub token_endpoint: &'a str,
     pub jwt_svid_audience: &'a str,
     pub client_assertion_type: &'a str,
@@ -382,7 +414,7 @@ fn configuration_failure() -> TokenGrantFailure {
 async fn perform_token_grant(
     http_client: &TokenGrantClient,
     token_endpoint: &str,
-    jwt_svid: &str,
+    assertion: &str,
     client_assertion_type: &str,
     audience: &str,
     scopes: &[String],
@@ -392,7 +424,7 @@ async fn perform_token_grant(
         http_client,
         token_endpoint,
         &TokenGrantParams {
-            client_assertion: jwt_svid,
+            client_assertion: assertion,
             client_assertion_type,
             audience,
             scopes,
@@ -662,6 +694,50 @@ mod tests {
     use tokio::net::TcpListener;
 
     const TEST_REQUEST_ID: &str = "4f1c2b3a-9d8e-4c7b-a6f5-e4d3c2b1a098";
+
+    #[tokio::test]
+    async fn token_grant_identity_mode_selects_only_its_own_source() {
+        // An insecure gateway is rejected before connection. A SPIFFE grant
+        // instead reaches the missing socket check on the same instance.
+        let gateway = GatewayEndpoint::new(
+            "http://localhost:1",
+            openshell_core::grpc_client::GatewayCredentials::from_gateway_token("synthetic")
+                .unwrap(),
+        );
+        let grants =
+            SandboxInstanceTokenGrants::new(Some(gateway), Some("sandbox-id".into()), None);
+        let request = |grant_type: ProviderCredentialTokenGrantType| ObtainProviderTokenRequest {
+            provider_name: "attached:access",
+            provider_id: "provider-id",
+            token_endpoint: "https://issuer.example/token",
+            jwt_svid_audience: "",
+            client_assertion_type: "",
+            audience: "",
+            scopes: &[],
+            cache_ttl_override: None,
+            grant_type: grant_type as i32,
+            requested_token_type: "",
+            request_id: TEST_REQUEST_ID,
+        };
+        let assertion = grants
+            .obtain_provider_token(request(
+                ProviderCredentialTokenGrantType::OpenshellClientCredentials,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(assertion.stage(), TokenGrantStage::GatewayRpc);
+        for mode in [
+            ProviderCredentialTokenGrantType::Unspecified,
+            ProviderCredentialTokenGrantType::ClientCredentials,
+            ProviderCredentialTokenGrantType::TokenExchange,
+        ] {
+            let err = grants
+                .obtain_provider_token(request(mode))
+                .await
+                .unwrap_err();
+            assert_eq!(err.stage(), TokenGrantStage::Configuration);
+        }
+    }
 
     fn test_http_client() -> TokenGrantClient {
         TokenGrantClient::new().expect("token grant HTTP client")

@@ -177,10 +177,20 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // The provider assertion RPC adds two public messages; the grant type's
+    // new enum value is also visible in persisted provider profiles.
+    // ProviderProfileCredential.token_grant_provider_id is additive in both
+    // closures. Prior profiles decode an empty value, and the gateway derives
+    // it from the provider record only when delivering a credential snapshot.
+    // Lint capability and mint request/response binding fields are public-only.
+    // ProviderCredentialTokenGrant field 11 adds a gateway-derived workload
+    // handle to both descriptor closures. An older grant decodes an empty
+    // handle. Authored profiles strip the field before persistence, and the
+    // gateway supplies it only in a resolved sandbox environment snapshot.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3b4c2af6cf22e7ed1d84279ff865acb0db7199717bee9bc041caef791334104d";
+        "7bf554e62f9a82602a1c246c89e711d7d0a53b481a6ab32b87aa520b69f0714a";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "db345aa85fe225ee7d3f391f28a033cc0adfc11b3a882d0a4c34ccba1afe8acf";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -652,7 +662,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            109 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            110 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -662,7 +672,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            82 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -672,7 +682,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -723,7 +733,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (337, 31),
+                (339, 31),
                 (100, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
@@ -808,6 +818,27 @@ mod tests {
         assert!(credential.required);
         assert_eq!(credential.auth_style, "bearer");
         assert!(!credential.stable_placeholder);
+        assert!(credential.token_grant_provider_id.is_empty());
+    }
+
+    #[test]
+    fn legacy_token_grant_decodes_without_a_workload_handle() {
+        use openshell_core::proto::{
+            ProviderCredentialTokenGrant, ProviderCredentialTokenGrantType,
+        };
+
+        // The previous wire shape has the issuer URL (field 1) and the client
+        // credentials grant type (field 8).
+        let bytes =
+            legacy_bytes("0a1c68747470733a2f2f6973737565722e6578616d706c652f746f6b656e4001");
+        let grant = ProviderCredentialTokenGrant::decode(bytes.as_slice()).unwrap();
+        assert_eq!(grant.token_endpoint, "https://issuer.example/token");
+        assert_eq!(
+            grant.grant_type,
+            ProviderCredentialTokenGrantType::ClientCredentials as i32
+        );
+        assert!(grant.workload_credential_handle.is_empty());
+        assert_eq!(grant.encode_to_vec(), bytes);
     }
 
     #[test]

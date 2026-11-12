@@ -211,6 +211,8 @@ Use `profile describe` to inspect a definition's credential metadata, endpoints,
 
 Existing scripts can continue using `provider list-profiles` and `provider profile export/import/update/lint/delete`. These commands share the top-level handlers and preserve their arguments, output options, and workspace/global flags. Prefer `profile` when writing new commands.
 
+For a provider using a gateway-signed client assertion, set `grant_type: client_credentials` and `assertion_source: openshell_gateway`. The CLI checks gateway support before importing or updating this selection. Upgrade every gateway replica, supervisor, and profile tool first; older tools can lose the selection outside the supported API. See the provider profiles and gateway configuration documentation for registration and rollback requirements.
+
 ### List, inspect, update, delete
 
 Use `openshell sandbox provider status --help` and the attach, detach, and update help to find the installed version's wait options. Add `--wait` when the next step depends on a provider change taking effect. Without it, a successful command only confirms that the gateway saved the change. Save the returned `receipt_id` to check that same change later, and inspect the result for every selected sandbox. Credential refresh status confirms that OpenShell obtained credentials; provider status confirms that the sandbox applied them, activated the policy, and updated the environment for new processes. If the status is `superseded`, explain that a later change replaced the request and inspect that change separately.

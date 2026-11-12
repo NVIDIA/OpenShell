@@ -531,7 +531,7 @@ import for compatibility.
 
 `category` supplies the `CATEGORY` column in `openshell profile list`. Use one of the values in the category enum.
 
-`credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests only at their binding endpoints. Every static credential environment key receives the full profile endpoint set when the profile defines endpoints. An endpointless profile requires explicit sandbox policy bindings for each attached provider instance. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints and support `bearer` or `header` placement. Credential environment variable names must not use the reserved `v<digits>_` prefix, such as `v10_GITHUB_TOKEN`, because OpenShell uses that namespace for revision-scoped placeholders.
+`credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. For static credentials, `auth_style` accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests only at their binding endpoints. Every static credential environment key receives the full profile endpoint set when the profile defines endpoints. An endpointless profile requires explicit sandbox policy bindings for each attached provider instance. The sandbox proxy resolves dynamic token grants on demand for matching profile endpoints. See [Dynamic Token Grants](#dynamic-token-grants) for the supported placements. Credential environment variable names must not use the reserved `v<digits>_` prefix, such as `v10_GITHUB_TOKEN`, because OpenShell uses that namespace for revision-scoped placeholders.
 
 Credential names must not contain control characters such as tabs or newlines. Dynamic token-grant endpoint and audience-override selectors have the same restriction.
 
@@ -610,6 +610,12 @@ The refresh attaches to the primary credential (`access_key_id`). Each reference
 
 `token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor resolves the dynamic credentials, caches each returned access token separately, and injects them before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
 
+Use `auth_style: placeholder` to let the client choose the header value's authentication format. Declare exactly one environment key with `env_vars` and set `header_name` to the allowed request header. The default is `Authorization`. OpenShell sets the environment key to an opaque handle when it launches a process. A client can send the handle as a raw header value, after an authentication scheme such as `Bearer`, or as the password in a Basic authentication value. The client supplies the Basic username.
+
+Configure a `protocol: rest` endpoint with TLS inspection and an endpoint path scoped to the protected service. The supervisor replaces the exact current handle only in the configured header and only after the endpoint's policy admits the request over inspected HTTPS. A request without the handle can receive the upstream service's normal authentication challenge. Duplicate, stale, misplaced, and ambiguous handles cannot select a grant. A grant token stays in the supervisor until it is used on an authorized upstream request.
+
+Placeholder grants require a gateway and supervisor that support this placement. A profile cannot set `tls: skip`, `allow_uninspected_credentials`, endpoint credential signing, or credential query, path, or refresh settings for this placement. Store the provider instance with runtime credentials only when all its credentials are grants.
+
 Declare multiple credentials with different destination headers when one request needs independently issued tokens. Each credential keeps its own token endpoint, audience, scopes, and cache lifetime. For example, this profile sends a service bearer token and a separate workload token on the same inspected request:
 
 ```yaml
@@ -646,7 +652,7 @@ The custom header carries the identity issuer's returned access token. To carry 
 
 The supervisor chooses the most-specific matching binding independently for each destination header. Bindings that target the same header are alternatives; equal-specificity matches from different credentials are rejected. Header names are case-insensitive. Omitting both `auth_style` and `header_name` selects `Authorization`; an explicit `bearer` or `header` style requires `header_name`. A more-specific audience override for one credential does not suppress grants for other headers.
 
-All selected grants must succeed and return valid header values before the request is rewritten. A failed grant returns HTTP 502 without forwarding the request. An earlier successful grant may remain in its own cache for a later attempt. Injection replaces every agent-supplied instance of each selected header, including any static credential placeholder in that header, and preserves unrelated headers. Issuer error descriptions are excluded from grant-failure logs and client errors because they may contain credentials.
+All selected grants must succeed and return valid header values before the request is rewritten. A failed grant returns HTTP 502 without forwarding the request. An earlier successful grant may remain in its own cache for a later attempt. Automatic `bearer` and `header` injection replace all instances of the selected header. Placeholder injection rewrites the single eligible header value. Both preserve unrelated headers. Issuer error descriptions are excluded from grant-failure logs and client errors because they may contain credentials.
 
 REST, GraphQL, MCP and JSON-RPC inspection use the same credential preparation step before forwarding each request, including plaintext HTTP forward-proxy requests and CONNECT tunnels. This also applies when endpoints share a host and port or the client reuses a connection. The supervisor selects grants only from endpoints whose policy admits the current request and calling binary. It checks the body again after middleware transformations before selecting credentials. An overlapping endpoint's allow rule cannot authorize another endpoint's grant. Requests forwarded solely because enforcement is `audit` receive no grant from an endpoint that denies them. A gateway-global policy supplies the effective authorization rules when it replaces provider policies; profile host, port and path selectors still limit each credential's destination. L4-only HTTP forwarding retains host, port and path credential selection without L7 owner admission.
 
@@ -656,12 +662,13 @@ Upgrade the gateway before the supervisor: inspected requests with a matching to
 
 Later requests use the latest installed provider credentials. If provider state or policy changes while a grant is being obtained, the supervisor rejects the request before sending it upstream. Reconnect and retry after the new configuration is ready. A token-service failure also closes the request without forwarding it; a later connection can retry the grant.
 
-OpenShell supports two dynamic grant types:
+The profile selects how the supervisor authenticates to the token endpoint.
 
-| Grant type | Behavior |
-|---|---|
-| `client_credentials` | The supervisor requests a SPIFFE JWT-SVID from the local Workload API and sends it directly to `token_endpoint` as the OAuth2 client assertion. This is the default when `grant_type` is omitted. |
-| `token_exchange` | The supervisor first asks the gateway for an intermediate token. The request includes the supervisor JWT-SVID; the gateway verifies it, uses the SVID subject as the intermediate token audience, and exchanges the stored subject credential at the same `token_endpoint` using the gateway's own JWT-SVID as the client assertion. The supervisor then exchanges that intermediate token for the final upstream token using its own JWT-SVID as the client assertion. |
+| Grant type | Assertion source | Behavior |
+|---|---|---|
+| `client_credentials` | `spiffe` (default) | The supervisor requests a SPIFFE JWT-SVID from the local Workload API and sends it to `token_endpoint` as the OAuth2 client assertion. |
+| `client_credentials` | `openshell_gateway` | The supervisor requests a dedicated gateway-signed JWT for the exact HTTPS token endpoint and submits it as the OAuth2 client assertion. Configure a [gateway registration](/how-it-works/gateways/configuration#provider-client-assertions) for this provider instance and credential. |
+| `token_exchange` | `spiffe` | The supervisor first asks the gateway for an intermediate token. The request includes the supervisor JWT-SVID; the gateway verifies it, uses the SVID subject as the intermediate token audience, and exchanges the stored subject credential at the same `token_endpoint` using the gateway's own JWT-SVID as the client assertion. The supervisor then exchanges that intermediate token for the final upstream token using its own JWT-SVID as the client assertion. |
 
 Create provider instances for token-grant-only profiles with `--runtime-credentials`. This records an empty provider instance and makes the runtime-resolved credential source explicit:
 
@@ -690,8 +697,9 @@ Token grant fields:
 
 | Field | Required | Behavior |
 |---|---|---|
-| `grant_type` | No | `client_credentials` or `token_exchange`. Defaults to `client_credentials` for backward compatibility. |
-| `token_endpoint` | Yes | OAuth2 token endpoint that accepts a SPIFFE JWT-SVID client assertion. Use `https://` unless the endpoint is loopback or a Kubernetes service DNS name such as `token-issuer.default.svc.cluster.local`. |
+| `grant_type` | No | `client_credentials` or `token_exchange`. Defaults to `client_credentials`. |
+| `assertion_source` | No | `spiffe` (default) or `openshell_gateway`. The gateway source is valid only with `client_credentials`; omit `jwt_svid_audience`, `client_assertion_type`, `requested_token_type`, and `subject_token`. |
+| `token_endpoint` | Yes | OAuth2 token endpoint that accepts the selected client assertion. Use a canonical `https://` URL for `openshell_gateway`. SPIFFE modes also allow HTTP on loopback and Kubernetes service DNS names such as `token-issuer.default.svc.cluster.local`. |
 | `audience` | No | Resource audience requested from the token service. For `token_exchange`, this is the final exchange audience; the gateway intermediate exchange always uses the verified supervisor SVID subject as its audience. |
 | `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
 | `client_assertion_type` | No | OAuth2 `client_assertion_type` form value. Defaults to RFC 7523 `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Set `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe` when the token issuer expects the SPIFFE assertion type. |
@@ -702,7 +710,7 @@ Token grant fields:
 | `subject_token.subject_token_type` | No | RFC 8693 `subject_token_type` for the stored subject token. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
 | `audience_overrides` | No | Endpoint-specific final-exchange `audience` and `scopes` overrides selected by host, port, and path. These overrides do not affect the gateway intermediate exchange. |
 
-Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. `token_exchange` also requires the gateway to have its own Workload API socket so it can present a gateway JWT-SVID during the intermediate exchange. They apply to HTTP traffic that the proxy can inspect. Token-grant profiles reject endpoints with `protocol: sql` or `tls: skip`, including when `allow_uninspected_credentials` is enabled, because those modes cannot inject the required HTTP credential. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
+The `spiffe` assertion source requires the sandbox supervisor to have access to a SPIFFE Workload API socket. `token_exchange` also requires the gateway to have its own Workload API socket so it can present a gateway JWT-SVID during the intermediate exchange. Token grants apply to HTTP traffic that the proxy can inspect. Token-grant profiles reject endpoints with `protocol: sql` or `tls: skip`, including when `allow_uninspected_credentials` is enabled, because those modes cannot inject the required HTTP credential. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
 
 The gateway only brokers an intermediate token for a sandbox principal, and only when the requested provider is attached to that sandbox. It verifies the supervisor JWT-SVID issuer, audience, signature, and SPIFFE trust domain against the gateway's own JWT-SVID, then uses the verified supervisor SVID subject as the intermediate-token audience.
 

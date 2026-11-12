@@ -24,10 +24,8 @@ pub type GrpcClient = openshell_sdk::raw::GrpcClient<
 /// Interceptor stack applied to gateway requests from clients built by
 /// [`grpc_client`].
 ///
-/// Runs authentication header injection first, then passive W3C trace-context
-/// forwarding so a CI pipeline's `TRACEPARENT` extends into the gateway's
-/// spans. tonic allows a single interceptor per channel, so the two concerns
-/// are composed here.
+/// Attaches CLI authentication and provider-profile capabilities and forwards
+/// W3C trace context from the environment.
 #[derive(Clone)]
 pub struct GatewayInterceptor {
     auth: openshell_sdk::EdgeAuthInterceptor,
@@ -39,7 +37,11 @@ impl tonic::service::Interceptor for GatewayInterceptor {
         &mut self,
         request: tonic::Request<()>,
     ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
-        let request = self.auth.call(request)?;
+        let mut request = self.auth.call(request)?;
+        request.metadata_mut().insert(
+            openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
         self.trace.call(request)
     }
 }
@@ -342,7 +344,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
 /// The returned client carries a [`GatewayInterceptor`] that injects
 /// authentication headers (when a token is set) and passively forwards the
 /// `TRACEPARENT`/`TRACESTATE` trace context from the environment on every
-/// request. With no token and no trace context, the interceptor is a no-op.
+/// request. It also advertises the profile grant types this CLI can preserve.
 pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     let config = sdk_client_config(server, tls)?;
     // Keep the SDK's transport state machine out of every command future.

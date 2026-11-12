@@ -402,6 +402,10 @@ mod tests {
             ("openshell.v1.IssueSandboxTokenResponse", "token"),
             ("openshell.v1.RefreshSandboxTokenResponse", "token"),
             ("openshell.v1.ExtensionServiceCredential", "token"),
+            (
+                "openshell.v1.MintProviderClientAssertionResponse",
+                "client_assertion",
+            ),
             ("openshell.v1.CreateSshSessionResponse", "token"),
             ("openshell.v1.RevokeSshSessionRequest", "token"),
             ("openshell.v1.TcpForwardInit", "authorization_token"),

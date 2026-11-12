@@ -1009,8 +1009,10 @@ gateway before retrying the scrape.
 If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
 is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
 mount the `sandbox-jwt` Secret.
-SPIRE is used by both the gateway and sandbox supervisors for dynamic provider
-token grants. The gateway pod must mount the `spiffe-workload-api` CSI volume
+For `client_credentials` grants with `assertion_source: openshell_gateway`, check the gateway signing configuration,
+supervisor-to-gateway TLS, and the provider ID, credential key and token endpoint in
+the operator registration. SPIRE is used by both the gateway and sandbox supervisors
+for `token_exchange` grants. The gateway pod must mount the `spiffe-workload-api` CSI volume
 and set `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`; supervisor Pods must
 receive the matching Workload API socket from the Kubernetes driver config.
 The gateway verifies supervisor JWT-SVIDs from JWT bundles fetched through this
@@ -1025,7 +1027,7 @@ kubectl -n openshell get configmap openshell-config -o yaml | grep provider_spif
 kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{.items[*].spec.containers[*].env[?(@.name==\"OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET\")].value}{\"\n\"}"
 ```
 
-Sandbox pods using provider token grants should have an
+Sandbox pods using SPIFFE provider token grants should have an
 `openshell.ai/sandbox-id` annotation, an `openshell.ai/managed-by=openshell`
 label, supervisor env vars `OPENSHELL_K8S_SA_TOKEN_FILE` and
 `OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET`, plus both the projected

@@ -17,6 +17,10 @@ use openshell_core::endpoint_failure::EndpointFailure;
 use openshell_core::endpoint_status::EndpointObservationContext;
 use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
 use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderCredentialState};
+use openshell_core::secrets::{
+    SecretResolver, contains_grant_placeholder, header_contains_grant_placeholder,
+    valid_grant_placeholder_header,
+};
 use openshell_core::token_grant_failure::{
     TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
 };
@@ -27,12 +31,14 @@ use openshell_ocsf::{
 use tracing::warn;
 
 use crate::l7::provider::L7Request;
-use crate::l7::relay::L7EvalContext;
+use crate::l7::relay::{L7EvalContext, normalized_endpoint_host};
+use crate::l7::{CredentialSigning, L7EndpointConfig, L7Protocol, TlsMode};
 use crate::telemetry::egress_emit;
 
 /// Borrowed grant configuration for one endpoint-bound provider credential.
 pub struct TokenGrantRequest<'a> {
     pub provider_key: &'a str,
+    pub provider_id: &'a str,
     pub token_endpoint: &'a str,
     pub jwt_svid_audience: &'a str,
     pub client_assertion_type: &'a str,
@@ -75,6 +81,7 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
             self.grants
                 .obtain_provider_token(crate::token_grant::ObtainProviderTokenRequest {
                     provider_name: request.provider_key,
+                    provider_id: request.provider_id,
                     token_endpoint: request.token_endpoint,
                     jwt_svid_audience: request.jwt_svid_audience,
                     client_assertion_type: request.client_assertion_type,
@@ -165,6 +172,17 @@ pub fn pin_live_credentials(ctx: &mut L7EvalContext) -> Option<Arc<ProviderCrede
     Some(snapshot)
 }
 
+struct SelectedGrant {
+    key: String,
+    credential: ProviderProfileCredential,
+    placeholder: Option<PresentedPlaceholder>,
+}
+
+struct PresentedPlaceholder {
+    handle: String,
+    value: String,
+}
+
 /// Inject the grants whose endpoint selectors match the request.
 ///
 /// L4-only forwarding uses this selector contract; it has no per-request L7
@@ -181,7 +199,7 @@ pub async fn inject_for_selectors(
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
-    let selected = select_scoped(snapshot, ctx, request_path(&req.target), None);
+    let selected = select_scoped(snapshot, ctx, &req, None, false);
     inject_or_report(req, ctx, selected, request_id, observation_context).await
 }
 
@@ -197,6 +215,7 @@ pub(super) async fn inject_for_admitted_owners(
     ctx: &L7EvalContext,
     snapshot: &ProviderCredentialSnapshot,
     admitted_owners: &HashSet<String>,
+    config: &L7EndpointConfig,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
@@ -218,7 +237,32 @@ pub(super) async fn inject_for_admitted_owners(
             key,
         ))
     } else {
-        select_scoped(snapshot, ctx, request_path, Some(admitted_owners))
+        // A configured port alone cannot establish TLS. The HTTP transport
+        // sets its authority default after detecting TLS or selecting HTTPS.
+        // Require the gateway's credentialed-route marker so the downstream
+        // relay always inspects streamed body segments before releasing them.
+        let placeholder_allowed = config.protocol == L7Protocol::Rest
+            && config.tls == TlsMode::Auto
+            && config.provider_credentialed
+            && !config.allow_uninspected_credentials
+            && config.credential_signing == CredentialSigning::None
+            && ctx.request_default_port == Some(443)
+            && crate::l7::rest::request_authority(&req.raw_header, Some(443)).is_ok_and(
+                |authority| {
+                    authority.is_some_and(|authority| {
+                        authority.effective_port == ctx.port
+                            && normalized_endpoint_host(authority.authority.host())
+                                .eq_ignore_ascii_case(normalized_endpoint_host(&ctx.host))
+                    })
+                },
+            );
+        select_scoped(
+            snapshot,
+            ctx,
+            &req,
+            Some(admitted_owners),
+            placeholder_allowed,
+        )
     };
     inject_or_report(req, ctx, selected, request_id, observation_context).await
 }
@@ -226,19 +270,105 @@ pub(super) async fn inject_for_admitted_owners(
 fn select_scoped(
     snapshot: &ProviderCredentialSnapshot,
     ctx: &L7EvalContext,
-    request_path: &str,
+    req: &L7Request,
     admitted_owners: Option<&HashSet<String>>,
-) -> Result<Vec<(String, ProviderProfileCredential)>, TokenGrantInjectionError> {
+    placeholder_allowed: bool,
+) -> Result<Vec<SelectedGrant>, TokenGrantInjectionError> {
     let candidates = token_grant_candidates(
         &snapshot.dynamic_credentials,
         ctx,
-        request_path,
+        request_path(&req.target),
         admitted_owners,
     )?;
-    Ok(select_token_grants(candidates)?
-        .into_iter()
-        .map(|(key, credential)| (snapshot.scoped_key(&key), credential))
-        .collect())
+    let selected = select_token_grants(candidates, placeholder_allowed)?;
+    select_present_grants(snapshot, req, selected)
+}
+
+fn select_present_grants(
+    snapshot: &ProviderCredentialSnapshot,
+    req: &L7Request,
+    selected: Vec<(String, ProviderProfileCredential)>,
+) -> Result<Vec<SelectedGrant>, TokenGrantInjectionError> {
+    let refused = || TokenGrantInjectionError::new(injection_configuration_failure());
+    let (header, end) =
+        parse_header_block(&req.raw_header).map_err(TokenGrantInjectionError::new)?;
+    // REST keeps the canonical path in req.target. The request line retains
+    // its query, and middleware may already have buffered a body. Only these
+    // available bytes can be checked before acquisition; the relay guards
+    // later body segments before forwarding them.
+    if contains_grant_placeholder(&req.target)
+        || header
+            .lines()
+            .next()
+            .is_some_and(contains_grant_placeholder)
+        || contains_grant_placeholder(&String::from_utf8_lossy(&req.raw_header[end + 4..]))
+    {
+        return Err(refused());
+    }
+    let mut presented: Vec<_> = header
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(_, value)| header_contains_grant_placeholder(value))
+        .collect();
+    let mut grants = Vec::with_capacity(selected.len());
+    for (key, credential) in selected {
+        let placeholder = if is_placeholder_grant(&credential) {
+            let binding_refused =
+                || TokenGrantInjectionError::for_binding(injection_configuration_failure(), &key);
+            let name = token_grant_header_name(&credential).map_err(|_| binding_refused())?;
+            let Some(index) = presented
+                .iter()
+                .position(|(header, _)| header.eq_ignore_ascii_case(name))
+            else {
+                // Let a client reach its normal authentication challenge.
+                continue;
+            };
+            let (_, value) = presented.swap_remove(index);
+            let handle = snapshot
+                .grant_placeholder(&credential)
+                .ok_or_else(binding_refused)?;
+            if header
+                .split("\r\n")
+                .skip(1)
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+                .count()
+                != 1
+                || crate::l7::rest::connection_nominated_header_names(&req.raw_header[..end + 4])
+                    .map_err(|_| binding_refused())?
+                    .contains(&name.to_ascii_lowercase())
+                || !SecretResolver::matches_grant_header_placeholder(value, handle)
+            {
+                return Err(binding_refused());
+            }
+            Some(PresentedPlaceholder {
+                handle: handle.to_string(),
+                value: value.to_string(),
+            })
+        } else {
+            None
+        };
+        grants.push(SelectedGrant {
+            key: snapshot.scoped_key(&key),
+            credential,
+            placeholder,
+        });
+    }
+    if !presented.is_empty() {
+        // A handle on a sibling route or in a different header cannot authorize
+        // acquisition of this grant or of another selected grant.
+        return Err(refused());
+    }
+    Ok(grants)
+}
+
+fn is_placeholder_grant(credential: &ProviderProfileCredential) -> bool {
+    credential.token_grant.is_some()
+        && credential
+            .auth_style
+            .trim()
+            .eq_ignore_ascii_case("placeholder")
 }
 
 /// Inject the selected grants, or record why the request was refused.
@@ -248,7 +378,7 @@ fn select_scoped(
 async fn inject_or_report(
     req: L7Request,
     ctx: &L7EvalContext,
-    selected: Result<Vec<(String, ProviderProfileCredential)>, TokenGrantInjectionError>,
+    selected: Result<Vec<SelectedGrant>, TokenGrantInjectionError>,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
@@ -266,8 +396,8 @@ async fn inject_or_report(
             .ok()
             .into_iter()
             .flatten()
-            .filter_map(|(key, _)| {
-                credential_identity(key)?
+            .filter_map(|grant| {
+                credential_identity(&grant.key)?
                     .split_once(':')
                     .map(|(provider, credential)| (provider.to_string(), credential.to_string()))
             })
@@ -365,7 +495,7 @@ fn report_refused_grant(
 async fn inject_selected(
     req: L7Request,
     ctx: &L7EvalContext,
-    credentials: Vec<(String, ProviderProfileCredential)>,
+    credentials: Vec<SelectedGrant>,
     request_id: &str,
 ) -> Result<L7Request, TokenGrantInjectionError> {
     let resolver = ctx
@@ -379,18 +509,42 @@ async fn inject_selected(
     // local until every selected grant and header has been validated, so a later
     // failure cannot expose a partially authenticated request to a relay caller.
     let mut headers = Vec::with_capacity(credentials.len());
-    for (provider_key, cred) in &credentials {
+    for SelectedGrant {
+        key: provider_key,
+        credential: cred,
+        placeholder,
+    } in &credentials
+    {
         let refused = |failure| TokenGrantInjectionError::for_binding(failure, provider_key);
         let token_grant = cred
             .token_grant
             .as_ref()
             .ok_or_else(|| refused(injection_configuration_failure()))?;
-        let request =
-            token_grant_request(provider_key, token_grant, request_id).map_err(refused)?;
+        let request = token_grant_request(
+            provider_key,
+            &cred.token_grant_provider_id,
+            token_grant,
+            request_id,
+        )
+        .map_err(refused)?;
         let access_token = resolver.obtain(request).await.map_err(refused)?;
         crate::token_grant::validate_access_token(&access_token)
             .map_err(|failure| refused(failure.at_stage(TokenGrantStage::Injection)))?;
-        headers.push(token_grant_header(cred, &access_token).map_err(refused)?);
+        let header = if let Some(placeholder) = placeholder {
+            let name = token_grant_header_name(cred).map_err(refused)?;
+            let value = SecretResolver::rewrite_grant_header_value(
+                &placeholder.value,
+                &placeholder.handle,
+                &access_token,
+            )
+            .ok()
+            .flatten()
+            .ok_or_else(|| refused(injection_configuration_failure()))?;
+            (name.to_string(), value)
+        } else {
+            token_grant_header(cred, &access_token).map_err(refused)?
+        };
+        headers.push(header);
     }
 
     let mut raw_header = req.raw_header;
@@ -398,7 +552,7 @@ async fn inject_selected(
         raw_header =
             inject_header(&raw_header, &name, &value).map_err(TokenGrantInjectionError::new)?;
     }
-    for (provider_key, _) in credentials {
+    for grant in credentials {
         egress_emit!(
             HttpActivityBuilder::new(ocsf_ctx())
                 .activity(ActivityId::Other)
@@ -413,7 +567,7 @@ async fn inject_selected(
                 .message(format!(
                     "Token grant successful for {} to {}:{}",
                     ocsf_message_field(
-                        credential_identity(&provider_key).unwrap_or("a dynamic credential")
+                        credential_identity(&grant.key).unwrap_or("a dynamic credential")
                     ),
                     ctx.host,
                     ctx.port
@@ -437,6 +591,7 @@ fn injection_configuration_failure() -> TokenGrantFailure {
 
 fn select_token_grants(
     mut candidates: Vec<(u32, String, ProviderProfileCredential)>,
+    placeholder_allowed: bool,
 ) -> Result<Vec<(String, ProviderProfileCredential)>, TokenGrantInjectionError> {
     // Examine the strongest bindings first. The complete binding key stays with
     // its grant because the resolver uses it to separate cache entries and revisions.
@@ -446,6 +601,9 @@ fn select_token_grants(
         let refused =
             || TokenGrantInjectionError::for_binding(injection_configuration_failure(), &key);
         let identity = credential_identity(&key).ok_or_else(refused)?;
+        if is_placeholder_grant(&credential) && !placeholder_allowed {
+            return Err(refused());
+        }
         let header = token_grant_header_name(&credential)
             .map_err(|_| refused())?
             .to_ascii_lowercase();
@@ -511,6 +669,7 @@ fn ocsf_message_field(value: &str) -> String {
 
 fn token_grant_request<'a>(
     provider_key: &'a str,
+    provider_id: &'a str,
     token_grant: &'a ProviderCredentialTokenGrant,
     request_id: &'a str,
 ) -> Result<TokenGrantRequest<'a>, TokenGrantFailure> {
@@ -527,6 +686,7 @@ fn token_grant_request<'a>(
         })?;
     Ok(TokenGrantRequest {
         provider_key,
+        provider_id,
         token_endpoint: &token_grant.token_endpoint,
         jwt_svid_audience: &token_grant.jwt_svid_audience,
         client_assertion_type: &token_grant.client_assertion_type,
@@ -605,6 +765,9 @@ fn token_grant_header(
     credential: &ProviderProfileCredential,
     access_token: &str,
 ) -> Result<(String, String), TokenGrantFailure> {
+    if is_placeholder_grant(credential) {
+        return Err(injection_configuration_failure());
+    }
     let header_name = token_grant_header_name(credential)?;
     let header_value = if credential.auth_style.trim().eq_ignore_ascii_case("header") {
         access_token.to_string()
@@ -625,6 +788,22 @@ fn token_grant_header_name(
                 credential.header_name.trim()
             }
         }
+        "placeholder"
+            if credential.query_param.trim().is_empty()
+                && credential.path_template.trim().is_empty()
+                && credential.refresh.is_none() =>
+        {
+            let name = credential.header_name.trim();
+            let name = if name.is_empty() {
+                "Authorization"
+            } else {
+                name
+            };
+            if !valid_grant_placeholder_header(name) {
+                return Err(injection_configuration_failure());
+            }
+            name
+        }
         // Header auth names its own header; there is no default to fall back to.
         "header" if !credential.header_name.trim().is_empty() => credential.header_name.trim(),
         _ => return Err(injection_configuration_failure()),
@@ -634,34 +813,13 @@ fn token_grant_header_name(
 }
 
 fn validate_header_name(header_name: &str) -> Result<(), TokenGrantFailure> {
-    let valid = !header_name.is_empty()
-        && header_name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        });
+    let name = http::HeaderName::from_bytes(header_name.as_bytes())
+        .map_err(|_| injection_configuration_failure())?;
     // A grant may not override HTTP framing or connection headers.
-    if !valid
-        || matches!(
-            header_name.to_ascii_lowercase().as_str(),
-            "host" | "content-length" | "transfer-encoding" | "connection"
-        )
-    {
+    if matches!(
+        name.as_str(),
+        "host" | "content-length" | "transfer-encoding" | "connection"
+    ) {
         return Err(injection_configuration_failure());
     }
     Ok(())
@@ -1004,6 +1162,7 @@ pub mod test_support {
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
             subject_token: None,
             requested_token_type: String::new(),
+            workload_credential_handle: String::new(),
         }
     }
 
@@ -1018,6 +1177,7 @@ pub mod test_support {
                 subject_token_type: "urn:ietf:params:oauth:token-type:id_token".to_string(),
             }),
             requested_token_type: "urn:ietf:params:oauth:token-type:access_token".to_string(),
+            workload_credential_handle: String::new(),
             ..token_grant()
         }
     }
@@ -1268,10 +1428,18 @@ mod tests {
     }
 
     #[test]
-    fn token_grant_header_rejects_framing_and_connection_headers() {
-        for header_name in ["Host", "Content-Length", "Transfer-Encoding", "Connection"] {
+    fn token_grant_header_rejects_invalid_framing_and_connection_headers() {
+        for header_name in [
+            "Host",
+            "Content-Length",
+            "Transfer-Encoding",
+            "Connection",
+            "Bad Name",
+            "Bad:Name",
+            &"x".repeat(65536),
+        ] {
             let err = token_grant_header(&credential("header", header_name), "grant-token")
-                .expect_err("framing header override should be rejected");
+                .expect_err("invalid or reserved header name");
             assert_eq!(err, injection_configuration_failure());
         }
     }

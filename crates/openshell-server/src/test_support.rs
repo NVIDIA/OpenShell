@@ -40,6 +40,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 
+pub mod provider_grant;
+
 type WatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 
 /// Build a real in-memory gateway service backed by the requested test compute driver.
@@ -47,6 +49,10 @@ type WatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>
 /// This fixture is intentionally narrow: integration tests can exercise the public
 /// gRPC service without exposing the gateway's internal state construction details.
 pub async fn gateway_service_with_driver(driver_name: &str) -> crate::OpenShellService {
+    crate::OpenShellService::new(Arc::new(gateway_state_with_driver(driver_name).await))
+}
+
+async fn gateway_state_with_driver(driver_name: &str) -> ServerState {
     let store = Arc::new(
         Store::connect("sqlite::memory:?cache=shared")
             .await
@@ -60,7 +66,7 @@ pub async fn gateway_service_with_driver(driver_name: &str) -> crate::OpenShellS
     } else {
         new_test_runtime_for_driver(store.clone(), driver_name).await
     };
-    let state = Arc::new(ServerState::new(
+    ServerState::new(
         Config::new(None)
             .with_database_url("sqlite::memory:?cache=shared")
             .with_credential_drivers(["test-static"]),
@@ -71,8 +77,7 @@ pub async fn gateway_service_with_driver(driver_name: &str) -> crate::OpenShellS
         TracingLogBus::new(),
         Arc::new(SupervisorSessionRegistry::new()),
         None,
-    ));
-    crate::OpenShellService::new(state)
+    )
 }
 
 /// Tonic interceptor that authenticates integration-test requests as the dev user.

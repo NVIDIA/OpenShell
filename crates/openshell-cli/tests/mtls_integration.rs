@@ -12,11 +12,10 @@ use openshell_cli::{
 };
 use openshell_core::proto::{
     CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, ExchangeProviderSubjectTokenRequest,
-    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, ServiceStatus,
-    UpdateProviderRequest,
+    DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxInput,
+    ExecSandboxRequest, GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest,
+    ListProvidersResponse, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ServiceStatus, UpdateProviderRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use tokio::net::TcpListener;
@@ -169,7 +168,7 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
-    unimplemented_sandbox_template_rpcs!();
+    unused_gateway_rpcs!(sandbox_templates);
 
     async fn list_sandbox_providers(
         &self,
@@ -300,12 +299,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(RevokeSshSessionResponse::default()))
     }
 
-    async fn exchange_provider_subject_token(
-        &self,
-        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
-    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
+    unused_gateway_rpcs!(provider_token_grants);
 
     async fn create_provider(
         &self,

@@ -3,7 +3,7 @@
 
 //! Runtime provider credential snapshots.
 
-use crate::secrets::{CredentialPlacement, SecretResolver};
+use crate::secrets::{CredentialPlacement, SecretResolver, grant_placeholder_for_env_key};
 use crate::{
     endpoint_path::EndpointPathPattern,
     host_pattern::HostPattern,
@@ -22,6 +22,66 @@ pub struct ProviderCredentialSnapshot {
     pub revision: u64,
     pub child_env: HashMap<String, String>,
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+}
+
+impl ProviderCredentialSnapshot {
+    /// Return the exact workload handle installed for this admitted grant.
+    pub fn grant_placeholder(
+        &self,
+        credential: &crate::proto::ProviderProfileCredential,
+    ) -> Option<&str> {
+        let (key, expected) = grant_placeholder(credential)?;
+        self.child_env
+            .get(key)
+            .filter(|value| **value == expected)
+            .map(String::as_str)
+    }
+}
+
+fn grant_placeholder(
+    credential: &crate::proto::ProviderProfileCredential,
+) -> Option<(&str, String)> {
+    if !credential
+        .auth_style
+        .trim()
+        .eq_ignore_ascii_case("placeholder")
+        || credential.token_grant_provider_id.is_empty()
+        || credential.token_grant_owners.is_empty()
+    {
+        return None;
+    }
+    let [key] = credential.env_vars.as_slice() else {
+        return None;
+    };
+    let grant = credential.token_grant.as_ref()?;
+    Some((
+        key,
+        grant_placeholder_for_env_key(key, &grant.workload_credential_handle)?,
+    ))
+}
+
+/// Project only unambiguous handles. Keep grant material out of static
+/// resolver snapshots and never override another provider's environment.
+fn project_grant_placeholders(
+    child_env: &mut HashMap<String, String>,
+    credentials: &HashMap<String, crate::proto::ProviderProfileCredential>,
+) {
+    let mut by_key = HashMap::<&str, Option<String>>::new();
+    for (key, handle) in credentials.values().filter_map(grant_placeholder) {
+        by_key
+            .entry(key)
+            .and_modify(|existing| {
+                if existing.as_ref() != Some(&handle) {
+                    *existing = None;
+                }
+            })
+            .or_insert(Some(handle));
+    }
+    for (key, handle) in by_key {
+        if let Some(handle) = handle {
+            child_env.entry(key.to_string()).or_insert(handle);
+        }
+    }
 }
 
 /// One atomic workload-facing snapshot and its local installation identity.
@@ -57,6 +117,22 @@ struct ProviderCredentialStateInner {
     // Revocation must retain this requirement so retrying against a downgraded
     // gateway cannot silently publish revision-scoped replacements.
     requires_stable_placeholders: bool,
+}
+
+/// Whether this exact URL can identify a provider assertion recipient.
+/// Reject URL parser normalization so the signed audience and transport URL
+/// identify the same destination byte for byte.
+#[must_use]
+pub fn provider_assertion_endpoint(endpoint: &str) -> bool {
+    url::Url::parse(endpoint).is_ok_and(|url| {
+        url.as_str() == endpoint
+            && url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
 }
 
 #[derive(Debug)]
@@ -129,12 +205,13 @@ impl ProviderCredentialState {
         dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     ) -> Self {
         let (_, dynamic_credentials) = split_static_credential_metadata(dynamic_credentials);
-        let (child_env, generation_resolver, current_resolver) =
+        let (mut child_env, generation_resolver, current_resolver) =
             SecretResolver::from_provider_env_for_current_revision(
                 env,
                 credential_expires_at_ms,
                 revision,
             );
+        project_grant_placeholders(&mut child_env, &dynamic_credentials);
         let snapshot = Arc::new(ProviderCredentialSnapshot {
             installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
@@ -208,13 +285,14 @@ impl ProviderCredentialState {
             &placement_metadata,
         )?;
         let stable_handles = static_credential_stable_handles(&static_credential_bindings);
-        let (child_env, generation_resolver, current_resolver) =
+        let (mut child_env, generation_resolver, current_resolver) =
             SecretResolver::from_provider_env_for_current_revision_with_stable_handles(
                 env,
                 credential_expires_at_ms,
                 revision,
                 &stable_handles,
             );
+        project_grant_placeholders(&mut child_env, &dynamic_credentials);
         let snapshot = Arc::new(ProviderCredentialSnapshot {
             installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
@@ -751,6 +829,7 @@ impl ProviderCredentialState {
                 credential_expires_at_ms,
                 revision,
             );
+        project_grant_placeholders(&mut child_env, &dynamic_credentials);
         let mut inner = self
             .inner
             .write()
@@ -849,6 +928,7 @@ impl ProviderCredentialState {
                 revision,
                 &stable_handles,
             );
+        project_grant_placeholders(&mut child_env, &dynamic_credentials);
         let mut inner = self
             .inner
             .write()
@@ -1310,6 +1390,72 @@ mod tests {
             .strip_prefix("openshell:resolve:env:")
             .expect("issued placeholder");
         format!("e30.e30.OPENSHELL-RESOLVE-ENV-{suffix}")
+    }
+
+    #[test]
+    fn grant_placeholder_projects_only_current_unambiguous_handle_without_a_secret() {
+        let credential = crate::proto::ProviderProfileCredential {
+            auth_style: "placeholder".into(),
+            env_vars: vec!["API_TOKEN".into()],
+            token_grant_provider_id: "provider-id".into(),
+            token_grant_owners: vec!["endpoint-owner".into()],
+            token_grant: Some(crate::proto::ProviderCredentialTokenGrant {
+                workload_credential_handle: "a".repeat(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let grants = HashMap::from([
+            ("default".to_string(), credential.clone()),
+            ("override".to_string(), credential.clone()),
+        ]);
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            grants.clone(),
+        );
+        let first = state.snapshot();
+        let handle = first.grant_placeholder(&credential).unwrap();
+        assert_eq!(handle, first.child_env["API_TOKEN"]);
+        assert!(state.inner.read().unwrap().current_resolver.is_none());
+
+        state.install_environment(2, HashMap::new(), HashMap::new(), grants);
+        assert_eq!(
+            state.snapshot().grant_placeholder(&credential),
+            Some(handle)
+        );
+
+        let mut replacement = credential.clone();
+        replacement
+            .token_grant
+            .as_mut()
+            .unwrap()
+            .workload_credential_handle = "b".repeat(64);
+        state.install_environment(
+            3,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("replacement".to_string(), replacement.clone())]),
+        );
+        assert!(state.snapshot().grant_placeholder(&credential).is_none());
+        assert!(state.snapshot().grant_placeholder(&replacement).is_some());
+
+        state.install_environment(
+            4,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                ("original".to_string(), credential.clone()),
+                ("replacement".to_string(), replacement.clone()),
+            ]),
+        );
+        assert!(state.snapshot().child_env.is_empty());
+        assert!(state.snapshot().grant_placeholder(&replacement).is_none());
+
+        state.install_environment(5, HashMap::new(), HashMap::new(), HashMap::new());
+        assert!(state.snapshot().child_env.is_empty());
+        assert!(state.snapshot().grant_placeholder(&credential).is_none());
     }
 
     #[test]

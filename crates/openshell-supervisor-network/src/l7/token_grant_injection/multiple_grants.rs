@@ -69,6 +69,113 @@ async fn malformed_endpoint_key_fails_before_acquisition() {
 }
 
 #[tokio::test]
+async fn placeholder_grant_requires_the_current_handle_and_an_admitted_https_route() {
+    let fixture = TokenGrantTestFixture::success(SERVICE, "service-token");
+    {
+        let credentials = fixture.dynamic_credentials();
+        let mut credentials = credentials.write().unwrap();
+        let credential = credentials.get_mut(SERVICE).unwrap();
+        credential.auth_style = "placeholder".into();
+        credential.header_name.clear();
+        credential.env_vars = vec!["API_TOKEN".into()];
+        credential.token_grant_provider_id = "provider-id".into();
+        credential
+            .token_grant
+            .as_mut()
+            .unwrap()
+            .workload_credential_handle = "a".repeat(64);
+    }
+    let state = fixture.provider_credentials();
+    let ctx = L7EvalContext {
+        host: "api.example.com".into(),
+        port: 443,
+        request_default_port: Some(443),
+        provider_credentials: Some(state.clone()),
+        token_grant_resolver: Some(fixture.resolver()),
+        ..Default::default()
+    };
+    let snapshot = state.snapshot();
+    let handle = &snapshot.child_env["API_TOKEN"];
+    let request = |headers: &str| L7Request {
+        action: "GET".into(),
+        target: "/v1/projects".into(),
+        query_params: HashMap::new(),
+        raw_header: format!("GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n{headers}\r\n")
+            .into_bytes(),
+        body_length: BodyLength::None,
+    };
+    let owners = HashSet::from(["test-owner".to_owned()]);
+    let endpoint =
+        regorus::Value::from_json_str(r#"{"protocol":"rest","provider_credentialed":true}"#)
+            .unwrap();
+    let config = crate::l7::parse_l7_config(&endpoint).unwrap();
+    let eligible = format!("Authorization: Bearer {handle}\r\n");
+    let inject = async |req,
+                        context: &L7EvalContext,
+                        admitted: &HashSet<String>,
+                        route: &L7EndpointConfig| {
+        inject_for_admitted_owners(req, context, &snapshot, admitted, route, REQUEST_ID, None).await
+    };
+    let mut unguarded = config.clone();
+    unguarded.provider_credentialed = false;
+    let mut plaintext = ctx.clone();
+    plaintext.request_default_port = Some(80);
+    for (context, admitted, route) in [
+        (&ctx, &owners, &unguarded),
+        (&ctx, &HashSet::new(), &config),
+        (&plaintext, &owners, &config),
+    ] {
+        assert!(
+            inject(request(&eligible), context, admitted, route)
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        inject_if_needed(request(&eligible), &ctx, REQUEST_ID)
+            .await
+            .is_err()
+    );
+    for headers in [
+        format!("X-Unrelated: {handle}\r\n"),
+        format!("{eligible}authorization: another-value\r\n"),
+        format!("{eligible}Connection: Authorization\r\n"),
+        format!(
+            "Authorization: {}\r\n",
+            handle.replace(&"a".repeat(64), &"b".repeat(64))
+        ),
+    ] {
+        assert!(
+            inject(request(&headers), &ctx, &owners, &config)
+                .await
+                .is_err()
+        );
+    }
+    let mut misplaced_query = request(&eligible);
+    misplaced_query.raw_header = format!(
+        "GET /v1/projects?probe={handle} HTTP/1.1\r\nHost: api.example.com\r\n{eligible}\r\n"
+    )
+    .into_bytes();
+    assert!(
+        inject(misplaced_query, &ctx, &owners, &config)
+            .await
+            .is_err()
+    );
+    let challenge = request("").raw_header;
+    let forwarded = inject(request(""), &ctx, &owners, &config).await.unwrap();
+    assert_eq!(forwarded.raw_header, challenge);
+    fixture.assert_no_requests();
+
+    let admitted = inject(request(&eligible), &ctx, &owners, &config)
+        .await
+        .unwrap();
+    let headers = String::from_utf8(admitted.raw_header).unwrap();
+    assert!(headers.contains("Authorization: Bearer service-token\r\n"));
+    assert!(!headers.contains(handle));
+    fixture.assert_one_request(SERVICE);
+}
+
+#[tokio::test]
 async fn injects_independent_grants_and_replaces_all_protected_headers() {
     let (fixture, ctx) = fixture(Ok("identity-token"));
     let rewritten = inject_if_needed(request(), &ctx, REQUEST_ID).await.unwrap();
@@ -310,6 +417,8 @@ async fn admitted_owners_select_grants_independently_per_header() {
         (&["identity-owner"], false, true),
         (&["test-owner", "identity-owner"], true, true),
     ];
+    let endpoint = regorus::Value::from_json_str(r#"{"protocol":"rest"}"#).unwrap();
+    let config = crate::l7::parse_l7_config(&endpoint).unwrap();
     for (admitted, service, identity) in cases {
         let (fixture, mut ctx) = fixture(Ok("identity-token"));
         fixture
@@ -331,6 +440,7 @@ async fn admitted_owners_select_grants_independently_per_header() {
             &ctx,
             &state.snapshot(),
             &owners,
+            &config,
             REQUEST_ID,
             None,
         )

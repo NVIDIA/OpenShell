@@ -82,6 +82,15 @@ pub struct OpenShellRoot {
     pub credential_drivers: BTreeMap<String, toml::Value>,
 }
 
+/// Operator authorization for a provider instance to use the gateway signer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderAssertionRegistration {
+    pub provider_id: String,
+    pub credential_key: String,
+    pub token_endpoint: String,
+}
+
 /// `[openshell.gateway]` section.
 ///
 /// All fields are `Option<T>` so the loader can tell whether a key was set
@@ -91,6 +100,9 @@ pub struct OpenShellRoot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayFileSection {
+    /// Exact recipients allowed to receive gateway-signed provider assertions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_assertions: Vec<ProviderAssertionRegistration>,
     // ── Identity ─────────────────────────────────────────────────────────
     /// Operator-assigned name for this gateway installation.
     #[serde(default)]
@@ -1510,6 +1522,20 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         Some(SCHEMA_VERSION) => {}
         Some(version) => return Err(ConfigFileError::UnsupportedVersion { version }),
         None => return Err(ConfigFileError::MissingVersion),
+    }
+
+    for registration in &file.openshell.gateway.provider_assertions {
+        if registration.provider_id.trim().is_empty()
+            || registration.credential_key.trim().is_empty()
+            || !openshell_core::provider_credentials::provider_assertion_endpoint(
+                &registration.token_endpoint,
+            )
+        {
+            return Err(ConfigFileError::InvalidValue {
+                field: "openshell.gateway.provider_assertions",
+                message: "each registration requires a provider ID, credential key, and canonical HTTPS token endpoint",
+            });
+        }
     }
 
     if file.openshell.gateway.database_url.is_some() {

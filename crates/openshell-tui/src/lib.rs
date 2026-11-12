@@ -2327,6 +2327,11 @@ async fn fetch_providers(
                     page_size: PROVIDER_PROFILE_PAGE_SIZE,
                     page_token,
                 };
+                let mut req = tonic::Request::new(req);
+                req.metadata_mut().insert(
+                    openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
+                    tonic::metadata::MetadataValue::from_static("1"),
+                );
                 match tokio::time::timeout(
                     Duration::from_secs(5),
                     client.list_provider_profiles(req),
@@ -2335,6 +2340,14 @@ async fn fetch_providers(
                 {
                     Ok(Ok(response)) => {
                         let response = response.into_inner();
+                        if response.profiles.iter().any(|profile| {
+                            openshell_providers::unknown_token_grant_type_diagnostic(
+                                "gateway", profile,
+                            )
+                            .is_some()
+                        }) {
+                            return None;
+                        }
                         Some((response.profiles, response.next_page_token))
                     }
                     _ => None,

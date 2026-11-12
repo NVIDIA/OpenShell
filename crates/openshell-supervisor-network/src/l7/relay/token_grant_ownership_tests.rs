@@ -8,6 +8,8 @@
 //! or that a real OAuth server issues the requested token. The resolver returns
 //! inert values and records which provider and audience the relay requested.
 
+mod provider_client_assertion_wire;
+
 use super::*;
 use crate::l7::token_grant_injection::{TokenGrantRequest, TokenGrantResolver};
 use crate::opa::{NetworkInput, OpaEngine};
@@ -278,12 +280,6 @@ impl Fixture {
         resolver: Arc<dyn TokenGrantResolver>,
         body_pending: Option<Arc<Notify>>,
     ) -> Connection {
-        let configs = self.configs.clone();
-        let middleware_engine = self.engine.clone();
-        let engine = self
-            .engine
-            .clone_engine_for_tunnel(self.generation)
-            .expect("tunnel policy snapshot");
         let ctx = L7EvalContext {
             host: HOST.into(),
             port: PORT,
@@ -295,31 +291,13 @@ impl Fixture {
             endpoint_observation_tx: self.observation.clone(),
             ..Default::default()
         };
-        let (app, client) = tokio::io::duplex(16 * 1024);
-        let mut client = BodyReadObservedStream {
-            stream: client,
+        Connection::new(
+            self.configs.clone(),
+            self.engine.clone(),
+            self.generation,
+            ctx,
             body_pending,
-            headers: Vec::new(),
-            headers_complete: false,
-            notified: false,
-        };
-        let (mut relay_upstream, upstream) = tokio::io::duplex(16 * 1024);
-        let relay = tokio::spawn(async move {
-            crate::proxy::relay_inspected_http_stream_for_test(
-                &mut client,
-                &mut relay_upstream,
-                configs,
-                engine,
-                &middleware_engine,
-                &ctx,
-            )
-            .await
-        });
-        Connection {
-            app,
-            relay,
-            upstream: tokio::spawn(capture_upstream(upstream)),
-        }
+        )
     }
 }
 
@@ -447,6 +425,43 @@ async fn capture_upstream(mut stream: DuplexStream) -> Capture {
 }
 
 impl Connection {
+    fn new(
+        configs: Vec<L7EndpointConfig>,
+        middleware_engine: Arc<OpaEngine>,
+        generation: u64,
+        ctx: L7EvalContext,
+        body_pending: Option<Arc<Notify>>,
+    ) -> Self {
+        let engine = middleware_engine
+            .clone_engine_for_tunnel(generation)
+            .expect("tunnel policy snapshot");
+        let (app, client) = tokio::io::duplex(16 * 1024);
+        let mut client = BodyReadObservedStream {
+            stream: client,
+            body_pending,
+            headers: Vec::new(),
+            headers_complete: false,
+            notified: false,
+        };
+        let (mut relay_upstream, upstream) = tokio::io::duplex(16 * 1024);
+        let relay = tokio::spawn(async move {
+            crate::proxy::relay_inspected_http_stream_for_test(
+                &mut client,
+                &mut relay_upstream,
+                configs,
+                engine,
+                &middleware_engine,
+                &ctx,
+            )
+            .await
+        });
+        Self {
+            app,
+            relay,
+            upstream: tokio::spawn(capture_upstream(upstream)),
+        }
+    }
+
     async fn exchange_body(&mut self, path: &str, body: &[u8]) -> String {
         let mut request = body_request(path, body);
         let version = b"MCP-Protocol-Version: 2025-11-25\r\n";
@@ -472,8 +487,12 @@ impl Connection {
         } else {
             ""
         };
+        self.send_with_headers(method, path, authorization).await;
+    }
+
+    async fn send_with_headers(&mut self, method: &str, path: &str, headers: &str) {
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n{authorization}Content-Length: 0\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n{headers}Content-Length: 0\r\n\r\n"
         );
         timeout(WAIT, self.app.write_all(request.as_bytes()))
             .await
@@ -531,6 +550,14 @@ impl Connection {
 }
 
 fn assert_authorization(request: &str, audience: &str) {
+    assert_bearer_token(request, &format!("inert-{audience}"));
+    assert!(
+        !request.contains("stale-inert-value"),
+        "stale header removed"
+    );
+}
+
+fn assert_bearer_token(request: &str, token: &str) {
     let values = request
         .lines()
         .filter_map(|line| line.split_once(':'))
@@ -539,12 +566,8 @@ fn assert_authorization(request: &str, audience: &str) {
         .collect::<Vec<_>>();
     assert_eq!(values.len(), 1, "exactly one Authorization replacement");
     assert!(
-        values[0] == format!("Bearer inert-{audience}"),
+        values[0] == format!("Bearer {token}"),
         "expected owner token"
-    );
-    assert!(
-        !request.contains("stale-inert-value"),
-        "stale header removed"
     );
 }
 

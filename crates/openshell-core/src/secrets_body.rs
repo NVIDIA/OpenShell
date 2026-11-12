@@ -6,8 +6,8 @@
 use super::{
     CREDENTIAL_MARKER_SCAN_TAIL_BYTES, PLACEHOLDER_PREFIX, PROVIDER_ALIAS_MARKER, SecretResolver,
     alias_env_key, is_alias_token_char, is_env_key_char, now_ms, placeholder_env_key,
-    placeholder_for_env_key, revisioned_placeholder_parts, split_revisioned_env_key,
-    stable_placeholder_parts, validate_resolved_secret,
+    placeholder_for_env_key, revisioned_placeholder_parts, split_grant_env_key,
+    split_revisioned_env_key, stable_placeholder_parts, validate_resolved_secret,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -108,6 +108,11 @@ impl BodyCredentialClassifier {
         let key = placeholder_env_key(token).ok_or(BodyCredentialError::InvalidToken)?;
         if key.is_empty() || !key.bytes().all(is_env_key_char) {
             return Err(BodyCredentialError::InvalidToken);
+        }
+        // Grant handles are reserved for request headers. Their absence from
+        // the static inventory must never classify them as harmless text.
+        if split_grant_env_key(key).is_some() {
+            return Err(BodyCredentialError::KnownUnavailable);
         }
         // Reserved identity namespaces must parse completely, including u64 overflow.
         if let Some(suffix) = token.strip_prefix(PLACEHOLDER_PREFIX)
@@ -404,7 +409,17 @@ mod tests {
             known: HashSet::from(["KEY".to_owned()]),
             ..BodyCredentialClassifier::default()
         };
-        for token in ["openshell:resolve:env:KEY", "sk-OPENSHELL-RESOLVE-ENV-KEY"] {
+        let grant = super::super::grant_placeholder_for_env_key("OTHER", &"a".repeat(64)).unwrap();
+        let grant_alias = format!(
+            "sk-OPENSHELL-RESOLVE-ENV-{}",
+            grant.strip_prefix(PLACEHOLDER_PREFIX).unwrap()
+        );
+        for token in [
+            "openshell:resolve:env:KEY",
+            "sk-OPENSHELL-RESOLVE-ENV-KEY",
+            grant.as_str(),
+            grant_alias.as_str(),
+        ] {
             for token in [token.to_owned(), encode_all(token)] {
                 let body = format!("{} {token}!", "safe ".repeat(100));
                 for split in 0..body.len() {
