@@ -60,13 +60,35 @@ documents carry no version.
 JSON and that readers reject invalid ones. A change that alters an encoding
 fails there.
 
-### Replacing it
+### The replacement format
 
-Options considered for the replacement are JSON Schema for these documents, and
-protobuf messages written as proto3 JSON. JSON Schema describes today's bytes
-exactly but is a second description of concepts that protos already define;
-protobuf avoids that, and a driver that serializes generated types would emit
-proto3 JSON, which existing readers reject. Nothing is decided.
+`proto/sandbox_runtime.proto` specifies the replacement: the same documents as
+protobuf messages, written as canonical protobuf JSON. It reuses
+`ResolvedWorkloadIdentity` and `DriverFenceEvidence` from `compute_driver.proto`
+and adds `contract_version`, which tells a new document from a legacy one. The
+generated types are in `proto::sandbox_runtime`, and `proto::FILE_DESCRIPTOR_SET`
+holds the descriptors for a reader or writer that works with the JSON directly.
+
+`legacy_contract::convert` converts between the legacy types and the messages
+(`From` into a message, `TryFrom` back, which applies the validation the legacy
+readers apply later). `tests/driver_contract_proto_json.rs` checks both
+directions against the examples in `tests/legacy_contract/proto_json/`: the
+message built from a legacy example must equal the protobuf JSON example, and
+reading the protobuf JSON example must give back the legacy example. The
+examples are the reference for a driver in any language. Regenerate them from
+the legacy examples with `UPDATE_EXAMPLES=1` and review the diff.
+
+No driver or reader uses the new format yet.
+
+### Migrating
+
+The replacement is protobuf messages written as protobuf JSON, chosen over JSON
+Schema. JSON Schema describes today's bytes exactly but is a second description
+of concepts that the protos already define. Protobuf JSON is not the encoding in
+use (tags, key casing, `oneof` shape, string-encoded 64-bit integers), so a
+driver that serialized the generated types would write documents that existing
+readers reject. That is why a reader tells the two formats apart by
+`contract_version`.
 
 A lower-risk path than reading both formats is to write both: a driver writes
 the new format under a new file name beside the legacy one, and the supervisor

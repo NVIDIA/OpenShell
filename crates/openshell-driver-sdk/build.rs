@@ -10,13 +10,14 @@ const PROTO_REL: &str = "../../proto";
 
 /// Proto files that make up the compute-driver contract. Their transitive
 /// imports are `options`, `extension`, `datamodel`, and `sandbox`; no other
-/// proto file is needed.
+/// proto file is needed. `sandbox_runtime.proto` imports `compute_driver.proto`.
 const PROTO_FILES: &[&str] = &[
     "options.proto",
     "extension.proto",
     "datamodel.proto",
     "sandbox.proto",
     "compute_driver.proto",
+    "sandbox_runtime.proto",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -70,6 +71,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut include_dirs = vec![proto_root];
     include_dirs.extend(proto_include);
+    let descriptor_path =
+        PathBuf::from(env::var("OUT_DIR")?).join("openshell_driver_sdk_descriptor.bin");
 
     tonic_prost_build::configure()
         .type_attribute(
@@ -79,7 +82,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .include_file("openshell.rs")
+        // Descriptors of these protos, for implementers that read or write the
+        // JSON documents described by `sandbox_runtime.proto`.
+        .file_descriptor_set_path(&descriptor_path)
         .compile_with_config(proto_config, &proto_files, &include_dirs)?;
+
+    println!(
+        "cargo:rustc-env=OPENSHELL_DRIVER_SDK_DESCRIPTOR_PATH={}",
+        descriptor_path.display()
+    );
 
     Ok(())
 }

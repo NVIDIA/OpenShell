@@ -4723,6 +4723,7 @@ dependencies = [
  "openshell-crypto",
  "openshell-otel",
  "prost",
+ "prost-reflect",
  "prost-types",
  "protoc-bin-vendored",
  "rcgen",
