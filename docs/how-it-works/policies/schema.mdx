@@ -335,7 +335,10 @@ deny_rules:
 
 For GraphQL over WebSocket, use `protocol: websocket` with a `GET` rule for the
 upgrade and GraphQL rules for operations. Do not mix WebSocket and GraphQL
-matcher fields in one rule.
+matcher fields in one rule. GraphQL rules apply only to the client text
+messages OpenShell inspects; a binary frame carrying the same operation
+bypasses GraphQL operation and field matching, consistent with [WebSocket
+Rules](#websocket-rules).
 
 ### MCP Rules
 
