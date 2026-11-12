@@ -89,6 +89,7 @@ jobs:
             {"environment":"fedora-podman-rootless","installer":"rpm","family":"features","package":"host-gateway","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-k3s","installer":"k3s","family":"features","package":"host-gateway","gateway":"tmachine","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"features","package":"host-gateway","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"cli-attach","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-userns-default","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},

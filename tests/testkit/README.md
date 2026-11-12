@@ -93,6 +93,14 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   plus `json()`, and `report_text()` for matching a wrapped error report.
   `cx.cli_handle()` returns that CLI for code that can't borrow `cx`, such as
   a cleanup hook.
+- `cx.cli_spawn([...])` to start the CLI and keep it running, for commands
+  that stream or read input, such as `sandbox connect`. The `CliChild` it
+  returns writes stdin, reads stdout and stderr line by line or all at once,
+  sends signals, and waits for the exit code. `cx.cli_spawn_with_stdin` takes
+  another stdin, such as a file or a pseudo-terminal.
+- `Cli::apply_env` to point another program at the same gateway, such as `ssh`
+  with the `ProxyCommand` from `sandbox ssh-config`. `Cli::gateway` says which
+  gateway that is.
 - `cx.on_cleanup(name, hook)` to remove something when the test ends.
 - `testkit::policy` for sandbox policies: `policy::base()` reads
   `testkit/src/base-policy.yaml`, which allows no network access, and

@@ -14,6 +14,7 @@ use rand::Rng;
 
 use crate::cleanup::{CLEANUP_TIMEOUT, Cleanup, Key};
 use crate::cli::{Cli, CliOutput};
+use crate::cli_child::CliChild;
 use crate::cli_sandbox::CliSandboxBuilder;
 use crate::error::{Error, Result, ResultExt};
 use crate::output::Outcome;
@@ -77,6 +78,30 @@ impl Context {
         S: AsRef<std::ffi::OsStr>,
     {
         self.handles.cli.run_with_env(None, env, args).await
+    }
+
+    /// Start the CLI with `args` and keep it running, with stdin, stdout,
+    /// and stderr piped to the test. See [`CliChild`].
+    pub fn cli_spawn<I, S>(&self, args: I) -> Result<CliChild>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.handles.cli.spawn(args)
+    }
+
+    /// Like [`Context::cli_spawn`], with `stdin` as the CLI's stdin, such
+    /// as [`std::process::Stdio::null`], a file, or a pseudo-terminal.
+    pub fn cli_spawn_with_stdin<I, S>(
+        &self,
+        args: I,
+        stdin: impl Into<std::process::Stdio>,
+    ) -> Result<CliChild>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.handles.cli.spawn_with_stdin(args, stdin)
     }
 
     /// The CLI that [`Context::cli`] runs, for code that can't borrow the
