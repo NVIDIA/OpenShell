@@ -191,3 +191,7 @@ debug = 1
 # is ~10x slower, which times out broker tests.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Keep SQLx Rust source unchanged while using patched bundled SQLite.
+[patch.crates-io]
+sqlx-sqlite = { path = "crates/sqlx-sqlite-compat" }
