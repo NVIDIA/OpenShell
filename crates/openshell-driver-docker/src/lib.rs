@@ -1069,6 +1069,36 @@ impl DockerComputeDriver {
         Ok(driver)
     }
 
+    fn resource_capabilities(gpu_supported: bool) -> ResourceCapabilities {
+        ResourceCapabilities {
+            cpu: Some(CpuResourceCapabilities {
+                limit_supported: true,
+                limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                    kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit
+                        as i32,
+                    scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container
+                        as i32,
+                }),
+                ..Default::default()
+            }),
+            memory: Some(MemoryResourceCapabilities {
+                limit_supported: true,
+                limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                    kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit
+                        as i32,
+                    scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container
+                        as i32,
+                }),
+                ..Default::default()
+            }),
+            gpu: Some(GpuResourceCapabilities {
+                default_selection_supported: gpu_supported,
+                count_selection_supported: gpu_supported,
+            }),
+            sampled_budget: None,
+        }
+    }
+
     fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
             resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
@@ -1082,25 +1112,14 @@ impl DockerComputeDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
-            resource_capabilities: Some(ResourceCapabilities {
-                cpu: Some(CpuResourceCapabilities {
-                    limit_supported: true,
-                }),
-                memory: Some(MemoryResourceCapabilities {
-                    limit_supported: true,
-                }),
-                gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: self.config.gpu.cdi_supported,
-                    count_selection_supported: self.config.gpu.cdi_supported,
-                }),
-            }),
+            resource_capabilities: Some(Self::resource_capabilities(self.config.gpu.cdi_supported)),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
             extension: Some(openshell_core::extension_protocol::extension_metadata(
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/docker",
                 openshell_core::VERSION,
-                [],
+                [openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT.to_string()],
             )),
         }
     }
@@ -1122,6 +1141,12 @@ impl DockerComputeDriver {
             config.allow_driver_config,
             sandbox,
         )?;
+        openshell_core::resource_contract::validate_request(
+            sandbox,
+            Some(&Self::resource_capabilities(config.gpu.cdi_supported)),
+            true,
+        )
+        .map_err(Status::failed_precondition)?;
         let spec = sandbox
             .spec
             .as_ref()
@@ -6502,7 +6527,6 @@ fn docker_pids_limit(value: Option<std::num::NonZeroI64>) -> Result<Option<i64>,
     Ok(value.map(std::num::NonZeroI64::get))
 }
 
-#[allow(clippy::cast_possible_truncation)]
 fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
     let value = value.trim();
     if value.is_empty() {
@@ -6519,7 +6543,9 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
                 "docker cpu_limit must be greater than zero",
             ));
         }
-        return Ok(Some(millicores.saturating_mul(1_000_000)));
+        return millicores.checked_mul(1_000_000).map(Some).ok_or_else(|| {
+            Status::failed_precondition("docker CPU limit exceeds the supported range")
+        });
     }
 
     let cores = value.parse::<f64>().map_err(|_| {
@@ -6533,10 +6559,9 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
         ));
     }
 
-    Ok(Some((cores * 1_000_000_000.0).round() as i64))
+    checked_docker_limit(cores * 1_000_000_000.0, "CPU").map(Some)
 }
 
-#[allow(clippy::cast_possible_truncation)]
 fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
     let value = value.trim();
     if value.is_empty() {
@@ -6579,7 +6604,20 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
         }
     };
 
-    Ok(Some((amount * multiplier).round() as i64))
+    checked_docker_limit(amount * multiplier, "memory").map(Some)
+}
+
+// Docker uses zero as an unlimited control. Positive authored quantities must
+// remain positive after conversion and fit the signed wire field exactly.
+#[allow(clippy::cast_possible_truncation)]
+fn checked_docker_limit(value: f64, resource: &str) -> Result<i64, Status> {
+    let value = value.floor();
+    if !value.is_finite() || value < 1.0 || value >= 2_f64.powi(63) {
+        return Err(Status::failed_precondition(format!(
+            "docker {resource} limit is outside the supported positive range"
+        )));
+    }
+    Ok(value as i64)
 }
 
 fn sandbox_from_container_summary(summary: &ContainerSummary) -> Option<DriverSandbox> {

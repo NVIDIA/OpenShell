@@ -983,15 +983,20 @@ fn sandbox_spec_from_workload_template(
             driver_config: spec.driver_config.clone(),
             ..SandboxTemplate::default()
         }),
-        resource_requirements: resources.and_then(template_gpu_requirements),
+        resource_requirements: resources.and_then(template_typed_resource_requirements),
         ..SandboxSpec::default()
     })
 }
 
-fn template_gpu_requirements(resources: &SandboxResources) -> Option<ResourceRequirements> {
-    Some(ResourceRequirements {
-        gpu: Some(resources.gpu?),
-    })
+fn template_typed_resource_requirements(
+    resources: &SandboxResources,
+) -> Option<ResourceRequirements> {
+    (resources.gpu.is_some() || resources.sampled_budget.is_some()).then_some(
+        ResourceRequirements {
+            gpu: resources.gpu,
+            sampled_budget: resources.sampled_budget,
+        },
+    )
 }
 
 fn template_resource_struct(resources: &SandboxResources) -> Option<Struct> {
@@ -4344,6 +4349,158 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn sampled_resource_contract_is_enforced_before_create() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+        use openshell_core::extension_protocol::{
+            COMPUTE_RESOURCE_CONTRACT, ExtensionFamily, extension_metadata,
+        };
+        use openshell_core::proto::compute::v1::{GetCapabilitiesResponse, ResourceCapabilities};
+        use openshell_core::proto::sandbox::v1::{
+            ResourceEnforcementScope, SampledResourceBudget, SampledResourceBudgetCapabilities,
+        };
+        let budget = SampledResourceBudget {
+            cpu_time: Some(prost_types::Duration {
+                seconds: 2,
+                nanos: 0,
+            }),
+            resident_bytes: Some(512 * 1024 * 1024),
+        };
+        let caps = ResourceCapabilities {
+            sampled_budget: Some(SampledResourceBudgetCapabilities {
+                cpu_time_supported: true,
+                resident_bytes_supported: true,
+                scope: ResourceEnforcementScope::SandboxAccount as i32,
+                sampling_interval: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 100_000_000,
+                }),
+                terminate_on_excess: true,
+                cpu_time_resolution: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 1_000_000,
+                }),
+                per_process_cpu_limit: true,
+            }),
+            ..Default::default()
+        };
+        for (modern, capabilities, cpu, memory, sampled, accepted) in [
+            (true, Some(caps), "", "", Some(budget), true),
+            (true, Some(caps), "1", "", None, false),
+            (true, Some(caps), "", "512Mi", None, false),
+            (true, Some(caps), "1", "", Some(budget), false),
+            (true, None, "", "", Some(budget), false),
+            (false, Some(caps), "", "", Some(budget), false),
+            (false, None, "1", "", None, true),
+        ] {
+            let mut state = test_server_state().await;
+            let driver = Arc::new(
+                FakeComputeDriver::new().with_capabilities(GetCapabilitiesResponse {
+                    driver_name: "test".into(),
+                    default_image: "test/image".into(),
+                    resource_capabilities: capabilities,
+                    resource_admission_policy:
+                        openshell_core::resource_admission::DriverAdmissionConfig::default()
+                            .acknowledgement(),
+                    extension: Some(extension_metadata(
+                        ExtensionFamily::Compute,
+                        "openshell/test",
+                        "test",
+                        if modern {
+                            vec![COMPUTE_RESOURCE_CONTRACT.into()]
+                        } else {
+                            vec![]
+                        },
+                    )),
+                    ..Default::default()
+                }),
+            );
+            let compute = crate::compute::ComputeRuntime::from_driver(
+                "test".into(),
+                driver.clone(),
+                None,
+                state.store.clone(),
+                crate::sandbox_index::SandboxIndex::new(),
+                crate::sandbox_watch::SandboxWatchBus::new(),
+                crate::tracing_bus::TracingLogBus::new(),
+                Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+            )
+            .await
+            .unwrap();
+            Arc::get_mut(&mut state).unwrap().compute = compute;
+            // Exercise the typed workload-template path as well as public-to-driver mapping.
+            let resources = SandboxResources {
+                cpu: cpu.into(),
+                memory: memory.into(),
+                sampled_budget: sampled,
+                ..Default::default()
+            };
+            let spec = SandboxSpec {
+                template: Some(SandboxTemplate {
+                    resources: template_resource_struct(&resources),
+                    ..Default::default()
+                }),
+                resource_requirements: template_typed_resource_requirements(&resources),
+                policy: Some(openshell_policy::restrictive_default_policy()),
+                ..Default::default()
+            };
+            let result = handle_create_sandbox(
+                &state,
+                authed_request(CreateSandboxRequest {
+                    name: "budget".into(),
+                    spec: Some(spec),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "modern={modern}, cpu={cpu}, memory={memory}"
+            );
+            let requests: Vec<_> = driver
+                .calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    FakeComputeDriverCall::ValidateSandboxCreate { sandbox }
+                    | FakeComputeDriverCall::CreateSandbox { sandbox } => Some(sandbox.unwrap()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(requests.len(), if accepted { 2 } else { 0 });
+            let stored = state
+                .store
+                .get_message_by_name::<Sandbox>("default", "budget")
+                .await
+                .unwrap();
+            assert_eq!(stored.is_some(), accepted);
+            if accepted && sampled.is_some() {
+                for request in requests {
+                    assert_eq!(
+                        request
+                            .spec
+                            .unwrap()
+                            .resource_requirements
+                            .unwrap()
+                            .sampled_budget,
+                        sampled
+                    );
+                }
+                assert_eq!(
+                    stored
+                        .unwrap()
+                        .spec
+                        .unwrap()
+                        .resource_requirements
+                        .unwrap()
+                        .sampled_budget,
+                    sampled
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn missing_launch_signer_precedes_driver_validation_and_preserves_staged_archive() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = test_server_state().await;
@@ -4507,6 +4664,7 @@ mod tests {
                 policy: Some(openshell_core::proto::SandboxPolicy::default()),
                 resource_requirements: Some(ResourceRequirements {
                     gpu: Some(GpuResourceRequirements { count: Some(1) }),
+                    ..Default::default()
                 }),
                 ..SandboxSpec::default()
             }),
@@ -5308,6 +5466,7 @@ mod tests {
                         cpu: "2".to_string(),
                         memory: "4Gi".to_string(),
                         gpu: Some(GpuResourceRequirements { count: Some(1) }),
+                        ..Default::default()
                     }),
                 }),
                 driver_config: None,

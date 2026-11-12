@@ -119,6 +119,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
+            supports_sampled_resource_budget: false,
         }))
     }
 

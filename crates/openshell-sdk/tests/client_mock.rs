@@ -20,7 +20,7 @@ use openshell_sdk::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -48,6 +48,8 @@ fn selects_all_workspaces(scope: &Option<proto::datamodel::v1::WorkspaceSelector
 /// returned. One per test so assertions are scoped.
 #[derive(Default)]
 struct MockState {
+    sampled_budget_ack: AtomicBool,
+    health_failure: AtomicBool,
     last_get_name: Mutex<Option<String>>,
     last_get_workspace: Mutex<Option<String>>,
     last_create: Mutex<Option<proto::CreateSandboxRequest>>,
@@ -312,6 +314,9 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<proto::HealthRequest>,
     ) -> Result<Response<proto::HealthResponse>, Status> {
+        if self.state.health_failure.load(Ordering::SeqCst) {
+            return Err(Status::unimplemented("legacy health RPC"));
+        }
         if let Some(expected) = &self.state.require_bearer {
             let got = request
                 .metadata()
@@ -325,6 +330,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::HealthResponse {
             status: proto::ServiceStatus::Healthy.into(),
             version: "test-1.2.3".to_string(),
+            supports_sampled_resource_budget: self.state.sampled_budget_ack.load(Ordering::SeqCst),
         }))
     }
 
@@ -1241,11 +1247,16 @@ async fn create_sandbox_passes_spec_through() {
     let mut labels = HashMap::new();
     labels.insert("team".to_string(), "core".to_string());
 
+    let budget = proto::sandbox::v1::SampledResourceBudget {
+        cpu_time: Some(Duration::from_secs(2).try_into().unwrap()),
+        resident_bytes: Some(4096),
+    };
     let spec = SandboxSpec {
         name: Some("my-box".to_string()),
         image: Some("ghcr.io/foo:bar".to_string()),
         labels: labels.clone(),
         gpu: true,
+        sampled_budget: Some(budget),
         service_exposures: vec![ServiceExposure {
             service: "web".to_string(),
             target_port: 8080,
@@ -1254,6 +1265,13 @@ async fn create_sandbox_passes_spec_through() {
         ..Default::default()
     };
 
+    assert!(client.create_sandbox(spec.clone()).await.is_err());
+    assert!(state.last_create.lock().await.is_none());
+    state.health_failure.store(true, Ordering::SeqCst);
+    assert!(client.create_sandbox(spec.clone()).await.is_err());
+    assert!(state.last_create.lock().await.is_none());
+    state.health_failure.store(false, Ordering::SeqCst);
+    state.sampled_budget_ack.store(true, Ordering::SeqCst);
     let result = client.create_sandbox(spec).await.unwrap();
     assert_eq!(result.name, "my-box");
     assert_eq!(result.phase, SandboxPhase::Provisioning);
@@ -1274,6 +1292,14 @@ async fn create_sandbox_passes_spec_through() {
         proto::ServiceAuthorizationMode::BearerPassthrough
     );
     let observed_spec = observed.spec.unwrap();
+    let budget = observed_spec
+        .resource_requirements
+        .as_ref()
+        .unwrap()
+        .sampled_budget
+        .unwrap();
+    assert_eq!(budget.cpu_time.unwrap().seconds, 2);
+    assert_eq!(budget.resident_bytes, Some(4096));
     assert!(
         observed_spec
             .resource_requirements
@@ -1326,10 +1352,30 @@ async fn sandbox_template_crud_uses_default_workspace() {
     let endpoint = start_mock(state.clone()).await;
     let client = connect(&endpoint).await;
 
-    let created = client
-        .create_sandbox_template(workload_template_proto("python", ""))
-        .await
-        .unwrap();
+    let mut template = workload_template_proto("python", "");
+    template
+        .spec
+        .as_mut()
+        .unwrap()
+        .workload
+        .as_mut()
+        .unwrap()
+        .resources = Some(proto::SandboxResources {
+        sampled_budget: Some(proto::sandbox::v1::SampledResourceBudget {
+            cpu_time: None,
+            resident_bytes: Some(4096),
+        }),
+        ..Default::default()
+    });
+    assert!(
+        client
+            .create_sandbox_template(template.clone())
+            .await
+            .is_err()
+    );
+    assert!(state.last_template_create.lock().await.is_none());
+    state.sampled_budget_ack.store(true, Ordering::SeqCst);
+    let created = client.create_sandbox_template(template).await.unwrap();
     assert_eq!(created.metadata.as_ref().unwrap().name, "python");
 
     let observed_create = state.last_template_create.lock().await.clone().unwrap();
@@ -2105,8 +2151,15 @@ async fn workspace_scoped_create_passes_workspace() {
     let ws = client.workspace("staging");
     let spec = SandboxSpec {
         name: Some("my-box".to_string()),
+        sampled_budget: Some(proto::sandbox::v1::SampledResourceBudget {
+            cpu_time: None,
+            resident_bytes: Some(4096),
+        }),
         ..Default::default()
     };
+    assert!(ws.create_sandbox(spec.clone()).await.is_err());
+    assert!(state.last_create.lock().await.is_none());
+    state.sampled_budget_ack.store(true, Ordering::SeqCst);
     let result = ws.create_sandbox(spec).await.unwrap();
     assert_eq!(result.name, "my-box");
 
@@ -2185,9 +2238,25 @@ async fn workspace_scoped_sandbox_template_crud_passes_workspace() {
     let client = connect(&endpoint).await;
     let ws = client.workspace("staging");
 
-    ws.create_sandbox_template(workload_template_proto("python", "staging"))
-        .await
-        .unwrap();
+    let mut template = workload_template_proto("python", "staging");
+    template
+        .spec
+        .as_mut()
+        .unwrap()
+        .workload
+        .as_mut()
+        .unwrap()
+        .resources = Some(proto::SandboxResources {
+        sampled_budget: Some(proto::sandbox::v1::SampledResourceBudget {
+            cpu_time: None,
+            resident_bytes: Some(4096),
+        }),
+        ..Default::default()
+    });
+    assert!(ws.create_sandbox_template(template.clone()).await.is_err());
+    assert!(state.last_template_create.lock().await.is_none());
+    state.sampled_budget_ack.store(true, Ordering::SeqCst);
+    ws.create_sandbox_template(template).await.unwrap();
     let observed_create = state.last_template_create.lock().await.clone().unwrap();
     assert_eq!(
         selected_workspace(&observed_create.workspace_scope),

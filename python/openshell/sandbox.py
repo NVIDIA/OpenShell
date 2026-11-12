@@ -28,6 +28,7 @@ from ._proto import (
     datamodel_pb2,
     openshell_pb2,
     openshell_pb2_grpc,
+    sandbox_pb2,
 )
 from .errors import _error_mapping_channel, from_grpc_error
 from .mutations import DeletionOutcome, DeletionResult
@@ -145,6 +146,16 @@ def _retry_unrouted(error: grpc.RpcError) -> bool:
         or "no healthy upstream" in details
         or "connection failure" in details
     )
+
+
+def _require_sampled_budget_support(stub: Any, timeout: float) -> None:
+    # This protocol acknowledgement is public; driver guarantees are checked
+    # by the gateway. Never write fields an older gateway would discard.
+    response = stub.Health(openshell_pb2.HealthRequest(), timeout=timeout)
+    if not response.supports_sampled_resource_budget:
+        raise SandboxError(
+            "gateway does not acknowledge sampled resource budgets; upgrade it before creating this workload"
+        )
 
 
 def _workspace_scope(workspace: str) -> datamodel_pb2.WorkspaceSelector:
@@ -932,6 +943,8 @@ class SandboxClient:
         service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
+        if request_spec.resource_requirements.HasField("sampled_budget"):
+            _require_sampled_budget_support(self._stub, self._timeout)
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
@@ -1514,6 +1527,7 @@ class SandboxTemplateClient:
         memory: str | None = None,
         gpu_count: int | None = None,
         gpu: bool = False,
+        sampled_budget: sandbox_pb2.SampledResourceBudget | None = None,
         driver_config: Mapping[str, Any] | None = None,
     ) -> openshell_pb2.SandboxWorkloadTemplate:
         if template is None:
@@ -1529,10 +1543,14 @@ class SandboxTemplateClient:
                 memory=memory,
                 gpu_count=gpu_count,
                 gpu=gpu,
+                sampled_budget=sampled_budget,
                 driver_config=driver_config,
             )
         elif (
-            any(value is not None for value in (name, image, cpu, memory, gpu_count))
+            any(
+                value is not None
+                for value in (name, image, cpu, memory, gpu_count, sampled_budget)
+            )
             or any(
                 bool(value)
                 for value in (labels, annotations, environment, driver_config)
@@ -1542,6 +1560,9 @@ class SandboxTemplateClient:
             raise SandboxError(
                 "template cannot be combined with template builder fields"
             )
+
+        if template.spec.workload.resources.HasField("sampled_budget"):
+            _require_sampled_budget_support(self._stub, self._timeout)
 
         response = self._stub.CreateSandboxTemplate(
             openshell_pb2.CreateSandboxTemplateRequest(
@@ -2065,6 +2086,7 @@ def _sandbox_workload_template(
     memory: str | None = None,
     gpu_count: int | None = None,
     gpu: bool = False,
+    sampled_budget: sandbox_pb2.SampledResourceBudget | None = None,
     driver_config: Mapping[str, Any] | None = None,
 ) -> openshell_pb2.SandboxWorkloadTemplate:
     if gpu_count is not None and gpu_count <= 0:
@@ -2084,6 +2106,8 @@ def _sandbox_workload_template(
         template.spec.workload.image = image
     if environment:
         template.spec.workload.environment.update(dict(environment))
+    if sampled_budget is not None:
+        template.spec.workload.resources.sampled_budget.CopyFrom(sampled_budget)
     if cpu is not None:
         template.spec.workload.resources.cpu = cpu
     if memory is not None:

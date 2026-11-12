@@ -291,6 +291,8 @@ pub struct SandboxSpec {
     /// Request a GPU. Driver-specific device selection is configured via
     /// driver config on the raw proto surface (see [`crate::raw`]).
     pub gpu: bool,
+    /// Explicit sampled account-wide budgets, distinct from hard resource limits.
+    pub sampled_budget: Option<proto::sandbox::v1::SampledResourceBudget>,
     /// Exact canonical command. Empty selects the gateway's scratch login shell.
     pub command: Vec<String>,
     /// Allocate a retained pseudo-terminal for the canonical command.

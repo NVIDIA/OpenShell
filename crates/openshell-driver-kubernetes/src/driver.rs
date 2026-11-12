@@ -1292,6 +1292,38 @@ impl KubernetesComputeDriver {
         Ok(driver)
     }
 
+    fn resource_capabilities() -> ResourceCapabilities {
+        ResourceCapabilities {
+                cpu: Some(CpuResourceCapabilities {
+                    limit_supported: true,
+                    request_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                        kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::SchedulerRequest as i32,
+                        scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container as i32,
+                    }),
+                    limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                        kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit as i32,
+                        scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container as i32,
+                    }),
+}),
+                memory: Some(MemoryResourceCapabilities {
+                    limit_supported: true,
+                    request_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                        kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::SchedulerRequest as i32,
+                        scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container as i32,
+                    }),
+                    limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                        kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit as i32,
+                        scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container as i32,
+                    }),
+}),
+                gpu: Some(GpuResourceCapabilities {
+                    default_selection_supported: true,
+                    count_selection_supported: true,
+                }),
+            sampled_budget: None,
+}
+    }
+
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
         Ok(GetCapabilitiesResponse {
             resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
@@ -1305,18 +1337,7 @@ impl KubernetesComputeDriver {
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication: true,
             driver_reports_runtime_readiness: false,
-            resource_capabilities: Some(ResourceCapabilities {
-                cpu: Some(CpuResourceCapabilities {
-                    limit_supported: true,
-                }),
-                memory: Some(MemoryResourceCapabilities {
-                    limit_supported: true,
-                }),
-                gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: true,
-                    count_selection_supported: true,
-                }),
-            }),
+            resource_capabilities: Some(Self::resource_capabilities()),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -1326,6 +1347,7 @@ impl KubernetesComputeDriver {
                 [
                     openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
                         .to_string(),
+                    openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT.to_string(),
                 ],
             )),
         })
@@ -2101,6 +2123,12 @@ impl KubernetesComputeDriver {
             self.config.allow_driver_config,
             sandbox,
         )?;
+        openshell_core::resource_contract::validate_request(
+            sandbox,
+            Some(&Self::resource_capabilities()),
+            true,
+        )
+        .map_err(tonic::Status::failed_precondition)?;
         self.config
             .resource_admission
             .validate()
@@ -2550,6 +2578,12 @@ impl KubernetesComputeDriver {
         )
     )]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<String, KubernetesDriverError> {
+        openshell_core::resource_contract::validate_request(
+            sandbox,
+            Some(&Self::resource_capabilities()),
+            true,
+        )
+        .map_err(|error| admission_error(tonic::Status::failed_precondition(error)))?;
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let _guard = self
             .lifecycle_gates
@@ -11847,6 +11881,7 @@ mod tests {
             spec: Some(SandboxSpec {
                 resource_requirements: Some(ResourceRequirements {
                     gpu: Some(GpuResourceRequirements { count: Some(0) }),
+                    ..Default::default()
                 }),
                 ..SandboxSpec::default()
             }),
