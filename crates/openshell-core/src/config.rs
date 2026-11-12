@@ -357,17 +357,13 @@ pub struct Config {
     /// armed until Ready. Must be between 1 and 86400, inclusive.
     pub provisioning_repair_window_seconds: i64,
 
-    /// Durable mutation admissions one caller identity can hold at once.
-    ///
-    /// Counted across every gateway replica that shares the database.
-    /// Unresolved admissions and successful ones still inside the replay
-    /// window both count. Must be within
+    /// Durable mutation admissions one caller can hold across every replica
+    /// sharing the database. Replicas must use the same value. Must be within
     /// [`MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE`].
     pub mutation_admission_limit_per_caller: u32,
 
-    /// Seconds a successful mutation admission stays replayable, measured from
-    /// durable completion. Replicas sharing a database must use the same value.
-    /// Must be within [`MUTATION_REPLAY_WINDOW_SECONDS_RANGE`].
+    /// Seconds a successful mutation admission stays replayable. Must be within
+    /// [`MUTATION_REPLAY_WINDOW_SECONDS_RANGE`].
     pub mutation_replay_window_seconds: u32,
 
     /// Maximum gRPC requests allowed per rate-limit window.

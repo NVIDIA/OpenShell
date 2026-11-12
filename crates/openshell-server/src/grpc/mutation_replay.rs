@@ -447,8 +447,6 @@ async fn prune_expired(
     window_ms: i64,
 ) -> Result<bool, Status> {
     // The bucket is atomically bounded, so this scan cannot grow without limit.
-    // A replica configured with a lower limit than its peers still scans only
-    // its own limit; every replica must use the same value.
     let rows = store
         .list(OBJECT_TYPE, bucket, limit, 0)
         .await
