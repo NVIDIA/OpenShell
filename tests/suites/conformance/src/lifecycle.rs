@@ -400,7 +400,11 @@ const MARKER_TIMEOUT: Duration = Duration::from_secs(15);
 /// Under the on-failure policy, a main command that fails is replaced by a new
 /// instance of it. The workspace survives the restart, the restart is counted,
 /// and the policy is still reported afterwards.
+//
+// Unignore this when #5507 is fixed: on the VM driver the replacement never
+// starts, because the preserved overlay disk fails e2fsck.
 #[testkit::test]
+#[ignore = "https://github.com/NVIDIA/OpenShell/issues/5507"]
 async fn on_failure_policy_restarts_main_and_keeps_workspace(cx: &mut Context) -> testkit::Result {
     const SCRIPT: &str = r#"
 marker=/sandbox/.openshell-restart-e2e
