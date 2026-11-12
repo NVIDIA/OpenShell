@@ -121,3 +121,20 @@ control, process I/O, and network mediation over the bound boundary. Both are
 supervisor-to-backend contracts, not gateway RPCs. Backend authors can generate bindings independently
 from these definitions. The negotiated Sandbox Protocol version covers the gRPC
 services, typed messages, streaming, and lifecycle semantics.
+
+## Driver contract documents
+
+[`sandbox_runtime.proto`](sandbox_runtime.proto) specifies the documents a
+compute driver hands to the supervisor and the sandbox boundary, besides the
+`ComputeDriver` service: the runtime descriptor and the boundary configuration. They travel as files or as opaque `bytes`, never as gRPC
+messages, and are the canonical protobuf JSON of their messages. A writer emits
+the canonical form; a reader accepts the original field names too and rejects
+unknown fields. The messages reuse `ResolvedWorkloadIdentity` and
+`DriverFenceEvidence` from `compute_driver.proto` instead of redefining them.
+
+These messages replace the legacy documents that the Rust types in
+`openshell-driver-sdk` (`legacy_contract`) write today. A document in the new
+encoding carries `contract_version`, which a legacy document does not, so a
+reader can tell the two apart. `openshell-driver-sdk` converts between the two
+and its tests pin the protobuf JSON examples. The file is not imported by
+`openshell.proto`, so the SDKs do not generate it.

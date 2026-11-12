@@ -1,0 +1,29 @@
+{
+  "boundaryId": "sbx-0002",
+  "contractVersion": "1.0",
+  "fenceEvidence": {
+    "evidenceDigest": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "generation": "g0000000000000001"
+  },
+  "generation": "g0000000000000001",
+  "sessionId": "7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14",
+  "tls": {
+    "serverName": "sandbox.7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14.openshell.internal",
+    "trustAnchorPem": "-----BEGIN CERTIFICATE-----\nMIIBexample\n-----END CERTIFICATE-----\n"
+  },
+  "transport": {
+    "endpoint": {
+      "tcp": {
+        "authority": "supervisor.openshell.svc"
+      }
+    },
+    "initiator": "CONNECTION_INITIATOR_RUNTIME",
+    "route": "rt-0123456789abcdef0123456789abcdef"
+  },
+  "workloadIdentity": {
+    "gid": 1000,
+    "resourceDigest": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "source": "image",
+    "uid": 1000
+  }
+}

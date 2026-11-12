@@ -1,0 +1,58 @@
+{
+  "boundaryId": "sbx-0002",
+  "contractVersion": "1.0",
+  "fenceEvidence": {
+    "evidenceDigest": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "generation": "g0000000000000001",
+    "resourceClaims": {
+      "kubernetes.pod_uid": "3f1c2d4e-0000-4000-8000-000000000001"
+    }
+  },
+  "generation": "g0000000000000001",
+  "listener": {
+    "endpoint": {
+      "tcp": {
+        "addresses": [
+          "10.0.0.5:8443",
+          "[fd00::5]:8443"
+        ],
+        "authority": "supervisor.openshell.svc"
+      }
+    },
+    "initiator": "CONNECTION_INITIATOR_RUNTIME",
+    "route": "rt-0123456789abcdef0123456789abcdef",
+    "tls": {
+      "certificateChainPath": "/.openshell/tls/server.crt",
+      "privateKeyPath": "/.openshell/tls/server.key"
+    }
+  },
+  "resourceClaimFiles": {
+    "kubernetes.pod_uid": "/etc/podinfo/uid"
+  },
+  "sessionId": "7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14",
+  "trust": {
+    "authEpoch": "3",
+    "gatewayId": "gw-test",
+    "sessionRotation": "2",
+    "verificationKeys": [
+      {
+        "keyId": "k1",
+        "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAexampleexampleexampleexampleexampleexample=\n-----END PUBLIC KEY-----\n"
+      },
+      {
+        "keyId": "k2",
+        "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAexampleexampleexampleexampleexampleexample=\n-----END PUBLIC KEY-----\n"
+      }
+    ]
+  },
+  "workloadIdentity": {
+    "gid": 1000,
+    "resourceDigest": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "source": "image",
+    "supplementaryGids": [
+      1001,
+      2000
+    ],
+    "uid": 1000
+  }
+}
