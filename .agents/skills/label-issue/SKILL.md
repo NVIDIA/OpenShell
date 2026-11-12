@@ -25,7 +25,7 @@ Stop when further reading is unlikely to change classification. Technical fetch 
 
 First identify the requested outcome, affected OpenShell boundary and substantive technical concerns; topics follow those concerns. Routine implementation or verification alone adds no topic. Testing work retains its testing topic.
 
-Choose exactly one area and every supported topic from the canonical scopes. Keep required SDK language and broad subscription topics. Report missing definitions or routing preparation as prerequisites; do not omit a needed label or invent replacements.
+Choose exactly one area and every supported topic from the canonical scopes. Report missing definitions or routing preparation as prerequisites; do not omit a needed label or invent replacements.
 
 Choose the best-supported set despite ordinary uncertainty. Record meaningful alternatives and medium/low confidence in `ambiguity`; use null for high-confidence choices. Ambiguity requires no escalation or extra approval.
 

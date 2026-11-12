@@ -142,8 +142,6 @@ def validate_result(snapshot: dict, result: dict) -> dict:
                 missing.append(f"Canonical taxonomy label unavailable: {label}")
             if label not in definitions:
                 missing.append(f"Live label definition unavailable: {label}")
-    if any(t.startswith("topic:sdk:") for t in topics) and "topic:sdk" not in topics:
-        errors.append("Language-specific SDK topics require topic:sdk")
     reasons = result.get("reasons")
     covered = set()
     if not isinstance(reasons, list) or not reasons:
