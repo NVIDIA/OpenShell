@@ -236,19 +236,6 @@ High availability, failure recovery, retries, graceful degradation, fault tolera
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 
-### topic:sdk
-
-Software Development Kit (SDK) creation, maintenance, language bindings, and distribution.
-
-Use this topic for SDK-wide concerns. Each language topic starts with the same reviewers and routes independently; individual memberships can be refined through reviewed follow-on changes.
-
-| Name | GitHub ID | Company/Organization |
-| --- | --- | --- |
-| Krzysztof Malczuk | [@2000krysztof](https://github.com/2000krysztof) | Red Hat |
-| Max Dubrinsky | [@maxdubrinsky](https://github.com/maxdubrinsky) | Gretel |
-| Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
-| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
-
 ### topic:sdk:go
 
 Go SDK implementation, maintenance, interfaces, and distribution.
