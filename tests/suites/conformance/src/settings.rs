@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Settings suite: sandbox-scoped settings and the gateway-global settings
-//! that override them.
+//! Settings suite: sandbox-scoped settings.
 //!
-//! The global test changes a setting for the whole gateway. That is safe
-//! because the runner runs one test at a time; a family that runs tests
-//! concurrently needs to give it a test group of its own.
+//! The gateway-global override test stays in `e2e/rust/tests/settings_management.rs`
+//! until the runner can give it a test group of its own: it changes a setting
+//! for the whole gateway, so nothing else may run beside it. The round trip
+//! below clears the global value for its key and restores it afterwards.
 
 use std::time::Duration;
 
@@ -39,53 +39,6 @@ async fn sandbox_setting_round_trip(cx: &mut Context) -> testkit::Result {
         .await?
         .success()?;
     expect_sandbox_setting(cx, &sandbox, UNSET, "unset").await
-}
-
-/// A global setting overrides the sandbox's value and blocks sandbox writes
-/// and deletes for that key. Once the global setting is deleted, the sandbox
-/// controls the key again.
-#[testkit::test]
-async fn global_setting_overrides_sandbox_scope(cx: &mut Context) -> testkit::Result {
-    let cli = cx.cli_handle();
-    restore_global_setting_on_cleanup(cx, KEY).await?;
-    delete_global_setting(&cli, KEY).await?;
-
-    let sandbox = cx
-        .sandbox("sg")
-        .command(["sleep", "infinity"])
-        .create_ready()
-        .await?;
-    set_sandbox_setting(cx, &sandbox, "true").await?.success()?;
-    expect_sandbox_setting(cx, &sandbox, "true", "sandbox").await?;
-
-    set_global_setting(&cli, KEY, "false").await?;
-    testkit::ensure!(
-        read_global_setting(&cli, KEY).await? == "false",
-        "the global {KEY} does not read back as false"
-    );
-    expect_sandbox_setting(cx, &sandbox, "false", "global").await?;
-
-    let blocked = set_sandbox_setting(cx, &sandbox, "true").await?.failure()?;
-    testkit::ensure!(
-        blocked.report_text().contains("managed globally"),
-        "setting a globally managed key on the sandbox failed without saying the key is managed globally: {}",
-        blocked.report_text()
-    );
-    cx.cli(["settings", "delete", sandbox.name(), "--key", KEY])
-        .await?
-        .failure()?;
-
-    delete_global_setting(&cli, KEY).await?;
-    let global = read_global_setting(&cli, KEY).await?;
-    testkit::ensure!(
-        global == UNSET,
-        "the global {KEY} is {global:?} after delete; expected {UNSET:?}"
-    );
-
-    set_sandbox_setting(cx, &sandbox, "false")
-        .await?
-        .success()?;
-    expect_sandbox_setting(cx, &sandbox, "false", "sandbox").await
 }
 
 async fn set_sandbox_setting(

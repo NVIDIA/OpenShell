@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use testkit::sdk::{SandboxPhase, SandboxRestartPolicy};
-use testkit::{Context, Poll, ResultExt as _, Sandbox, poll_until, with_deadline};
+use testkit::{Context, ResultExt as _, Sandbox, with_deadline};
 
 /// A long-running sandbox becomes ready, runs a command with exec, and is gone
 /// from get and list after delete.
@@ -388,105 +388,6 @@ async fn main_environment(
         .filter_map(|line| line.split_once('='))
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect())
-}
-
-/// How long a restart under the on-failure policy may take to be reported.
-/// The runner kills a test after two minutes, so the test's deadlines must
-/// add up to less.
-const RESTART_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long a running main command may take to write its workspace marker.
-const MARKER_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Under the on-failure policy, a main command that fails is replaced by a new
-/// instance of it. The workspace survives the restart, the restart is counted,
-/// and the policy is still reported afterwards.
-//
-// Unignore this when #5507 is fixed: on the VM driver the replacement never
-// starts, because the preserved overlay disk fails e2fsck.
-#[testkit::test]
-#[ignore = "https://github.com/NVIDIA/OpenShell/issues/5507"]
-async fn on_failure_policy_restarts_main_and_keeps_workspace(cx: &mut Context) -> testkit::Result {
-    const SCRIPT: &str = r#"
-marker=/sandbox/.openshell-restart-e2e
-if [ -e "$marker" ]; then
-  printf 'replacement-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/replacement-run
-  sleep 300
-else
-  touch "$marker"
-  printf 'initial-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/initial-run
-  while [ ! -e /sandbox/.openshell-restart-release ]; do sleep 0.05; done
-  exit 17
-fi
-"#;
-    let sandbox = cx
-        .sandbox("of")
-        .command(["sh", "-c", SCRIPT])
-        .restart_policy(SandboxRestartPolicy::OnFailure)
-        .create_ready()
-        .await?;
-    sandbox
-        .poll_exec(
-            "the initial main command to write its workspace marker",
-            MARKER_TIMEOUT,
-            ["cat", "/sandbox/initial-run"],
-            |output| output.stdout.contains("initial-"),
-        )
-        .await?;
-
-    let initial = sandbox.get_json().await?;
-    let initial_instance = main_instance(&initial).to_string();
-    testkit::ensure!(
-        !initial_instance.is_empty(),
-        "sandbox get reports no main process instance: {initial}"
-    );
-    sandbox
-        .exec(["touch", "/sandbox/.openshell-restart-release"])
-        .await?
-        .success()?;
-
-    let restarted = poll_until(
-        "the on-failure restart",
-        RESTART_TIMEOUT,
-        Duration::from_millis(250),
-        async || {
-            let details = sandbox.get_json().await?;
-            let instance = main_instance(&details);
-            let replaced = !instance.is_empty() && instance != initial_instance;
-            Ok(
-                if details["phase"] == "Ready" && details["restart_count"] == 1 && replaced {
-                    Poll::Ready(details)
-                } else {
-                    Poll::Pending(format!(
-                        "phase {}, restart count {}, main process instance {instance:?}",
-                        details["phase"], details["restart_count"]
-                    ))
-                },
-            )
-        },
-    )
-    .await?;
-    sandbox
-        .poll_exec(
-            "the replacement main command to find the workspace and write its marker",
-            MARKER_TIMEOUT,
-            ["cat", "/sandbox/initial-run", "/sandbox/replacement-run"],
-            |output| output.stdout.contains("initial-") && output.stdout.contains("replacement-"),
-        )
-        .await?;
-    testkit::ensure!(
-        restarted["restart_policy"] == "on-failure",
-        "the restart policy after the restart is {}; expected \"on-failure\"",
-        restarted["restart_policy"]
-    );
-    Ok(())
-}
-
-/// The ID of the sandbox's current main process instance, from
-/// [`Sandbox::get_json`]. Empty if none is reported.
-fn main_instance(details: &serde_json::Value) -> &str {
-    details["main_process_instance_id"]
-        .as_str()
-        .unwrap_or_default()
 }
 
 /// How long the gateway may take to remove an ephemeral sandbox after its
