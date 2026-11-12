@@ -410,6 +410,18 @@ fn resolve_legacy_driver_selector_env(args: &mut RunArgs) -> Result<bool> {
     Ok(true)
 }
 
+fn in_range(name: &str, value: u32, range: std::ops::RangeInclusive<u32>) -> Result<u32> {
+    if range.contains(&value) {
+        Ok(value)
+    } else {
+        Err(miette::miette!(
+            "{name} must be between {} and {}",
+            range.start(),
+            range.end()
+        ))
+    }
+}
+
 #[cfg(test)]
 fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<ServerStartupConfig> {
     prepare_server_config_with_drivers(args, matches, &ComputeDriverRegistry::new())
@@ -722,30 +734,22 @@ fn prepare_server_config_with_drivers(
         .as_ref()
         .and_then(|f| f.openshell.gateway.mutation_admission_limit_per_caller)
     {
-        let range = openshell_core::config::MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE;
-        if !range.contains(&limit) {
-            return Err(miette::miette!(
-                "mutation_admission_limit_per_caller must be between {} and {}",
-                range.start(),
-                range.end()
-            ));
-        }
-        config.mutation_admission_limit_per_caller = limit;
+        config.mutation_admission_limit_per_caller = in_range(
+            "mutation_admission_limit_per_caller",
+            limit,
+            openshell_core::config::MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE,
+        )?;
     }
 
     if let Some(seconds) = file
         .as_ref()
         .and_then(|f| f.openshell.gateway.mutation_replay_window_seconds)
     {
-        let range = openshell_core::config::MUTATION_REPLAY_WINDOW_SECONDS_RANGE;
-        if !range.contains(&seconds) {
-            return Err(miette::miette!(
-                "mutation_replay_window_seconds must be between {} and {}",
-                range.start(),
-                range.end()
-            ));
-        }
-        config.mutation_replay_window_seconds = seconds;
+        config.mutation_replay_window_seconds = in_range(
+            "mutation_replay_window_seconds",
+            seconds,
+            openshell_core::config::MUTATION_REPLAY_WINDOW_SECONDS_RANGE,
+        )?;
     }
 
     if let Some(raw) = std::env::var_os("OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS") {

@@ -36,6 +36,10 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
         .map(|migration| migration.sql.as_ref())
 }
 
+use super::mutation_admission::{
+    self, ADMISSION_OBJECT_TYPE, AdmissionTx, COUNTER_OBJECT_TYPE, CompletedAdmission, Counter,
+    RECOUNT_STATUS, counter_id,
+};
 use super::{
     DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, EXISTING_IDS_BATCH_SIZE, POLICY_OBJECT_TYPE,
 };
@@ -1075,6 +1079,103 @@ RETURNING resource_version, created_at_ms, updated_at_ms
             created_at_ms: row.get("created_at_ms"),
             updated_at_ms: row.get("updated_at_ms"),
         }))
+    }
+
+    pub async fn create_mutation_admission(
+        &self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        limit: u32,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(ADMISSION_OBJECT_TYPE)
+            .bind(bucket)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        mutation_admission::admit(PgAdmission(tx), id, name, bucket, payload, limit).await
+    }
+
+    pub async fn list_completed_mutation_admissions(
+        &self,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> PersistenceResult<Vec<CompletedAdmission>> {
+        // The object type is a literal so the planner can use the partial index
+        // from migration 010, whose predicate it must match exactly.
+        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, payload FROM objects
+WHERE object_type = 'mutation_admission_v1' AND resource_version > 1 AND updated_at_ms <= $1
+ORDER BY updated_at_ms LIMIT $2",
+        )
+        .bind(cutoff_ms)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, payload)| CompletedAdmission { id, payload })
+            .collect())
+    }
+
+    pub async fn delete_mutation_admissions(&self, ids: &[String]) -> PersistenceResult<u64> {
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        let mut deleted = 0_u64;
+        for ids in ids.chunks(DELETE_MANY_BATCH_SIZE) {
+            let mut mark = QueryBuilder::<Postgres>::new("UPDATE objects SET status = ");
+            mark.push_bind(RECOUNT_STATUS)
+                .push(" WHERE object_type = ")
+                .push_bind(COUNTER_OBJECT_TYPE)
+                .push(" AND workspace IN (SELECT workspace FROM objects WHERE object_type = ")
+                .push_bind(ADMISSION_OBJECT_TYPE)
+                .push(" AND id IN (");
+            let mut separated = mark.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated("))");
+            mark.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+            let mut delete =
+                QueryBuilder::<Postgres>::new("DELETE FROM objects WHERE object_type = ");
+            delete.push_bind(ADMISSION_OBJECT_TYPE).push(" AND id IN (");
+            let mut separated = delete.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            deleted += delete
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?
+                .rows_affected();
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(deleted)
+    }
+
+    #[cfg(test)]
+    pub async fn backdate_mutation_admission(
+        &self,
+        id: &str,
+        updated_at_ms: i64,
+    ) -> PersistenceResult<()> {
+        sqlx::query("UPDATE objects SET updated_at_ms = $1 WHERE object_type = $2 AND id = $3")
+            .bind(updated_at_ms)
+            .bind(ADMISSION_OBJECT_TYPE)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(())
     }
 
     pub async fn get(
@@ -2280,6 +2381,86 @@ WHERE object_type = $1 AND scope = $2
             max_version = max_version.max(wrapper.draft_version);
         }
         Ok(max_version)
+    }
+}
+
+struct PgAdmission(sqlx::Transaction<'static, Postgres>);
+
+impl AdmissionTx for PgAdmission {
+    async fn counter(&mut self, bucket: &str) -> PersistenceResult<Option<Counter>> {
+        // Row lock orders this count against concurrent recount marks.
+        let row: Option<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT hit_count, status FROM objects WHERE object_type = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(COUNTER_OBJECT_TYPE)
+        .bind(counter_id(bucket))
+        .fetch_optional(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(row.map(|(count, status)| Counter {
+            count,
+            recount: status.is_some(),
+        }))
+    }
+
+    async fn count(&mut self, bucket: &str) -> PersistenceResult<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE object_type = $1 AND workspace = $2")
+            .bind(ADMISSION_OBJECT_TYPE)
+            .bind(bucket)
+            .fetch_one(&mut *self.0)
+            .await
+            .map_err(|e| map_db_error(&e))
+    }
+
+    async fn insert(
+        &mut self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        now_ms: i64,
+    ) -> PersistenceResult<()> {
+        sqlx::query(
+            "INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $6, $6, '{}'::jsonb, 1)",
+        )
+        .bind(ADMISSION_OBJECT_TYPE)
+        .bind(id)
+        .bind(name)
+        .bind(bucket)
+        .bind(payload)
+        .bind(now_ms)
+        .execute(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    async fn put_counter(
+        &mut self,
+        bucket: &str,
+        counter: &Counter,
+        now_ms: i64,
+    ) -> PersistenceResult<()> {
+        sqlx::query(
+            "INSERT INTO objects (object_type, id, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version, hit_count, status)
+VALUES ($1, $2, $3, ''::bytea, $4, $4, '{}'::jsonb, 1, $5, $6)
+ON CONFLICT (id) DO UPDATE SET hit_count = EXCLUDED.hit_count, status = EXCLUDED.status, updated_at_ms = EXCLUDED.updated_at_ms",
+        )
+        .bind(COUNTER_OBJECT_TYPE)
+        .bind(counter_id(bucket))
+        .bind(bucket)
+        .bind(now_ms)
+        .bind(counter.count)
+        .bind(counter.recount.then_some(RECOUNT_STATUS))
+        .execute(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    async fn commit(self) -> PersistenceResult<()> {
+        self.0.commit().await.map_err(|e| map_db_error(&e))
     }
 }
 

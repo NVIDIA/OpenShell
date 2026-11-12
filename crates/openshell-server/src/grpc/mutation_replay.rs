@@ -257,7 +257,11 @@ async fn execute_owned<M: Mutation>(
     protection: Option<Protection>,
     scope: Scope,
 ) -> Result<Response<M::Output>, Status> {
-    let limit = state.config.mutation_admission_limit_per_caller;
+    let range = openshell_core::config::MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE;
+    let limit = state
+        .config
+        .mutation_admission_limit_per_caller
+        .clamp(*range.start(), *range.end());
     let window_ms = replay_window_ms(&state.config);
     let admission = Admission {
         format_version: 1,
@@ -286,14 +290,12 @@ async fn execute_owned<M: Mutation>(
                     current_time_ms() >= completed.saturating_add(window_ms)
                 })
             {
-                match state
+                state
                     .store
-                    .delete_if(OBJECT_TYPE, &row.id, row.resource_version)
+                    .delete_mutation_admissions(std::slice::from_ref(&row.id))
                     .await
-                {
-                    Ok(_) | Err(PersistenceError::Conflict { .. }) => continue,
-                    Err(error) => return Err(storage_error(error)),
-                }
+                    .map_err(storage_error)?;
+                continue;
             }
             // A rotated/unavailable protection key must never turn the old ID
             // into a new admission, or report a misleading payload mismatch.
@@ -334,9 +336,6 @@ async fn execute_owned<M: Mutation>(
         let version = match write {
             Ok(Some(write)) => write.resource_version,
             Ok(None) => {
-                if sweep_expired(&state.store, window_ms).await? {
-                    continue;
-                }
                 return Err(Status::resource_exhausted(
                     "caller has reached the durable mutation admission limit; unresolved requests require reconciliation",
                 ));
@@ -430,7 +429,12 @@ impl Completion {
 }
 
 fn replay_window_ms(config: &openshell_core::Config) -> i64 {
-    i64::from(config.mutation_replay_window_seconds) * 1000
+    let range = openshell_core::config::MUTATION_REPLAY_WINDOW_SECONDS_RANGE;
+    i64::from(
+        config
+            .mutation_replay_window_seconds
+            .clamp(*range.start(), *range.end()),
+    ) * 1000
 }
 
 /// Delete expired successful admissions across all callers in bounded batches.
@@ -462,7 +466,7 @@ async fn sweep_expired(store: &Store, window_ms: i64) -> Result<bool, Status> {
             return Ok(removed);
         }
         removed |= store
-            .delete_many(OBJECT_TYPE, &expired)
+            .delete_mutation_admissions(&expired)
             .await
             .map_err(storage_error)?
             > 0;
@@ -487,7 +491,11 @@ pub fn spawn_expiry_sweeper(
             }
             tokio::select! {
                 _ = shutdown.changed() => return,
-                _ = sweep_expired(&state.store, replay_window_ms(&state.config)) => {}
+                result = sweep_expired(&state.store, replay_window_ms(&state.config)) => {
+                    if let Err(status) = result {
+                        tracing::warn!(%status, "mutation admission expiry sweep failed");
+                    }
+                }
             }
         }
     });
