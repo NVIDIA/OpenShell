@@ -274,7 +274,13 @@ fn baseline_compute_service_methods_are_frozen() {
     let compute = descriptor
         .file
         .iter()
-        .find(|file| file.package.as_deref() == Some("openshell.compute.v1"))
+        .find(|file| {
+            file.package.as_deref() == Some("openshell.compute.v1")
+                && file
+                    .service
+                    .iter()
+                    .any(|service| service.name.as_deref() == Some("ComputeDriver"))
+        })
         .unwrap();
     let baseline = compute
         .service

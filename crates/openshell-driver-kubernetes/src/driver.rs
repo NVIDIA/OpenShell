@@ -57,6 +57,7 @@ use openshell_driver_sdk::driver_utils::{
 };
 use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_driver_sdk::legacy_contract::ResolvedWorkloadIdentity;
+use openshell_driver_sdk::legacy_contract::convert::LaunchAuthenticationFields;
 use openshell_driver_sdk::legacy_contract::{
     GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
     generate_sandbox_tls_material,
@@ -627,22 +628,34 @@ fn random_sandbox_runtime_token() -> Result<String, KubernetesDriverError> {
     Ok(token)
 }
 
+/// The launch authentication fields of a driver sandbox spec: the typed message
+/// when the gateway set it, with the opaque bytes an older gateway sends.
+fn spec_launch_authentication(
+    spec: &openshell_driver_sdk::proto::compute::v1::DriverSandboxSpec,
+) -> LaunchAuthenticationFields<'_> {
+    LaunchAuthenticationFields::new(
+        spec.launch_credentials.as_deref(),
+        &spec.launch_authentication,
+    )
+}
+
+/// Decode the launch authentication, preferring the typed field and falling back
+/// to the JSON bytes.
 fn decode_launch_authentication(
-    encoded: &[u8],
+    fields: LaunchAuthenticationFields<'_>,
 ) -> Result<openshell_driver_sdk::jwt::SandboxLaunchAuthentication, KubernetesDriverError> {
-    let authentication =
-        serde_json::from_slice::<openshell_driver_sdk::jwt::SandboxLaunchAuthentication>(encoded)
-            .map_err(|error| {
+    fields
+        .resolve()
+        .map_err(|error| {
             KubernetesDriverError::Precondition(format!(
                 "decode Kubernetes sandbox launch authentication: {error}"
             ))
-        })?;
-    authentication.validate().map_err(|error| {
-        KubernetesDriverError::Precondition(format!(
-            "validate Kubernetes sandbox launch authentication: {error}"
-        ))
-    })?;
-    Ok(authentication)
+        })?
+        .ok_or_else(|| {
+            KubernetesDriverError::Precondition(
+                "Kubernetes sandbox launch authentication is required".to_string(),
+            )
+        })
 }
 
 fn gateway_verification_keys(
@@ -3339,13 +3352,13 @@ impl KubernetesComputeDriver {
         let launch_authentication = sandbox
             .spec
             .as_ref()
-            .filter(|spec| !spec.launch_authentication.is_empty())
+            .filter(|spec| !spec_launch_authentication(spec).is_empty())
             .ok_or_else(|| {
                 KubernetesDriverError::Precondition(
                     "Kubernetes sandbox launch authentication is required".to_string(),
                 )
             })
-            .and_then(|spec| decode_launch_authentication(&spec.launch_authentication))?;
+            .and_then(|spec| decode_launch_authentication(spec_launch_authentication(spec)))?;
         let cr_uid = sandbox_cr.metadata.uid.as_deref().ok_or_else(|| {
             KubernetesDriverError::Message("created Sandbox CR has no UID".to_string())
         })?;
@@ -4219,7 +4232,7 @@ impl KubernetesComputeDriver {
         &self,
         sandbox_id: &str,
         generation_id: &str,
-        launch_authentication: &[u8],
+        launch_authentication: LaunchAuthenticationFields<'_>,
         expected_runtime_identity: &str,
     ) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
@@ -4239,7 +4252,7 @@ impl KubernetesComputeDriver {
         &self,
         sandbox_id: &str,
         encoded_generation: &str,
-        encoded_authentication: &[u8],
+        encoded_authentication: LaunchAuthenticationFields<'_>,
         encoded_expected_runtime_identity: &str,
     ) -> Result<String, KubernetesDriverError> {
         let staged = self.read_staged_bootstrap_material().await?;
@@ -9892,7 +9905,7 @@ mod tests {
             .start_sandbox(
                 "sandbox-1",
                 "invalid-generation",
-                b"secret-launch-authentication",
+                LaunchAuthenticationFields::new(None, b"secret-launch-authentication"),
                 "kubernetes://namespace/resource/pod",
             )
             .with_subscriber(subscriber)
@@ -14822,4 +14835,42 @@ mod tests {
     }
 
     include!("lifecycle_tests.rs");
+}
+
+#[cfg(test)]
+mod launch_authentication_fields_tests {
+    use super::*;
+    use openshell_driver_sdk::legacy_contract::convert::launch_credentials_from_bytes;
+
+    fn encoded() -> Vec<u8> {
+        let document = include_str!(
+            "../../openshell-driver-sdk/tests/legacy_contract/examples/SandboxLaunchAuthentication.json"
+        );
+        let authentication: openshell_driver_sdk::jwt::SandboxLaunchAuthentication =
+            serde_json::from_str(document).unwrap();
+        serde_json::to_vec(&authentication).unwrap()
+    }
+
+    #[test]
+    fn bytes_only_from_an_older_gateway_decode() {
+        let encoded = encoded();
+        decode_launch_authentication(LaunchAuthenticationFields::new(None, &encoded)).unwrap();
+    }
+
+    #[test]
+    fn typed_only_from_a_newer_gateway_decodes() {
+        let typed = launch_credentials_from_bytes(&encoded()).unwrap().unwrap();
+        decode_launch_authentication(LaunchAuthenticationFields::new(Some(&typed), &[])).unwrap();
+    }
+
+    #[test]
+    fn typed_wins_when_both_are_present() {
+        let encoded = encoded();
+        let mut typed = launch_credentials_from_bytes(&encoded).unwrap().unwrap();
+        typed.gateway_id = "typed-gateway".to_string();
+        let decoded =
+            decode_launch_authentication(LaunchAuthenticationFields::new(Some(&typed), &encoded))
+                .unwrap();
+        assert_eq!(decoded.gateway_id, "typed-gateway");
+    }
 }

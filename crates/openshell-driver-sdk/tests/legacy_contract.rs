@@ -158,3 +158,70 @@ fn some_rules_are_enforced_after_decoding() {
     let bundle: SupervisorAuthBundle = serde_json::from_value(document).unwrap();
     assert!(bundle.validate().is_err());
 }
+
+mod launch_authentication_fields {
+    use super::*;
+    use openshell_driver_sdk::legacy_contract::convert::{
+        launch_credentials_from_bytes, resolve_launch_authentication,
+    };
+
+    fn example_bytes() -> Vec<u8> {
+        serde_json::to_vec(&example("SandboxLaunchAuthentication.json")).unwrap()
+    }
+
+    fn legacy() -> SandboxLaunchAuthentication {
+        serde_json::from_slice(&example_bytes()).unwrap()
+    }
+
+    #[test]
+    fn only_bytes_present_decodes_the_bytes() {
+        let resolved = resolve_launch_authentication(None, &example_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&resolved).unwrap(),
+            serde_json::to_value(legacy()).unwrap()
+        );
+    }
+
+    #[test]
+    fn typed_present_without_bytes_decodes_the_typed_field() {
+        let typed = launch_credentials_from_bytes(&example_bytes())
+            .unwrap()
+            .unwrap();
+        let resolved = resolve_launch_authentication(Some(&typed), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&resolved).unwrap(),
+            serde_json::to_value(legacy()).unwrap()
+        );
+    }
+
+    #[test]
+    fn both_present_prefers_typed_over_bytes() {
+        let mut typed = launch_credentials_from_bytes(&example_bytes())
+            .unwrap()
+            .unwrap();
+        typed.gateway_id = "from-the-typed-field".to_string();
+        let resolved = resolve_launch_authentication(Some(&typed), &example_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.gateway_id, "from-the-typed-field");
+    }
+
+    #[test]
+    fn invalid_typed_field_is_not_bypassed_for_the_bytes() {
+        let mut typed = launch_credentials_from_bytes(&example_bytes())
+            .unwrap()
+            .unwrap();
+        typed.supervisor = None;
+        assert!(resolve_launch_authentication(Some(&typed), &example_bytes()).is_err());
+    }
+
+    #[test]
+    fn neither_present_is_none() {
+        assert!(resolve_launch_authentication(None, &[]).unwrap().is_none());
+        assert!(launch_credentials_from_bytes(&[]).unwrap().is_none());
+    }
+}

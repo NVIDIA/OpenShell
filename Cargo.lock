@@ -5187,6 +5187,7 @@ dependencies = [
  "openshell-core",
  "openshell-credential-issuer",
  "openshell-crypto",
+ "openshell-driver-sdk",
  "openshell-extension-core",
  "openshell-gateway-interceptors",
  "openshell-ocsf",
