@@ -576,31 +576,36 @@ async fn handle_create_sandbox_inner(
         .await?
         .ensure_active()?;
 
-    let (mut spec, created_from_workload_template) = if workload_template_name.is_empty() {
-        let spec = request
-            .spec
-            .ok_or_else(|| Status::invalid_argument("spec is required"))?;
-        (spec, None)
-    } else {
-        let governance_spec = request.spec.unwrap_or_default();
-        let template = state
-            .store
-            .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &workload_template_name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox template not found"))?;
-        let provenance = SandboxWorkloadTemplateProvenance {
-            name: template.object_name().to_string(),
-            resource_version: template.get_resource_version().to_string(),
+    let (mut spec, created_from_workload_template, workload_template_id) =
+        if workload_template_name.is_empty() {
+            let spec = request
+                .spec
+                .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+            (spec, None, None)
+        } else {
+            let governance_spec = request.spec.unwrap_or_default();
+            let template = state
+                .store
+                .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &workload_template_name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
+                .ok_or_else(|| Status::not_found("sandbox template not found"))?;
+            let provenance = SandboxWorkloadTemplateProvenance {
+                name: template.object_name().to_string(),
+                resource_version: template.get_resource_version().to_string(),
+            };
+            let mut resolved = sandbox_spec_from_stored_workload_template(&template)?;
+            resolved.policy = governance_spec.policy;
+            resolved.providers = governance_spec.providers;
+            resolved.command = governance_spec.command;
+            resolved.tty = governance_spec.tty;
+            resolved.restart_policy = governance_spec.restart_policy;
+            (
+                resolved,
+                Some(provenance),
+                Some(template.object_id().to_string()),
+            )
         };
-        let mut resolved = sandbox_spec_from_stored_workload_template(&template)?;
-        resolved.policy = governance_spec.policy;
-        resolved.providers = governance_spec.providers;
-        resolved.command = governance_spec.command;
-        resolved.tty = governance_spec.tty;
-        resolved.restart_policy = governance_spec.restart_policy;
-        (resolved, Some(provenance))
-    };
 
     // Attachment identity belongs to the gateway. Accepting an epoch from a
     // create request or workload template could revive stale installation proof.
@@ -720,6 +725,17 @@ async fn handle_create_sandbox_inner(
         status: None,
         created_from_workload_template,
     };
+    if let Some(template_id) = workload_template_id {
+        sandbox
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .annotations
+            .insert(
+                crate::compute::WORKLOAD_TEMPLATE_ID_ANNOTATION.into(),
+                template_id,
+            );
+    }
     sandbox.set_phase(SandboxPhase::Provisioning as i32);
     sandbox
         .status
@@ -950,7 +966,7 @@ fn validate_template_create_governance_spec(spec: &SandboxSpec) -> Result<(), St
     Ok(())
 }
 
-fn sandbox_spec_from_stored_workload_template(
+pub fn sandbox_spec_from_stored_workload_template(
     template: &SandboxWorkloadTemplate,
 ) -> Result<SandboxSpec, Status> {
     sandbox_spec_from_workload_template(template, tonic::Code::Internal)

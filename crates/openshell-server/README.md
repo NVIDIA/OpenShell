@@ -18,6 +18,13 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+A successful warm claim adopts the prepared physical generation and TLS session
+instead. Its resource claims are persisted with the Sandbox identity and included
+in Sandbox Protocol tokens, including refresh replays and takeover credentials.
+The gateway-facing token keeps its ordinary logical identity claims, with a new
+lineage that revokes the proposed launch's token. A fresh start clears the prepared
+identity and resumes the ordinary session derivation.
+
 ## Shared supervisor pool
 
 The `SharedSupervision` the gateway hands a compute driver that asks for it
@@ -61,7 +68,8 @@ replica, independent of which replica runs the compute driver's watch:
   can never publish or be admitted; a reservation or admitting record older
   than two minutes (a stalled, failed, or crashed launch) is fenced by
   removing it at its version, and its material is then collected. A
-  withdrawal removes the material and then the record, or fences a reserved or
+  withdrawal atomically removes the record and records its material for cleanup,
+  or fences a reserved or
   admitting row; an ended generation
   (sandbox gone, replaced, stopped, or deleting) is withdrawn by the sweep; and
   the compute driver's recovery backfills instances it runs without a record and
@@ -99,11 +107,57 @@ replica, independent of which replica runs the compute driver's watch:
   started waits 30 seconds before taking over, so members reconnect after a
   gateway restart first. The takeover log names its `cause`: `expired`,
   `leaving`, or `restarted`.
+- **Prepared runtimes.** `SharedSupervision::prepare` reserves an unassigned
+  physical runtime on a live member using the same atomic capacity admission.
+  The assignment records its workspace and bootstrap epoch without requiring a
+  Sandbox. Recovery loads the prepared assignment and preserves its owner;
+  sandbox-generation pruning and takeover exclude preparations. Activation
+  validates the exact physical descriptor and the claiming Sandbox's workspace,
+  expected launch generation, and epoch. Only a Provisioning or Starting Sandbox
+  may claim. Activation mints bound credentials and atomically adopts the prepared
+  generation, epoch, and TLS session, replacing the material and logical identity
+  under the assignment, owner, and Sandbox record versions. The member,
+  process, and capacity slot remain unchanged. A material staging row also fences
+  activation, so collection of a stalled attempt cannot race its publication.
+  The old material becomes collectible in the same transaction. A losing claim
+  leaves the reservation intact; an exact retry of the winner is idempotent.
+  A lost or leaving prepared owner requires withdrawal and replacement by the
+  warm-pool controller, rather than an unfenced takeover. Workspace-scoped
+  preparation inventory supplies physical coordinates, original-owner
+  availability, and an exact reservation revision. Conditional release fences
+  claims before retiring material and retaining a permanent physical-route
+  fence; it never enqueues an unconditional route withdrawal. Retirement can
+  also fence an absent or not-yet-admitted preparation, preventing delayed
+  retries from recreating it. The fence has no credentials or capacity charge.
+  The Kubernetes driver's default-on warm-pool reconciler derives capacity from
+  templates with startup tuning. It stores bounded creation intents in
+  `warm_pool_journal`, scoped by workspace and immutable template ID. Template
+  deletion leaves drain targets for restart-safe cleanup; sandbox creates are
+  restricted to their original template ID, recorded in a gateway-owned annotation.
+  Compare-and-swap updates and monotonically increasing configuration revisions
+  prevent replica overfill and stale configuration rollback. Public runtime
+  trust comes from the session authority without minting tenant credentials.
+  These journals do not authorize claims; the existing assignment/owner
+  transaction remains authoritative. Kubernetes creation journals its claim
+  before activation and persists the returned canonical registration for recovery.
+  The activation transaction records the proposed generation it replaced, so the
+  owning create operation can settle across this specific identity transition.
+  Unrelated restart and takeover changes still invalidate that result.
 - **Credentials.** Each replica mints a takeover term's grant and session
   credentials only for members it serves, from the granted record and the
   persisted identity, and mints them again after half the grant's lifetime.
   Other replicas send the term without credentials; a host that already runs
   it keeps it.
+
+- **Dedicated warm capacity.** A separate in-process coordinator uses the same
+  preparation, credential storage, retirement fences, and atomic claim transaction.
+  Dedicated records are excluded from shared placement and takeover. There is no
+  shared owner or capacity row: the Kubernetes driver binds and checks the original
+  dedicated supervisor Pod UID. Its deferred `RegisterSupervisor` stream returns
+  the committed launch material after rechecking that physical binding and the
+  current sandbox identity and credentials. Bootstrap principals may only register;
+  they cannot call sandbox or shared-host APIs. Cleanup retires ended generations without
+  running shared membership reconciliation.
 
 - **Observations.** The replica serving an owner records what the owner reports
   of its instances (`supervisor_instance_report`; no error text), one record per

@@ -12,6 +12,28 @@ release:
   namespace: app-a
 
 tests:
+  - it: grants namespace Secret get for template warm-pool recovery by default
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "delete", "get"]
+
+  - it: permits removing Secret reads after warm pools have drained
+    template: templates/role.yaml
+    set:
+      gateway.warmPoolSecretReads: false
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "delete"]
+
   - it: grants supervisor lifecycle and complete stopped-update pod inspection
     template: templates/role.yaml
     asserts:
@@ -81,7 +103,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "delete"]
+            verbs: ["create", "delete", "get"]
       - notExists:
           path: rules[*].resourceNames
 

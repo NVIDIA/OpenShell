@@ -37,6 +37,30 @@ openshell sandbox template create gpu-kata-custom \
 
 If you omit `--image`, the gateway applies its default sandbox image when a sandbox is created from the template. Use this when the template should only define resource, environment, or driver settings.
 
+## Request Warm Capacity
+
+On a Kubernetes gateway with TLS and JWT signing, templates can request warm
+capacity in shared or operator workspace mode:
+
+```shell
+openshell sandbox template create agents \
+  --image nvcr.io/nvidia/base/ubuntu:24.04 \
+  --ready-within 5s \
+  --max-burst 2
+```
+
+Pooling is enabled by default. Both startup options must be present, with a
+positive burst count. This template requests two unassigned runtimes using its
+image, environment, resources, and driver settings. The gateway's per-template
+capacity limit may cap that count. `--ready-within` expresses a desired startup
+time; it does not guarantee that deadline.
+
+Create with `--template agents` to use that capacity. An empty pool falls back to
+cold creation. Deleting the template drains its unclaimed runtimes; it does not
+delete sandboxes already created from it. Templates without startup tuning do not
+create pools. Operators can disable pooling with
+[`openshell.drivers.kubernetes.warm_pool.enabled`](/how-it-works/gateways/configuration).
+
 ## Create a Sandbox from a Template
 
 ```shell

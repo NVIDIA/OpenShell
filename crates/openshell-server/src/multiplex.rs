@@ -823,6 +823,10 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
             fields.insert("replica_id".to_string(), peer.replica_id.clone());
             fields.insert("pod_uid".to_string(), peer.pod_uid.clone());
         }
+        Principal::SupervisorRegistration(identity) => {
+            fields.insert("kind".into(), "supervisor_registration".into());
+            fields.insert("route".into(), identity.route.clone());
+        }
         Principal::Supervisor(supervisor) => {
             fields.insert("kind".to_string(), "supervisor".to_string());
             fields.insert("subject".to_string(), supervisor.identity.subject.clone());
@@ -1382,6 +1386,11 @@ where
                         "supervisor tokens may call only the supervisor assignment stream",
                     )
                 }
+                Principal::SupervisorRegistration(_)
+                    if path != crate::auth::compute_driver::REGISTER_SUPERVISOR_PATH =>
+                {
+                    method_denied("physical supervisors may only register for their own claim")
+                }
                 Principal::Anonymous => {
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "anonymous callers may not call authenticated methods",
@@ -1390,7 +1399,8 @@ where
                 Principal::Operator(_)
                 | Principal::Sandbox(_)
                 | Principal::Peer(_)
-                | Principal::Supervisor(_) => None,
+                | Principal::Supervisor(_)
+                | Principal::SupervisorRegistration(_) => None,
             };
             if let Some((denial, status)) = denial {
                 audit::emit_authorization_denial_for(&path, &origin, &principal, denial);
@@ -3664,6 +3674,33 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn physical_supervisors_reach_only_deferred_registration() {
+            let registration = crate::auth::compute_driver::REGISTER_SUPERVISOR_PATH;
+            for path in crate::auth::method_authz::all_paths() {
+                let (recorder, seen) = PrincipalRecorder::new();
+                let principal = Principal::SupervisorRegistration(
+                    openshell_core::proto::compute::v1::SupervisorRegistrationIdentity::default(),
+                );
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Authentication::Accepted(principal)),
+                ))]);
+                let response = AuthGrpcRouter::new(recorder, Some(chain), None)
+                    .call(empty_request(path))
+                    .await
+                    .unwrap();
+                if path == registration {
+                    assert!(grpc_status(&response).is_none());
+                    assert!(matches!(
+                        *seen.lock().unwrap(),
+                        Some(Principal::SupervisorRegistration(_))
+                    ));
+                } else if !crate::auth::method_authz::is_unauthenticated(path) {
+                    assert_eq!(grpc_status(&response).as_deref(), Some("7"), "{path}");
+                }
+            }
+        }
+
+        #[tokio::test]
         async fn supervisor_tokens_reach_only_the_assignment_stream() {
             let attach = "/openshell.supervisor.host.v1.SupervisorHost/Attach";
             let supervisor = Principal::Supervisor(crate::auth::principal::SupervisorPrincipal {
@@ -3680,6 +3717,7 @@ mod tests {
             };
             for (method, permitted) in [
                 (attach, true),
+                (crate::auth::compute_driver::REGISTER_SUPERVISOR_PATH, false),
                 ("/openshell.v1.OpenShell/ListSandboxes", false),
                 ("/openshell.v1.OpenShell/ConnectSupervisor", false),
                 ("/openshell.v1.OpenShell/GetSandboxConfig", false),

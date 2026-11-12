@@ -352,8 +352,8 @@ mod linux {
     }
 
     fn validate_config(config: &BoundaryConfig) -> Result<(), String> {
-        if config.boundary_id.is_empty() {
-            return Err("boundary ID must not be empty".to_string());
+        if config.boundary_id.is_empty() && config.resource_claims.is_empty() {
+            return Err("unassigned boundary requires physical resource claims".to_string());
         }
         if config.generation.is_empty() {
             return Err("boundary generation must not be empty".to_string());
@@ -1062,8 +1062,13 @@ mod linux {
                     }
                 }
                 _ = discovery.tick(), if spares.pooled => {
-                    discover_route_owner(&pool, &mut spares, &server_config, &runtime, &active_connections)
-                        .await;
+                    // A warm runtime stays on its reserved supervisor until
+                    // assigned. Connection failure still redials, but waiting
+                    // for a claim does not probe other pool members.
+                    if runtime.authenticator.is_assigned() {
+                        discover_route_owner(&pool, &mut spares, &server_config, &runtime, &active_connections)
+                            .await;
+                    }
                 }
                 () = tokio::time::sleep_until(retry_at), if waiting => {}
             }
@@ -1695,6 +1700,7 @@ mod linux {
             openshell_sandbox_backend::isolation_protocol::validate_open(
                 &request,
                 &self.runtime.config,
+                &principal,
             )?;
             self.connection_expiry
                 .update(principal.session().expires_at);
@@ -2814,8 +2820,6 @@ mod linux {
             workload_launcher: crate::linux::workload_launcher::WorkloadLauncher,
             qualification: crate::RuntimeQualification,
         ) -> Result<Self, String> {
-            let sandbox_id = SandboxId::parse(config.boundary_id.clone())
-                .map_err(|error| format!("validate sandbox ID: {error}"))?;
             let runtime_generation =
                 openshell_core::sandbox_generation::SandboxGenerationId::parse(
                     config.generation.clone(),
@@ -2835,13 +2839,25 @@ mod linux {
             )
             .map_err(|error| format!("configure Sandbox Protocol JWT verifier: {error}"))?;
             let filesystem_flush = FilesystemFlush::for_listener(&config.listener);
-            Ok(Self {
-                authenticator: SandboxProtocolAuthenticator::new(
+            let authenticator = if config.boundary_id.is_empty() {
+                SandboxProtocolAuthenticator::unassigned(
                     verifier,
-                    sandbox_id,
+                    config.resource_claims.clone(),
                     runtime_generation,
                     config.auth_epoch,
-                ),
+                )
+                .map_err(|error| format!("configure unassigned runtime: {error}"))?
+            } else {
+                SandboxProtocolAuthenticator::new(
+                    verifier,
+                    SandboxId::parse(config.boundary_id.clone())
+                        .map_err(|error| format!("validate sandbox ID: {error}"))?,
+                    runtime_generation,
+                    config.auth_epoch,
+                )
+            };
+            Ok(Self {
+                authenticator,
                 connections: SandboxConnectionRegistry::new(
                     config.session_id,
                     config.session_rotation,
@@ -7297,11 +7313,11 @@ mod linux {
                 .build()
                 .expect("test process runtime");
             let _entered = process_runtime.enter();
-            for pooled in [false, true] {
+            for (pooled, assigned) in [(false, true), (true, true), (true, false)] {
                 let gateway = TestGateway::new();
                 let boundary = takeover_test_runtime(
                     &gateway,
-                    "sandbox-probe",
+                    if assigned { "sandbox-probe" } else { "" },
                     "generation-probe",
                     &process_runtime,
                 );
@@ -7359,7 +7375,7 @@ mod linux {
                 let connections = dialed.load(Ordering::SeqCst);
                 control.abort();
                 forwarding.abort();
-                if pooled {
+                if pooled && assigned {
                     assert!(
                         connections > 1,
                         "a pool runtime must run discovery rounds: {connections} connections"
@@ -7371,6 +7387,143 @@ mod linux {
                     );
                 }
             }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn prepared_runtime_activates_on_its_original_tls_connection() {
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _entered = process_runtime.enter();
+            let activation = async {
+                let gateway = TestGateway::new();
+                let boundary =
+                    takeover_test_runtime(&gateway, "", "generation-1", &process_runtime);
+                assert!(!boundary.authenticator.is_assigned());
+                let directory = tempfile::tempdir().unwrap();
+                let (server_tls, client_tls) = stage_test_tls(directory.path(), "warm");
+                let server_config = Arc::new(load_tls_server_config(&server_tls).unwrap());
+                let route = new_route_handle();
+                let supervisor = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                supervisor.set_directory(
+                    Some(supervisor.local_addr()),
+                    std::collections::HashMap::new(),
+                );
+                let prepared = supervisor.register(&route, &client_tls).unwrap();
+                let active = Arc::new(AtomicUsize::new(0));
+                let control_task = tokio::spawn(run_routed_runtime_control(
+                    SupervisorRoute {
+                        addresses: vec![supervisor.local_addr()],
+                        route,
+                    },
+                    server_config,
+                    boundary.clone(),
+                    active.clone(),
+                    Duration::from_millis(50),
+                ));
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while active.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                // Several discovery intervals pass with no logical assignment
+                // and no consumer of the supervisor's TLS spare queue.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(!boundary.authenticator.is_assigned());
+                assert_eq!(active.load(Ordering::SeqCst), 1);
+                let delivered =
+                    tokio::time::timeout(Duration::from_secs(5), prepared.accept(&client_tls))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut delivered = Some(delivered);
+                let channel =
+                    tonic::transport::Endpoint::from_static("http://boundary.openshell.internal")
+                        .connect_with_connector(tower::service_fn(
+                            move |_: tonic::transport::Uri| {
+                                let stream = delivered.take();
+                                async move {
+                                    stream.map(hyper_util::rt::TokioIo::new).ok_or_else(|| {
+                                        io::Error::other(
+                                            "activation must reuse the delivered connection",
+                                        )
+                                    })
+                                }
+                            },
+                        ))
+                        .await
+                        .unwrap();
+                let mut control = openshell_sandbox_backend::backend_proto::isolation_backend_client::IsolationBackendClient::new(channel);
+                control
+                    .describe(DescribeIsolationBackendRequest {
+                        supervisor: Some(openshell_sandbox_backend::isolation_protocol::metadata(
+                            "test/supervisor",
+                        )),
+                    })
+                    .await
+                    .unwrap();
+                let mut opening = test_open_request(&boundary.config);
+                let mut descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor = serde_json::from_slice(&opening.driver_descriptor).unwrap();
+                descriptor.boundary_id = "claimed-sandbox".into();
+                opening.driver_descriptor = serde_json::to_vec(&descriptor).unwrap();
+
+                // Ordinary credentials cannot claim a prepared physical runtime.
+                let ordinary = gateway.token("claimed-sandbox", "generation-1", 1);
+                assert_eq!(
+                    control
+                        .open_boundary(bearer_request(opening.clone(), &ordinary))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    tonic::Code::Unauthenticated
+                );
+                assert!(!boundary.authenticator.is_assigned());
+                let token = gateway
+                    .issuer
+                    .mint_bound_sandbox_token(
+                        &SandboxRuntimeIdentity {
+                            sandbox_id: SandboxId::parse("claimed-sandbox").unwrap(),
+                            runtime_generation:
+                                openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                                    "generation-1",
+                                )
+                                .unwrap(),
+                            auth_epoch: CredentialEpoch::new(1).unwrap(),
+                        },
+                        boundary.config.resource_claims.clone(),
+                    )
+                    .unwrap();
+                let opened = control
+                    .open_boundary(bearer_request(opening.clone(), token.token.expose_secret()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert!(!opened.boundary_id.is_empty());
+                assert!(boundary.authenticator.is_assigned());
+                // Renewals work after assignment; the descriptor still must
+                // name the sandbox authenticated by the credential.
+                control
+                    .open_boundary(bearer_request(opening.clone(), &ordinary))
+                    .await
+                    .unwrap();
+                descriptor.boundary_id = "another-sandbox".into();
+                opening.driver_descriptor = serde_json::to_vec(&descriptor).unwrap();
+                assert_eq!(
+                    control
+                        .open_boundary(bearer_request(opening, &ordinary))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    tonic::Code::PermissionDenied
+                );
+                control_task.abort();
+                let _ = control_task.await;
+            };
+            process_runtime.block_on(activation);
         }
 
         /// The gateway granted a pool runtime's route to member B while the
@@ -8959,7 +9112,14 @@ mod linux {
                         address: "127.0.0.1:5500".parse().expect("control address"),
                         tls: placeholder_server_tls(),
                     },
-                    resource_claims: std::collections::BTreeMap::new(),
+                    resource_claims: if sandbox.is_empty() {
+                        std::collections::BTreeMap::from([(
+                            "kubernetes.workload_pod_uid".into(),
+                            "prepared-pod".into(),
+                        )])
+                    } else {
+                        std::collections::BTreeMap::new()
+                    },
                     resource_claim_files: std::collections::BTreeMap::new(),
                     workload_identity: test_workload_identity(),
                     provisioning_evidence: test_provisioning_evidence(),

@@ -187,6 +187,9 @@ pub struct SharedHost {
     app_listener: Option<crate::app_listener::HostHandle>,
     host: SandboxInstanceHost,
     router: Arc<RuntimeRouter>,
+    /// Capacity reserved for physical runtimes that have no sandbox yet.
+    prepared: Mutex<BTreeMap<String, PreparedRuntime>>,
+    prepared_changes: watch::Sender<u64>,
     gateway_endpoint: String,
     removal_grace: Duration,
     attach_request_timeout: Duration,
@@ -224,6 +227,11 @@ pub struct SharedHost {
     /// Lets tests stall reconciliations and see how many run at once.
     #[cfg(test)]
     reconcile_probe: ReconcileProbe,
+}
+
+struct PreparedRuntime {
+    registration: openshell_supervisor_control::PreparedRuntimeRegistration,
+    route: Arc<openshell_sandbox_backend::runtime_routed::RouteRegistration>,
 }
 
 /// Stalls the next reconciliation until released, and records how many ran
@@ -306,6 +314,8 @@ impl SharedHost {
             app_listener,
             host,
             router,
+            prepared: Mutex::new(BTreeMap::new()),
+            prepared_changes: watch::Sender::new(0),
             gateway_endpoint: config.gateway_endpoint,
             removal_grace: config.removal_grace,
             attach_request_timeout: config.attach_request_timeout,
@@ -346,14 +356,23 @@ impl SharedHost {
         );
         self.leaving.send_replace(true);
         let mut changes = self.host.changes();
+        let mut prepared_changes = self.prepared_changes.subscribe();
         let mut connected = self.gateway_connected.subscribe();
         // Only a gateway that hears the announcement moves the instances; one
         // that stops hearing from this member takes them over after the
         // membership TTL instead.
         let drained = tokio::time::timeout(limit, async {
-            while !self.host.list().is_empty() && *connected.borrow_and_update() {
+            while (!self.host.list().is_empty()
+                || !self
+                    .prepared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty())
+                && *connected.borrow_and_update()
+            {
                 tokio::select! {
                     hosted = changes.changed() => if hosted.is_err() { return },
+                    prepared = prepared_changes.changed() => if prepared.is_err() { return },
                     gateway = connected.changed() => if gateway.is_err() { return },
                 }
             }
@@ -371,6 +390,11 @@ impl SharedHost {
     /// relinquished to the members that take them over, and their workloads
     /// keep running.
     pub async fn shut_down(&self) {
+        self.prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.prepared_changes.send_modify(|revision| *revision += 1);
         self.host.relinquish_all().await;
     }
 
@@ -390,14 +414,73 @@ impl SharedHost {
         fingerprint: [u8; 32],
         takeover: Result<Option<BoundaryTakeover>, ControlError>,
     ) -> Result<SandboxInstanceAdmitted, ControlError> {
+        let route = registration.route.clone();
+        {
+            let prepared = self
+                .prepared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(prepared) = prepared.get(&route) {
+                prepared
+                    .registration
+                    .validate_activation(&registration)
+                    .map_err(|error| ControlError::Invalid(error.to_string()))?;
+            }
+        }
         let admission = SandboxInstanceAdmission {
             key: registration.route.clone(),
             fingerprint,
             sandbox_id: registration.sandbox_id.clone(),
         };
-        self.host.admit(admission, |dir| {
+        let outcome = self.host.admit(admission, |dir| {
             self.instance_launch(registration, takeover?, dir)
-        })
+        });
+        if outcome.is_ok() {
+            // The backend now owns the same route registration. Dropping the
+            // reservation releases no capacity and closes no connection.
+            self.prepared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&route);
+            self.prepared_changes.send_modify(|revision| *revision += 1);
+        }
+        outcome
+    }
+
+    fn prepare(
+        &self,
+        assignment: &SandboxInstanceAssignment,
+    ) -> Result<SandboxInstanceAdmitted, ControlError> {
+        let registration =
+            openshell_supervisor_control::PreparedRuntimeRegistration::from_assignment(assignment)
+                .map_err(|error| ControlError::Invalid(error.to_string()))?;
+        if self.host.status(&registration.route).is_some() {
+            return Err(ControlError::Conflict);
+        }
+        let mut prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = prepared.get(&registration.route) {
+            return if existing.registration == registration {
+                Ok(SandboxInstanceAdmitted::Unchanged)
+            } else {
+                Err(ControlError::Conflict)
+            };
+        }
+        let route = self
+            .router
+            .register(&registration.route, &registration.runtime_descriptor.tls)
+            .map_err(|error| ControlError::Invalid(error.to_string()))?;
+        prepared.insert(
+            registration.route.clone(),
+            PreparedRuntime {
+                registration,
+                route,
+            },
+        );
+        self.prepared_changes.send_modify(|revision| *revision += 1);
+        Ok(SandboxInstanceAdmitted::Created)
     }
 
     /// Admit one assignment of a pool snapshot for its ownership term.
@@ -443,7 +526,13 @@ impl SharedHost {
     /// Status of one hosted sandbox instance.
     #[must_use]
     pub fn status(&self, route: &str) -> Option<SandboxInstanceStatusReport> {
-        self.host.status(route)
+        self.host.status(route).or_else(|| {
+            self.prepared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(route)
+                .map(|runtime| prepared_report(route, runtime.route.has_parked_connection()))
+        })
     }
 
     /// Status of every hosted sandbox instance. An assignment of the latest
@@ -470,6 +559,26 @@ impl SharedHost {
                 !rejected.contains_key(&hosted.route) && !deferred.contains_key(&hosted.route)
             })
             .collect::<Vec<_>>();
+        // Admission publishes the active instance before releasing its
+        // prepared entry. A concurrent report must describe that route once.
+        let active_routes = reports
+            .iter()
+            .map(|report| report.route.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        reports.extend(
+            self.prepared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|(route, _)| {
+                    !rejected.contains_key(*route)
+                        && !deferred.contains_key(*route)
+                        && !active_routes.contains(*route)
+                })
+                .map(|(route, runtime)| {
+                    prepared_report(route, runtime.route.has_parked_connection())
+                }),
+        );
         reports.extend(rejected.values().cloned());
         reports.extend(deferred.values().cloned());
         reports
@@ -484,6 +593,11 @@ impl SharedHost {
 
     /// Stop one sandbox instance, delete its private files, and forget it.
     pub async fn remove(&self, route: &str) -> Option<SandboxInstanceStatusReport> {
+        self.prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(route);
+        self.prepared_changes.send_modify(|revision| *revision += 1);
         self.host.remove(route, self.removal_grace).await
     }
 
@@ -546,12 +660,19 @@ impl SharedHost {
         // Owned instances the gateway could not describe yet are kept as they
         // are: neither started, released, nor stopped.
         routes.extend(snapshot.keep_routes.iter().cloned());
-        let hosted = self
+        let mut hosted = self
             .host
             .list()
             .into_iter()
             .map(|status| status.route)
             .collect::<std::collections::BTreeSet<_>>();
+        hosted.extend(
+            self.prepared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .cloned(),
+        );
         let (admitted, unstarted) = within_capacity(snapshot, &hosted);
         if !unstarted.is_empty() {
             tracing::warn!(
@@ -567,7 +688,11 @@ impl SharedHost {
         let mut rejected = BTreeMap::new();
         let mut deferred = BTreeMap::new();
         for assignment in admitted {
-            let outcome = self.admit_pool_assignment(assignment).await;
+            let outcome = if assignment.prepared {
+                self.prepare(assignment)
+            } else {
+                self.admit_pool_assignment(assignment).await
+            };
             match outcome {
                 Ok(SandboxInstanceAdmitted::Created) => {
                     let route = &assignment.route;
@@ -676,6 +801,11 @@ impl SharedHost {
         let Some(desired) = desired else {
             return;
         };
+        self.prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|route, _| desired.contains(route));
+        self.prepared_changes.send_modify(|revision| *revision += 1);
         let withdrawn = self
             .host
             .list()
@@ -840,15 +970,20 @@ impl SharedHost {
             otlp_agent_endpoint: None,
             otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
         };
-        crate::sandbox_instance_host::sandbox_instance_launch(
-            Box::new(crate::backend_setup::RoutedBackendSetup::new(
-                self.router.clone(),
-                registration.route,
-            )),
-            config,
-            dir,
-        )
-        .map_err(failure)
+        let mut setup = crate::backend_setup::RoutedBackendSetup::new(
+            self.router.clone(),
+            registration.route.clone(),
+        );
+        if let Some(prepared) = self
+            .prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&registration.route)
+        {
+            setup = setup.with_prepared_route(prepared.route.clone());
+        }
+        crate::sandbox_instance_host::sandbox_instance_launch(Box::new(setup), config, dir)
+            .map_err(failure)
     }
 }
 
@@ -1324,10 +1459,19 @@ impl Drop for ReconcilerHandle {
     }
 }
 
+fn prepared_report(route: &str, connected: bool) -> SandboxInstanceStatusReport {
+    SandboxInstanceStatusReport {
+        route: route.to_string(),
+        sandbox_id: String::new(),
+        phase: SandboxInstancePhaseReport::Prepared,
+        ready: connected,
+    }
+}
+
 /// The assignments of `snapshot` a host admits, and the routes it leaves
-/// unstarted. Hosted instances the snapshot assigns or keeps stay; new ones
-/// are admitted in route order while fewer than [`MAX_ASSIGNED_INSTANCES`]
-/// would run.
+/// unstarted. Hosted instances and preparations the snapshot assigns or keeps
+/// stay; new ones are admitted in route order while fewer than
+/// [`MAX_ASSIGNED_INSTANCES`] slots would be occupied.
 fn within_capacity<'a>(
     snapshot: &'a AssignmentSnapshot,
     hosted: &std::collections::BTreeSet<String>,
@@ -1554,6 +1698,13 @@ async fn run_stream(
                 if !send(beat, send_deadline(last_heard)).await {
                     break lost(accepted);
                 }
+                // A parked TLS stream can connect or close without an instance
+                // lifecycle transition. Sample those observations on the existing
+                // heartbeat cadence; the gateway persists only changed reports.
+                let has_prepared = !host.prepared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty();
+                if accepted && has_prepared && !send(status_message(host, applied_revision), send_deadline(last_heard)).await {
+                    break lost(accepted);
+                }
                 // Deferred admissions and withdrawn instances whose cleanup
                 // failed are retried at the heartbeat cadence, never
                 // concurrently with a snapshot.
@@ -1569,6 +1720,9 @@ async fn run_stream(
 }
 
 #[cfg(test)]
+mod prepared_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::sandbox_instance_host::SandboxInstanceAdmission;
@@ -1576,7 +1730,11 @@ mod tests {
     use openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId;
 
     /// A hosted instance whose stop path reports on `stopped`.
-    fn admit_supervising(host: &SharedHost, route: &str, stopped: tokio::sync::mpsc::Sender<()>) {
+    pub(super) fn admit_supervising(
+        host: &SharedHost,
+        route: &str,
+        stopped: tokio::sync::mpsc::Sender<()>,
+    ) {
         let bindings = crate::SandboxInstanceBindings {
             gateway_credentials:
                 openshell_core::grpc_client::GatewayCredentials::from_gateway_token(
@@ -1916,6 +2074,7 @@ mod tests {
             generation: "generation".to_string(),
             launch_material: b"{}".to_vec(),
             takeover: None,
+            prepared: false,
         };
         let mut instances = vec![assignment(hosted_route.to_string())];
         instances.extend(

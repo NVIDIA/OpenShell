@@ -121,6 +121,95 @@ pub struct SandboxInstanceRegistration {
     pub trace_context: Option<RegistrationTraceContext>,
 }
 
+/// Trusted preparation of a physical runtime before a sandbox claims it.
+///
+/// Contains only public TLS trust and immutable runtime coordinates. A host
+/// reserves one slot and queues authenticated connections, without starting
+/// a sandbox instance or obtaining operational credentials.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedRuntimeRegistration {
+    pub route: String,
+    pub runtime_descriptor: SandboxRuntimeDescriptor,
+}
+
+impl PreparedRuntimeRegistration {
+    pub fn validate(&self) -> Result<(), RegistrationError> {
+        openshell_sandbox_backend::runtime_routed::validate_route_handle(&self.route)
+            .map_err(|error| RegistrationError::new(error.to_string()))?;
+        openshell_sandbox_backend::validate_prepared_runtime_coordinates(&self.runtime_descriptor)
+            .map_err(|error| RegistrationError::new(error.to_string()))?;
+        match &self.runtime_descriptor.transport {
+            SandboxTransport::RuntimeInitiatedRouted { route, .. } if route == &self.route => {
+                Ok(())
+            }
+            _ => Err(RegistrationError::new(
+                "prepared runtime requires its routed transport",
+            )),
+        }
+    }
+
+    pub fn to_assignment(&self) -> Result<SandboxInstanceAssignment, RegistrationError> {
+        self.validate()?;
+        let launch_material = serde_json::to_vec(self)
+            .map_err(|_| RegistrationError::new("could not encode prepared runtime"))?;
+        if launch_material.len() > MAX_LAUNCH_MATERIAL_BYTES {
+            return Err(RegistrationError::new(
+                "prepared runtime material is too large",
+            ));
+        }
+        Ok(SandboxInstanceAssignment {
+            route: self.route.clone(),
+            generation: self.runtime_descriptor.generation.clone(),
+            launch_material,
+            prepared: true,
+            ..Default::default()
+        })
+    }
+
+    pub fn from_assignment(
+        assignment: &SandboxInstanceAssignment,
+    ) -> Result<Self, RegistrationError> {
+        if !assignment.prepared
+            || !assignment.sandbox_id.is_empty()
+            || assignment.takeover.is_some()
+            || assignment.launch_material.len() > MAX_LAUNCH_MATERIAL_BYTES
+        {
+            return Err(RegistrationError::new(
+                "invalid prepared runtime assignment",
+            ));
+        }
+        let registration: Self = serde_json::from_slice(&assignment.launch_material)
+            .map_err(|_| RegistrationError::new("invalid prepared runtime material"))?;
+        registration.validate()?;
+        if registration.route != assignment.route
+            || registration.runtime_descriptor.generation != assignment.generation
+        {
+            return Err(RegistrationError::new(
+                "prepared assignment does not match its material",
+            ));
+        }
+        Ok(registration)
+    }
+
+    /// Activation may supply only the logical identity. All physical
+    /// coordinates, including the TLS pin, must remain exactly as prepared.
+    pub fn validate_activation(
+        &self,
+        registration: &SandboxInstanceRegistration,
+    ) -> Result<(), RegistrationError> {
+        registration.validate()?;
+        let mut descriptor = registration.runtime_descriptor.clone();
+        descriptor.boundary_id.clear();
+        if registration.route != self.route || descriptor != self.runtime_descriptor {
+            return Err(RegistrationError::new(
+                "activation does not match the prepared runtime",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for SandboxInstanceRegistration {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -194,6 +283,7 @@ impl SandboxInstanceRegistration {
             generation: self.auth.runtime_generation.to_string(),
             launch_material,
             takeover: None,
+            prepared: false,
         })
     }
 
@@ -216,6 +306,11 @@ impl SandboxInstanceRegistration {
     pub fn from_assignment(
         assignment: &SandboxInstanceAssignment,
     ) -> Result<Self, RegistrationError> {
+        if assignment.prepared {
+            return Err(RegistrationError::new(
+                "prepared runtime has no sandbox registration",
+            ));
+        }
         let registration = Self::from_launch_material(&assignment.launch_material)?;
         if registration.route != assignment.route
             || registration.sandbox_id != assignment.sandbox_id
@@ -242,6 +337,7 @@ mod tests {
             generation: "gen".to_string(),
             launch_material: b"{}".to_vec(),
             takeover: None,
+            prepared: false,
         };
         let error = SandboxInstanceRegistration::from_assignment(&mismatched).unwrap_err();
         assert!(error.to_string().contains("not a valid registration"));

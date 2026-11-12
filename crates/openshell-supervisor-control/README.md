@@ -86,6 +86,116 @@ re-implementing the control contracts.
   delivery until it succeeds or a newer token supersedes it.
 - `proto`: the private wire protocol, generated in `openshell-core`.
 
+## Prepared runtimes
+
+The private assignment protocol supports a prepared runtime before it belongs
+to a logical sandbox. `PreparedRuntimeRegistration` carries an unassigned
+runtime descriptor with its generation, launch session, physical resource
+claims, workload identity, provisioning evidence, routed endpoint, and TLS pin.
+It carries no operational credentials or command. A `prepared` assignment
+reserves one of the host's 256 slots and registers its route, allowing the host
+to authenticate and hold the runtime's idle TLS connection. `PREPARED` reports
+an installed reservation; it does not assert connection health or workload
+readiness.
+
+Activation replaces that assignment with a `SandboxInstanceRegistration` on
+the same route. Only the descriptor's logical sandbox ID may change. The host
+transfers the existing route registration, including its queued connections,
+into the instance's backend. Activation needs no additional slot. A repeated
+preparation is idempotent, conflicting preparation is rejected, `keep_routes`
+retains it during material loading, and withdrawal releases it. An active
+instance cannot be downgraded to prepared.
+
+`SharedSupervision::prepare` records the preparation, its owning workspace,
+bootstrap credential epoch, supervisor process, and capacity charge durably
+before the driver releases the runtime. Every gateway replica can recover this
+reservation. Prepared and active runtimes share the same capacity limit.
+Ordinary sandbox-generation recovery excludes preparations; their lifecycle
+belongs to the warm-pool controller.
+
+`warm_pool` defines the bounded creation journal shared by gateway replicas.
+`warm_runtime_trust`, `warm_pool_state` and `update_warm_pool` expose public
+verification material and conditional journal writes through the installed
+placement authority. No Sandbox credentials are issued for pool inventory.
+The journal records provisioning/retirement intent, not allocation authority.
+
+For a `PREPARED` wire report only, `ready` means the host has a TLS-authenticated
+parked connection. `prepared_connection_ready` reads that observation from the
+current acknowledged owner. Ordinary instance-status conversion still masks
+this bit, so a spare cannot appear as a ready logical Sandbox. The host samples
+parked connections on its existing heartbeat cadence. The router reads idle TLS
+streams to detect closure and preserves at most 64 KiB of early HTTP/2 bytes for
+activation. The observation cannot guarantee that a peer stays connected.
+
+`SharedSupervision::prepared_runtimes` recovers admitted preparations for one
+workspace, including their physical resource claims, bootstrap epoch, and
+original supervisor process. Owner availability is a reconciliation hint;
+activation checks it again. Read or material-loading failures return an error,
+not an empty inventory. The listing can race claims and other pool changes.
+
+Cleanup calls `SharedSupervision::release_preparation` with the exact revision
+from the listing. Release compares the reservation ID and record version and
+atomically transfers its material to cleanup, retaining a retirement fence for
+the physical route. If a claim or replacement wins,
+release returns `Changed` and the controller must leave the physical runtime
+alone. Only `Released` permits cleanup by immutable resource UID; `Absent` is
+an observation, not a fence against concurrent preparation. Host stop and capacity reclamation follow through
+pool reconciliation. Do not use the unconditional `withdraw` method for warm
+cleanup, and allocate a fresh route for each replacement runtime.
+
+`retire_preparation` also handles runtimes that never reached admission. The
+driver first journals retirement on its physical resource, then supplies its
+workspace, route, generation and bootstrap epoch. Retirement creates a fence if
+the route is absent, or conditionally retires a matching unclaimed record. A
+claim wins or loses against the same record version. Retrying a completed
+retirement returns `Released`; preparation can never reuse that route, even
+after a gateway restart. These small records are retained without an expiry;
+they hold no credentials or capacity. A claimed warm runtime retains its origin
+so stopping the assigned Sandbox also permanently retires the physical route.
+Prepared assignments are published only
+by durable reconciliation, so a delayed preparation response cannot locally
+republish a retired route.
+
+After persisting its claim, the driver calls `SharedSupervision::activate`.
+The driver supplies both the expected Sandbox launch generation/epoch and the
+prepared runtime's registration. Only a Provisioning or Starting Sandbox can
+claim a runtime. The gateway verifies the physical descriptor, workspace, and
+expected identity, then mints a resource-bound Sandbox Protocol token and a new
+gateway token lineage. One transaction adopts the prepared generation, launch
+epoch, and TLS session in the Sandbox, replaces the preparation's material, and
+binds the owner to the Sandbox. The supervisor process and capacity charge stay
+unchanged. Concurrent claims (including two runtimes for one Sandbox), withdrawals,
+and Sandbox identity changes are fenced by record versions.
+
+Activation returns the committed registration with gateway-issued tokens. The
+driver must persist that result for recovery; tokens in the request are replaced.
+A retry of the winning registration returns the same material while that launch
+remains current. The runtime's physical claims and TLS session are stored with
+the Sandbox identity, so credential renewal and takeover retain them. In
+particular, renewal before the first protocol call still supplies the binding
+the unassigned runtime requires. A subsequent fresh start clears the binding.
+
+Prepared reservations remain pinned to their original supervisor process.
+Gateway restart or host-stream reconnection recovers them without migration.
+An expired, leaving, or replaced supervisor process cannot activate a prepared
+runtime. The warm-pool controller must conditionally release and replace that runtime;
+there is no unassigned credential epoch with which to authorize takeover.
+This also avoids redirecting an idle runtime away from a reachable old owner.
+
+The Kubernetes driver's OpenShell-owned pool persists per-Pod TLS bootstrap
+material before calling `prepare`, then releases its scheduling gate. Creation
+selects a compatible connected spare, journals its claim with a CR CAS and a
+Pod-owned Secret, and calls `activate`. Recovery completes interrupted claims;
+pool reconciliation replaces unusable preparations. Activation publication uses
+durable pool reconciliation so a delayed response cannot locally revive a stopped
+route. Dedicated pools use the same journal and activation contracts with a
+separate coordinator: no shared membership or capacity rows are created. The driver
+binds the dedicated Pod UID, observes startup-probe success, and delivers the
+committed registration through the dedicated supervisor’s pending
+`RegisterSupervisor` stream. Initial gateway TLS trust is mounted before warming;
+claim credentials and the proxy CA arrive in the response. The supervisor adopts
+the held TLS route and enters normal dedicated startup.
+
 ## Ownership
 
 The gateway (`openshell-server`) constructs the `SharedSupervision` when the

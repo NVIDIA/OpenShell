@@ -1434,6 +1434,70 @@ releasing a sandbox Pod. Your cluster CNI must enforce ingress and egress
 `NetworkPolicy` in every sandbox namespace; the Kubernetes API does not verify
 enforcement.
 
+#### Experimental warm capacity
+
+Warm pooling is enabled by default for Kubernetes in `shared` or `operator`
+workspace mode, with dedicated or shared supervisors. It requires gateway TLS and
+JWT signing. No capacity is created until a sandbox template sets both
+`desired_service_level.startup.ready_within` and a positive `max_burst`.
+See [Sandbox Templates](/how-it-works/sandboxes/templates) for the CLI configuration.
+A create from that template claims a ready spare with matching Pod configuration
+and environment, or uses cold creation when none is available. Creates without a
+template do not consume template pools. `ready_within` is a requested service level,
+not a guaranteed startup deadline.
+
+The following optional driver settings control operator limits, not pool definitions:
+
+```toml
+[openshell.drivers.kubernetes.warm_pool]
+enabled = true
+revision = 1
+max_size = 16
+max_age_secs = 3600
+preparation_timeout_secs = 300
+```
+
+The target count is the template's `max_burst`, capped by `max_size`. Pending and
+deleting spares count against this per-template maximum (1–256).
+`max_age_secs` accepts 60–86400 seconds; `preparation_timeout_secs` accepts
+30–3600 seconds and must not exceed the maximum age. Increase `revision` when
+changing these limits, other driver settings, or gateway verification keys;
+older gateway replicas cannot overwrite a newer plan.
+
+Deleting a template drains its unclaimed capacity automatically, including after
+a gateway restart. Recreating the same template name creates a distinct pool.
+Set `warm_pool.enabled = false` on all gateway replicas to stop claims and drain
+all pools. Re-enabling allows tuned templates to refill. Claimed sandboxes continue
+through their normal lifecycle.
+
+Recovery reads immutable bootstrap and claim Secrets. Shared workspace deployments
+and the operator workspace chart grant Secret `get` by default, without `list` or
+`watch`. This permission covers the sandbox namespace because Kubernetes RBAC
+cannot match generated name prefixes. After disabling pooling and waiting for its
+resources to drain, operator workspace releases can set
+`gateway.warmPoolSecretReads = false`. Retain Secret reads while draining.
+
+The gateway reserves shared-supervisor capacity, or creates a dedicated supervisor
+Pod, before releasing each runtime Pod. A dedicated spare consumes both Pods.
+Readiness requires an authenticated connection to the assigned supervisor;
+a running Pod or released scheduling gate is insufficient. Runtimes that fail
+to connect within the preparation timeout, lose their supervisor, exceed their
+maximum age, or lack a healthy observation for 60 seconds are retired and replaced.
+Shared supervisors report current parked connections; dedicated supervisors use
+Kubernetes startup-probe success and the original supervisor Pod's running state.
+Gateway replicas share durable creation intents, so a restart or lost API
+response reuses the pending identity.
+
+Dedicated supervisors require gateway TLS and keep a registration stream open
+until claimed. The response supplies the assigned identity and credentials, so
+claims do not wait for Kubernetes Secret projection. The runtime makes no bootstrap
+request to the gateway. Shared supervisors receive claims through their existing
+assignment stream. Drain warm pools before changing supervisor topology.
+
+A claim keeps the existing Pod and supervisor connection. Policy, credentials,
+and the main process are assigned at claim time. A stopped sandbox starts with
+a fresh runtime generation; claimed runtimes never return to the pool.
+
 In managed workspace mode, the Kubernetes driver copies each explicitly named
 `image_pull_secrets` Secret from `namespace` into the managed workspace
 namespace on sandbox creation. Shared and operator modes require the Secret to

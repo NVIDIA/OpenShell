@@ -8,6 +8,7 @@ pub mod grpc;
 pub mod isolation;
 mod lifecycle;
 pub mod otel_tracing;
+pub mod prepared_runtime;
 mod resource_admission;
 mod sandbox_runtime;
 mod shared_supervisor;

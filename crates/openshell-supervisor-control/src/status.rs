@@ -12,6 +12,7 @@ use crate::proto::{SandboxInstancePhase, SandboxInstanceStatus};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum SandboxInstancePhaseReport {
+    Prepared,
     Starting,
     Supervising,
     Stopping,
@@ -43,6 +44,9 @@ impl SandboxInstanceStatusReport {
     #[must_use]
     pub fn to_proto(&self) -> SandboxInstanceStatus {
         let (phase, exit_code, error) = match &self.phase {
+            SandboxInstancePhaseReport::Prepared => {
+                (SandboxInstancePhase::Prepared, 0, String::new())
+            }
             SandboxInstancePhaseReport::Starting => {
                 (SandboxInstancePhase::Starting, 0, String::new())
             }
@@ -74,6 +78,7 @@ impl SandboxInstanceStatusReport {
     #[must_use]
     pub fn from_proto(status: &SandboxInstanceStatus) -> Self {
         let phase = match SandboxInstancePhase::try_from(status.phase) {
+            Ok(SandboxInstancePhase::Prepared) => SandboxInstancePhaseReport::Prepared,
             Ok(SandboxInstancePhase::Starting) => SandboxInstancePhaseReport::Starting,
             Ok(SandboxInstancePhase::Supervising) => SandboxInstancePhaseReport::Supervising,
             Ok(SandboxInstancePhase::Stopping) => SandboxInstancePhaseReport::Stopping,
@@ -87,7 +92,8 @@ impl SandboxInstanceStatusReport {
                 error: "sandbox instance reported an unknown phase".to_string(),
             },
         };
-        let ready = status.ready && !phase.is_terminal();
+        let ready =
+            status.ready && !phase.is_terminal() && phase != SandboxInstancePhaseReport::Prepared;
         Self {
             route: status.route.clone(),
             sandbox_id: status.sandbox_id.clone(),
@@ -104,6 +110,12 @@ mod tests {
     #[test]
     fn status_reports_round_trip_and_unknown_phases_fail_closed() {
         for report in [
+            SandboxInstanceStatusReport {
+                route: "rt-prepared".to_string(),
+                sandbox_id: String::new(),
+                phase: SandboxInstancePhaseReport::Prepared,
+                ready: false,
+            },
             SandboxInstanceStatusReport {
                 route: "rt-a".to_string(),
                 sandbox_id: "sandbox-a".to_string(),
@@ -141,5 +153,11 @@ mod tests {
         let report = SandboxInstanceStatusReport::from_proto(&unknown);
         assert!(report.phase.is_terminal());
         assert!(!report.ready);
+        let prepared = SandboxInstanceStatus {
+            phase: SandboxInstancePhase::Prepared.into(),
+            ready: true,
+            ..unknown
+        };
+        assert!(!SandboxInstanceStatusReport::from_proto(&prepared).ready);
     }
 }

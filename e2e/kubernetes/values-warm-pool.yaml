@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Layer with ci/values-tls-port-forward.yaml. Add ci/values-supervisor.yaml
+# for shared supervisors. The test creates its pool through the template CLI.
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    warm_pool:
+      max_size: 2

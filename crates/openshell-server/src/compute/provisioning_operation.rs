@@ -37,6 +37,30 @@ fn operation_id(sandbox: &Sandbox) -> Option<&str> {
         .map(|record| record.driver_operation_id.as_str())
 }
 
+// Activation is the one legitimate generation change inside a submitted CREATE.
+// Its predecessor is written atomically with the DB claim, and the operation ID
+// still has to match. A restart or takeover must not inherit this exception.
+fn same_launch(current: &Sandbox, starting: &Sandbox) -> bool {
+    if sandbox_runtime_generation(current) == sandbox_runtime_generation(starting) {
+        return true;
+    }
+    let identity = |sandbox: &Sandbox| {
+        crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &sandbox.metadata.as_ref()?.annotations,
+        )
+        .ok()
+    };
+    let (Some(current), Some(starting)) = (identity(current), identity(starting)) else {
+        return false;
+    };
+    starting.prepared_runtime.is_none()
+        && current.auth_epoch == starting.auth_epoch
+        && current.prepared_runtime.as_ref().is_some_and(|binding| {
+            binding.claimed_from.as_ref()
+                == Some(&(starting.runtime_generation, starting.auth_epoch))
+        })
+}
+
 /// Called only inside a CAS that has checked the prior operation is settled.
 /// Legacy rows without an attempt retain their existing lifecycle contract.
 pub(super) fn claim_record(sandbox: &mut Sandbox) {
@@ -51,9 +75,7 @@ pub(super) fn claim_record(sandbox: &mut Sandbox) {
 }
 
 pub(super) fn ensure_current_result(current: &Sandbox, owned: &Sandbox) -> Result<(), Status> {
-    if !same_operation(current, owned)
-        || sandbox_runtime_generation(current) != sandbox_runtime_generation(owned)
-    {
+    if !same_operation(current, owned) || !same_launch(current, owned) {
         return Err(Status::aborted(
             "sandbox driver operation changed before result handling",
         ));
@@ -138,9 +160,7 @@ impl ComputeRuntime {
                 // Settlement records a known response even if another writer
                 // rotated identity. That response cannot bind or compensate
                 // against the replacement generation in its returned snapshot.
-                if sandbox_runtime_generation(&settled)
-                    != sandbox_runtime_generation(&owned_attempt)
-                {
+                if !same_launch(&settled, &owned_attempt) {
                     return Err(ProvisioningOperationError::Monitor(Status::aborted(
                         "sandbox runtime generation changed during driver operation",
                     )));
@@ -176,7 +196,7 @@ impl ComputeRuntime {
                             Status::not_found("sandbox removed during startup")
                         ))?;
                     if !same_operation(&current, starting)
-                        || sandbox_runtime_generation(&current) != sandbox_runtime_generation(starting) {
+                        || !same_launch(&current, starting) {
                         return Err(ProvisioningOperationError::Monitor(Status::aborted(
                             "sandbox provisioning attempt changed while waiting for compute"
                         )));
@@ -309,5 +329,44 @@ impl ComputeRuntime {
         self.sandbox_index.update_from_sandbox(&updated);
         self.sandbox_watch_bus.notify(starting.object_id());
         Ok(updated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::sandbox_session::{PersistedSandboxIdentity, PreparedRuntimeIdentity};
+    use openshell_core::jwt::CredentialEpoch;
+
+    #[test]
+    fn only_the_recorded_activation_may_change_a_submitted_launch_generation() {
+        let identity = PersistedSandboxIdentity::new().unwrap();
+        let mut starting = Sandbox::default();
+        identity.write(&mut starting.metadata.get_or_insert_default().annotations);
+        let mut claimed = identity.clone();
+        let session = openshell_core::SandboxSessionId::new();
+        let mut binding =
+            PreparedRuntimeIdentity::new(session, [("pod".into(), "uid".into())].into()).unwrap();
+        binding.claimed_from = Some((identity.runtime_generation.clone(), identity.auth_epoch));
+        claimed.runtime_generation =
+            openshell_core::sandbox_generation::SandboxGenerationId::parse(session.to_string())
+                .unwrap();
+        claimed.prepared_runtime = Some(binding);
+        let mut current = starting.clone();
+        claimed.write(&mut current.metadata.as_mut().unwrap().annotations);
+        assert!(same_launch(&current, &starting));
+        assert!(ensure_current_result(&current, &starting).is_ok());
+        // A subsequent ownership epoch cannot use a late CREATE result.
+        claimed.auth_epoch = CredentialEpoch::new(2).unwrap();
+        claimed.write(&mut current.metadata.as_mut().unwrap().annotations);
+        assert!(!same_launch(&current, &starting));
+        claimed.auth_epoch = identity.auth_epoch;
+        claimed.prepared_runtime.as_mut().unwrap().claimed_from = None;
+        claimed.write(&mut current.metadata.as_mut().unwrap().annotations);
+        assert!(!same_launch(&current, &starting));
+        // Normal new generations clear the warm binding.
+        claimed.prepared_runtime = None;
+        claimed.write(&mut current.metadata.as_mut().unwrap().annotations);
+        assert!(!same_launch(&current, &starting));
     }
 }
