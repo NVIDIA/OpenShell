@@ -24,9 +24,7 @@ Documentation.
 Network transport.
 ### topic:policy
 Policy enforcement.
-### topic:sdk
-Language bindings.
-#### topic:sdk:python
+### topic:sdk:python
 Python SDK.
 ### topic:ux
 User interaction.
@@ -39,7 +37,6 @@ NAMES = [
     "topic:documentation",
     "topic:networking",
     "topic:policy",
-    "topic:sdk",
     "topic:sdk:python",
     "topic:ux",
     "topic:dx",
@@ -203,14 +200,13 @@ class PolicyTests(unittest.TestCase):
             report["remove"], ["retired:topic:compatibility", "retired:topic:l7"]
         )
 
-    def test_nested_sdk_requires_broad_subscription_topic(self):
+    def test_sdk_language_topic_validates_without_a_parent_topic(self):
         decision = result()
         decision["topics"] = ["topic:sdk:python"]
         decision["reasons"][0]["labels"] = ["area:runtime", "topic:sdk:python"]
-        self.assertFalse(validate_result(snapshot(), decision)["valid"])
-        decision["topics"].append("topic:sdk")
-        decision["reasons"][0]["labels"].append("topic:sdk")
-        self.assertTrue(validate_result(snapshot(), decision)["valid"])
+        validation = validate_result(snapshot(), decision)
+        self.assertTrue(validation["valid"], validation["errors"])
+        self.assertEqual(validation["missing_prerequisites"], [])
 
     def test_malformed_names_need_explicit_observed_evidenced_removals(self):
         snap = snapshot()
