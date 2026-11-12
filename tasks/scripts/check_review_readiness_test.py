@@ -53,6 +53,36 @@ def event(number, login, *, human=False, removed=False):
 
 
 class RegistryTests(unittest.TestCase):
+    def test_nested_sdk_subscription_topics_route_without_the_parent_topic(self):
+        text = DOCUMENT + "\n### topic:sdk\n\n" + TABLE + ALICE
+        language_member = "| Bob | [@bob](https://github.com/bob) | Example |\n"
+        for language in ("go", "python", "rust", "typescript"):
+            text += f"\n### topic:sdk:{language}\n\n" + TABLE + language_member
+        categories = routing.parse_reviewers(text)
+        for language in ("go", "python", "rust", "typescript"):
+            with self.subTest(language=language):
+                self.assertEqual(categories[f"topic:sdk:{language}"], {"bob"})
+                self.assertEqual(
+                    routing.select_reviewers(
+                        categories,
+                        {"area:runtime", f"topic:sdk:{language}"},
+                    ),
+                    {"alice", "bob"},
+                )
+
+    def test_malformed_nested_headings_are_not_active_categories(self):
+        for label in (
+            "topic:sdk:",
+            "topic:sdk::go",
+            "topic:sdk:-go",
+            "retired:topic:sdk:go",
+        ):
+            with self.subTest(label=label):
+                text = DOCUMENT + f"\n### {label}\n\n" + TABLE
+                self.assertEqual(
+                    routing.parse_reviewers(text), {"area:runtime": {"alice"}}
+                )
+
     def test_reads_only_membership_rows_and_allows_empty_categories(self):
         text = DOCUMENT.replace(
             "Scope.", "Thanks [@outside](https://github.com/outside)."

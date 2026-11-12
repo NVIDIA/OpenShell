@@ -30,7 +30,7 @@ from check_maintainer_approval import parse_maintainers
 from label_accepted_work import ACCEPTED_LABEL, check_pr_accepted_work
 
 HEADER = ["Name", "GitHub ID", "Company/Organization"]
-LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:-[a-z0-9]+)*")
+LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:[-:][a-z0-9]+)*")
 PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)", re.I)
 
 

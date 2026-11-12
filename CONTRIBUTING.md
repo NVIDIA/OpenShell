@@ -157,6 +157,8 @@ Automatic classification at issue creation and filters that exclude unaccepted w
 
 ### Label Discovery
 
+Classify SDK work with `topic:sdk:go`, `topic:sdk:python`, `topic:sdk:rust`, or `topic:sdk:typescript`. For work spanning SDKs, apply each supported language topic. Propose individual reviewer membership changes through review. Only apply a topic after its live definition and routing support are available.
+
 Retrieve every page of repository labels and their descriptions:
 
 ```shell
