@@ -44,8 +44,8 @@ use openshell_driver_sdk::driver_utils::{
 use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_driver_sdk::legacy_contract::ResolvedWorkloadIdentity;
 use openshell_driver_sdk::legacy_contract::{
-    BoundaryConfig, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
-    SandboxTlsServerConfig, generate_sandbox_tls_material,
+    BoundaryConfig, ContractDocument as _, GatewayVerificationKey, SandboxRuntimeDescriptor,
+    SandboxTlsClientConfig, SandboxTlsServerConfig, generate_sandbox_tls_material,
 };
 use openshell_driver_sdk::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
@@ -2645,12 +2645,21 @@ impl DockerComputeDriver {
                 "read Docker sandbox workspace for restart: {error}"
             ))
         })?;
+        let boundary_config_protobuf = read_optional_docker_state_file(
+            &openshell_driver_sdk::legacy_contract::protobuf_json_path(
+                &boundary_directory.join(BOUNDARY_CONFIG_FILE),
+            ),
+        )
+        .await?;
         stage_docker_sandbox_bundle(
             &self.docker,
             &target,
             &self.config,
             &runtime_descriptor.workload_identity,
-            &boundary_config,
+            DockerBoundaryConfigFiles {
+                legacy: &boundary_config,
+                protobuf: boundary_config_protobuf.as_deref(),
+            },
             DockerSandboxTls {
                 certificate: &boundary_certificate,
                 private_key: &boundary_private_key,
@@ -4559,6 +4568,7 @@ struct DockerSandboxTls<'a> {
 fn docker_sandbox_bundle_archive(
     sandbox_binary: &[u8],
     boundary_config: &[u8],
+    boundary_config_protobuf: Option<&[u8]>,
     boundary_tls: DockerSandboxTls<'_>,
     identity: &ResolvedWorkloadIdentity,
     workspace_root: &str,
@@ -4596,6 +4606,16 @@ fn docker_sandbox_bundle_archive(
         identity.gid,
         boundary_config,
     )?;
+    if let Some(contents) = boundary_config_protobuf {
+        append_docker_archive_file(
+            &mut archive,
+            ".openshell/channel/sandbox/bootstrap.pb.json",
+            0o600,
+            identity.uid,
+            identity.gid,
+            contents,
+        )?;
+    }
     for (path, contents) in [
         (
             ".openshell/channel/sandbox/server.crt",
@@ -4632,18 +4652,27 @@ fn docker_sandbox_bundle_archive(
         .map_err(|error| Status::internal(format!("finish Docker sandbox archive: {error}")))
 }
 
+/// The boundary configuration in each form the driver stages for the sandbox.
+struct DockerBoundaryConfigFiles<'a> {
+    /// The legacy JSON.
+    legacy: &'a [u8],
+    /// The protobuf JSON, once the driver has written it for this sandbox.
+    protobuf: Option<&'a [u8]>,
+}
+
 async fn stage_docker_sandbox_bundle(
     docker: &Docker,
     container_id: &str,
     config: &DockerDriverRuntimeConfig,
     identity: &ResolvedWorkloadIdentity,
-    boundary_config: &[u8],
+    boundary_config: DockerBoundaryConfigFiles<'_>,
     boundary_tls: DockerSandboxTls<'_>,
     workspace_root: &str,
 ) -> Result<(), Status> {
     let archive = docker_sandbox_bundle_archive(
         config.sandbox_binary.as_slice(),
-        boundary_config,
+        boundary_config.legacy,
+        boundary_config.protobuf,
         boundary_tls,
         identity,
         workspace_root,
@@ -4762,11 +4791,11 @@ async fn prepare_docker_boundary_files(
     }
     .provision()
     .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    let boundary_config = provisioning
+    let boundary_files = provisioning
         .boundary_config
-        .encode()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    write_docker_boundary_file(&directory.join(BOUNDARY_CONFIG_FILE), &boundary_config).await?;
+        .to_files(BOUNDARY_CONFIG_FILE)
+        .map_err(docker_document_error)?;
+    write_docker_document_files(&directory, &boundary_files).await?;
     write_docker_boundary_file(
         &directory.join(BOUNDARY_CERTIFICATE_FILE),
         tls.certificate_chain_pem.as_bytes(),
@@ -4782,7 +4811,10 @@ async fn prepare_docker_boundary_files(
         container_id,
         config,
         workload_identity,
-        &boundary_config,
+        DockerBoundaryConfigFiles {
+            legacy: &boundary_files.legacy.contents,
+            protobuf: Some(&boundary_files.protobuf.contents),
+        },
         DockerSandboxTls {
             certificate: tls.certificate_chain_pem.as_bytes(),
             private_key: tls.private_key_pem.as_bytes(),
@@ -4790,13 +4822,12 @@ async fn prepare_docker_boundary_files(
         &workspace_root,
     )
     .await?;
-    let descriptor = provisioning
-        .runtime_descriptor
-        .backend_descriptor()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    write_docker_boundary_file(
-        &directory.join(RUNTIME_DESCRIPTOR_FILE),
-        &descriptor.payload,
+    write_docker_document_files(
+        &directory,
+        &provisioning
+            .runtime_descriptor
+            .to_files(RUNTIME_DESCRIPTOR_FILE)
+            .map_err(docker_document_error)?,
     )
     .await?;
     let supervisor_auth = serde_json::to_vec(&launch_authentication.supervisor)
@@ -4822,6 +4853,39 @@ async fn prepare_docker_boundary_files(
     )
     .await?;
     Ok(())
+}
+
+fn docker_document_error(
+    error: openshell_driver_sdk::legacy_contract::convert::ContractConversionError,
+) -> Status {
+    Status::internal(format!("encode Docker launch document: {error}"))
+}
+
+/// Write both files of a launch document into the state directory. The files
+/// are encoded from one value by the SDK, so they cannot disagree. Readers
+/// prefer the protobuf JSON file when it exists; this driver still reads only
+/// its legacy state.
+async fn write_docker_document_files(
+    directory: &Path,
+    files: &openshell_driver_sdk::legacy_contract::DocumentFiles,
+) -> Result<(), Status> {
+    for file in files.iter() {
+        write_docker_boundary_file(&directory.join(&file.name), &file.contents).await?;
+    }
+    Ok(())
+}
+
+/// Read a state file that exists only once the driver has written the new
+/// format for this sandbox.
+async fn read_optional_docker_state_file(path: &Path) -> Result<Option<Vec<u8>>, Status> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Status::internal(format!(
+            "read Docker state file {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 async fn docker_supervisor_bundle_archive(
@@ -4859,6 +4923,19 @@ async fn docker_supervisor_bundle_archive(
         SUPERVISOR_GID,
         &auth_bundle,
     )?;
+    for (name, file) in [("runtime-descriptor.pb.json", RUNTIME_DESCRIPTOR_FILE)] {
+        let path = openshell_driver_sdk::legacy_contract::protobuf_json_path(&directory.join(file));
+        if let Some(contents) = read_optional_docker_state_file(&path).await? {
+            append_docker_archive_file(
+                &mut archive,
+                name,
+                0o600,
+                SUPERVISOR_UID,
+                SUPERVISOR_GID,
+                &contents,
+            )?;
+        }
+    }
     if let Some(tls) = &config.guest_tls {
         append_docker_archive_directory(
             &mut archive,
@@ -4984,19 +5061,15 @@ async fn refresh_docker_boundary_authentication(
         server_name: tls.server_name,
         trust_anchor_pem: tls.trust_anchor_pem,
     };
-    let encoded_boundary_config = boundary_config
-        .encode()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    let descriptor = runtime_descriptor
-        .backend_descriptor()
-        .map_err(|error| Status::internal(error.to_string()))?;
+    let boundary_files = boundary_config
+        .to_files(BOUNDARY_CONFIG_FILE)
+        .map_err(docker_document_error)?;
+    let descriptor_files = runtime_descriptor
+        .to_files(RUNTIME_DESCRIPTOR_FILE)
+        .map_err(docker_document_error)?;
     let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
         .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
-    write_docker_boundary_file(
-        &directory.join(BOUNDARY_CONFIG_FILE),
-        &encoded_boundary_config,
-    )
-    .await?;
+    write_docker_document_files(&directory, &boundary_files).await?;
     write_docker_boundary_file(
         &directory.join(BOUNDARY_CERTIFICATE_FILE),
         tls.certificate_chain_pem.as_bytes(),
@@ -5007,11 +5080,7 @@ async fn refresh_docker_boundary_authentication(
         tls.private_key_pem.as_bytes(),
     )
     .await?;
-    write_docker_boundary_file(
-        &directory.join(RUNTIME_DESCRIPTOR_FILE),
-        &descriptor.payload,
-    )
-    .await?;
+    write_docker_document_files(&directory, &descriptor_files).await?;
     write_docker_boundary_file(
         &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
         &supervisor_auth,
@@ -5031,16 +5100,12 @@ async fn refresh_docker_supervisor_authentication(
             "Docker sandbox runtime descriptor is missing during supervisor authentication rotation",
         ));
     };
-    let descriptor = runtime_descriptor
-        .backend_descriptor()
-        .map_err(|error| Status::internal(error.to_string()))?;
+    let descriptor_files = runtime_descriptor
+        .to_files(RUNTIME_DESCRIPTOR_FILE)
+        .map_err(docker_document_error)?;
     let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
         .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
-    write_docker_boundary_file(
-        &directory.join(RUNTIME_DESCRIPTOR_FILE),
-        &descriptor.payload,
-    )
-    .await?;
+    write_docker_document_files(&directory, &descriptor_files).await?;
     write_docker_boundary_file(
         &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
         &supervisor_auth,

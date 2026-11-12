@@ -138,3 +138,14 @@ encoding carries `contract_version`, which a legacy document does not, so a
 reader can tell the two apart. `openshell-driver-sdk` converts between the two
 and its tests pin the protobuf JSON examples. The file is not imported by
 `openshell.proto`, so the SDKs do not generate it.
+
+During the transition a driver writes each document in the new encoding beside
+its legacy file, in a file named like the legacy one with `.pb.json` in place of
+`.json` (`bootstrap.json` and `bootstrap.pb.json`). A reader looks for the new
+file first and falls back to the legacy one. A new file that exists but is
+invalid is an error, not a reason to fall back. A single-use document, such as
+the boundary configuration, is removed in both forms once it has been read.
+An older driver writes only the legacy file and an older reader ignores the new
+one, so each side can be upgraded independently. A driver must not be replaced
+by an older one while it leaves new files behind: the newer readers would prefer
+the stale files.
