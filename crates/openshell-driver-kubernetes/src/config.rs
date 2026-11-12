@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;
-use openshell_core::config;
+use openshell_driver_sdk::config;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -58,7 +58,7 @@ pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
 /// Hard upper bound on a `proxy_ca_bundle` staged into a bootstrap Secret.
 ///
 /// The shared reader already bounds the file at
-/// [`MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES`](openshell_core::driver_utils::MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES),
+/// [`MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES`](openshell_driver_sdk::driver_utils::MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES),
 /// but that bound is exactly the apiserver's own ~1 MiB limit on a Secret,
 /// and the bootstrap Secret carries four other keys besides this one. A
 /// bundle between the two limits would be accepted on the gateway host and
@@ -300,7 +300,7 @@ pub struct KubernetesComputeConfig {
     /// Permit caller-supplied driver JSON. Does not waive resource admission.
     pub allow_driver_config: bool,
     /// Operator-owned external attachment approval policy.
-    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
+    pub resource_admission: openshell_driver_sdk::resource_admission::ResourceAdmissionConfig,
     /// How workspaces map to Kubernetes namespaces. `"shared"` (default)
     /// renders all sandboxes into `namespace`; `"managed"` creates per-workspace
     /// namespaces on demand; `"operator"` uses pre-provisioned namespaces.
@@ -399,7 +399,7 @@ pub struct KubernetesComputeConfig {
     /// OTLP exports passed to supervisor pods. The gateway supplies them
     /// from `[otlp]`; driver TOML cannot set them.
     #[serde(skip)]
-    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
+    pub supervisor_otlp: openshell_driver_sdk::sandbox_env::SupervisorOtlp,
 
     /// Gateway name passed to supervisors for their telemetry. The gateway
     /// supplies its own name; driver TOML cannot set it.
@@ -505,13 +505,13 @@ impl Default for KubernetesComputeConfig {
             workspace_mode: WorkspaceMode::default(),
             allow_driver_config: false,
             resource_admission:
-                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
+                openshell_driver_sdk::resource_admission::ResourceAdmissionConfig::default(),
             gateway_id: DEFAULT_GATEWAY_ID.to_string(),
             namespace: DEFAULT_K8S_NAMESPACE.to_string(),
             operator_namespace_label: None,
             operator_namespace_file: None,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME.to_string(),
-            default_image: openshell_core::image::default_sandbox_image(),
+            default_image: openshell_driver_sdk::image::default_sandbox_image(),
             // Default empty so the gateway omits `imagePullPolicy` from pod
             // specs and Kubernetes applies its own default (Always for `latest`,
             // IfNotPresent otherwise). `DEFAULT_IMAGE_PULL_POLICY` ("missing")
@@ -534,9 +534,9 @@ impl Default for KubernetesComputeConfig {
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
             grpc_endpoint: String::new(),
-            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
+            supervisor_otlp: openshell_driver_sdk::sandbox_env::SupervisorOtlp::default(),
             supervisor_gateway_name: None,
-            ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
+            ssh_socket_path: openshell_driver_sdk::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
@@ -682,7 +682,7 @@ impl KubernetesComputeConfig {
     ///
     /// The URL grammar and the pairing rules for `no_proxy`,
     /// `proxy_connect_by_hostname`, and `proxy_ca_bundle` are delegated to
-    /// [`validate_upstream_proxy_settings`](openshell_core::driver_utils::validate_upstream_proxy_settings)
+    /// [`validate_upstream_proxy_settings`](openshell_driver_sdk::driver_utils::validate_upstream_proxy_settings)
     /// so this driver can never accept a value the supervisor rejects, or
     /// drift from the Podman and VM drivers.
     ///
@@ -694,7 +694,7 @@ impl KubernetesComputeConfig {
     ///
     /// Returns a message naming the offending key.
     pub fn validate_upstream_proxy_config(&self) -> Result<(), String> {
-        use openshell_core::driver_utils::{
+        use openshell_driver_sdk::driver_utils::{
             UpstreamProxySettings, parse_upstream_proxy_url, validate_upstream_proxy_settings,
         };
 
@@ -824,7 +824,9 @@ impl KubernetesComputeConfig {
     pub fn from_open_shift_uid_range(annotation: &str) -> Option<u32> {
         let (start, _) = annotation.split_once('/')?;
         start.trim().parse::<u32>().ok().filter(|&uid| {
-            (openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID).contains(&uid)
+            (openshell_driver_sdk::policy::MIN_SANDBOX_UID
+                ..=openshell_driver_sdk::policy::MAX_SANDBOX_UID)
+                .contains(&uid)
         })
     }
 
@@ -832,7 +834,9 @@ impl KubernetesComputeConfig {
     pub fn from_open_shift_supplemental_groups(annotation: &str) -> Option<u32> {
         let (start, _) = annotation.split_once('/')?;
         start.trim().parse::<u32>().ok().filter(|&gid| {
-            (openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID).contains(&gid)
+            (openshell_driver_sdk::policy::MIN_SANDBOX_UID
+                ..=openshell_driver_sdk::policy::MAX_SANDBOX_UID)
+                .contains(&gid)
         })
     }
 
@@ -840,14 +844,15 @@ impl KubernetesComputeConfig {
     /// the policy-enforced UID/GID range. Called during driver initialization
     /// before any pod parameters are rendered.
     pub fn validate_sandbox_identity_config(&self) -> Result<(), String> {
-        let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
+        let range = openshell_driver_sdk::policy::MIN_SANDBOX_UID
+            ..=openshell_driver_sdk::policy::MAX_SANDBOX_UID;
         if let Some(uid) = self.sandbox_uid
             && !range.contains(&uid)
         {
             return Err(format!(
                 "sandbox_uid {uid} is outside the allowed range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
+                openshell_driver_sdk::policy::MIN_SANDBOX_UID,
+                openshell_driver_sdk::policy::MAX_SANDBOX_UID,
             ));
         }
         if let Some(gid) = self.sandbox_gid
@@ -855,8 +860,8 @@ impl KubernetesComputeConfig {
         {
             return Err(format!(
                 "sandbox_gid {gid} is outside the allowed range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
+                openshell_driver_sdk::policy::MIN_SANDBOX_UID,
+                openshell_driver_sdk::policy::MAX_SANDBOX_UID,
             ));
         }
         Ok(())
@@ -1645,7 +1650,7 @@ mod tests {
     #[test]
     fn validate_sandbox_identity_config_rejects_gid_above_max() {
         let cfg = KubernetesComputeConfig {
-            sandbox_gid: Some(openshell_policy::MAX_SANDBOX_UID + 1),
+            sandbox_gid: Some(openshell_driver_sdk::policy::MAX_SANDBOX_UID + 1),
             ..KubernetesComputeConfig::default()
         };
         let err = cfg.validate_sandbox_identity_config().unwrap_err();

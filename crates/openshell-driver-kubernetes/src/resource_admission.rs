@@ -8,7 +8,7 @@ use kube::{
     api::ApiResource,
     core::{DynamicObject, GroupVersionKind},
 };
-use openshell_core::resource_admission::ResourceAdmissionConfig;
+use openshell_driver_sdk::resource_admission::ResourceAdmissionConfig;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use tonic::Status;

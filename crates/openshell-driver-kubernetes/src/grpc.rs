@@ -4,7 +4,7 @@
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<_, tonic::Status>
 
 use futures::{Stream, StreamExt};
-use openshell_core::proto::compute::v1::{
+use openshell_driver_sdk::proto::compute::v1::{
     AuthenticateSandboxRequest, AuthenticateSandboxResponse, CreateSandboxRequest,
     CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse, DeleteWorkspaceRequest,
     DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
@@ -79,8 +79,8 @@ impl ComputeDriver for ComputeDriverService {
         self.rpc_tracer
             .trace(openshell_otel::rpc::GET_CAPABILITIES, async {
                 let capabilities = self.driver.capabilities().map_err(Status::internal)?;
-                openshell_core::extension_protocol::validate_gateway_metadata(
-                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                openshell_driver_sdk::extension_protocol::validate_gateway_metadata(
+                    openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
                     "kubernetes",
                     capabilities.extension.as_ref(),
                     request.into_inner().gateway,
@@ -159,7 +159,7 @@ impl ComputeDriver for ComputeDriverService {
                         .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
                     let runtime_identity =
                         self.driver.create_sandbox(&sandbox).await.map_err(|e| {
-                            Status::from(openshell_core::ComputeDriverError::from(e))
+                            Status::from(openshell_driver_sdk::ComputeDriverError::from(e))
                         })?;
                     Ok(Response::new(CreateSandboxResponse { runtime_identity }))
                 }),
@@ -190,7 +190,7 @@ impl ComputeDriver for ComputeDriverService {
                     .stop_sandbox(&request.sandbox_id)
                     .await
                     .map_err(|error| {
-                        Status::from(openshell_core::ComputeDriverError::from(error))
+                        Status::from(openshell_driver_sdk::ComputeDriverError::from(error))
                     })?;
                 Ok(Response::new(StopSandboxResponse {}))
             })
@@ -216,7 +216,7 @@ impl ComputeDriver for ComputeDriverService {
                     ))
                     .await
                     .map_err(|error| {
-                        Status::from(openshell_core::ComputeDriverError::from(error))
+                        Status::from(openshell_driver_sdk::ComputeDriverError::from(error))
                     })?;
                     Ok(Response::new(StartSandboxResponse { runtime_identity }))
                 }),
@@ -280,7 +280,7 @@ impl ComputeDriver for ComputeDriverService {
                 self.driver
                     .validate_workspace_namespace(&workspace)
                     .map_err(|error| {
-                        Status::from(openshell_core::ComputeDriverError::from(error))
+                        Status::from(openshell_driver_sdk::ComputeDriverError::from(error))
                     })?;
                 match self.driver.workspace_mode() {
                     WorkspaceMode::Managed => {
@@ -324,7 +324,7 @@ impl ComputeDriver for ComputeDriverService {
                     self.driver
                         .validate_workspace_namespace(&workspace)
                         .map_err(|error| {
-                            Status::from(openshell_core::ComputeDriverError::from(error))
+                            Status::from(openshell_driver_sdk::ComputeDriverError::from(error))
                         })?;
                     self.driver
                         .delete_namespace(&workspace)
@@ -338,12 +338,12 @@ impl ComputeDriver for ComputeDriverService {
 }
 
 #[tonic::async_trait]
-impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for ComputeDriverService {
+impl openshell_driver_sdk::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for ComputeDriverService {
     async fn resolve_supervisor_app_endpoint(
         &self,
-        request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+        request: Request<openshell_driver_sdk::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
     ) -> Result<
-        Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Response<openshell_driver_sdk::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
         Status,
     > {
         self.rpc_tracer
@@ -360,7 +360,7 @@ impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::Co
                         .await
                         .map_err(|e| Status::unavailable(e.to_string()))?;
                     Ok(Response::new(
-                        openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse {
+                        openshell_driver_sdk::proto::compute::v1::ResolveSupervisorAppEndpointResponse {
                             sandbox_id: request.sandbox_id,
                             supervisor_app_endpoint: endpoint,
                         },
@@ -372,12 +372,14 @@ impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::Co
 }
 
 #[tonic::async_trait]
-impl openshell_core::compute::ComputeDriver for ComputeDriverService {
+impl openshell_driver_sdk::compute::ComputeDriver for ComputeDriverService {
     async fn update_sandbox_configuration(
         &self,
-        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+        request: Request<
+            openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationRequest,
+        >,
     ) -> Result<
-        Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Response<openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationResponse>,
         Status,
     > {
         self.rpc_tracer
@@ -386,10 +388,10 @@ impl openshell_core::compute::ComputeDriver for ComputeDriverService {
                     .update_sandbox_configuration(&request.into_inner())
                     .await
                     .map_err(|error| {
-                        Status::from(openshell_core::ComputeDriverError::from(error))
+                        Status::from(openshell_driver_sdk::ComputeDriverError::from(error))
                     })?;
                 Ok(Response::new(
-                    openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse {},
+                    openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationResponse {},
                 ))
             })
             .await
@@ -397,9 +399,9 @@ impl openshell_core::compute::ComputeDriver for ComputeDriverService {
 }
 
 #[tonic::async_trait]
-impl openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates for ComputeDriverService {
-    async fn update_sandbox_configuration(&self, request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>, Status> {
-        openshell_core::compute::ComputeDriver::update_sandbox_configuration(self, request).await
+impl openshell_driver_sdk::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates for ComputeDriverService {
+    async fn update_sandbox_configuration(&self, request: Request<openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationRequest>) -> Result<Response<openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationResponse>, Status> {
+        openshell_driver_sdk::compute::ComputeDriver::update_sandbox_configuration(self, request).await
     }
 }
 
@@ -411,7 +413,7 @@ fn workspace_delete_requires_namespace_access(mode: WorkspaceMode) -> bool {
 mod tests {
     use super::{WorkspaceMode, workspace_delete_requires_namespace_access};
     use crate::KubernetesDriverError;
-    use openshell_core::ComputeDriverError;
+    use openshell_driver_sdk::ComputeDriverError;
     use tonic::Status;
 
     #[tokio::test]
@@ -452,8 +454,8 @@ mod tests {
             ComputeDriver::get_capabilities(
                 &service,
                 Request::new(GetCapabilitiesRequest {
-                    gateway: Some(openshell_core::extension_protocol::gateway_metadata(
-                        openshell_core::extension_protocol::ExtensionFamily::Compute,
+                    gateway: Some(openshell_driver_sdk::extension_protocol::gateway_metadata(
+                        openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
                     )),
                 }),
             )
