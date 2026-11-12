@@ -34,15 +34,23 @@ pub const CONTRACT_VERSION: &str = "1.0";
 pub struct ContractConversionError(String);
 
 impl ContractConversionError {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    /// An error with `message`, which must not quote field values.
+    pub fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
 
 type Result<T> = std::result::Result<T, ContractConversionError>;
 
-/// Accept an absent version, or a version this implementation reads.
-fn check_version(version: &str, required: bool) -> Result<()> {
+/// Accept an absent version, or a version this implementation reads. Public for
+/// documents defined outside this crate, such as the launch credentials in
+/// `openshell-driver-sdk`.
+///
+/// # Errors
+///
+/// Returns an error when the version is absent and `required`, or not one this
+/// implementation reads.
+pub fn check_version(version: &str, required: bool) -> Result<()> {
     if version.is_empty() {
         return if required {
             Err(ContractConversionError::new("contract_version is required"))
@@ -438,7 +446,13 @@ fn fence_from_pb(
     ))
 }
 
-fn session_id(value: &str) -> Result<SandboxSessionId> {
+/// Parse a canonical session id. Public for the same reason as
+/// [`check_version`].
+///
+/// # Errors
+///
+/// Returns an error when `value` is not a canonical UUID.
+pub fn session_id(value: &str) -> Result<SandboxSessionId> {
     value
         .parse()
         .map_err(|_| ContractConversionError::new("session_id is not a canonical UUID"))

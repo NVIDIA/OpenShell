@@ -135,6 +135,18 @@ document. The file does not import `compute_driver.proto`, so it repeats
 identical, and `crates/openshell-core/tests/duplicated_proto_messages.rs` fails
 if they drift.
 
+The launch authentication and the supervisor auth bundle it carries are defined
+in [`launch_credentials.proto`](launch_credentials.proto), in package
+`openshell.compute.v1`, because `compute_driver.proto` carries the launch
+authentication as a typed message and the gateway and every driver already
+import it. `DriverSandboxSpec` and `StartSandboxRequest` carry it as
+`launch_credentials` beside the older opaque `launch_authentication` bytes (the
+serde JSON of the legacy type). The gateway fills both. A driver uses the typed
+field when it is set and otherwise decodes the bytes, so an older gateway and a
+newer driver, and the reverse, keep working. Remove the bytes once no supported
+gateway or driver relies on them. A driver writes the supervisor auth bundle
+beside its legacy file in the same way as the other documents.
+
 These messages replace the legacy documents that the Rust types in
 `openshell-driver-contract` write today. A document in the new
 encoding carries `contract_version`, which a legacy document does not, so a

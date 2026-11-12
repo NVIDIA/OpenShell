@@ -42,3 +42,20 @@ runtime descriptor and the boundary configuration) are in
 `jwt::SandboxLaunchAuthentication` and `jwt::SupervisorAuthBundle`, the gateway's
 launch credentials, stay here with the JWT code. Their golden JSON examples are
 in `tests/legacy_contract/examples/`, checked by `tests/legacy_jwt_documents.rs`.
+
+`jwt::SandboxLaunchAuthentication` and `jwt::SupervisorAuthBundle` also have
+protobuf messages, defined in `launch_credentials.proto` (package
+`openshell.compute.v1`) and generated into `proto::compute`. `launch_credentials`
+converts between them and the JWT types, and implements the contract crate's
+`Codec` for the bundle, so the supervisor auth bundle is written and read with
+the same file machinery as the contract documents.
+
+`DriverSandboxSpec.launch_credentials` and
+`StartSandboxRequest.launch_credentials` carry the launch credentials as the
+typed `SandboxLaunchCredentials` message, beside the opaque
+`launch_authentication` bytes. The gateway fills both from one value. A driver
+resolves them with `launch_credentials::LaunchAuthenticationFields`: the typed
+field wins when it is set, the bytes are decoded as before when it is not, and
+neither present is `None`. A typed field that fails validation is an error; the
+driver does not fall back to the bytes. `launch_credentials_from_bytes` produces
+the typed form from the bytes for the gateway.

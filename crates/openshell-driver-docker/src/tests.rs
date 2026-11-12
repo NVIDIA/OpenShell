@@ -10,6 +10,7 @@ use openshell_driver_sdk::jwt::{
     CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
     SupervisorAuthBundle,
 };
+use openshell_driver_sdk::launch_credentials::LaunchAuthenticationFields;
 use openshell_driver_sdk::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
     PROGRESS_COMPLETE_STEP_KEY, PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
@@ -143,9 +144,13 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
             .unwrap();
     authentication.supervisor.session_id = openshell_driver_sdk::SandboxSessionId::new();
     let encoded = serde_json::to_vec(&authentication).unwrap();
-    refresh_docker_boundary_authentication(&sandbox_id, &config, &encoded)
-        .await
-        .unwrap();
+    refresh_docker_boundary_authentication(
+        &sandbox_id,
+        &config,
+        LaunchAuthenticationFields::new(None, &encoded),
+    )
+    .await
+    .unwrap();
 
     let bootstrap: BoundaryConfig =
         serde_json::from_slice(&fs::read(directory.join(BOUNDARY_CONFIG_FILE)).unwrap()).unwrap();
@@ -190,6 +195,13 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
         let written_descriptor =
             read::runtime_descriptor(&directory.join(RUNTIME_DESCRIPTOR_FILE)).unwrap();
         assert_eq!(written_descriptor, descriptor);
+        assert!(directory.join(SUPERVISOR_AUTH_BUNDLE_BINARY_FILE).exists());
+        let written_supervisor: SupervisorAuthBundle =
+            read::document(&directory.join(SUPERVISOR_AUTH_BUNDLE_FILE)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&written_supervisor).unwrap(),
+            serde_json::to_value(&supervisor).unwrap()
+        );
     }
     bootstrap
         .provisioning_evidence
@@ -208,9 +220,13 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
         provisioned.runtime_descriptor.resource_claims
     );
     // Retrying this launch keeps its generation/evidence binding stable.
-    refresh_docker_boundary_authentication(&sandbox_id, &config, &encoded)
-        .await
-        .unwrap();
+    refresh_docker_boundary_authentication(
+        &sandbox_id,
+        &config,
+        LaunchAuthenticationFields::new(None, &encoded),
+    )
+    .await
+    .unwrap();
     let retried = read_docker_runtime_descriptor(&sandbox_id, &config)
         .await
         .unwrap()
@@ -1072,7 +1088,7 @@ async fn start_sandbox_span_does_not_capture_launch_authentication() {
             "sandbox-1",
             "sandbox",
             "invalid-generation",
-            b"secret-launch-authentication",
+            LaunchAuthenticationFields::new(None, b"secret-launch-authentication"),
             None,
         )
         .with_subscriber(subscriber)
@@ -1163,8 +1179,15 @@ async fn tracing_direct_start_exports_a_docker_start_span() {
     let driver = test_driver_with_config(runtime_config());
 
     Box::pin(
-        DockerComputeDriver::start_sandbox(&driver, "", "", "", &[], None)
-            .with_subscriber(subscriber),
+        DockerComputeDriver::start_sandbox(
+            &driver,
+            "",
+            "",
+            "",
+            LaunchAuthenticationFields::default(),
+            None,
+        )
+        .with_subscriber(subscriber),
     )
     .await
     .expect_err("missing identifier should fail");
@@ -4609,4 +4632,44 @@ fn normalize_pull_reference_appends_latest_only_when_untagged() {
         normalize_pull_reference("registry:5000/team/app:v1"),
         "registry:5000/team/app:v1"
     );
+}
+
+#[test]
+fn launch_authentication_typed_field_alone_is_accepted() {
+    // A newer gateway that fills only the typed field.
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.launch_credentials =
+        openshell_driver_sdk::launch_credentials::launch_credentials_from_bytes(
+            &spec.launch_authentication,
+        )
+        .unwrap()
+        .map(Box::new);
+    assert!(spec.launch_credentials.is_some());
+    spec.launch_authentication.clear();
+    DockerComputeDriver::validate_sandbox_auth(&sandbox).unwrap();
+}
+
+#[test]
+fn launch_authentication_typed_field_wins_over_the_bytes() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    let mut typed = openshell_driver_sdk::launch_credentials::launch_credentials_from_bytes(
+        &spec.launch_authentication,
+    )
+    .unwrap()
+    .unwrap();
+    typed.gateway_id = "typed-gateway".to_string();
+    spec.launch_credentials = Some(Box::new(typed));
+    let decoded = decode_docker_launch_authentication(spec_launch_authentication(spec)).unwrap();
+    assert_eq!(decoded.gateway_id, "typed-gateway");
+}
+
+#[test]
+fn launch_authentication_bytes_alone_still_decode() {
+    // An older gateway that fills only the bytes.
+    let sandbox = test_sandbox();
+    let spec = sandbox.spec.as_ref().unwrap();
+    assert!(spec.launch_credentials.is_none());
+    decode_docker_launch_authentication(spec_launch_authentication(spec)).unwrap();
 }

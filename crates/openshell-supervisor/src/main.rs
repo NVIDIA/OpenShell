@@ -363,14 +363,9 @@ fn auth_bundle(args: &Args) -> Result<SupervisorAuthBundle> {
     let path = args.auth_bundle_file.as_deref().ok_or_else(|| {
         miette::miette!("--auth-bundle-file is required for --role=isolation-backend")
     })?;
-    let bytes = std::fs::read(path).map_err(|error| {
-        miette::miette!(
-            "read supervisor authentication bundle {}: {error}",
-            path.display()
-        )
-    })?;
-    let bundle = serde_json::from_slice::<SupervisorAuthBundle>(&bytes)
-        .map_err(|error| miette::miette!("decode supervisor authentication bundle: {error}"))?;
+    // A binary bundle beside the legacy file is preferred.
+    let bundle: SupervisorAuthBundle = openshell_driver_contract::read::document(path)
+        .map_err(|error| miette::miette!("read supervisor authentication bundle: {error}"))?;
     bundle
         .validate()
         .map_err(|error| miette::miette!("validate supervisor authentication bundle: {error}"))?;

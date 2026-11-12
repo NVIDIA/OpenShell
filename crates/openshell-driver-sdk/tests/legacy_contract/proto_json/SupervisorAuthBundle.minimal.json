@@ -1,0 +1,11 @@
+{
+  "authEpoch": "1",
+  "contractVersion": "1.0",
+  "gatewayExpiresAt": "1893456000",
+  "gatewayToken": "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJnYXRld2F5In0.c2ln",
+  "runtimeGeneration": "g0000000000000001",
+  "sandboxExpiresAt": "1893456000",
+  "sandboxToken": "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJzYW5kYm94In0.c2ln",
+  "sessionId": "7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14",
+  "sessionRotation": "1"
+}
