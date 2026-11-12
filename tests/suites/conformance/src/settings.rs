@@ -3,10 +3,10 @@
 
 //! Settings suite: sandbox-scoped settings.
 //!
-//! The gateway-global override test stays in `e2e/rust/tests/settings_management.rs`
-//! until the runner can give it a test group of its own: it changes a setting
-//! for the whole gateway, so nothing else may run beside it. Conformance tests
-//! only read gateway-global settings.
+//! Conformance tests only read gateway-global settings. The global override
+//! test changes a setting for every sandbox on the gateway, so it stays in
+//! `e2e/rust/tests/settings_management.rs` until #5527 decides where
+//! destructive tests run.
 
 use std::time::Duration;
 
