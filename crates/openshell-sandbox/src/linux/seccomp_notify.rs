@@ -326,7 +326,9 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
 /// launcher thread.
 ///
 /// The filter mediates every syscall that can create, select, or materially
-/// reconfigure an INET endpoint. Connected `send()`/null-destination
+/// reconfigure an INET endpoint, and every scheduling, priority, and
+/// resource-limit call whose target must be checked against the caller's
+/// thread group. Connected `send()`/null-destination
 /// `sendto()` retains the audited cBPF fast path. `accept`/`accept4` run
 /// natively: the broker binds every INET socket to loopback before injecting
 /// it, and accepted sockets inherit their listener's binding.
@@ -349,6 +351,11 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_openat,
         libc::SYS_openat2,
     ];
+    syscalls.extend(
+        crate::linux::process_sched::MEDIATED_PROCESS_SCHED_SYSCALLS
+            .iter()
+            .map(|&(syscall, _)| syscall),
+    );
     #[cfg(target_arch = "x86_64")]
     syscalls.push(libc::SYS_open);
     install_listener(&syscalls)

@@ -43,6 +43,7 @@ PODMAN_CI_TESTS=(
   podman_host_gateway
   podman_oci_identity
   provider_token_exchange
+  sandbox_compat_signals_sched
   upload_backpressure
 )
 
