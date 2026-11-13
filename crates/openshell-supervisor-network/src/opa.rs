@@ -1712,6 +1712,7 @@ fn preprocess_yaml_data(
             "invalid L7 policy configuration",
         )));
     }
+    raw_schema::validate_endpoint_ambiguities(&data)?;
     // Emit authored warnings only after the candidate passes validation.
     emit_l7_config_warnings(&warnings, "L7 policy validation warning");
 
@@ -9751,6 +9752,262 @@ process:
             get_str(&authorization.matched_endpoints[0].endpoint, "host").as_deref(),
             Some("my-service.corp.net")
         );
+    }
+
+    /// `a_open_web` sorts before `pinned_provider`, so these tests fail if
+    /// endpoint-config order rather than host precedence picks the metadata.
+    const HOST_PRECEDENCE_DATA: &str = r#"
+network_policies:
+  a_open_web:
+    name: a_open_web
+    endpoints:
+      - port: 443
+        allowed_ips: ["172.0.0.0/6", "192.0.0.0/2"]
+    binaries:
+      - { path: "/**" }
+  pinned_provider:
+    name: pinned_provider
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: rest
+        path: "/v1/**"
+        access: full
+        allowed_ips: ["172.66.147.243"]
+    binaries:
+      - { path: /usr/bin/agent }
+  plain_host:
+    name: plain_host
+    endpoints:
+      - host: github.com
+        port: 443
+        allowed_ips: ["172.66.147.243"]
+    binaries:
+      - { path: /usr/bin/agent }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+
+    fn host_precedence_authorization(host: &str, binary: &str) -> EgressAuthorization {
+        let engine = OpaEngine::from_strings(TEST_POLICY, HOST_PRECEDENCE_DATA)
+            .expect("hosted and hostless endpoints on one port should load");
+        engine
+            .authorize_egress(&NetworkInput {
+                host: host.into(),
+                port: 443,
+                binary_path: PathBuf::from(binary),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn hosted_endpoint_config_takes_precedence_over_hostless_endpoint() {
+        let authorization = host_precedence_authorization("example.com", "/usr/bin/agent");
+
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(
+            get_str(&authorization.endpoint_configs[0], "host").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
+            vec!["172.66.147.243"]
+        );
+    }
+
+    #[test]
+    fn hostless_endpoint_applies_when_hosted_endpoint_binary_does_not_match() {
+        let authorization = host_precedence_authorization("example.com", "/usr/bin/curl");
+
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(get_str(&authorization.endpoint_configs[0], "host"), None);
+        assert_eq!(
+            get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
+            vec!["172.0.0.0/6", "192.0.0.0/2"]
+        );
+    }
+
+    #[test]
+    fn hostless_endpoint_applies_to_undeclared_hosts() {
+        let authorization = host_precedence_authorization("other.example.net", "/usr/bin/agent");
+
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(get_str(&authorization.endpoint_configs[0], "host"), None);
+    }
+
+    #[test]
+    fn host_precedence_keys_on_hostname_not_pinned_ip() {
+        let authorization = host_precedence_authorization("172.66.147.243", "/usr/bin/agent");
+
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(get_str(&authorization.endpoint_configs[0], "host"), None);
+    }
+
+    #[test]
+    fn hosted_endpoint_keeps_its_validated_allowed_ips() {
+        let authorization = host_precedence_authorization("github.com", "/usr/bin/agent");
+
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert!(authorization.exact_declared_endpoint_host);
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(
+            get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
+            vec!["172.66.147.243"]
+        );
+    }
+
+    #[test]
+    fn hosted_path_is_selected_before_request_path_matching() {
+        let authorization = host_precedence_authorization("example.com", "/usr/bin/agent");
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        let config = crate::l7::parse_l7_config(&authorization.endpoint_configs[0]).unwrap();
+        assert!(config.matches_path("/v1/models"));
+        assert!(!config.matches_path("/v2/models"));
+        // The hostless config is gone at connection time. The relay has no
+        // fallback configuration to select for /v2/models and returns 403.
+    }
+
+    #[test]
+    fn local_path_overrides_preserve_lowered_mcp_restrictions() {
+        let broader = serde_json::json!({
+            "host": "mcp.example.com", "port": 443, "protocol": "mcp",
+            "rules": [{"allow": {"method": "*"}}],
+            "mcp": {"max_body_bytes": 1024}
+        });
+        for options in [
+            serde_json::json!({"mcp": {"strict_tool_names": false}}),
+            serde_json::json!({"mcp": {"versions": ["2025-03-26"]}}),
+            serde_json::json!({"mcp": {"max_body_bytes": 2048}}),
+            serde_json::json!({"mcp_strict_tool_names": false}),
+            serde_json::json!({"mcp_versions": ["2025-03-26"]}),
+            serde_json::json!({"json_rpc_max_body_bytes": 2048}),
+        ] {
+            let mut narrower = broader.clone();
+            narrower.as_object_mut().unwrap().remove("mcp");
+            narrower["path"] = serde_json::json!("/v1/**");
+            narrower
+                .as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            let data = serde_json::json!({"network_policies": {"mcp": {
+                "endpoints": [broader, narrower], "binaries": [{"path": "/**"}]
+            }}}).to_string();
+            let error = OpaEngine::from_strings(TEST_POLICY, &data)
+                .err()
+                .expect("narrower path must preserve MCP restrictions");
+            assert!(
+                error.to_string().contains("network endpoint ambiguity validation failed")
+            );
+        }
+    }
+
+    #[test]
+    fn local_policy_ingress_rejects_unsafe_overrides_and_preserves_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let rules_path = directory.path().join("policy.rego");
+        let data_path = directory.path().join("data.yaml");
+        std::fs::write(&rules_path, TEST_POLICY).unwrap();
+        let engine = OpaEngine::from_strings(TEST_POLICY, HOST_PRECEDENCE_DATA).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let broader = serde_json::json!({
+            "port": 443, "allowed_ips": ["8.0.0.0/8"],
+            "protocol": "rest", "access": "full", "enforcement": "enforce"
+        });
+        let safe = serde_json::json!({
+            "host": "api.example.com", "port": 443, "allowed_ips": ["8.8.8.8"],
+            "protocol": "rest", "access": "full", "enforcement": "enforce"
+        });
+        let mut candidates = vec![serde_json::json!({"host": "internal.corp", "port": 443})];
+        for (key, value) in [
+            ("allowed_ips", serde_json::json!(["9.9.9.9"])),
+            ("protocol", serde_json::json!("")),
+            ("protocol", serde_json::json!("sql")),
+            ("enforcement", serde_json::json!("audit")),
+            ("allow_uninspected_credentials", serde_json::json!(true)),
+            ("request_body_credential_rewrite", serde_json::json!(true)),
+            ("websocket_credential_rewrite", serde_json::json!(true)),
+        ] {
+            let mut candidate = safe.clone();
+            candidate[key] = value;
+            candidates.push(candidate);
+        }
+        let mut signed = safe.clone();
+        signed["credential_signing"] = serde_json::json!("sigv4");
+        signed["signing_service"] = serde_json::json!("bedrock");
+        candidates.push(signed);
+        for candidate in candidates {
+            for endpoints in [
+                serde_json::json!([broader, candidate]),
+                serde_json::json!([candidate, broader]),
+            ] {
+                let data = serde_json::json!({"network_policies": {
+                    "private-policy-name": {"endpoints": endpoints, "binaries": [{"path": "/**"}]}
+                }}).to_string();
+                std::fs::write(&data_path, &data).unwrap();
+                for error in [
+                    OpaEngine::from_strings(TEST_POLICY, &data)
+                        .err()
+                        .expect("unsafe strings"),
+                    OpaEngine::from_strings_with_middleware_config(TEST_POLICY, &data, None)
+                        .err()
+                        .expect("unsafe middleware strings"),
+                    OpaEngine::from_files(&rules_path, &data_path)
+                        .err()
+                        .expect("unsafe files"),
+                    OpaEngine::from_files_with_middleware_config(&rules_path, &data_path, None)
+                        .err()
+                        .expect("unsafe middleware files"),
+                    OpaEngine::from_files_for_endpoint_only_proxy(&rules_path, &data_path, None)
+                        .err()
+                        .expect("unsafe proxy files"),
+                    engine.reload(TEST_POLICY, &data).expect_err("unsafe reload"),
+                ] {
+                    assert!(
+                        error.to_string().contains("network endpoint ambiguity validation failed"),
+                        "{error}"
+                    );
+                    assert_safe_load_error(
+                        &error,
+                        &["private-policy-name", "internal.corp", "api.example.com"],
+                    );
+                }
+                assert_eq!(engine.current_generation(), 0);
+                assert!(!guard.is_stale());
+                let (configs, _) = engine
+                    .query_endpoint_configs_with_generation(&NetworkInput {
+                        host: "example.com".into(),
+                        port: 443,
+                        binary_path: PathBuf::from("/usr/bin/agent"),
+                        binary_sha256: "unused".into(),
+                        ancestors: vec![],
+                        cmdline_paths: vec![],
+                    })
+                    .unwrap();
+                assert_eq!(
+                    get_str_array(&configs[0], "allowed_ips"),
+                    vec!["172.66.147.243"]
+                );
+            }
+        }
+        engine.reload(TEST_POLICY, HOST_PRECEDENCE_DATA).unwrap();
+        assert_eq!(engine.current_generation(), 1);
+        assert!(guard.is_stale());
     }
 
     #[test]

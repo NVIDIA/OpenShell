@@ -472,6 +472,88 @@ fn yaml_mcp_method(
     method.to_string()
 }
 
+/// Convert an authored endpoint to runtime fields without whole-policy validation.
+/// Local OPA loaders use this for ambiguity checking after validating and
+/// normalizing their extended runtime data.
+pub fn network_endpoint_to_proto(e: NetworkEndpointDef) -> Result<NetworkEndpoint> {
+    let protocol = e.protocol;
+    let allow_rules = e.rules;
+    let deny_rules = e.deny_rules;
+    // Normalize port/ports: ports takes precedence, else
+    // single port is promoted to ports array.
+    let normalized_ports: Vec<u32> = if !e.ports.is_empty() {
+        e.ports.into_iter().map(u32::from).collect()
+    } else if e.port > 0 {
+        vec![u32::from(e.port)]
+    } else {
+        vec![]
+    };
+    Ok(NetworkEndpoint {
+        host: e.host,
+        path: e.path,
+        port: normalized_ports.first().copied().unwrap_or(0),
+        ports: normalized_ports,
+        protocol: protocol.clone(),
+        tls: network_tls_mode_from_str(&e.tls)
+            .ok_or_else(|| miette::miette!("invalid endpoint tls"))?
+            as i32,
+        enforcement: network_enforcement_mode_from_str(&e.enforcement)
+            .ok_or_else(|| miette::miette!("invalid endpoint enforcement"))?
+            as i32,
+        access: network_access_preset_from_str(&e.access)
+            .ok_or_else(|| miette::miette!("invalid endpoint access"))?
+            as i32,
+        rules: allow_rules
+            .into_iter()
+            .map(|r| L7Rule {
+                allow: Some(allow_def_to_proto(&protocol, r.allow)),
+            })
+            .collect(),
+        allowed_ips: e.allowed_ips,
+        deny_rules: deny_rules
+            .into_iter()
+            .map(|deny| deny_def_to_proto(&protocol, deny))
+            .collect(),
+        allow_encoded_slash: e.allow_encoded_slash,
+        websocket_credential_rewrite: e.websocket_credential_rewrite,
+        request_body_credential_rewrite: e.request_body_credential_rewrite,
+        allow_uninspected_credentials: e.allow_uninspected_credentials,
+        // Provider credential provenance is derived by the
+        // gateway and cannot be authored in policy YAML.
+        provider_credentialed: false,
+        token_grant_owner: String::new(),
+        // Advisor provenance is internal runtime state, not
+        // a user-authored policy schema field.
+        advisor_proposed: false,
+        persisted_queries: e.persisted_queries,
+        graphql_persisted_queries: e
+            .graphql_persisted_queries
+            .into_iter()
+            .map(|(key, op)| {
+                (
+                    key,
+                    GraphqlOperation {
+                        operation_type: op.operation_type,
+                        operation_name: op.operation_name,
+                        fields: op.fields,
+                    },
+                )
+            })
+            .collect(),
+        graphql_max_body_bytes: e.graphql_max_body_bytes,
+        credential_signing: e.credential_signing,
+        signing_service: e.signing_service,
+        signing_region: e.signing_region,
+        credential_binding: e.credential_binding.map(|binding| {
+            openshell_core::proto::NetworkCredentialBinding {
+                provider: binding.provider,
+            }
+        }),
+        json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
+        mcp: mcp_options(&protocol, &e.mcp),
+    })
+}
+
 fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
     for (policy_name, rule) in &raw.network_policies {
         for (endpoint_index, endpoint) in rule.endpoints.iter().enumerate() {
@@ -503,94 +585,17 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                 endpoints: rule
                     .endpoints
                     .into_iter()
-                    .map(|e| {
-                        let protocol = e.protocol;
-                        let allow_rules = e.rules;
-                        let deny_rules = e.deny_rules;
-                        // Normalize port/ports: ports takes precedence, else
-                        // single port is promoted to ports array.
-                        let normalized_ports: Vec<u32> = if !e.ports.is_empty() {
-                            e.ports.into_iter().map(u32::from).collect()
-                        } else if e.port > 0 {
-                            vec![u32::from(e.port)]
-                        } else {
-                            vec![]
-                        };
-                        NetworkEndpoint {
-                            host: e.host,
-                            path: e.path,
-                            port: normalized_ports.first().copied().unwrap_or(0),
-                            ports: normalized_ports,
-                            protocol: protocol.clone(),
-                            tls: network_tls_mode_from_str(&e.tls)
-                                .expect("endpoint modes validated above")
-                                as i32,
-                            enforcement: network_enforcement_mode_from_str(&e.enforcement)
-                                .expect("endpoint modes validated above")
-                                as i32,
-                            access: network_access_preset_from_str(&e.access)
-                                .expect("endpoint modes validated above")
-                                as i32,
-                            rules: allow_rules
-                                .into_iter()
-                                .map(|r| L7Rule {
-                                    allow: Some(allow_def_to_proto(&protocol, r.allow)),
-                                })
-                                .collect(),
-                            allowed_ips: e.allowed_ips,
-                            deny_rules: deny_rules
-                                .into_iter()
-                                .map(|deny| deny_def_to_proto(&protocol, deny))
-                                .collect(),
-                            allow_encoded_slash: e.allow_encoded_slash,
-                            websocket_credential_rewrite: e.websocket_credential_rewrite,
-                            request_body_credential_rewrite: e.request_body_credential_rewrite,
-                            allow_uninspected_credentials: e.allow_uninspected_credentials,
-                            // Provider credential provenance is derived by the
-                            // gateway and cannot be authored in policy YAML.
-                            provider_credentialed: false,
-                            token_grant_owner: String::new(),
-                            // Advisor provenance is internal runtime state, not
-                            // a user-authored policy schema field.
-                            advisor_proposed: false,
-                            persisted_queries: e.persisted_queries,
-                            graphql_persisted_queries: e
-                                .graphql_persisted_queries
-                                .into_iter()
-                                .map(|(key, op)| {
-                                    (
-                                        key,
-                                        GraphqlOperation {
-                                            operation_type: op.operation_type,
-                                            operation_name: op.operation_name,
-                                            fields: op.fields,
-                                        },
-                                    )
-                                })
-                                .collect(),
-                            graphql_max_body_bytes: e.graphql_max_body_bytes,
-                            credential_signing: e.credential_signing,
-                            signing_service: e.signing_service,
-                            signing_region: e.signing_region,
-                            credential_binding: e.credential_binding.map(|binding| {
-                                openshell_core::proto::NetworkCredentialBinding {
-                                    provider: binding.provider,
-                                }
-                            }),
-                            json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
-                            mcp: mcp_options(&protocol, &e.mcp),
-                        }
-                    })
-                    .collect(),
+                    .map(network_endpoint_to_proto)
+                    .collect::<Result<Vec<_>>>()?,
                 binaries: rule
                     .binaries
                     .into_iter()
                     .map(|b| NetworkBinary { path: b.path })
                     .collect(),
             };
-            (key, proto_rule)
+            Ok((key, proto_rule))
         })
-        .collect();
+        .collect::<Result<HashMap<_, _>>>()?;
 
     Ok(SandboxPolicy {
         version: raw.version,

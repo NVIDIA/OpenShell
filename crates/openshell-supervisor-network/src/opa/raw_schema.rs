@@ -12,8 +12,95 @@ use openshell_policy_schema::{
     JsonRpcConfig, L7Allow, L7DenyRule, McpConfig, NetworkBinary, NetworkEndpoint,
     NetworkPolicyRule,
 };
-use serde::{Deserializer, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::{Map, Value};
+
+/// Project validated runtime JSON through the authored endpoint types so file,
+/// string, and reload ingress use the same ambiguity checks as protobuf ingress.
+/// Keep the original document intact: it can contain unrelated Rego data and
+/// lowered fields that are deliberately outside the authored schema.
+pub(super) fn validate_endpoint_ambiguities(data: &Value) -> Result<()> {
+    let Some(policies) = data.get("network_policies").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let mut projection = openshell_core::proto::SandboxPolicy::default();
+    for (name, policy) in policies {
+        let mut endpoints = Vec::new();
+        for raw in array_entries(policy, "endpoints") {
+            let endpoint = project_runtime_endpoint(raw)
+                .map_err(|_| miette::miette!("failed to project network endpoint settings"))?;
+            endpoints.push(
+                openshell_policy::network_endpoint_to_proto(endpoint)
+                    .map_err(|_| miette::miette!("failed to convert network endpoint settings"))?,
+            );
+        }
+        projection.network_policies.insert(
+            name.clone(),
+            openshell_core::proto::NetworkPolicyRule {
+                endpoints,
+                ..Default::default()
+            },
+        );
+    }
+    let ambiguities = openshell_policy::find_endpoint_ambiguities(&projection);
+    if ambiguities.is_empty() {
+        Ok(())
+    } else {
+        Err(miette::miette!(super::render_repeated_validation_diagnostic(
+            "network endpoint ambiguity validation failed",
+            ambiguities.len(),
+            "ambiguous network endpoint selectors",
+        )))
+    }
+}
+
+fn project_runtime_endpoint(
+    raw: &Value,
+) -> std::result::Result<NetworkEndpoint, serde_json::Error> {
+    let mut fields = raw.as_object().cloned().unwrap_or_default();
+    fields.remove("rules");
+    fields.remove("deny_rules");
+    let mut endpoint = NetworkEndpoint::deserialize(KnownFields(Value::Object(fields)))?;
+    for rule in array_entries(raw, "rules") {
+        let mut fields = rule
+            .get("allow")
+            .unwrap_or(rule)
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        adapt_matchers(&mut fields);
+        endpoint.rules.push(openshell_policy_schema::L7Rule {
+            allow: L7Allow::deserialize(KnownFields(Value::Object(fields)))?,
+        });
+    }
+    for rule in array_entries(raw, "deny_rules") {
+        let mut fields = rule.as_object().cloned().unwrap_or_default();
+        adapt_matchers(&mut fields);
+        endpoint
+            .deny_rules
+            .push(L7DenyRule::deserialize(KnownFields(Value::Object(fields)))?);
+    }
+    if endpoint.protocol == "mcp" {
+        endpoint.mcp = Some(serde_json::from_value(Value::Object(renamed_fields(
+            raw,
+            &[
+                ("mcp_versions", "versions"),
+                ("mcp_strict_tool_names", "strict_tool_names"),
+                (
+                    "mcp_allow_all_known_mcp_methods",
+                    "allow_all_known_mcp_methods",
+                ),
+                ("json_rpc_max_body_bytes", "max_body_bytes"),
+            ],
+        )))?);
+    } else if endpoint.protocol == "json-rpc" {
+        endpoint.json_rpc = Some(serde_json::from_value(Value::Object(renamed_fields(
+            raw,
+            &[("json_rpc_max_body_bytes", "max_body_bytes")],
+        )))?);
+    }
+    Ok(endpoint)
+}
 
 /// Validate consumed fields after the parent has checked collection shapes.
 ///
@@ -121,15 +208,18 @@ fn validate_renamed<T: DeserializeOwned>(
     names: &[(&str, &str)],
     diagnostic: &'static str,
 ) -> Result<()> {
-    let fields = names
+    validate_known::<T>(renamed_fields(value, names), diagnostic)
+}
+
+fn renamed_fields(value: &Value, names: &[(&str, &str)]) -> Map<String, Value> {
+    names
         .iter()
         .filter_map(|(raw, authored)| {
             value
                 .get(*raw)
                 .map(|value| ((*authored).to_string(), value.clone()))
         })
-        .collect();
-    validate_known::<T>(fields, diagnostic)
+        .collect()
 }
 
 /// Adapt only validation copies of runtime matcher leaves.
