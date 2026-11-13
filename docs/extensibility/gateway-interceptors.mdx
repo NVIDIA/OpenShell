@@ -18,6 +18,7 @@ Use a gateway interceptor when an external service needs to govern gateway API o
 - Apply an approved policy to every new sandbox.
 - Reject provider or policy changes that violate organizational rules.
 - Enforce tenant quotas or naming conventions.
+- Default and enforce sandbox resource requests.
 - Observe committed operations for an audit or inventory service.
 - Vend an authoritative or composed provider profile catalog.
 
@@ -120,6 +121,44 @@ Operations and committed responses use protobuf JSON field names and shapes. Onl
 The gateway applies all patches returned by one binding as an atomic candidate. It then encodes that candidate as the RPC's protobuf request type and decodes it back to canonical protobuf JSON. If any patch or the resulting operation is invalid, the gateway discards the complete candidate and applies the binding's failure policy. Later bindings see only schema-valid operations that the handler can receive.
 
 Fields marked secret in the protobuf schema are recursively omitted from interceptor requests and committed responses. An interceptor cannot patch an omitted field, use one as a patch source, or replace a containing object. Gateway handlers retain the complete operation and continue to receive secret fields that were omitted from the interceptor view.
+
+## Enforce Resource Requests
+
+Sandboxes whose callers omit `spec.template.resources` run without CPU or memory requests. An interceptor can guarantee a floor — defaulting missing requests and rejecting requests below a minimum — without compute-driver or cluster configuration.
+
+Register one binding on `CreateSandbox` in the `modify_operation` phase:
+
+```toml
+[[openshell.gateway.interceptors]]
+name             = "resource-floors"
+grpc_endpoint    = "https://resource-floors.example:18081"
+tls_ca_cert_path = "/path/to/resource-floors-ca.pem"
+failure_policy   = "fail_closed"
+binding_policy   = "exact"
+
+[[openshell.gateway.interceptors.bindings]]
+rpc    = "openshell.v1.OpenShell/CreateSandbox"
+phases = ["modify_operation"]
+```
+
+Use `fail_closed` when the floor is a governance boundary: an unavailable interceptor then rejects sandbox creation instead of admitting an unchecked request.
+
+In each evaluation, read `/spec/template/resources` from the proposed operation — the Kubernetes-style `requests` and `limits` maps — and decide:
+
+- **Default.** When the caller set no request for a governed resource, patch in the floor. RFC 6902 `add` requires every parent object to exist, so add the deepest missing level:
+  - no `resources` object: `add /spec/template/resources` with `{"requests": {"cpu": "250m", "memory": "1Gi"}}`
+  - `resources` present but `requests` absent: `add /spec/template/resources/requests` with the same value
+  - `requests` present but a key missing: `add /spec/template/resources/requests/cpu` (or `/memory`) with the floor quantity
+- **Enforce.** When the caller set a request below the floor, return `allowed = false` with a denial reason such as `cpu request 100m is below the 250m floor` and an optional status code such as `FAILED_PRECONDITION`. Compare quantities numerically, not as strings: `0.25` and `250m` are the same CPU request.
+
+A denial in `modify_operation` rejects the operation before the gateway handler runs, so a separate `validate` binding is not required.
+
+The gateway re-encodes the patched operation as a `CreateSandboxRequest`, so patched requests follow the same path as caller-supplied ones, including typed CPU and memory extraction and any remaining keys passed through to the compute driver.
+
+Two scope limits apply:
+
+- The recipe governs the caller-visible workload container. Platform-owned containers — the supervisor and the workspace bootstrap init container — are not part of the public request and are unaffected.
+- Sandboxes created from a workload template take their resources from the stored template's `workload.resources`; the inline `spec` is ignored except for policy, providers, command, tty, and restart policy. Workload-template management RPCs are not interceptable, so a `CreateSandbox` interceptor cannot govern template-created sandboxes today.
 
 ## Configure Failure Behavior
 
