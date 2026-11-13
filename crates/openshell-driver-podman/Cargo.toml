@@ -15,11 +15,9 @@ name = "openshell-driver-podman"
 path = "src/main.rs"
 
 [dependencies]
-openshell-driver-sdk = { path = "../openshell-driver-sdk", features = ["jwt", "otel", "clap"] }
+openshell-driver-sdk = { path = "../openshell-driver-sdk", features = ["jwt", "otel", "clap", "legacy-contract"] }
 openshell-container-runtime = { path = "../openshell-container-runtime" }
 openshell-otel = { path = "../openshell-otel" }
-openshell-isolation-interface = { path = "../openshell-isolation-interface" }
-openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 tar = "0.4"
 tempfile = "3"
 uuid = { workspace = true }
