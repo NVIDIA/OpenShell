@@ -2,28 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_core::jwt::CredentialEpoch;
 use openshell_core::sandbox_generation::SandboxGenerationId;
 
 pub(super) const CLAIM: &str = "openshell.ai/warm-claim";
 const CLAIM_COMPLETE: &str = "openshell.ai/warm-claim-complete";
-const INTENT_KEY: &str = "claim.json";
-
-// Credentials and the proxy CA belong in a Pod-owned immutable Secret, never
-// in annotations. The CR CAS arbitrates with retirement before DB activation.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClaimIntent {
-    registration: SandboxInstanceRegistration,
-    expected_generation: SandboxGenerationId,
-    expected_auth_epoch: CredentialEpoch,
-}
+use openshell_supervisor_control::{WarmClaimIntent, WarmClaimLookup, WarmClaimReservation};
 
 pub(in crate::driver) fn physical_resource_id(object: &DynamicObject, logical_id: &str) -> String {
     annotation(object, RECORD)
         .and_then(|value| serde_json::from_str::<Record>(value).ok())
         .filter(|record| sandbox_runtime_generation(object) == Some(record.physical_id().as_str()))
         .map_or_else(|| logical_id.to_string(), |record| record.physical_id())
+}
+
+/// Corrupt warm records must not enable legacy workspace Secret recovery.
+pub(in crate::driver) fn requires_gateway_recovery(object: &DynamicObject) -> bool {
+    annotation(object, RECORD).is_some_and(|value| {
+        serde_json::from_str::<Record>(value).map_or(true, |record| {
+            sandbox_runtime_generation(object) == Some(record.physical_id().as_str())
+        })
+    })
 }
 
 pub(in crate::driver) fn claim_pending(object: &DynamicObject) -> bool {
@@ -37,8 +35,6 @@ pub(in crate::driver) fn claim_pending(object: &DynamicObject) -> bool {
 }
 
 impl KubernetesComputeDriver {
-    /// No match returns None before any claim is written. Once a claim may have
-    /// committed, errors propagate: falling back could launch a second workload.
     pub(in crate::driver) async fn try_claim_warm_runtime(
         &self,
         sandbox: &Sandbox,
@@ -47,6 +43,29 @@ impl KubernetesComputeDriver {
         if self.warm_supervision().is_err() {
             return Ok(None);
         }
+        if let Some(identity) = self.select_warm_runtime(sandbox, namespace).await? {
+            return Ok(Some(identity));
+        }
+        // Fence delayed warm selection before creating cold infrastructure.
+        if let Some(intent) = self
+            .warm_supervision()?
+            .choose_cold_launch(launch_lookup(sandbox)?)
+            .await
+            .map_err(KubernetesDriverError::Message)?
+        {
+            return self
+                .resume_warm_claim(sandbox, namespace, intent)
+                .await
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    async fn select_warm_runtime(
+        &self,
+        sandbox: &Sandbox,
+        namespace: &str,
+    ) -> Result<Option<String>, KubernetesDriverError> {
         let supervision = self.warm_supervision()?;
         let api = self
             .supported_agent_sandbox_api(self.client.clone(), namespace)
@@ -77,6 +96,18 @@ impl KubernetesComputeDriver {
                 ));
             }
             return Ok(None);
+        }
+        if let Some(intent) = supervision
+            .warm_claim_for_launch(launch_lookup(sandbox)?)
+            .await
+            .map_err(KubernetesDriverError::Message)?
+        {
+            // The gateway selected this physical runtime before the CR was bound.
+            // Resume it even when the pool is disabled; never choose a second one.
+            return self
+                .resume_warm_claim(sandbox, namespace, intent)
+                .await
+                .map(Some);
         }
         if !self.config.warm_pool.enabled {
             return Ok(None);
@@ -124,32 +155,192 @@ impl KubernetesComputeDriver {
                             .is_none_or(|uid| uid == &resource.uid)
                         && openshell_core::time::now_ms().saturating_sub(entry.created_at_ms)
                             < i64::try_from(pool.max_age_secs * 1000).unwrap_or(i64::MAX)
-                }) || !self.warm_connection_ready(resource).await?
-                {
+                }) {
                     continue;
                 }
-                let object = api
-                    .api
-                    .get(&resource.name)
-                    .await
-                    .map_err(KubernetesDriverError::from_kube)?;
-                let record = read_record(&object, &self.config.gateway_id)?;
-                if !self.warm_shape_matches(sandbox, &record)? {
-                    continue;
+                // Recheck Pod identity, durable preparation, admission and fences.
+                let result = async {
+                    if !self.warm_connection_ready(resource).await? {
+                        return Ok(None);
+                    }
+                    let object = api
+                        .api
+                        .get(&resource.name)
+                        .await
+                        .map_err(KubernetesDriverError::from_kube)?;
+                    let record = read_record(&object, &self.config.gateway_id)?;
+                    if !self.warm_shape_matches(sandbox, &record)? {
+                        return Ok(None);
+                    }
+                    let prepared = self.resume_warm_runtime(resource).await?;
+                    let object = api
+                        .api
+                        .get(&resource.name)
+                        .await
+                        .map_err(KubernetesDriverError::from_kube)?;
+                    if self
+                        .claim_warm_object(sandbox, &api, &object, &record, prepared.registration)
+                        .await?
+                    {
+                        claim_runtime_identity(&object).map(Some)
+                    } else {
+                        Ok(None)
+                    }
                 }
-                // Recheck Pod identity, immutable bootstrap, admission and fences.
-                let prepared = self.resume_warm_runtime(resource).await?;
-                let object = api
-                    .api
-                    .get(&resource.name)
-                    .await
-                    .map_err(KubernetesDriverError::from_kube)?;
-                self.claim_warm_object(sandbox, &api, &object, &record, prepared.registration)
-                    .await?;
-                return claim_runtime_identity(&object).map(Some);
+                .await;
+                match result {
+                    Ok(Some(identity)) => return Ok(Some(identity)),
+                    Ok(None) => {}
+                    Err(error) => {
+                        if let Some(intent) = supervision
+                            .warm_claim_for_launch(launch_lookup(sandbox)?)
+                            .await
+                            .map_err(KubernetesDriverError::Message)?
+                        {
+                            return self
+                                .resume_warm_claim(sandbox, namespace, intent)
+                                .await
+                                .map(Some);
+                        }
+                        if supervision
+                            .pending_warm_claims(&resource.workspace)
+                            .await
+                            .map_err(KubernetesDriverError::Message)?
+                            .retired
+                            .iter()
+                            .any(|retired| {
+                                retired.route == format!("rt-{}", resource.session_id)
+                                    && retired.generation.as_str()
+                                        == resource.session_id.to_string()
+                            })
+                        {
+                            continue;
+                        }
+                        // Inventory can race another create. Only a durable claim
+                        // for another sandbox proves that this attempt cannot have
+                        // committed; missing/unreadable intent remains ambiguous.
+                        if supervision
+                            .warm_claim(&resource.workspace, &format!("rt-{}", resource.session_id))
+                            .await
+                            .is_ok_and(|intent| intent.registration.sandbox_id != sandbox.id)
+                        {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                }
             }
         }
         Ok(None)
+    }
+
+    async fn resume_warm_claim(
+        &self,
+        sandbox: &Sandbox,
+        namespace: &str,
+        intent: WarmClaimIntent,
+    ) -> Result<String, KubernetesDriverError> {
+        let api = self
+            .supported_agent_sandbox_api(self.client.clone(), namespace)
+            .await
+            .map_err(KubernetesDriverError::Message)?;
+        let name = format!("warm-{}", intent.registration.runtime_descriptor.session_id);
+        let Some(object) = api
+            .api
+            .get_opt(&name)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?
+        else {
+            self.warm_supervision()?
+                .cancel_warm_claim(&sandbox.workspace, &intent.registration.route)
+                .await
+                .map_err(KubernetesDriverError::Message)?;
+            return Err(invalid("reserved warm runtime disappeared"));
+        };
+        let record = read_record(&object, &self.config.gateway_id)?;
+        let claims = &intent.registration.runtime_descriptor.resource_claims;
+        let pod = Api::<Pod>::namespaced(self.client.clone(), namespace)
+            .get_opt(&name)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        if claims.get("kubernetes.sandbox_resource_uid") != object.metadata.uid.as_ref()
+            || object.metadata.deletion_timestamp.is_some()
+            || pod.as_ref().is_none_or(|pod| {
+                claims.get("kubernetes.workload_pod_uid") != pod.metadata.uid.as_ref()
+                    || pod.metadata.deletion_timestamp.is_some()
+            })
+        {
+            self.warm_supervision()?
+                .cancel_warm_claim(&sandbox.workspace, &intent.registration.route)
+                .await
+                .map_err(KubernetesDriverError::Message)?;
+            return Err(invalid("reserved warm runtime was lost or replaced"));
+        }
+        if !self.warm_shape_matches(sandbox, &record)?
+            || intent.registration.sandbox_id != sandbox.id
+            || intent.registration.main_process_spec
+                != openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
+                    sandbox.spec.as_ref(),
+                )
+                .map_err(record_error)?
+        {
+            return Err(invalid("create retry differs from the pending warm claim"));
+        }
+        if annotation(&object, CLAIM).is_some() {
+            if annotation(&object, CLAIM) != Some(intent.registration.route.as_str())
+                || sandbox_id_from_object(&object).map_err(KubernetesDriverError::Message)?
+                    != sandbox.id
+            {
+                return Err(invalid("warm claim CR belongs to another launch"));
+            }
+            self.finish_warm_claim(&api, &object).await?;
+        } else {
+            self.bind_warm_claim(sandbox, &api, &object, &record, &intent)
+                .await?;
+        }
+        claim_runtime_identity(&object)
+    }
+
+    /// Recover gateway reservations even when no CR carries the logical ID yet.
+    /// Return their sessions so pool maintenance excludes them from spare capacity.
+    pub(super) async fn recover_pending_warm_claims(
+        &self,
+        workspace: &str,
+        resources: &[WarmRuntimeResource],
+    ) -> Result<std::collections::BTreeSet<SandboxSessionId>, KubernetesDriverError> {
+        let claims = self
+            .warm_supervision()?
+            .pending_warm_claims(workspace)
+            .await
+            .map_err(KubernetesDriverError::Message)?;
+        let mut reserved = std::collections::BTreeSet::new();
+        for pending in claims.pending {
+            let session = pending.intent.registration.runtime_descriptor.session_id;
+            reserved.insert(session);
+            let Ok(_guard) = self
+                .lifecycle_gates
+                .gate_for(&pending.sandbox.id)
+                .try_lock_owned()
+            else {
+                continue;
+            };
+            let namespace = self.warm_runtime_namespace(workspace).await?;
+            if let Err(error) = self
+                .resume_warm_claim(&pending.sandbox, &namespace, pending.intent)
+                .await
+            {
+                warn!(sandbox_id = %pending.sandbox.id, %error, "warm claim completion remains pending");
+            }
+        }
+        for retired in claims.retired {
+            if let Some(resource) = resources.iter().find(|resource| {
+                retired.route == format!("rt-{}", resource.session_id)
+                    && retired.generation.as_str() == resource.session_id.to_string()
+            }) {
+                self.retire_warm_runtime(resource).await?;
+            }
+        }
+        Ok(reserved)
     }
 
     async fn validate_claim_retry(
@@ -158,30 +349,16 @@ impl KubernetesComputeDriver {
         object: &DynamicObject,
     ) -> Result<(), KubernetesDriverError> {
         let record = read_record(object, &self.config.gateway_id)?;
-        let namespace = object
-            .metadata
-            .namespace
-            .as_deref()
-            .ok_or_else(|| invalid("claim namespace missing"))?;
-        let name = format!(
-            "{}-claim",
-            SandboxRuntimeNames::for_generation(&sandbox.id, &record.physical_id())
-                .supervisor_secret
-        );
-        let secret = Api::<Secret>::namespaced(self.client.clone(), namespace)
-            .get(&name)
+        if annotation(object, CLAIM) != Some(record.route().as_str()) {
+            return Err(invalid(
+                "legacy or changed warm claim reference; finish Secret-backed claims with the previous gateway before upgrading",
+            ));
+        }
+        let intent = self
+            .warm_supervision()?
+            .warm_claim(&record.workspace, &record.route())
             .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        let bytes = secret
-            .data
-            .as_ref()
-            .and_then(|data| data.get(INTENT_KEY))
-            .filter(|bytes| {
-                bytes.0.len() <= openshell_supervisor_control::MAX_LAUNCH_MATERIAL_BYTES
-            })
-            .ok_or_else(|| invalid("claim intent missing or oversized"))?;
-        let intent: ClaimIntent =
-            serde_json::from_slice(&bytes.0).map_err(|_| invalid("invalid claim intent"))?;
+            .map_err(KubernetesDriverError::Message)?;
         let auth = decode_launch_authentication(
             &sandbox
                 .spec
@@ -216,7 +393,7 @@ impl KubernetesComputeDriver {
             &SandboxPodParams {
                 default_image: &self.config.default_image,
                 image_pull_policy: self.config.image_pull_policy,
-                image_pull_secrets: &self.config.image_pull_secrets,
+                image_pull_secrets: &self.generation_image_pull_secret_names(&names),
                 sandbox_runtime_image: &self.config.sandbox_runtime_image,
                 sandbox_runtime_image_pull_policy: self.config.sandbox_runtime_image_pull_policy,
                 service_account_name: &self.config.service_account_name,
@@ -253,7 +430,7 @@ impl KubernetesComputeDriver {
         object: &DynamicObject,
         record: &Record,
         prepared: PreparedRuntimeRegistration,
-    ) -> Result<(), KubernetesDriverError> {
+    ) -> Result<bool, KubernetesDriverError> {
         ensure_unclaimed(object)?;
         let resource = resource_from_object(object, record)?;
         if !resource.released {
@@ -305,78 +482,67 @@ impl KubernetesComputeDriver {
         prepared
             .validate_activation(&registration)
             .map_err(|_| invalid("claim does not match preparation"))?;
-        let intent = ClaimIntent {
+        let intent = WarmClaimIntent {
             registration,
             expected_generation,
             expected_auth_epoch,
         };
-        let names = SandboxRuntimeNames::for_generation(&sandbox.id, &record.physical_id());
-        let intent_name = format!("{}-claim", names.supervisor_secret);
-        let owner = runtime_pod_owner(
-            &resource.name,
-            resource
-                .pod_uid
-                .as_deref()
-                .ok_or_else(|| invalid("warm Pod UID missing"))?,
-        );
-        let mut secret = shared_instance_secret(
-            &resource.namespace,
-            &names,
-            &sandbox.id,
-            serde_json::to_vec(&intent).map_err(record_error)?,
-            owner,
-        );
-        secret.metadata.name = Some(intent_name.clone());
-        let bytes = secret
-            .data
-            .as_mut()
-            .expect("shared instance data")
-            .remove(SHARED_INSTANCE_KEY)
-            .expect("shared instance key");
-        secret
-            .data
-            .as_mut()
-            .expect("shared instance data")
-            .insert(INTENT_KEY.into(), bytes);
-        // A fresh name is unique to this logical/physical pairing. A conflict is
-        // retried through the CR journal, never by replacing existing credentials.
-        let secrets = Api::<Secret>::namespaced(self.client.clone(), &resource.namespace);
-        match secrets.create(&PostParams::default(), &secret).await {
-            Ok(_) => {}
-            Err(KubeError::Api(error)) if error.code == 409 => {
-                let stored = secrets
-                    .get(&intent_name)
-                    .await
-                    .map_err(KubernetesDriverError::from_kube)?;
-                let bytes = stored
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get(INTENT_KEY))
-                    .filter(|bytes| {
-                        bytes.0.len() <= openshell_supervisor_control::MAX_LAUNCH_MATERIAL_BYTES
-                    })
-                    .ok_or_else(|| invalid("warm claim intent missing or oversized"))?;
-                let previous: ClaimIntent = serde_json::from_slice(&bytes.0)
-                    .map_err(|_| invalid("invalid warm claim intent"))?;
-                let mut expected = intent;
-                expected
-                    .registration
-                    .proxy_ca
-                    .clone_from(&previous.registration.proxy_ca);
-                expected
-                    .registration
-                    .trace_context
-                    .clone_from(&previous.registration.trace_context);
-                if stored.immutable != secret.immutable
-                    || stored.metadata.owner_references != secret.metadata.owner_references
-                    || serde_json::to_value(&expected).map_err(record_error)?
-                        != serde_json::to_value(&previous).map_err(record_error)?
-                {
-                    return Err(invalid("warm claim intent changed"));
-                }
-            }
-            Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+        let reservation = self
+            .warm_supervision()?
+            .reserve_warm_claim(&record.workspace, intent)
+            .await
+            .map_err(KubernetesDriverError::Message)?;
+        let WarmClaimReservation::Reserved(intent) = reservation else {
+            return Ok(false);
+        };
+        self.bind_warm_claim(sandbox, api, object, record, &intent)
+            .await?;
+        Ok(true)
+    }
+
+    async fn bind_warm_claim(
+        &self,
+        sandbox: &Sandbox,
+        api: &AgentSandboxApi,
+        object: &DynamicObject,
+        record: &Record,
+        intent: &WarmClaimIntent,
+    ) -> Result<(), KubernetesDriverError> {
+        ensure_unclaimed(object)?;
+        let resource = resource_from_object(object, record)?;
+        if intent.registration.sandbox_id != sandbox.id
+            || intent.registration.route != record.route()
+            || intent
+                .registration
+                .runtime_descriptor
+                .resource_claims
+                .get("kubernetes.sandbox_resource_uid")
+                != Some(&resource.uid)
+            || intent
+                .registration
+                .runtime_descriptor
+                .resource_claims
+                .get("kubernetes.workload_pod_uid")
+                != resource.pod_uid.as_ref()
+        {
+            return Err(invalid("warm claim physical identity changed"));
         }
+        let prepared = PreparedRuntimeRegistration {
+            route: record.route(),
+            runtime_descriptor: intent.registration.runtime_descriptor.clone(),
+        };
+        let mut claimed = object.clone();
+        let annotations = claimed.metadata.annotations.get_or_insert_default();
+        annotations.extend(sandbox_annotations(sandbox));
+        annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC.into(),
+            intent.registration.main_process_spec.clone(),
+        );
+        annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL.into(),
+            openshell_core::driver_utils::sandbox_log_level(sandbox, "info"),
+        );
+        let intent_name = record.route();
         let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), &resource.namespace);
         let fence = policies
             .get(&record.names().workload_policy)
@@ -497,39 +663,14 @@ impl KubernetesComputeDriver {
         }
         let resource = resource_from_object(object, &record)?;
         let logical_id = sandbox_id_from_object(object).map_err(KubernetesDriverError::Message)?;
-        let names = SandboxRuntimeNames::for_generation(&logical_id, &record.physical_id());
-        let intent_name = format!("{}-claim", names.supervisor_secret);
-        if annotation(object, CLAIM) != Some(intent_name.as_str()) {
-            return Err(invalid("warm claim Secret reference changed"));
+        if annotation(object, CLAIM) != Some(record.route().as_str()) {
+            return Err(invalid("warm claim reference changed"));
         }
-        let secrets = Api::<Secret>::namespaced(self.client.clone(), &resource.namespace);
-        let intent_secret = secrets
-            .get(&intent_name)
+        let intent = self
+            .warm_supervision()?
+            .warm_claim(&record.workspace, &record.route())
             .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        let owner = runtime_pod_owner(
-            &resource.name,
-            resource
-                .pod_uid
-                .as_deref()
-                .ok_or_else(|| invalid("warm Pod UID missing"))?,
-        );
-        if intent_secret.immutable != Some(true)
-            || intent_secret.metadata.owner_references.as_deref()
-                != Some(std::slice::from_ref(&owner))
-        {
-            return Err(invalid("warm claim Secret ownership changed"));
-        }
-        let bytes = intent_secret
-            .data
-            .as_ref()
-            .and_then(|data| data.get(INTENT_KEY))
-            .ok_or_else(|| invalid("warm claim material missing"))?;
-        if bytes.0.len() > openshell_supervisor_control::MAX_LAUNCH_MATERIAL_BYTES {
-            return Err(invalid("warm claim material too large"));
-        }
-        let intent: ClaimIntent =
-            serde_json::from_slice(&bytes.0).map_err(|_| invalid("invalid warm claim material"))?;
+            .map_err(KubernetesDriverError::Message)?;
         if intent.registration.sandbox_id != logical_id
             || intent.registration.route != record.route()
             || intent.registration.runtime_descriptor.session_id != record.session_id
@@ -610,38 +751,28 @@ impl KubernetesComputeDriver {
             self.publish_dedicated_claim_identity(object, &record, &intent.registration)
                 .await?;
         }
-        let committed = supervision
-            .activate(
-                &intent.registration,
-                intent.expected_generation,
-                intent.expected_auth_epoch,
-            )
+        supervision
+            .activate_warm_claim(&record.workspace, &record.route())
             .await
             .map_err(KubernetesDriverError::Message)?;
-        let material = committed
-            .to_assignment()
-            .map_err(|_| invalid("invalid committed claim"))?
-            .launch_material;
-        let canonical =
-            shared_instance_secret(&resource.namespace, &names, &logical_id, material, owner);
-        match secrets.create(&PostParams::default(), &canonical).await {
-            Ok(_) => {}
-            Err(KubeError::Api(error)) if error.code == 409 => {
-                let stored = secrets
-                    .get(&names.supervisor_secret)
-                    .await
-                    .map_err(KubernetesDriverError::from_kube)?;
-                if stored.immutable != canonical.immutable
-                    || stored.data != canonical.data
-                    || stored.metadata.owner_references != canonical.metadata.owner_references
-                {
-                    return Err(invalid("committed warm claim material changed"));
-                }
-            }
-            Err(error) => return Err(KubernetesDriverError::from_kube(error)),
-        }
         complete_claim(&api.api, object).await
     }
+}
+
+fn launch_lookup(sandbox: &Sandbox) -> Result<WarmClaimLookup, KubernetesDriverError> {
+    let auth = decode_launch_authentication(
+        &sandbox
+            .spec
+            .as_ref()
+            .ok_or_else(|| invalid("sandbox spec missing"))?
+            .launch_authentication,
+    )?;
+    Ok(WarmClaimLookup {
+        workspace: sandbox.workspace.clone(),
+        sandbox_id: sandbox.id.clone(),
+        expected_generation: auth.supervisor.runtime_generation,
+        expected_auth_epoch: auth.supervisor.auth_epoch,
+    })
 }
 
 async fn complete_claim(

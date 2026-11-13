@@ -1382,9 +1382,7 @@ impl KubernetesComputeDriver {
             .as_ref()
             .is_some_and(|labels| labels.contains_key("openshell.ai/warm-pool"))
         {
-            return Err(tonic::Status::permission_denied(
-                "unclaimed supervisors may only register",
-            ));
+            warm_pool::validate_restarted_supervisor(&pod, &sandbox, &self.config.gateway_id)?;
         }
         require_proxy_control_authentication(via_proxy_control)?;
         let resource_uid = sandbox
@@ -5440,6 +5438,7 @@ impl KubernetesComputeDriver {
                         namespace,
                         sandbox_id,
                         generation,
+                        warm: warm_pool::requires_gateway_recovery(object),
                     },
                 })
             })
@@ -5461,6 +5460,13 @@ impl KubernetesComputeDriver {
         &self,
         record: SharedInstanceSecretRecord,
     ) -> Result<Option<Vec<u8>>, KubernetesDriverError> {
+        if record.warm {
+            // Warm claims are committed to gateway storage before completion.
+            // Missing gateway state is an error, never a workspace Secret fallback.
+            return Err(KubernetesDriverError::Precondition(
+                "warm runtime assignment is missing from gateway persistence".into(),
+            ));
+        }
         let names = SandboxRuntimeNames::for_generation(&record.sandbox_id, &record.generation);
         let secrets = Api::<Secret>::namespaced(self.client.clone(), &record.namespace);
         let secret =
@@ -5508,7 +5514,7 @@ impl KubernetesComputeDriver {
         }
         if let Err(error) = self
             .delete_sandbox_runtime_supervisor(
-                sandbox_id,
+                &warm_pool::physical_resource_id(object, sandbox_id),
                 namespace,
                 sandbox_runtime_generation(object).as_slice(),
             )
@@ -6039,6 +6045,7 @@ struct SharedInstanceSecretRecord {
     namespace: String,
     sandbox_id: String,
     generation: String,
+    warm: bool,
 }
 
 /// Launch material of one shared-supervisor sandbox instance, taken from the
@@ -7098,8 +7105,15 @@ async fn generation_control_availability(
             .await
         }
         Ok(SupervisorPlacement::Shared { route }) => {
-            shared_instance_control_availability(client, shared, namespace, sandbox_id, &route)
-                .await
+            shared_instance_control_availability(
+                client,
+                shared,
+                namespace,
+                sandbox_id,
+                &warm_pool::physical_resource_id(object, sandbox_id),
+                &route,
+            )
+            .await
         }
         Err(error) => {
             warn!(sandbox_id, %error, "sandbox-runtime supervisor placement is invalid");
@@ -7116,6 +7130,7 @@ async fn shared_instance_control_availability(
     shared: Option<&SharedSupervisor>,
     namespace: &str,
     sandbox_id: &str,
+    physical_id: &str,
     route: &str,
 ) -> SandboxRuntimeControlAvailability {
     let Some(shared) = shared else {
@@ -7125,7 +7140,7 @@ async fn shared_instance_control_availability(
         );
         return SandboxRuntimeControlAvailability::Unavailable;
     };
-    let names = SandboxRuntimeNames::new(sandbox_id);
+    let names = SandboxRuntimeNames::new(physical_id);
     let policies = Api::<NetworkPolicy>::namespaced(client.clone(), namespace);
     let exists = |result: Result<Result<Option<NetworkPolicy>, KubeError>, _>, what: &str| {
         match result {

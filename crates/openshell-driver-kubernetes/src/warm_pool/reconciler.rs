@@ -260,8 +260,8 @@ impl KubernetesComputeDriver {
             })
     }
 
-    /// Reconcile one administrator-owned pool. All external writes follow a
-    /// successful journal CAS. Errors leave creation identities intact for retry.
+    /// Pool mutations follow a journal CAS; claim recovery uses the gateway's
+    /// assignment fences. Errors leave creation identities intact for retry.
     pub async fn reconcile_warm_pool(
         &self,
         pool: &WarmPoolConfig,
@@ -280,9 +280,15 @@ impl KubernetesComputeDriver {
             .warm_pool_state(&pool.workspace, &pool.name)
             .await
             .map_err(KubernetesDriverError::Message)?;
-        let inventory: Vec<_> = self
-            .warm_runtime_inventory(&pool.workspace)
-            .await?
+        let mut inventory = self.warm_runtime_inventory(&pool.workspace).await?;
+        let reserved = self
+            .recover_pending_warm_claims(&pool.workspace, &inventory)
+            .await?;
+        // A gateway reservation owns the physical runtime before CR labels do.
+        for resource in &mut inventory {
+            resource.claimed |= reserved.contains(&resource.session_id);
+        }
+        let inventory: Vec<_> = inventory
             .into_iter()
             .filter(|resource| resource.pool_id == pool.name)
             .collect();

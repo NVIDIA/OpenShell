@@ -1372,7 +1372,7 @@ and does not redistribute existing owners; check individual Pod memory as well
 as the average. See the published High Availability guide for configuration
 and enabling or disabling autoscaling on an existing release.
 
-Template-driven warm pooling is enabled by default in shared/operator Kubernetes
+Template-driven warm pooling is enabled by default in managed, shared and operator Kubernetes
 workspaces with TLS and JWT signing. No spares exist until a template requests both
 `--ready-within` and positive `--max-burst`. Inspect the template's startup tuning,
 its workload shape, and `warm_pool.enabled` before investigating missing capacity.
@@ -1381,18 +1381,24 @@ Check gateway logs for `warm template inventory unavailable`,
 Configuration or verification-key changes require increasing `warm_pool.revision`;
 inconsistent revisions across replicas stop stale writers. Pending and deleting
 spares consume `warm_pool.max_size` per template. Missing supervisor capacity keeps
-runtime Pods gated. Recovery requires namespace Secret `get`, granted by default
-in shared mode and by `gateway.warmPoolSecretReads` in operator workspaces.
-A `Forbidden` reading a bootstrap or claim Secret leaves recovery pending.
+runtime Pods gated. Warm pooling requires no additional workspace Secret reads.
+Recovery uses gateway assignment and credential storage; failures reading that
+storage leave recovery pending. Incomplete unclaimed preparations expire and are
+replaced with fresh physical identities.
 A running warm Pod is not proof of an authenticated parked connection.
 Delete a template to drain its unclaimed pool, or set `warm_pool.enabled=false`
-on all replicas to drain all pools. Retain Secret reads until drain completes.
+on all replicas to drain all pools.
 Creates with `--template` claim only that template's ready spares; unmatched
 requests use cold creation. `warm runtime ready for
 claim` records the first authenticated readiness observation. A claimed sandbox
 keeps its `warm-` physical resource name. `warm claim completion remains pending`
 indicates that recovery is retrying the recorded claim; inspect the reported API
-or supervisor error before deleting anything. Dedicated warm pairs have a separate
+or supervisor error before deleting anything. A gateway reservation protects its
+runtime from pool draining even before the CR carries the logical Sandbox ID.
+Recovery discovers these reservations from gateway storage. Cancellation after
+launch termination, provisioning timeout, or physical runtime loss fences
+activation and cleans up the reserved runtime; it does not start a second runtime
+for the same launch. Dedicated warm pairs have a separate
 supervisor Pod: its startup probe on port 5502 records TLS authentication, while
 normal readiness on port 5501 remains false until claim. Check the original Pod UID,
 container running/startup state and restart count, gateway TLS trust, and the

@@ -11,7 +11,7 @@ release:
   namespace: my-namespace
 
 tests:
-  - it: retains bootstrap Secret reads to drain disabled pools
+  - it: requires no additional Secret reads to drain disabled pools
     template: templates/role.yaml
     set:
       gatewayConfig:
@@ -24,9 +24,9 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "delete", "get"]
+            verbs: ["create", "delete"]
 
-  - it: grants only namespaced Secret get for template pools by default
+  - it: requires no additional Secret reads for template pools by default
     template: templates/role.yaml
     set:
       gatewayConfig:
@@ -38,7 +38,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "delete", "get"]
+            verbs: ["create", "delete"]
 
   - it: creates the namespaced sandbox Role by default
     template: templates/role.yaml

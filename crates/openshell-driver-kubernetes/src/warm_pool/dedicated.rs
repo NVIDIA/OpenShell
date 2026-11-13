@@ -58,6 +58,28 @@ pub(in crate::driver) fn validate_claimed_supervisor(
     Ok(())
 }
 
+/// Stop/start retains the warm CR labels but replaces its runtime generation
+/// and supervisor. Only that new supervisor may use normal sandbox bootstrap.
+#[allow(clippy::result_large_err)]
+pub(in crate::driver) fn validate_restarted_supervisor(
+    pod: &Pod,
+    object: &DynamicObject,
+    gateway_id: &str,
+) -> Result<(), tonic::Status> {
+    let record = read_record(object, gateway_id)
+        .map_err(|_| tonic::Status::permission_denied("invalid warm runtime record"))?;
+    if sandbox_runtime_generation(object)
+        .is_none_or(|generation| generation.is_empty() || generation == record.physical_id())
+        || pod.metadata.uid.as_deref()
+            != annotation(object, ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID)
+    {
+        return Err(tonic::Status::permission_denied(
+            "supervisor does not match a restarted warm sandbox",
+        ));
+    }
+    Ok(())
+}
+
 pub(in crate::driver) fn configure_dedicated_pod(
     pod: &mut Pod,
     names: &SandboxRuntimeNames,
@@ -199,28 +221,23 @@ impl KubernetesComputeDriver {
             .get_or_insert_default()
             .insert(LABEL_SANDBOX_ID.into(), record.physical_id());
         validate_proxy_control_labels(&physical_pod, &record.physical_id())?;
-        let secret = Api::<Secret>::namespaced(self.client.clone(), &identity.namespace)
-            .get(&format!("{}-prepared", names.supervisor_secret))
+        let assignment = self
+            .warm_supervision()
+            .map_err(|_| denied())?
+            .runtime_assignment(&record.workspace, &record.route())
             .await
-            .map_err(registration_read_error)?;
-        if secret.metadata.owner_references.as_deref()
-            != Some(&[runtime_pod_owner(&names.supervisor_pod, &identity.pod_uid)])
-            || secret.immutable != Some(true)
-            || secret.metadata.deletion_timestamp.is_some()
-        {
-            return Err(denied());
-        }
-        let bytes = secret
-            .data
-            .as_ref()
-            .and_then(|data| data.get(PREPARED_KEY))
+            .map_err(|_| tonic::Status::unavailable("runtime assignment is unavailable"))?
             .ok_or_else(denied)?;
-        if bytes.0.len() > openshell_supervisor_control::MAX_LAUNCH_MATERIAL_BYTES {
-            return Err(denied());
-        }
-        let prepared: PreparedRuntimeRegistration =
-            serde_json::from_slice(&bytes.0).map_err(|_| denied())?;
-        prepared.validate().map_err(|_| denied())?;
+        let prepared = if assignment.prepared {
+            PreparedRuntimeRegistration::from_assignment(&assignment).map_err(|_| denied())?
+        } else {
+            let committed =
+                SandboxInstanceRegistration::from_assignment(&assignment).map_err(|_| denied())?;
+            PreparedRuntimeRegistration {
+                route: committed.route,
+                runtime_descriptor: committed.runtime_descriptor,
+            }
+        };
         let descriptor = &prepared.runtime_descriptor;
         let workload = Api::<Pod>::namespaced(self.client.clone(), &identity.namespace)
             .get(&owner.name)
@@ -376,7 +393,7 @@ impl KubernetesComputeDriver {
         })
     }
 
-    pub(super) async fn release_warm_dedicated(
+    pub(super) async fn create_warm_dedicated_bootstrap(
         &self,
         object: &DynamicObject,
         record: &Record,
@@ -421,6 +438,18 @@ impl KubernetesComputeDriver {
         }
         self.create_immutable_warm_secret(&resource.namespace, &secret)
             .await?;
+        Ok(())
+    }
+
+    pub(super) async fn release_warm_dedicated(
+        &self,
+        object: &DynamicObject,
+        record: &Record,
+    ) -> Result<(), KubernetesDriverError> {
+        let resource = resource_from_object(object, record)?;
+        let names = record.names();
+        let uid = annotation(object, ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID)
+            .ok_or_else(|| invalid("warm supervisor UID missing"))?;
         let pods = Api::<Pod>::namespaced(self.client.clone(), &resource.namespace);
         let pod = pods
             .get(&names.supervisor_pod)
@@ -438,24 +467,11 @@ impl KubernetesComputeDriver {
         secret: &Secret,
     ) -> Result<(), KubernetesDriverError> {
         let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
-        match secrets.create(&PostParams::default(), secret).await {
-            Ok(_) => Ok(()),
-            Err(KubeError::Api(error)) if error.code == 409 => {
-                let stored = secrets
-                    .get(secret.metadata.name.as_deref().expect("named Secret"))
-                    .await
-                    .map_err(KubernetesDriverError::from_kube)?;
-                if stored.immutable != secret.immutable
-                    || stored.data != secret.data
-                    || stored.metadata.owner_references != secret.metadata.owner_references
-                    || stored.metadata.deletion_timestamp.is_some()
-                {
-                    return Err(invalid("warm supervisor Secret changed"));
-                }
-                Ok(())
-            }
-            Err(error) => Err(KubernetesDriverError::from_kube(error)),
-        }
+        secrets
+            .create(&PostParams::default(), secret)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        Ok(())
     }
 
     pub(super) async fn warm_connection_ready(

@@ -172,28 +172,39 @@ binds the owner to the Sandbox. The supervisor process and capacity charge stay
 unchanged. Concurrent claims (including two runtimes for one Sandbox), withdrawals,
 and Sandbox identity changes are fenced by record versions.
 
-Activation returns the committed registration with gateway-issued tokens. The
-driver must persist that result for recovery; tokens in the request are replaced.
-A retry of the winning registration returns the same material while that launch
-remains current. The runtime's physical claims and TLS session are stored with
-the Sandbox identity, so credential renewal and takeover retain them. In
+Activation persists and returns the committed registration with gateway-issued
+tokens, replacing the tokens in the request. Recovery reads this material from
+gateway persistence. A retry of the winning registration returns the same material
+while that launch remains current. The runtime's physical claims and TLS session
+are stored with the Sandbox identity, so credential renewal and takeover retain them. In
 particular, renewal before the first protocol call still supplies the binding
 the unassigned runtime requires. A subsequent fresh start clears the binding.
 
 Prepared reservations remain pinned to their original supervisor process.
 Gateway restart or host-stream reconnection recovers them without migration.
 An expired, leaving, or replaced supervisor process cannot activate a prepared
-runtime. The warm-pool controller must conditionally release and replace that runtime;
-there is no unassigned credential epoch with which to authorize takeover.
+runtime. Unclaimed runtimes are conditionally retired; reserved claims are
+cancelled when their launch ends or exceeds its provisioning deadline. There is
+no unassigned credential epoch with which to authorize takeover.
 This also avoids redirecting an idle runtime away from a reachable old owner.
 
 The Kubernetes driver's OpenShell-owned pool persists per-Pod TLS bootstrap
 material before calling `prepare`, then releases its scheduling gate. Creation
-selects a compatible connected spare, journals its claim with a CR CAS and a
-Pod-owned Secret, and calls `activate`. Recovery completes interrupted claims;
-pool reconciliation replaces unusable preparations. Activation publication uses
-durable pool reconciliation so a delayed response cannot locally revive a stopped
-route. Dedicated pools use the same journal and activation contracts with a
+selects a compatible connected spare, persists its intent through
+`reserve_warm_claim`, binds the CR with a CAS, and calls `activate_warm_claim`.
+Recovery uses gateway persistence to complete interrupted claims without reading
+workspace Secrets, including intents whose CR binding never happened. Reservation
+and retirement compete on the gateway assignment version. Retirement must commit
+before marking or deleting Kubernetes resources; a reserved runtime is no longer
+available to pool maintenance. Cold selection also commits against the Sandbox
+version, fencing delayed warm reservations.
+
+Cancellation atomically retires an unactivated assignment and records a terminal
+decision on its logical launch. It cannot cancel a winning activation or permit
+cold fallback within that launch. Retirement tombstones also authorize cleanup of
+CR bindings that arrive after cancellation. Activation publication uses durable
+pool reconciliation so a delayed response cannot locally revive a stopped route.
+Dedicated pools use the same journal and activation contracts with a
 separate coordinator: no shared membership or capacity rows are created. The driver
 binds the dedicated Pod UID, observes startup-probe success, and delivers the
 committed registration through the dedicated supervisor’s pending
@@ -208,8 +219,9 @@ selected in-process driver asks for it, keeps the controller to serve the
 host's `Attach` stream and to publish the token it mints and renews at half
 its lifetime, and gives the coordination to the driver. The driver
 (`openshell-driver-kubernetes` today) records placements, persists and reads
-back launch material, provisions the workload's path to the supervisor, checks
-its own infrastructure evidence alongside the coordinator's verdict, and
+back cold-launch material, recovers warm claims from gateway persistence,
+provisions the workload's path to the supervisor, checks its own infrastructure
+evidence alongside the coordinator's verdict, and
 delivers the token into the Secret the supervisor Pod mounts. The supervisor
 (`openshell-supervisor`) consumes only the registration and status types; it
 owns admission, per-instance runtime, routing, and cleanup.

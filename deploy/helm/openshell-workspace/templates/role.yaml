@@ -64,6 +64,3 @@ rules:
     verbs:
       - create
       - delete
-      {{- if .Values.gateway.warmPoolSecretReads }}
-      - get
-      {{- end }}

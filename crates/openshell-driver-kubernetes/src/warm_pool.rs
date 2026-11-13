@@ -46,10 +46,10 @@ pub use reconciler::WarmPoolReport;
 mod claim;
 #[path = "warm_pool/dedicated.rs"]
 mod dedicated;
-pub(super) use claim::{claim_pending, physical_resource_id};
+pub(super) use claim::{claim_pending, physical_resource_id, requires_gateway_recovery};
 pub(super) use dedicated::{
     claimed_supervisor_pair, configure_dedicated_pod, validate_claimed_supervisor,
-    validate_dedicated_pod,
+    validate_dedicated_pod, validate_restarted_supervisor,
 };
 
 /// One single-use physical runtime. Retrying this request reuses its CR and TLS
@@ -174,6 +174,9 @@ impl KubernetesComputeDriver {
         ))
         .map_err(|status| KubernetesDriverError::InvalidArgument(status.message().into()))?;
         let namespace = self.warm_runtime_namespace(&request.workspace).await?;
+        if self.config.workspace_mode == WorkspaceMode::Managed {
+            self.ensure_namespace(&request.workspace).await?;
+        }
         let sandbox = Sandbox {
             workspace: request.workspace.clone(),
             spec: Some(request.spec.clone()),
@@ -193,9 +196,7 @@ impl KubernetesComputeDriver {
             &SandboxPodParams {
                 default_image: &self.config.default_image,
                 image_pull_policy: self.config.image_pull_policy,
-                // Shared/operator namespaces already contain these operator-managed
-                // references. Managed mode needs a separate bootstrap journal.
-                image_pull_secrets: &self.config.image_pull_secrets,
+                image_pull_secrets: &self.generation_image_pull_secret_names(&names),
                 sandbox_runtime_image: &self.config.sandbox_runtime_image,
                 sandbox_runtime_image_pull_policy: self.config.sandbox_runtime_image_pull_policy,
                 service_account_name: &self.config.service_account_name,
@@ -342,7 +343,7 @@ impl KubernetesComputeDriver {
             .collect()
     }
 
-    /// Journal retirement, permanently fence preparation/activation, then delete
+    /// Permanently fence preparation/activation, mark retirement, then delete
     /// only this CR by UID and version. Its Pod, Pod-owned bootstrap Secret and
     /// CR-owned control policy follow through Kubernetes garbage collection.
     /// Namespace-wide network fences are retained. All steps are retryable.
@@ -369,14 +370,26 @@ impl KubernetesComputeDriver {
         };
         let record = read_record(&object, &self.config.gateway_id)?;
         let current = resource_from_object(&object, &record)?;
-        if !same_resource(&current, resource)
-            || annotation_or_label(&object, LABEL_SANDBOX_ID).is_some()
-        {
+        if !same_resource(&current, resource) {
             return Ok(WarmRuntimeRetirement::Changed);
         }
-        if !current.retiring && !current.deleting {
-            object =
-                patch_annotations(&api.api, &object, serde_json::json!({RETIRING: "true"})).await?;
+        if annotation_or_label(&object, LABEL_SANDBOX_ID).is_some()
+            && !self
+                .warm_supervision()?
+                .pending_warm_claims(&record.workspace)
+                .await
+                .map_err(KubernetesDriverError::Message)?
+                .retired
+                .iter()
+                .any(|retired| {
+                    retired.route == record.route()
+                        && retired.generation.as_str() == record.physical_id()
+                        && retired.auth_epoch == record.trust.auth_epoch
+                })
+        {
+            // A missing assignment does not authorize deleting a bound CR.
+            // Only an existing retirement tombstone proves cancellation won.
+            return Ok(WarmRuntimeRetirement::Changed);
         }
         let outcome = self
             .warm_supervision()?
@@ -393,6 +406,18 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::Message)?;
         if outcome != PreparationRelease::Released {
             return Ok(WarmRuntimeRetirement::Changed);
+        }
+        // Claim reservation and retirement compete in gateway persistence.
+        // Only the winner may mutate Kubernetes; marking first poisons a claim
+        // that committed before its CR binding.
+        if !current.retiring && !current.deleting {
+            object = match api.api.patch(&resource.name, &PatchParams::default(), &Patch::Merge(&serde_json::json!({"metadata": {
+                "uid": resource.uid, "resourceVersion": required_version(&object)?, "annotations": {RETIRING: "true"}
+            }}))).await {
+                Ok(object) => object,
+                Err(KubeError::Api(error)) if error.code == 409 => return Ok(WarmRuntimeRetirement::Changed),
+                Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+            };
         }
         // Re-read after the durable operation. Status may have advanced, but a
         // concurrent claim, journal edit or object replacement is not ours to delete.
@@ -438,12 +463,6 @@ impl KubernetesComputeDriver {
         if self.warm_supervision().is_err() {
             return Err(invalid(
                 "warm runtime preparation requires gateway coordination",
-            ));
-        }
-        if self.config.workspace_mode == WorkspaceMode::Managed {
-            // Do not widen the managed namespace's create-only Secret permission.
-            return Err(invalid(
-                "managed workspace warm runtimes require a gateway-namespace bootstrap journal",
             ));
         }
         Ok(())
@@ -532,41 +551,67 @@ impl KubernetesComputeDriver {
         )
         .map_err(|error| invalid(&error.to_string()))?;
         let registration = bootstrap
-            .prepare(self.client.clone(), self.warm_supervision()?, |tls| {
-                KubernetesSandboxRuntimeBoundarySpec {
-                    boundary_id: String::new(),
-                    generation: record.physical_id(),
-                    session_id: record.session_id,
-                    session_rotation: record.trust.session_rotation,
-                    auth_epoch: record.trust.auth_epoch,
-                    gateway_id: record.trust.gateway_id.clone(),
-                    verification_keys: verification_keys.clone(),
-                    namespace_uid: namespace_uid.clone(),
-                    sandbox_resource_uid: resource.uid.clone(),
-                    workload_pod_uid: pod_uid.into(),
-                    workload_pod_uid_path: SANDBOX_POD_UID_PATH.into(),
-                    supervisor: target.supervisor.clone(),
-                    egress_policy_uid: fence_coordinates.uid.clone(),
-                    egress_policy_resource_version: fence_coordinates.resource_version.clone(),
-                    control_path: KubernetesControlPath::RuntimeInitiatedShared {
-                        control_authority: target.authority.clone(),
-                        supervisor_address: target.address,
-                        supervisor_namespace: target.namespace.clone(),
-                        route: route.clone(),
-                        control_policy_uid: control_policy.uid.clone(),
-                        control_policy_resource_version: control_policy.resource_version.clone(),
-                    },
-                    sandbox_tls: SandboxTlsServerConfig {
-                        certificate_chain_path: BOUNDARY_CERTIFICATE_PATH.into(),
-                        private_key_path: BOUNDARY_PRIVATE_KEY_PATH.into(),
-                    },
-                    supervisor_tls: tls,
-                    host_gateway_ip: self.config.host_gateway_ip.parse().ok(),
-                    workload_identity: workload_identity.clone(),
-                    child_env: record.child_env.clone().into_iter().collect(),
-                }
-                .provision_prepared()
-            })
+            .prepare(
+                self.client.clone(),
+                self.warm_supervision()?,
+                |tls| {
+                    KubernetesSandboxRuntimeBoundarySpec {
+                        boundary_id: String::new(),
+                        generation: record.physical_id(),
+                        session_id: record.session_id,
+                        session_rotation: record.trust.session_rotation,
+                        auth_epoch: record.trust.auth_epoch,
+                        gateway_id: record.trust.gateway_id.clone(),
+                        verification_keys: verification_keys.clone(),
+                        namespace_uid: namespace_uid.clone(),
+                        sandbox_resource_uid: resource.uid.clone(),
+                        workload_pod_uid: pod_uid.into(),
+                        workload_pod_uid_path: SANDBOX_POD_UID_PATH.into(),
+                        supervisor: target.supervisor.clone(),
+                        egress_policy_uid: fence_coordinates.uid.clone(),
+                        egress_policy_resource_version: fence_coordinates.resource_version.clone(),
+                        control_path: KubernetesControlPath::RuntimeInitiatedShared {
+                            control_authority: target.authority.clone(),
+                            supervisor_address: target.address,
+                            supervisor_namespace: target.namespace.clone(),
+                            route: route.clone(),
+                            control_policy_uid: control_policy.uid.clone(),
+                            control_policy_resource_version: control_policy
+                                .resource_version
+                                .clone(),
+                        },
+                        sandbox_tls: SandboxTlsServerConfig {
+                            certificate_chain_path: BOUNDARY_CERTIFICATE_PATH.into(),
+                            private_key_path: BOUNDARY_PRIVATE_KEY_PATH.into(),
+                        },
+                        supervisor_tls: tls,
+                        host_gateway_ip: self.config.host_gateway_ip.parse().ok(),
+                        workload_identity: workload_identity.clone(),
+                        child_env: record.child_env.clone().into_iter().collect(),
+                    }
+                    .provision_prepared()
+                },
+                |registration| {
+                    let resource = &resource;
+                    let names = &names;
+                    let record = &record;
+                    let object = &object;
+                    async move {
+                        self.create_generation_image_pull_secrets(
+                            &resource.namespace,
+                            names,
+                            &record.physical_id(),
+                            vec![runtime_pod_owner(&resource.name, pod_uid)],
+                        )
+                        .await?;
+                        if self.shared_supervisor.is_none() {
+                            self.create_warm_dedicated_bootstrap(object, record, &registration)
+                                .await?;
+                        }
+                        Ok(())
+                    }
+                },
+            )
             .await?;
 
         // Capacity is now durably reserved. Re-read the live resources after that
@@ -628,8 +673,7 @@ impl KubernetesComputeDriver {
             .await?;
         }
         if self.shared_supervisor.is_none() {
-            self.release_warm_dedicated(&current, &record, &registration)
-                .await?;
+            self.release_warm_dedicated(&current, &record).await?;
         }
         release_gate(&pods, &current_pod).await?;
         let object =

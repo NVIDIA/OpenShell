@@ -45,10 +45,11 @@ pub use controller::{
     SupervisorCredential, SupervisorHostController,
 };
 pub use coordinator::{
-    ActivationRequest, InstancePlacement, InstanceSupervision, LaunchError, PlacementFuture,
-    PlacementRequest, PreparationRelease, PreparationRequest, PreparationRetirement,
-    PreparationRevision, PreparedRuntime, PreparedRuntimeOwner, RecoverableInstance,
-    RecoveryBaseline, RecoveryOutcome, SharedSupervision,
+    ActivationRequest, InstancePlacement, InstanceSupervision, LaunchError, PendingWarmClaim,
+    PlacementFuture, PlacementRequest, PreparationRelease, PreparationRequest,
+    PreparationRetirement, PreparationRevision, PreparedRuntime, PreparedRuntimeOwner,
+    RecoverableInstance, RecoveryBaseline, RecoveryOutcome, SharedSupervision, WarmClaimIntent,
+    WarmClaimInventory, WarmClaimLookup, WarmClaimReservation,
 };
 pub use credential::deliver_credentials;
 /// Recovery deadlines, in seconds, a supervisor may offer a sandbox runtime.

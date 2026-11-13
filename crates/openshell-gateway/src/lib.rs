@@ -303,10 +303,7 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
                 context.shared_supervision(),
             )
             .await
-        } else if context.gateway_tls_enabled()
-            && context.gateway_launch_signing_enabled()
-            && config.workspace_mode != openshell_driver_kubernetes::config::WorkspaceMode::Managed
-        {
+        } else if context.gateway_tls_enabled() && context.gateway_launch_signing_enabled() {
             openshell_driver_kubernetes::KubernetesComputeDriver::with_dedicated_warm_supervision(
                 config,
                 context.shutdown_receiver(),

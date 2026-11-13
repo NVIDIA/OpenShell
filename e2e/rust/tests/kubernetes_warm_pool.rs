@@ -36,9 +36,8 @@ async fn ready_spare(excluding: Option<&str>) -> serde_json::Value {
     tokio::time::timeout(Duration::from_mins(6), async {
         loop {
             let resources = kubectl_json(&[
-                "-n",
-                &release_namespace(),
                 "get",
+                "--all-namespaces",
                 "sandboxes.agents.x-k8s.io",
                 "-l",
                 "openshell.ai/warm-pool",
@@ -87,7 +86,55 @@ async fn ready_spare(excluding: Option<&str>) -> serde_json::Value {
 
 #[tokio::test]
 #[ignore = "requires e2e/kubernetes/values-warm-pool.yaml and matching branch images"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one lifecycle scenario retains physical identity across claims and restarts"
+)]
 async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
+    // Managed workspace overlay copies this source into each physical generation.
+    kubectl(&[
+        "-n",
+        &release_namespace(),
+        "create",
+        "secret",
+        "generic",
+        "e2e-regcred",
+        "--type=kubernetes.io/dockerconfigjson",
+        "--from-literal=.dockerconfigjson={\"auths\":{}}",
+    ])
+    .await;
+    if std::env::var_os("OPENSHELL_E2E_WARM_OPERATOR").is_some() {
+        kubectl(&[
+            "label",
+            "namespace",
+            "default",
+            "openshell.ai/e2e-operator-workspace=true",
+        ])
+        .await;
+        let chart = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/helm/openshell-workspace"
+        );
+        let output = shared_supervisor::helm_command()
+            .args([
+                "install",
+                "warm-workspace",
+                chart,
+                "--namespace",
+                "default",
+                "--set",
+                &format!("gateway.serviceAccount.namespace={}", release_namespace()),
+                "--wait",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let (output, code) = run_cli(&[
         "sandbox",
         "template",
@@ -103,6 +150,8 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
     .await;
     assert_eq!(code, 0, "{output}");
     let spare = ready_spare(None).await;
+    let workspace_namespace = spare["metadata"]["namespace"].as_str().unwrap();
+    assert_no_workspace_secret_reads(workspace_namespace).await;
     let record: serde_json::Value = serde_json::from_str(
         spare["metadata"]["annotations"]["openshell.ai/warm-runtime"]
             .as_str()
@@ -113,7 +162,7 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
     let physical_name = spare["metadata"]["name"].as_str().unwrap();
     let pod = kubectl_json(&[
         "-n",
-        &release_namespace(),
+        workspace_namespace,
         "get",
         "pod",
         physical_name,
@@ -124,7 +173,7 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
     let dedicated_uid =
         spare["metadata"]["annotations"]["openshell.ai/sandbox-runtime-supervisor-uid"].as_str();
     let prepared_secret = if let Some(uid) = dedicated_uid {
-        let pods = kubectl_json(&["-n", &release_namespace(), "get", "pods", "-o", "json"]).await;
+        let pods = kubectl_json(&["-n", workspace_namespace, "get", "pods", "-o", "json"]).await;
         let supervisor = pods["items"]
             .as_array()
             .unwrap()
@@ -142,7 +191,7 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
             .unwrap();
         let secret = kubectl_json(&[
             "-n",
-            &release_namespace(),
+            workspace_namespace,
             "get",
             "secret",
             name,
@@ -184,6 +233,44 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
     } else {
         None
     };
+    let mut forward = None;
+    restart_gateway(&mut forward).await;
+    // Diagnose any lost spare before a cold fallback hides the recovery failure.
+    let recovered = kubectl_json(&[
+        "-n",
+        workspace_namespace,
+        "get",
+        "sandbox",
+        physical_name,
+        "-o",
+        "json",
+    ])
+    .await;
+    let recovered_pods =
+        kubectl_json(&["-n", workspace_namespace, "get", "pods", "-o", "json"]).await;
+    if let Some(uid) = dedicated_uid {
+        let supervisor = recovered_pods["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pod| pod["metadata"]["uid"] == uid)
+            .expect("original supervisor survives gateway restart");
+        if supervisor["status"]["containerStatuses"][0]["state"]["running"].is_null() {
+            let logs = kubectl(&[
+                "-n",
+                workspace_namespace,
+                "logs",
+                supervisor["metadata"]["name"].as_str().unwrap(),
+                "--tail=50",
+            ])
+            .await;
+            panic!("prepared supervisor ended during gateway restart: {logs}");
+        }
+    }
+    assert!(
+        recovered["metadata"]["annotations"]["openshell.ai/warm-runtime-retiring"].is_null(),
+        "healthy spare retired after gateway restart: {recovered}"
+    );
     let mut sandbox = SandboxGuard::create_with_gateway_default(&["--template", "e2e-warm"])
         .await
         .expect("claim warm runtime");
@@ -209,7 +296,7 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let pods =
-                    kubectl_json(&["-n", &release_namespace(), "get", "pods", "-o", "json"]).await;
+                    kubectl_json(&["-n", workspace_namespace, "get", "pods", "-o", "json"]).await;
                 let supervisor = pods["items"]
                     .as_array()
                     .unwrap()
@@ -230,7 +317,7 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
     if let Some((name, version)) = prepared_secret {
         let secret = kubectl_json(&[
             "-n",
-            &release_namespace(),
+            workspace_namespace,
             "get",
             "secret",
             &name,
@@ -275,10 +362,22 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
     );
     let replacement = ready_spare(Some(session)).await;
     assert_ne!(replacement["metadata"]["uid"], spare["metadata"]["uid"]);
+    restart_gateway(&mut forward).await;
+    assert_eq!(generation(&sandbox.name).await, claimed);
+    tokio::time::timeout(Duration::from_mins(1), async {
+        loop {
+            if sandbox.exec(&["true"]).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("committed warm claim must recover after gateway restart");
     let (output, code) = run_cli(&["sandbox", "stop", &sandbox.name]).await;
     assert_eq!(code, 0, "{output}");
     if let Some(uid) = dedicated_uid {
-        let pods = kubectl_json(&["-n", &release_namespace(), "get", "pods", "-o", "json"]).await;
+        let pods = kubectl_json(&["-n", workspace_namespace, "get", "pods", "-o", "json"]).await;
         assert!(
             pods["items"].as_array().unwrap().iter().all(|pod| {
                 pod["metadata"]["uid"] != uid || pod["metadata"]["deletionTimestamp"].is_string()
@@ -308,9 +407,8 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
     tokio::time::timeout(Duration::from_mins(3), async {
         loop {
             let resources = kubectl_json(&[
-                "-n",
-                &release_namespace(),
                 "get",
+                "--all-namespaces",
                 "sandboxes.agents.x-k8s.io",
                 "-l",
                 "openshell.ai/warm-pool",
@@ -326,4 +424,126 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
     })
     .await
     .expect("deleting the template must drain unclaimed capacity");
+}
+
+async fn assert_no_workspace_secret_reads(namespace: &str) {
+    let pods = kubectl_json(&[
+        "-n",
+        &release_namespace(),
+        "get",
+        "pods",
+        "-l",
+        GATEWAY_SELECTOR,
+        "-o",
+        "json",
+    ])
+    .await;
+    let service_account = pods["items"][0]["spec"]["serviceAccountName"]
+        .as_str()
+        .unwrap();
+    let identity = format!(
+        "system:serviceaccount:{}:{service_account}",
+        release_namespace()
+    );
+    for verb in ["get", "list", "watch"] {
+        let output = shared_supervisor::kubectl_command()
+            .args([
+                "auth", "can-i", verb, "secrets", "-n", namespace, "--as", &identity,
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "no",
+            "warm pooling must not require {verb} on workspace Secrets: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+async fn restart_gateway(forward: &mut Option<tokio::process::Child>) {
+    let namespace = release_namespace();
+    let workloads = kubectl_json(&[
+        "-n",
+        &namespace,
+        "get",
+        "deployments,statefulsets",
+        "-l",
+        GATEWAY_SELECTOR,
+        "-o",
+        "json",
+    ])
+    .await;
+    let workload = workloads["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|workload| {
+            workload["spec"]["template"]["spec"]["containers"]
+                .as_array()
+                .is_some_and(|containers| {
+                    containers
+                        .iter()
+                        .any(|container| container["name"] == GATEWAY_CONTAINER)
+                })
+        })
+        .expect("gateway workload");
+    let resource = format!(
+        "{}/{}",
+        workload["kind"].as_str().unwrap(),
+        workload["metadata"]["name"].as_str().unwrap()
+    );
+    kubectl(&["-n", &namespace, "rollout", "restart", &resource]).await;
+    kubectl(&[
+        "-n",
+        &namespace,
+        "rollout",
+        "status",
+        &resource,
+        "--timeout=120s",
+    ])
+    .await;
+    if let Some(mut old) = forward.take() {
+        let _ = old.kill().await;
+    }
+    let config = std::env::var("XDG_CONFIG_HOME").unwrap();
+    let gateway = std::env::var("OPENSHELL_GATEWAY").unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!(
+            "{config}/openshell/gateways/{gateway}/metadata.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let port = metadata["gateway_port"].as_u64().unwrap();
+    *forward = Some(
+        shared_supervisor::kubectl_command()
+            .args([
+                "-n",
+                &namespace,
+                "port-forward",
+                "svc/openshell",
+                &format!("{port}:8080"),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_mins(1), async {
+        loop {
+            let (_, code) = run_cli(&["sandbox", "list"]).await;
+            if code == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("gateway must recover with its persisted records");
+    // Allow the supervisor's assignment stream and the five-second pool pass to
+    // reconnect before the one-shot create, which otherwise may cold-fallback.
+    tokio::time::sleep(Duration::from_secs(10)).await;
 }

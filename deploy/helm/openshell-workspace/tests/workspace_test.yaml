@@ -12,20 +12,8 @@ release:
   namespace: app-a
 
 tests:
-  - it: grants namespace Secret get for template warm-pool recovery by default
+  - it: requires no Secret reads for warm pool creation recovery or draining
     template: templates/role.yaml
-    asserts:
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            verbs: ["create", "delete", "get"]
-
-  - it: permits removing Secret reads after warm pools have drained
-    template: templates/role.yaml
-    set:
-      gateway.warmPoolSecretReads: false
     asserts:
       - contains:
           path: rules
@@ -103,7 +91,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "delete", "get"]
+            verbs: ["create", "delete"]
       - notExists:
           path: rules[*].resourceNames
 

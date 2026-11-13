@@ -266,7 +266,7 @@ struct AssignmentPayload {
     /// Credential handle of the launch material (encoded `CredentialHandle`);
     /// empty in a reservation.
     material_handle: Vec<u8>,
-    /// No logical Sandbox exists yet; this is a reserved physical runtime.
+    /// No logical Sandbox has activated; a claim intent may already reserve it.
     #[serde(default)]
     prepared: bool,
     /// Original bootstrap epoch of a warm runtime, retained after activation so
@@ -276,6 +276,10 @@ struct AssignmentPayload {
     /// A material candidate whose version fences an in-flight activation.
     #[serde(default)]
     activation_candidate: bool,
+    /// Credential-store handle of the immutable warm claim intent. Kept through
+    /// activation and collected atomically with retirement.
+    #[serde(default)]
+    claim_handle: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -1001,6 +1005,7 @@ impl SupervisorPool {
                     // host membership, placement, or takeover stream.
                     pool.remove_stale_candidates().await;
                     if let Ok(records) = pool.all_assignments().await {
+                        pool.cancel_abandoned_warm_claims(&records).await;
                         pool.fence_stale_reservations(&records).await;
                         pool.sweep_ended_instances(&records).await;
                         pool.remove_withdrawn().await;
@@ -1499,12 +1504,16 @@ impl SupervisorPool {
 
     /// The record or reservation of `route`.
     async fn assignment(&self, route: &str) -> Result<Option<AssignmentRecord>, PersistenceError> {
-        Ok(self
-            .store
+        self.store
             .get_by_name(ASSIGNMENT_OBJECT_TYPE, "", route)
             .await?
             .as_ref()
-            .and_then(decode_assignment))
+            .map(|row| {
+                decode_assignment(row).ok_or_else(|| {
+                    PersistenceError::Decode("invalid supervisor runtime assignment".into())
+                })
+            })
+            .transpose()
     }
 
     /// Keep `material` in the credential store under a fresh path, so a
@@ -1700,6 +1709,7 @@ impl SupervisorPool {
             prepared: assignment.prepared,
             prepared_epoch: preparation.map_or(0, |(_, epoch)| epoch),
             activation_candidate: false,
+            claim_handle: Vec::new(),
         };
         let id = assignment_object_id(&payload.route, &payload.writer);
         let encode = |payload: &AssignmentPayload| {
@@ -2309,7 +2319,10 @@ impl SupervisorPool {
             .pool_withdrawals()
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let records = self.all_assignments().await?;
+        let mut records = self.all_assignments().await?;
+        if self.cancel_abandoned_warm_claims(&records).await {
+            records = self.all_assignments().await?;
+        }
         self.fence_stale_reservations(&records).await;
         self.remove_stale_candidates().await;
         let mut desired = records
@@ -3156,6 +3169,81 @@ async fn detached<T: Send + 'static>(
 }
 
 impl InstancePlacement for PoolPlacement {
+    fn reserve_warm_claim(
+        &self,
+        workspace: String,
+        intent: openshell_supervisor_control::WarmClaimIntent,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimReservation> {
+        let pool = self.0.clone();
+        Box::pin(detached(async move {
+            pool.reserve_warm_claim(&workspace, intent).await
+        }))
+    }
+
+    fn choose_cold_launch(
+        &self,
+        lookup: openshell_supervisor_control::WarmClaimLookup,
+    ) -> PlacementFuture<Option<openshell_supervisor_control::WarmClaimIntent>> {
+        let pool = self.0.clone();
+        Box::pin(detached(
+            async move { pool.choose_cold_launch(lookup).await },
+        ))
+    }
+
+    fn pending_warm_claims(
+        &self,
+        workspace: String,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventory> {
+        let pool = self.0.clone();
+        Box::pin(detached(async move {
+            pool.pending_warm_claims(&workspace).await
+        }))
+    }
+
+    fn cancel_warm_claim(&self, workspace: String, route: String) -> PlacementFuture<bool> {
+        let pool = self.0.clone();
+        Box::pin(detached(async move {
+            pool.cancel_warm_claim(&workspace, &route).await
+        }))
+    }
+
+    fn warm_claim_for_launch(
+        &self,
+        lookup: openshell_supervisor_control::WarmClaimLookup,
+    ) -> PlacementFuture<Option<openshell_supervisor_control::WarmClaimIntent>> {
+        let pool = self.0.clone();
+        Box::pin(async move { pool.warm_claim_for_launch(lookup).await })
+    }
+
+    fn record_warm_claim(
+        &self,
+        workspace: String,
+        intent: openshell_supervisor_control::WarmClaimIntent,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimIntent> {
+        let pool = self.0.clone();
+        Box::pin(detached(async move {
+            pool.record_warm_claim(&workspace, intent).await
+        }))
+    }
+
+    fn warm_claim(
+        &self,
+        workspace: String,
+        route: String,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimIntent> {
+        let pool = self.0.clone();
+        Box::pin(async move { pool.warm_claim(&workspace, &route).await })
+    }
+
+    fn runtime_assignment(
+        &self,
+        workspace: String,
+        route: String,
+    ) -> PlacementFuture<Option<SandboxInstanceAssignment>> {
+        let pool = self.0.clone();
+        Box::pin(async move { pool.runtime_assignment(&workspace, &route).await })
+    }
+
     fn warm_runtime_trust(
         &self,
     ) -> PlacementFuture<openshell_supervisor_control::warm_pool::WarmRuntimeTrust> {
@@ -3486,6 +3574,7 @@ mod tests {
                 prepared: false,
                 prepared_epoch: 0,
                 activation_candidate: false,
+                claim_handle: Vec::new(),
             };
             self.store
                 .put_if(

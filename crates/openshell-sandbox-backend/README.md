@@ -85,8 +85,10 @@ connection registry continues to govern supervisor replacement and recovery.
 A runtime may bootstrap with an empty logical sandbox ID and nonempty physical
 resource claims. Its TLS identity and runtime generation are fixed at creation.
 TLS alone cannot assign it: its first accepted Sandbox Protocol bearer must be
-gateway-signed, carry the exact `resource_binding` claims, and match both the
-generation and launch credential epoch. `mint_bound_sandbox_token` creates this
+gateway-signed, carry the exact `resource_binding` claims, match the generation,
+and have a credential epoch at least as high as the launch epoch. A higher epoch
+allows recovery when the launch owner dies before assignment; attachment still
+requires a valid supervisor takeover grant. `mint_bound_sandbox_token` creates this
 initial credential. Authentication permanently fixes the sandbox ID; subsequent
 renewals may omit the physical binding and must retain that logical identity.
 The usual epoch and supervisor takeover checks continue to apply.

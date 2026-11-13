@@ -39,12 +39,228 @@ struct State {
     lose_delete_response: bool,
     activated: BTreeMap<String, SandboxInstanceAssignment>,
     lose_activation_response: bool,
+    published: BTreeMap<String, SandboxInstanceAssignment>,
+    claims: BTreeMap<String, openshell_supervisor_control::WarmClaimIntent>,
+    lose_intent_response: bool,
+    claim_barrier: Option<(String, Arc<tokio::sync::Barrier>)>,
+    cold_launches: Vec<openshell_supervisor_control::WarmClaimLookup>,
+    retired: BTreeMap<String, PreparationRetirement>,
+    claim_sandboxes: BTreeMap<String, Sandbox>,
+    retire_on_claim: Option<String>,
 }
 
 #[derive(Debug)]
 struct Placement(Arc<Mutex<State>>);
 
 impl InstancePlacement for Placement {
+    fn choose_cold_launch(
+        &self,
+        lookup: openshell_supervisor_control::WarmClaimLookup,
+    ) -> PlacementFuture<Option<openshell_supervisor_control::WarmClaimIntent>> {
+        let mut state = self.0.lock().unwrap();
+        let intent = state
+            .claims
+            .values()
+            .find(|intent| {
+                intent.registration.sandbox_id == lookup.sandbox_id
+                    && intent.expected_generation == lookup.expected_generation
+                    && intent.expected_auth_epoch == lookup.expected_auth_epoch
+            })
+            .cloned();
+        let result = if let Some(intent) = intent {
+            if state.retired.contains_key(&intent.registration.route) {
+                Err("warm launch was cancelled".into())
+            } else {
+                Ok(Some(intent))
+            }
+        } else {
+            state.cold_launches.push(lookup);
+            Ok(None)
+        };
+        Box::pin(async move { result })
+    }
+
+    fn pending_warm_claims(
+        &self,
+        _: String,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventory> {
+        let state = self.0.lock().unwrap();
+        let inventory = openshell_supervisor_control::WarmClaimInventory {
+            pending: state
+                .claims
+                .iter()
+                .filter(|(route, _)| {
+                    !state.retired.contains_key(*route) && !state.activated.contains_key(*route)
+                })
+                .filter_map(|(_, intent)| {
+                    state
+                        .claim_sandboxes
+                        .get(&intent.registration.sandbox_id)
+                        .map(|sandbox| openshell_supervisor_control::PendingWarmClaim {
+                            sandbox: sandbox.clone(),
+                            intent: intent.clone(),
+                        })
+                })
+                .collect(),
+            retired: state.retired.values().cloned().collect(),
+        };
+        Box::pin(async move { Ok(inventory) })
+    }
+
+    fn cancel_warm_claim(&self, workspace: String, route: String) -> PlacementFuture<bool> {
+        let mut state = self.0.lock().unwrap();
+        let activated = state.activated.contains_key(&route);
+        if !activated {
+            let intent = state.claims.get(&route).unwrap();
+            let retirement = PreparationRetirement {
+                workspace,
+                route: route.clone(),
+                generation: intent.registration.auth.runtime_generation.clone(),
+                auth_epoch: intent.registration.auth.auth_epoch,
+            };
+            state.retired.insert(route, retirement);
+        }
+        Box::pin(async move { Ok(!activated) })
+    }
+
+    fn reserve_warm_claim(
+        &self,
+        workspace: String,
+        intent: openshell_supervisor_control::WarmClaimIntent,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimReservation> {
+        let state = self.0.clone();
+        let write = self.record_warm_claim(workspace, intent.clone());
+        Box::pin(async move {
+            match write.await {
+                Ok(intent) => Ok(
+                    openshell_supervisor_control::WarmClaimReservation::Reserved(Box::new(intent)),
+                ),
+                Err(error) => {
+                    let state = state.lock().unwrap();
+                    if state.retired.contains_key(&intent.registration.route)
+                        || state
+                            .claims
+                            .get(&intent.registration.route)
+                            .is_some_and(|previous| {
+                                previous.registration.sandbox_id != intent.registration.sandbox_id
+                            })
+                        || state.cold_launches.iter().any(|lookup| {
+                            lookup.sandbox_id == intent.registration.sandbox_id
+                                && lookup.expected_generation == intent.expected_generation
+                                && lookup.expected_auth_epoch == intent.expected_auth_epoch
+                        })
+                    {
+                        Ok(openshell_supervisor_control::WarmClaimReservation::Unavailable)
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
+        })
+    }
+
+    fn warm_claim_for_launch(
+        &self,
+        lookup: openshell_supervisor_control::WarmClaimLookup,
+    ) -> PlacementFuture<Option<openshell_supervisor_control::WarmClaimIntent>> {
+        let intent = self
+            .0
+            .lock()
+            .unwrap()
+            .claims
+            .values()
+            .find(|intent| {
+                intent.registration.sandbox_id == lookup.sandbox_id
+                    && intent.expected_generation == lookup.expected_generation
+                    && intent.expected_auth_epoch == lookup.expected_auth_epoch
+            })
+            .cloned();
+        Box::pin(async move { Ok(intent) })
+    }
+
+    fn runtime_assignment(
+        &self,
+        _: String,
+        route: String,
+    ) -> PlacementFuture<Option<SandboxInstanceAssignment>> {
+        let state = self.0.lock().unwrap();
+        let result = state
+            .activated
+            .get(&route)
+            .or_else(|| state.published.get(&route))
+            .cloned();
+        Box::pin(async move { Ok(result) })
+    }
+    fn record_warm_claim(
+        &self,
+        _: String,
+        intent: openshell_supervisor_control::WarmClaimIntent,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimIntent> {
+        let state = self.0.clone();
+        Box::pin(async move {
+            let barrier = state
+                .lock()
+                .unwrap()
+                .claim_barrier
+                .as_ref()
+                .filter(|(route, _)| *route == intent.registration.route)
+                .map(|(_, barrier)| barrier.clone());
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+            let mut state = state.lock().unwrap();
+            if state.retire_on_claim.as_ref() == Some(&intent.registration.route) {
+                state.retire_on_claim = None;
+                state.retired.insert(
+                    intent.registration.route.clone(),
+                    PreparationRetirement {
+                        workspace: "team-a".into(),
+                        route: intent.registration.route.clone(),
+                        generation: intent.registration.auth.runtime_generation.clone(),
+                        auth_epoch: intent.registration.auth.auth_epoch,
+                    },
+                );
+            }
+            if state.retired.contains_key(&intent.registration.route)
+                || state.cold_launches.iter().any(|lookup| {
+                    lookup.sandbox_id == intent.registration.sandbox_id
+                        && lookup.expected_generation == intent.expected_generation
+                        && lookup.expected_auth_epoch == intent.expected_auth_epoch
+                })
+            {
+                return Err("warm candidate unavailable".into());
+            }
+            let previous = state
+                .claims
+                .entry(intent.registration.route.clone())
+                .or_insert_with(|| intent.clone())
+                .clone();
+            let lost = std::mem::take(&mut state.lose_intent_response);
+            if lost {
+                Err("lost intent response".into())
+            } else if previous.registration.sandbox_id != intent.registration.sandbox_id {
+                Err("another claim won".into())
+            } else {
+                Ok(previous)
+            }
+        })
+    }
+    fn warm_claim(
+        &self,
+        _: String,
+        route: String,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimIntent> {
+        let result = self
+            .0
+            .lock()
+            .unwrap()
+            .claims
+            .get(&route)
+            .cloned()
+            .ok_or_else(|| "claim missing".into());
+        Box::pin(async move { result })
+    }
+
     fn warm_runtime_trust(&self) -> PlacementFuture<WarmRuntimeTrust> {
         let trust =
             serde_json::from_value(self.0.lock().unwrap().public_trust.clone().unwrap()).unwrap();
@@ -104,14 +320,18 @@ impl InstancePlacement for Placement {
     ) -> PlacementFuture<PreparationRelease> {
         let mut state = self.0.lock().unwrap();
         state.events.push("retire".into());
+        if state.claims.contains_key(&request.route) && !state.retired.contains_key(&request.route)
+        {
+            return Box::pin(async { Ok(PreparationRelease::Changed) });
+        }
         let Some((_, object)) = state
             .objects
             .iter_mut()
             .find(|(path, _)| *path == &format!("{SANDBOXES}/warm-{}", request.generation))
         else {
+            state.retired.insert(request.route.clone(), request);
             return Box::pin(async { Ok(PreparationRelease::Released) });
         };
-        assert_eq!(object["metadata"]["annotations"][RETIRING], "true");
         let record: Record =
             serde_json::from_str(object["metadata"]["annotations"][RECORD].as_str().unwrap())
                 .unwrap();
@@ -131,10 +351,16 @@ impl InstancePlacement for Placement {
             .retirement
             .clone()
             .unwrap_or(Ok(PreparationRelease::Released));
+        if matches!(result, Ok(PreparationRelease::Released)) {
+            state.retired.insert(request.route.clone(), request);
+        }
         Box::pin(async move { result })
     }
     fn prepare_runtime(&self, request: PreparationRequest) -> PlacementFuture {
         let mut state = self.0.lock().unwrap();
+        if state.retired.contains_key(&request.registration.route) {
+            return Box::pin(async { Err("runtime was retired".into()) });
+        }
         let expected_uid =
             &request.registration.runtime_descriptor.resource_claims["kubernetes.workload_pod_uid"];
         assert!(
@@ -146,6 +372,12 @@ impl InstancePlacement for Placement {
                         == Some(expected_uid))
         );
         state.events.push("reserve".into());
+        if !state.refuse_capacity {
+            state.published.insert(
+                request.registration.route.clone(),
+                request.registration.to_assignment().unwrap(),
+            );
+        }
         state.preparations.push(request);
         if state.replace_pod_on_prepare {
             let (_, pod) = state
@@ -276,6 +508,10 @@ fn fixture(state: Arc<Mutex<State>>) -> KubernetesComputeDriver {
         async move {
             let method = request.method().clone();
             let path = request.uri().path().to_string();
+            assert!(
+                !(request.method() == http::Method::GET && path.starts_with(SECRETS)),
+                "workspace Secret reads are forbidden: {path}"
+            );
             let selector = request
                 .uri()
                 .query()
@@ -306,10 +542,17 @@ fn fixture(state: Arc<Mutex<State>>) -> KubernetesComputeDriver {
                     let Some(object) = state.objects.get(&path) else {
                         return Ok(error(404));
                     };
-                    assert_eq!(body["propagationPolicy"], "Foreground");
-                    if body["preconditions"]["uid"] != object["metadata"]["uid"]
-                        || body["preconditions"]["resourceVersion"]
-                            != object["metadata"]["resourceVersion"]
+                    if !path.starts_with(SECRETS) {
+                        assert_eq!(body["propagationPolicy"], "Foreground");
+                    }
+                    if body["preconditions"]
+                        .get("uid")
+                        .is_some_and(|uid| uid != &object["metadata"]["uid"])
+                        || body["preconditions"]
+                            .get("resourceVersion")
+                            .is_some_and(|version| {
+                                version != &object["metadata"]["resourceVersion"]
+                            })
                     {
                         return Ok(error(409));
                     }
@@ -509,6 +752,23 @@ struct ApiTestPlacement {
 }
 
 impl InstancePlacement for ApiTestPlacement {
+    fn runtime_assignment(
+        &self,
+        workspace: String,
+        route: String,
+    ) -> PlacementFuture<Option<SandboxInstanceAssignment>> {
+        let assignment = self
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| request.workspace == workspace && request.registration.route == route)
+            .map(|request| request.registration.to_assignment())
+            .transpose()
+            .map_err(|error| error.to_string());
+        Box::pin(async move { assignment })
+    }
+
     fn warm_runtime_trust(&self) -> PlacementFuture<WarmRuntimeTrust> {
         let trust = serde_json::from_value(self.trust.lock().unwrap().clone().unwrap()).unwrap();
         Box::pin(async move { Ok(trust) })
@@ -644,7 +904,7 @@ async fn warm_runtime_resources_on_kubernetes() {
         );
         let resumed = driver.resume_warm_runtime(&prepared.resource).await?;
         assert_eq!(resumed.registration, prepared.registration);
-        assert_eq!(placement.requests.lock().unwrap().len(), 2);
+        assert_eq!(placement.requests.lock().unwrap().len(), 1);
         // Exercise UID/version-preconditioned foreground deletion against the
         // real API as well. Capacity fencing is tested with the durable store.
         for _ in 0..10 {
@@ -848,46 +1108,43 @@ async fn claim_object(
     (api, object, record)
 }
 
-fn mark_prepared_ready(driver: &KubernetesComputeDriver, prepared: &WarmRuntimePreparation) {
+fn mark_prepared_ready(driver: &KubernetesComputeDriver, prepared: &[WarmRuntimePreparation]) {
     use openshell_supervisor_control::{InstanceOwner, PoolView};
-    let route = prepared.registration.route.clone();
+    let mut view = PoolView::default();
+    for prepared in prepared {
+        let route = prepared.registration.route.clone();
+        view.owners.insert(
+            route.clone(),
+            InstanceOwner {
+                member_id: "member".into(),
+                process_id: "process".into(),
+                auth_epoch: 1,
+                supervisor_instance_id: None,
+                takeover: None,
+            },
+        );
+        view.desired.insert(route.clone());
+        view.assignments.insert(
+            route.clone(),
+            prepared.registration.to_assignment().unwrap(),
+        );
+        view.reports.insert(
+            route.clone(),
+            openshell_supervisor_control::proto::SandboxInstanceStatus {
+                route,
+                phase: openshell_supervisor_control::proto::SandboxInstancePhase::Prepared as i32,
+                ready: true,
+                ..Default::default()
+            },
+        );
+    }
     driver
         .shared_supervisor
         .as_ref()
         .unwrap()
         .supervision()
         .controller()
-        .update_pool(
-            PoolView {
-                owners: BTreeMap::from([(
-                    route.clone(),
-                    InstanceOwner {
-                        member_id: "member".into(),
-                        process_id: "process".into(),
-                        auth_epoch: 1,
-                        supervisor_instance_id: None,
-                        takeover: None,
-                    },
-                )]),
-                desired: [route.clone()].into(),
-                assignments: BTreeMap::from([(
-                    route.clone(),
-                    prepared.registration.to_assignment().unwrap(),
-                )]),
-                reports: BTreeMap::from([(
-                    route.clone(),
-                    openshell_supervisor_control::proto::SandboxInstanceStatus {
-                        route,
-                        phase: openshell_supervisor_control::proto::SandboxInstancePhase::Prepared
-                            as i32,
-                        ready: true,
-                        ..Default::default()
-                    },
-                )]),
-                ..Default::default()
-            },
-            tokio::time::Instant::now(),
-        );
+        .update_pool(view, tokio::time::Instant::now());
 }
 
 #[tokio::test]
@@ -905,7 +1162,7 @@ async fn create_claims_ready_capacity_and_preserves_physical_resources() {
         .unwrap()
         .remove(0);
     let prepared = driver.resume_warm_runtime(&resource).await.unwrap();
-    mark_prepared_ready(&driver, &prepared);
+    mark_prepared_ready(&driver, std::slice::from_ref(&prepared));
     let mut request = request();
     request.spec = reconciler::spec(&pool);
     let sandbox = claiming_sandbox(&request, "logical-one");
@@ -942,13 +1199,8 @@ async fn create_claims_ready_capacity_and_preserves_physical_resources() {
         driver.retire_warm_runtime(&resource).await.unwrap(),
         WarmRuntimeRetirement::Changed
     );
-    let names = SandboxRuntimeNames::for_generation(&sandbox.id, &resource.session_id.to_string());
-    let secret: Secret = serde_json::from_value(
-        state.lock().unwrap().objects[&format!("{SECRETS}/{}", names.supervisor_secret)].clone(),
-    )
-    .unwrap();
-    let canonical = SandboxInstanceRegistration::from_launch_material(
-        &secret.data.unwrap()[SHARED_INSTANCE_KEY].0,
+    let canonical = SandboxInstanceRegistration::from_assignment(
+        &state.lock().unwrap().activated[&prepared.registration.route],
     )
     .unwrap();
     assert_eq!(
@@ -960,17 +1212,17 @@ async fn create_claims_ready_capacity_and_preserves_physical_resources() {
         prepared.registration.runtime_descriptor.tls
     );
     assert_eq!(canonical.runtime_descriptor.session_id, resource.session_id);
-    // Ordinary recovery reads the canonical Secret by logical ID and generation.
+    // Missing gateway state must not fall back to a workspace Secret read.
     assert!(
         driver
             .read_shared_instance_material(SharedInstanceSecretRecord {
                 namespace: resource.namespace.clone(),
                 sandbox_id: sandbox.id,
                 generation: resource.session_id.to_string(),
+                warm: true,
             })
             .await
-            .unwrap()
-            .is_some()
+            .is_err()
     );
     driver.reconcile_warm_pool(&pool).await.unwrap();
     assert!(
@@ -988,8 +1240,103 @@ async fn create_claims_ready_capacity_and_preserves_physical_resources() {
 }
 
 #[tokio::test]
-async fn warm_claim_recovers_lost_activation_and_secret_responses() {
-    for lost in ["activation", "intent", "claim", "canonical"] {
+async fn competing_creates_try_another_spare_or_allow_cold_fallback() {
+    for ready in [1, 2] {
+        let state = Arc::new(Mutex::new(State::default()));
+        let (driver, request, prepared) = Box::pin(ready_pool(state.clone(), ready)).await;
+        state.lock().unwrap().claim_barrier = Some((
+            prepared[0].registration.route.clone(),
+            Arc::new(tokio::sync::Barrier::new(2)),
+        ));
+        let a = claiming_sandbox(&request, "logical-a");
+        let b = claiming_sandbox(&request, "logical-b");
+        // Both creates must reach the first spare before either publishes intent.
+        let (a, b) = Box::pin(tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                driver.try_claim_warm_runtime(&a, "openshell"),
+                driver.try_claim_warm_runtime(&b, "openshell"),
+            )
+        }))
+        .await
+        .unwrap();
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert_ne!(a, b, "the two creates must never share physical identity");
+        assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), ready);
+        assert_eq!(state.lock().unwrap().claims.len(), ready);
+        assert_eq!(state.lock().unwrap().activated.len(), ready);
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_claim_failure_never_selects_another_spare() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let (driver, request, prepared) = Box::pin(ready_pool(state.clone(), 2)).await;
+    let sandbox = claiming_sandbox(&request, "logical-one");
+    state.lock().unwrap().lose_intent_response = true;
+    let identity = driver
+        .try_claim_warm_runtime(&sandbox, "openshell")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        identity,
+        kubernetes_runtime_identity(
+            &prepared[0].resource.namespace,
+            &prepared[0].resource.uid,
+            &prepared[0].registration.route,
+        )
+    );
+    assert_eq!(state.lock().unwrap().claims.len(), 1);
+    assert_eq!(state.lock().unwrap().activated.len(), 1);
+}
+
+#[tokio::test]
+async fn retirement_winner_tries_another_spare_or_commits_cold_creation() {
+    for ready in [1, 2] {
+        let state = Arc::new(Mutex::new(State::default()));
+        let (driver, request, prepared) = Box::pin(ready_pool(state.clone(), ready)).await;
+        state.lock().unwrap().retire_on_claim = Some(prepared[0].registration.route.clone());
+        let sandbox = claiming_sandbox(&request, "logical-retirement-race");
+        let result = driver
+            .try_claim_warm_runtime(&sandbox, "openshell")
+            .await
+            .unwrap();
+        assert_eq!(result.is_some(), ready == 2);
+        let state = state.lock().unwrap();
+        assert!(!state.claims.contains_key(&prepared[0].registration.route));
+        assert_eq!(state.activated.len(), ready - 1);
+        assert_eq!(state.cold_launches.len(), usize::from(ready == 1));
+    }
+}
+
+async fn ready_pool(
+    state: Arc<Mutex<State>>,
+    ready: usize,
+) -> (
+    KubernetesComputeDriver,
+    WarmRuntimeRequest,
+    Vec<WarmRuntimePreparation>,
+) {
+    let mut driver = fixture(state);
+    let pool = pool_config();
+    driver.config.warm_pool.max_size = pool.max_size;
+    driver.config.warm_pool.max_age_secs = pool.max_age_secs;
+    driver.config.warm_pool.preparation_timeout_secs = pool.preparation_timeout_secs;
+    driver.reconcile_warm_pool(&pool).await.unwrap();
+    let mut prepared = Vec::new();
+    for resource in driver.warm_runtime_inventory("team-a").await.unwrap() {
+        prepared.push(driver.resume_warm_runtime(&resource).await.unwrap());
+    }
+    mark_prepared_ready(&driver, &prepared[..ready]);
+    let mut request = request();
+    request.spec = reconciler::spec(&pool);
+    (driver, request, prepared)
+}
+
+#[tokio::test]
+async fn warm_claim_recovers_lost_intent_binding_and_activation_responses() {
+    for lost in ["activation", "intent", "claim"] {
         let state = Arc::new(Mutex::new(State::default()));
         let driver = fixture(state.clone());
         let request = request();
@@ -997,14 +1344,9 @@ async fn warm_claim_recovers_lost_activation_and_secret_responses() {
         let sandbox = claiming_sandbox(&request, "logical-one");
         let (api, object, record) = claim_object(&driver, &prepared.resource).await;
         state.lock().unwrap().lose_activation_response = lost == "activation";
+        state.lock().unwrap().lose_intent_response = lost == "intent";
         state.lock().unwrap().lose_response = match lost {
-            "intent" => Some(SECRETS.into()),
             "claim" => Some(format!("{SANDBOXES}/{}", prepared.resource.name)),
-            "canonical" => Some(format!(
-                "{SECRETS}/{}",
-                SandboxRuntimeNames::for_generation(&sandbox.id, &record.physical_id())
-                    .supervisor_secret
-            )),
             _ => None,
         };
         assert!(
@@ -1021,11 +1363,17 @@ async fn warm_claim_recovers_lost_activation_and_secret_responses() {
         );
         let current = api.api.get(&prepared.resource.name).await.unwrap();
         if lost == "intent" {
-            // Secret committed before the CR claim: retry adopts that intent.
-            driver
-                .claim_warm_object(&sandbox, &api, &current, &record, prepared.registration)
-                .await
-                .unwrap();
+            // No CR binding exists. Even a disabled pool must resume its intent
+            // before the create path considers cold fallback.
+            let mut restarted = fixture(state.clone());
+            restarted.config.warm_pool.enabled = false;
+            assert!(
+                restarted
+                    .try_claim_warm_runtime(&sandbox, "openshell")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
         } else {
             assert!(claim_pending(&current));
             driver.finish_warm_claim(&api, &current).await.unwrap();
@@ -1057,7 +1405,7 @@ async fn two_sandboxes_cannot_claim_the_same_physical_runtime() {
         driver.claim_warm_object(&a, &api, &object, &record, prepared.registration.clone()),
         driver.claim_warm_object(&b, &api, &object, &record, prepared.registration),
     );
-    assert_ne!(first.is_ok(), second.is_ok());
+    assert_ne!(first.unwrap_or(false), second.unwrap_or(false));
     assert_eq!(state.lock().unwrap().activated.len(), 1);
     assert_eq!(
         state
@@ -1068,6 +1416,108 @@ async fn two_sandboxes_cannot_claim_the_same_physical_runtime() {
             .filter(|event| *event == "activate")
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn gateway_reservation_blocks_retirement_and_recovers_without_a_create_retry() {
+    for dedicated in [false, true] {
+        let state = Arc::new(Mutex::new(State::default()));
+        let driver = if dedicated {
+            dedicated_fixture(state.clone())
+        } else {
+            fixture(state.clone())
+        };
+        let request = request();
+        let prepared = driver.prepare_warm_runtime(&request).await.unwrap();
+        let sandbox = claiming_sandbox(&request, "logical-recovery");
+        let (api, object, record) = claim_object(&driver, &prepared.resource).await;
+        state.lock().unwrap().lose_intent_response = true;
+        assert!(
+            driver
+                .claim_warm_object(
+                    &sandbox,
+                    &api,
+                    &object,
+                    &record,
+                    prepared.registration.clone()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            driver
+                .retire_warm_runtime(&prepared.resource)
+                .await
+                .unwrap(),
+            WarmRuntimeRetirement::Changed
+        );
+        let current = api.api.get(&prepared.resource.name).await.unwrap();
+        assert!(annotation(&current, RETIRING).is_none());
+        assert!(annotation(&current, claim::CLAIM).is_none());
+        let mut stored = sandbox.clone();
+        stored.spec.as_mut().unwrap().launch_authentication.clear();
+        state
+            .lock()
+            .unwrap()
+            .claim_sandboxes
+            .insert(sandbox.id.clone(), stored);
+        let restarted = if dedicated {
+            dedicated_fixture(state.clone())
+        } else {
+            fixture(state.clone())
+        };
+        restarted
+            .recover_pending_warm_claims(
+                &request.workspace,
+                std::slice::from_ref(&prepared.resource),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.lock().unwrap().activated.len(), 1);
+        let current = api.api.get(&prepared.resource.name).await.unwrap();
+        assert!(!claim_pending(&current));
+        assert_eq!(sandbox_id_from_object(&current).unwrap(), sandbox.id);
+    }
+}
+
+#[tokio::test]
+async fn recovery_cancels_a_missing_pod_then_collects_the_reserved_cr() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let driver = fixture(state.clone());
+    let request = request();
+    let prepared = driver.prepare_warm_runtime(&request).await.unwrap();
+    let sandbox = claiming_sandbox(&request, "logical-lost");
+    let (api, object, record) = claim_object(&driver, &prepared.resource).await;
+    state.lock().unwrap().lose_intent_response = true;
+    assert!(
+        driver
+            .claim_warm_object(&sandbox, &api, &object, &record, prepared.registration)
+            .await
+            .is_err()
+    );
+    {
+        let mut state = state.lock().unwrap();
+        state.claim_sandboxes.insert(sandbox.id.clone(), sandbox);
+        state
+            .objects
+            .remove(&format!("{PODS}/{}", prepared.resource.name));
+    }
+    for _ in 0..2 {
+        driver
+            .recover_pending_warm_claims(
+                &request.workspace,
+                std::slice::from_ref(&prepared.resource),
+            )
+            .await
+            .unwrap();
+    }
+    let state = state.lock().unwrap();
+    assert!(state.activated.is_empty());
+    assert!(
+        !state
+            .objects
+            .contains_key(&format!("{SANDBOXES}/{}", prepared.resource.name))
     );
 }
 
@@ -1235,7 +1685,7 @@ async fn pool_preserves_creation_intent_on_lost_response_and_fails_closed_on_inv
 }
 
 #[tokio::test]
-async fn pool_capacity_refusal_keeps_the_same_gated_runtime_for_retry() {
+async fn pool_capacity_refusal_keeps_incomplete_runtime_gated_until_retirement() {
     let state = Arc::new(Mutex::new(State {
         refuse_capacity: true,
         ..Default::default()
@@ -1253,14 +1703,14 @@ async fn pool_capacity_refusal_keeps_the_same_gated_runtime_for_retry() {
     assert!(has_gate(&pod(&state.lock().unwrap())));
     state.lock().unwrap().refuse_capacity = false;
     permit_next_attempt(&state);
-    assert_eq!(driver.reconcile_warm_pool(&pool).await.unwrap().failed, 0);
+    assert_eq!(driver.reconcile_warm_pool(&pool).await.unwrap().failed, 1);
     let after = driver
         .warm_runtime_inventory(&pool.workspace)
         .await
         .unwrap();
     assert_eq!(before[0].uid, after[0].uid);
     assert_eq!(before[0].session_id, after[0].session_id);
-    assert!(after[0].released);
+    assert!(!after[0].released);
 }
 
 fn pod(state: &State) -> Pod {
@@ -1330,44 +1780,26 @@ async fn creates_a_unique_gated_runtime_and_reserves_before_releasing() {
 }
 
 #[tokio::test]
-async fn capacity_refusal_stays_gated_and_restart_reuses_secret_and_identity() {
+async fn capacity_refusal_stays_gated_and_cannot_adopt_bootstrap_on_retry() {
     let state = Arc::new(Mutex::new(State {
         refuse_capacity: true,
         ..Default::default()
     }));
     let driver = fixture(state.clone());
-    assert!(
-        driver
-            .prepare_warm_runtime(&request())
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("capacity")
-    );
+    assert!(driver.prepare_warm_runtime(&request()).await.is_err());
     let inventory = driver.warm_runtime_inventory("team-a").await.unwrap();
-    let before = {
-        let mut state = state.lock().unwrap();
-        assert!(has_gate(&pod(&state)));
-        state.refuse_capacity = false;
-        state.preparations[0].registration.clone()
-    };
+    state.lock().unwrap().refuse_capacity = false;
     let restarted = fixture(state.clone());
-    let resumed = restarted.resume_warm_runtime(&inventory[0]).await.unwrap();
-    assert_eq!(resumed.registration, before);
+    assert!(restarted.resume_warm_runtime(&inventory[0]).await.is_err());
+    assert!(has_gate(&pod(&state.lock().unwrap())));
     assert_eq!(
-        state
-            .lock()
-            .unwrap()
-            .events
-            .iter()
-            .filter(|event| *event == &format!("POST {SECRETS}"))
-            .count(),
-        1
+        restarted.retire_warm_runtime(&inventory[0]).await.unwrap(),
+        WarmRuntimeRetirement::Deleting
     );
 }
 
 #[tokio::test]
-async fn lost_create_or_secret_or_gate_response_recovers_without_new_identity() {
+async fn lost_response_recovers_completed_bootstrap_and_retires_incomplete_bootstrap() {
     for phase in ["sandbox", "secret", "gate"] {
         let request = request();
         let path = match phase {
@@ -1386,6 +1818,14 @@ async fn lost_create_or_secret_or_gate_response_recovers_without_new_identity() 
         );
         let inventory = driver.warm_runtime_inventory("team-a").await.unwrap();
         assert_eq!(inventory.len(), 1);
+        if phase == "secret" {
+            assert!(driver.resume_warm_runtime(&inventory[0]).await.is_err());
+            assert_eq!(
+                driver.retire_warm_runtime(&inventory[0]).await.unwrap(),
+                WarmRuntimeRetirement::Deleting
+            );
+            continue;
+        }
         let result = driver.resume_warm_runtime(&inventory[0]).await.unwrap();
         assert_eq!(result.resource.uid, inventory[0].uid);
         assert_eq!(result.resource.session_id, request.session_id);
@@ -1537,7 +1977,7 @@ async fn malformed_trust_fails_before_creating_resources() {
 }
 
 #[tokio::test]
-async fn retirement_journals_before_fencing_and_deletes_only_after_success() {
+async fn retirement_fences_before_mutating_kubernetes_and_deletes_only_after_success() {
     for released in [false, true] {
         let state = Arc::new(Mutex::new(State {
             refuse_capacity: !released,
@@ -1558,9 +1998,7 @@ async fn retirement_journals_before_fencing_and_deletes_only_after_success() {
         state.lock().unwrap().retirement = Some(Err("ambiguous retirement response".into()));
         assert!(driver.retire_warm_runtime(&resource).await.is_err());
         let pending = driver.warm_runtime_inventory("team-a").await.unwrap();
-        assert!(pending[0].retiring);
-        assert!(driver.resume_warm_runtime(&resource).await.is_err());
-        assert!(driver.prepare_warm_runtime(&request).await.is_err());
+        assert!(!pending[0].retiring);
         assert!(
             !state
                 .lock()
@@ -1639,7 +2077,7 @@ async fn retirement_does_not_delete_changed_reservations_or_replaced_resources()
 }
 
 #[tokio::test]
-async fn concurrent_kubernetes_claim_fences_retirement_before_capacity_release() {
+async fn retired_route_cleans_up_a_delayed_cr_binding() {
     let state = Arc::new(Mutex::new(State::default()));
     let driver = fixture(state.clone());
     let resource = driver
@@ -1649,19 +2087,50 @@ async fn concurrent_kubernetes_claim_fences_retirement_before_capacity_release()
         .resource;
     state.lock().unwrap().conflict =
         Some(json!({"metadata":{"labels":{LABEL_SANDBOX_ID:"claimed"}}}));
-    assert!(driver.retire_warm_runtime(&resource).await.is_err());
     assert_eq!(
         driver.retire_warm_runtime(&resource).await.unwrap(),
         WarmRuntimeRetirement::Changed
     );
     assert!(
-        !state
+        state
+            .lock()
+            .unwrap()
+            .retired
+            .contains_key(&format!("rt-{}", resource.session_id))
+    );
+    assert_eq!(
+        driver.retire_warm_runtime(&resource).await.unwrap(),
+        WarmRuntimeRetirement::Deleting
+    );
+    assert!(
+        state
             .lock()
             .unwrap()
             .events
             .iter()
-            .any(|event| event == "retire" || event.starts_with("DELETE"))
+            .any(|event| event.starts_with("DELETE"))
     );
+}
+
+#[tokio::test]
+async fn bound_cr_without_a_retirement_tombstone_is_not_deleted() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let driver = fixture(state.clone());
+    let prepared = driver.prepare_warm_runtime(&request()).await.unwrap();
+    state
+        .lock()
+        .unwrap()
+        .objects
+        .get_mut(&format!("{SANDBOXES}/{}", prepared.resource.name))
+        .unwrap()["metadata"]["labels"][LABEL_SANDBOX_ID] = json!("logical-existing");
+    assert_eq!(
+        driver
+            .retire_warm_runtime(&prepared.resource)
+            .await
+            .unwrap(),
+        WarmRuntimeRetirement::Changed
+    );
+    assert!(state.lock().unwrap().retired.is_empty());
 }
 
 #[tokio::test]
@@ -1743,10 +2212,7 @@ async fn dedicated_warm_claim_persists_credentials_without_projecting_or_replaci
             .unwrap()
     );
     let sandbox = claiming_sandbox(&request, "logical-dedicated");
-    let canonical_names = SandboxRuntimeNames::for_generation(&sandbox.id, &record.physical_id());
-    // Lose the persistence response after the canonical claim has committed.
-    state.lock().unwrap().lose_response =
-        Some(format!("{SECRETS}/{}", canonical_names.supervisor_secret));
+    state.lock().unwrap().lose_activation_response = true;
     assert!(
         driver
             .claim_warm_object(
@@ -1788,20 +2254,8 @@ async fn dedicated_warm_claim_persists_credentials_without_projecting_or_replaci
         state.lock().unwrap().objects[&supervisor_path]["metadata"]["uid"],
         before["metadata"]["uid"]
     );
-    let secret: Secret = serde_json::from_value(
-        state.lock().unwrap().objects[&format!("{SECRETS}/{}", canonical_names.supervisor_secret)]
-            .clone(),
-    )
-    .unwrap();
-    assert!(
-        !state
-            .lock()
-            .unwrap()
-            .objects
-            .contains_key(&format!("{SECRETS}/{}", names.supervisor_secret))
-    );
-    let registration = SandboxInstanceRegistration::from_launch_material(
-        &secret.data.unwrap()[SHARED_INSTANCE_KEY].0,
+    let registration = SandboxInstanceRegistration::from_assignment(
+        &state.lock().unwrap().activated[&prepared.registration.route],
     )
     .unwrap();
     assert_eq!(registration.sandbox_id, sandbox.id);
@@ -1825,6 +2279,67 @@ async fn dedicated_warm_claim_persists_credentials_without_projecting_or_replaci
             .unwrap()
             .ends_with(before["metadata"]["uid"].as_str().unwrap())
     );
+}
+
+#[tokio::test]
+async fn dedicated_warm_suspension_deletes_physical_supervisor_before_forgetting_generation() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let driver = dedicated_fixture(state.clone());
+    let request = request();
+    let prepared = driver.prepare_warm_runtime(&request).await.unwrap();
+    let (api, object, record) = claim_object(&driver, &prepared.resource).await;
+    let sandbox = claiming_sandbox(&request, "logical-dedicated");
+    driver
+        .claim_warm_object(&sandbox, &api, &object, &record, prepared.registration)
+        .await
+        .unwrap();
+    let (_, claimed, _) = claim_object(&driver, &prepared.resource).await;
+    driver
+        .suspend_sandbox_runtime_after_dependency_failure(&api, &claimed)
+        .await;
+    let (_, suspending, _) = claim_object(&driver, &prepared.resource).await;
+    assert_eq!(
+        sandbox_runtime_bootstrap_phase(&suspending),
+        Some(SandboxRuntimeBootstrapPhase::Suspending)
+    );
+    let supervisor_path = format!("{PODS}/{}", record.names().supervisor_pod);
+    {
+        let mut state = state.lock().unwrap();
+        // The Sandbox controller removes the workload before cleanup can finish.
+        state
+            .objects
+            .remove(&format!("{PODS}/{}", prepared.resource.name));
+        assert!(state.objects.contains_key(&supervisor_path));
+        state.events.clear();
+    }
+    driver
+        .reconcile_sandbox_runtime_suspending(
+            &api,
+            &suspending,
+            &sandbox.id,
+            &prepared.resource.namespace,
+            &prepared.resource.name,
+        )
+        .await;
+
+    let state = state.lock().unwrap();
+    assert!(!state.objects.contains_key(&supervisor_path));
+    let sandbox_path = format!("{SANDBOXES}/{}", prepared.resource.name);
+    let completed: DynamicObject =
+        serde_json::from_value(state.objects[&sandbox_path].clone()).unwrap();
+    assert!(sandbox_runtime_generation(&completed).is_none());
+    assert!(sandbox_runtime_bootstrap_phase(&completed).is_none());
+    let deletion = state
+        .events
+        .iter()
+        .position(|event| event == &format!("DELETE {supervisor_path}"))
+        .unwrap();
+    let completion = state
+        .events
+        .iter()
+        .position(|event| event == &format!("PATCH {sandbox_path}"))
+        .unwrap();
+    assert!(deletion < completion);
 }
 
 #[tokio::test]
@@ -2002,6 +2517,109 @@ async fn dedicated_registration_authenticates_only_the_original_live_physical_bi
 }
 
 #[tokio::test]
+async fn restarted_warm_sandbox_authenticates_its_new_dedicated_supervisor() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let driver = dedicated_fixture(state.clone());
+    let request = request();
+    let prepared = driver.prepare_warm_runtime(&request).await.unwrap();
+    let (api, object, record) = claim_object(&driver, &prepared.resource).await;
+    let sandbox = claiming_sandbox(&request, "logical-restarted");
+    driver
+        .claim_warm_object(
+            &sandbox,
+            &api,
+            &object,
+            &record,
+            prepared.registration.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Start creates a normal supervisor but retains the warm CR and its labels.
+    let (_, claimed, _) = claim_object(&driver, &prepared.resource).await;
+    let generation = SandboxSessionId::new().to_string();
+    let names = SandboxRuntimeNames::for_generation(&sandbox.id, &generation);
+    let supervisor_uid = driver
+        .create_sandbox_runtime_supervisor(
+            &prepared.resource.namespace,
+            &names,
+            &sandbox.id,
+            &sandbox.name,
+            sandbox_runtime_sandbox_owner_reference(
+                &prepared.resource.name,
+                &prepared.resource.uid,
+                &api.resource.api_version,
+                false,
+            ),
+            record.uid,
+            record.gid,
+            &required_sandbox_annotation(&claimed, ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC)
+                .unwrap(),
+            "info",
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    let resource_path = format!("{SANDBOXES}/{}", prepared.resource.name);
+    {
+        let mut state = state.lock().unwrap();
+        let resource = state.objects.get_mut(&resource_path).unwrap();
+        resource["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_GENERATION] =
+            json!(generation);
+        resource["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID] =
+            json!(supervisor_uid);
+        assert!(resource["metadata"]["labels"][POOL_LABEL].is_string());
+        state.token_review = Some(json!({
+            "authenticated": true, "audiences": [SANDBOX_TOKEN_AUDIENCE],
+            "user": {
+                "username": format!("system:serviceaccount:openshell:{}", driver.config.service_account_name),
+                "extra": {POD_NAME_EXTRA: [names.supervisor_pod], POD_UID_EXTRA: [supervisor_uid]}
+            }
+        }));
+    }
+    assert_eq!(
+        driver.authenticate_sandbox("test-token").await.unwrap(),
+        (
+            sandbox.id,
+            kubernetes_runtime_identity(
+                &prepared.resource.namespace,
+                &prepared.resource.uid,
+                &supervisor_uid,
+            ),
+        )
+    );
+
+    // A historical label alone cannot justify accepting an unclaimed or corrupt
+    // warm generation, or a supervisor other than the current one.
+    let original = state.lock().unwrap().objects[&resource_path].clone();
+    for patch in [
+        json!({ANNOTATION_SANDBOX_RUNTIME_GENERATION: record.physical_id()}),
+        json!({ANNOTATION_SANDBOX_RUNTIME_GENERATION: null}),
+        json!({ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: "other-supervisor"}),
+        json!({RECORD: "invalid"}),
+        json!({RECORD: null}),
+    ] {
+        let mut changed = original.clone();
+        merge(&mut changed["metadata"]["annotations"], &patch);
+        state
+            .lock()
+            .unwrap()
+            .objects
+            .insert(resource_path.clone(), changed);
+        assert_eq!(
+            driver
+                .authenticate_sandbox("test-token")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied,
+            "{patch}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn template_targets_are_capped_and_disable_drains_without_changing_identity() {
     let state = Arc::new(Mutex::new(State::default()));
     let mut driver = fixture(state);
@@ -2018,5 +2636,31 @@ async fn template_targets_are_capped_and_disable_drains_without_changing_identit
     assert_eq!(
         reconciler::fingerprint(&driver.config, &disabled, &trust).unwrap(),
         before
+    );
+}
+
+#[tokio::test]
+async fn corrupt_warm_records_do_not_enable_workspace_secret_recovery() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let driver = fixture(state);
+    let prepared = driver.prepare_warm_runtime(&request()).await.unwrap();
+    let (_, mut object, _) = claim_object(&driver, &prepared.resource).await;
+    object
+        .metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert(RECORD.into(), "invalid".into());
+    assert!(requires_gateway_recovery(&object));
+    assert!(
+        driver
+            .read_shared_instance_material(SharedInstanceSecretRecord {
+                namespace: prepared.resource.namespace,
+                sandbox_id: "logical".into(),
+                generation: prepared.resource.session_id.to_string(),
+                warm: requires_gateway_recovery(&object),
+            })
+            .await
+            .is_err()
     );
 }

@@ -193,9 +193,9 @@ impl SandboxProtocolAuthenticator {
                 return Err(SandboxAuthError::WrongSandbox);
             }
         } else {
-            if session.auth_epoch != self.launch_auth_epoch {
-                return Err(SandboxAuthError::StaleCredentialEpoch);
-            }
+            // The launch owner may die before first assignment. A bound token
+            // at a higher epoch can select the identity, but the registry still
+            // requires a takeover grant before that owner can attach.
             if session.resource_binding != self.resource_binding {
                 return Err(SandboxAuthError::WrongSandbox);
             }
@@ -714,16 +714,6 @@ mod tests {
             )
             .is_err()
         );
-        wrong = identity.clone();
-        wrong.auth_epoch = CredentialEpoch::new(2).unwrap();
-        assert!(
-            authenticate(
-                &issuer
-                    .mint_bound_sandbox_token(&wrong, binding.clone())
-                    .unwrap()
-            )
-            .is_err()
-        );
         let token = issuer
             .mint_bound_sandbox_token(&identity, binding.clone())
             .unwrap();
@@ -740,6 +730,63 @@ mod tests {
         wrong = identity;
         wrong.sandbox_id = SandboxId::parse("logical-b").unwrap();
         assert!(authenticate(&issuer.mint_bound_sandbox_token(&wrong, binding).unwrap()).is_err());
+    }
+
+    #[test]
+    fn unassigned_runtime_accepts_a_granted_first_owner_at_a_higher_epoch() {
+        let mut gateway = Gateway::new();
+        let binding = std::collections::BTreeMap::from([("pod_uid".into(), "pod-1".into())]);
+        let generation = SandboxGenerationId::parse("generation-1").unwrap();
+        gateway.authenticator = SandboxProtocolAuthenticator::unassigned(
+            gateway.authenticator.verifier,
+            binding.clone(),
+            generation.clone(),
+            epoch(1),
+        )
+        .unwrap();
+        let registry = gateway.registry();
+        let candidate = SupervisorInstanceId::new();
+        let identity = SandboxRuntimeIdentity {
+            sandbox_id: SandboxId::parse("sandbox-a").unwrap(),
+            runtime_generation: generation,
+            auth_epoch: epoch(2),
+        };
+        // An ordinary higher-epoch token still cannot assign physical identity.
+        assert!(
+            gateway
+                .authenticator
+                .authenticate(SandboxConnectionId::new(), &metadata(&gateway.token(2)))
+                .is_err()
+        );
+        assert!(!gateway.authenticator.is_assigned());
+        let token = gateway
+            .issuer
+            .mint_bound_sandbox_token(&identity, binding)
+            .unwrap();
+        let replacement = gateway.connect(token.token.expose_secret());
+        registry.admit(&replacement).unwrap();
+        assert_eq!(
+            registry.attach(&replacement, candidate, None),
+            Err(SandboxAuthError::TakeoverRequired)
+        );
+        assert_eq!(
+            registry.attach(
+                &replacement,
+                candidate,
+                Some(&gateway.grant(2, SupervisorInstanceId::new()))
+            ),
+            Err(SandboxAuthError::TakeoverMismatch)
+        );
+        registry
+            .attach(&replacement, candidate, Some(&gateway.grant(2, candidate)))
+            .unwrap();
+        registry.confirm(&replacement).unwrap();
+        assert_eq!(registry.supervisor_instance(), Some(candidate));
+        assert_eq!(registry.accepted_epoch(), epoch(2));
+        assert_eq!(
+            registry.admit(&gateway.connect(&gateway.token(1))),
+            Err(SandboxAuthError::StaleCredentialEpoch)
+        );
     }
 
     #[test]

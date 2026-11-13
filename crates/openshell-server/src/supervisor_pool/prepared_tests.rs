@@ -224,6 +224,12 @@ async fn malformed_preparation_is_neither_an_empty_inventory_nor_an_absent_route
         .await
         .unwrap();
     assert!(pool.prepared_runtimes("default").await.is_err());
+    assert!(
+        pool.runtime_assignment("default", &revision.route)
+            .await
+            .is_err()
+    );
+    assert!(pool.warm_claim("default", &revision.route).await.is_err());
     assert!(pool.release_preparation(revision).await.is_err());
     assert!(pool.controller.pool_withdrawals().is_empty());
 }
@@ -590,6 +596,32 @@ async fn warm_and_active_reservations_share_capacity_and_claim_needs_no_free_slo
         pool.capacity("m1").await.unwrap().payload.routes.len(),
         MAX_ASSIGNED_INSTANCES
     );
+}
+
+#[tokio::test]
+async fn concurrent_activation_of_the_same_intent_returns_the_committed_material() {
+    let (fixture, pool, prepared) = setup().await;
+    pool.record_warm_claim("default", claim_intent(&prepared, "sandbox-a"))
+        .await
+        .unwrap();
+    let claim = activation(&prepared, "sandbox-a");
+    let (task, resume) = pause_claim(&pool, claim.clone()).await;
+    let other = fixture.replica("gateway-b");
+    let winner = other.activate_runtime(claim).await.unwrap();
+    resume.send(()).unwrap();
+    assert_eq!(task.await.unwrap().unwrap(), winner);
+    assert_eq!(fixture.candidates().await, 0);
+}
+
+#[tokio::test]
+async fn activation_rechecks_a_concurrent_sandbox_status_update() {
+    let (fixture, pool, prepared) = setup().await;
+    let (task, resume) = pause_claim(&pool, activation(&prepared, "sandbox-a")).await;
+    fixture.set_phase("sandbox-a", SandboxPhase::Starting).await;
+    resume.send(()).unwrap();
+    let published = task.await.unwrap().unwrap();
+    assert_eq!(published.sandbox_id, "sandbox-a");
+    assert_eq!(fixture.candidates().await, 0);
 }
 
 #[tokio::test]
@@ -1169,4 +1201,437 @@ async fn dedicated_registration_rejects_retirement_and_credential_epoch_changes(
         .await
         .unwrap();
     assert!(pool.dedicated_registration(&identity).await.is_err());
+}
+
+fn claim_intent(
+    prepared: &PreparationRequest,
+    sandbox: &str,
+) -> openshell_supervisor_control::WarmClaimIntent {
+    let request = activation(prepared, sandbox);
+    openshell_supervisor_control::WarmClaimIntent {
+        registration: SandboxInstanceRegistration::from_assignment(&request.assignment).unwrap(),
+        expected_generation: request.expected_generation,
+        expected_auth_epoch: request.expected_auth_epoch,
+    }
+}
+
+fn claim_lookup(
+    intent: &openshell_supervisor_control::WarmClaimIntent,
+) -> openshell_supervisor_control::WarmClaimLookup {
+    openshell_supervisor_control::WarmClaimLookup {
+        workspace: "default".into(),
+        sandbox_id: intent.registration.sandbox_id.clone(),
+        expected_generation: intent.expected_generation.clone(),
+        expected_auth_epoch: intent.expected_auth_epoch,
+    }
+}
+
+#[tokio::test]
+async fn committed_intent_owns_the_preparation_before_infrastructure_binding() {
+    let (fixture, pool, prepared) = setup().await;
+    let intent = claim_intent(&prepared, "sandbox-a");
+    pool.record_warm_claim("default", intent.clone())
+        .await
+        .unwrap();
+    let restarted = fixture.replica("gateway-restarted");
+    let observed = inventory(&restarted).await;
+    assert_eq!(
+        restarted
+            .release_preparation(observed.revision)
+            .await
+            .unwrap(),
+        PreparationRelease::Changed
+    );
+    assert_eq!(
+        restarted
+            .retire_preparation(retirement(&prepared))
+            .await
+            .unwrap(),
+        PreparationRelease::Changed
+    );
+    let recovered = restarted.pending_warm_claims("default").await.unwrap();
+    assert_eq!(recovered.pending.len(), 1);
+    assert!(recovered.retired.is_empty());
+    assert_eq!(
+        recovered.pending[0].intent.registration.route,
+        prepared.registration.route
+    );
+    assert!(
+        restarted
+            .choose_cold_launch(claim_lookup(&intent))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    restarted
+        .activate_runtime(activation(&prepared, "sandbox-a"))
+        .await
+        .unwrap();
+    assert!(
+        !restarted
+            .cancel_warm_claim("default", &prepared.registration.route)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn retirement_winner_is_a_typed_miss_and_allows_a_cold_decision() {
+    let (_, pool, prepared) = setup().await;
+    let intent = claim_intent(&prepared, "sandbox-a");
+    pool.retire_preparation(retirement(&prepared))
+        .await
+        .unwrap();
+    assert!(matches!(
+        pool.reserve_warm_claim("default", intent.clone())
+            .await
+            .unwrap(),
+        openshell_supervisor_control::WarmClaimReservation::Unavailable
+    ));
+    assert!(
+        pool.choose_cold_launch(claim_lookup(&intent))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let other = preparation("rt-other-prepared-0123456789");
+    pool.prepare_runtime(other.clone()).await.unwrap();
+    assert!(matches!(
+        pool.reserve_warm_claim("default", claim_intent(&other, "sandbox-a"))
+            .await
+            .unwrap(),
+        openshell_supervisor_control::WarmClaimReservation::Unavailable
+    ));
+    assert!(
+        pool.activate_runtime(activation(&other, "sandbox-a"))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn cold_decision_fences_a_staged_warm_intent() {
+    let (fixture, pool, prepared) = setup().await;
+    let intent = claim_intent(&prepared, "sandbox-a");
+    let (reached, wait) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    *lock(&pool.staged_gate) = Some((reached, resumed));
+    let worker = pool.clone();
+    let proposed = intent.clone();
+    let task = tokio::spawn(async move { worker.reserve_warm_claim("default", proposed).await });
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .unwrap()
+        .unwrap();
+    let other = fixture.replica("gateway-cold");
+    assert!(
+        other
+            .choose_cold_launch(claim_lookup(&intent))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    resume.send(()).unwrap();
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        openshell_supervisor_control::WarmClaimReservation::Unavailable
+    ));
+    assert!(
+        other
+            .warm_claim_for_launch(claim_lookup(&intent))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    other.remove_stale_candidates().await;
+    assert_eq!(fixture.candidates().await, 0);
+}
+
+#[tokio::test]
+async fn cancellation_fences_staged_activation_and_preserves_a_terminal_launch_decision() {
+    let (fixture, pool, prepared) = setup().await;
+    let intent = claim_intent(&prepared, "sandbox-a");
+    pool.record_warm_claim("default", intent.clone())
+        .await
+        .unwrap();
+    let (task, resume) = pause_claim(&pool, activation(&prepared, "sandbox-a")).await;
+    let other = fixture.replica("gateway-cancel");
+    assert!(
+        other
+            .cancel_warm_claim("default", &prepared.registration.route)
+            .await
+            .unwrap()
+    );
+    resume.send(()).unwrap();
+    assert!(task.await.unwrap().is_err());
+    assert!(
+        other
+            .choose_cold_launch(claim_lookup(&intent))
+            .await
+            .is_err()
+    );
+    assert!(
+        other
+            .warm_claim_for_launch(claim_lookup(&intent))
+            .await
+            .is_err()
+    );
+    let inventory = other.pending_warm_claims("default").await.unwrap();
+    assert!(inventory.pending.is_empty());
+    assert_eq!(inventory.retired.len(), 1);
+    assert!(
+        other
+            .cancel_warm_claim("default", &prepared.registration.route)
+            .await
+            .unwrap()
+    );
+    other.remove_stale_candidates().await;
+    assert_eq!(fixture.candidates().await, 0);
+}
+
+#[tokio::test]
+async fn abandoned_claim_cleanup_preserves_a_newer_launch() {
+    for restart in [false, true] {
+        let (fixture, pool, prepared) = setup().await;
+        let intent = claim_intent(&prepared, "sandbox-a");
+        pool.record_warm_claim("default", intent.clone())
+            .await
+            .unwrap();
+        if restart {
+            fixture
+                .sandbox("sandbox-a", "next-generation", SandboxPhase::Provisioning)
+                .await;
+        } else {
+            fixture.set_phase("sandbox-a", SandboxPhase::Stopped).await;
+        }
+        let restarted = fixture.replica("gateway-restarted");
+        restarted
+            .cancel_abandoned_warm_claims(&restarted.all_assignments().await.unwrap())
+            .await;
+        let inventory = restarted.pending_warm_claims("default").await.unwrap();
+        assert!(inventory.pending.is_empty());
+        assert_eq!(inventory.retired.len(), 1);
+        if restart {
+            let mut lookup = claim_lookup(&intent);
+            lookup.expected_generation =
+                openshell_core::sandbox_generation::SandboxGenerationId::parse("next-generation")
+                    .unwrap();
+            assert!(
+                restarted
+                    .choose_cold_launch(lookup)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert!(
+                restarted
+                    .choose_cold_launch(claim_lookup(&intent))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn warm_claim_journal_survives_restart_activation_and_collects_on_retirement() {
+    let (fixture, pool, prepared) = setup().await;
+    let route = &prepared.registration.route;
+    let intent = claim_intent(&prepared, "sandbox-a");
+    let persisted = pool
+        .record_warm_claim("default", intent.clone())
+        .await
+        .unwrap();
+    let restarted = fixture.replica("gateway-restarted");
+    let recovered = restarted.warm_claim("default", route).await.unwrap();
+    assert_eq!(
+        serde_json::to_vec(&persisted).unwrap(),
+        serde_json::to_vec(&recovered).unwrap()
+    );
+    assert!(
+        restarted
+            .warm_claim("other-workspace", route)
+            .await
+            .is_err()
+    );
+    assert!(
+        restarted
+            .runtime_assignment("other-workspace", route)
+            .await
+            .is_err()
+    );
+    let reference = restarted.assignment(route).await.unwrap().unwrap();
+    let intent_material = AssignmentPayload {
+        material_handle: reference.payload.claim_handle.clone(),
+        prepared: true,
+        sandbox_id: String::new(),
+        ..reference.payload.clone()
+    };
+    // Database records carry a credential handle, not tokens or the proxy key.
+    let record_bytes = serde_json::to_string(&reference.payload).unwrap();
+    assert!(!record_bytes.contains("test-key"));
+    assert!(!record_bytes.contains("test-gateway"));
+    let committed = restarted
+        .activate_runtime(activation(&prepared, "sandbox-a"))
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted
+            .runtime_assignment("default", route)
+            .await
+            .unwrap()
+            .unwrap(),
+        committed
+    );
+    assert_eq!(
+        serde_json::to_vec(&restarted.warm_claim("default", route).await.unwrap()).unwrap(),
+        serde_json::to_vec(&intent).unwrap()
+    );
+    restarted.remove_stale_candidates().await;
+    assert!(restarted.load_material(&intent_material).await.is_ok());
+    let current = restarted.assignment(route).await.unwrap().unwrap();
+    restarted.retire_assignment(&current).await.unwrap();
+    restarted.remove_stale_candidates().await;
+    assert!(restarted.load_material(&intent_material).await.is_err());
+    assert!(restarted.warm_claim("default", route).await.is_err());
+    assert!(
+        restarted
+            .record_warm_claim("default", intent)
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.candidates().await, 0);
+}
+
+#[tokio::test]
+async fn concurrent_warm_claim_intents_preserve_one_winner_and_collect_losers() {
+    let (fixture, first, prepared) = setup().await;
+    let second = fixture.replica("gateway-b");
+    let intent = claim_intent(&prepared, "sandbox-a");
+    let mut retry = intent.clone();
+    retry.registration.auth.gateway_token =
+        openshell_core::jwt::SecretJwt::parse("refreshed-proposed-token").unwrap();
+    retry.registration.auth.gateway_expires_at = 123;
+
+    retry.registration.proxy_ca = openshell_supervisor_control::ProxyCaMaterial {
+        certificate_pem: "another-ca".into(),
+        private_key_pem: openshell_supervisor_control::SecretPem::new("another-key".into()),
+    };
+    let (a, b) = tokio::join!(
+        first.record_warm_claim("default", intent),
+        second.record_warm_claim("default", retry)
+    );
+    assert_eq!(
+        serde_json::to_vec(&a.unwrap()).unwrap(),
+        serde_json::to_vec(&b.unwrap()).unwrap()
+    );
+    first.remove_stale_candidates().await;
+    let winning = first
+        .warm_claim("default", &prepared.registration.route)
+        .await
+        .unwrap();
+    let mut changed = winning.clone();
+    changed.expected_auth_epoch = CredentialEpoch::new(2).unwrap();
+    assert!(first.record_warm_claim("default", changed).await.is_err());
+    fixture
+        .sandbox("sandbox-b", "generation-1", SandboxPhase::Provisioning)
+        .await;
+    assert!(
+        first
+            .record_warm_claim("default", claim_intent(&prepared, "sandbox-b"))
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.candidates().await, 0);
+    assert_eq!(
+        serde_json::to_vec(&winning).unwrap(),
+        serde_json::to_vec(
+            &first
+                .warm_claim("default", &prepared.registration.route)
+                .await
+                .unwrap()
+        )
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn warm_claim_collection_and_retirement_fence_delayed_intent_publication() {
+    for retire in [false, true] {
+        let (fixture, pool, prepared) = setup().await;
+        let (reached, wait) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        *lock(&pool.staged_gate) = Some((reached, resumed));
+        let worker = pool.clone();
+        let intent = claim_intent(&prepared, "sandbox-a");
+        let task = tokio::spawn(async move { worker.record_warm_claim("default", intent).await });
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        let collector = fixture.replica("gateway-collector");
+        if retire {
+            assert_eq!(
+                collector
+                    .retire_preparation(retirement(&prepared))
+                    .await
+                    .unwrap(),
+                PreparationRelease::Released
+            );
+        }
+        collector.remove_stale_candidates().await;
+        resume.send(()).unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert!(
+            collector
+                .warm_claim("default", &prepared.registration.route)
+                .await
+                .is_err()
+        );
+        assert_eq!(fixture.candidates().await, 0);
+    }
+}
+
+#[tokio::test]
+async fn one_logical_launch_selects_one_intent_before_either_cr_is_bound() {
+    let (fixture, first, prepared) = setup().await;
+    let other = preparation("rt-another-prepared-0123456789");
+    first.prepare_runtime(other.clone()).await.unwrap();
+    let second = fixture.replica("gateway-b");
+    let (a, b) = tokio::join!(
+        first.record_warm_claim("default", claim_intent(&prepared, "sandbox-a")),
+        second.record_warm_claim("default", claim_intent(&other, "sandbox-a")),
+    );
+    assert_ne!(
+        a.is_ok(),
+        b.is_ok(),
+        "only one physical route can bind the logical launch"
+    );
+    let winning = a.or(b).unwrap();
+    let lookup = openshell_supervisor_control::WarmClaimLookup {
+        workspace: "default".into(),
+        sandbox_id: "sandbox-a".into(),
+        expected_generation: winning.expected_generation.clone(),
+        expected_auth_epoch: winning.expected_auth_epoch,
+    };
+    let restarted = fixture.replica("gateway-restarted");
+    let recovered = restarted
+        .warm_claim_for_launch(lookup.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(winning.registration.route, recovered.registration.route);
+    let mut later = lookup;
+    later.expected_generation =
+        openshell_core::sandbox_generation::SandboxGenerationId::parse("next-launch").unwrap();
+    assert!(
+        restarted
+            .warm_claim_for_launch(later)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    restarted.remove_stale_candidates().await;
+    assert_eq!(fixture.candidates().await, 0);
 }

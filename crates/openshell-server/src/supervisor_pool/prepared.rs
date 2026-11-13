@@ -6,9 +6,560 @@
 use super::*;
 use crate::auth::sandbox_session::PreparedRuntimeIdentity;
 use crate::persistence::ObjectType;
-use openshell_supervisor_control::{PreparedRuntimeRegistration, SandboxInstanceRegistration};
+use openshell_supervisor_control::{
+    PendingWarmClaim, PreparedRuntimeRegistration, SandboxInstanceRegistration, WarmClaimIntent,
+    WarmClaimInventory, WarmClaimLookup, WarmClaimReservation,
+};
+
+const CLAIM_LINK: &str = "openshell.ai/warm-claim-intent";
+
+#[derive(Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LaunchDecision {
+    #[default]
+    Warm,
+    Cold,
+    Cancelled,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimLink {
+    route: String,
+    generation: openshell_core::sandbox_generation::SandboxGenerationId,
+    auth_epoch: openshell_core::jwt::CredentialEpoch,
+    #[serde(default)]
+    decision: LaunchDecision,
+}
 
 impl SupervisorPool {
+    pub(super) async fn warm_claim_for_launch(
+        &self,
+        lookup: WarmClaimLookup,
+    ) -> Result<Option<WarmClaimIntent>, String> {
+        let sandbox = self
+            .store
+            .get_message::<Sandbox>(&lookup.sandbox_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("claiming sandbox disappeared")?;
+        if sandbox.object_workspace() != lookup.workspace {
+            return Err("claim lookup workspace mismatch".into());
+        }
+        let Some(value) = sandbox
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.annotations.get(CLAIM_LINK))
+        else {
+            return Ok(None);
+        };
+        let link: ClaimLink = serde_json::from_str(value).map_err(|_| "invalid warm claim link")?;
+        if link.generation != lookup.expected_generation
+            || link.auth_epoch != lookup.expected_auth_epoch
+        {
+            return Ok(None);
+        }
+        match link.decision {
+            LaunchDecision::Cold => return Ok(None),
+            LaunchDecision::Cancelled => return Err("warm launch was cancelled".into()),
+            LaunchDecision::Warm => {}
+        }
+        let intent = self.warm_claim(&lookup.workspace, &link.route).await?;
+        if intent.registration.sandbox_id != lookup.sandbox_id
+            || intent.expected_generation != lookup.expected_generation
+            || intent.expected_auth_epoch != lookup.expected_auth_epoch
+        {
+            return Err("warm claim link does not match its launch".into());
+        }
+        Ok(Some(intent))
+    }
+
+    pub(super) async fn choose_cold_launch(
+        &self,
+        lookup: WarmClaimLookup,
+    ) -> Result<Option<WarmClaimIntent>, String> {
+        let mut write_error = None;
+        for _ in 0..TRANSITION_ATTEMPTS {
+            let row = self
+                .store
+                .get(Sandbox::object_type(), &lookup.sandbox_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("claiming sandbox disappeared")?;
+            let mut sandbox = Sandbox::decode(row.payload.as_slice()).map_err(|e| e.to_string())?;
+            if sandbox.object_workspace() != lookup.workspace {
+                return Err("cold launch workspace mismatch".into());
+            }
+            if let Some(link) = read_claim_link(&sandbox)?
+                && link.generation == lookup.expected_generation
+                && link.auth_epoch == lookup.expected_auth_epoch
+            {
+                return match link.decision {
+                    LaunchDecision::Warm => self.warm_claim_for_launch(lookup).await,
+                    LaunchDecision::Cold if launch_is_current(&sandbox, &lookup) => Ok(None),
+                    LaunchDecision::Cold => Err("cold launch is no longer current".into()),
+                    LaunchDecision::Cancelled => Err("warm launch was cancelled".into()),
+                };
+            }
+            if !launch_is_current(&sandbox, &lookup) {
+                return Err("cold decision does not match the current sandbox launch".into());
+            }
+            write_claim_link(
+                &mut sandbox,
+                &ClaimLink {
+                    route: String::new(),
+                    generation: lookup.expected_generation.clone(),
+                    auth_epoch: lookup.expected_auth_epoch,
+                    decision: LaunchDecision::Cold,
+                },
+            )?;
+            match self
+                .store
+                .write_atomically(&[AtomicWrite::Update {
+                    object_type: Sandbox::object_type().into(),
+                    id: lookup.sandbox_id.clone(),
+                    payload: sandbox.encode_to_vec(),
+                    expected_version: row.resource_version,
+                }])
+                .await
+            {
+                Ok(_) => return Ok(None),
+                Err(PersistenceError::Conflict { .. }) => {}
+                // A lost reply may follow a committed decision. The next read
+                // resolves it before another write or any cold provisioning.
+                Err(error) => write_error = Some(format!("persist cold launch decision: {error}")),
+            }
+        }
+        Err(write_error
+            .unwrap_or_else(|| "sandbox launch changed repeatedly during cold selection".into()))
+    }
+
+    pub(super) async fn reserve_warm_claim(
+        &self,
+        workspace: &str,
+        intent: WarmClaimIntent,
+    ) -> Result<WarmClaimReservation, String> {
+        match self.record_warm_claim(workspace, intent.clone()).await {
+            Ok(intent) => Ok(WarmClaimReservation::Reserved(Box::new(intent))),
+            Err(error) => {
+                // A missing row or failed read is not proof that a write lost.
+                let record = self
+                    .assignment(&intent.registration.route)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Some(record) = record
+                    && record.payload.workspace == workspace
+                    && record.payload.dedicated == self.dedicated
+                {
+                    if record.payload.phase == RecordPhase::Retired {
+                        return Ok(WarmClaimReservation::Unavailable);
+                    }
+                    if !record.payload.claim_handle.is_empty() {
+                        let previous = self
+                            .warm_claim(workspace, &intent.registration.route)
+                            .await?;
+                        if previous.registration.sandbox_id != intent.registration.sandbox_id {
+                            return Ok(WarmClaimReservation::Unavailable);
+                        }
+                        return matching_claim(intent, previous)
+                            .map(|intent| WarmClaimReservation::Reserved(Box::new(intent)));
+                    }
+                }
+                let sandbox = self
+                    .store
+                    .get_message::<Sandbox>(&intent.registration.sandbox_id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or("claiming sandbox disappeared")?;
+                if sandbox.object_workspace() == workspace
+                    && let Some(link) = read_claim_link(&sandbox)?
+                    && link.generation == intent.expected_generation
+                    && link.auth_epoch == intent.expected_auth_epoch
+                    && (link.decision == LaunchDecision::Cold
+                        || (link.decision == LaunchDecision::Warm
+                            && link.route != intent.registration.route))
+                {
+                    return Ok(WarmClaimReservation::Unavailable);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Include reservations whose CR binding never happened. Invalid launches
+    /// are cancelled with the same assignment/Sandbox CAS as activation.
+    pub(super) async fn pending_warm_claims(
+        &self,
+        workspace: &str,
+    ) -> Result<WarmClaimInventory, String> {
+        if workspace.is_empty() {
+            return Err("pending claims require a workspace".into());
+        }
+        let mut inventory = WarmClaimInventory::default();
+        for record in self
+            .all_assignments()
+            .await
+            .map_err(|e| e.to_string())?
+            .values()
+        {
+            if record.payload.workspace != workspace
+                || record.payload.dedicated != self.dedicated
+                || !record.payload.prepared
+            {
+                continue;
+            }
+            let retirement = PreparationRetirement {
+                workspace: workspace.into(),
+                route: record.payload.route.clone(),
+                generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    record.payload.generation.clone(),
+                )
+                .map_err(|e| e.to_string())?,
+                auth_epoch: openshell_core::jwt::CredentialEpoch::new(
+                    record.payload.prepared_epoch,
+                )
+                .map_err(|e| e.to_string())?,
+            };
+            if record.payload.phase == RecordPhase::Retired {
+                inventory.retired.push(retirement);
+                continue;
+            }
+            if record.payload.phase != RecordPhase::Published
+                || record.payload.claim_handle.is_empty()
+            {
+                continue;
+            }
+            let bytes = self.load_material(&claim_material(&record.payload)).await?;
+            let intent: WarmClaimIntent =
+                serde_json::from_slice(&bytes).map_err(|_| "invalid persisted warm claim")?;
+            let sandbox = self
+                .store
+                .get_message::<Sandbox>(&intent.registration.sandbox_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Some(sandbox) = sandbox
+                && claim_is_current(&sandbox, workspace, &intent)?
+            {
+                let mut sandbox =
+                    crate::compute::driver_sandbox_from_public(&sandbox, "kubernetes")
+                        .map_err(|error| error.to_string())?;
+                let process = openshell_core::sandbox_env::MainProcessConfig::decode(
+                    &intent.registration.main_process_spec,
+                )?;
+                if let Some(spec) = sandbox.spec.as_mut() {
+                    spec.await_main_process_attachment = process.await_main_process_attachment;
+                }
+                inventory.pending.push(PendingWarmClaim { sandbox, intent });
+            } else if self
+                .cancel_warm_claim_inner(workspace, &record.payload.route, true)
+                .await?
+            {
+                inventory.retired.push(retirement);
+            }
+        }
+        Ok(inventory)
+    }
+
+    pub(super) async fn cancel_abandoned_warm_claims(
+        &self,
+        records: &BTreeMap<String, AssignmentRecord>,
+    ) -> bool {
+        let mut changed = false;
+        for record in records.values().filter(|record| {
+            record.payload.prepared
+                && record.payload.phase == RecordPhase::Published
+                && !record.payload.claim_handle.is_empty()
+        }) {
+            match self
+                .cancel_warm_claim_inner(&record.payload.workspace, &record.payload.route, true)
+                .await
+            {
+                Ok(cancelled) => changed |= cancelled,
+                Err(error) => {
+                    warn!(route = %record.payload.route, %error, "warm claim cancellation will be reconciled");
+                }
+            }
+        }
+        changed
+    }
+
+    pub(super) async fn cancel_warm_claim(
+        &self,
+        workspace: &str,
+        route: &str,
+    ) -> Result<bool, String> {
+        self.cancel_warm_claim_inner(workspace, route, false).await
+    }
+
+    async fn cancel_warm_claim_inner(
+        &self,
+        workspace: &str,
+        route: &str,
+        only_abandoned: bool,
+    ) -> Result<bool, String> {
+        for _ in 0..TRANSITION_ATTEMPTS {
+            let record = self
+                .assignment(route)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("warm claim disappeared")?;
+            if record.payload.workspace != workspace || record.payload.dedicated != self.dedicated {
+                return Err("warm claim cancellation scope mismatch".into());
+            }
+            if !record.payload.prepared {
+                return Ok(false);
+            }
+            if record.payload.phase == RecordPhase::Retired {
+                return Ok(true);
+            }
+            if record.payload.claim_handle.is_empty() {
+                return Err("runtime has no warm claim to cancel".into());
+            }
+            let bytes = self.load_material(&claim_material(&record.payload)).await?;
+            let intent: WarmClaimIntent =
+                serde_json::from_slice(&bytes).map_err(|_| "invalid persisted warm claim")?;
+            let mut writes = Vec::new();
+            if let Some(row) = self
+                .store
+                .get(Sandbox::object_type(), &intent.registration.sandbox_id)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                let mut sandbox =
+                    Sandbox::decode(row.payload.as_slice()).map_err(|e| e.to_string())?;
+                if only_abandoned && claim_is_current(&sandbox, workspace, &intent)? {
+                    return Ok(false);
+                }
+                if let Some(mut link) = read_claim_link(&sandbox)?
+                    && sandbox.object_workspace() == workspace
+                    && link.route == route
+                    && link.generation == intent.expected_generation
+                    && link.auth_epoch == intent.expected_auth_epoch
+                {
+                    link.decision = LaunchDecision::Cancelled;
+                    write_claim_link(&mut sandbox, &link)?;
+                }
+                // Even an unchanged Sandbox must fence a concurrent lifecycle edit.
+                writes.push(AtomicWrite::Update {
+                    object_type: Sandbox::object_type().into(),
+                    id: intent.registration.sandbox_id.clone(),
+                    payload: sandbox.encode_to_vec(),
+                    expected_version: row.resource_version,
+                });
+            }
+            if self.commit_retirement(&record, writes).await? {
+                return Ok(true);
+            }
+        }
+        Err("warm claim changed repeatedly during cancellation".into())
+    }
+
+    pub(super) async fn runtime_assignment(
+        &self,
+        workspace: &str,
+        route: &str,
+    ) -> Result<Option<SandboxInstanceAssignment>, String> {
+        let Some(record) = self.assignment(route).await.map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let payload = &record.payload;
+        if payload.workspace != workspace || payload.dedicated != self.dedicated {
+            return Err("runtime belongs to another workspace or supervisor topology".into());
+        }
+        if payload.phase != RecordPhase::Published {
+            return Err("runtime is not published".into());
+        }
+        Ok(Some(SandboxInstanceAssignment {
+            route: payload.route.clone(),
+            sandbox_id: payload.sandbox_id.clone(),
+            generation: payload.generation.clone(),
+            prepared: payload.prepared,
+            launch_material: self.load_material(payload).await?,
+            ..Default::default()
+        }))
+    }
+
+    pub(super) async fn warm_claim(
+        &self,
+        workspace: &str,
+        route: &str,
+    ) -> Result<WarmClaimIntent, String> {
+        let record = self
+            .assignment(route)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("warm claim has no preparation")?;
+        if record.payload.workspace != workspace
+            || record.payload.dedicated != self.dedicated
+            || record.payload.phase != RecordPhase::Published
+            || record.payload.claim_handle.is_empty()
+        {
+            return Err("warm claim is unavailable".into());
+        }
+        let bytes = self.load_material(&claim_material(&record.payload)).await?;
+        serde_json::from_slice(&bytes).map_err(|_| "invalid persisted warm claim".into())
+    }
+
+    pub(super) async fn record_warm_claim(
+        &self,
+        workspace: &str,
+        intent: WarmClaimIntent,
+    ) -> Result<WarmClaimIntent, String> {
+        intent.registration.validate().map_err(|e| e.to_string())?;
+        let route = &intent.registration.route;
+        let record = self
+            .assignment(route)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("warm claim has no preparation")?;
+        if record.payload.workspace != workspace
+            || record.payload.dedicated != self.dedicated
+            || record.payload.phase != RecordPhase::Published
+        {
+            return Err("warm preparation is unavailable".into());
+        }
+        if !record.payload.claim_handle.is_empty() {
+            let previous = self.warm_claim(workspace, route).await?;
+            return matching_claim(intent, previous);
+        }
+        if !record.payload.prepared {
+            return Err("runtime is already assigned".into());
+        }
+        let assignment = self
+            .runtime_assignment(workspace, route)
+            .await?
+            .ok_or("warm preparation disappeared")?;
+        PreparedRuntimeRegistration::from_assignment(&assignment)
+            .map_err(|e| e.to_string())?
+            .validate_activation(&intent.registration)
+            .map_err(|e| e.to_string())?;
+        let sandbox_row = self
+            .store
+            .get(Sandbox::object_type(), &intent.registration.sandbox_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("claiming sandbox disappeared")?;
+        let mut sandbox =
+            Sandbox::decode(sandbox_row.payload.as_slice()).map_err(|e| e.to_string())?;
+        let identity = sandbox
+            .metadata
+            .as_ref()
+            .and_then(|meta| PersistedSandboxIdentity::read(&meta.annotations).ok())
+            .ok_or("invalid claiming sandbox identity")?;
+        if sandbox.object_workspace() != workspace
+            || identity.runtime_generation != intent.expected_generation
+            || identity.auth_epoch != intent.expected_auth_epoch
+            || identity.prepared_runtime.is_some()
+            || crate::compute::provisioning_deadline::timed_out(&sandbox)
+            || !matches!(
+                SandboxPhase::try_from(sandbox.phase()),
+                Ok(SandboxPhase::Provisioning | SandboxPhase::Starting)
+            )
+        {
+            return Err("claim intent does not match the current sandbox launch".into());
+        }
+        let annotations = &mut sandbox
+            .metadata
+            .as_mut()
+            .ok_or("sandbox metadata missing")?
+            .annotations;
+        if let Some(previous) = annotations.get(CLAIM_LINK) {
+            let link: ClaimLink =
+                serde_json::from_str(previous).map_err(|_| "invalid warm claim link")?;
+            if link.generation == intent.expected_generation
+                && link.auth_epoch == intent.expected_auth_epoch
+                && (link.route != *route || link.decision != LaunchDecision::Warm)
+            {
+                return Err("this sandbox launch already has a different warm claim intent".into());
+            }
+        }
+        annotations.insert(
+            CLAIM_LINK.into(),
+            serde_json::to_string(&ClaimLink {
+                route: route.clone(),
+                generation: intent.expected_generation.clone(),
+                auth_epoch: intent.expected_auth_epoch,
+                decision: LaunchDecision::Warm,
+            })
+            .map_err(|e| e.to_string())?,
+        );
+        let bytes = encode(&intent)?;
+        if bytes.len() > openshell_supervisor_control::MAX_LAUNCH_MATERIAL_BYTES {
+            return Err("warm claim intent is too large".into());
+        }
+        // Use the physical route's owner even after activation. Each writer gets
+        // a fresh credential path, and the staging row fences late publication.
+        let mut staged_payload = claim_material(&record.payload);
+        let handle = self.store_material(&staged_payload, &bytes).await?;
+        staged_payload.material_handle = handle.encode_to_vec();
+        staged_payload.activation_candidate = true;
+        staged_payload.phase = RecordPhase::Admitting;
+        let candidate = Uuid::new_v4().to_string();
+        let staged = match self
+            .store
+            .put_if(
+                MATERIAL_CANDIDATE_OBJECT_TYPE,
+                &candidate,
+                &candidate,
+                "",
+                &encode(&staged_payload)?,
+                None,
+                WriteCondition::MustCreate,
+            )
+            .await
+        {
+            Ok(staged) => staged,
+            Err(error) => {
+                let _ = self.delete_material(&staged_payload, handle).await;
+                return Err(format!("stage warm claim: {error}"));
+            }
+        };
+        #[cfg(test)]
+        {
+            let gate = lock(&self.staged_gate).take();
+            if let Some((reached, resume)) = gate {
+                let _ = reached.send(());
+                let _ = resume.await;
+            }
+        }
+        let mut payload = record.payload.clone();
+        payload
+            .claim_handle
+            .clone_from(&staged_payload.material_handle);
+        let result = self
+            .store
+            .write_atomically(&[
+                AtomicWrite::Update {
+                    object_type: ASSIGNMENT_OBJECT_TYPE.into(),
+                    id: assignment_object_id(route, &payload.writer),
+                    payload: encode(&payload)?,
+                    expected_version: record.resource_version,
+                },
+                // Choose one intent for this logical launch before any CR binding.
+                // This also fences concurrent stop, restart, or another spare.
+                AtomicWrite::Update {
+                    object_type: Sandbox::object_type().into(),
+                    id: intent.registration.sandbox_id.clone(),
+                    payload: sandbox.encode_to_vec(),
+                    expected_version: sandbox_row.resource_version,
+                },
+                AtomicWrite::Delete {
+                    object_type: MATERIAL_CANDIDATE_OBJECT_TYPE.into(),
+                    id: candidate,
+                    expected_version: staged.resource_version,
+                },
+            ])
+            .await;
+        match result {
+            Ok(_) => Ok(intent),
+            Err(PersistenceError::Conflict { .. }) => {
+                let previous = self.warm_claim(workspace, route).await?;
+                matching_claim(intent, previous)
+            }
+            Err(error) => Err(format!("persist warm claim: {error}")),
+        }
+    }
+
     /// Read only a committed, still-current launch for this physical supervisor.
     /// A prepared row is a pending registration, never a reason to reconnect.
     pub(crate) async fn dedicated_registration(
@@ -214,6 +765,7 @@ impl SupervisorPool {
             return Ok(PreparationRelease::Released);
         }
         if !record.payload.prepared
+            || !record.payload.claim_handle.is_empty()
             || record.payload.phase != RecordPhase::Published
             || record.payload.workspace != revision.workspace
             || record.payload.writer != revision.reservation_id
@@ -288,6 +840,7 @@ impl SupervisorPool {
                     .ok_or("invalid supervisor pool assignment during retirement")?;
                 let payload = &record.payload;
                 if !payload.prepared
+                    || !payload.claim_handle.is_empty()
                     || !payload.sandbox_id.is_empty()
                     || payload.workspace != retirement.workspace
                     || payload.generation != retirement.generation.as_str()
@@ -313,6 +866,7 @@ impl SupervisorPool {
                     prepared: true,
                     prepared_epoch: retirement.auth_epoch.get(),
                     activation_candidate: false,
+                    claim_handle: Vec::new(),
                 };
                 match self
                     .store
@@ -347,6 +901,14 @@ impl SupervisorPool {
     pub(super) async fn activate_runtime(
         &self,
         request: ActivationRequest,
+    ) -> Result<SandboxInstanceAssignment, String> {
+        self.activate_runtime_attempt(request, 4).await
+    }
+
+    async fn activate_runtime_attempt(
+        &self,
+        request: ActivationRequest,
+        retries: u8,
     ) -> Result<SandboxInstanceAssignment, String> {
         let assignment = &request.assignment;
         let mut registration =
@@ -477,6 +1039,13 @@ impl SupervisorPool {
                 "the claim does not match the prepared workspace, generation, and epoch".into(),
             );
         }
+        if let Some(link) = read_claim_link(&sandbox)?
+            && link.generation == request.expected_generation
+            && link.auth_epoch == request.expected_auth_epoch
+            && (link.decision != LaunchDecision::Warm || link.route != assignment.route)
+        {
+            return Err("activation lost the sandbox launch decision".into());
+        }
         let mut binding = PreparedRuntimeIdentity::new(
             prepared.runtime_descriptor.session_id,
             prepared.runtime_descriptor.resource_claims.clone(),
@@ -590,7 +1159,7 @@ impl SupervisorPool {
             },
             AtomicWrite::Delete {
                 object_type: MATERIAL_CANDIDATE_OBJECT_TYPE.into(),
-                id: candidate,
+                id: candidate.clone(),
                 expected_version: staged.resource_version,
             },
             material_candidate(&obsolete, &record.payload)?,
@@ -608,11 +1177,26 @@ impl SupervisorPool {
         }
         // Keep staged material on failure: even an ambiguous database outcome
         // is safe. Collection fences the staging row before deleting its secret.
-        let results = self
-            .store
-            .write_atomically(&writes)
-            .await
-            .map_err(|e| format!("claim prepared runtime: {e}"))?;
+        let results = match self.store.write_atomically(&writes).await {
+            Ok(results) => results,
+            Err(error @ PersistenceError::Conflict { .. }) if retries > 0 => {
+                // A concurrent reconciliation can refresh the owner or publish
+                // this same claim. Reload all fences before retrying, unless
+                // collection has already fenced this activation's material.
+                let candidate_unchanged = self
+                    .store
+                    .get(MATERIAL_CANDIDATE_OBJECT_TYPE, &candidate)
+                    .await
+                    .map_err(|e| format!("reload activation candidate: {e}"))?
+                    .is_some_and(|row| row.resource_version == staged.resource_version);
+                if !candidate_unchanged {
+                    return Err(format!("claim prepared runtime: {error}"));
+                }
+                self.discard_candidate(&candidate, &staged_payload).await;
+                return Box::pin(self.activate_runtime_attempt(request, retries - 1)).await;
+            }
+            Err(error) => return Err(format!("claim prepared runtime: {error}")),
+        };
         lock(&self.materials).insert(assignment.route.clone(), assignment.clone());
         self.claim_changed.notify_waiters();
         if let Some(activated_owner) = activated_owner {
@@ -673,11 +1257,23 @@ impl SupervisorPool {
     }
 
     async fn try_retire_assignment(&self, record: &AssignmentRecord) -> Result<bool, String> {
+        if record.payload.prepared && !record.payload.claim_handle.is_empty() {
+            return Ok(false);
+        }
+        self.commit_retirement(record, Vec::new()).await
+    }
+
+    async fn commit_retirement(
+        &self,
+        record: &AssignmentRecord,
+        mut writes: Vec<AtomicWrite>,
+    ) -> Result<bool, String> {
         let candidate = Uuid::new_v4().to_string();
         let retire = if record.payload.prepared || record.payload.prepared_epoch != 0 {
             let payload = AssignmentPayload {
                 phase: RecordPhase::Retired,
                 material_handle: Vec::new(),
+                claim_handle: Vec::new(),
                 ..record.payload.clone()
             };
             AtomicWrite::Update {
@@ -693,7 +1289,13 @@ impl SupervisorPool {
                 expected_version: record.resource_version,
             }
         };
-        let mut writes = vec![retire];
+        writes.push(retire);
+        if !record.payload.claim_handle.is_empty() {
+            writes.push(material_candidate(
+                &Uuid::new_v4().to_string(),
+                &claim_material(&record.payload),
+            )?);
+        }
         // Reserved/admitting recordings already have a candidate (or are still
         // writing one). Their original version can no longer publish it.
         let collect = record.payload.phase == RecordPhase::Published;
@@ -712,6 +1314,67 @@ impl SupervisorPool {
             Err(error) => Err(format!("withdraw runtime assignment: {error}")),
         }
     }
+}
+
+fn read_claim_link(sandbox: &Sandbox) -> Result<Option<ClaimLink>, String> {
+    sandbox
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.annotations.get(CLAIM_LINK))
+        .map(|value| serde_json::from_str(value).map_err(|_| "invalid warm claim link".into()))
+        .transpose()
+}
+
+fn write_claim_link(sandbox: &mut Sandbox, link: &ClaimLink) -> Result<(), String> {
+    sandbox
+        .metadata
+        .as_mut()
+        .ok_or("sandbox metadata missing")?
+        .annotations
+        .insert(
+            CLAIM_LINK.into(),
+            serde_json::to_string(link).map_err(|e| e.to_string())?,
+        );
+    Ok(())
+}
+
+fn launch_is_current(sandbox: &Sandbox, lookup: &WarmClaimLookup) -> bool {
+    let identity = sandbox
+        .metadata
+        .as_ref()
+        .and_then(|meta| PersistedSandboxIdentity::read(&meta.annotations).ok());
+    sandbox.object_workspace() == lookup.workspace
+        && !crate::compute::provisioning_deadline::timed_out(sandbox)
+        && matches!(
+            SandboxPhase::try_from(sandbox.phase()),
+            Ok(SandboxPhase::Provisioning | SandboxPhase::Starting)
+        )
+        && identity.is_some_and(|identity| {
+            identity.runtime_generation == lookup.expected_generation
+                && identity.auth_epoch == lookup.expected_auth_epoch
+                && identity.prepared_runtime.is_none()
+        })
+}
+
+fn claim_is_current(
+    sandbox: &Sandbox,
+    workspace: &str,
+    intent: &WarmClaimIntent,
+) -> Result<bool, String> {
+    Ok(launch_is_current(
+        sandbox,
+        &WarmClaimLookup {
+            workspace: workspace.into(),
+            sandbox_id: intent.registration.sandbox_id.clone(),
+            expected_generation: intent.expected_generation.clone(),
+            expected_auth_epoch: intent.expected_auth_epoch,
+        },
+    ) && read_claim_link(sandbox)?.is_some_and(|link| {
+        link.decision == LaunchDecision::Warm
+            && link.route == intent.registration.route
+            && link.generation == intent.expected_generation
+            && link.auth_epoch == intent.expected_auth_epoch
+    }))
 }
 
 /// Keep the launch's SSH identity, telemetry, and session rotation, while the
@@ -739,4 +1402,40 @@ fn material_candidate(id: &str, payload: &AssignmentPayload) -> Result<AtomicWri
         workspace: String::new(),
         payload: encode(payload)?,
     })
+}
+
+/// The intent is always owned by the physical route, including after activation.
+fn claim_material(payload: &AssignmentPayload) -> AssignmentPayload {
+    AssignmentPayload {
+        prepared: true,
+        sandbox_id: String::new(),
+        material_handle: payload.claim_handle.clone(),
+        claim_handle: Vec::new(),
+        activation_candidate: false,
+        ..payload.clone()
+    }
+}
+
+fn matching_claim(
+    mut requested: WarmClaimIntent,
+    previous: WarmClaimIntent,
+) -> Result<WarmClaimIntent, String> {
+    // Attempt-local material and refreshed session tokens do not replace the
+    // winner. Activation issues credentials for the persisted physical binding.
+    replace_session_tokens(
+        &mut requested.registration.auth,
+        previous.registration.auth.clone(),
+    );
+    requested
+        .registration
+        .proxy_ca
+        .clone_from(&previous.registration.proxy_ca);
+    requested
+        .registration
+        .trace_context
+        .clone_from(&previous.registration.trace_context);
+    if encode(&requested)? != encode(&previous)? {
+        return Err("warm runtime already has a different claim intent".into());
+    }
+    Ok(previous)
 }

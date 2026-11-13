@@ -178,6 +178,46 @@ impl std::fmt::Debug for ActivationRequest {
     }
 }
 
+/// Durable intent for one logical Sandbox to adopt a physical runtime.
+/// Sensitive fields live in the gateway credential store, never CR annotations.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarmClaimIntent {
+    pub registration: SandboxInstanceRegistration,
+    pub expected_generation: openshell_core::sandbox_generation::SandboxGenerationId,
+    pub expected_auth_epoch: openshell_core::jwt::CredentialEpoch,
+}
+
+/// Source launch whose pending warm claim must be resolved before cold fallback.
+#[derive(Clone, Debug)]
+pub struct WarmClaimLookup {
+    pub workspace: String,
+    pub sandbox_id: String,
+    pub expected_generation: openshell_core::sandbox_generation::SandboxGenerationId,
+    pub expected_auth_epoch: openshell_core::jwt::CredentialEpoch,
+}
+
+/// A candidate can lose to retirement or another launch without failing create.
+#[derive(Clone, Debug)]
+pub enum WarmClaimReservation {
+    Reserved(Box<WarmClaimIntent>),
+    Unavailable,
+}
+
+/// Gateway-owned input for recovery before the physical CR has been bound.
+#[derive(Clone, Debug)]
+pub struct PendingWarmClaim {
+    pub sandbox: openshell_core::proto::compute::v1::DriverSandbox,
+    pub intent: WarmClaimIntent,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WarmClaimInventory {
+    pub pending: Vec<PendingWarmClaim>,
+    /// Durable fences, including cancelled claims whose CR binding arrived late.
+    pub retired: Vec<PreparationRetirement>,
+}
+
 /// The gateway's durable records of a supervisor pool's instances.
 ///
 /// Installed by the gateway before instances launch, they make the pool's
@@ -185,6 +225,65 @@ impl std::fmt::Debug for ActivationRequest {
 /// replica, whichever replica launched an instance or runs the compute
 /// driver's watch.
 pub trait InstancePlacement: Send + Sync + std::fmt::Debug {
+    fn reserve_warm_claim(
+        &self,
+        workspace: String,
+        intent: WarmClaimIntent,
+    ) -> PlacementFuture<WarmClaimReservation> {
+        let write = self.record_warm_claim(workspace, intent);
+        Box::pin(async move {
+            write
+                .await
+                .map(|intent| WarmClaimReservation::Reserved(Box::new(intent)))
+        })
+    }
+
+    /// Atomically choose cold creation, or return the warm reservation that won.
+    fn choose_cold_launch(
+        &self,
+        _lookup: WarmClaimLookup,
+    ) -> PlacementFuture<Option<WarmClaimIntent>> {
+        Box::pin(async { Err("cold launch arbitration is not supported".into()) })
+    }
+
+    fn pending_warm_claims(&self, _workspace: String) -> PlacementFuture<WarmClaimInventory> {
+        Box::pin(async { Err("pending warm claim inventory is not supported".into()) })
+    }
+
+    /// Cancel an unactivated reservation. False means activation already won.
+    fn cancel_warm_claim(&self, _workspace: String, _route: String) -> PlacementFuture<bool> {
+        Box::pin(async { Err("warm claim cancellation is not supported".into()) })
+    }
+
+    fn warm_claim_for_launch(
+        &self,
+        _lookup: WarmClaimLookup,
+    ) -> PlacementFuture<Option<WarmClaimIntent>> {
+        Box::pin(async { Err("warm claim lookup is not supported".into()) })
+    }
+
+    /// Persist before binding infrastructure. Repeated calls return the winning intent.
+    fn record_warm_claim(
+        &self,
+        _workspace: String,
+        _intent: WarmClaimIntent,
+    ) -> PlacementFuture<WarmClaimIntent> {
+        Box::pin(async { Err("warm claim persistence is not supported".into()) })
+    }
+
+    fn warm_claim(&self, _workspace: String, _route: String) -> PlacementFuture<WarmClaimIntent> {
+        Box::pin(async { Err("warm claim persistence is not supported".into()) })
+    }
+
+    /// Gateway-owned material for a prepared or committed physical route.
+    fn runtime_assignment(
+        &self,
+        _workspace: String,
+        _route: String,
+    ) -> PlacementFuture<Option<crate::proto::SandboxInstanceAssignment>> {
+        Box::pin(async { Err("runtime lookup is not supported".into()) })
+    }
+
     /// Public trust for preparing runtimes without minting tenant credentials.
     fn warm_runtime_trust(&self) -> PlacementFuture<crate::warm_pool::WarmRuntimeTrust> {
         Box::pin(async { Err("warm-pool trust is not supported".into()) })
@@ -354,6 +453,108 @@ impl SharedSupervision {
             .await
     }
 
+    /// Resolve a durable intent even if the driver crashed before binding its CR.
+    pub async fn warm_claim_for_launch(
+        &self,
+        lookup: WarmClaimLookup,
+    ) -> Result<Option<WarmClaimIntent>, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .warm_claim_for_launch(lookup)
+            .await
+    }
+
+    pub async fn record_warm_claim(
+        &self,
+        workspace: &str,
+        intent: WarmClaimIntent,
+    ) -> Result<WarmClaimIntent, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .record_warm_claim(workspace.into(), intent)
+            .await
+    }
+
+    pub async fn reserve_warm_claim(
+        &self,
+        workspace: &str,
+        intent: WarmClaimIntent,
+    ) -> Result<WarmClaimReservation, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .reserve_warm_claim(workspace.into(), intent)
+            .await
+    }
+
+    pub async fn choose_cold_launch(
+        &self,
+        lookup: WarmClaimLookup,
+    ) -> Result<Option<WarmClaimIntent>, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .choose_cold_launch(lookup)
+            .await
+    }
+
+    pub async fn pending_warm_claims(&self, workspace: &str) -> Result<WarmClaimInventory, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .pending_warm_claims(workspace.into())
+            .await
+    }
+
+    pub async fn cancel_warm_claim(&self, workspace: &str, route: &str) -> Result<bool, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .cancel_warm_claim(workspace.into(), route.into())
+            .await
+    }
+
+    pub async fn warm_claim(
+        &self,
+        workspace: &str,
+        route: &str,
+    ) -> Result<WarmClaimIntent, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .warm_claim(workspace.into(), route.into())
+            .await
+    }
+
+    pub async fn runtime_assignment(
+        &self,
+        workspace: &str,
+        route: &str,
+    ) -> Result<Option<crate::proto::SandboxInstanceAssignment>, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .runtime_assignment(workspace.into(), route.into())
+            .await
+    }
+
+    /// Activate exactly the gateway-persisted intent after infrastructure binding.
+    pub async fn activate_warm_claim(
+        &self,
+        workspace: &str,
+        route: &str,
+    ) -> Result<SandboxInstanceRegistration, String> {
+        let intent = self.warm_claim(workspace, route).await?;
+        self.activate(
+            &intent.registration,
+            intent.expected_generation,
+            intent.expected_auth_epoch,
+        )
+        .await
+    }
+
     /// Readiness of a spare, separate from readiness of a supervising Sandbox.
     /// Only the current owner's acknowledged report is accepted.
     #[must_use]
@@ -391,8 +592,11 @@ impl SharedSupervision {
         self.controller.credential()
     }
 
-    /// Reserve capacity durably before the driver releases the runtime to connect.
-    /// The gateway's reservation is authoritative across gateway restarts.
+    /// Reserve capacity durably after every bootstrap delivery write succeeds,
+    /// before the driver releases the runtime to connect. This is the recoverable
+    /// preparation milestone. Warm pooling requires no additional workspace
+    /// Secret-read permissions: incomplete attempts expire into retirement;
+    /// completed attempts recover from this gateway-owned record.
     pub async fn prepare(&self, request: PreparationRequest) -> Result<(), String> {
         request.registration.validate().map_err(|e| e.to_string())?;
         let placement = self
@@ -452,7 +656,7 @@ impl SharedSupervision {
     /// `expected_generation` and `expected_auth_epoch` name the Sandbox launch
     /// being replaced; the registration names the prepared physical generation.
     /// The gateway replaces its session tokens and returns the committed launch
-    /// material. Persist that result for driver recovery, never the input tokens.
+    /// material. Warm claims recover that result from gateway persistence.
     pub async fn activate(
         &self,
         registration: &SandboxInstanceRegistration,

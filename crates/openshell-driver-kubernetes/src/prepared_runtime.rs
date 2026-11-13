@@ -18,7 +18,7 @@ use kube::api::{ObjectMeta, PostParams};
 use openshell_core::SandboxSessionId;
 use openshell_isolation_interface::contract::BackendError;
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, SandboxTlsClientConfig, SandboxTlsMaterial, SandboxTransport,
+    BoundaryListener, SandboxTlsClientConfig, SandboxTlsMaterial, SandboxTransport,
     generate_sandbox_tls_material,
 };
 use openshell_supervisor_control::{
@@ -53,69 +53,51 @@ pub struct PreparedRuntimeBootstrap {
 }
 
 impl PreparedRuntimeBootstrap {
-    /// Persist (or recover) per-Pod bootstrap material, then reserve host capacity.
-    ///
-    /// `provision` builds both protocol endpoints using the supplied TLS pin and
-    /// freshly verified Kubernetes resource coordinates. It must be deterministic
-    /// for those inputs and call `provision_prepared`. After a concurrent Secret
-    /// creation it may be called again with the winner's pin.
-    ///
-    /// This operation never removes the Pod's gate. Retry with the same coordinates: an API
-    /// timeout may have committed either the Secret or the reservation. Never
-    /// delete material or withdraw a route unconditionally on an error. Only the
-    /// controller may release the gate, after revalidating the current Pod UID,
-    /// admission and fences. The returned registration contains no private key.
-    pub async fn prepare<F>(
+    /// Complete all bootstrap writes before recording the public preparation.
+    /// A completed preparation needs no Secret reads. An incomplete attempt is
+    /// disposable: conflicts and ambiguous creates must never adopt another key.
+    pub async fn prepare<F, C, Fut>(
         &self,
         client: kube::Client,
         supervision: &SharedSupervision,
         provision: F,
+        complete: C,
     ) -> Result<PreparedRuntimeRegistration, KubernetesDriverError>
     where
         F: Fn(
             SandboxTlsClientConfig,
         ) -> Result<KubernetesSandboxRuntimeBoundaryProvisioning, BackendError>,
+        C: FnOnce(PreparedRuntimeRegistration) -> Fut,
+        Fut: Future<Output = Result<(), KubernetesDriverError>>,
     {
         self.validate()?;
-        let secrets = Api::<Secret>::namespaced(client, &self.namespace);
-        let secret = if let Some(secret) = secrets
-            .get_opt(&self.secret_name)
+        let route = format!("rt-{}", self.session_id);
+        if let Some(assignment) = supervision
+            .runtime_assignment(&self.workspace, &route)
             .await
-            .map_err(KubernetesDriverError::from_kube)?
+            .map_err(KubernetesDriverError::Precondition)?
         {
-            secret
-        } else {
-            let material = generate_sandbox_tls_material(self.session_id).map_err(backend_error)?;
-            let provisioning = provision(tls_pin(&material)).map_err(backend_error)?;
-            let request = self.request(&provisioning)?;
-            let candidate = self.secret(&provisioning, &request.registration, material)?;
-            match secrets.create(&PostParams::default(), &candidate).await {
-                Ok(secret) => secret,
-                // Another replica won. Its key is authoritative; never replace it.
-                Err(kube::Error::Api(error)) if error.code == 409 => secrets
-                    .get(&self.secret_name)
-                    .await
-                    .map_err(KubernetesDriverError::from_kube)?,
-                Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+            let registration = PreparedRuntimeRegistration::from_assignment(&assignment)
+                .map_err(|_| invalid("runtime is no longer an unclaimed preparation"))?;
+            let expected =
+                provision(registration.runtime_descriptor.tls.clone()).map_err(backend_error)?;
+            if self.request(&expected)?.registration != registration {
+                return Err(invalid(
+                    "prepared bootstrap no longer matches observed runtime coordinates",
+                ));
             }
-        };
-        let registration = self.read_registration(&secret)?;
-        let expected =
-            provision(registration.runtime_descriptor.tls.clone()).map_err(backend_error)?;
-        let request = self.request(&expected)?;
-        let stored_config: BoundaryConfig =
-            serde_json::from_slice(secret_value(&secret, BOUNDARY_CONFIG_KEY)?)
-                .map_err(|_| invalid("invalid prepared boundary configuration"))?;
-        if request.registration != registration
-            || serde_json::to_value(stored_config)
-                .map_err(|_| invalid("invalid boundary configuration"))?
-                != serde_json::to_value(&expected.boundary_config)
-                    .map_err(|_| invalid("invalid boundary configuration"))?
-        {
-            return Err(invalid(
-                "prepared bootstrap no longer matches observed runtime coordinates",
-            ));
+            return Ok(registration);
         }
+        let material = generate_sandbox_tls_material(self.session_id).map_err(backend_error)?;
+        let provisioning = provision(tls_pin(&material)).map_err(backend_error)?;
+        let request = self.request(&provisioning)?;
+        let candidate = self.secret(&provisioning, &request.registration, material)?;
+        Api::<Secret>::namespaced(client, &self.namespace)
+            .create(&PostParams::default(), &candidate)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        complete(request.registration.clone()).await?;
+        let registration = request.registration.clone();
         supervision
             .prepare(request)
             .await

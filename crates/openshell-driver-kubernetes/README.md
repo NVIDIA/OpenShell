@@ -199,11 +199,12 @@ It supplies no logical Sandbox ID, gateway session token, or workload credential
 The controller must persist the physical session, generation and route first,
 admit the Sandbox and gated Pod, and verify the namespace and network fences.
 The provisioning callback builds the boundary configuration and descriptor from
-those observations using the TLS pin supplied by the helper. On retry, the helper
-reads the existing Secret, checks its workspace and Pod UID ownership, and compares
-the complete bootstrap configuration with the expected one. Concurrent creators
-use the winning Secret's identity. Read failures, changed inputs and capacity
-refusals fail without replacing keys, deleting resources or releasing the gate.
+those observations using the generated TLS pin. All bootstrap Secret creates,
+including managed image-pull copies and dedicated supervisor material, finish
+before the gateway records the preparation. Recovery reads that public record
+and compares its descriptor with current resource observations. Incomplete
+attempts remain gated and expire into retirement; a conflicting or ambiguous
+Secret create never authorizes adopting its contents.
 
 `driver::warm_pool` now owns the physical provisioning sequence through
 `prepare_warm_runtime`, `resume_warm_runtime`, and `warm_runtime_inventory`. It
@@ -219,14 +220,14 @@ shared-supervisor capacity before releasing the scheduling gate. Immediately
 before release it rechecks the CR, Pod, resource admission, namespace UID and
 network fences. Pod and CR mutations carry resource-version preconditions;
 gate removal preserves gates owned by other controllers. Lost responses recover
-through the CR journal and existing immutable Secret. Replacements, changed
+through the CR journal and gateway preparation record. Replacements, changed
 requests and premature gate removal fail closed. A replacement needs a fresh
 session, generation, route and Secret. Pool controllers must retain request
 identities across uncertain writes and never reuse retired names or sessions.
 
-`retire_warm_runtime` journals retirement before asking the gateway to fence the
-physical route permanently, including when capacity admission never completed.
-Only a confirmed fence permits foreground deletion of the CR with UID and
+`retire_warm_runtime` asks the gateway to fence the physical route permanently,
+including when capacity admission never completed. Only a confirmed fence permits
+marking the CR retiring and deleting it in the foreground with UID and
 resource-version preconditions. Kubernetes collects its Pod, the Pod-owned
 bootstrap Secret and the CR-owned control policy; namespace-wide network fences
 remain. Ambiguous failures leave the journal for retry. Concurrent claims,
@@ -234,11 +235,11 @@ replaced resources and changed reservations do not authorize deletion. If the
 CR is already absent, the controller must reconcile any remaining gateway
 preparation independently from its durable inventory.
 
-These operations support dedicated and shared supervisors in shared and operator
-workspace modes. Managed namespaces need bootstrap journaling in the gateway
-namespace to preserve their create-only Secret permissions. Inventory includes preparing, retiring
-and deleting resources; a released gate does not mean that the supervisor has
-authenticated the runtime or that it is claimable.
+These operations support dedicated and shared supervisors in shared, operator
+and managed workspaces. Warm pooling requires no additional workspace Secret-read
+permissions. Secrets deliver bootstrap material to Pods; gateway persistence owns
+preparation and claim recovery. Inventory includes preparing, retiring and deleting
+resources; a released gate does not prove that a runtime is claimable.
 
 Template-driven pooling is enabled by default through `warm_pool.enabled`.
 The gateway supplies stored template targets through the existing in-process
@@ -255,9 +256,6 @@ operator configurations. The fingerprint covers canonical driver settings,
 workload shape and public verification keys. Deleted templates leave journal
 tombstones that drain old inventory, even after restart. Recreating a name gets a
 new pool. Disabling pooling drains spares without affecting claimed sandboxes.
-Recovery requires namespace-scoped Secret `get`, granted by default in shared
-mode and by the operator workspace chart's `gateway.warmPoolSecretReads` setting.
-Kubernetes cannot constrain generated names by prefix; no list/watch is added.
 
 Each pool attempts at most four operations concurrently per pass, retries
 unfinished operations no sooner than 30 seconds later, and bounds an operation
@@ -279,7 +277,6 @@ the process holding the authenticated connection.
 The loop counts reserved or released runtimes as pending until then. A missing
 owner, preparation timeout, maximum age or
 60 seconds without a ready observation retires the spare. Template workloads pass through the normal driver conversion and admission.
-Managed namespace pooling remains unsupported.
 
 A dedicated supervisor starts with public runtime coordinates and gateway TLS trust
 mounted before the scheduling gate opens. It holds the authenticated runtime
@@ -298,18 +295,36 @@ original physical supervisor; restart provisions a fresh generation.
 
 Sandbox creation from a template selects a ready spare from that template's
 current pool revision in the same workspace. Its rendered Pod shape and child environment must match exactly;
-non-matching requests and empty pools use cold creation. The driver writes a
-Pod-owned immutable claim Secret, then CAS-labels the physical CR with the logical
-Sandbox ID before gateway activation. Retirement and competing claims use the
-same CR fence. After this point an error never falls back to a second runtime.
+non-matching requests and empty pools use cold creation. A create that loses a
+spare to another sandbox or to retirement tries the next candidate only after
+gateway persistence confirms the outcome. Cold selection commits a launch decision
+that fences delayed warm reservations. An ambiguous failure cannot fall back. The driver writes a
+durable claim intent through `SharedSupervision`, then CAS-labels the physical CR
+with the logical Sandbox ID before gateway activation. Reservation and retirement
+compete on the gateway assignment version. Retirement must win before it marks or
+deletes the CR; a committed reservation excludes that runtime from pool maintenance.
+After reservation an error never falls back to a second runtime.
 Activation atomically replaces the proposed cold identity with the physical
-binding and canonical credentials. The canonical registration is persisted under
-the logical Sandbox's generation Secret name for existing recovery. Reconciliation
-finishes interrupted claims. Restart uses a new generation and updates the Pod's
-pair label; the original physical CR name remains unchanged.
+binding and canonical credentials. Intent and committed material live in the
+existing gateway credential store, with references in gateway assignment records.
+The CR stores only the intent's route. A link on the logical launch selects one
+intent before CR binding; retries resolve it before considering cold creation,
+even when pooling has been disabled. Reconciliation discovers pending claims from
+gateway records even before CR binding. It cancels unactivated claims whose launch
+ends, times out, or loses its physical runtime. Cancellation fences activation and
+leaves a terminal launch decision; a delayed CR binding is collected using the
+retirement tombstone. Recovery never falls back to workspace Secret reads. Retirement
+fences delayed writers before collecting their credential material. Restart uses
+a new generation and updates the Pod's pair label; the original physical CR name remains unchanged.
+
+Development deployments using the earlier Secret-backed claim format must finish
+pending claims with that gateway before upgrading. The driver rejects those
+references explicitly; it does not read legacy claim Secrets or discard a
+potentially activated workload.
 
 The focused gateway-backed claim E2E uses fresh branch images and checks physical
-Pod reuse, refill, exec, and stop/start with a new identity:
+Pod reuse, gateway restart recovery before and after claiming, refill, exec,
+stop/start with a new identity, and draining without workspace Secret reads:
 
 ```shell
 OPENSHELL_E2E_KUBE_TLS=1 \
@@ -317,6 +332,12 @@ OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-supervisor.yaml:
 e2e/with-kube-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml \
   --features e2e-kubernetes-shared-supervisor --test kubernetes_warm_pool -- --ignored --nocapture
 ```
+
+Add `ci/values-workspace-managed.yaml` to the values list to exercise managed
+namespaces and generation image-pull copies. For operator workspaces, add
+`ci/values-workspace-operator.yaml` and set `OPENSHELL_E2E_WARM_OPERATOR=1`; the
+test installs the workspace chart in the test cluster's default namespace.
+Omit `ci/values-supervisor.yaml` to test dedicated supervisors.
 
 The Kubernetes API integration test exercises real Sandbox CRD defaulting, Pod
 creation, Secret ownership, gate release, journal recovery and conditional

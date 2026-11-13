@@ -64,10 +64,8 @@ rules:
     verbs: ["create", "get"]
   - apiGroups: [""]
     resources: ["secrets"]
-    # Warm-pool recovery reads immutable generation-specific bootstrap and
-    # claim Secrets. RBAC cannot restrict GET by a generated name prefix.
-    # Keep reads when pooling is disabled so existing spares can drain.
-    verbs: ["create", "delete", "get"]
+    # Warm pooling uses gateway persistence for recovery.
+    verbs: ["create", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]
