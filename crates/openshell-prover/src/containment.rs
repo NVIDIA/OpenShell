@@ -569,9 +569,14 @@ fn solve_network_mode(
         }
         SatResult::Sat => solver
             .get_model()
-            .and_then(|model| counterexample_from_model(&model, &action, binary_identity_required))
-            .filter(|counterexample| {
-                counterexample_satisfies_predicate(boundary, candidate, counterexample)
+            .and_then(|model| {
+                network_witness_from_model(
+                    &model,
+                    &action,
+                    boundary,
+                    candidate,
+                    binary_identity_required,
+                )
             })
             .map_or_else(
                 || {
@@ -1022,15 +1027,38 @@ fn methods_match(action: &SymbolicAction, methods: &[&str], path: &str) -> Bool 
     ])
 }
 
+/// Turn a satisfying model into a request that replays against the predicate.
+///
+/// Which model Z3 returns is version-dependent, and some versions pick
+/// characters the runtime never presents to policy, such as the path
+/// "/v1/\0/". When the exact model is not a usable request, try a readable
+/// variant of it. Both are replayed against the full predicate, so a repair
+/// that loses the expansion is rejected rather than reported.
+fn network_witness_from_model(
+    model: &z3::Model,
+    action: &SymbolicAction,
+    boundary: &ContainmentPolicy,
+    candidate: &ContainmentPolicy,
+    binary_identity_required: bool,
+) -> Option<Counterexample> {
+    [model_string_exact, model_string_readable]
+        .into_iter()
+        .filter_map(|read| counterexample_from_model(model, action, binary_identity_required, read))
+        .find(|counterexample| {
+            counterexample_satisfies_predicate(boundary, candidate, counterexample)
+        })
+}
+
 fn counterexample_from_model(
     model: &z3::Model,
     action: &SymbolicAction,
     binary_identity_required: bool,
+    read: fn(&z3::Model, &Z3String) -> Option<String>,
 ) -> Option<Counterexample> {
     let port = model.eval(&action.port, true)?.as_u64()?;
-    let layer = model_string_exact(model, &action.layer)?;
+    let layer = read(model, &action.layer)?;
     let binary = if binary_identity_required {
-        let binary = model_string_exact(model, &action.binary)?;
+        let binary = read(model, &action.binary)?;
         if !is_canonical_runtime_binary_path(&binary) {
             return None;
         }
@@ -1039,7 +1067,7 @@ fn counterexample_from_model(
         None
     };
     let ancestor_binary = if binary_identity_required {
-        let binary = model_string_exact(model, &action.ancestor_binary)?;
+        let binary = read(model, &action.ancestor_binary)?;
         if !is_canonical_runtime_binary_path(&binary) {
             return None;
         }
@@ -1047,7 +1075,7 @@ fn counterexample_from_model(
     } else {
         None
     };
-    let host = model_string_exact(model, &action.host)?;
+    let host = read(model, &action.host)?;
     if !is_canonical_dns_host(&host) {
         return None;
     }
@@ -1057,8 +1085,8 @@ fn counterexample_from_model(
         Protocol::Rest
     };
     let (method, path) = if protocol == Protocol::Rest {
-        let method = model_string_exact(model, &action.method)?;
-        let path = model_string_exact(model, &action.path)?;
+        let method = read(model, &action.method)?;
+        let path = read(model, &action.path)?;
         if !is_http_method(&method) || !is_canonical_rest_path(&path) {
             return None;
         }
@@ -1095,6 +1123,36 @@ fn model_string_exact(model: &z3::Model, value: &Z3String) -> Option<String> {
     }
     let reconstructed = Z3String::from_str(&decoded).ok()?;
     (evaluated.eq(reconstructed).simplify().as_bool() == Some(true)).then_some(decoded)
+}
+
+/// Read a model string with every character outside a small, always-canonical
+/// alphabet replaced by `a`, including the `\u{..}` escapes Z3 uses for
+/// control and non-ASCII characters. The result is only a candidate witness:
+/// callers must replay it against the predicate before reporting it.
+fn model_string_readable(model: &z3::Model, value: &Z3String) -> Option<String> {
+    let serialized = model.eval(value, true)?.as_string()?;
+    let mut unescaped = String::with_capacity(serialized.len());
+    let mut rest = serialized.as_str();
+    while let Some(start) = rest.find("\\u{") {
+        unescaped.push_str(&rest[..start]);
+        unescaped.push('a');
+        rest = rest[start..]
+            .find('}')
+            .map_or("", |end| &rest[start + end + 1..]);
+    }
+    unescaped.push_str(rest);
+    Some(
+        unescaped
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '-' | '_') {
+                    character
+                } else {
+                    'a'
+                }
+            })
+            .collect(),
+    )
 }
 
 fn counterexample_satisfies_predicate(
@@ -3466,6 +3524,36 @@ network_policies:
                 );
             }
         }
+    }
+
+    #[test]
+    fn unreadable_model_paths_are_repaired_and_replayed() {
+        let policy = |selector: &str, rule_path: &str| {
+            parse_policy_str(&format!(
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        path: '{selector}'\n        rules: [{{ allow: {{ method: GET, path: '{rule_path}' }} }}]\n    binaries: [{{ path: /usr/bin/curl }}]\n"
+            ))
+            .unwrap()
+        };
+        let boundary = policy("", "/v1/*");
+        let candidate = policy("/v1/*", "/**");
+        // Pin the model to the kind of witness Z3 4.8 chooses, a control
+        // character in a path segment, whatever version runs this test.
+        let solver = Solver::new();
+        let action = symbolic_action("repair");
+        assert_action_domain(&solver, &action, true);
+        solver.assert(
+            policy_allows(&candidate, &action, true) & !policy_allows(&boundary, &action, true),
+        );
+        solver.assert(action.path.eq(Z3String::from_str("/v1/\u{1}/").unwrap()));
+        assert_eq!(solver.check(), SatResult::Sat);
+        let model = solver.get_model().unwrap();
+
+        assert!(counterexample_from_model(&model, &action, true, model_string_exact).is_none());
+        let witness = network_witness_from_model(&model, &action, &boundary, &candidate, true);
+        let Some(Counterexample::Network { path, .. }) = witness else {
+            panic!("an unreadable path should repair to a replayable witness: {witness:?}");
+        };
+        assert_eq!(path.as_deref(), Some("/v1/a/"));
     }
 
     #[test]
