@@ -310,17 +310,17 @@ async fn main() -> Result<()> {
 
     let listen_mode = compute_driver_listen_mode(&args).map_err(|err| miette::miette!("{err}"))?;
 
-    // Arm procguard so that if the gateway is killed (SIGKILL or crash)
-    // we also die. Without this the driver is reparented to init and
-    // keeps its per-sandbox VM launchers alive forever. Launchers have
-    // their own procguards (armed in `run_vm`) which cascade cleanup of
-    // the libkrun worker the moment this driver exits.
-    if let Err(err) = procguard::die_with_parent() {
-        tracing::warn!(
-            error = %err,
-            "procguard arm failed; gateway crashes may orphan this driver"
-        );
-    }
+    // The managed driver must not serve after its gateway exits. Its own
+    // process group keeps terminal SIGINT away during the gateway shutdown
+    // sweep, so a failed parent-death guard must stop startup instead of
+    // leaving the driver and its VM launchers behind.
+    let expected_gateway_pid = match &listen_mode {
+        ComputeDriverListenMode::Unix {
+            expected_peer_pid, ..
+        } => *expected_peer_pid,
+        ComputeDriverListenMode::Tcp(_) => None,
+    };
+    arm_driver_parent_guard(expected_gateway_pid)?;
 
     let supervisor_otlp = args.otlp.supervisor_otlp();
     let driver = VmDriver::new(VmDriverConfig {
@@ -406,6 +406,43 @@ async fn main() -> Result<()> {
     };
     socket_cleanup.remove_socket_root();
     result
+}
+
+fn arm_driver_parent_guard(expected_gateway_pid: Option<u32>) -> Result<()> {
+    if let Some(expected) = expected_gateway_pid {
+        ensure_gateway_parent(expected)?;
+    }
+
+    // Launchers arm their own procguards in `run_vm`, which cascade cleanup
+    // to libkrun workers when this driver exits.
+    match procguard::die_with_parent() {
+        Ok(()) => {}
+        Err(err) if expected_gateway_pid.is_some() => {
+            return Err(miette::miette!(
+                "failed to arm managed VM driver parent-death guard: {err}"
+            ));
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "procguard arm failed; driver may outlive its parent");
+        }
+    }
+
+    // A subreaper can adopt an orphan before procguard reads getppid(). In
+    // that case it could arm against the subreaper instead of the gateway.
+    if let Some(expected) = expected_gateway_pid {
+        ensure_gateway_parent(expected)?;
+    }
+    Ok(())
+}
+
+fn ensure_gateway_parent(expected: u32) -> Result<()> {
+    let actual = nix::unistd::getppid().as_raw();
+    if i64::from(actual) != i64::from(expected) {
+        return Err(miette::miette!(
+            "expected gateway parent PID {expected}, found {actual}"
+        ));
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {
