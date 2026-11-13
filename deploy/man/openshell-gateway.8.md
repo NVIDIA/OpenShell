@@ -14,7 +14,7 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
-**openshell-gateway** **config preflight** [**--path** *PATH* | **--config-dir** *DIR* | **--** *GATEWAY_ARGS*...]
+**openshell-gateway** **config preflight** [**--path** *PATH* (alias **--config**) | **--config-dir** *DIR* | **--** *GATEWAY_ARGS*...]
 
 # DESCRIPTION
 
@@ -172,7 +172,7 @@ configured in the TOML file passed with **--config**.
 
 Validate a gateway configuration before starting the daemon:
 
-    openshell-gateway config preflight [--path PATH | -- GATEWAY_ARGS...]
+    openshell-gateway config preflight [--path PATH (alias --config) | -- GATEWAY_ARGS...]
 
 With no path, preflight validates a nonempty OPENSHELL_GATEWAY_CONFIG. If that
 variable is unset, it optionally validates an auto-discovered XDG config. The

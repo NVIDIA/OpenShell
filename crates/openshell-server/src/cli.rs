@@ -62,7 +62,9 @@ enum ConfigCommand {
 #[derive(clap::Args, Debug, Default)]
 struct ConfigPreflightArgs {
     /// Explicit configuration path. Overrides `OPENSHELL_GATEWAY_CONFIG` and XDG discovery.
-    #[arg(long, conflicts_with = "gateway_args")]
+    ///
+    /// `--config` is an alias that matches the daemon flag.
+    #[arg(long, visible_alias = "config", conflicts_with = "gateway_args")]
     path: Option<PathBuf>,
 
     /// Explicit drop-in directory. Defaults to `gateway.d` next to the base file.
@@ -2106,6 +2108,30 @@ mod tests {
                 Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
             assert_eq!(cli.run.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
         });
+    }
+
+    #[test]
+    fn preflight_accepts_config_as_an_alias_for_path() {
+        for flag in ["--path", "--config"] {
+            let cli = Cli::try_parse_from([
+                "openshell-gateway",
+                "config",
+                "preflight",
+                flag,
+                "/etc/gateway.toml",
+            ])
+            .unwrap();
+            let Some(super::Commands::Config(super::ConfigArgs {
+                command: super::ConfigCommand::Preflight(args),
+            })) = cli.command
+            else {
+                panic!("expected the preflight subcommand");
+            };
+            assert_eq!(
+                args.path,
+                Some(std::path::PathBuf::from("/etc/gateway.toml"))
+            );
+        }
     }
 
     #[test]
