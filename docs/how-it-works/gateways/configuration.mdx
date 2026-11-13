@@ -132,7 +132,7 @@ Clients that send a `request_id` get a durable admission for each mutation, such
 as sandbox create, start, exec, or delete. A successful admission keeps its slot
 until its replay window ends, and an unresolved one keeps it until an operator
 reconciles it. The gateway deletes expired admissions in the background about
-once a minute. Admissions are counted per caller identity across every replica
+once a minute, and immediately for a caller that reaches the limit. Admissions are counted per caller identity across every replica
 that shares the database. When a caller's admissions reach the limit, the gateway
 rejects new requests with `RESOURCE_EXHAUSTED`. Requests without a `request_id`
 do not use this capacity.

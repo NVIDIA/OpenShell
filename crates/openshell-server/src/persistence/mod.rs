@@ -793,8 +793,9 @@ impl Store {
     }
 
     /// List completed mutation admissions last written at or before
-    /// `cutoff_ms`, oldest first. Admissions are rewritten only once, on
-    /// completion, so `resource_version > 1` marks them for every gateway version.
+    /// `cutoff_ms`, oldest first, optionally for one bucket. Admissions are
+    /// rewritten only once, on completion, so `resource_version > 1` marks them
+    /// for every gateway version.
     #[tracing::instrument(
         name = "store",
         level = "debug",
@@ -803,10 +804,11 @@ impl Store {
     )]
     pub async fn list_completed_mutation_admissions(
         &self,
+        bucket: Option<&str>,
         cutoff_ms: i64,
         limit: u32,
     ) -> PersistenceResult<Vec<mutation_admission::CompletedAdmission>> {
-        store_dispatch_traced!(self.list_completed_mutation_admissions(cutoff_ms, limit))
+        store_dispatch_traced!(self.list_completed_mutation_admissions(bucket, cutoff_ms, limit))
     }
 
     /// Delete mutation admissions by id and mark their buckets for recount.
@@ -820,14 +822,10 @@ impl Store {
         store_dispatch_traced!(self.delete_mutation_admissions(ids))
     }
 
-    /// Backdate a mutation admission's last write to exercise expiry.
+    /// Backdate an object's last write to exercise expiry.
     #[cfg(test)]
-    pub async fn backdate_mutation_admission(
-        &self,
-        id: &str,
-        updated_at_ms: i64,
-    ) -> PersistenceResult<()> {
-        store_dispatch!(self.backdate_mutation_admission(id, updated_at_ms))
+    pub async fn backdate(&self, id: &str, updated_at_ms: i64) -> PersistenceResult<()> {
+        store_dispatch!(self.backdate(id, updated_at_ms))
     }
 
     /// Fetch an object by id.

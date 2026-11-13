@@ -1101,20 +1101,38 @@ RETURNING resource_version, created_at_ms, updated_at_ms
 
     pub async fn list_completed_mutation_admissions(
         &self,
+        bucket: Option<&str>,
         cutoff_ms: i64,
         limit: u32,
     ) -> PersistenceResult<Vec<CompletedAdmission>> {
-        // The object type is a literal so the planner can use the partial index
+        // The object type is a literal so the planner can use the partial indexes
         // from migration 010, whose predicate it must match exactly.
-        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
-            "SELECT id, payload FROM objects
+        let rows: Vec<(String, Vec<u8>)> = match bucket {
+            None => {
+                sqlx::query_as(
+                    "SELECT id, payload FROM objects
 WHERE object_type = 'mutation_admission_v1' AND resource_version > 1 AND updated_at_ms <= $1
 ORDER BY updated_at_ms LIMIT $2",
-        )
-        .bind(cutoff_ms)
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await
+                )
+                .bind(cutoff_ms)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+            }
+            Some(bucket) => {
+                sqlx::query_as(
+                    "SELECT id, payload FROM objects
+WHERE object_type = 'mutation_admission_v1' AND resource_version > 1 AND workspace = $1
+  AND updated_at_ms <= $2
+ORDER BY updated_at_ms LIMIT $3",
+                )
+                .bind(bucket)
+                .bind(cutoff_ms)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
         .map_err(|e| map_db_error(&e))?;
         Ok(rows
             .into_iter()
@@ -1163,14 +1181,9 @@ ORDER BY updated_at_ms LIMIT $2",
     }
 
     #[cfg(test)]
-    pub async fn backdate_mutation_admission(
-        &self,
-        id: &str,
-        updated_at_ms: i64,
-    ) -> PersistenceResult<()> {
-        sqlx::query("UPDATE objects SET updated_at_ms = $1 WHERE object_type = $2 AND id = $3")
+    pub async fn backdate(&self, id: &str, updated_at_ms: i64) -> PersistenceResult<()> {
+        sqlx::query("UPDATE objects SET updated_at_ms = $1 WHERE id = $2")
             .bind(updated_at_ms)
-            .bind(ADMISSION_OBJECT_TYPE)
             .bind(id)
             .execute(&self.pool)
             .await
@@ -2389,17 +2402,18 @@ struct PgAdmission(sqlx::Transaction<'static, Postgres>);
 impl AdmissionTx for PgAdmission {
     async fn counter(&mut self, bucket: &str) -> PersistenceResult<Option<Counter>> {
         // Row lock orders this count against concurrent recount marks.
-        let row: Option<(i64, Option<String>)> = sqlx::query_as(
-            "SELECT hit_count, status FROM objects WHERE object_type = $1 AND id = $2 FOR UPDATE",
+        let row: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+            "SELECT hit_count, status, updated_at_ms FROM objects WHERE object_type = $1 AND id = $2 FOR UPDATE",
         )
         .bind(COUNTER_OBJECT_TYPE)
         .bind(counter_id(bucket))
         .fetch_optional(&mut *self.0)
         .await
         .map_err(|e| map_db_error(&e))?;
-        Ok(row.map(|(count, status)| Counter {
+        Ok(row.map(|(count, status, updated_at_ms)| Counter {
             count,
             recount: status.is_some(),
+            updated_at_ms,
         }))
     }
 

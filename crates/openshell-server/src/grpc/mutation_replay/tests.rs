@@ -485,7 +485,7 @@ async fn exercise_expiry_and_uncertainty(state: &Arc<ServerState>) {
         "REQUEST_OUTCOME_UNCERTAIN"
     );
     assert!(
-        !sweep_expired(&state.store, replay_window_ms(&state.config))
+        !sweep_expired(&state.store, None, replay_window_ms(&state.config))
             .await
             .unwrap()
     );
@@ -812,16 +812,7 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
         )
         .await
         .unwrap();
-    state
-        .store
-        .backdate_mutation_admission(&original.id, 0)
-        .await
-        .unwrap();
-    assert!(
-        sweep_expired(&state.store, replay_window_ms(&state.config))
-            .await
-            .unwrap()
-    );
+    state.store.backdate(&original.id, 0).await.unwrap();
     run(&state, authed_request(new_req)).await.unwrap();
     assert_eq!(
         state
@@ -874,7 +865,7 @@ async fn age_success(state: &Arc<ServerState>, req: &CreateWorkspaceRequest, age
         .unwrap();
     state
         .store
-        .backdate_mutation_admission(&row.id, current_time_ms() - age_ms)
+        .backdate(&row.id, current_time_ms() - age_ms)
         .await
         .unwrap();
 }
@@ -915,15 +906,16 @@ async fn expiry_sweeper_removes_only_expired_successes() {
         .await
         .unwrap()
         .unwrap();
-    state
-        .store
-        .backdate_mutation_admission("sweep-pending", 0)
-        .await
-        .unwrap();
+    state.store.backdate("sweep-pending", 0).await.unwrap();
     age_success(&state, &expired, window_ms + 1).await;
 
-    assert!(sweep_expired(&state.store, window_ms).await.unwrap());
-    assert!(!sweep_expired(&state.store, window_ms).await.unwrap());
+    assert!(
+        !sweep_expired(&state.store, Some("_mutation/other"), window_ms)
+            .await
+            .unwrap()
+    );
+    assert!(sweep_expired(&state.store, None, window_ms).await.unwrap());
+    assert!(!sweep_expired(&state.store, None, window_ms).await.unwrap());
     assert_eq!(
         state
             .store
@@ -945,7 +937,7 @@ async fn expiry_sweeper_removes_only_expired_successes() {
 }
 
 #[tokio::test]
-async fn rejections_at_capacity_recount_only_after_admission_deletions() {
+async fn full_counters_recount_after_admission_deletions_or_a_minute() {
     let mut state = test_server_state().await;
     Arc::get_mut(&mut state)
         .unwrap()
@@ -974,10 +966,25 @@ async fn rejections_at_capacity_recount_only_after_admission_deletions() {
         .await
         .unwrap();
 
-    // A deletion outside the admission store leaves the counter unmarked, so
-    // rejections keep reading the counter without recounting.
+    // A deletion outside the admission store, as by an older gateway, leaves the
+    // counter unmarked, so rejections read only the counter until it is stale.
     assert!(state.store.delete(OBJECT_TYPE, &rows[0].id).await.unwrap());
     assert!(exhausted("counter-d").await);
+    let counter = state
+        .store
+        .list_by_type_after("mutation_admission_count_v1", None, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    state
+        .store
+        .backdate(&counter.id, current_time_ms() - 60_000)
+        .await
+        .unwrap();
+    run(&state, authed_request(create("counter-e")))
+        .await
+        .unwrap();
+    assert!(exhausted("counter-f").await);
 
     assert_eq!(
         state
@@ -987,13 +994,10 @@ async fn rejections_at_capacity_recount_only_after_admission_deletions() {
             .unwrap(),
         1
     );
-    run(&state, authed_request(create("counter-e")))
+    run(&state, authed_request(create("counter-g")))
         .await
         .unwrap();
-    run(&state, authed_request(create("counter-f")))
-        .await
-        .unwrap();
-    assert!(exhausted("counter-g").await);
+    assert!(exhausted("counter-h").await);
 }
 
 #[tokio::test]
@@ -1031,15 +1035,11 @@ async fn expiry_sweep_continues_past_a_full_batch() {
             )
             .await
             .unwrap();
-        state
-            .store
-            .backdate_mutation_admission(&id, 0)
-            .await
-            .unwrap();
+        state.store.backdate(&id, 0).await.unwrap();
     }
 
     assert!(
-        sweep_expired(&state.store, replay_window_ms(&state.config))
+        sweep_expired(&state.store, None, replay_window_ms(&state.config))
             .await
             .unwrap()
     );
@@ -1087,11 +1087,6 @@ async fn configured_limit_and_replay_window_govern_admission() {
     );
 
     age_success(&state, &first, 60_000).await;
-    assert!(
-        sweep_expired(&state.store, replay_window_ms(&state.config))
-            .await
-            .unwrap()
-    );
     run(&state, authed_request(third.clone())).await.unwrap();
     let bucket = state
         .store

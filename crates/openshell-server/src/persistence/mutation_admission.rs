@@ -5,9 +5,10 @@
 //!
 //! Each caller bucket has a counter row. Admission increments it under the
 //! bucket lock. Deleting admissions marks the counter for recount instead of
-//! decrementing it, and admission recounts a marked counter only once it reaches
-//! the limit. A rejection at capacity therefore reads one row unless admissions
-//! were deleted since the last count.
+//! decrementing it, and admission recounts a full counter only when it is marked
+//! or was last written over a minute ago. A rejection at capacity therefore reads
+//! one row, and counts left stale by writers that do not maintain counters, such
+//! as older gateway versions, correct themselves within a minute.
 
 use super::{PersistenceResult, WriteResult, current_time_ms};
 
@@ -15,6 +16,7 @@ pub const ADMISSION_OBJECT_TYPE: &str = "mutation_admission_v1";
 pub(super) const COUNTER_OBJECT_TYPE: &str = "mutation_admission_count_v1";
 /// Counter `status` while deleted admissions are not yet reflected in its count.
 pub(super) const RECOUNT_STATUS: &str = "recount";
+const RECOUNT_INTERVAL_MS: i64 = 60_000;
 
 pub(super) fn counter_id(bucket: &str) -> String {
     format!("mutation-admission-count:{bucket}")
@@ -29,6 +31,7 @@ pub struct CompletedAdmission {
 pub(super) struct Counter {
     pub count: i64,
     pub recount: bool,
+    pub updated_at_ms: i64,
 }
 
 /// Backend statements run inside one transaction that holds the bucket lock.
@@ -63,12 +66,16 @@ pub(super) async fn admit(
 ) -> PersistenceResult<Option<WriteResult>> {
     let now_ms = current_time_ms();
     let limit = i64::from(limit);
+    let stale = |counter: &Counter| {
+        counter.recount || now_ms.saturating_sub(counter.updated_at_ms) >= RECOUNT_INTERVAL_MS
+    };
     let (mut counter, recounted) = match tx.counter(bucket).await? {
-        Some(counter) if counter.count < limit || !counter.recount => (counter, false),
+        Some(counter) if counter.count < limit || !stale(&counter) => (counter, false),
         _ => (
             Counter {
                 count: tx.count(bucket).await?,
                 recount: false,
+                updated_at_ms: now_ms,
             },
             true,
         ),

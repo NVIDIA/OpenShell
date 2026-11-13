@@ -336,6 +336,9 @@ async fn execute_owned<M: Mutation>(
         let version = match write {
             Ok(Some(write)) => write.resource_version,
             Ok(None) => {
+                if sweep_expired(&state.store, Some(bucket), window_ms).await? {
+                    continue;
+                }
                 return Err(Status::resource_exhausted(
                     "caller has reached the durable mutation admission limit; unresolved requests require reconciliation",
                 ));
@@ -437,14 +440,18 @@ fn replay_window_ms(config: &openshell_core::Config) -> i64 {
     ) * 1000
 }
 
-/// Delete expired successful admissions across all callers in bounded batches.
-/// Returns whether any admission was removed.
-async fn sweep_expired(store: &Store, window_ms: i64) -> Result<bool, Status> {
+/// Delete expired successful admissions for one bucket, or all buckets, in
+/// bounded batches. Returns whether any admission was removed.
+async fn sweep_expired(
+    store: &Store,
+    bucket: Option<&str>,
+    window_ms: i64,
+) -> Result<bool, Status> {
     let now = current_time_ms();
     let mut removed = false;
     loop {
         let rows = store
-            .list_completed_mutation_admissions(now.saturating_sub(window_ms), SWEEP_BATCH)
+            .list_completed_mutation_admissions(bucket, now.saturating_sub(window_ms), SWEEP_BATCH)
             .await
             .map_err(storage_error)?;
         let full_page = rows.len() == SWEEP_BATCH as usize;
@@ -491,7 +498,7 @@ pub fn spawn_expiry_sweeper(
             }
             tokio::select! {
                 _ = shutdown.changed() => return,
-                result = sweep_expired(&state.store, replay_window_ms(&state.config)) => {
+                result = sweep_expired(&state.store, None, replay_window_ms(&state.config)) => {
                     if let Err(status) = result {
                         tracing::warn!(%status, "mutation admission expiry sweep failed");
                     }
