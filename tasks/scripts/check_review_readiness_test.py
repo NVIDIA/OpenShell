@@ -222,6 +222,181 @@ class TimelineTests(unittest.TestCase):
 
 
 class GitHubTests(unittest.TestCase):
+    def test_api_failure_reports_operation_status_and_reviewers_without_raw_output(
+        self,
+    ):
+        error = subprocess.CalledProcessError(
+            1,
+            ["gh", "api"],
+            output='{"message":"sensitive-response-body"}',
+            stderr="gh: sensitive-response-body (HTTP 422)",
+        )
+        with (
+            mock.patch.object(routing.subprocess, "run", side_effect=error),
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            routing._api(
+                f"{PULL}/requested_reviewers",
+                method="POST",
+                data={"reviewers": ["alice", "bob"]},
+            )
+        message = str(raised.exception)
+        for expected in (
+            "POST",
+            f"{PULL}/requested_reviewers",
+            "HTTP 422",
+            "alice",
+            "bob",
+        ):
+            self.assertIn(expected, message)
+        self.assertNotIn("sensitive-response-body", message)
+
+    def test_mixed_roster_requests_collaborators_from_every_page_in_preview_and_apply(
+        self,
+    ):
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                writes = []
+
+                def github(command, *, writes=writes, **kwargs):
+                    endpoint = command[2]
+                    method = command[command.index("--method") + 1]
+                    if endpoint == PULL:
+                        result = pr("area:runtime", author="author")
+                    elif "/collaborators?" in endpoint:
+                        self.assertIn("--paginate", command)
+                        self.assertIn("--slurp", command)
+                        result = [
+                            [
+                                {
+                                    "login": "READ-MEMBER",
+                                    "permissions": {"pull": True, "push": False},
+                                }
+                            ],
+                            [
+                                {
+                                    "login": "triage-member",
+                                    "permissions": {
+                                        "pull": True,
+                                        "push": False,
+                                        "triage": True,
+                                    },
+                                }
+                            ],
+                        ]
+                    elif endpoint.endswith("/requested_reviewers") and method == "POST":
+                        writes.append(json.loads(kwargs["input"]))
+                        result = {}
+                    else:
+                        result = [[]]
+                    return subprocess.CompletedProcess(
+                        command, 0, stdout=json.dumps(result), stderr=""
+                    )
+
+                with mock.patch.object(routing.subprocess, "run", side_effect=github):
+                    plan = routing.check_review_readiness(
+                        {
+                            "area:runtime": {
+                                "read-member",
+                                "triage-member",
+                                "non-collaborator",
+                            }
+                        },
+                        REPO,
+                        42,
+                        apply=apply,
+                    )
+                assert plan is not None
+                self.assertEqual(plan.add, ("read-member", "triage-member"))
+                self.assertEqual(plan.skipped_non_collaborators, ("non-collaborator",))
+                self.assertEqual(
+                    writes,
+                    [{"reviewers": ["read-member", "triage-member"]}] if apply else [],
+                )
+
+    def test_all_non_collaborators_are_reported_without_request_or_removal(self):
+        with (
+            mock.patch.object(
+                routing, "_api", side_effect=[pr("area:runtime"), []]
+            ) as api,
+            mock.patch.object(routing, "_load_reviewers", return_value=reviewers()),
+        ):
+            plan = routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
+        assert plan is not None
+        self.assertEqual(plan.add, ())
+        self.assertEqual(plan.skipped_non_collaborators, ("alice", "bob"))
+        self.assertTrue(
+            all(
+                call.kwargs.get("method", "GET") == "GET" for call in api.call_args_list
+            )
+        )
+
+    def test_collaborator_filter_does_not_remove_selected_existing_reviewers(self):
+        value = pr("area:runtime", requested=("alice",))
+        with (
+            mock.patch.object(routing, "_api", side_effect=[value, []]) as api,
+            mock.patch.object(
+                routing, "_load_reviewers", return_value=reviewers(requested=("alice",))
+            ),
+        ):
+            plan = routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
+        assert plan is not None
+        self.assertEqual(plan.remove, ())
+        self.assertEqual(plan.skipped_non_collaborators, ("bob",))
+        self.assertTrue(
+            all(
+                call.kwargs.get("method", "GET") == "GET" for call in api.call_args_list
+            )
+        )
+
+    def test_api_preserves_404_for_the_shared_accepted_work_checker(self):
+        error = subprocess.CalledProcessError(
+            1, "gh", stderr="gh: Not Found (HTTP 404)"
+        )
+        closing_issues = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "closingIssuesReferences": {
+                            "nodes": [],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        }
+        with mock.patch.object(
+            routing.subprocess,
+            "run",
+            side_effect=[
+                error,
+                subprocess.CompletedProcess([], 0, stdout=json.dumps(closing_issues)),
+            ],
+        ):
+            self.assertFalse(
+                routing.check_pr_accepted_work(
+                    REPO, pr(), {"maintainer"}, api=routing._api
+                )
+            )
+
+    def test_collaborator_lookup_failure_stops_reviewer_writes(self):
+        error = subprocess.CalledProcessError(
+            1, "gh", stderr="gh: forbidden (HTTP 403)"
+        )
+        with (
+            mock.patch.object(
+                routing, "_api", side_effect=[pr("area:runtime"), error]
+            ) as api,
+            mock.patch.object(routing, "_load_reviewers", return_value=reviewers()),
+            self.assertRaises(subprocess.CalledProcessError),
+        ):
+            routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
+        self.assertTrue(
+            all(
+                call.kwargs.get("method", "GET") == "GET" for call in api.call_args_list
+            )
+        )
+
     def test_api_rejects_empty_paginated_response(self):
         with mock.patch.object(routing.subprocess, "run") as run:
             run.return_value.stdout = ""
@@ -261,8 +436,29 @@ class GitHubTests(unittest.TestCase):
 
 class ReconciliationTests(unittest.TestCase):
     def run_routing(self, categories, *, snapshots, responses, apply=True):
+        responses = iter(responses)
+
+        def github(path, **_kwargs):
+            if "/collaborators?" in path:
+                return [
+                    {"login": login}
+                    for login in (
+                        "alice",
+                        "bob",
+                        "carol",
+                        "dave",
+                        "read-member",
+                        "triage-member",
+                        "outside-collaborator",
+                    )
+                ]
+            response = next(responses)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
         with (
-            mock.patch.object(routing, "_api", side_effect=responses) as api,
+            mock.patch.object(routing, "_api", side_effect=github) as api,
             mock.patch.object(
                 routing, "_load_reviewers", side_effect=snapshots
             ) as load,
@@ -278,13 +474,13 @@ class ReconciliationTests(unittest.TestCase):
         )
         self.assertEqual(plan, routing.ReviewPlan(("bob", "carol"), ()))
         load.assert_called_once()
-        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_count, 3)
         self.assertEqual(
             api.call_args.kwargs,
             {"method": "POST", "data": {"reviewers": ["bob", "carol"]}},
         )
 
-    def test_requests_roster_members_without_permission_lookups(self):
+    def test_requests_read_triage_and_outside_collaborators_without_write_checks(self):
         members = {"read-member", "triage-member", "outside-collaborator"}
         categories = {"area:runtime": members}
         plan, api, _ = self.run_routing(
@@ -297,6 +493,10 @@ class ReconciliationTests(unittest.TestCase):
             api.call_args_list,
             [
                 mock.call(PULL),
+                mock.call(
+                    "repos/owner/repo/collaborators?per_page=100&affiliation=all",
+                    pages=True,
+                ),
                 mock.call(
                     f"{PULL}/requested_reviewers",
                     method="POST",
@@ -333,7 +533,11 @@ class ReconciliationTests(unittest.TestCase):
             apply=False,
         )
         self.assertEqual(plan.add, ("dave",))
-        api.assert_called_once_with(PULL)
+        self.assertTrue(
+            all(
+                call.kwargs.get("method", "GET") == "GET" for call in api.call_args_list
+            )
+        )
 
     def test_refresh_before_removal_protects_new_manual_choices_and_engagement(self):
         before = pr("area:build", requested=("alice", "bob", "carol"))
@@ -496,7 +700,9 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
     def test_labels_and_requests_reviewers_for_a_classified_ready_pr(self):
         with (
             mock.patch.object(
-                routing, "_api", side_effect=[pr("area:build"), None, None]
+                routing,
+                "_api",
+                side_effect=[pr("area:build"), None, [{"login": "dave"}], None],
             ) as api,
             mock.patch.object(routing, "check_pr_accepted_work", return_value=True),
             mock.patch.object(routing, "_load_reviewers", return_value=reviewers()),
@@ -637,6 +843,7 @@ class CliTests(unittest.TestCase):
                     "remove": [],
                     "accepted_work": None,
                     "add_labels": [],
+                    "skipped_non_collaborators": [],
                 },
             )
             check.assert_called_once_with(

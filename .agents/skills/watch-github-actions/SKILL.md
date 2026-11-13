@@ -125,6 +125,12 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+For `Review Readiness`, the reconciliation JSON reports `skipped_non_collaborators`:
+these roster members cannot receive GitHub review requests. Read and triage
+collaborators remain eligible. GitHub API failures identify the operation and HTTP
+status; reviewer-request failures also identify the submitted reviewers. Resolve
+roster membership/access separately from area/topic label validation failures.
+
 For Kubernetes app-listener E2E failures during kind setup, inspect the uploaded
 `results/app-listener/cni-setup/` evidence. It includes node and Calico pod
 descriptions, events, and current/previous container logs. A CNI rollout timeout

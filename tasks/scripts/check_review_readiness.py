@@ -11,8 +11,9 @@
 
 Preview with --repo OWNER/REPO --pr NUMBER; add --apply to update requests.
 For newly opened PRs, --label-accepted-work also adds state:accepted if qualified.
-Request all matching roster members, excluding the author. Preserve
-manual choices, unknown request provenance, and anyone who commented or reviewed.
+Request matching repository collaborators, excluding the author. Report roster
+members GitHub cannot request. Preserve manual choices, unknown request provenance,
+and anyone who commented or reviewed.
 The parser and planning helpers are importable. No state is stored between runs.
 """
 
@@ -40,6 +41,7 @@ class ReviewPlan:
     remove: tuple[str, ...]
     accepted_work: bool | None = None
     add_labels: tuple[str, ...] = ()
+    skipped_non_collaborators: tuple[str, ...] = ()
 
 
 def parse_reviewers(markdown: str) -> dict[str, set[str]]:
@@ -162,19 +164,41 @@ def plan_review_requests(
     )
 
 
+class GitHubApiError(subprocess.CalledProcessError):
+    """Keep HTTP error handling compatible while reporting safe diagnostics."""
+
+    def __init__(self, error: subprocess.CalledProcessError, message: str):
+        super().__init__(
+            error.returncode, error.cmd, output=error.output, stderr=error.stderr
+        )
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+
 def _api(path: str, *, method: str = "GET", data=None, pages: bool = False):
     command = ["gh", "api", path, "--method", method]
     if pages:
         command.extend(["--paginate", "--slurp"])
     if data is not None:
         command.extend(["--input", "-"])
-    result = subprocess.run(
-        command,
-        input=json.dumps(data) if data is not None else None,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            input=json.dumps(data) if data is not None else None,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        # Do not echo raw responses: other API operations can contain PR text.
+        status = re.search(r"\(HTTP (\d{3})\)", exc.stderr or "")
+        detail = f"HTTP {status[1]}" if status else f"exit {exc.returncode}"
+        message = f"GitHub API {method} {path} failed ({detail})"
+        if path.endswith("/requested_reviewers") and data:
+            message += "; reviewers: " + ", ".join(data.get("reviewers", []))
+        raise GitHubApiError(exc, message) from exc
     value = json.loads(result.stdout) if result.stdout.strip() else None
     if pages:
         if not isinstance(value, list) or not all(
@@ -257,6 +281,23 @@ def check_review_readiness(
         accepted_work=accepted,
         add_labels=add_labels,
     )
+    if plan.add:
+        # Public read access alone does not make an account requestable. GitHub
+        # rejects an entire batch containing a non-collaborator with HTTP 422.
+        collaborators = {
+            member["login"].lower()
+            for member in _api(
+                f"repos/{repository}/collaborators?per_page=100&affiliation=all",
+                pages=True,
+            )
+        }
+        plan = replace(
+            plan,
+            add=tuple(login for login in plan.add if login in collaborators),
+            skipped_non_collaborators=tuple(
+                login for login in plan.add if login not in collaborators
+            ),
+        )
     if apply:
         endpoint = f"{pull}/requested_reviewers"
         if plan.add:
