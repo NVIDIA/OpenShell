@@ -3,6 +3,7 @@
 
 //! Persistence layer for `OpenShell` Server.
 
+pub mod frozen_policy;
 mod image_activation;
 mod legacy_time_wire;
 pub mod lock_order;
