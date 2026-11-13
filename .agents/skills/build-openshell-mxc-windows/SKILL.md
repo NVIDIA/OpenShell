@@ -104,6 +104,7 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
 | `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus advisory `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
+| `.github/workflows/windows-packages.yml`, `packaging/windows/` | Explicit signing-candidate workflow: pinned Windows source, native builds, separate test fixtures, SDKs, package hashes, and GitHub ZIP attestations; no release publication or Authenticode signing. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
 Use the code that is already in the repo. Do not generate a parallel Windows
@@ -300,6 +301,12 @@ not run this workflow. Release-branch seed
 and build jobs use job-level `continue-on-error: true`; opt-in PR jobs report
 failures normally. Applying the label alone does not start a run: re-run all
 jobs in the current mirror push run, or push a new mirrored commit. The binaries are not uploaded or published.
+
+The separate signing-candidate workflow uploads binaries and candidate ZIPs.
+Its build and package failures are blocking. Validate downloaded bytes by hash
+on a supported native host without rebuilding; keep test fixtures and local
+reports outside public ZIPs. Authenticode signing requires updated manifests,
+retesting, new archives, and new attestations. See `packaging/windows/README.md`.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
