@@ -325,6 +325,7 @@ impl WxcExecInvoker {
     /// default-deny, so a write to any ungranted path is denied by the OS.
     ///
     /// **Stdout is raw agent output; the exit code is the agent's own exit code.**
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_oneshot(
         &self,
         container_id: &str,
@@ -333,6 +334,7 @@ impl WxcExecInvoker {
         process: MxcProcess,
         network: Option<MxcNetwork>,
         ui: Option<MxcUi>,
+        job: &crate::job::GenerationJob,
     ) -> Result<tokio::process::Child, InvokerError> {
         let config = oneshot_config_json(
             container_id,
@@ -386,7 +388,9 @@ impl WxcExecInvoker {
         }
 
         info!(container_id = %container_id, "wxc-exec one-shot processContainer spawn");
-        let child = cmd.spawn()?;
+        // Spawned inside the generation's job so the boundary and workload tree
+        // cannot outlive the driver; fails closed if the job cannot adopt it.
+        let child = job.spawn(&mut cmd)?;
         Ok(child)
     }
 }

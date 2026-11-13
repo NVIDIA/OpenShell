@@ -4643,7 +4643,6 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
- "windows",
 ]
 
 [[package]]

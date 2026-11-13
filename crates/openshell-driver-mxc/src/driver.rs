@@ -757,7 +757,13 @@ async fn run_lifecycle_inner(
     // ProcessContainer launch so unrelated local processes cannot squat it
     // during the more expensive host-side setup.
     drop(proxy_reservation);
-    let mut supervisor = spawn_supervisor(context, &descriptor_path, &auth_bundle_path, &main)?;
+    // One kill-on-close job per generation owns the supervisor and the whole
+    // boundary tree. Every early return below drops it, which ends whatever was
+    // already started.
+    let job = crate::job::GenerationJob::new()
+        .map_err(|error| format!("create sandbox job object: {error}"))?;
+    let mut supervisor =
+        spawn_supervisor(context, &descriptor_path, &auth_bundle_path, &main, &job)?;
     let sandbox_command = encode_windows_command_line(&[
         context.config.sandbox_binary_path.clone(),
         "--bootstrap".to_string(),
@@ -795,6 +801,7 @@ async fn run_lifecycle_inner(
             process,
             Some(network),
             mapped.ui,
+            &job,
         )
         .await
         .map_err(|error| format!("start MXC ProcessContainer: {error}"))?;
@@ -838,6 +845,10 @@ async fn run_lifecycle_inner(
     }
     drop(startup_guard);
     let result = monitor_runtime_pair(boundary, supervisor, shutdown_rx).await;
+    // Whatever ended the pair, end the rest of the tree (workload, conhost,
+    // grandchildren) that `Child::kill` on the two roots does not reach.
+    job.terminate();
+    drop(job);
     let _ = terminated_tx.send(true);
     if let Ok(mut attribution) = context.attribution.lock() {
         attribution.forget(&context.sandbox.id);
@@ -859,9 +870,10 @@ fn spawn_supervisor(
     descriptor_path: &Path,
     auth_bundle_path: &Path,
     main: &openshell_core::sandbox_env::MainProcessConfig,
+    job: &crate::job::GenerationJob,
 ) -> Result<Child, String> {
-    supervisor_command(context, descriptor_path, auth_bundle_path, main)?
-        .spawn()
+    let mut command = supervisor_command(context, descriptor_path, auth_bundle_path, main)?;
+    job.spawn(&mut command)
         .map_err(|error| format!("start host openshell-supervisor: {error}"))
 }
 

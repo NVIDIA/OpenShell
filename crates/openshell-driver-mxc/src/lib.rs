@@ -24,6 +24,8 @@ mod grpc;
 #[cfg(target_os = "windows")]
 mod isolation;
 #[cfg(target_os = "windows")]
+mod job;
+#[cfg(target_os = "windows")]
 mod mxc;
 #[cfg(target_os = "windows")]
 mod policy;

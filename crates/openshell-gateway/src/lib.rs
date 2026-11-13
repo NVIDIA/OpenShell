@@ -16,8 +16,6 @@ compile_error!(
      build a telemetry-free gateway with `--no-default-features --features defaults-without-telemetry`"
 );
 
-pub mod process_lifetime;
-
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 mod vm;
 
