@@ -725,6 +725,11 @@ pub struct GatewayAuditConfig {
     /// sets. Bytes values are never recorded.
     #[serde(default)]
     pub capture_setting_values: bool,
+    /// Record the command arguments of `ExecSandbox` and
+    /// `ExecSandboxInteractive` calls. Environment variables and standard
+    /// input are never recorded.
+    #[serde(default)]
+    pub capture_exec_command: bool,
 }
 
 /// mTLS user authentication for gateway users.

@@ -437,6 +437,7 @@ operator_enabled = false # Opt-in: trusted OU=operator grants gateway-wide admin
 
 [openshell.gateway.audit]
 capture_setting_values = false # Opt-in: record setting values in mutation records.
+capture_exec_command = false # Opt-in: record exec command arguments in mutation records.
 
 # OTLP export. Omit this table entirely to disable it.
 [openshell.gateway.otlp]
@@ -807,11 +808,13 @@ Allow enough retention and disk space for shipper outages. Graceful shutdown all
 ```toml
 [openshell.gateway.audit]
 capture_setting_values = true
+capture_exec_command = true
 ```
 
 | Field | Default | Behavior |
 |---|---|---|
 | `capture_setting_values` | `false` | Record the value an `UpdateConfig` call sets for a registered setting. |
+| `capture_exec_command` | `false` | Record the first 32 arguments of each exec command. Arguments can contain secrets the caller passes, such as an `Authorization` header. |
 
 Unknown fields are rejected. Restart the gateway after changing this configuration.
 

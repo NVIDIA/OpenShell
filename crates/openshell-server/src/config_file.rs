@@ -2129,10 +2129,15 @@ service_name = "openshell-gateway-dev"
 
     #[test]
     fn gateway_audit_capture_is_opt_in() {
-        let tmp = write_tmp("[openshell.gateway.audit]\ncapture_setting_values = true\n");
+        let tmp = write_tmp(
+            "[openshell.gateway.audit]\ncapture_setting_values = true\ncapture_exec_command = true\n",
+        );
         let audit = load(tmp.path()).unwrap().openshell.gateway.audit.unwrap();
         assert!(audit.capture_setting_values);
-        assert!(!GatewayAuditConfig::default().capture_setting_values);
+        assert!(audit.capture_exec_command);
+        let defaults = GatewayAuditConfig::default();
+        assert!(!defaults.capture_setting_values);
+        assert!(!defaults.capture_exec_command);
     }
 
     #[test]
