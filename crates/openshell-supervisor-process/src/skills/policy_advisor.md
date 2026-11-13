@@ -146,6 +146,10 @@ agent's `/wait` returns approved in ~1 second. When the prover does
 find something — or the setting is `"manual"`/unset — the chunk lands
 in `pending` for human review.
 
+MCP tool permissions are not modeled by the prover. A policy containing MCP
+rules reports `prover: unsupported MCP rules; manual review required` and stays
+pending for human approval, even in automatic mode.
+
 The prover answers four formal questions about each proposed change.
 Each "yes" answer is its own categorical finding — there is no
 severity grade. Any finding blocks auto-approval.
@@ -213,6 +217,8 @@ The new submission wins by structural overlap.
   TCP or a raw TLS tunnel, ask an administrator to add that access explicitly.
 - Do not include query strings, tokens, credentials, or secret values in
   paths.
+- For an MCP server, name the tool with `tool` on the `tools/call` allow
+  rule. A `tools/call` allow without `tool` permits every tool.
 - Explain uncertainty in `intent_summary` instead of widening the rule.
 - If pushing with `git` fails, that is a separate L4 or protocol-specific
   path from GitHub REST API access. Propose it separately.

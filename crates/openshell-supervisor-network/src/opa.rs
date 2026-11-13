@@ -469,47 +469,38 @@ impl OpaEngine {
         entrypoint_pid: u32,
         require_binary_identity: bool,
     ) -> Result<Self> {
-        // Protobuf cannot distinguish an omitted repeated MCP version field
-        // from an empty one. Canonicalize before any runtime consumer reads
-        // the policy so both representations select the pinned default.
-        let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto.clone())
-            .map_err(|error| {
-                miette::miette!(render_bounded_validation_diagnostics(
-                    "policy validation failed",
-                    error
-                        .violations()
-                        .iter()
-                        .map(redacted_policy_violation_category),
-                ))
-            })?;
-
-        let ambiguities = openshell_policy::find_endpoint_ambiguities(&proto);
-        if !ambiguities.is_empty() {
-            return Err(miette::miette!(render_repeated_validation_diagnostic(
-                "network endpoint ambiguity validation failed",
-                ambiguities.len(),
-                "ambiguous network endpoint selectors",
-            )));
-        }
-
+        let (mut data, warnings) =
+            validated_proto_data(proto, entrypoint_pid, require_binary_identity).map_err(
+                |invalid| match invalid {
+                    ProtoPolicyInvalid::Policy(error) => {
+                        miette::miette!(render_bounded_validation_diagnostics(
+                            "policy validation failed",
+                            error
+                                .violations()
+                                .iter()
+                                .map(redacted_policy_violation_category),
+                        ))
+                    }
+                    ProtoPolicyInvalid::Ambiguous(ambiguities) => {
+                        miette::miette!(render_repeated_validation_diagnostic(
+                            "network endpoint ambiguity validation failed",
+                            ambiguities.len(),
+                            "ambiguous network endpoint selectors",
+                        ))
+                    }
+                    ProtoPolicyInvalid::L7(errors) => {
+                        miette::miette!(render_repeated_validation_diagnostic(
+                            "L7 policy validation failed",
+                            errors.len(),
+                            "invalid L7 policy configuration",
+                        ))
+                    }
+                    ProtoPolicyInvalid::Internal => {
+                        miette::miette!("internal: failed to parse proto JSON")
+                    }
+                },
+            )?;
         emit_binary_identity_mode(require_binary_identity, "proto");
-        let data_json_str = proto_to_opa_data_json(&proto, entrypoint_pid);
-
-        // Parse back to Value for preprocessing, then re-serialize
-        let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
-            .map_err(|_| miette::miette!("internal: failed to parse proto JSON"))?;
-        inject_runtime_policy_data(&mut data, require_binary_identity);
-        normalize_endpoint_protocols(&mut data);
-
-        // Validate BEFORE expanding presets
-        let (errors, warnings) = crate::l7::validate_l7_policies(&data);
-        if !errors.is_empty() {
-            return Err(miette::miette!(render_repeated_validation_diagnostic(
-                "L7 policy validation failed",
-                errors.len(),
-                "invalid L7 policy configuration",
-            )));
-        }
         // Rejected candidates must not leak authored values through warnings.
         emit_l7_config_warnings(&warnings, "L7 policy validation warning");
 
@@ -2235,6 +2226,64 @@ fn l7_matchers_to_json(
             (key.clone(), matcher_json)
         })
         .collect()
+}
+
+/// Why [`validated_proto_data`] rejected a policy. The messages name authored
+/// values, so the runtime loader redacts them; policy.local returns them to
+/// the agent that wrote the proposal.
+#[derive(Debug)]
+pub(crate) enum ProtoPolicyInvalid {
+    Policy(openshell_policy::PolicyValidationError),
+    Ambiguous(Vec<openshell_policy::EndpointAmbiguity>),
+    L7(Vec<String>),
+    Internal,
+}
+
+impl std::fmt::Display for ProtoPolicyInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Policy(error) => write!(f, "{error}"),
+            Self::Ambiguous(ambiguities) => {
+                let messages: Vec<String> = ambiguities.iter().map(ToString::to_string).collect();
+                write!(f, "{}", messages.join("; "))
+            }
+            Self::L7(errors) => write!(f, "{}", errors.join("; ")),
+            Self::Internal => write!(f, "internal: failed to parse proto JSON"),
+        }
+    }
+}
+
+/// Validate a proto policy and project it to OPA data, without emitting
+/// events. Returns the data and the L7 warnings for the caller to emit.
+pub(crate) fn validated_proto_data(
+    proto: &ProtoSandboxPolicy,
+    entrypoint_pid: u32,
+    require_binary_identity: bool,
+) -> std::result::Result<(serde_json::Value, Vec<String>), ProtoPolicyInvalid> {
+    // Protobuf cannot distinguish an omitted repeated MCP version field
+    // from an empty one. Canonicalize before any runtime consumer reads
+    // the policy so both representations select the pinned default.
+    let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto.clone())
+        .map_err(ProtoPolicyInvalid::Policy)?;
+
+    let ambiguities = openshell_policy::find_endpoint_ambiguities(&proto);
+    if !ambiguities.is_empty() {
+        return Err(ProtoPolicyInvalid::Ambiguous(ambiguities));
+    }
+
+    // Parse back to Value for preprocessing, then re-serialize
+    let mut data: serde_json::Value =
+        serde_json::from_str(&proto_to_opa_data_json(&proto, entrypoint_pid))
+            .map_err(|_| ProtoPolicyInvalid::Internal)?;
+    inject_runtime_policy_data(&mut data, require_binary_identity);
+    normalize_endpoint_protocols(&mut data);
+
+    // Validate BEFORE expanding presets
+    let (errors, warnings) = crate::l7::validate_l7_policies(&data);
+    if !errors.is_empty() {
+        return Err(ProtoPolicyInvalid::L7(errors));
+    }
+    Ok((data, warnings))
 }
 
 /// Convert typed proto policy fields to JSON suitable for `engine.add_data_json()`.

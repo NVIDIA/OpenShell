@@ -279,7 +279,8 @@ fn params_with_tool(
     params
 }
 
-fn allow_def_to_proto(_protocol: &str, allow: L7AllowDef) -> L7Allow {
+/// Convert an authored L7 allow rule to protobuf, carrying MCP `tool` as `params.name`.
+pub fn allow_def_to_proto(allow: L7AllowDef) -> L7Allow {
     let params = flatten_param_matchers(params_with_tool(allow.params, allow.tool));
     L7Allow {
         method: allow.method,
@@ -300,7 +301,8 @@ fn allow_def_to_proto(_protocol: &str, allow: L7AllowDef) -> L7Allow {
     }
 }
 
-fn deny_def_to_proto(_protocol: &str, deny: L7DenyRuleDef) -> L7DenyRule {
+/// Convert an authored L7 deny rule to protobuf, carrying MCP `tool` as `params.name`.
+pub fn deny_def_to_proto(deny: L7DenyRuleDef) -> L7DenyRule {
     let params = flatten_param_matchers(params_with_tool(deny.params, deny.tool));
     L7DenyRule {
         method: deny.method,
@@ -534,14 +536,11 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             rules: allow_rules
                                 .into_iter()
                                 .map(|r| L7Rule {
-                                    allow: Some(allow_def_to_proto(&protocol, r.allow)),
+                                    allow: Some(allow_def_to_proto(r.allow)),
                                 })
                                 .collect(),
                             allowed_ips: e.allowed_ips,
-                            deny_rules: deny_rules
-                                .into_iter()
-                                .map(|deny| deny_def_to_proto(&protocol, deny))
-                                .collect(),
+                            deny_rules: deny_rules.into_iter().map(deny_def_to_proto).collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
