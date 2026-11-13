@@ -1112,7 +1112,7 @@ async fn attach_with(
                 member_id: host.pool.member_id.clone(),
                 runtime_address: host.pool.runtime_address.to_string(),
             }),
-            stay: stay || redial.is_some(),
+            accepts_redirect: !stay && redial.is_none(),
         };
         let attempt_timeout = timings.attempt_timeout(unanswered);
         let end = tokio::select! {
@@ -2341,7 +2341,7 @@ mod tests {
         match message {
             Some(HostMessage {
                 payload: Some(host_message::Payload::Hello(hello)),
-            }) => hello.stay,
+            }) => !hello.accepts_redirect,
             other => panic!("expected a hello, got {other:?}"),
         }
     }

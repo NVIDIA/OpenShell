@@ -822,7 +822,7 @@ impl SupervisorHostController {
 
     /// Serve one authenticated host stream. Reads the hello, supersedes any
     /// session it replaces, and returns the host's member ID and the
-    /// gateway-to-host stream. A host that does not ask to stay is redirected,
+    /// gateway-to-host stream. A host that accepts a redirect is redirected,
     /// without a session, to the peer endpoint `home` names for its member.
     pub async fn attach(
         &self,
@@ -862,7 +862,7 @@ impl SupervisorHostController {
         validate_member(member).map_err(Status::invalid_argument)?;
         let member_id = member.member_id.clone();
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
-        if !hello.stay
+        if hello.accepts_redirect
             && let Some(peer_endpoint) = home(&member_id)
         {
             tracing::info!(member_id, peer_endpoint, "redirecting supervisor host");
@@ -1468,7 +1468,7 @@ mod tests {
                 member_id: member.to_string(),
                 runtime_address: format!("10.0.0.{}:5500", member.len()),
             }),
-            stay: false,
+            accepts_redirect: false,
         }
     }
 
@@ -1988,7 +1988,7 @@ mod tests {
                     instance_id: "p1".to_string(),
                     connection_epoch: 1,
                     member: None,
-                    stay: false,
+                    accepts_redirect: false,
                 },
             )
             .unwrap_err();

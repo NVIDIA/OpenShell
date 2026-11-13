@@ -64,9 +64,11 @@ message HostHello {
   uint64 connection_epoch = 2;
   // Present when the host is a member of a supervisor pool.
   PoolMember member = 3;
-  // The host asks to be served by the replica it dialed: it is following a
-  // redirect or redialing the replica that last accepted it.
-  bool stay = 4;
+  // The gateway may answer with a HostRedirect. A host leaves it unset to be
+  // served by the replica it dialed: when it follows a redirect or redials
+  // the replica that last accepted it. Hosts that predate HostRedirect never
+  // set it.
+  bool accepts_redirect = 4;
 }
 
 // One member of a supervisor pool.
@@ -95,7 +97,7 @@ message HostAccepted {
 }
 
 // Another gateway replica should serve the host, which dials it at once with
-// HostHello.stay set. The stream ends after this message.
+// HostHello.accepts_redirect unset. The stream ends after this message.
 message HostRedirect {
   string peer_endpoint = 1;
 }
