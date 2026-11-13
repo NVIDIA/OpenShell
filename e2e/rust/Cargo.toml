@@ -40,7 +40,7 @@ e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
 # One supervisor process shared by the gateway's sandboxes.
 e2e-kubernetes-shared-supervisor = ["e2e-kubernetes", "e2e-host-gateway"]
 # The shared supervisor acting as sandbox identities delegated by SPIRE.
-e2e-kubernetes-shared-supervisor-spiffe = ["e2e-kubernetes-shared-supervisor"]
+e2e-kubernetes-shared-supervisor-spiffe = ["e2e-kubernetes-shared-supervisor", "dep:openshell-core"]
 
 # A high-availability pool of shared supervisors.
 e2e-kubernetes-shared-supervisor-ha = ["e2e-kubernetes", "e2e-host-gateway"]
@@ -268,6 +268,7 @@ path = "tests/otlp_relay.rs"
 required-features = ["e2e-local-container-driver"]
 
 [dependencies]
+openshell-core = { path = "../../crates/openshell-core", default-features = false, features = ["jwt"], optional = true }
 openshell-crypto = { path = "../../crates/openshell-crypto" }
 openshell-otel-test-support = { path = "../../crates/openshell-otel-test-support" }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "trace"] }

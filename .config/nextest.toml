@@ -36,7 +36,7 @@ test-group = "kubernetes-ha"
 # they kill members or gateways, or scale the pool. Never run them at once.
 # Test names, not binary(), for the reason above.
 [[profile.e2e-kubernetes.overrides]]
-filter = "test(/^(losing_a_supervisor_pod_moves_its_sandboxes_without_restarting_them|scaling_a_supervisor_pool_up_and_down_keeps_its_sandboxes_running|pool_sessions_follow_their_supervisors_gateway)$/)"
+filter = "test(/^(losing_a_supervisor_pod_moves_its_sandboxes_without_restarting_them|scaling_a_supervisor_pool_up_and_down_keeps_its_sandboxes_running|pool_sessions_follow_their_supervisors_gateway|shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity)$/)"
 test-group = "kubernetes-shared-supervisor-pool"
 
 # Scaling the pool runs two bounded Helm upgrades (up to 6 minutes each), waits

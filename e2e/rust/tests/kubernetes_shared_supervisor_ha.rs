@@ -27,8 +27,8 @@ use std::time::Duration;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use shared_supervisor::{
     EXEC_PROBE_TIMEOUT, GATEWAY_SELECTOR, HostEndpoint, SUPERVISOR_CONTAINER, call_host,
-    counts_past, create, gateway_log_lines, generation, is_takeover, kubectl, kubectl_command,
-    kubectl_json, main_process, owner_of, policy, release_namespace, supervisor_pods,
+    counts_past, create, gateway_log_lines, generation, is_takeover, kill_abruptly, kubectl,
+    kubectl_command, main_process, owner_of, policy, release_namespace, supervisor_pods,
     wait_for_owner, wait_until_attached,
 };
 use tokio::io::AsyncBufReadExt as _;
@@ -48,116 +48,6 @@ const PLACEMENT_ATTEMPTS: usize = 32;
 const EXPIRY_EVIDENCE: Duration = Duration::from_secs(10);
 /// What a supervisor logs as it begins to leave the pool.
 const LEAVING: &str = "pool member is leaving";
-
-/// Run `command` in a cluster node's container; k3d and kind name node
-/// containers after their nodes.
-async fn node_exec(node: &str, command: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new("docker")
-        .arg("exec")
-        .arg(node)
-        .args(command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|error| format!("docker exec {node} {command:?}: {error}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(format!(
-            "docker exec {node} {command:?}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-/// SIGKILL the supervisor container of `pod` through its node's container
-/// runtime, so it cannot announce that it is leaving, then force-delete the
-/// Pod so its member does not come back in place. Kills the task with
-/// `ctr`, or failing that the container's process with `kill -KILL`; panics
-/// when neither succeeds. Returns how the container was killed.
-async fn kill_abruptly(pod: &str) -> String {
-    let namespace = release_namespace();
-    let description = kubectl_json(&["-n", &namespace, "get", "pod", pod, "-o", "json"]).await;
-    let node = description["spec"]["nodeName"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{pod} has no node: {description}"))
-        .to_string();
-    let container = description["status"]["containerStatuses"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|status| status["name"] == SUPERVISOR_CONTAINER)
-        .and_then(|status| status["containerID"].as_str())
-        .and_then(|id| id.split_once("://").map(|(_, id)| id.to_string()))
-        .unwrap_or_else(|| panic!("{pod} has no running {SUPERVISOR_CONTAINER} container"));
-    let mut failures = Vec::new();
-    let mut killed = None;
-    // k3s ships `ctr` as a multi-call alias; kind ships it on its own.
-    for ctr in [&["ctr"][..], &["k3s", "ctr"][..]] {
-        let kill = [
-            ctr,
-            &[
-                "-n", "k8s.io", "tasks", "kill", "--signal", "SIGKILL", &container,
-            ],
-        ]
-        .concat();
-        match node_exec(&node, &kill).await {
-            Ok(_) => {
-                killed = Some(format!("ctr tasks kill --signal SIGKILL on {node}"));
-                break;
-            }
-            Err(error) => failures.push(error),
-        }
-    }
-    if killed.is_none() {
-        for ctr in [&["ctr"][..], &["k3s", "ctr"][..]] {
-            let list = [ctr, &["-n", "k8s.io", "tasks", "ls"]].concat();
-            let pid = match node_exec(&node, &list).await {
-                Ok(tasks) => tasks.lines().find_map(|line| {
-                    let mut fields = line.split_whitespace();
-                    (fields.next() == Some(container.as_str()))
-                        .then(|| fields.next())
-                        .flatten()
-                        .filter(|pid| pid.parse::<u32>().is_ok_and(|pid| pid > 1))
-                        .map(str::to_string)
-                }),
-                Err(error) => {
-                    failures.push(error);
-                    continue;
-                }
-            };
-            let Some(pid) = pid else {
-                failures.push(format!("no running task {container} on {node}"));
-                continue;
-            };
-            match node_exec(&node, &["kill", "-KILL", &pid]).await {
-                Ok(_) => {
-                    killed = Some(format!("kill -KILL {pid} on {node}"));
-                    break;
-                }
-                Err(error) => failures.push(error),
-            }
-        }
-    }
-    let killed = killed.unwrap_or_else(|| {
-        panic!(
-            "could not hard-kill supervisor {pod}; a graceful stop proves nothing: {failures:#?}"
-        )
-    });
-    kubectl(&[
-        "-n",
-        &namespace,
-        "delete",
-        "pod",
-        pod,
-        "--grace-period=0",
-        "--force",
-        "--wait=false",
-    ])
-    .await;
-    killed
-}
 
 /// Lines a supervisor Pod logs from its start until its container ends.
 struct FollowedLogs {

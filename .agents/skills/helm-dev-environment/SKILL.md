@@ -114,7 +114,12 @@ OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
 identities with `ClusterStaticEntry` resources. `mise run test:spire-delegation`
 checks the `openshell-spire` adapter's delegated issuance and identity selection
 against a local SPIRE server and agent without a cluster; the Kubernetes test
-covers the gateway broker.
+covers the gateway broker. The task enables gateway TLS and uses the harness's
+mTLS port-forward path, layering the fixture and TLS values before caller
+overlays. Its two-member supervisor pool also verifies abrupt owner loss:
+workload generation, Pod, process, and stable SPIFFE identity survive, the
+new owner acquires a fresh provider token under a higher credential epoch,
+and the broker rejects the old bearer even with its cached credential key.
 
 The fixture requires admission that permits the admin socket `hostPath` and
 supplemental group; an unlabeled namespace can still inherit cluster-wide

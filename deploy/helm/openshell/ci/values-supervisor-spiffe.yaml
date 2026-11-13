@@ -12,6 +12,11 @@
 # deployment needs a Pod Security exception or
 # equivalent admission policy and registrations for every agent that may run a
 # gateway Pod.
+# Two members let the identity test exercise abrupt owner loss and takeover.
+supervisor:
+  replicas: 2
+  recoveryTimeoutSeconds: 60
+
 gatewayConfig:
   openshell.drivers.kubernetes:
     supervisor_topology: gateway

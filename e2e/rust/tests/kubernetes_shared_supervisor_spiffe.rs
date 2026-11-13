@@ -16,6 +16,11 @@
 //! The token service is a host fixture reached
 //! through a selectorless Service, and it hands out tokens that name the
 //! identity they were issued to.
+//! A two-member pool also verifies that abrupt owner loss preserves the
+//! workload and SPIFFE identity while fencing the old credential epoch and
+//! its still-live broker cache entry.
+
+mod shared_supervisor;
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write as _;
@@ -24,11 +29,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
+use openshell_core::jwt::{SecretJwt, SupervisorAuthBundle};
+use openshell_core::proto::{
+    GetSandboxProviderAccessTokenRequest, GetSandboxProviderEnvironmentRequest,
+    open_shell_client::OpenShellClient,
+};
 use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
+use shared_supervisor::{
+    COUNTER_MAIN, counts_past, gateway_log_lines, generation, is_takeover, kill_abruptly,
+    main_process, release_namespace, supervisor_pods, wait_for_owner, wait_until_attached,
+};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 const TEST_HOST: &str = "host.openshell.internal";
 /// Matches `ci/values-spire-delegation-stack.yaml`.
@@ -46,18 +62,8 @@ const TOPOLOGY_ANNOTATION: &str = "openshell.ai/sandbox-runtime-supervisor-topol
 /// Instance route annotation; the key keeps its established `-session` name.
 const INSTANCE_ROUTE_ANNOTATION: &str = "openshell.ai/sandbox-runtime-supervisor-session";
 
-fn release_namespace() -> String {
-    std::env::var("OPENSHELL_E2E_KUBE_NAMESPACE").unwrap_or_else(|_| "openshell".to_string())
-}
-
 fn kubectl_command() -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("kubectl");
-    if let Ok(context) = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
-        && !context.trim().is_empty()
-    {
-        command.arg("--context").arg(context);
-    }
-    command
+    shared_supervisor::kubectl_command()
 }
 
 async fn kubectl_with_input(args: &[&str], input: Option<&str>) -> String {
@@ -169,6 +175,7 @@ impl TokenService {
         let (shared, stored) = (state.clone(), Arc::new(stored_token));
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                openshell_core::net::set_tcp_nodelay_best_effort(&stream);
                 let (state, stored) = (shared.clone(), stored.clone());
                 tokio::spawn(async move {
                     let _ = answer_token_request(stream, &state, &stored).await;
@@ -302,6 +309,7 @@ async fn answer_token_request(
 /// Protected endpoint that reports which sandbox a final token was issued to.
 struct Target {
     port: u16,
+    seen_tokens: Arc<Mutex<HashMap<String, String>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -311,8 +319,12 @@ impl Target {
             .await
             .expect("bind protected target");
         let port = listener.local_addr().expect("target address").port();
+        let seen_tokens = Arc::new(Mutex::new(HashMap::new()));
+        let observed = seen_tokens.clone();
         let task = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+                let observed = observed.clone();
                 tokio::spawn(async move {
                     let Ok((head, _)) = read_request(&mut stream).await else {
                         return;
@@ -330,6 +342,7 @@ impl Target {
                         .strip_prefix("Bearer final-")
                         .and_then(|rest| rest.rsplit_once('-'))
                         .map_or_else(|| "SAW:NONE".to_string(), |(id, _)| format!("SAW:{id}"));
+                    observed.lock().unwrap().insert(seen.clone(), authorization);
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{seen}",
                         seen.len()
@@ -338,7 +351,11 @@ impl Target {
                 });
             }
         });
-        Self { port, task }
+        Self {
+            port,
+            seen_tokens,
+            task,
+        }
     }
 }
 
@@ -499,7 +516,7 @@ async fn call(sandbox: &SandboxGuard, port: u16) -> String {
 /// its agent and a restarted sandbox instance becomes ready.
 async fn call_until(sandbox: &SandboxGuard, port: u16, expected: &str) {
     let mut last = String::new();
-    let reached = tokio::time::timeout(Duration::from_secs(120), async {
+    let reached = tokio::time::timeout(Duration::from_mins(2), async {
         loop {
             last = call(sandbox, port).await;
             if last == expected {
@@ -714,10 +731,239 @@ print("LEAKS:" + ",".join(leaks) if leaks else "NO-SPIFFE")
     );
 }
 
+/// Operator-side probe of one generation's launch bearer. It never refreshes
+/// that bearer, and uses server-authenticated TLS without a user certificate.
+/// Tokens stay in memory and are never included in assertion diagnostics.
+struct BrokerProbe {
+    client: OpenShellClient<Channel>,
+    bearer: SecretJwt,
+    credential_key: String,
+    epoch: u64,
+}
+
+impl BrokerProbe {
+    async fn capture(sandbox_id: &str) -> Self {
+        #[derive(serde::Deserialize)]
+        struct LaunchMaterial {
+            auth: SupervisorAuthBundle,
+        }
+
+        let secrets: serde_json::Value = serde_json::from_str(
+            &kubectl(&[
+                "get", "secrets", "--all-namespaces", "-l",
+                &format!("openshell.ai/sandbox-id={sandbox_id},openshell.ai/component=supervisor-bootstrap"),
+                "-o", "json",
+            ]).await,
+        ).expect("parse launch Secret list");
+        let materials = secrets["items"]
+            .as_array()
+            .expect("Secret items")
+            .iter()
+            .filter_map(|secret| secret["data"]["instance.json"].as_str())
+            .collect::<Vec<_>>();
+        let [material] = materials.as_slice() else {
+            panic!("expected one shared launch Secret for {sandbox_id}");
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(material)
+            .expect("decode launch material");
+        let launch: LaunchMaterial = serde_json::from_slice(&bytes).expect("parse launch material");
+        let home = std::env::var_os("XDG_CONFIG_HOME").expect("harness config home");
+        let gateway = std::env::var("OPENSHELL_GATEWAY").expect("harness gateway name");
+        let directory = std::path::PathBuf::from(home)
+            .join("openshell/gateways")
+            .join(gateway);
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("metadata.json")).expect("gateway metadata"),
+        )
+        .expect("parse gateway metadata");
+        let endpoint = metadata["gateway_endpoint"]
+            .as_str()
+            .expect("gateway endpoint");
+        assert!(
+            endpoint.starts_with("https://"),
+            "the SPIFFE fixture requires TLS"
+        );
+        let ca = std::fs::read(directory.join("mtls/ca.crt")).expect("gateway CA");
+        openshell_crypto::tls::ensure_default_provider();
+        let channel = Endpoint::from_shared(endpoint.to_string())
+            .expect("valid gateway endpoint")
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca)))
+            .expect("configure gateway TLS")
+            .connect()
+            .await
+            .expect("connect with server-authenticated TLS");
+        let mut probe = Self {
+            client: OpenShellClient::new(channel),
+            bearer: launch.auth.gateway_token,
+            credential_key: String::new(),
+            epoch: launch.auth.auth_epoch.get(),
+        };
+        let request = probe.request(GetSandboxProviderEnvironmentRequest {
+            sandbox_id: sandbox_id.to_string(),
+            supports_static_credential_bindings: true,
+            supports_stable_placeholder_environment_keys: true,
+        });
+        let environment = probe
+            .client
+            .get_sandbox_provider_environment(request)
+            .await
+            .expect("the launch bearer is currently authorized")
+            .into_inner();
+        let mut keys = environment.dynamic_credentials.into_keys();
+        probe.credential_key = keys.next().expect("configured token grant key");
+        assert!(
+            keys.next().is_none(),
+            "the fixture must have exactly one configured grant"
+        );
+        probe
+    }
+
+    fn request<T>(&self, message: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", self.bearer.expose_secret())
+                .parse()
+                .expect("valid bearer header"),
+        );
+        request
+    }
+
+    async fn access_token(&mut self) -> Result<(String, Duration), tonic::Status> {
+        let request = self.request(GetSandboxProviderAccessTokenRequest {
+            credential_key: self.credential_key.clone(),
+        });
+        self.client
+            .get_sandbox_provider_access_token(request)
+            .await
+            .map(|response| {
+                let response = response.into_inner();
+                let lifetime = openshell_core::time::duration_to_std(
+                    response
+                        .expires_after
+                        .as_ref()
+                        .expect("broker token lifetime"),
+                )
+                .expect("valid broker token lifetime");
+                (response.access_token, lifetime)
+            })
+    }
+}
+
+/// A warmed broker cache cannot bypass an ownership epoch change. Prove the
+/// replacement adopts the same workload and identity, obtains a new provider
+/// token, and rejects the previous owner's still-unexpired gateway bearer.
+async fn assert_provider_failover(
+    sandbox: &SandboxGuard,
+    gateway: &str,
+    tokens: &TokenService,
+    target: &Target,
+) {
+    let id = sandbox_id(&sandbox.name).await;
+    let before = generation(&sandbox.name).await;
+    let owner = wait_for_owner(&before.route).await;
+    let process = main_process(sandbox)
+        .await
+        .expect("main process before failover");
+    let mut probe = BrokerProbe::capture(&id).await;
+    let (old_token, lifetime) = probe
+        .access_token()
+        .await
+        .expect("warm the broker's credential cache");
+    let cache_expires = tokio::time::Instant::now() + lifetime;
+    let exchange_count = tokens.exchanges().len();
+    let killed_at = tokio::time::Instant::now();
+    let killed = kill_abruptly(&owner).await;
+    eprintln!("SPIFFE supervisor {owner} killed: {killed}");
+    let replacement = wait_for_owner(&before.route).await;
+    assert_ne!(replacement, owner, "the lost member cannot own the route");
+    assert!(
+        killed_at.elapsed() >= Duration::from_secs(10),
+        "takeover must wait for membership expiry"
+    );
+    let logs = gateway_log_lines(&before.route).await;
+    let term = logs
+        .iter()
+        .find(|line| is_takeover(line, &before.route, &owner, "expired"))
+        .and_then(|line| {
+            strip_ansi(line)
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("term=")?.parse::<u64>().ok())
+        })
+        .expect("the gateway records the failed owner's replacement epoch");
+    assert!(
+        term > probe.epoch,
+        "takeover must advance the credential epoch"
+    );
+    counts_past(sandbox, &process).await;
+    assert_eq!(generation(&sandbox.name).await, before);
+    call_until(sandbox, target.port, &format!("SAW:{id}")).await;
+    assert!(
+        tokio::time::Instant::now() < cache_expires,
+        "the old cache entry must still be live, so TTL expiry cannot explain the fresh exchange"
+    );
+    assert!(
+        tokens.exchanges()[exchange_count..]
+            .iter()
+            .any(|exchange| !exchange.intermediate
+                && exchange.assertion_subject == spiffe_id(gateway, &id)),
+        "the new owner must acquire a provider token for the unchanged sandbox identity"
+    );
+    assert!(
+        target
+            .seen_tokens
+            .lock()
+            .unwrap()
+            .get(&format!("SAW:{id}"))
+            .is_some_and(|token| token != &format!("Bearer {old_token}")),
+        "the provider request must not reuse the previous epoch's cached token"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("current time")
+        .as_secs();
+    assert!(
+        claims(probe.bearer.expose_secret())["exp"]
+            .as_u64()
+            .is_some_and(|expiry| expiry > now),
+        "the stale bearer must still be unexpired, so expiry cannot explain its rejection"
+    );
+    let exchanges_before_rejection = tokens.exchanges().len();
+    let Err(error) = probe.access_token().await else {
+        panic!("the broker accepted the old owner bearer");
+    };
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    assert_eq!(
+        tokens.exchanges().len(),
+        exchanges_before_rejection,
+        "reject the old owner before contacting the token service"
+    );
+    let pod = shared_supervisor::kubectl_json(&[
+        "-n",
+        &release_namespace(),
+        "get",
+        "pod",
+        &replacement,
+        "-o",
+        "json",
+    ])
+    .await;
+    assert_no_spiffe_access(&pod);
+    assert_sandbox_holds_no_spiffe_material(sandbox).await;
+    eprintln!(
+        "SPIFFE takeover preserved {id}: owner {owner} -> {replacement}, epoch {} -> {term}",
+        probe.epoch
+    );
+}
+
 async fn create(name: &str, provider: &str) -> SandboxGuard {
+    let main = format!("echo spiffe-ready; {COUNTER_MAIN}");
     SandboxGuard::create_keep_with_args(
         &["--name", name, "--provider", provider],
-        &["sh", "-c", "echo spiffe-ready; exec sleep infinity"],
+        &["sh", "-c", &main],
         "spiffe-ready",
     )
     .await
@@ -727,6 +973,12 @@ async fn create(name: &str, provider: &str) -> SandboxGuard {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity() {
+    let members = supervisor_pods().await;
+    assert!(
+        members.len() >= 2,
+        "SPIFFE failover needs two supervisor members"
+    );
+    wait_until_attached(&members).await;
     let nonce = format!("{:08x}", rand::random::<u32>());
     let stored_token = format!("stored-{nonce}");
     let tokens = TokenService::start(stored_token.clone()).await;
@@ -830,6 +1082,8 @@ async fn shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity() {
     assert_workloads_hold_no_spiffe_material().await;
     assert_sandbox_holds_no_spiffe_material(&alpha).await;
     assert_sandbox_holds_no_spiffe_material(&beta).await;
+
+    assert_provider_failover(&alpha, &gateway_id, &tokens, &target).await;
 
     // A restart is a new generation with a new sandbox instance and an empty
     // cache, and it acquires under the same SPIFFE ID.
