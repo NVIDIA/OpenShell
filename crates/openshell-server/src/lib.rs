@@ -48,7 +48,7 @@ mod refresh_store;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
-mod spiffe_delegation;
+mod spiffe_broker;
 mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
@@ -443,7 +443,7 @@ pub struct ServerState {
     pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
 
     /// Source of sandbox JWT-SVIDs for brokered provider tokens, built once
-    /// from the SPIRE delegation settings. `None` when disabled.
+    /// from the SPIRE broker settings. `None` when disabled.
     pub(crate) sandbox_identity:
         Option<Arc<dyn SandboxIdentityProvider<Error = TokenGrantFailure>>>,
 
@@ -599,7 +599,7 @@ impl ServerState {
     ///
     /// # Panics
     ///
-    /// Panics when `config` holds credential-driver or SPIRE delegation
+    /// Panics when `config` holds credential-driver or SPIRE broker
     /// settings that startup validation would reject. Gateway startup uses
     /// [`Self::new_with_credentials`], which reports those as errors.
     #[must_use]
@@ -633,12 +633,12 @@ impl ServerState {
 
     /// Create new server state with an already-initialized credential runtime.
     ///
-    /// Parses the SPIRE delegation settings into the state that serves every
+    /// Parses the SPIRE broker settings into the state that serves every
     /// provider access-token request.
     ///
     /// # Errors
     ///
-    /// Returns a configuration error when the SPIRE delegation settings are
+    /// Returns a configuration error when the SPIRE broker settings are
     /// invalid.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_credentials(
@@ -653,7 +653,7 @@ impl ServerState {
         credentials: credentials::CredentialRuntime,
     ) -> Result<Self> {
         let sandbox_identity =
-            spiffe_delegation::sandbox_identity_provider(&config).map_err(Error::config)?;
+            spiffe_broker::sandbox_identity_provider(&config).map_err(Error::config)?;
         let replica_id = compute::lease::replica_id();
         let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
         compute.configure_ssh_identities(credentials.clone());

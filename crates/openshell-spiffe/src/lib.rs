@@ -187,6 +187,7 @@ pub trait SandboxIdentityProvider: fmt::Debug + Send + Sync {
         gateway_id: &str,
         sandbox_id: &str,
         audience: &str,
+        runtime_identity: &str,
     ) -> Result<SandboxJwtSvid, Self::Error>;
 }
 

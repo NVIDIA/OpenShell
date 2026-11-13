@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# SPIRE 1.15.3 / hardened chart 0.30.3 Broker API fixture.
+global:
+  spire:
+    clusterName: openshell-e2e
+    jwtIssuer: https://spire.openshell.local
+    trustDomain: openshell.local
+spire-server:
+  defaultJwtSvidTTL: 5m
+  defaultX509SvidTTL: 30s
+  agentTTL: 1h
+spire-agent:
+  brokerAPI:
+    tcp:
+      enabled: true
+      bindAddress: 0.0.0.0:8443
+    brokers:
+      openshell:
+        enabled: true
+        idTemplate: spiffe://{{ .TrustDomain }}/ns/openshell/sa/openshell
+        allowedReferenceTypes:
+          - typeURL: type.googleapis.com/spiffe.broker.KubernetesObjectReference
+            allowOverTCP: true
+  workloadAttestors:
+    k8s:
+      brokerAPI:
+        accessPolicy: enforced
+        brokers:
+          openshell:
+            enabled: true
+            podReferenceScope: cluster
+            impersonation:
+              clusterWidePodsOnly: false
+spiffe-oidc-discovery-provider:
+  enabled: false

@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-spire"
-description = "SPIRE Delegated Identity adapter for gateway-owned sandbox JWT-SVIDs"
+description = "SPIFFE Broker API adapter for gateway-owned sandbox JWT-SVIDs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,10 +17,16 @@ openshell-crypto = { workspace = true }
 async-trait = "0.1"
 http = { workspace = true }
 prost = { workspace = true }
-spiffe = { workspace = true }
+spiffe = { workspace = true, features = ["workload-api-x509"] }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["channel"] }
 tonic-prost = { workspace = true }
+
+hyper-util = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+tower = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

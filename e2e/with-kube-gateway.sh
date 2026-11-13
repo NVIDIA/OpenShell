@@ -58,10 +58,10 @@
 #   installing OpenShell. This is used by HA CI so the gateway can run multiple
 #   replicas without requiring the OpenShell chart to own a database.
 #
-# SPIRE delegation fixture:
-#   Set OPENSHELL_E2E_KUBE_SPIRE_DELEGATION=1 to install pinned SPIRE hardened
-#   charts (ci/values-spire-delegation-stack.yaml) before OpenShell, with the
-#   agent admin socket exposed for the shared supervisor. The fixture needs a
+# SPIFFE Broker API fixture:
+#   Set OPENSHELL_E2E_KUBE_SPIRE_BROKER=1 to install pinned SPIRE hardened
+#   charts (ci/values-spire-broker-stack.yaml) before OpenShell, with an
+#   mTLS Broker endpoint and enforced object authorization. The fixture needs a
 #   cluster without SPIRE CRDs and creates a fresh namespace
 #   (OPENSHELL_E2E_SPIRE_NAMESPACE, default openshell-e2e-spire); it removes
 #   both, and the registration entries tests label with that namespace, on exit.
@@ -530,18 +530,103 @@ deploy_spire_fixture() {
   helmctl install spire-crds spire-crds --repo "${SPIRE_CHART_REPO}" \
     --version "${SPIRE_CRDS_CHART_VERSION}" \
     --namespace "${SPIRE_NAMESPACE}" --wait
+  local spire_values="${ROOT}/deploy/helm/openshell/ci/values-spire-broker-stack.yaml"
   helmctl install spire spire --repo "${SPIRE_CHART_REPO}" \
     --version "${SPIRE_CHART_VERSION}" \
     --namespace "${SPIRE_NAMESPACE}" \
-    --values "${ROOT}/deploy/helm/openshell/ci/values-spire-delegation-stack.yaml" \
+    --values "${spire_values}" \
     --wait --timeout 5m
   kctl -n "${SPIRE_NAMESPACE}" rollout status daemonset/spire-agent --timeout=180s
+  if [ "${OPENSHELL_E2E_KUBE_SPIRE_BROKER:-0}" = "1" ]; then
+    # UID-only references are resolved by SPIRE, never by a supervisor. The
+    # agent needs object lookup and SAR access; the broker's grant is namespace scoped.
+    kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+    kctl apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-broker
+  namespace: ${SPIRE_NAMESPACE}
+spec:
+  selector:
+    app.kubernetes.io/name: agent
+    app.kubernetes.io/instance: spire
+  ports:
+    - name: broker
+      port: 8443
+      targetPort: 8443
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: openshell-e2e-spire-broker-${SPIRE_NAMESPACE}
+  labels:
+    openshell.ai/e2e-spire-fixture: ${SPIRE_NAMESPACE}
+rules:
+  - apiGroups: [agents.x-k8s.io]
+    resources: [sandboxes]
+    verbs: [get, list]
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openshell-e2e-spire-broker-${SPIRE_NAMESPACE}
+  labels:
+    openshell.ai/e2e-spire-fixture: ${SPIRE_NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: spire-agent
+    namespace: ${SPIRE_NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: openshell-e2e-spire-broker-${SPIRE_NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openshell-e2e-spire-broker
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: [agents.x-k8s.io]
+    resources: [sandboxes]
+    verbs: [impersonate-via-spire]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openshell-e2e-spire-broker
+  namespace: ${NAMESPACE}
+subjects:
+  - kind: User
+    name: spiffe://openshell.local/ns/${NAMESPACE}/sa/openshell
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: openshell-e2e-spire-broker
+EOF
+    local node_uid broker_values
+    node_uid="$(kctl get nodes -o jsonpath='{.items[0].metadata.uid}')"
+    broker_values="${WORKDIR}/spire-broker-values.yaml"
+    cat >"${broker_values}" <<EOF
+gatewayConfig:
+  openshell.gateway.spiffe_broker:
+    endpoint: https://spire-broker.${SPIRE_NAMESPACE}.svc:8443
+    server_spiffe_id: spiffe://openshell.local/spire/agent/k8s_psat/openshell-e2e/${node_uid}
+EOF
+    helm_values_args+=(--values "${broker_values}")
+  fi
   # Tests label the registration entries they create with this namespace.
   export OPENSHELL_E2E_SPIRE_NAMESPACE="${SPIRE_NAMESPACE}"
 }
 
 cleanup_spire_fixture() {
   [ "${SPIRE_FIXTURE_DEPLOYED}" = "1" ] || return 0
+  kctl delete clusterroles,clusterrolebindings -l "openshell.ai/e2e-spire-fixture=${SPIRE_NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
   kctl delete clusterstaticentries.spire.spiffe.io \
     -l "openshell.ai/e2e-spire-fixture=${SPIRE_NAMESPACE}" --ignore-not-found \
     >/dev/null 2>&1 || true
@@ -1561,7 +1646,7 @@ if use_envoy_gateway; then
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
   install_envoy_gateway
 fi
-if [ "${OPENSHELL_E2E_KUBE_SPIRE_DELEGATION:-0}" = "1" ]; then
+if [ "${OPENSHELL_E2E_KUBE_SPIRE_BROKER:-0}" = "1" ]; then
   deploy_spire_fixture
 fi
 

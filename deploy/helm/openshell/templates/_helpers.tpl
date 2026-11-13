@@ -393,23 +393,19 @@ fullname, so the name never collapses into another release resource's name.
 {{- printf "%s%s" $base $suffix -}}
 {{- end }}
 
-{{/*
-SPIRE delegation belongs to the gateway. The private node admin socket is
-never mounted in a supervisor or sandbox Pod.
-*/}}
-{{- define "openshell.validateSpiffeDelegation" -}}
-{{- $delegation := .delegation -}}
-{{- $admin := get $delegation "admin_socket_path" | default "" -}}
-{{- $prefix := get $delegation "spiffe_id_prefix" | default "" -}}
-{{- $canonical := "^(/[A-Za-z0-9_.-]+){2,}$" -}}
-{{- if or (not (regexMatch $canonical $admin)) (regexMatch "/\\.\\.?(/|$)" $admin) -}}
-{{- fail "spiffe_delegation.admin_socket_path must be a canonical absolute UNIX socket path below a dedicated directory" -}}
+{{/* Validate gateway-owned SPIFFE Broker API settings. */}}
+{{- define "openshell.validateSpiffeBroker" -}}
+{{- $broker := .broker -}}
+{{- if not (regexMatch "^https://[^/]+/?$" (get $broker "endpoint" | default "")) -}}
+{{- fail "spiffe_broker.endpoint must be an HTTPS endpoint" -}}
 {{- end -}}
-{{- if and (hasKey $delegation "admin_socket_group") (not (regexMatch "^[1-9][0-9]*$" (toString (get $delegation "admin_socket_group")))) -}}
-{{- fail "spiffe_delegation.admin_socket_group must be a positive group ID" -}}
+{{- if not (regexMatch "^(/[A-Za-z0-9_.-]+){2,}$" (get $broker "workload_api_socket_path" | default "")) -}}
+{{- fail "spiffe_broker.workload_api_socket_path must be an absolute UNIX socket path" -}}
 {{- end -}}
-{{- if not (regexMatch "^spiffe://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*$" $prefix) -}}
-{{- fail "spiffe_delegation.spiffe_id_prefix must be spiffe://<trust-domain>[/<segment>...]" -}}
+{{- range $field := list "server_spiffe_id" "spiffe_id_prefix" -}}
+{{- if not (regexMatch "^spiffe://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*$" (get $broker $field | default "")) -}}
+{{- fail (printf "spiffe_broker.%s must be a SPIFFE ID" $field) -}}
+{{- end -}}
 {{- end -}}
 {{- end }}
 
@@ -783,12 +779,12 @@ Validate chart values that Helm would otherwise accept silently.
 {{- fail "supervisor_topology=gateway in operator workspace mode requires operator_namespace_label of the form key=value" -}}
 {{- end -}}
 {{- end -}}
-{{- $delegation := get (.Values.gatewayConfig | default dict) "openshell.gateway.spiffe_delegation" | default dict -}}
-{{- if $delegation -}}
+{{- $broker := get (.Values.gatewayConfig | default dict) "openshell.gateway.spiffe_broker" | default dict -}}
+{{- if $broker -}}
 {{- if ne (get $kubernetes "supervisor_topology" | default "") "gateway" -}}
-{{- fail "spiffe_delegation requires supervisor_topology=gateway" -}}
+{{- fail "spiffe_broker requires supervisor_topology=gateway" -}}
 {{- end -}}
-{{- include "openshell.validateSpiffeDelegation" (dict "delegation" $delegation) -}}
+{{- include "openshell.validateSpiffeBroker" (dict "broker" $broker) -}}
 {{- end -}}
 {{- if hasKey (get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict) "shared_supervisor" -}}
 {{- fail "shared_supervisor is rendered by the chart; set only supervisor_topology" -}}

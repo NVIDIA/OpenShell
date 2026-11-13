@@ -208,41 +208,38 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
-/// Gateway-owned SPIRE delegation for sandbox provider grants.
+/// Gateway-owned SPIFFE Broker API issuance for Kubernetes sandbox identities.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SpiffeDelegationConfig {
-    pub admin_socket_path: String,
+pub struct SpiffeBrokerConfig {
     pub spiffe_id_prefix: String,
-    /// Supplementary group permitted to open the admin socket.
-    ///
-    /// The gateway validates it but
-    /// never changes its own groups; the Helm chart adds it to the gateway
-    /// Pod's `supplementalGroups`, and other deployments must run the gateway
-    /// with it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub admin_socket_group: Option<u32>,
+    pub endpoint: String,
+    pub server_spiffe_id: String,
+    pub workload_api_socket_path: String,
 }
 
-impl SpiffeDelegationConfig {
-    /// Reject ambiguous host paths and identities before opening the SPIRE socket.
+impl SpiffeBrokerConfig {
+    /// Validate the identity and authenticated transport before use.
     pub fn validate(&self, gateway_id: &str) -> Result<(), String> {
-        let path = std::path::Path::new(&self.admin_socket_path);
-        if !path.is_absolute()
-            || path
-                .parent()
-                .is_none_or(|parent| parent == std::path::Path::new("/"))
-            || self
-                .admin_socket_path
-                .split('/')
-                .skip(1)
-                .any(|part| part.is_empty() || part == "." || part == "..")
-            || self.admin_socket_group == Some(0)
-        {
-            return Err("spiffe_delegation requires a canonical absolute admin socket path in a dedicated directory and a non-root socket group".into());
-        }
         openshell_spiffe::SandboxSpiffeIdPrefix::parse(&self.spiffe_id_prefix)?
             .sandbox_spiffe_id(gateway_id, "sandbox")?;
+        let endpoint = url::Url::parse(&self.endpoint)
+            .map_err(|_| "spiffe_broker.endpoint must be an HTTPS endpoint")?;
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.path() != "/"
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || !std::path::Path::new(&self.workload_api_socket_path).is_absolute()
+        {
+            return Err(
+                "spiffe_broker requires an HTTPS endpoint and absolute Workload API socket path"
+                    .into(),
+            );
+        }
+        openshell_spiffe::SandboxSpiffeIdPrefix::parse(&self.server_spiffe_id)?;
         Ok(())
     }
 }
@@ -324,7 +321,7 @@ pub struct Config {
     /// flow (issue #1354).
     pub gateway_jwt: Option<GatewayJwtConfig>,
     /// Gateway-only access to SPIRE; shared supervisors receive access tokens.
-    pub spiffe_delegation: Option<SpiffeDelegationConfig>,
+    pub spiffe_broker: Option<SpiffeBrokerConfig>,
 
     /// Database URL for persistence.
     pub database_url: String,
@@ -1096,7 +1093,7 @@ impl Config {
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
-            spiffe_delegation: None,
+            spiffe_broker: None,
             database_url: String::new(),
             database_max_connections: None,
             database_lock_max_connections: None,
@@ -2068,5 +2065,28 @@ mod tests {
             runtime_image_default(None, "compiled:default".to_string()),
             "compiled:default"
         );
+    }
+    #[test]
+    fn broker_configuration_rejects_ambiguous_transport() {
+        let mut config = super::SpiffeBrokerConfig {
+            spiffe_id_prefix: "spiffe://example.org/openshell".into(),
+            endpoint: "https://spire-broker.spire.svc:8443".into(),
+            server_spiffe_id: "spiffe://example.org/spire/agent/node".into(),
+            workload_api_socket_path: "/spiffe-workload-api/spire-agent.sock".into(),
+        };
+        config.validate("gw").unwrap();
+        for endpoint in [
+            "http://broker:8443",
+            "https://user:password@broker",
+            "https://broker/path",
+            "https://broker/?query",
+            "https://broker/#fragment",
+        ] {
+            config.endpoint = endpoint.into();
+            assert!(config.validate("gw").is_err());
+        }
+        config.endpoint = "https://broker:8443".into();
+        config.workload_api_socket_path = "tcp:broker:1234".into();
+        assert!(config.validate("gw").is_err());
     }
 }

@@ -39,8 +39,10 @@ operation forwards a configured dynamic credential key and request ID; the
 gateway derives the sandbox identity,
 validates current authorization, resolves grant parameters, and obtains the
 final access token, which the resolver validates. No SPIRE client, SVID,
-intermediate token, or grant cache is used in the shared supervisor. `mise run test:spire-delegation` exercises the gateway's
-SPIRE acquisition client against a real server and agent. A process hosting several instances serves
+intermediate token, or grant cache is used in the shared supervisor.
+`mise run e2e:kubernetes:shared-supervisor-spiffe` exercises the gateway's
+SPIFFE Broker API flow against a real server and agent. A process hosting
+several instances serves
 `/v1/denials` from a per-instance `SandboxInstanceDenialLog` instead of the shared
 shorthand log files.
 

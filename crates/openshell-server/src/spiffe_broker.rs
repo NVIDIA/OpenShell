@@ -5,19 +5,19 @@
 //!
 //! The provider broker depends only on
 //! [`SandboxIdentityProvider`]; this module chooses the SPIRE adapter when
-//! `[openshell.gateway.spiffe_delegation]` is configured.
+//! `[openshell.gateway.spiffe_broker]` is configured.
 use std::sync::Arc;
 
-use openshell_core::config::{Config, SpiffeDelegationConfig};
+use openshell_core::config::{Config, SpiffeBrokerConfig};
 use openshell_core::token_grant_failure::TokenGrantFailure;
 use openshell_spiffe::SandboxIdentityProvider;
 
-/// Check the delegation settings `config` enables without building them.
+/// Check the broker settings `config` enables without building them.
 ///
 /// # Errors
 ///
-/// Rejects delegation without gateway session JWTs and a positive session
-/// TTL, and settings [`SpiffeDelegationConfig::validate`] rejects.
+/// Rejects broker without gateway session JWTs and a positive session
+/// TTL, and settings [`SpiffeBrokerConfig::validate`] rejects.
 pub fn validate_config(config: &Config) -> Result<(), String> {
     enabled(config).map(drop)
 }
@@ -30,25 +30,25 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 pub fn sandbox_identity_provider(
     config: &Config,
 ) -> Result<Option<Arc<dyn SandboxIdentityProvider<Error = TokenGrantFailure>>>, String> {
-    let Some(delegation) = enabled(config)? else {
+    let Some(broker) = enabled(config)? else {
         return Ok(None);
     };
-    let provider = openshell_spire::SpireDelegatedIdentity::new(delegation)?;
+    let provider = openshell_spire::SpireSandboxIdentity::new(broker)?;
     Ok(Some(Arc::new(provider)))
 }
 
-/// Validated delegation settings, when delegation is enabled.
-fn enabled(config: &Config) -> Result<Option<&SpiffeDelegationConfig>, String> {
-    let Some(delegation) = &config.spiffe_delegation else {
+/// Validated broker settings, when broker is enabled.
+fn enabled(config: &Config) -> Result<Option<&SpiffeBrokerConfig>, String> {
+    let Some(broker) = &config.spiffe_broker else {
         return Ok(None);
     };
     let jwt = config
         .gateway_jwt
         .as_ref()
-        .ok_or("spiffe_delegation requires gateway session JWTs")?;
-    delegation.validate(&jwt.gateway_id)?;
+        .ok_or("spiffe_broker requires gateway session JWTs")?;
+    broker.validate(&jwt.gateway_id)?;
     if jwt.ttl_secs.is_none() {
-        return Err("spiffe_delegation requires a positive gateway_jwt.ttl_secs".into());
+        return Err("spiffe_broker requires a positive gateway_jwt.ttl_secs".into());
     }
-    Ok(Some(delegation))
+    Ok(Some(broker))
 }

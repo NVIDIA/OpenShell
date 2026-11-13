@@ -5223,14 +5223,19 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "http 1.4.0",
+ "hyper-util",
  "openshell-core",
  "openshell-crypto",
  "openshell-spiffe",
  "prost",
+ "rustls",
  "spiffe",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tonic-prost",
+ "tower",
+ "uuid",
 ]
 
 [[package]]
@@ -7685,6 +7690,7 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "log",
+ "pkcs8 0.10.2",
  "prost",
  "prost-types",
  "serde",
@@ -7698,6 +7704,7 @@ dependencies = [
  "tower",
  "tracing",
  "url",
+ "x509-parser 0.18.1",
  "zeroize",
 ]
 

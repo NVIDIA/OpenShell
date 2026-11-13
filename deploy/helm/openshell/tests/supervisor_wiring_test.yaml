@@ -118,35 +118,28 @@ tests:
             name: spiffe-workload-api
             mountPath: /spiffe-workload-api
             readOnly: true
-      - notContains:
-          path: spec.template.spec.volumes
-          content:
-            name: spire-agent-admin
-          any: true
-  - it: mounts SPIRE delegation only into the gateway
+      - notExists:
+          path: spec.template.spec.volumes[*].hostPath
+  - it: uses only the Workload API CSI mount for broker identity
     template: templates/statefulset.yaml
     set:
       gatewayConfig:
         openshell.drivers.kubernetes:
           supervisor_topology: gateway
-        openshell.gateway.spiffe_delegation:
-          admin_socket_path: /run/spire/admin/admin.sock
+        openshell.gateway.spiffe_broker:
           spiffe_id_prefix: spiffe://example.org/openshell
-          admin_socket_group: 10035
+          endpoint: https://spire-broker.spire.svc:8443
+          server_spiffe_id: spiffe://example.org/spire/agent/node
+          workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
     asserts:
-      - contains:
+      - notExists:
           path: spec.template.spec.securityContext.supplementalGroups
-          content: 10035
-      - contains:
-          path: spec.template.spec.containers[0].volumeMounts
-          content:
-            name: spire-agent-admin
-            mountPath: /run/spire/admin
-            readOnly: true
+      - notExists:
+          path: spec.template.spec.volumes[*].hostPath
       - contains:
           path: spec.template.spec.volumes
           content:
-            name: spire-agent-admin
-            hostPath:
-              path: /run/spire/admin
-              type: Directory
+            name: spiffe-workload-api
+            csi:
+              driver: csi.spiffe.io
+              readOnly: true

@@ -7,21 +7,16 @@ release:
   name: openshell
   namespace: gateway
 tests:
-  - it: lists SPIRE delegation prerequisites
+  - it: describes enforced Broker API authorization
     set:
       gatewayConfig:
-        openshell.drivers.kubernetes:
-          supervisor_topology: gateway
-        openshell.gateway.spiffe_delegation:
-          admin_socket_path: /run/spire/admin/admin.sock
+        openshell.gateway.spiffe_broker:
           spiffe_id_prefix: spiffe://example.org/openshell
-          admin_socket_group: 10035
+          endpoint: https://spire-broker.spire.svc:8443
+          server_spiffe_id: spiffe://example.org/spire/agent/node
+          workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
     asserts:
       - matchRegexRaw:
-          pattern: "admin socket directory\\s+/run/spire/admin as a hostPath volume"
+          pattern: "gateway uses mTLS"
       - matchRegexRaw:
-          pattern: "namespace\\s+gateway needs an explicit policy exception"
-      - matchRegexRaw:
-          pattern: "supplemental group 10035"
-      - matchRegexRaw:
-          pattern: "every SPIRE agent that may run a gateway Pod"
+          pattern: "impersonate-via-spire"

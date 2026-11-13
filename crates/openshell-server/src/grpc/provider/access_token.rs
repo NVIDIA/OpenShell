@@ -363,8 +363,28 @@ async fn acquire(
 ) -> Result<(oauth::OAuthTokenResponse, i64), Status> {
     authorize(state, bearer).await?;
     let audience = effective_jwt_svid_audience(&grant.token_endpoint, &grant.jwt_svid_audience);
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(session.sandbox_id.as_str())
+        .await
+        .map_err(|_| token_grant_store_status())?
+        .ok_or_else(|| token_grant_identity_rejected(tonic::Code::Unauthenticated))?;
+    let runtime_identity = sandbox
+        .metadata
+        .as_ref()
+        .and_then(|metadata| {
+            metadata
+                .annotations
+                .get(crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION)
+        })
+        .map_or("", String::as_str);
     let svid = identity
-        .fetch_jwt_svid(gateway_id, session.sandbox_id.as_str(), &audience)
+        .fetch_jwt_svid(
+            gateway_id,
+            session.sandbox_id.as_str(),
+            &audience,
+            runtime_identity,
+        )
         .await
         .map_err(TokenGrantFailure::to_status)?;
     authorize(state, bearer).await?;

@@ -1,75 +1,50 @@
 # openshell-spire
 
-SPIRE adapter for gateway-owned sandbox identities. The gateway uses it to
-obtain JWT-SVIDs for sandboxes under shared supervision. In this flow, only
-the gateway reaches the SPIRE agent.
+SPIFFE Broker API adapter for gateway-owned sandbox identities. Only the
+gateway obtains sandbox JWT-SVIDs; supervisors receive final provider tokens.
 
-## Interface
-
-`SpireDelegatedIdentity` implements
-`openshell_spiffe::SandboxIdentityProvider` with
+`SpireSandboxIdentity` implements `SandboxIdentityProvider` using
 `openshell_core::token_grant_failure::TokenGrantFailure` as its error type.
-The gateway builds it once
-at startup from `[openshell.gateway.spiffe_delegation]` and keeps it as a
-trait object, so the provider-token broker does not depend on SPIRE. The
-broker authorizes the sandbox session and provider credential first, then asks
-for an identity with the gateway ID, sandbox ID, and token-service audience.
-It retains provider configuration, token exchange, caching, and the
-authorization checks around each call.
+Startup selects it from `[openshell.gateway.spiffe_broker]`. The provider-token
+broker owns session authorization, provider configuration, exchange, and caching.
 
-The result is a `SandboxJwtSvid` holding the stable SPIFFE ID, the token, and
-its verified expiry. Its `Debug` output omits the token.
+For each acquisition the adapter:
 
-## Issuance
+1. Extracts the Sandbox CR UID from the gateway's persisted Kubernetes runtime
+   identity. Supervisors cannot supply a reference or selectors.
+2. Fetches current gateway X.509-SVID credentials and trust bundles through the
+   local CSI Workload API socket.
+3. Connects to the Broker endpoint over mTLS, verifying the agent certificate
+   chain and exact configured SPIFFE URI through `openshell-crypto`.
+4. Requests a JWT-SVID for a `KubernetesObjectReference` containing the Sandbox
+   resource type and UID. SPIRE resolves and attests the object and enforces the
+   gateway's Kubernetes authorization.
+5. Fetches the JWT bundle and verifies the signature, audience, expiry, and
+   exact expected subject `<prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>`.
 
-The stable identity is
-`<spiffe_id_prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>`, built by
-`openshell_spiffe::SandboxSpiffeIdPrefix`, which configuration
-validation also uses. Gateway and sandbox IDs must already be SPIFFE path
-segments; anything else fails as a configuration error before the agent is
-contacted.
+Every RPC includes `broker.spiffe.io: true`. Acquisitions fetch fresh credentials
+and bundles so Workload API rotation does not require a gateway restart. The
+whole operation is bounded by `WORKLOAD_IDENTITY_CALL_TIMEOUT`. Errors retain
+only bounded classifications; credentials and upstream diagnostics are not logged.
 
-For each request the adapter:
+The operator enables SPIRE's experimental Broker endpoint, authorizes the
+gateway SPIFFE ID and `KubernetesObjectReference` over TCP, and configures
+`access_policy = "enforced"`. The agent needs Sandbox lookup and
+SubjectAccessReview permissions; the gateway SPIFFE ID needs
+`impersonate-via-spire` only for its permitted Sandbox resources. Registrations
+match attested Sandbox UIDs and must reach each selected agent. The configured
+server SPIFFE ID must match the endpoint's agent certificate.
 
-1. Connects to the agent's admin socket. Only an absolute Unix socket path is
-   accepted, because the agent authorizes the delegate by attesting the
-   connecting process. The underlying `spiffe` connector rejects Unix sockets
-   on other platforms.
-2. Calls `FetchJWTSVIDs` with the single selector
-   `openshell:sandbox:<gateway-id>:<sandbox-id>` and the audience.
-3. Requires exactly one SVID whose reported ID is the stable identity, so a
-   missing, misregistered, or ambiguous registration is refused.
-4. Reads the agent's current JWT bundle for the prefix's trust domain from
-   `SubscribeToJWTBundles`, then verifies the token signature, audience, and
-   expiry through the `spiffe` crate with the JWT provider installed by
-   `openshell-crypto`, and checks the verified subject again.
-
-Nothing is cached; every request fetches a new SVID and bundle.
-
-## Errors and limits
-
-Failures are `openshell_core::token_grant_failure::TokenGrantFailure` values,
-which carry only an allowlisted classification. Agent status messages,
-tokens, and bundles are never retained or logged. Agent status codes map to
-`WorkloadIdentityRejected`, `Timeout`, `Unavailable`, `Configuration`, or
-`Unclassified`. Connecting and each agent call are bounded by
-`WORKLOAD_IDENTITY_CALL_TIMEOUT`.
-
-## Wire messages
-
-`src/wire.rs` transcribes the Delegated Identity API messages for
-`FetchJWTSVIDs` and `SubscribeToJWTBundles` from `spire-api-sdk` `v1.15.3`,
-with field numbers and types unchanged, instead of generating the full API.
-
-## Tests
-
-Unit tests cover identity and socket checks that fail before contacting an
-agent. The ignored live test runs against a real SPIRE server and agent:
+## Verification
 
 ```shell
-mise run test:spire-delegation
+mise run e2e:kubernetes:shared-supervisor-spiffe
 ```
 
-The task downloads a pinned, checksum-verified SPIRE release, registers
-correct, missing, misregistered, and ambiguous sandbox entries, and requires
-Linux.
+The test installs pinned SPIRE charts, exercises the full provider exchange,
+checks supervisor takeover and stale-session fencing, and forces acquisition
+after the fixture's 30-second workload X.509-SVID expires. It also checks that
+the gateway Pod passes Restricted Pod Security admission.
+
+The [`broker_probe` experiment](../../e2e/kubernetes/spiffe-broker/README.md)
+provides independent positive and negative protocol checks.

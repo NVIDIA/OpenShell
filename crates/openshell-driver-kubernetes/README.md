@@ -261,8 +261,8 @@ fails closed.
   when the token that opened it expires. Sandboxes cannot reach the stream,
   and the routing preface only selects which generation-pinned TLS identity
   the supervisor demands.
-- **Workload identity.** The gateway owns SPIRE delegation and provider-token
-  exchange when `openshell.gateway.spiffe_delegation` is configured.
+- **Workload identity.** The gateway owns SPIFFE Broker API identity acquisition and provider-token
+  exchange when `openshell.gateway.spiffe_broker` is configured.
   Shared supervisors receive final access tokens through their authenticated
   sessions. No SPIFFE socket is mounted in a shared supervisor or workload Pod.
   The existing Workload API option supplies the gateway's component identity

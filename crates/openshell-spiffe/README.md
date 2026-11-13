@@ -10,10 +10,11 @@ depend on it without a cycle.
 - `SandboxSpiffeIdPrefix` maps a gateway and sandbox to the stable identity
   `<prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>`. Both IDs must already
   be SPIFFE path segments; nothing is encoded, so distinct IDs always map to
-  distinct SPIFFE IDs. `SpiffeDelegationConfig::validate` in `openshell-core`
+  distinct SPIFFE IDs. `SpiffeBrokerConfig::validate` in `openshell-core`
   uses it.
 - `SandboxIdentityProvider` is the gateway's interface for obtaining a
-  `SandboxJwtSvid` verified for that stable identity and one audience. The
+  `SandboxJwtSvid` verified for that stable identity and one audience, using
+  the gateway's persisted driver runtime identity as the workload reference. The
   error is an associated type: the SPIRE adapter in `openshell-spire` uses the
   sanitized `TokenGrantFailure`. `SandboxJwtSvid` omits the token from `Debug`
   output.

@@ -3,16 +3,16 @@
 
 #![cfg(feature = "e2e-kubernetes-shared-supervisor-spiffe")]
 
-//! Sandbox identities delegated by SPIRE to the gateway for a shared supervisor.
+//! Sandbox identities issued by the SPIFFE Broker API to the gateway for a shared supervisor.
 //!
-//! The wrapper installs SPIRE (`ci/values-spire-delegation-stack.yaml`) and
-//! the gateway topology with SPIRE delegation
+//! The wrapper installs SPIRE (`ci/values-spire-broker-stack.yaml`) and
+//! the gateway topology with the SPIFFE Broker API
 //! (`ci/values-supervisor-spiffe.yaml`). This test registers
 //! sandbox identities as an operator would, with `ClusterStaticEntry`
 //! resources, and drives the existing RFC 8693 provider exchange: the gateway
 //! exchanges the stored subject token with its own SVID for the sandbox's
 //! SPIFFE ID, then exchanges that intermediate token with the sandbox's
-//! delegated SVID. The supervisor receives only the final access token.
+//! sandbox SVID. The supervisor receives only the final access token.
 //! The token service is a host fixture reached
 //! through a selectorless Service, and it hands out tokens that name the
 //! identity they were issued to.
@@ -47,7 +47,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 const TEST_HOST: &str = "host.openshell.internal";
-/// Matches `ci/values-spire-delegation-stack.yaml`.
+/// Matches `ci/values-spire-broker-stack.yaml`.
 const TRUST_DOMAIN: &str = "openshell.local";
 const SPIRE_CLUSTER: &str = "openshell-e2e";
 /// Matches `ci/values-supervisor-spiffe.yaml`.
@@ -425,8 +425,8 @@ async fn remove_token_service() {
 fn profile(id: &str, token_endpoint: &str, target_port: u16) -> NamedTempFile {
     temp_yaml(&format!(
         r"id: {id}
-display_name: E2E delegated sandbox identity
-description: Token exchange with the sandbox's SPIRE-delegated SVID
+display_name: E2E sandbox identity
+description: Token exchange with the sandbox's SPIFFE JWT-SVID
 category: other
 credentials:
   - name: subject_token
@@ -618,12 +618,32 @@ fn spire_fixture() -> String {
         .expect("OPENSHELL_E2E_SPIRE_NAMESPACE is set by with-kube-gateway.sh")
 }
 
-/// Register `sandbox_id`'s SPIFFE ID for delegation, scoped to `agent_id`.
+/// Register `sandbox_id`'s SPIFFE ID for object-reference attestation, scoped to `agent_id`.
 async fn register(gateway_id: &str, sandbox_id: &str, agent_id: &str) {
     let fixture = spire_fixture();
     // The SPIRE Controller Manager's class is `<namespace>-<release>`; the
     // wrapper installs release `spire` in the fixture namespace.
     let class_name = format!("{fixture}-spire");
+    let resources = kubectl(&[
+        "get",
+        "sandboxes.agents.x-k8s.io",
+        "-A",
+        "-l",
+        &format!("openshell.ai/sandbox-id={sandbox_id}"),
+        "-o",
+        "json",
+    ])
+    .await;
+    let resources: serde_json::Value = serde_json::from_str(&resources).expect("Sandbox resources");
+    let [resource] = resources["items"]
+        .as_array()
+        .expect("Sandbox items")
+        .as_slice()
+    else {
+        panic!("expected one Sandbox for {sandbox_id}");
+    };
+    let uid = resource["metadata"]["uid"].as_str().expect("Sandbox UID");
+    let selectors = format!("k8s:resource:sandboxes.agents.x-k8s.io\n    - k8s:uid:{uid}");
     let manifest = format!(
         r"apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterStaticEntry
@@ -636,7 +656,7 @@ spec:
   spiffeID: {}
   parentID: {agent_id}
   selectors:
-    - openshell:sandbox:{gateway_id}:{sandbox_id}
+    - {selectors}
 ",
         spiffe_id(gateway_id, sandbox_id)
     );

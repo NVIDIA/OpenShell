@@ -1,27 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# E2E overlay: the gateway obtains each sandbox's stable SPIFFE
-# identity from the node's SPIRE agent (ci/values-spire-delegation-stack.yaml)
-# for provider token grants. The gateway keeps its own Workload API identity
-# for the RFC 8693 intermediate exchange.
-#
-# This fixture requires admission that permits the admin socket hostPath and
-# group; an unlabeled namespace can inherit cluster-wide restrictions. The
-# test registers sandboxes only with the agent on the gateway's node. A
-# deployment needs a Pod Security exception or
-# equivalent admission policy and registrations for every agent that may run a
-# gateway Pod.
-# Two members let the identity test exercise abrupt owner loss and takeover.
+# The wrapper supplies this fixture's node-specific server_spiffe_id.
 supervisor:
   replicas: 2
   recoveryTimeoutSeconds: 60
-
 gatewayConfig:
   openshell.drivers.kubernetes:
     supervisor_topology: gateway
     provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
-  openshell.gateway.spiffe_delegation:
-    admin_socket_path: /run/spire/agent/sockets/csi.spiffe.io/admin/admin.sock
+  openshell.gateway.spiffe_broker:
     spiffe_id_prefix: spiffe://openshell.local/openshell
-    admin_socket_group: 10035
+    endpoint: https://spire-broker.spire.svc:8443
+    server_spiffe_id: spiffe://openshell.local/spire/agent/fixture
+    workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
