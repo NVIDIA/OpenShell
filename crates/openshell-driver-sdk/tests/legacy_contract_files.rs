@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+use openshell_driver_sdk::jwt::SupervisorAuthBundle;
 use openshell_driver_sdk::legacy_contract::{
     BUILTIN_BACKEND_NAME, BoundaryConfig, ContractDocument, SandboxRuntimeDescriptor,
     protobuf_json_file_name, protobuf_json_path, read_descriptor_payload, read_document,
@@ -30,6 +31,7 @@ fn the_new_file_is_named_beside_the_legacy_one() {
             "/.openshell/channel/sandbox/bootstrap.json",
             "/.openshell/channel/sandbox/bootstrap.pb.json",
         ),
+        ("auth.json", "auth.pb.json"),
         ("/run/descriptor", "/run/descriptor.pb.json"),
     ] {
         assert_eq!(protobuf_json_path(Path::new(legacy)), Path::new(expected));
@@ -58,9 +60,13 @@ fn decoding_gives_back_the_document() {
 }
 
 #[test]
-fn the_descriptor_round_trips_through_protobuf_json() {
+fn every_document_type_round_trips_through_protobuf_json() {
     let descriptor: SandboxRuntimeDescriptor = serde_json::from_str(include_str!(
         "legacy_contract/examples/SandboxRuntimeDescriptor.runtime-initiated-routed.json"
+    ))
+    .unwrap();
+    let bundle: SupervisorAuthBundle = serde_json::from_str(include_str!(
+        "legacy_contract/examples/SupervisorAuthBundle.full.json"
     ))
     .unwrap();
     let again =
@@ -68,6 +74,12 @@ fn the_descriptor_round_trips_through_protobuf_json() {
             .unwrap();
     assert_eq!(
         serde_json::to_value(&descriptor).unwrap(),
+        serde_json::to_value(&again).unwrap()
+    );
+    let again =
+        SupervisorAuthBundle::from_protobuf_json(&bundle.to_protobuf_json().unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&bundle).unwrap(),
         serde_json::to_value(&again).unwrap()
     );
 }
@@ -129,10 +141,16 @@ fn both_files_are_encoded_from_one_value() {
     let files = config().to_files("bootstrap.json").unwrap();
     assert_eq!(files.legacy.name, "bootstrap.json");
     assert_eq!(files.protobuf.name, "bootstrap.pb.json");
-    assert_eq!(files.legacy.contents, config().to_legacy_json().unwrap());
+    // Compare the parsed JSON: map entries are written in hash order, so two
+    // encodings of one value can differ in key order.
+    let parse = |bytes: &[u8]| serde_json::from_slice::<Value>(bytes).unwrap();
     assert_eq!(
-        files.protobuf.contents,
-        config().to_protobuf_json().unwrap()
+        parse(&files.legacy.contents),
+        parse(&config().to_legacy_json().unwrap())
+    );
+    assert_eq!(
+        parse(&files.protobuf.contents),
+        parse(&config().to_protobuf_json().unwrap())
     );
     let names: Vec<_> = files.iter().map(|file| file.name.as_str()).collect();
     assert_eq!(names, ["bootstrap.json", "bootstrap.pb.json"]);

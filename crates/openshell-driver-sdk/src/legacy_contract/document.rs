@@ -19,6 +19,8 @@ use serde::de::DeserializeOwned;
 
 use super::boundary::{BoundaryConfig, SandboxRuntimeDescriptor};
 use super::convert::ContractConversionError;
+use crate::jwt::{SandboxLaunchAuthentication, SupervisorAuthBundle};
+use crate::proto::compute::v1 as compute;
 use crate::proto::sandbox_runtime::v1 as pb;
 
 /// Why a document could not be read or decoded. The text never quotes field
@@ -204,6 +206,16 @@ contract_document!(
     SandboxRuntimeDescriptor,
     pb::SandboxRuntimeDescriptor,
     "openshell.sandbox.runtime.v1.SandboxRuntimeDescriptor"
+);
+contract_document!(
+    SupervisorAuthBundle,
+    compute::SupervisorAuthBundle,
+    "openshell.compute.v1.SupervisorAuthBundle"
+);
+contract_document!(
+    SandboxLaunchAuthentication,
+    compute::SandboxLaunchCredentials,
+    "openshell.compute.v1.SandboxLaunchCredentials"
 );
 
 /// Read the document whose legacy file is `legacy`, preferring the protobuf JSON

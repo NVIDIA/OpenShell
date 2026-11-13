@@ -50,6 +50,7 @@ use openshell_driver_sdk::UpstreamProxyConfig;
 use openshell_driver_sdk::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_driver_sdk::driver_mounts;
 use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
+use openshell_driver_sdk::legacy_contract::convert::LaunchAuthenticationFields;
 use openshell_driver_sdk::legacy_contract::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsMaterial, SandboxTlsServerConfig, SandboxTransport,
@@ -1616,12 +1617,7 @@ impl VmDriver {
     #[allow(clippy::result_large_err)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<CreateSandboxResponse, Status> {
         self.validate_sandbox(sandbox)?;
-        decode_launch_authentication(
-            sandbox
-                .spec
-                .as_ref()
-                .map_or(&[], |spec| spec.launch_authentication.as_slice()),
-        )?;
+        decode_launch_authentication(spec_launch_authentication(sandbox.spec.as_ref()))?;
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
@@ -1815,12 +1811,8 @@ impl VmDriver {
         self.ensure_provisioning_active(&sandbox.id).await?;
         // Launch credentials are independent of the image. Validate them before
         // resolving registry references, preparing disks, or publishing progress.
-        let launch_authentication = decode_launch_authentication(
-            sandbox
-                .spec
-                .as_ref()
-                .map_or(&[], |spec| spec.launch_authentication.as_slice()),
-        )?;
+        let launch_authentication =
+            decode_launch_authentication(spec_launch_authentication(sandbox.spec.as_ref()))?;
         let is_gpu = sandbox_requests_gpu(&sandbox);
         let driver_config =
             VmSandboxDriverConfig::from_sandbox(&sandbox).map_err(Status::invalid_argument)?;
@@ -2433,6 +2425,9 @@ impl VmDriver {
         sandbox_name: &str,
         generation_id: &str,
         launch_authentication: Vec<u8>,
+        launch_credentials: Option<
+            openshell_driver_sdk::proto::compute::v1::SandboxLaunchCredentials,
+        >,
     ) -> Result<(), Status> {
         if !sandbox_id.is_empty() {
             validate_sandbox_id(sandbox_id)?;
@@ -2474,14 +2469,17 @@ impl VmDriver {
                     active_generation.trim()
                 )));
             }
-            if launch_authentication.is_empty() {
+            if launch_authentication.is_empty() && launch_credentials.is_none() {
                 return Ok(());
             }
         }
         // An invalid replacement must not stop the active VM or remove the
         // previous generation's credentials. Preserve the empty idempotent
         // replay above, which does not request a new launch.
-        decode_launch_authentication(&launch_authentication)?;
+        decode_launch_authentication(LaunchAuthenticationFields::new(
+            launch_credentials.as_ref(),
+            &launch_authentication,
+        ))?;
         let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
             .await
             .map_err(|error| {
@@ -2514,6 +2512,7 @@ impl VmDriver {
             .as_mut()
             .ok_or_else(|| Status::failed_precondition("persisted VM sandbox spec is missing"))?;
         spec.launch_authentication = launch_authentication;
+        spec.launch_credentials = launch_credentials.map(Box::new);
         write_sandbox_request(&state_dir, &sandbox)
             .await
             .map_err(|error| {
@@ -2811,12 +2810,9 @@ impl VmDriver {
     ) -> bool {
         // Startup recovery bypasses create/start admission. Validate saved
         // credentials before host preparation, extension hooks, or state changes.
-        if let Err(error) = decode_launch_authentication(
-            sandbox
-                .spec
-                .as_ref()
-                .map_or(&[], |spec| spec.launch_authentication.as_slice()),
-        ) {
+        if let Err(error) =
+            decode_launch_authentication(spec_launch_authentication(sandbox.spec.as_ref()))
+        {
             warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by launch authentication");
             return false;
         }
@@ -5424,6 +5420,7 @@ impl ComputeDriver for VmDriver {
             &request.name,
             &request.generation_id,
             request.launch_authentication,
+            request.launch_credentials.map(|typed| *typed),
         )
         .await?;
         Ok(Response::new(StartSandboxResponse::default()))
@@ -5524,18 +5521,39 @@ fn check_gpu_privileges() -> Result<(), String> {
     Ok(())
 }
 
+/// The launch authentication fields of a driver sandbox spec: the typed message
+/// when the gateway set it, with the opaque bytes an older gateway sends.
+fn spec_launch_authentication(
+    spec: Option<&openshell_driver_sdk::proto::compute::v1::DriverSandboxSpec>,
+) -> LaunchAuthenticationFields<'_> {
+    spec.map_or_else(LaunchAuthenticationFields::default, |spec| {
+        LaunchAuthenticationFields::new(
+            spec.launch_credentials.as_deref(),
+            &spec.launch_authentication,
+        )
+    })
+}
+
 // `tonic::Status` is ~176 bytes; it's the standard error type across the
 // gRPC API surface, so boxing here would diverge from every other handler.
 #[allow(clippy::result_large_err)]
 fn decode_launch_authentication(
-    encoded: &[u8],
+    fields: LaunchAuthenticationFields<'_>,
 ) -> Result<openshell_driver_sdk::jwt::SandboxLaunchAuthentication, Status> {
-    if encoded.is_empty() {
+    if fields.is_empty() {
         return Err(Status::failed_precondition(
             "VM sandbox launch authentication is required; configure the gateway's \
                  [openshell.gateway.gateway_jwt] signing bundle. Listener TLS is separate",
         ));
     }
+    // The typed field wins when the gateway set it. An older gateway sends only
+    // the JSON bytes below. Conversion errors never quote field values.
+    if let Some(typed) = fields.typed {
+        return typed.clone().try_into().map_err(|_| {
+            Status::failed_precondition("VM sandbox launch authentication has invalid fields")
+        });
+    }
+    let encoded = fields.encoded;
     // Serde errors may quote an unexpected field or value from the secret
     // bundle. Return fixed diagnostics rather than forwarding those details.
     let authentication = serde_json::from_slice::<
@@ -10819,6 +10837,7 @@ mod tests {
                 &sandbox.name,
                 "g0000000000000001",
                 fresh_authentication,
+                None,
             )
             .await
             .expect_err("start without an image should fail");
@@ -10896,7 +10915,13 @@ mod tests {
         );
 
         driver
-            .start_sandbox(&sandbox.id, &sandbox.name, "g0000000000000001", Vec::new())
+            .start_sandbox(
+                &sandbox.id,
+                &sandbox.name,
+                "g0000000000000001",
+                Vec::new(),
+                None,
+            )
             .await
             .expect("matching already-running start must remain an idempotent no-op");
 
@@ -11224,6 +11249,7 @@ mod tests {
                     &sandbox.name,
                     "g0000000000000001",
                     br#"{"secret-marker-that-must-not-be-logged":true}"#.to_vec(),
+                    None,
                 )
                 .await
                 .unwrap_err();
@@ -11250,7 +11276,7 @@ mod tests {
         }
     }
 
-    fn test_launch_authentication(
+    pub(super) fn test_launch_authentication(
         label: &str,
     ) -> (Vec<u8>, openshell_driver_sdk::SandboxSessionId) {
         use openshell_driver_sdk::jwt::{
@@ -14300,6 +14326,7 @@ while :; do sleep 0.05; done"#,
                 "demo",
                 "g0000000000000001",
                 start_authentication,
+                None,
             )
             .await
             .expect_err("a supplied id that is not registered must not resolve by name");
@@ -14329,6 +14356,7 @@ while :; do sleep 0.05; done"#,
                     "demo",
                     "g0000000000000001",
                     test_launch_authentication("ambiguous").0,
+                    None,
                 )
                 .await
                 .unwrap_err(),
@@ -14895,7 +14923,7 @@ while :; do sleep 0.05; done"#,
             }),
             ..Default::default()
         };
-        decode_launch_authentication(&sandbox.spec.as_ref().unwrap().launch_authentication)
+        decode_launch_authentication(spec_launch_authentication(sandbox.spec.as_ref()))
             .expect("credentials are valid, so only the mount gate can deny recovery");
         driver
             .validate_sandbox(&sandbox)
@@ -14937,6 +14965,55 @@ while :; do sleep 0.05; done"#,
         assert_eq!(
             render_mount_manifest(&mounts),
             "osfs0\t/sandbox/a\tro\nosfs1\t/sandbox/b\trw\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod launch_authentication_fields_tests {
+    use super::*;
+    use openshell_driver_sdk::legacy_contract::convert::launch_credentials_from_bytes;
+
+    fn encoded() -> Vec<u8> {
+        tests::test_launch_authentication("fields").0
+    }
+
+    #[test]
+    fn bytes_only_from_an_older_gateway_decode() {
+        let encoded = encoded();
+        decode_launch_authentication(LaunchAuthenticationFields::new(None, &encoded)).unwrap();
+    }
+
+    #[test]
+    fn typed_only_from_a_newer_gateway_decodes() {
+        let typed = launch_credentials_from_bytes(&encoded()).unwrap().unwrap();
+        decode_launch_authentication(LaunchAuthenticationFields::new(Some(&typed), &[])).unwrap();
+    }
+
+    #[test]
+    fn typed_wins_when_both_are_present() {
+        let encoded = encoded();
+        let mut typed = launch_credentials_from_bytes(&encoded).unwrap().unwrap();
+        typed.gateway_id = "typed-gateway".to_string();
+        let decoded =
+            decode_launch_authentication(LaunchAuthenticationFields::new(Some(&typed), &encoded))
+                .unwrap();
+        assert_eq!(decoded.gateway_id, "typed-gateway");
+    }
+
+    #[test]
+    fn neither_is_required_and_a_bad_typed_field_has_a_fixed_diagnostic() {
+        let missing =
+            decode_launch_authentication(LaunchAuthenticationFields::default()).unwrap_err();
+        assert!(missing.message().contains("is required"));
+        let mut typed = launch_credentials_from_bytes(&encoded()).unwrap().unwrap();
+        typed.verification_keys.clear();
+        let invalid =
+            decode_launch_authentication(LaunchAuthenticationFields::new(Some(&typed), &[]))
+                .unwrap_err();
+        assert_eq!(
+            invalid.message(),
+            "VM sandbox launch authentication has invalid fields"
         );
     }
 }

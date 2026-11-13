@@ -22,6 +22,7 @@ use openshell_container_runtime::network_trust::{
     NETWORK_SUPERVISOR_TRUST_GENERATION_KEY, NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
 };
 use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
+use openshell_driver_sdk::legacy_contract::convert::LaunchAuthenticationFields;
 use openshell_driver_sdk::proto::compute::v1::{
     CpuResourceCapabilities, DriverSandbox, GetCapabilitiesResponse, GpuResourceCapabilities,
     GpuResourceRequirements, MemoryResourceCapabilities, ResourceCapabilities,
@@ -115,22 +116,34 @@ fn supervisor_collector_endpoint(endpoint: &str, environment: PodmanEndpointEnvi
     }
 }
 
+/// The launch authentication fields of a driver sandbox spec: the typed message
+/// when the gateway set it, with the opaque bytes an older gateway sends.
+fn spec_launch_authentication(
+    spec: &openshell_driver_sdk::proto::compute::v1::DriverSandboxSpec,
+) -> LaunchAuthenticationFields<'_> {
+    LaunchAuthenticationFields::new(
+        spec.launch_credentials.as_deref(),
+        &spec.launch_authentication,
+    )
+}
+
+/// Decode the launch authentication, preferring the typed field and falling back
+/// to the JSON bytes.
 fn decode_launch_authentication(
-    encoded: &[u8],
+    fields: LaunchAuthenticationFields<'_>,
 ) -> Result<openshell_driver_sdk::jwt::SandboxLaunchAuthentication, ComputeDriverError> {
-    let authentication =
-        serde_json::from_slice::<openshell_driver_sdk::jwt::SandboxLaunchAuthentication>(encoded)
-            .map_err(|error| {
+    fields
+        .resolve()
+        .map_err(|error| {
             ComputeDriverError::Precondition(format!(
                 "decode Podman sandbox launch authentication: {error}"
             ))
-        })?;
-    authentication.validate().map_err(|error| {
-        ComputeDriverError::Precondition(format!(
-            "validate Podman sandbox launch authentication: {error}"
-        ))
-    })?;
-    Ok(authentication)
+        })?
+        .ok_or_else(|| {
+            ComputeDriverError::Precondition(
+                "Podman sandbox launch authentication is required".to_string(),
+            )
+        })
 }
 
 impl From<PodmanApiError> for ComputeDriverError {
@@ -1527,14 +1540,14 @@ impl PodmanComputeDriver {
                     let launch_authentication = sandbox
                         .spec
                         .as_ref()
-                        .filter(|spec| !spec.launch_authentication.is_empty())
+                        .filter(|spec| !spec_launch_authentication(spec).is_empty())
                         .ok_or_else(|| {
                             ComputeDriverError::Precondition(
                                 "Podman sandbox launch authentication is required".to_string(),
                             )
                         })
                         .and_then(|spec| {
-                            decode_launch_authentication(&spec.launch_authentication)
+                            decode_launch_authentication(spec_launch_authentication(spec))
                         })?;
                     let archives = crate::isolation::bootstrap_archives(
                         crate::isolation::BootstrapArchivesInput {
@@ -1878,7 +1891,7 @@ impl PodmanComputeDriver {
         old_workload: &ContainerListEntry,
         durable_sandbox: &DriverSandbox,
         generation: &openshell_driver_sdk::sandbox_generation::SandboxGenerationId,
-        encoded_authentication: &[u8],
+        encoded_authentication: LaunchAuthenticationFields<'_>,
     ) -> Result<(), ComputeDriverError> {
         if durable_sandbox.id
             != old_workload
@@ -1935,7 +1948,12 @@ impl PodmanComputeDriver {
             .spec
             .as_mut()
             .expect("validated durable snapshot has a spec")
-            .launch_authentication = encoded_authentication.to_vec();
+            .launch_authentication = encoded_authentication.encoded.to_vec();
+        replacement
+            .spec
+            .as_mut()
+            .expect("validated durable snapshot has a spec")
+            .launch_credentials = encoded_authentication.typed.cloned().map(Box::new);
 
         let supervisor_rollback_name =
             format!("openshell-supervisor-rollback-{}", uuid::Uuid::new_v4());
@@ -2025,7 +2043,7 @@ impl PodmanComputeDriver {
         &self,
         sandbox_id: &str,
         generation_id: &str,
-        encoded_authentication: &[u8],
+        encoded_authentication: LaunchAuthenticationFields<'_>,
         durable_sandbox: Option<&DriverSandbox>,
     ) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
@@ -2721,7 +2739,7 @@ mod tests {
         }
     }
 
-    fn encoded_launch_authentication() -> Vec<u8> {
+    pub(super) fn encoded_launch_authentication() -> Vec<u8> {
         serde_json::to_vec(&launch_authentication()).unwrap()
     }
 
@@ -2883,7 +2901,12 @@ mod tests {
         let driver = test_driver(socket);
         let (old_workload, durable, generation) = refresh_fixture("prep-1");
         let result = driver
-            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
+            .replace_supervisor_for_network_trust(
+                &old_workload,
+                &durable,
+                &generation,
+                LaunchAuthenticationFields::new(None, b"auth"),
+            )
             .await;
         assert!(
             result.is_err(),
@@ -2918,7 +2941,12 @@ mod tests {
         let driver = test_driver(socket);
         let (old_workload, durable, generation) = refresh_fixture("restore-1");
         let result = driver
-            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
+            .replace_supervisor_for_network_trust(
+                &old_workload,
+                &durable,
+                &generation,
+                LaunchAuthenticationFields::new(None, b"auth"),
+            )
             .await;
         assert!(result.is_err(), "failed replacement must fail the refresh");
         handle.await.unwrap();
@@ -2973,7 +3001,12 @@ mod tests {
         let driver = test_driver(socket);
         let (old_workload, durable, generation) = refresh_fixture("orphan-1");
         let error = driver
-            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
+            .replace_supervisor_for_network_trust(
+                &old_workload,
+                &durable,
+                &generation,
+                LaunchAuthenticationFields::new(None, b"auth"),
+            )
             .await
             .expect_err("restore failure must fail the refresh");
         handle.await.unwrap();
@@ -3058,7 +3091,12 @@ mod tests {
         );
         let authentication = encoded_launch_authentication();
         test_driver(start_socket.clone())
-            .start_sandbox("sandbox-1", "generation-1", &authentication, None)
+            .start_sandbox(
+                "sandbox-1",
+                "generation-1",
+                LaunchAuthenticationFields::new(None, &authentication),
+                None,
+            )
             .await
             .expect("start should succeed");
         start_handle.await.expect("start stub should finish");
@@ -3245,7 +3283,7 @@ mod tests {
             .start_sandbox(
                 "sandbox-1",
                 "invalid-generation",
-                b"secret-launch-authentication",
+                LaunchAuthenticationFields::new(None, b"secret-launch-authentication"),
                 None,
             )
             .with_subscriber(subscriber)
@@ -3413,7 +3451,12 @@ mod tests {
         );
         let authentication = encoded_launch_authentication();
         test_driver(start_socket.clone())
-            .start_sandbox("sandbox-1", "generation-1", &authentication, None)
+            .start_sandbox(
+                "sandbox-1",
+                "generation-1",
+                LaunchAuthenticationFields::new(None, &authentication),
+                None,
+            )
             .with_subscriber(subscriber)
             .await
             .expect("start should succeed");
@@ -5127,5 +5170,43 @@ mod tests {
         let artifact_mode = fs::metadata(artifact).unwrap().permissions().mode() & 0o777;
         assert_eq!(artifact_mode, 0o444, "staged artifact must be read-only");
         let _ = fs::remove_file(&source);
+    }
+}
+
+#[cfg(test)]
+mod launch_authentication_fields_tests {
+    use super::*;
+    use openshell_driver_sdk::legacy_contract::convert::launch_credentials_from_bytes;
+
+    fn encoded() -> Vec<u8> {
+        tests::encoded_launch_authentication()
+    }
+
+    #[test]
+    fn bytes_only_from_an_older_gateway_decode() {
+        let encoded = encoded();
+        decode_launch_authentication(LaunchAuthenticationFields::new(None, &encoded)).unwrap();
+    }
+
+    #[test]
+    fn typed_only_from_a_newer_gateway_decodes() {
+        let typed = launch_credentials_from_bytes(&encoded()).unwrap().unwrap();
+        decode_launch_authentication(LaunchAuthenticationFields::new(Some(&typed), &[])).unwrap();
+    }
+
+    #[test]
+    fn typed_wins_when_both_are_present() {
+        let encoded = encoded();
+        let mut typed = launch_credentials_from_bytes(&encoded).unwrap().unwrap();
+        typed.gateway_id = "typed-gateway".to_string();
+        let decoded =
+            decode_launch_authentication(LaunchAuthenticationFields::new(Some(&typed), &encoded))
+                .unwrap();
+        assert_eq!(decoded.gateway_id, "typed-gateway");
+    }
+
+    #[test]
+    fn neither_is_an_error() {
+        assert!(decode_launch_authentication(LaunchAuthenticationFields::default()).is_err());
     }
 }

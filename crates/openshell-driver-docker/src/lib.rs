@@ -43,6 +43,7 @@ use openshell_driver_sdk::driver_utils::{
 };
 use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_driver_sdk::legacy_contract::ResolvedWorkloadIdentity;
+use openshell_driver_sdk::legacy_contract::convert::LaunchAuthenticationFields;
 use openshell_driver_sdk::legacy_contract::{
     BoundaryConfig, ContractDocument as _, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, generate_sandbox_tls_material,
@@ -54,8 +55,8 @@ use openshell_driver_sdk::progress::{
 use openshell_driver_sdk::proto::compute::v1::{
     CpuResourceCapabilities, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
     DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition,
-    DriverPlatformEvent, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
-    EnsureWorkspaceRequest, EnsureWorkspaceResponse, GetCapabilitiesRequest,
+    DriverPlatformEvent, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
+    DriverSandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse, GetCapabilitiesRequest,
     GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse, GpuResourceCapabilities,
     GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
     MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
@@ -1199,13 +1200,13 @@ impl DockerComputeDriver {
         let authentication = sandbox
             .spec
             .as_ref()
-            .filter(|spec| !spec.launch_authentication.is_empty())
+            .filter(|spec| !spec_launch_authentication(spec).is_empty())
             .ok_or_else(|| {
                 Status::failed_precondition(
                     "docker sandboxes require launch-scoped gateway authentication",
                 )
             })?;
-        decode_docker_launch_authentication(&authentication.launch_authentication).map(|_| ())
+        decode_docker_launch_authentication(spec_launch_authentication(authentication)).map(|_| ())
     }
 
     fn validate_gpu_request(
@@ -2485,7 +2486,7 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
         generation_id: &str,
-        launch_authentication: &[u8],
+        launch_authentication: LaunchAuthenticationFields<'_>,
         durable_sandbox: Option<&DriverSandbox>,
     ) -> Result<bool, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
@@ -2514,7 +2515,7 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
         generation: &openshell_driver_sdk::sandbox_generation::SandboxGenerationId,
-        launch_authentication: &[u8],
+        launch_authentication: LaunchAuthenticationFields<'_>,
         _durable_sandbox: Option<&DriverSandbox>,
     ) -> Result<bool, Status> {
         self.verify_network_trust()?;
@@ -3505,7 +3506,10 @@ impl ComputeDriver for DockerComputeDriver {
             &request.sandbox_id,
             &request.name,
             &request.generation_id,
-            &request.launch_authentication,
+            LaunchAuthenticationFields::new(
+                request.launch_credentials.as_deref(),
+                &request.launch_authentication,
+            ),
             request.sandbox.as_ref(),
         ))
         .await?
@@ -4700,22 +4704,30 @@ async fn stage_docker_sandbox_bundle(
 /// Docker's archive endpoint returns an untrusted tar stream, so reject every
 /// entry outside the original workspace and all non-file/non-directory entry
 /// types before uploading the same filtered archive to the replacement.
+/// The typed launch authentication of a driver sandbox spec when the gateway
+/// set it, with the opaque bytes it falls back to for an older gateway.
+fn spec_launch_authentication(spec: &DriverSandboxSpec) -> LaunchAuthenticationFields<'_> {
+    LaunchAuthenticationFields::new(
+        spec.launch_credentials.as_deref(),
+        &spec.launch_authentication,
+    )
+}
+
+/// Decode the launch authentication, preferring the typed field and falling back
+/// to the JSON bytes an older gateway sends.
 fn decode_docker_launch_authentication(
-    encoded: &[u8],
+    fields: LaunchAuthenticationFields<'_>,
 ) -> Result<openshell_driver_sdk::jwt::SandboxLaunchAuthentication, Status> {
-    let authentication =
-        serde_json::from_slice::<openshell_driver_sdk::jwt::SandboxLaunchAuthentication>(encoded)
-            .map_err(|error| {
+    fields
+        .resolve()
+        .map_err(|error| {
             Status::failed_precondition(format!(
                 "decode Docker sandbox launch authentication: {error}"
             ))
-        })?;
-    authentication.validate().map_err(|error| {
-        Status::failed_precondition(format!(
-            "validate Docker sandbox launch authentication: {error}"
-        ))
-    })?;
-    Ok(authentication)
+        })?
+        .ok_or_else(|| {
+            Status::failed_precondition("Docker sandbox launch authentication is required")
+        })
 }
 
 fn gateway_verification_keys(
@@ -4752,11 +4764,11 @@ async fn prepare_docker_boundary_files(
     let launch_authentication = sandbox
         .spec
         .as_ref()
-        .filter(|spec| !spec.launch_authentication.is_empty())
+        .filter(|spec| !spec_launch_authentication(spec).is_empty())
         .ok_or_else(|| {
             Status::failed_precondition("Docker sandbox launch authentication is required")
         })
-        .and_then(|spec| decode_docker_launch_authentication(&spec.launch_authentication))?;
+        .and_then(|spec| decode_docker_launch_authentication(spec_launch_authentication(spec)))?;
     let session_id = launch_authentication.supervisor.session_id;
     let tls = generate_sandbox_tls_material(session_id)
         .map_err(|error| Status::internal(format!("generate Docker boundary TLS: {error}")))?;
@@ -4830,11 +4842,12 @@ async fn prepare_docker_boundary_files(
             .map_err(docker_document_error)?,
     )
     .await?;
-    let supervisor_auth = serde_json::to_vec(&launch_authentication.supervisor)
-        .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
-    write_docker_boundary_file(
-        &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
-        &supervisor_auth,
+    write_docker_document_files(
+        &directory,
+        &launch_authentication
+            .supervisor
+            .to_files(SUPERVISOR_AUTH_BUNDLE_FILE)
+            .map_err(docker_document_error)?,
     )
     .await?;
     let main_process_spec =
@@ -4923,7 +4936,10 @@ async fn docker_supervisor_bundle_archive(
         SUPERVISOR_GID,
         &auth_bundle,
     )?;
-    for (name, file) in [("runtime-descriptor.pb.json", RUNTIME_DESCRIPTOR_FILE)] {
+    for (name, file) in [
+        ("runtime-descriptor.pb.json", RUNTIME_DESCRIPTOR_FILE),
+        ("auth.pb.json", SUPERVISOR_AUTH_BUNDLE_FILE),
+    ] {
         let path = openshell_driver_sdk::legacy_contract::protobuf_json_path(&directory.join(file));
         if let Some(contents) = read_optional_docker_state_file(&path).await? {
             append_docker_archive_file(
@@ -5011,7 +5027,7 @@ fn append_docker_proxy_ca_bundle(
 async fn refresh_docker_boundary_authentication(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
-    encoded_authentication: &[u8],
+    encoded_authentication: LaunchAuthenticationFields<'_>,
 ) -> Result<(), Status> {
     let authentication = decode_docker_launch_authentication(encoded_authentication)?;
     let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
@@ -5067,8 +5083,10 @@ async fn refresh_docker_boundary_authentication(
     let descriptor_files = runtime_descriptor
         .to_files(RUNTIME_DESCRIPTOR_FILE)
         .map_err(docker_document_error)?;
-    let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
-        .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
+    let supervisor_files = authentication
+        .supervisor
+        .to_files(SUPERVISOR_AUTH_BUNDLE_FILE)
+        .map_err(docker_document_error)?;
     write_docker_document_files(&directory, &boundary_files).await?;
     write_docker_boundary_file(
         &directory.join(BOUNDARY_CERTIFICATE_FILE),
@@ -5081,17 +5099,13 @@ async fn refresh_docker_boundary_authentication(
     )
     .await?;
     write_docker_document_files(&directory, &descriptor_files).await?;
-    write_docker_boundary_file(
-        &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
-        &supervisor_auth,
-    )
-    .await
+    write_docker_document_files(&directory, &supervisor_files).await
 }
 
 async fn refresh_docker_supervisor_authentication(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
-    encoded_authentication: &[u8],
+    encoded_authentication: LaunchAuthenticationFields<'_>,
 ) -> Result<(), Status> {
     let authentication = decode_docker_launch_authentication(encoded_authentication)?;
     let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
@@ -5103,14 +5117,12 @@ async fn refresh_docker_supervisor_authentication(
     let descriptor_files = runtime_descriptor
         .to_files(RUNTIME_DESCRIPTOR_FILE)
         .map_err(docker_document_error)?;
-    let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
-        .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
+    let supervisor_files = authentication
+        .supervisor
+        .to_files(SUPERVISOR_AUTH_BUNDLE_FILE)
+        .map_err(docker_document_error)?;
     write_docker_document_files(&directory, &descriptor_files).await?;
-    write_docker_boundary_file(
-        &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
-        &supervisor_auth,
-    )
-    .await
+    write_docker_document_files(&directory, &supervisor_files).await
 }
 
 async fn read_docker_runtime_descriptor(

@@ -16,13 +16,28 @@
 
 use std::path::Path;
 
+use openshell_driver_sdk::jwt::{SandboxLaunchAuthentication, SupervisorAuthBundle};
 use openshell_driver_sdk::legacy_contract::{BoundaryConfig, SandboxRuntimeDescriptor};
 use openshell_driver_sdk::proto::FILE_DESCRIPTOR_SET;
+use openshell_driver_sdk::proto::compute::v1 as compute;
 use openshell_driver_sdk::proto::sandbox_runtime::v1 as pb;
 use prost_reflect::{DescriptorPool, DeserializeOptions, DynamicMessage};
 use serde_json::{Value, json};
 
 const PACKAGE: &str = "openshell.sandbox.runtime.v1";
+/// The launch authentication documents live in the compute package, which
+/// `compute_driver.proto` carries them in.
+const LAUNCH_PACKAGE: &str = "openshell.compute.v1";
+
+fn qualified(document_type: &str) -> String {
+    // The launch credentials message replaces the legacy launch authentication
+    // type, whose name the example files keep.
+    match document_type {
+        "SandboxLaunchAuthentication" => format!("{LAUNCH_PACKAGE}.SandboxLaunchCredentials"),
+        "SupervisorAuthBundle" => format!("{LAUNCH_PACKAGE}.{document_type}"),
+        _ => format!("{PACKAGE}.{document_type}"),
+    }
+}
 
 macro_rules! example {
     ($name:literal) => {
@@ -42,6 +57,9 @@ const EXAMPLES: &[(&str, &str, &str)] = &[
     example!("SandboxRuntimeDescriptor.runtime-initiated-routed.json"),
     example!("SandboxRuntimeDescriptor.tcp.json"),
     example!("SandboxRuntimeDescriptor.vsock.json"),
+    example!("SupervisorAuthBundle.minimal.json"),
+    example!("SupervisorAuthBundle.full.json"),
+    example!("SandboxLaunchAuthentication.json"),
 ];
 
 fn document_type(file: &str) -> &str {
@@ -68,10 +86,16 @@ fn to_proto_json(document_type: &str, legacy: &Value) -> Value {
         "SandboxRuntimeDescriptor" => {
             through::<SandboxRuntimeDescriptor, pb::SandboxRuntimeDescriptor>(legacy)
         }
+        "SupervisorAuthBundle" => {
+            through::<SupervisorAuthBundle, compute::SupervisorAuthBundle>(legacy)
+        }
+        "SandboxLaunchAuthentication" => {
+            through::<SandboxLaunchAuthentication, compute::SandboxLaunchCredentials>(legacy)
+        }
         other => panic!("no type registered for {other}"),
     };
     let descriptor = pool()
-        .get_message_by_name(&format!("{PACKAGE}.{document_type}"))
+        .get_message_by_name(&qualified(document_type))
         .expect("message exists");
     let message = DynamicMessage::decode(descriptor, bytes.as_slice()).expect("message decodes");
     serde_json::to_value(&message).expect("message serializes as protobuf JSON")
@@ -91,7 +115,7 @@ fn to_legacy(document_type: &str, text: &str) -> Result<Value, String> {
         serde_json::to_value(&legacy).map_err(|error| error.to_string())
     }
     let descriptor = pool()
-        .get_message_by_name(&format!("{PACKAGE}.{document_type}"))
+        .get_message_by_name(&qualified(document_type))
         .expect("message exists");
     let mut deserializer = serde_json::Deserializer::from_str(text);
     let message = DynamicMessage::deserialize_with_options(
@@ -105,6 +129,12 @@ fn to_legacy(document_type: &str, text: &str) -> Result<Value, String> {
         "BoundaryConfig" => back::<BoundaryConfig, pb::BoundaryConfig>(&message),
         "SandboxRuntimeDescriptor" => {
             back::<SandboxRuntimeDescriptor, pb::SandboxRuntimeDescriptor>(&message)
+        }
+        "SupervisorAuthBundle" => {
+            back::<SupervisorAuthBundle, compute::SupervisorAuthBundle>(&message)
+        }
+        "SandboxLaunchAuthentication" => {
+            back::<SandboxLaunchAuthentication, compute::SandboxLaunchCredentials>(&message)
         }
         other => panic!("no type registered for {other}"),
     }
@@ -175,6 +205,8 @@ fn readers_reject_unknown_fields() {
     for file in [
         "BoundaryConfig.runtime-initiated-unix.json",
         "SandboxRuntimeDescriptor.tcp.json",
+        "SupervisorAuthBundle.minimal.json",
+        "SandboxLaunchAuthentication.json",
     ] {
         assert_rejected(file, |document| {
             document["unexpected"] = json!(true);
@@ -187,6 +219,7 @@ fn readers_reject_a_missing_or_unsupported_version() {
     for file in [
         "BoundaryConfig.runtime-initiated-unix.json",
         "SandboxRuntimeDescriptor.tcp.json",
+        "SandboxLaunchAuthentication.json",
     ] {
         assert_rejected(file, |document| {
             document.as_object_mut().unwrap().remove("contractVersion");
@@ -250,5 +283,12 @@ fn readers_reject_a_malformed_digest_and_session_id() {
     });
     assert_rejected("BoundaryConfig.runtime-initiated-unix.json", |document| {
         document["sessionId"] = json!("00000000-0000-0000-0000-000000000000");
+    });
+}
+
+#[test]
+fn readers_reject_an_out_of_range_collector_tls_index() {
+    assert_rejected("SupervisorAuthBundle.full.json", |document| {
+        document["tracesOtlpTls"] = json!(9);
     });
 }

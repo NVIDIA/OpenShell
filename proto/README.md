@@ -125,12 +125,26 @@ services, typed messages, streaming, and lifecycle semantics.
 ## Driver contract documents
 
 [`sandbox_runtime.proto`](sandbox_runtime.proto) specifies the documents a
-compute driver hands to the supervisor and the sandbox boundary, besides the
-`ComputeDriver` service: the runtime descriptor and the boundary configuration. They travel as files or as opaque `bytes`, never as gRPC
+compute driver receives from the gateway or hands to the supervisor and the
+sandbox boundary, besides the `ComputeDriver` service: the launch
+authentication, the supervisor auth bundle, the runtime descriptor, and the
+boundary configuration. They travel as files or as opaque `bytes`, never as gRPC
 messages, and are the canonical protobuf JSON of their messages. A writer emits
 the canonical form; a reader accepts the original field names too and rejects
 unknown fields. The messages reuse `ResolvedWorkloadIdentity` and
 `DriverFenceEvidence` from `compute_driver.proto` instead of redefining them.
+
+The launch authentication and the supervisor auth bundle it carries are defined
+in [`launch_credentials.proto`](launch_credentials.proto), in package
+`openshell.compute.v1`. They cannot sit in `sandbox_runtime.proto`'s package:
+`compute_driver.proto` carries the launch authentication as a typed message, and
+`sandbox_runtime.proto` imports `compute_driver.proto`, so a shared package
+would create an import cycle, which `buf` rejects. `DriverSandboxSpec` and
+`StartSandboxRequest` carry it as `launch_credentials` beside the older
+opaque `launch_authentication` bytes (the serde JSON of the legacy type). The
+gateway fills both. A driver uses the typed field when it is set and otherwise
+decodes the bytes, so an older gateway and a newer driver, and the reverse, keep
+working. Remove the bytes once no supported gateway or driver relies on them.
 
 These messages replace the legacy documents that the Rust types in
 `openshell-driver-sdk` (`legacy_contract`) write today. A document in the new
