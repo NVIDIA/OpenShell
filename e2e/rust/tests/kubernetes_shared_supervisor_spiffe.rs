@@ -1046,6 +1046,51 @@ async fn shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity() {
     assert!(tokens.exchanges().is_empty());
 
     // Each sandbox exchanges under its own stable SPIFFE ID.
+
+    let pods = kubectl(&[
+        "-n",
+        &release_namespace(),
+        "get",
+        "pods",
+        "-l",
+        "app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell",
+        "-o",
+        "json",
+    ])
+    .await;
+    let pods: serde_json::Value = serde_json::from_str(&pods).expect("gateway pods");
+    for pod in pods["items"].as_array().expect("gateway pod items") {
+        assert!(
+            pod["spec"]["volumes"]
+                .as_array()
+                .expect("gateway volumes")
+                .iter()
+                .all(|volume| volume.get("hostPath").is_none()),
+            "broker gateway must not mount hostPath"
+        );
+        assert!(
+            pod["spec"]["securityContext"]
+                .get("supplementalGroups")
+                .is_none(),
+            "broker gateway must not require supplemental groups"
+        );
+        let admission_namespace = format!("spiffe-admit-{nonce}");
+        let namespace = serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": admission_namespace, "labels": {"pod-security.kubernetes.io/enforce": "restricted"}}});
+        kubectl_with_input(&["apply", "-f", "-"], Some(&namespace.to_string())).await;
+        let service_account = pod["spec"]["serviceAccountName"]
+            .as_str()
+            .unwrap_or("default");
+        let account = serde_json::json!({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": service_account, "namespace": admission_namespace}});
+        kubectl_with_input(&["apply", "-f", "-"], Some(&account.to_string())).await;
+        let probe = serde_json::json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "gateway-admission", "namespace": admission_namespace}, "spec": pod["spec"]});
+        kubectl_with_input(
+            &["create", "--dry-run=server", "-f", "-"],
+            Some(&probe.to_string()),
+        )
+        .await;
+        kubectl(&["delete", "namespace", &admission_namespace]).await;
+    }
+
     register(&gateway_id, &alpha_id, &agent_id).await;
     register(&gateway_id, &beta_id, &agent_id).await;
     call_until(&alpha, target.port, &format!("SAW:{alpha_id}")).await;
@@ -1104,6 +1149,11 @@ async fn shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity() {
     assert_sandbox_holds_no_spiffe_material(&beta).await;
 
     assert_provider_failover(&alpha, &gateway_id, &tokens, &target).await;
+
+    // The fixture's workload X.509-SVID TTL is 30 seconds. Let the
+    // credential used for initial acquisition expire before forcing a new
+    // acquisition; success requires fetching rotated Workload API material.
+    tokio::time::sleep(Duration::from_secs(35)).await;
 
     // A restart is a new generation with a new sandbox instance and an empty
     // cache, and it acquires under the same SPIFFE ID.
