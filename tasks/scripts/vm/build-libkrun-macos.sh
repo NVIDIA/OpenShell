@@ -170,6 +170,16 @@ cd ..
 LIBKRUN_COMMIT=$(git -C libkrun rev-parse HEAD)
 echo "    Commit: ${LIBKRUN_COMMIT}"
 
+# The pinned libkrun opens firmware by a bare name. Hardened dyld rejects
+# that lookup, so expose a setter for the driver's canonical absolute path.
+PATCH="${ROOT}/tasks/scripts/vm/patches/libkrun-macos-absolute-firmware.patch"
+if git -C libkrun apply --unidiff-zero --check "$PATCH"; then
+    git -C libkrun apply --unidiff-zero "$PATCH"
+elif ! git -C libkrun apply --unidiff-zero --reverse --check "$PATCH"; then
+    echo "Error: libkrun firmware path patch does not match ${LIBKRUN_COMMIT}" >&2
+    exit 1
+fi
+
 cd libkrun
 
 # ── Build libkrun ───────────────────────────────────────────────────────

@@ -13,6 +13,7 @@ use std::time::Duration;
 use crate::{embedded_runtime, ffi, procguard, rootfs};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
+pub const VM_RUNTIME_REEXEC_ENV: &str = "__OPENSHELL_DRIVER_VM_REEXEC";
 const KRUN_INIT_PID1_ENV: &str = "KRUN_INIT_PID1=1";
 
 /// PID of the VM worker process (libkrun fork or QEMU). Zero when not running.
@@ -333,7 +334,7 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     configure_runtime_loader_env(&runtime_dir)?;
     raise_nofile_limit();
 
-    let vm = VmContext::create(&runtime_dir, config.log_level)?;
+    let vm = create_vm_context(&runtime_dir, config.log_level)?;
     vm.set_vm_config(config.vcpus, config.mem_mib)?;
     vm.set_disks(
         &config.root_disk,
@@ -439,6 +440,14 @@ pub fn configured_runtime_dir() -> Result<PathBuf, String> {
     embedded_runtime::ensure_runtime_extracted()
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn external_runtime_selected() -> bool {
+    // The embedded-runtime re-exec sets VM_RUNTIME_DIR_ENV to keep the cache
+    // path stable. Its marker distinguishes that path from an operator override.
+    std::env::var_os(VM_RUNTIME_DIR_ENV).is_some()
+        && std::env::var_os(VM_RUNTIME_REEXEC_ENV).is_none()
+}
+
 fn qemu_runtime_dir() -> Result<PathBuf, String> {
     configured_runtime_dir().map_err(|_| {
         "QEMU backend requires OPENSHELL_VM_RUNTIME_DIR to be set (pointing to a directory \
@@ -449,6 +458,10 @@ fn qemu_runtime_dir() -> Result<PathBuf, String> {
 
 #[cfg(target_os = "macos")]
 fn configure_runtime_loader_env(runtime_dir: &Path) -> Result<(), String> {
+    if external_runtime_selected() {
+        return Ok(());
+    }
+
     let existing = std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH");
     let mut paths = vec![runtime_dir.to_path_buf()];
     if let Some(existing) = existing {
@@ -508,6 +521,21 @@ fn clamp_log_level(level: u32) -> u32 {
 struct VmContext {
     krun: &'static ffi::LibKrun,
     ctx_id: u32,
+}
+
+fn create_vm_context(runtime_dir: &Path, log_level: u32) -> Result<VmContext, String> {
+    #[cfg(target_os = "macos")]
+    if external_runtime_selected() {
+        let runtime_dir = std::fs::canonicalize(runtime_dir).map_err(|e| {
+            format!(
+                "resolve VM runtime directory {}: {e}",
+                runtime_dir.display()
+            )
+        })?;
+        return VmContext::create(&runtime_dir, log_level);
+    }
+
+    VmContext::create(runtime_dir, log_level)
 }
 
 impl VmContext {
