@@ -222,7 +222,8 @@ not required; driver-owned guest TLS fields are rejected.
 | Exec, signals, retained output | Authenticated Sandbox Protocol; ConPTY resize is not yet supported |
 | Dynamic forwarding | Standard supervisor `ForwardTcp` path through sandbox loopback connect |
 | ETW/OCSF audit | Optional Windows Sandboxing ETW consumer |
-| Gateway restart recovery | Not yet supported; live MXC generations remain in-memory |
+| Gateway exit | Ends the sandbox processes, workloads included ([details](#gateway-exit-and-restart)) |
+| Gateway restart recovery | Not supported; live MXC generations remain in-memory and are not recovered |
 
 Workloads receive the proxy CA in `NODE_EXTRA_CA_CERTS` and `DENO_CERT`, and a
 combined bundle in `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and
@@ -253,6 +254,43 @@ containment targets are rejected before provisioning. MXC advertises
 explicit UI policy (including `{}`) for drivers missing this capability; those
 drivers need no UI-specific handling. UI policy itself does not require the
 `allow_driver_config` opt-in. Recreate the sandbox to change these settings.
+
+## Gateway exit and restart
+
+The driver runs inside the gateway. Each sandbox generation runs in its own
+Windows job object with kill-on-close: the host supervisor and `wxc-exec` are
+started inside it, and the boundary and workload processes below them inherit
+it. When a generation stops, the job is terminated, and when the gateway process
+ends for any reason Windows closes the job and ends everything in it. In
+practice:
+
+- **Stop and delete** end the whole generation: supervisor, `wxc-exec`, boundary
+  and workload, not only the two direct children.
+- **Graceful gateway stop** (Ctrl-C) ends every sandbox process, workloads
+  included, and frees the gateway port.
+- **Gateway crash or hard kill** ends every sandbox process through the job, and
+  the listening socket is not inherited by any child, so a new gateway can bind
+  the port at once.
+
+MXC does not recover sandboxes across a gateway restart. The Docker, Podman and
+VM drivers stop their sandboxes on a graceful gateway stop and recover them when
+the gateway starts again; MXC reports `gateway_manages_lifecycle: false`, so the
+gateway skips that shutdown sweep and startup recovery for it, and live
+generations exist only in the driver's memory. After a restart on the same
+database:
+
+- each sandbox record is still listed, with the phase it had when the gateway
+  went away (for example `Provisioning` after a graceful stop, `Ready` after a
+  hard kill); nothing updates it to show that the workload ended;
+- no workload is running, and nothing restarts it;
+- `openshell sandbox delete <name>` removes the record, and the name can then be
+  created again.
+
+Treat a sandbox that was running when the gateway exited as lost, delete its
+record, and create it again. The `gateway-kill` and `gateway-restart` E2E
+scenarios (see [Validation](#validation)) check this behavior. Behavior for a
+driver that runs as its own process, separate from the gateway, is not defined
+yet.
 
 ## Validation
 

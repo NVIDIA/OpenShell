@@ -487,6 +487,26 @@ firewall modification is required. A failed host health check or workload
 request fails the test. This verifies direct localhost connectivity; retain
 the existing shared proxy SSRF controls.
 
+The default `gateway-kill` and `gateway-restart` scenarios cover gateway loss.
+`gateway-kill` hard-kills the gateway and requires every sandbox process under it
+(the supervisor, `wxc-exec`, the boundary and the workload) to end and a
+replacement gateway to bind the port. `gateway-restart` sends a real Ctrl-C with
+a persisted SQLite database, requires a logged graceful shutdown and every
+sandbox process to end, then restarts on the same database and requires the
+record to still be listed, its workload not to be running, and the record to be
+deletable with its name reusable. Use `-Scenario gateway-kill` or
+`-Scenario gateway-restart` for focused checks. Report the behavior accurately:
+gateway exit ends workloads and MXC has no restart recovery, unlike the Docker,
+Podman and VM drivers, which stop and recover sandboxes on a graceful restart
+(MXC reports `gateway_manages_lifecycle: false`). Never describe MXC as
+stop-and-recover. A graceful stop ends workloads with or without the
+per-generation job; the job is what covers a hard kill, so do not cite
+`gateway-restart` as evidence for the job. If recovery is added, update
+`gateway-restart`, the driver README and `WINDOWS.md` together. These scenarios
+send Ctrl-C and track process trees, so run them on a host you can disturb;
+they track only processes under their own gateway and leave other sandboxes
+alone.
+
 When reporting `windows:ci`, distinguish these categories:
 
 - Passed tests from the full x64 workspace test log.
