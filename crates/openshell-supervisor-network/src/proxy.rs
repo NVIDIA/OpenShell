@@ -4244,14 +4244,6 @@ fn query_endpoint_credential_guard(
     })
 }
 
-/// When the policy endpoint host is a literal IP address, the user has
-/// explicitly declared intent to allow that destination.  Synthesize an
-/// `allowed_ips` entry so the existing allowlist-validation path is used
-/// instead of the blanket internal-IP rejection.
-///
-/// Always-blocked addresses (loopback, link-local, unspecified) are skipped
-/// — synthesizing an `allowed_ips` entry for them would be silently
-/// un-enforceable at runtime.
 fn implicit_allowed_ips_for_ip_host(host: &str) -> Vec<String> {
     let lookup_host = normalize_host_lookup_key(host);
     if let Ok(ip) = lookup_host.parse::<IpAddr>() {
@@ -6349,8 +6341,6 @@ async fn handle_forward_proxy(
     //    - If the endpoint is an exact declared hostname: allow private IPs,
     //      but still reject always-blocked addresses and control-plane ports.
     //    - Otherwise: reject internal IPs, allow public IPs through.
-    //    When the policy host is already a literal IP address, treat it as
-    //    implicitly allowed — the user explicitly declared the destination.
     match hydrate_destination_plan(&mut decision, *backend_host_gateway, *trusted_host_gateway) {
         Ok(()) => {}
         Err(denial) => {
@@ -7331,6 +7321,7 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
     reason = "Test code: test fixtures and explicit control-flow markers are idiomatic in tests."
 )]
 mod tests {
+    mod destination_policy;
     mod ipv4_mapped;
 
     #[test]
