@@ -28,6 +28,8 @@ pub struct CompletedAdmission {
     pub payload: Vec<u8>,
 }
 
+/// A counter row stores `count` in the `hit_count` column and the recount mark
+/// as `status = RECOUNT_STATUS`, reusing existing `objects` columns.
 pub(super) struct Counter {
     pub count: i64,
     pub recount: bool,

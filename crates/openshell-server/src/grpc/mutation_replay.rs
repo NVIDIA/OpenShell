@@ -336,7 +336,12 @@ async fn execute_owned<M: Mutation>(
         let version = match write {
             Ok(Some(write)) => write.resource_version,
             Ok(None) => {
-                if sweep_expired(&state.store, Some(bucket), window_ms).await? {
+                // A failed reclaim, such as a Postgres deadlock with a concurrent
+                // sweep, is logged and leaves the caller at the limit.
+                if sweep_expired(&state.store, Some(bucket), window_ms)
+                    .await
+                    .unwrap_or(false)
+                {
                     continue;
                 }
                 return Err(Status::resource_exhausted(
