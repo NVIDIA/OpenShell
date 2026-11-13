@@ -56,6 +56,30 @@ preflight and gateway startup.
 
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
+## Drop-In Configs
+
+The gateway merges `*.toml` drop-in configs from a directory over the base file. Use drop-in configs to customize a package-seeded `gateway.toml` without editing it. Set the directory with `--config-dir` or `OPENSHELL_GATEWAY_CONFIG_DIR`. When you do not set it, the gateway uses `gateway.d` next to the base file if that directory exists. An explicit directory must exist.
+
+Drop-in configs apply in lexical order by file name, and a later one wins. Each file must declare `[openshell] version = 2`. The merge works as follows:
+
+- Tables merge key by key.
+- Scalars and arrays replace the earlier value. An array in a drop-in config replaces the whole array.
+- A drop-in config cannot unset a key. Set it to a different value instead.
+- Hidden files and files without a `.toml` extension are ignored.
+- The gateway does not follow a symlinked base file. A drop-in config can be a symlink only when it resolves to a file inside the drop-in directory, as in a Kubernetes ConfigMap mount; a link that leaves the directory fails startup.
+- A `gateway.d` directory next to an explicit `--config` file is merged too, so remove files you do not want applied.
+
+The gateway reads each file, requires its version, merges the files, and validates the merged result once. A drop-in config can set part of a table, such as a single key under `[openshell.gateway.tls]`, and a key a file sets wrongly is reported against that file: an unknown key, a value of the wrong type, or a value that must come from the environment. A required key that no file sets, and rules that relate keys across files, name the merged configuration and list the files merged. The precedence is: command-line flag, then `OPENSHELL_*` environment variable, then drop-in configs, then the base file, then the built-in default.
+
+```toml
+# ~/.config/openshell/gateway.d/10-podman.toml
+[openshell]
+version = 2
+
+[openshell.drivers.podman]
+userns = "keep-id"
+```
+
 ## Package-Managed Locations
 
 Package-managed gateways use either built-in defaults or a package-seeded TOML file. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
@@ -1879,7 +1903,7 @@ changing it:
 openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
 ```
 
-Without `--path`, the command validates a nonempty `OPENSHELL_GATEWAY_CONFIG`. Otherwise, it validates an existing XDG gateway config when one is discovered. When neither source selects a config, preflight validates the effective daemon arguments. An explicit missing path, a legacy schema-v1 file, invalid TOML, a symlink, or any nonregular file fails. Preflight merges the selected file with the current `OPENSHELL_*` environment and applies the daemon's read-only startup checks. These checks include selector and socket normalization, registered-driver selection and configuration, rate-limit pairs, TLS and mTLS relationships, interceptor registrations, and supervisor middleware registrations. When a selected file omits `compute_driver`, preflight validates each configured table for an auto-detectable driver without running the runtime detection probes, which can connect local sockets or launch discovery commands. It validates configured driver TLS requirements, including the gateway CA, without requiring package-generated certificate files to exist before certificate generation. It does not construct a compute driver or connect to a transport. A failed preflight always preserves the file; it never migrates, replaces, or rewrites configuration.
+Without `--path`, the command validates a nonempty `OPENSHELL_GATEWAY_CONFIG`. Otherwise, it validates an existing XDG gateway config when one is discovered. When neither source selects a config, preflight validates the effective daemon arguments. An explicit missing path, a legacy schema-v1 file, invalid TOML, a symlink, or any nonregular file fails. Preflight also loads the drop-in configs, prints the files it merged, and fails on the same errors as startup; pass `--config-dir` to select a directory. It merges the selected file with the current `OPENSHELL_*` environment and applies the daemon's read-only startup checks. These checks include selector and socket normalization, registered-driver selection and configuration, rate-limit pairs, TLS and mTLS relationships, interceptor registrations, and supervisor middleware registrations. When a selected file omits `compute_driver`, preflight validates each configured table for an auto-detectable driver without running the runtime detection probes, which can connect local sockets or launch discovery commands. It validates configured driver TLS requirements, including the gateway CA, without requiring package-generated certificate files to exist before certificate generation. It does not construct a compute driver or connect to a transport. A failed preflight always preserves the file; it never migrates, replaces, or rewrites configuration.
 
 Config preflight validates configuration without loading launch-signing keys, so a successful result does not confirm that the key files exist or form a usable pair. Gateway startup validates configured or discovered signing bundles. Sandbox creation checks the selected driver's launch-signing requirement before image preparation.
 

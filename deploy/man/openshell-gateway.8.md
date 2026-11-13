@@ -14,7 +14,7 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
-**openshell-gateway** **config preflight** [**--path** *PATH* | **--** *GATEWAY_ARGS*...]
+**openshell-gateway** **config preflight** [**--path** *PATH* | **--config-dir** *DIR* | **--** *GATEWAY_ARGS*...]
 
 # DESCRIPTION
 
@@ -160,6 +160,13 @@ TLS.
 Compute driver settings such as sandbox image, callback endpoint, image
 pull policy, network name, VM state directory, and guest TLS material are
 configured in the TOML file passed with **--config**.
+
+**--config-dir** *DIR*
+:   Directory of **\*.toml** drop-in configs merged over the **--config**
+    file. Drop-in configs apply in lexical order and a later drop-in config wins. Each file must declare **version = 2**; a drop-in config may set only some keys of a table. Tables
+    merge key by key; scalars and arrays replace. Defaults to **gateway.d**
+    next to the config file when that directory exists.
+    Environment: **OPENSHELL_GATEWAY_CONFIG_DIR**.
 
 # CONFIGURATION PREFLIGHT
 

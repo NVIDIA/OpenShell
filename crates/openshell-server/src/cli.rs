@@ -65,6 +65,10 @@ struct ConfigPreflightArgs {
     #[arg(long, conflicts_with = "gateway_args")]
     path: Option<PathBuf>,
 
+    /// Explicit drop-in directory. Defaults to `gateway.d` next to the base file.
+    #[arg(long, conflicts_with = "gateway_args")]
+    config_dir: Option<PathBuf>,
+
     /// Gateway daemon arguments to replay after `--`.
     #[arg(last = true, allow_hyphen_values = true, value_name = "GATEWAY_ARGS")]
     gateway_args: Vec<OsString>,
@@ -80,6 +84,14 @@ struct RunArgs {
     /// variables continue to take precedence over gateway file values.
     #[arg(long, env = "OPENSHELL_GATEWAY_CONFIG")]
     config: Option<PathBuf>,
+
+    /// Directory of `*.toml` drop-in configs merged over the base file.
+    ///
+    /// Drop-in configs apply in lexical order and a later drop-in config wins. Tables
+    /// merge key by key; scalars and arrays replace. Defaults to `gateway.d`
+    /// next to the base file when that directory exists.
+    #[arg(long, env = "OPENSHELL_GATEWAY_CONFIG_DIR")]
+    config_dir: Option<PathBuf>,
 
     /// Operator-assigned name for this gateway installation.
     #[arg(
@@ -423,11 +435,15 @@ fn prepare_server_config_with_drivers(
     // Load TOML when explicitly requested, or from the default XDG location
     // when that file exists. Missing default config is not an error: runtime
     // defaults and OPENSHELL_* env vars are enough for package-managed starts.
-    let config_path = resolve_config_path(args)?;
-    let mut file: Option<ConfigFile> = if let Some(path) = config_path {
-        Some(config_file::load(&path).map_err(|e| miette::miette!("{e}"))?)
-    } else {
+    let sources = resolve_config_sources(args, None, None)?;
+    let mut file: Option<ConfigFile> = if sources.is_empty() {
         None
+    } else {
+        Some(
+            config_file::load_layered(sources.base.as_deref(), sources.dir.as_deref())
+                .map_err(|e| miette::miette!("{e}"))?
+                .file,
+        )
     };
     if let Some(file) = file.as_ref() {
         merge_file_into_args(args, &file.openshell.gateway, matches);
@@ -1041,7 +1057,13 @@ fn run_config_preflight_with_drivers(
     compute_drivers: &ComputeDriverRegistry,
 ) -> Result<Option<crate::ConfiguredComputeDriver>> {
     if args.gateway_args.is_empty() {
-        return run_effective_config_preflight(args.path, run, matches, compute_drivers);
+        return run_effective_config_preflight(
+            args.path,
+            args.config_dir,
+            run,
+            matches,
+            compute_drivers,
+        );
     }
 
     let replay_matches = match command().try_get_matches_from(
@@ -1065,24 +1087,30 @@ fn run_config_preflight_with_drivers(
         // configuration. Let the immediately following invocation perform it.
         return Ok(None);
     }
-    run_effective_config_preflight(None, replay.run, &replay_matches, compute_drivers)
+    run_effective_config_preflight(None, None, replay.run, &replay_matches, compute_drivers)
 }
 
 fn run_effective_config_preflight(
     path_override: Option<PathBuf>,
+    dir_override: Option<PathBuf>,
     mut run: RunArgs,
     matches: &ArgMatches,
     compute_drivers: &ComputeDriverRegistry,
 ) -> Result<Option<crate::ConfiguredComputeDriver>> {
-    let path = if path_override.is_some() {
-        path_override
+    let sources = resolve_config_sources(&run, path_override, dir_override)?;
+    // Name the base file (or the directory) in the stable failure message.
+    let path = sources.base.clone().or_else(|| sources.dir.clone());
+    let mut file = if sources.is_empty() {
+        None
     } else {
-        resolve_config_path(&run)?
+        let layered =
+            config_file::preflight_layered(sources.base.as_deref(), sources.dir.as_deref())
+                .map_err(|error| miette::miette!("{error}"))?;
+        for source in &layered.sources {
+            println!("config: merged {}", source.display());
+        }
+        Some(layered.file)
     };
-    let mut file = path
-        .as_ref()
-        .map(|path| config_file::preflight(path).map_err(|error| miette::miette!("{error}")))
-        .transpose()?;
     if let Some(file) = file.as_ref() {
         merge_file_into_args(&mut run, &file.openshell.gateway, matches);
     }
@@ -1386,19 +1414,63 @@ fn validate_preflight_semantics(
     Ok(())
 }
 
-fn resolve_config_path(args: &RunArgs) -> Result<Option<PathBuf>> {
-    if let Some(path) = args.config.clone() {
-        return Ok(Some(path));
-    }
+/// Where gateway configuration is read from: an optional base file and an
+/// optional directory of `*.toml` drop-in configs merged over it.
+#[derive(Debug, Default)]
+struct ConfigSources {
+    base: Option<PathBuf>,
+    dir: Option<PathBuf>,
+}
 
-    let default_path = defaults::default_gateway_config_path()?;
-    match std::fs::symlink_metadata(&default_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        // Fail closed when the path exists or cannot be inspected. Returning it
-        // lets the shared loader produce the same safe, path-specific error used
-        // for an explicit configuration instead of treating it as absent.
-        Ok(_) | Err(_) => Ok(Some(default_path)),
+impl ConfigSources {
+    fn is_empty(&self) -> bool {
+        self.base.is_none() && self.dir.is_none()
     }
+}
+
+fn resolve_config_sources(
+    args: &RunArgs,
+    base_override: Option<PathBuf>,
+    dir_override: Option<PathBuf>,
+) -> Result<ConfigSources> {
+    let base = if let Some(path) = base_override.or_else(|| args.config.clone()) {
+        Some(path)
+    } else {
+        let default_path = defaults::default_gateway_config_path()?;
+        match std::fs::symlink_metadata(&default_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            // Fail closed when the path exists or cannot be inspected.
+            // Returning it lets the shared loader produce the same safe,
+            // path-specific error used for an explicit configuration.
+            Ok(_) | Err(_) => Some(default_path),
+        }
+    };
+    // An explicit directory must exist. Otherwise use `gateway.d` beside the
+    // base file (or beside the default location) when it is there.
+    let dir = if let Some(dir) = dir_override.or_else(|| args.config_dir.clone()) {
+        Some(dir)
+    } else {
+        let anchor = match base.clone() {
+            Some(path) => path,
+            None => defaults::default_gateway_config_path()?,
+        };
+        anchor
+            .parent()
+            .map(|parent| parent.join("gateway.d"))
+            .filter(|dir| dir.is_dir())
+    };
+    // A directory with no drop-in configs and no base file holds no
+    // configuration, so the gateway starts on its defaults as it would
+    // without the directory.
+    let dir = match (&base, dir) {
+        (None, Some(dir))
+            if config_file::drop_in_paths(&dir).is_ok_and(|paths| paths.is_empty()) =>
+        {
+            None
+        }
+        (_, dir) => dir,
+    };
+    Ok(ConfigSources { base, dir })
 }
 
 fn apply_runtime_defaults(args: &mut RunArgs) -> Result<Option<LocalTlsPaths>> {
@@ -3633,13 +3705,23 @@ require_client_auth = true
                 let tmp = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
 
                 let (args, _) = parse_with_args(&["openshell-gateway"]);
-                assert_eq!(super::resolve_config_path(&args).unwrap(), None);
+                assert_eq!(
+                    super::resolve_config_sources(&args, None, None)
+                        .unwrap()
+                        .base,
+                    None
+                );
 
                 let config = tmp.join("openshell").join("gateway.toml");
                 std::fs::create_dir_all(config.parent().unwrap()).unwrap();
                 std::fs::write(&config, "[openshell]\nversion = 2\n").unwrap();
 
-                assert_eq!(super::resolve_config_path(&args).unwrap(), Some(config));
+                assert_eq!(
+                    super::resolve_config_sources(&args, None, None)
+                        .unwrap()
+                        .base,
+                    Some(config)
+                );
             });
     }
 
@@ -3652,9 +3734,139 @@ require_client_auth = true
                     parse_with_args(&["openshell-gateway", "--config", "/tmp/missing.toml"]);
 
                 assert_eq!(
-                    super::resolve_config_path(&args).unwrap(),
+                    super::resolve_config_sources(&args, None, None)
+                        .unwrap()
+                        .base,
                     Some(std::path::PathBuf::from("/tmp/missing.toml"))
                 );
+            });
+    }
+
+    #[test]
+    fn config_dir_defaults_to_gateway_d_beside_the_base_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("gateway.toml");
+        std::fs::write(&base, "[openshell]\nversion = 2\n").unwrap();
+        Environment::new()
+            .remove("OPENSHELL_GATEWAY_CONFIG")
+            .remove("OPENSHELL_GATEWAY_CONFIG_DIR")
+            .run(|| {
+                let (args, _) =
+                    parse_with_args(&["openshell-gateway", "--config", base.to_str().unwrap()]);
+                assert_eq!(
+                    super::resolve_config_sources(&args, None, None)
+                        .unwrap()
+                        .dir,
+                    None,
+                    "a missing gateway.d is not an error"
+                );
+                std::fs::create_dir(tmp.path().join("gateway.d")).unwrap();
+                assert_eq!(
+                    super::resolve_config_sources(&args, None, None)
+                        .unwrap()
+                        .dir,
+                    Some(tmp.path().join("gateway.d"))
+                );
+            });
+    }
+
+    #[test]
+    fn a_config_dir_without_drop_ins_or_a_base_file_is_no_configuration() {
+        let xdg = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_CONFIG_HOME", xdg.path().to_str().unwrap())
+            .remove("OPENSHELL_GATEWAY_CONFIG")
+            .remove("OPENSHELL_GATEWAY_CONFIG_DIR")
+            .run(|| {
+                // The environment runs this closure in a child process that
+                // inherits `XDG_CONFIG_HOME`, so build paths from it.
+                let dir = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap())
+                    .join("openshell")
+                    .join("gateway.d");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("notes.txt"), "not a drop-in").unwrap();
+                let (args, _) = parse_with_args(&["openshell-gateway"]);
+                assert!(
+                    super::resolve_config_sources(&args, None, None)
+                        .unwrap()
+                        .is_empty()
+                );
+                std::fs::write(dir.join("10-a.toml"), "[openshell]\nversion = 2\n").unwrap();
+                assert_eq!(
+                    super::resolve_config_sources(&args, None, None)
+                        .unwrap()
+                        .dir,
+                    Some(dir)
+                );
+            });
+    }
+
+    #[test]
+    fn explicit_config_dir_overrides_the_implicit_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("other");
+        let base = tmp.path().join("gateway.toml");
+        std::fs::write(&base, "[openshell]\nversion = 2\n").unwrap();
+        std::fs::create_dir(tmp.path().join("gateway.d")).unwrap();
+        Environment::new()
+            .remove("OPENSHELL_GATEWAY_CONFIG")
+            .remove("OPENSHELL_GATEWAY_CONFIG_DIR")
+            .run(|| {
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    base.to_str().unwrap(),
+                    "--config-dir",
+                    other.to_str().unwrap(),
+                ]);
+                assert_eq!(
+                    super::resolve_config_sources(&args, None, None)
+                        .unwrap()
+                        .dir,
+                    Some(other.clone())
+                );
+            });
+    }
+
+    #[test]
+    fn preflight_merges_drop_ins_and_names_a_bad_drop_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("gateway.toml");
+        std::fs::write(&base, "[openshell]\nversion = 2\n").unwrap();
+        let dir = tmp.path().join("gateway.d");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("10-ok.toml"),
+            "[openshell]\nversion = 2\n[openshell.gateway]\nlog_level = 'debug'\n",
+        )
+        .unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_CONFIG_HOME", xdg.path().to_str().unwrap())
+            .set("XDG_STATE_HOME", xdg.path().to_str().unwrap())
+            .remove("OPENSHELL_GATEWAY_CONFIG")
+            .remove("OPENSHELL_GATEWAY_CONFIG_DIR")
+            .remove("OPENSHELL_COMPUTE_DRIVER")
+            .remove("OPENSHELL_DRIVERS")
+            .run(|| {
+                let args = || super::ConfigPreflightArgs {
+                    path: Some(base.clone()),
+                    ..Default::default()
+                };
+                let (run, matches) = parse_with_args(&["openshell-gateway", "--disable-tls"]);
+                super::run_config_preflight(args(), run, &matches).unwrap();
+
+                std::fs::write(
+                    dir.join("20-bad.toml"),
+                    "[openshell]\nversion = 2\n[openshell.gateway]\nnot_a_field = 1\n",
+                )
+                .unwrap();
+                let (run, matches) = parse_with_args(&["openshell-gateway", "--disable-tls"]);
+                let error = super::run_config_preflight(args(), run, &matches)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("category=malformed"), "{error}");
+                assert!(error.contains("20-bad.toml"), "{error}");
             });
     }
 
@@ -3864,8 +4076,14 @@ require_client_auth = true
             )
             .unwrap();
         let (preflight_args, preflight_matches) = parse_with_args(&argv);
-        super::run_effective_config_preflight(None, preflight_args, &preflight_matches, &registry)
-            .expect("selected or candidate Podman preflight accepts the legacy alias");
+        super::run_effective_config_preflight(
+            None,
+            None,
+            preflight_args,
+            &preflight_matches,
+            &registry,
+        )
+        .expect("selected or candidate Podman preflight accepts the legacy alias");
         assert!(!state.path().join("network-supervisor").exists());
         let prepared = super::prepare_server_config_with_drivers(&mut run, &matches, &registry)
             .expect("global network trust should normalize during startup preparation");
@@ -3946,7 +4164,7 @@ require_client_auth = true
                         argv.extend(["--compute-driver", "docker"]);
                     }
                     let (run, matches) = parse_with_args(&argv);
-                    super::run_effective_config_preflight(None, run, &matches, &registry)
+                    super::run_effective_config_preflight(None, None, run, &matches, &registry)
                         .expect("inactive Podman settings must not affect preflight");
                     let (mut run, matches) = parse_with_args(&argv);
                     let prepared =
