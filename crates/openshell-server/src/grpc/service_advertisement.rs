@@ -99,7 +99,7 @@ impl LeaseWindow {
 
 /// One record per immutable sandbox identity. These records are ephemeral:
 /// reads revalidate owner, configuration, generation, and expiry.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Installation {
     pub sandbox_id: String,
     pub session_id: String,
@@ -118,6 +118,16 @@ pub struct Installation {
     pub port: u32,
     pub expires_at_ms: i64,
     pub routes: Vec<Vec<u8>>,
+}
+
+impl Installation {
+    /// Lease-only renewals do not change serving identity or declarations.
+    pub(super) fn same_identity(&self, other: &Self) -> bool {
+        let mut identity = self.clone();
+        identity.sequence = other.sequence;
+        identity.expires_at_ms = other.expires_at_ms;
+        identity == *other
+    }
 }
 
 fn runtime_identity(sandbox: &Sandbox) -> Result<&str, Status> {
@@ -468,12 +478,30 @@ async fn accept_inner(
 /// Discovery must call this before publishing each persisted installation.
 /// Freshness failures are absence; storage/decoding failures are errors.
 pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bool, Status> {
+    Ok(current_routes(state, record).await?.is_some())
+}
+
+pub(super) async fn current_routes(
+    state: &ServerState,
+    record: &Installation,
+) -> Result<Option<Vec<SandboxServiceRoute>>, Status> {
+    Ok(validated_routes(state, record, None)
+        .await?
+        .map(|(_, routes)| routes))
+}
+
+/// Recheck the live sandbox, owner and shared-pool authority without rebuilding
+/// configuration. Callers may not treat this as configuration validation.
+pub(super) async fn current_sandbox(
+    state: &ServerState,
+    record: &Installation,
+) -> Result<Option<Sandbox>, Status> {
     if !state.config.supervisor_app_listener.enabled
         || record.expires_at_ms <= current_time_ms()
         || record.service_domain != state.config.supervisor_app_listener.domain
         || record.routes.is_empty()
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(sandbox) = state
         .store
@@ -481,7 +509,7 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
         .await
         .map_err(|_| Status::unavailable("sandbox storage unavailable"))?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if sandbox
         .metadata
@@ -489,14 +517,14 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
         .is_some_and(|m| m.deletion_time.is_some())
         || runtime_identity(&sandbox)? != record.runtime_identity
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(owner) = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
         .read(&record.sandbox_id)
         .await
         .map_err(|_| Status::unavailable("supervisor ownership unavailable"))?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if !owner.is_fresh(OWNER_TTL)
         || owner.session_id != record.session_id
@@ -508,7 +536,7 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
             != record.ownership_epoch
         || !sandbox_term_matches(&sandbox, owner.auth_epoch)
     {
-        return Ok(false);
+        return Ok(None);
     }
     if !record.pool_route.is_empty() {
         let endpoint = openshell_core::proto::compute::v1::SupervisorAppEndpoint {
@@ -522,15 +550,29 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
             .await
             .map_err(|_| Status::unavailable("pool application authority unavailable"))?
         {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    let config = super::policy::build_sandbox_config_snapshot(state, &sandbox).await?;
+    Ok(Some(sandbox))
+}
+
+pub(super) async fn validated_routes(
+    state: &ServerState,
+    record: &Installation,
+    inputs: Option<&super::policy::DiscoveryConfigInputs>,
+) -> Result<Option<(Sandbox, Vec<SandboxServiceRoute>)>, Status> {
+    let Some(sandbox) = current_sandbox(state, record).await? else {
+        return Ok(None);
+    };
+    let config = match inputs {
+        Some(inputs) => inputs.build(state, &sandbox).await?,
+        None => super::policy::build_sandbox_config_snapshot(state, &sandbox).await?,
+    };
     if !config.configuration_admitted
         || config.configuration_instance_id != record.configuration_instance_id
         || config.config_revision != record.config_revision
     {
-        return Ok(false);
+        return Ok(None);
     }
     let routes = record
         .routes
@@ -542,7 +584,9 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
         routes,
         ..Default::default()
     };
-    Ok(validate_routes(&report, &config.service_routes).is_ok())
+    Ok(validate_routes(&report, &config.service_routes)
+        .is_ok()
+        .then_some((sandbox, report.routes)))
 }
 
 const CLEANUP_PAGE_SIZE: u16 = 128;
@@ -616,6 +660,7 @@ pub fn spawn_cleanup(state: Arc<ServerState>, mut shutdown: tokio::sync::watch::
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::installed_fixture;
     use super::*;
 
     fn test_lease_authority() -> LeaseAuthority {
@@ -1072,101 +1117,6 @@ mod tests {
         );
     }
 
-    pub async fn installed_fixture()
-    -> (Arc<ServerState>, OwnerGuard, SupervisorServiceAdvertisement) {
-        use openshell_core::proto::datamodel::v1::ObjectMeta;
-        use openshell_core::proto::{SandboxPolicy, SandboxSpec, ServiceEndpoint};
-        let endpoint = openshell_core::proto::compute::v1::SupervisorAppEndpoint {
-            host: "10.0.0.7".into(),
-            port: 9443,
-            runtime_identity: "runtime-a".into(),
-            ..Default::default()
-        };
-        let driver = Arc::new(crate::compute::NoopTestDriver::with_app_endpoint(endpoint));
-        let mut state = crate::grpc::test_support::test_server_state_with_compute_driver(
-            "test",
-            driver.clone(),
-        )
-        .await;
-        {
-            let inner = Arc::get_mut(&mut state).unwrap();
-            inner.compute = inner
-                .compute
-                .clone()
-                .with_app_endpoint_resolver(Some(driver));
-        }
-        Arc::get_mut(&mut state)
-            .unwrap()
-            .config
-            .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
-            enabled: true,
-            port: 9443,
-            domain: "services.example.com".into(),
-        };
-        let sandbox = Sandbox {
-            metadata: Some(ObjectMeta {
-                id: "sandbox".into(),
-                name: "demo".into(),
-                workspace: "default".into(),
-                annotations: [(
-                    COMPUTE_RUNTIME_IDENTITY_ANNOTATION.into(),
-                    "runtime-a".into(),
-                )]
-                .into(),
-                ..Default::default()
-            }),
-            spec: Some(SandboxSpec {
-                policy: Some(SandboxPolicy::default()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        state.store.put_message(&sandbox).await.unwrap();
-        let endpoint = ServiceEndpoint {
-            metadata: Some(ObjectMeta {
-                id: "endpoint".into(),
-                name: "demo--web".into(),
-                workspace: "default".into(),
-                labels: [("sandbox".into(), "demo".into())].into(),
-                ..Default::default()
-            }),
-            sandbox_id: "sandbox".into(),
-            sandbox: "demo".into(),
-            name: "web".into(),
-            target_port: 8080,
-            domain: true,
-            authorization_mode: 1,
-        };
-        state.store.put_message(&endpoint).await.unwrap();
-        let owner = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
-            .publish(
-                "sandbox",
-                "session",
-                "instance",
-                1,
-                "replica",
-                "local://replica",
-            )
-            .await
-            .unwrap();
-        let config = super::super::policy::build_sandbox_config_snapshot(&state, &sandbox)
-            .await
-            .unwrap();
-        assert!(
-            config.configuration_admitted,
-            "{}",
-            config.configuration_error
-        );
-        let report = SupervisorServiceAdvertisement {
-            service_domain: "services.example.com".into(),
-            lease_sequence: 1,
-            configuration_instance_id: config.configuration_instance_id,
-            config_revision: config.config_revision,
-            routes: config.service_routes,
-        };
-        (state, owner, report)
-    }
-
     #[tokio::test]
     async fn accepted_installs_use_trusted_endpoints_and_withdraw_on_declaration_or_owner_change() {
         let (state, owner, mut report) = installed_fixture().await;
@@ -1237,5 +1187,105 @@ mod tests {
         assert!(validate_routes(&report, &[declared.clone(), second]).is_err());
         report.routes.clear();
         validate_routes(&report, &[declared]).unwrap();
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+    pub async fn installed_fixture()
+    -> (Arc<ServerState>, OwnerGuard, SupervisorServiceAdvertisement) {
+        use openshell_core::proto::datamodel::v1::ObjectMeta;
+        use openshell_core::proto::{SandboxPolicy, SandboxSpec, ServiceEndpoint};
+        let endpoint = openshell_core::proto::compute::v1::SupervisorAppEndpoint {
+            host: "10.0.0.7".into(),
+            port: 9443,
+            runtime_identity: "runtime-a".into(),
+            ..Default::default()
+        };
+        let driver = Arc::new(crate::compute::NoopTestDriver::with_app_endpoint(endpoint));
+        let mut state = crate::grpc::test_support::test_server_state_with_compute_driver(
+            "test",
+            driver.clone(),
+        )
+        .await;
+        {
+            let inner = Arc::get_mut(&mut state).unwrap();
+            inner.compute = inner
+                .compute
+                .clone()
+                .with_app_endpoint_resolver(Some(driver));
+        }
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            enabled: true,
+            port: 9443,
+            domain: "services.example.com".into(),
+        };
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".into();
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sandbox".into(),
+                name: "demo".into(),
+                workspace: "default".into(),
+                annotations: [(
+                    COMPUTE_RUNTIME_IDENTITY_ANNOTATION.into(),
+                    "runtime-a".into(),
+                )]
+                .into(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        let endpoint = ServiceEndpoint {
+            metadata: Some(ObjectMeta {
+                id: "endpoint".into(),
+                name: "demo--web".into(),
+                workspace: "default".into(),
+                labels: [("sandbox".into(), "demo".into())].into(),
+                ..Default::default()
+            }),
+            sandbox_id: "sandbox".into(),
+            sandbox: "demo".into(),
+            name: "web".into(),
+            target_port: 8080,
+            domain: true,
+            authorization_mode: 1,
+        };
+        state.store.put_message(&endpoint).await.unwrap();
+        let owner = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .publish(
+                "sandbox",
+                "session",
+                "instance",
+                1,
+                "replica",
+                "local://replica",
+            )
+            .await
+            .unwrap();
+        let config = super::super::policy::build_sandbox_config_snapshot(&state, &sandbox)
+            .await
+            .unwrap();
+        assert!(
+            config.configuration_admitted,
+            "{}",
+            config.configuration_error
+        );
+        let report = SupervisorServiceAdvertisement {
+            service_domain: "services.example.com".into(),
+            lease_sequence: 1,
+            configuration_instance_id: config.configuration_instance_id,
+            config_revision: config.config_revision,
+            routes: config.service_routes,
+        };
+        (state, owner, report)
     }
 }

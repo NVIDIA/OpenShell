@@ -1978,9 +1978,9 @@ Expose services with the existing commands. For direct listener testing, an
 unnamed service on sandbox `demo` in workspace `default` uses SNI and Host
 `default--demo.services.example.com`; a service named `web` uses
 `default--demo--web.services.example.com`. Configure DNS or your ingress to reach
-the owning supervisor while preserving that hostname. Automatic discovery and
-application URL publication are separate work; current CLI URLs still identify
-the existing gateway path.
+the owning supervisor while preserving that hostname. The discovery API supplies accepted supervisor endpoints. Application URL
+publication is separate work; current CLI URLs still identify the existing
+gateway path.
 
 Enabled supervisors report installed service routes through their authenticated
 gateway sessions. The gateway accepts only current configuration and ownership,
@@ -2001,3 +2001,35 @@ application streams even if configuration continues renewing. Under a partition,
 allow for pool membership failure detection before the last serving lease expires.
 Storage errors prevent lease renewal. Discovery expiry and serving expiry are
 separate from external ingress readiness.
+
+Both discovery RPCs require `supervisor_app_listener.enabled = true`. When the
+listener is disabled, they return `FAILED_PRECONDITION` without collecting routes
+or starting a watch.
+
+Discovery clients use the separate `openshell.v1.ServiceDiscovery` gRPC service.
+Call `GetServiceRouteSnapshot` or `WatchServiceRoutes` with
+one explicit workspace selector, `sandbox:read`, and workspace user access. Each
+response replaces the workspace route view and includes the hostname, supervisor
+TLS endpoint, installation version, and expiry. Preserve the hostname as TLS SNI
+and HTTP authority when routing directly to the endpoint. Remove absent routes
+and expire cached entries even during discovery errors. An API error does not
+mean the workspace has no routes. Watches end after one minute; reconnect and
+relist when they end. Discovery-only machine credentials are separate work.
+
+Discovery limits apply per gateway process: 1,000 installation records, 4,096
+routes, and 4 MiB per snapshot, with a ten-second collection timeout. Up to four
+collections and 16 unary requests run concurrently. Collections wait for a free
+slot within the ten-second timeout; unary requests are limited
+to four per principal and eight per workspace. Watches are limited to 32 total,
+four per principal, and 16 per workspace. Capacity and size limits return
+`RESOURCE_EXHAUSTED`; storage failures, configuration changes during collection,
+and timeouts return `UNAVAILABLE`; corrupt
+records return `INTERNAL`. Disabling the app listener returns `FAILED_PRECONDITION`.
+
+Consumers share a one-second collection cache, bounded to 16 workspaces. Cache reuse adds at most one refresh interval to collection freshness;
+cached routes never outlive their advertised expiry. Collections publish the
+latest accepted renewal for an unchanged, revalidated installation; the gateway
+does not create a new lease when serving discovery. Watches recheck bearer
+credentials and workspace access every second and terminate if either is lost.
+OIDC token revocation follows the configured verifier's semantics; offline JWT
+verification cannot detect issuer-side revocation before token expiry.

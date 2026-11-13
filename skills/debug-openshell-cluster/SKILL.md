@@ -1719,8 +1719,8 @@ renew a 30-second lease; rejected configuration or expired freshness closes
 routes. When the listener is enabled, polling delays are capped at five seconds
 even if the configured interval is longer; failed polls do not renew the lease.
 App traffic uses application/edge authentication independently of gateway
-user authentication. This listener stage does not add service discovery or
-change the public URLs printed by the CLI.
+user authentication. The discovery API publishes accepted listener installations; public URLs
+printed by the CLI continue to use the gateway path.
 
 When enabled application routes are not published, check the authenticated
 supervisor session and installed configuration before checking ingress. The
@@ -1732,7 +1732,16 @@ compute driver once per challenge/report exchange, with fresh resolution for the
 next challenge. Acceptance still checks durable ownership and shared member
 readiness; ambiguous shared ownership must not publish an address.
 
-For shared pools, compare the discovered endpoint to the
+For discovery troubleshooting, request `GetServiceRouteSnapshot` for an explicit
+active workspace using an identity with `sandbox:read` and workspace user access.
+Both discovery RPCs return `FAILED_PRECONDITION` when
+`supervisor_app_listener.enabled` is false; enable the listener before discovering routes.
+`WatchServiceRoutes` rechecks access every second and ends after one minute;
+clients must reconnect/relist. Compare installation versions separately from
+snapshot revisions: lease renewal changes expiry and the snapshot revision while
+preserving installation identity. Treat unavailable/corrupt/over-limit results as
+errors, and expire cached routes independently. Do not turn an error into an
+empty replacement. For shared pools, compare the discovered endpoint to the
 acknowledged owner's Pod IP and configured app port, not its runtime port or a
 load-balanced supervisor Service. Publication requires a current ownership term,
 live member, and acknowledged ready report. During takeover old streams may close;
@@ -1740,3 +1749,13 @@ verify workload identity/memory survives and new connections reach the replaceme
 Shared serving leases last at most fifteen seconds from issuance, independently
 of configuration renewal; include membership failure detection when measuring a
 partition's stale-owner interval. Storage failures prevent renewal.
+
+
+Application ingress consumers call the separate `openshell.v1.ServiceDiscovery`
+service, rather than `OpenShell`. Discovery snapshots share a one-second cache
+per workspace (16 cached workspaces, four concurrent collections). The gateway
+admits 16 unary requests (four per principal, eight per workspace), and 32 watches
+(four per principal, 16 per workspace). `RESOURCE_EXHAUSTED` means capacity or
+record/route/byte limits; `UNAVAILABLE` means storage or collection timeout.
+Watches recheck bearer credentials and membership every second. Allow one refresh
+interval for withdrawals; route lease expiry remains independently enforced.

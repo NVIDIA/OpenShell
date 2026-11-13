@@ -25,7 +25,7 @@ use crate::persistence::{ObjectListQuery, ObjectType, WriteCondition};
 use crate::service_routing;
 
 const MAX_SERVICE_NAME_LEN: usize = super::MAX_ROUTABLE_NAME_LEN;
-const MAX_APP_SERVICE_ROUTES: u32 = 1024;
+pub(super) const MAX_APP_SERVICE_ROUTES: u32 = 1024;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -421,8 +421,22 @@ pub(super) async fn configured_app_routes(
     if !state.config.supervisor_app_listener.enabled {
         return Ok(Vec::new());
     }
-    let mut service_routes: Vec<_> = app_service_endpoints(state, sandbox)
-        .await?
+    Ok(configured_app_routes_from_endpoints(
+        state,
+        sandbox,
+        app_service_endpoints(state, sandbox).await?,
+    ))
+}
+
+pub(super) fn configured_app_routes_from_endpoints(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    endpoints: Vec<ServiceEndpoint>,
+) -> Vec<openshell_core::proto::SandboxServiceRoute> {
+    if !state.config.supervisor_app_listener.enabled {
+        return Vec::new();
+    }
+    let mut service_routes: Vec<_> = endpoints
         .into_iter()
         .filter(|ep| {
             ep.sandbox_id == sandbox.object_id()
@@ -441,7 +455,7 @@ pub(super) async fn configured_app_routes(
         })
         .collect();
     service_routes.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(service_routes)
+    service_routes
 }
 
 async fn app_service_endpoints(
