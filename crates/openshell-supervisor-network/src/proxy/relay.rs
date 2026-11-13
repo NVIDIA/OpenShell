@@ -404,6 +404,65 @@ mod tests {
         }
     }
 
+    async fn read_http_response<R>(reader: &mut R) -> Vec<u8>
+    where
+        R: AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            response.push(reader.read_u8().await.unwrap());
+            assert!(response.len() < 4096);
+        }
+        let headers = String::from_utf8_lossy(&response);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or_default();
+        for _ in 0..content_length {
+            response.push(reader.read_u8().await.unwrap());
+        }
+        response
+    }
+
+    fn assert_passthrough_response(
+        response: &[u8],
+        expected_body: &[u8],
+        expect_connection_close: bool,
+    ) {
+        let header_end = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("response headers")
+            + 4;
+        let headers = String::from_utf8_lossy(&response[..header_end]);
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers}");
+        assert!(
+            headers.contains(&format!("Content-Length: {}\r\n", expected_body.len())),
+            "{headers}"
+        );
+        assert_eq!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Connection: close")),
+            expect_connection_close,
+            "{headers}"
+        );
+        assert!(
+            !headers
+                .lines()
+                .any(|line| line.split_once(':').is_some_and(|(name, _)| name
+                    .eq_ignore_ascii_case(openshell_core::token_grant_failure::REQUEST_ID_HEADER))),
+            "uninspected passthrough must not claim an inspected request receipt"
+        );
+        assert_eq!(&response[header_end..], expected_body);
+    }
+
     async fn assert_response_lifecycle<C, P>(mut caller: C, mut client: P)
     where
         C: AsyncRead + AsyncWrite + Unpin,
@@ -443,16 +502,15 @@ mod tests {
             let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
             caller.write_all(request).await.unwrap();
             caller.flush().await.unwrap();
-            let mut first = vec![0; persistent.len()];
-            caller.read_exact(&mut first).await.unwrap();
-            assert_eq!(first, persistent);
+            let first = read_http_response(&mut caller).await;
+            assert_passthrough_response(&first, b"hello", false);
             // A real second exchange verifies reuse, without a timing assertion.
             caller.write_all(request).await.unwrap();
             caller.flush().await.unwrap();
             let mut second = Vec::new();
             // TLS must return clean EOF, not UnexpectedEof from a dropped socket.
             caller.read_to_end(&mut second).await.unwrap();
-            assert_eq!(second, closing);
+            assert_passthrough_response(&second, &body, true);
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (result, (), ()) = tokio::join!(relay, serve, receive);

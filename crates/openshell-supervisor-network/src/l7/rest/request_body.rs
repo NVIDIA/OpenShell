@@ -563,6 +563,8 @@ pub struct UpstreamWriteFailed {
 struct UpstreamWrites<'a, W> {
     inner: &'a mut W,
     failed: &'a AtomicBool,
+    correlation: Option<&'a RequestCorrelation>,
+    request_span: Option<tracing::Span>,
 }
 
 impl<W> UpstreamWrites<'_, W> {
@@ -584,7 +586,13 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for UpstreamWrites<'_, W> {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let result = std::pin::Pin::new(&mut *this.inner).poll_write(cx, buf);
+        let span = this.request_span.get_or_insert_with(|| {
+            this.correlation
+                .map_or_else(tracing::Span::none, |correlation| {
+                    correlation.stage(RequestStage::UpstreamSend)
+                })
+        });
+        let result = span.in_scope(|| std::pin::Pin::new(&mut *this.inner).poll_write(cx, buf));
         this.record(result)
     }
 
@@ -593,7 +601,11 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for UpstreamWrites<'_, W> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let result = std::pin::Pin::new(&mut *this.inner).poll_flush(cx);
+        let result = if let Some(span) = &this.request_span {
+            span.in_scope(|| std::pin::Pin::new(&mut *this.inner).poll_flush(cx))
+        } else {
+            std::pin::Pin::new(&mut *this.inner).poll_flush(cx)
+        };
         this.record(result)
     }
 
@@ -664,6 +676,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    let correlation = response_options.correlation;
     let head = &req.raw_header[..request_header_end(&req.raw_header)];
     let (mut client_reader, client_writer) = tokio::io::split(&mut *client);
     let mut client_writer = ResponseCommit {
@@ -677,14 +690,22 @@ where
         &mut client_reader,
         &mut upstream_writer,
         options,
+        correlation,
     ));
-    let mut response = Box::pin(relay_response(
-        &req.action,
-        &mut upstream_reader,
-        &mut client_writer,
-        response_options,
-        response_middleware,
-    ));
+    let mut response = Box::pin(async {
+        let span = correlation.map_or_else(tracing::Span::none, |correlation| {
+            correlation.stage(RequestStage::Response)
+        });
+        relay_response(
+            &req.action,
+            &mut upstream_reader,
+            &mut client_writer,
+            response_options,
+            response_middleware,
+        )
+        .instrument(span)
+        .await
+    });
 
     tokio::select! {
         biased;
@@ -728,7 +749,7 @@ where
             drop(response);
             // Dropping the upload cancels every request middleware stage.
             drop(upload);
-            body.cancelled("upstream_response");
+            body.cancelled("upstream_response", correlation);
             let _ = upstream_writer.shutdown().await;
             match responded? {
                 RelayOutcome::Reusable => finish_response(&mut client_writer, true).await,
@@ -755,6 +776,7 @@ async fn upload_live_request<C, U>(
     client: &mut C,
     upstream: &mut U,
     options: RelayRequestOptions<'_>,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<()>
 where
     C: AsyncRead + Unpin,
@@ -764,8 +786,19 @@ where
     let mut upstream = UpstreamWrites {
         inner: upstream,
         failed: &failed,
+        correlation,
+        request_span: None,
     };
-    let uploaded = upload_live_body(head, body, client, &mut upstream, options, &failed).await;
+    let uploaded = upload_live_body(
+        head,
+        body,
+        client,
+        &mut upstream,
+        options,
+        &failed,
+        correlation,
+    )
+    .await;
     match uploaded {
         Err(error) if failed.load(Ordering::Acquire) => {
             Err(miette::Report::new(UpstreamWriteFailed {
@@ -783,6 +816,7 @@ async fn upload_live_body<C, U>(
     upstream: &mut U,
     options: RelayRequestOptions<'_>,
     upstream_failed: &AtomicBool,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<()>
 where
     C: AsyncRead + Unpin,
@@ -793,7 +827,7 @@ where
     // Chunked input may end with trailers, which only chunked output carries.
     let input_chunked = body.input_is_chunked();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-    let run = body.run_to(client, sender, upstream_failed);
+    let run = body.run_to(client, sender, upstream_failed, correlation);
     let upstream_for_write = &mut *upstream;
     let write = async move {
         let mut scanner = options
@@ -826,7 +860,19 @@ where
                         head = require_identity_response_coding(&head)
                             .map_err(LiveWriteError::Failed)?;
                     }
-                    let head = rewrite_http_header_block(&head, options.resolver)
+                    let credential_span = if options.resolver.is_some()
+                        || contains_reserved_credential_marker_bytes(&head)
+                    {
+                        correlation.map_or_else(tracing::Span::none, |correlation| {
+                            correlation.stage(RequestStage::CredentialPrepare)
+                        })
+                    } else {
+                        tracing::Span::none()
+                    };
+                    let rewritten = credential_span
+                        .in_scope(|| rewrite_http_header_block(&head, options.resolver));
+                    drop(credential_span);
+                    let head = rewritten
                         .map_err(|error| LiveWriteError::Failed(miette::Report::new(error)))?
                         .rewritten;
                     fixed_length = Some(output_body_bytes.is_some());
@@ -967,6 +1013,8 @@ mod tests {
         let mut writes = UpstreamWrites {
             inner: &mut upstream,
             failed: &failed,
+            correlation: None,
+            request_span: None,
         };
         writes
             .write_all(b"body")

@@ -76,6 +76,15 @@ impl BodyRelayError {
         }
     }
 
+    const fn correlation_failure(&self) -> (HttpOutcome, &'static str) {
+        match self {
+            Self::Upstream(_) => (HttpOutcome::UpstreamError, "upstream_response_body"),
+            Self::Downstream(_) => (HttpOutcome::PlatformError, "downstream_write"),
+            Self::PolicyReload(_) => (HttpOutcome::PlatformError, "policy_generation_changed"),
+            Self::Output(_) => (HttpOutcome::PlatformError, "middleware_response_output"),
+        }
+    }
+
     fn into_report(self) -> miette::Report {
         match self {
             Self::Upstream(error) | Self::PolicyReload(error) | Self::Output(error) => error,
@@ -99,6 +108,7 @@ pub(super) async fn relay_response_through_pipeline<U, C>(
     body_length: BodyLength,
     server_wants_close: bool,
     event_stream: bool,
+    response_correlation: Option<&RequestCorrelation>,
 ) -> Result<Option<RelayOutcome>>
 where
     U: AsyncRead + Unpin,
@@ -152,6 +162,7 @@ where
         Err(error) => {
             debug!(error = %error, "HTTP response middleware preflight failed");
             emit_http_response_middleware_failure(
+                response_correlation,
                 middleware.policy_name,
                 &middleware.target,
                 status_code,
@@ -163,6 +174,9 @@ where
                 middleware.policy_name,
                 &middleware.target,
                 None,
+                HttpOutcome::PlatformError,
+                "middleware_response_preflight",
+                response_correlation,
             )
             .await?;
             return Ok(Some(RelayOutcome::Consumed));
@@ -174,9 +188,15 @@ where
         if let Some(session) = preflight.pipeline.take() {
             session.end(MiddlewareSessionEndReason::PolicyReload).await;
         }
+        record_committed_response_error(
+            response_correlation,
+            HttpOutcome::PlatformError,
+            "policy_generation_changed",
+        );
         return Err(error);
     }
     emit_http_response_stage_events(
+        response_correlation,
         middleware.policy_name,
         &middleware.target,
         status_code,
@@ -191,10 +211,13 @@ where
                 middleware.policy_name,
                 &middleware.target,
                 denial,
+                "middleware_response_preflight",
+                response_correlation,
             )
             .await?;
         } else {
             emit_http_response_middleware_failure(
+                response_correlation,
                 middleware.policy_name,
                 &middleware.target,
                 status_code,
@@ -206,6 +229,9 @@ where
                 middleware.policy_name,
                 &middleware.target,
                 preflight.failure.as_ref(),
+                HttpOutcome::PlatformError,
+                "middleware_response_preflight",
+                response_correlation,
             )
             .await?;
         }
@@ -229,8 +255,10 @@ where
             body_length,
             server_wants_close,
             event_stream,
+            response_correlation,
         )
         .await?;
+        record_allowed_response(response_correlation);
         return Ok(Some(outcome));
     };
     // Eligibility offers a bodyless response no body mode, so no stage can
@@ -240,6 +268,7 @@ where
             .end(MiddlewareSessionEndReason::MiddlewareFailure)
             .await;
         emit_http_response_middleware_failure(
+            response_correlation,
             middleware.policy_name,
             &middleware.target,
             status_code,
@@ -251,6 +280,9 @@ where
             middleware.policy_name,
             &middleware.target,
             None,
+            HttpOutcome::PlatformError,
+            "middleware_response_preflight",
+            response_correlation,
         )
         .await?;
         return Ok(Some(RelayOutcome::Consumed));
@@ -276,6 +308,7 @@ where
         chunked,
         connection_close: server_wants_close,
         generation_guard: middleware.generation_guard,
+        correlation: response_correlation,
         framing: None,
         committed: false,
         withheld: Vec::new(),
@@ -313,14 +346,22 @@ where
     let failure = match (finish, relayed) {
         (Ok(finish), Ok(())) => {
             emit_http_response_stage_events(
+                response_correlation,
                 middleware.policy_name,
                 &middleware.target,
                 status_code,
                 &finish.diagnostics,
             );
             if let Some(guard) = middleware.generation_guard {
-                guard.ensure_current()?;
+                guard.ensure_current().inspect_err(|_| {
+                    record_committed_response_error(
+                        response_correlation,
+                        HttpOutcome::PlatformError,
+                        "policy_generation_changed",
+                    );
+                })?;
             }
+            record_allowed_response(response_correlation);
             return Ok(Some(
                 if server_wants_close
                     || framing == Some(OutputFraming::CloseDelimited)
@@ -334,6 +375,7 @@ where
         }
         (Err(failure), relayed) => {
             emit_http_response_stage_events(
+                response_correlation,
                 middleware.policy_name,
                 &middleware.target,
                 status_code,
@@ -347,6 +389,7 @@ where
         }
         (Ok(finish), Err(error)) => {
             emit_http_response_stage_events(
+                response_correlation,
                 middleware.policy_name,
                 &middleware.target,
                 status_code,
@@ -357,9 +400,14 @@ where
     };
     let committed = writer.committed;
     match failure {
-        Err(error @ BodyRelayError::Downstream(_)) => Err(error.into_report()),
+        Err(error @ BodyRelayError::Downstream(_)) => {
+            record_relay_error(response_correlation, &error);
+            Err(error.into_report())
+        }
         Err(error) if committed => {
+            record_relay_error(response_correlation, &error);
             emit_http_response_middleware_abort(
+                response_correlation,
                 middleware.policy_name,
                 &middleware.target,
                 status_code,
@@ -369,8 +417,10 @@ where
             Err(error.into_report())
         }
         Err(error) => {
+            let (outcome, stage) = error.correlation_failure();
             debug!(error = %error.into_report(), "HTTP response relay failed before commitment");
             emit_http_response_middleware_failure(
+                response_correlation,
                 middleware.policy_name,
                 &middleware.target,
                 status_code,
@@ -382,12 +432,27 @@ where
                 middleware.policy_name,
                 &middleware.target,
                 None,
+                outcome,
+                stage,
+                response_correlation,
             )
             .await?;
             Ok(Some(RelayOutcome::Consumed))
         }
         Ok(failure) if committed => {
+            if let Some(correlation) = response_correlation {
+                correlation.record_enforcement_block();
+                correlation.record_failure(
+                    if failure.denial.is_some() {
+                        HttpOutcome::Denied
+                    } else {
+                        HttpOutcome::PlatformError
+                    },
+                    "middleware_response_finalize",
+                );
+            }
             emit_http_response_middleware_abort(
+                response_correlation,
                 middleware.policy_name,
                 &middleware.target,
                 status_code,
@@ -408,10 +473,13 @@ where
                     middleware.policy_name,
                     &middleware.target,
                     denial,
+                    "middleware_response_finalize",
+                    response_correlation,
                 )
                 .await?;
             } else {
                 emit_http_response_middleware_failure(
+                    response_correlation,
                     middleware.policy_name,
                     &middleware.target,
                     status_code,
@@ -423,12 +491,20 @@ where
                     middleware.policy_name,
                     &middleware.target,
                     failure.failure.as_deref(),
+                    HttpOutcome::PlatformError,
+                    "middleware_response_finalize",
+                    response_correlation,
                 )
                 .await?;
             }
             Ok(Some(RelayOutcome::Consumed))
         }
     }
+}
+
+fn record_relay_error(correlation: Option<&RequestCorrelation>, error: &BodyRelayError) {
+    let (outcome, reason) = error.correlation_failure();
+    record_committed_response_error(correlation, outcome, reason);
 }
 
 /// Feed the upstream body to the stages in units of at most `limit` bytes.
@@ -575,6 +651,7 @@ struct ResponseWriter<'c, 'a, C> {
     chunked: bool,
     connection_close: bool,
     generation_guard: Option<&'a PolicyGenerationGuard>,
+    correlation: Option<&'a RequestCorrelation>,
     /// Set on the output `Start`.
     framing: Option<OutputFraming>,
     /// True once any byte reached the client: no canonical error response may
@@ -659,6 +736,11 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
                 &[]
             },
         );
+        let head = if self.correlation.is_some() {
+            final_response_head(&head, self.correlation).into_owned()
+        } else {
+            head
+        };
         self.framing = Some(framing);
         // The head alone completes an empty declared body.
         if framing == (OutputFraming::ContentLength { remaining: 0 }) {
@@ -730,14 +812,16 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
 
 /// OCSF events for one phase of a response through the stage pipeline.
 fn emit_http_response_stage_events(
+    correlation: Option<&RequestCorrelation>,
     policy_name: &str,
     target: &HttpRequestTarget,
     status_code: u16,
     diagnostics: &HttpStageDiagnostics,
 ) {
-    for event in http_response_stage_events(policy_name, target, status_code, diagnostics) {
-        crate::telemetry::egress_emit!(event);
-    }
+    crate::l7::correlation::emit_request_events(
+        correlation,
+        http_response_stage_events(policy_name, target, status_code, diagnostics),
+    );
 }
 
 fn http_response_stage_events(
@@ -882,6 +966,7 @@ fn push_trailer(
 /// upstream failed, so delivery was aborted. `denied` is true when a stage
 /// stopped delivery, matching the legacy delivery failure finding.
 fn emit_http_response_middleware_abort(
+    correlation: Option<&RequestCorrelation>,
     policy_name: &str,
     target: &HttpRequestTarget,
     status_code: u16,
@@ -908,12 +993,106 @@ fn emit_http_response_middleware_abort(
         ])
         .message("HTTP response middleware failed after response commitment; delivery aborted")
         .build();
-    crate::telemetry::egress_emit!(event);
+    crate::l7::correlation::emit_request_events(correlation, [event]);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::request_tracing::RequestTracing;
+    use opentelemetry_sdk::trace::Sampler;
+    use tokio::io::AsyncReadExt as _;
+    use tracing::instrument::WithSubscriber as _;
+
+    #[tokio::test]
+    async fn empty_pipeline_response_defers_its_protected_receipt_until_completion() {
+        for sampler in [None, Some(Sampler::AlwaysOff), Some(Sampler::AlwaysOn)] {
+            let capture = RequestTracing::new(sampler);
+            async {
+                let request = L7Request {
+                    action: "GET".into(),
+                    target: "/data".into(),
+                    query_params: HashMap::default(),
+                    raw_header: b"GET /data HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec(),
+                    body_length: BodyLength::None,
+                };
+                let correlation = RequestCorrelation::with_request_id(
+                    &request,
+                    &crate::l7::relay::L7EvalContext {
+                        host: "example.test".into(),
+                        port: 443,
+                        ..Default::default()
+                    },
+                    "pipeline-receipt".into(),
+                );
+                let parsed = ParsedResponseHead {
+                    representable: true,
+                    headers: vec![HttpHeader {
+                        name: "x-openshell-request-id".into(),
+                        value: "upstream-forgery".into(),
+                    }],
+                    preserved_credential_headers: Vec::new(),
+                    connection_nominated: Vec::new(),
+                    declared_trailers: Vec::new(),
+                };
+                let (mut relay, mut app) = tokio::io::duplex(4096);
+                {
+                    let mut audited = correlation.observe_response(&mut relay);
+                    let mut writer = ResponseWriter {
+                        client: &mut audited,
+                        status_line: "HTTP/1.1 200 OK",
+                        headers: &parsed.headers,
+                        parsed: &parsed,
+                        chunked: true,
+                        connection_close: false,
+                        generation_guard: None,
+                        correlation: Some(&correlation),
+                        framing: None,
+                        committed: false,
+                        withheld: Vec::new(),
+                    };
+                    writer
+                        .write(HttpBodyOutput::Start {
+                            header_mutations: Vec::new(),
+                            output_body_bytes: Some(0),
+                        })
+                        .await
+                        .unwrap();
+                    assert!(!writer.committed);
+                    assert!(capture.events.json_events().is_empty());
+                    writer
+                        .write(HttpBodyOutput::End {
+                            trailers: Vec::new(),
+                        })
+                        .await
+                        .unwrap();
+                    assert!(writer.committed);
+                }
+                drop(relay);
+                let mut response = Vec::new();
+                app.read_to_end(&mut response).await.unwrap();
+                let response = std::str::from_utf8(&response).unwrap();
+                let mut receipts = response.lines().filter(|line| {
+                    line.split_once(':').is_some_and(|(name, _)| {
+                        name.eq_ignore_ascii_case("x-openshell-request-id")
+                    })
+                });
+                assert_eq!(
+                    receipts.next(),
+                    Some("x-openshell-request-id: pipeline-receipt")
+                );
+                assert_eq!(receipts.next(), None);
+                assert!(!response.contains("upstream-forgery"));
+                let events = capture.events.json_events();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0]["metadata"]["correlation_uid"], "pipeline-receipt");
+                assert_eq!(events[0]["http_response"]["code"], 200);
+            }
+            .with_subscriber(capture.subscriber())
+            .await;
+            capture.shutdown();
+        }
+    }
 
     #[test]
     fn denied_stage_emits_blocked_finding_with_denied_action() {
