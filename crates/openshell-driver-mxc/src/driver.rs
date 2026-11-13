@@ -474,6 +474,13 @@ impl MxcComputeBackend {
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: true,
             resource_capabilities: None,
+            workload_compatibility: Some(
+                openshell_core::proto::compute::v1::WorkloadCompatibility {
+                    operating_system: "windows".to_string(),
+                    architecture: String::new(),
+                    execution_restrictions: Vec::new(),
+                },
+            ),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
             extension: Some(openshell_core::extension_protocol::extension_metadata(

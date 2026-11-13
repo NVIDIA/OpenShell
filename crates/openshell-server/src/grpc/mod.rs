@@ -318,6 +318,13 @@ impl OpenShell for OpenShellService {
                         .resource_capabilities
                         .as_ref()
                         .map(|resources| public_resource_capabilities(*resources)),
+                    workload_compatibility: driver.workload_compatibility.as_ref().map(
+                        |workload| openshell_core::proto::WorkloadCompatibility {
+                            operating_system: workload.operating_system.clone(),
+                            architecture: workload.architecture.clone(),
+                            execution_restrictions: workload.execution_restrictions.clone(),
+                        },
+                    ),
                 }),
             })
             .collect();
@@ -1317,6 +1324,83 @@ mod tests {
         MemoryResourceCapabilities as DriverMemoryResourceCapabilities,
         ResourceCapabilities as DriverResourceCapabilities,
     };
+
+    #[tokio::test]
+    async fn gateway_info_preserves_driver_workload_compatibility_and_legacy_absence() {
+        use crate::test_support::FakeComputeDriver;
+        use openshell_core::proto::compute::v1::GetCapabilitiesRequest;
+        use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriver;
+
+        for (workload, valid) in [
+            (None, true),
+            (
+                Some(openshell_core::proto::compute::v1::WorkloadCompatibility {
+                    operating_system: "macos".into(),
+                    architecture: "arm64".into(),
+                    execution_restrictions: vec![
+                        "Setuid executables cannot run in this runtime.".into(),
+                    ],
+                }),
+                true,
+            ),
+            (
+                Some(openshell_core::proto::compute::v1::WorkloadCompatibility {
+                    execution_restrictions: vec!["bad\nPRIVATE DIAGNOSTIC".into()],
+                    ..Default::default()
+                }),
+                false,
+            ),
+        ] {
+            let mut state = test_support::test_server_state().await;
+            let driver = FakeComputeDriver::new();
+            let mut capabilities = driver
+                .get_capabilities(Request::new(GetCapabilitiesRequest::default()))
+                .await
+                .unwrap()
+                .into_inner();
+            capabilities.workload_compatibility = workload.clone();
+            let driver = Arc::new(driver.with_capabilities(capabilities));
+            let compute = crate::compute::ComputeRuntime::from_driver(
+                "external-native".into(),
+                driver,
+                None,
+                state.store.clone(),
+                crate::sandbox_index::SandboxIndex::new(),
+                crate::sandbox_watch::SandboxWatchBus::new(),
+                crate::tracing_bus::TracingLogBus::new(),
+                Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+            )
+            .await;
+            if !valid {
+                let error = compute.expect_err("invalid metadata must fail startup");
+                assert!(error.to_string().contains("workload_compatibility"));
+                assert!(!error.to_string().contains("PRIVATE DIAGNOSTIC"));
+                continue;
+            }
+            let compute = compute.unwrap();
+            Arc::get_mut(&mut state).unwrap().compute = compute;
+            let response = OpenShellService::new(state)
+                .get_gateway_info(Request::new(GetGatewayInfoRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+            let reported = response.compute_drivers[0]
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .workload_compatibility
+                .as_ref();
+            assert_eq!(reported.is_some(), workload.is_some());
+            if let Some(reported) = reported {
+                assert_eq!(reported.operating_system, "macos");
+                assert_eq!(reported.architecture, "arm64");
+                assert_eq!(
+                    reported.execution_restrictions,
+                    workload.unwrap().execution_restrictions
+                );
+            }
+        }
+    }
 
     #[test]
     fn public_resource_capabilities_preserves_reported_fields() {
