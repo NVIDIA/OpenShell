@@ -359,7 +359,7 @@ impl OpenShell for TestOpenShell {
         } else {
             req.name.clone()
         };
-        let service_urls = req
+        let service_urls: HashMap<String, String> = req
             .service_exposures
             .iter()
             .map(|exposure| {
@@ -371,6 +371,11 @@ impl OpenShell for TestOpenShell {
             .collect();
         *self.state.last_create.lock().await = Some(req);
         Ok(Response::new(proto::SandboxResponse {
+            application_service_urls: service_urls.clone(),
+            gateway_service_urls: HashMap::from([(
+                "web".into(),
+                "https://web.gateway.test:8080/".into(),
+            )]),
             sandbox: Some(sandbox_with_phase(&name, proto::SandboxPhase::Provisioning)),
             service_urls,
         }))
@@ -441,6 +446,8 @@ impl OpenShell for TestOpenShell {
         );
         *self.state.last_stop.lock().await = Some(request);
         Ok(Response::new(proto::SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
         }))
@@ -458,6 +465,8 @@ impl OpenShell for TestOpenShell {
         );
         *self.state.last_start.lock().await = Some(request);
         Ok(Response::new(proto::SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
         }))
@@ -475,6 +484,8 @@ impl OpenShell for TestOpenShell {
         );
         *self.state.last_suspend.lock().await = Some(request);
         Ok(Response::new(proto::SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
         }))
@@ -492,6 +503,8 @@ impl OpenShell for TestOpenShell {
         );
         *self.state.last_resume.lock().await = Some(request);
         Ok(Response::new(proto::SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
         }))
@@ -539,6 +552,8 @@ impl OpenShell for TestOpenShell {
             sandbox.metadata.as_mut().unwrap().id.clone_from(id);
         }
         let mut response = Response::new(proto::SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
         });
@@ -1293,6 +1308,11 @@ async fn create_sandbox_passes_spec_through() {
     assert_eq!(
         result.service_urls.get("web").map(String::as_str),
         Some("https://web.example.test/")
+    );
+    assert_eq!(result.application_service_urls, result.service_urls);
+    assert_eq!(
+        result.gateway_service_urls["web"],
+        "https://web.gateway.test:8080/"
     );
 
     let observed = state.last_create.lock().await.clone().unwrap();

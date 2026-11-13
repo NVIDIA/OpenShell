@@ -484,12 +484,25 @@ async fn publish_installations(
             previous.routes
         };
         for (bytes, route) in installation.routes.iter().zip(installed_routes) {
-            let label = crate::service_routing::service_route_readable_label(
-                workspace,
-                sandbox.object_name(),
-                &route.name,
-            );
-            let hostname = format!("{label}.{}", installation.service_domain);
+            let hostname = if route.application_hostname.is_empty() {
+                // Legacy reports can only be current against legacy configuration.
+                state.config.supervisor_app_listener.service_hostname(
+                    workspace,
+                    sandbox.object_name(),
+                    &route.name,
+                    state.config.service_routing_discriminator(),
+                )
+            } else {
+                route.application_hostname.clone()
+            };
+            let label = hostname
+                .strip_suffix(&format!(".{}", installation.service_domain))
+                .ok_or_else(|| Status::internal("installed hostname domain mismatch"))?;
+            if label.is_empty() || label.len() > 63 || label.contains('.') {
+                return Err(Status::failed_precondition(
+                    "service hostname exceeds DNS label limit",
+                ));
+            }
             let version = installation_version(&installation, bytes)?;
             routes.push(DiscoveredServiceRoute {
                 workspace: workspace.to_string(),
@@ -621,6 +634,83 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error.message().contains("app listener"));
         assert_eq!(state.discovery_watches.available_permits(), permits);
+    }
+
+    #[tokio::test]
+    async fn hashed_urls_discovery_and_installed_routes_use_the_same_gateway_identity() {
+        use super::super::service_advertisement::test_support::installed_fixture_for_gateway;
+        use openshell_core::config::ServiceHostnameFormat;
+        let (mut state, owner, report) =
+            installed_fixture_for_gateway("gateway-a", ServiceHostnameFormat::Hashed).await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .supervisor_app_listener
+            .public_url = Some("https://services.example.com:10443".into());
+        accept(&state, &owner, &report, current_time_ms() + 10_000)
+            .await
+            .unwrap();
+        let first = snapshot(&state, "default").await.unwrap();
+        let hostname = &first.routes[0].hostname;
+        let label = crate::service_routing::service_route_hash_label(
+            "gateway-a",
+            "default",
+            "demo",
+            Some("web"),
+        );
+        assert_eq!(*hostname, format!("{label}.services.example.com"));
+        assert_eq!(*hostname, report.routes[0].application_hostname);
+        let endpoint = state
+            .store
+            .get_message::<openshell_core::proto::ServiceEndpoint>("endpoint")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut response = openshell_core::proto::ServiceEndpointResponse {
+            endpoint: Some(endpoint),
+            ..Default::default()
+        };
+        super::super::service::refresh_response_urls(&state, &mut response);
+        assert_eq!(
+            response.application_url,
+            format!("https://{hostname}:10443/")
+        );
+        assert_eq!(response.url, response.application_url);
+
+        // A renamed installation cannot advertise a hostname it has not installed.
+        Arc::get_mut(&mut state).unwrap().config.name = "gateway-b".into();
+        assert!(snapshot(&state, "default").await.unwrap().routes.is_empty());
+        assert_eq!(
+            accept(&state, &owner, &report, current_time_ms() + 10_000)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let config = super::super::policy::build_sandbox_config_snapshot(&state, &sandbox)
+            .await
+            .unwrap();
+        let replacement = openshell_core::proto::SupervisorServiceAdvertisement {
+            config_revision: config.config_revision,
+            routes: config.service_routes,
+            lease_sequence: report.lease_sequence + 1,
+            ..report
+        };
+        accept(&state, &owner, &replacement, current_time_ms() + 10_000)
+            .await
+            .unwrap();
+        let second = snapshot(&state, "default").await.unwrap();
+        assert_ne!(first.routes[0].hostname, second.routes[0].hostname);
+        assert_ne!(
+            first.routes[0].installation_version,
+            second.routes[0].installation_version
+        );
     }
 
     #[tokio::test]
