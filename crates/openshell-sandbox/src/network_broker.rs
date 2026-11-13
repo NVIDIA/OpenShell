@@ -31,7 +31,7 @@ use openshell_isolation_interface::contract::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-const SOCKET_CAPACITY: usize = 4_096;
+pub const SOCKET_CAPACITY: usize = 4_096;
 const SOCKET_FD_HEADROOM: usize = 64;
 const OPEN_QUEUE_CAPACITY: usize = 256;
 const DNS_QUEUE_CAPACITY: usize = 256;
@@ -742,44 +742,33 @@ fn dispatch_notification(
     ) {
         return classify_send(&registry, &listener, notification, &queues.dns_relay);
     }
-    if syscall == libc::SYS_setsockopt {
-        let level = i32::try_from(notification.args[1])
-            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-        let option = i32::try_from(notification.args[2])
-            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-        if socket_option_is_denied(level, option) {
-            return Err(io::Error::from_raw_os_error(libc::EPERM));
-        }
-        return listener.respond_continue(notification.id);
-    }
     Err(io::Error::from_raw_os_error(libc::EPERM))
 }
 
-/// Options the workload may never set, decided from scalar syscall arguments
-/// that another thread cannot replace before the kernel reads them.
+/// Options the workload may never set, decided before the syscall reaches the
+/// broker.
 ///
 /// Interface-selection options could redirect or unpin a socket's loopback
-/// device binding; the others enable Fast Open or change the address family. The kernel already refuses to change an existing binding
-/// without `CAP_NET_RAW`; denying them here keeps confinement independent of
-/// the capability state of the namespace that owns the network namespace.
-fn socket_option_is_denied(level: i32, option: i32) -> bool {
-    matches!(
-        (level, option),
-        (libc::IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT)
-            | (
-                libc::IPPROTO_IPV6,
-                libc::IPV6_ADDRFORM | libc::IPV6_UNICAST_IF | libc::IPV6_MULTICAST_IF
-            )
-            | (
-                libc::SOL_SOCKET,
-                libc::SO_BINDTODEVICE | libc::SO_BINDTOIFINDEX
-            )
-            | (
-                libc::IPPROTO_IP,
-                libc::IP_UNICAST_IF | libc::IP_MULTICAST_IF
-            )
-    )
-}
+/// device binding; the others enable Fast Open or change the address family.
+/// The kernel already refuses to change an existing binding without
+/// `CAP_NET_RAW`; denying them in the workload seccomp filter keeps
+/// confinement independent of the capability state of the namespace that owns
+/// the network namespace.
+///
+/// This table is the single source of truth, consumed at listener install.
+/// The filter matches the low 32-bit word of `level` and `optname`, because
+/// the kernel truncates both to `int`: a junk-extended encoding of a denied
+/// pair must be denied, not allowed.
+pub const DENIED_SOCKET_OPTIONS: [(i32, i32); 8] = [
+    (libc::IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT),
+    (libc::IPPROTO_IPV6, libc::IPV6_ADDRFORM),
+    (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_IF),
+    (libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF),
+    (libc::SOL_SOCKET, libc::SO_BINDTODEVICE),
+    (libc::SOL_SOCKET, libc::SO_BINDTOIFINDEX),
+    (libc::IPPROTO_IP, libc::IP_UNICAST_IF),
+    (libc::IPPROTO_IP, libc::IP_MULTICAST_IF),
+];
 
 fn create_socket(
     registry: &Mutex<SocketRegistry>,
@@ -1927,7 +1916,8 @@ mod tests {
     fn listening_socket_lives_only_as_long_as_workload_aliases() {
         for address in ["127.0.0.1:0", "[::1]:0"] {
             let address: SocketAddr = address.parse().unwrap();
-            let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+            let (launcher, listener) =
+                crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS).unwrap();
             let broker = NetworkBroker::start_for_test(listener).unwrap();
             let (socket, alias, address, inode) = launcher
                 .execute(move || -> io::Result<_> {
@@ -1972,7 +1962,8 @@ mod tests {
 
     #[test]
     fn implicit_listen_releases_source_and_failed_listen_retains_it() {
-        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS).unwrap();
         let broker = NetworkBroker::start_for_test(listener).unwrap();
         let (address, inode, udp) = launcher
             .execute(|| -> io::Result<_> {
@@ -2006,7 +1997,8 @@ mod tests {
     fn source_cloexec_is_independent_of_workload_inheritance() {
         use rustix::io::{FdFlags, fcntl_getfd};
         for close_on_exec in [false, true] {
-            let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+            let (launcher, listener) =
+                crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS).unwrap();
             let broker = NetworkBroker::start_for_test(listener).unwrap();
             let socket = launcher
                 .execute(move || -> io::Result<OwnedFd> {
@@ -2057,8 +2049,8 @@ mod tests {
 
     #[test]
     fn provider_files_are_opened_on_demand_and_replaced() {
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start broker");
         let path = "/run/openshell/providers/acme/client.toml".to_string();
         broker
@@ -2304,7 +2296,8 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         receiver.set_nonblocking(true).unwrap();
         let destination = receiver.local_addr().unwrap();
-        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS).unwrap();
         let _broker = NetworkBroker::start_for_test(listener).unwrap();
         let executable = std::env::current_exe().unwrap();
         let mut child = launcher
@@ -2329,7 +2322,8 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn closed_workload_socket_reports_bad_descriptor() {
-        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS).unwrap();
         let _broker = NetworkBroker::start_for_test(listener).unwrap();
         let error = launcher
             .execute(|| {
@@ -2396,7 +2390,8 @@ mod tests {
 
     #[test]
     fn metadata_reservation_preserves_other_loopback_and_rejects_udp() {
-        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS).unwrap();
         let _broker = NetworkBroker::start_for_test(listener).unwrap();
         let local_server = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = local_server.local_addr().unwrap();
@@ -2418,7 +2413,8 @@ mod tests {
     #[test]
     fn metadata_loopback_connect_is_relayed_to_supervisor() {
         use std::io::{Read as _, Write as _};
-        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS).unwrap();
         let broker = NetworkBroker::start_for_test(listener).unwrap();
         let client = std::thread::spawn(move || {
             launcher
@@ -2463,8 +2459,8 @@ mod tests {
 
     #[test]
     fn external_connect_times_out_when_supervisor_retains_the_decision() {
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let broker = NetworkBroker::start_with_decision_timeout(
             listener,
             "127.0.0.1:0".parse().unwrap(),
@@ -2683,7 +2679,8 @@ mod tests {
         use std::process::{Command, Stdio};
 
         for transport in [DnsTransport::Udp, DnsTransport::Tcp] {
-            let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+            let (launcher, listener) =
+                crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS).unwrap();
             let broker = NetworkBroker::start_for_test(listener).unwrap();
             let address = broker.dns_address();
             let child = std::thread::spawn(move || {
@@ -2761,7 +2758,8 @@ mod tests {
         let control = TcpListener::bind("127.0.0.1:0").unwrap();
         control.set_nonblocking(true).unwrap();
         let address = control.local_addr().unwrap();
-        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS).unwrap();
         let _broker = NetworkBroker::start_with_dns_address(
             listener,
             "127.0.0.1:0".parse().unwrap(),
@@ -2822,8 +2820,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary Unix socket directory");
         let path = directory.path().join("service.sock");
         let service = UnixListener::bind(&path).expect("bind Unix service");
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let client = std::thread::spawn(move || {
             launcher
@@ -2844,7 +2842,8 @@ mod tests {
     fn unix_listen_remains_kernel_driven() {
         let directory = tempfile::tempdir().expect("temporary Unix socket directory");
         let path = directory.path().join("service.sock");
-        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS).unwrap();
         let _broker = NetworkBroker::start_for_test(listener).unwrap();
         let service = launcher
             .execute(move || UnixListener::bind(path))
@@ -2855,8 +2854,8 @@ mod tests {
 
     #[test]
     fn native_accept_inherits_loopback_confinement() {
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let workload = std::thread::spawn(move || {
@@ -2918,8 +2917,8 @@ mod tests {
 
     #[test]
     fn workload_sockets_are_bound_to_loopback_and_cannot_be_rebound() {
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let results = launcher
             .execute(|| -> io::Result<Vec<ConfinementObservation>> {
@@ -2952,8 +2951,8 @@ mod tests {
         let local = TcpListener::bind("127.0.0.1:0").unwrap();
         local.set_nonblocking(true).unwrap();
         let address = local.local_addr().unwrap();
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let error = launcher
             .execute(move || -> io::Result<()> {
@@ -2993,8 +2992,8 @@ mod tests {
     fn broker_refuses_socket_families_it_cannot_confine() {
         // Independent of the static workload filter: the broker continues
         // only Unix and netlink sockets and creates INET sockets itself.
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let results = launcher
             .execute(|| {
@@ -3077,8 +3076,8 @@ mod tests {
         // address succeeds, unlike a native EINVAL, so a restart is safe.
         let service = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = service.local_addr().unwrap();
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let (bind_again, connect_again) = launcher
             .execute(move || -> io::Result<(io::Result<()>, Option<i32>)> {
@@ -3129,8 +3128,8 @@ mod tests {
             println!("kill={kill} tgkill={tgkill}");
             return;
         }
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let run_workload = |launcher: &crate::linux::workload_launcher::WorkloadLauncher| {
             let output = launcher
@@ -3174,8 +3173,8 @@ mod tests {
             .unwrap();
         saturated.listen(0).unwrap();
         let address = saturated.local_addr().unwrap().as_socket().unwrap();
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let (blocking_wait, nonblocking_result) = launcher
             .execute(move || {
@@ -3216,8 +3215,8 @@ mod tests {
         // Workload sockets can only present loopback source addresses. A
         // non-loopback peer on a loopback-bound workload listener is therefore
         // a non-workload process in the same network namespace.
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let errors = launcher
             .execute(|| {
@@ -3231,38 +3230,284 @@ mod tests {
         assert_eq!(errors, [Some(libc::EACCES), Some(libc::EACCES)]);
     }
 
-    #[test]
-    fn interface_selection_options_are_denied() {
-        for (level, option) in [
-            (libc::SOL_SOCKET, libc::SO_BINDTODEVICE),
-            (libc::SOL_SOCKET, libc::SO_BINDTOIFINDEX),
-            (libc::IPPROTO_IP, libc::IP_UNICAST_IF),
-            (libc::IPPROTO_IP, libc::IP_MULTICAST_IF),
-            (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_IF),
-            (libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF),
-            (libc::IPPROTO_IPV6, libc::IPV6_ADDRFORM),
-            (libc::IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT),
-        ] {
-            assert!(socket_option_is_denied(level, option), "{level}/{option}");
+    /// Probes run by the filtered thread and asserted by the unfiltered test.
+    struct SocketOptionProbes {
+        canonical: Vec<Option<i32>>,
+        junk_extended: [Option<i32>; 3],
+        out_of_range: [Option<i32>; 2],
+        low_word_above_i32_max: [Option<i32>; 2],
+        permitted: Vec<Option<i32>>,
+    }
+
+    /// Run one `setsockopt(2)` with 64-bit `level` and `optname` encodings and
+    /// report the kernel errno, or `None` when the call succeeds.
+    fn setsockopt_errno(fd: RawFd, level: u64, option: u64, value: &[u8]) -> Option<i32> {
+        // SAFETY: `value` is live for the call. Denied and rejected arguments
+        // are decided before the kernel reads it.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_setsockopt,
+                fd,
+                level,
+                option,
+                value.as_ptr().cast::<libc::c_void>(),
+                libc::socklen_t::try_from(value.len()).expect("optlen fits socklen_t"),
+            )
+        };
+        if result < 0 {
+            io::Error::last_os_error().raw_os_error()
+        } else {
+            None
         }
-        assert!(!socket_option_is_denied(
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR
-        ));
-        assert!(!socket_option_is_denied(
-            libc::IPPROTO_TCP,
-            libc::TCP_NODELAY
-        ));
-        assert!(!socket_option_is_denied(
-            libc::IPPROTO_IPV6,
-            libc::IPV6_V6ONLY
-        ));
+    }
+
+    /// Formatted tracing output, shared between a capture subscriber and the
+    /// test asserting on it.
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            let output = self.output.lock().expect("log capture lock");
+            String::from_utf8_lossy(&output).into_owned()
+        }
+    }
+
+    impl io::Write for CapturedLogs {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.output
+                .lock()
+                .expect("log capture lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn workload_filter_denies_interface_selection_options() {
+        // Denied options are answered by the workload filter itself, so this
+        // test installs the production filter with no broker behind it. A
+        // notification would block the probe thread until the timeout below.
+        let (listener_tx, listener_rx) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            // A nonzero high word, which the kernel truncates away.
+            const JUNK: u64 = 1 << 32;
+            // A zero high word with a low word above i32::MAX matches no deny
+            // arm and passes both high-word guards, so the kernel truncates the
+            // word to a negative int and refuses it itself.
+            const TRUNCATES_TO_NEGATIVE: u64 = 0x0000_0000_8000_0000;
+            // Create the probe socket before the install: socket creation is
+            // notified and this test runs no broker.
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .expect("create probe socket");
+            let listener =
+                crate::linux::seccomp_notify::install_workload_listener(&DENIED_SOCKET_OPTIONS)
+                    .expect("install workload filter");
+            listener_tx.send(listener).expect("hand listener to test");
+            let fd = socket.as_raw_fd();
+
+            let bits = |value: i32| u64::try_from(value).expect("option is nonnegative");
+            let canonical = DENIED_SOCKET_OPTIONS
+                .iter()
+                .map(|&(level, option)| setsockopt_errno(fd, bits(level), bits(option), &[0; 4]))
+                .collect();
+            let junk_extended = [
+                (
+                    JUNK | bits(libc::IPPROTO_TCP),
+                    bits(libc::TCP_FASTOPEN_CONNECT),
+                ),
+                (bits(libc::SOL_SOCKET), JUNK | bits(libc::SO_BINDTODEVICE)),
+                (JUNK | bits(libc::IPPROTO_IPV6), bits(libc::IPV6_ADDRFORM)),
+            ]
+            .map(|(level, option)| setsockopt_errno(fd, level, option, &[0; 4]));
+            let out_of_range = [
+                (JUNK, bits(libc::SO_REUSEADDR)),
+                (bits(libc::IPPROTO_IP), JUNK | bits(libc::TCP_NODELAY)),
+            ]
+            .map(|(level, option)| setsockopt_errno(fd, level, option, &[0; 4]));
+            // A zero high word with a low word above i32::MAX matches no deny
+            // arm and passes both high-word guards, so the kernel truncates the
+            // word to a negative int and refuses it itself. The broker used to
+            // answer this encoding with EINVAL; after the move into the filter
+            // it must still fail and must never report success.
+            let low_word_above_i32_max = [
+                (TRUNCATES_TO_NEGATIVE, bits(libc::SO_BINDTODEVICE)),
+                (bits(libc::SOL_SOCKET), TRUNCATES_TO_NEGATIVE),
+            ]
+            .map(|(level, option)| setsockopt_errno(fd, level, option, &[0; 4]));
+            let int_value = 1_i32.to_ne_bytes();
+            let timeout_value = [0_u8; size_of::<libc::timeval>()];
+            let permitted = vec![
+                setsockopt_errno(
+                    fd,
+                    bits(libc::IPPROTO_TCP),
+                    bits(libc::TCP_NODELAY),
+                    &int_value,
+                ),
+                setsockopt_errno(
+                    fd,
+                    bits(libc::SOL_SOCKET),
+                    bits(libc::SO_REUSEADDR),
+                    &int_value,
+                ),
+                setsockopt_errno(
+                    fd,
+                    bits(libc::SOL_SOCKET),
+                    bits(libc::SO_RCVTIMEO),
+                    &timeout_value,
+                ),
+                setsockopt_errno(
+                    fd,
+                    bits(libc::SOL_SOCKET),
+                    bits(libc::SO_SNDTIMEO),
+                    &timeout_value,
+                ),
+            ];
+            result_tx
+                .send(SocketOptionProbes {
+                    canonical,
+                    junk_extended,
+                    out_of_range,
+                    low_word_above_i32_max,
+                    permitted,
+                })
+                .expect("send probe results");
+        });
+
+        let _listener = listener_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("workload filter installs");
+        let probes = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("setsockopt probes finish without a broker round trip");
+        worker.join().expect("probe worker exits");
+
+        assert_eq!(probes.canonical.len(), DENIED_SOCKET_OPTIONS.len());
+        for (&(level, option), errno) in DENIED_SOCKET_OPTIONS.iter().zip(&probes.canonical) {
+            assert_eq!(*errno, Some(libc::EPERM), "{level}/{option} was not denied");
+        }
+        assert_eq!(
+            probes.junk_extended,
+            [Some(libc::EPERM), Some(libc::EPERM), Some(libc::EPERM)]
+        );
+        assert_eq!(
+            probes.out_of_range,
+            [Some(libc::EINVAL), Some(libc::EINVAL)]
+        );
+        // Nothing in the filter matches these encodings, so the kernel sees the
+        // truncated negative int and refuses the unknown level or option. The
+        // exact errno is the kernel's choice; the probe pins that the
+        // fall-through allow still ends in a failure the filter did not deny.
+        for errno in probes.low_word_above_i32_max {
+            assert!(
+                errno.is_some_and(|errno| errno != libc::EPERM),
+                "a truncation encoding was allowed ({errno:?}) or denied by the filter"
+            );
+        }
+        for errno in &probes.permitted {
+            assert_eq!(*errno, None, "permitted option did not reach the kernel");
+        }
+    }
+
+    #[test]
+    fn denied_setsockopt_is_answered_without_a_denial_log() {
+        // A confined setsockopt pair is answered with EPERM by the workload
+        // filter, so the broker dispatcher never sees the call and the
+        // "sandbox network notification denied" warning no longer fires. The
+        // capture runs in a child process: a process-wide subscriber would
+        // also collect denials from tests running concurrently here.
+        const CHILD_MARKER: &str = "OPENSHELL_DENIED_SETSOCKOPT_LOG_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let logs = CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("install the log capture subscriber");
+
+            let (launcher, listener) =
+                crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+                    .expect("start workload launcher");
+            let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+            let errno = launcher
+                .execute(|| -> io::Result<Option<i32>> {
+                    let socket = socket2::Socket::new(
+                        socket2::Domain::IPV4,
+                        socket2::Type::STREAM,
+                        Some(socket2::Protocol::TCP),
+                    )?;
+                    Ok(setsockopt_errno(
+                        socket.as_raw_fd(),
+                        u64::try_from(libc::SOL_SOCKET).expect("level is nonnegative"),
+                        u64::try_from(libc::SO_BINDTODEVICE).expect("option is nonnegative"),
+                        b"lo\0",
+                    ))
+                })
+                .expect("launcher result")
+                .expect("workload socket");
+            assert_eq!(errno, Some(libc::EPERM), "confined option was not denied");
+            // Prove the capture observes another thread's events before
+            // relying on its silence: a regression would log from the broker.
+            std::thread::spawn(|| {
+                tracing::warn!("openshell denied-option log capture control");
+            })
+            .join()
+            .expect("log capture control thread");
+            let captured = logs.text();
+            assert!(
+                captured.contains("openshell denied-option log capture control"),
+                "log capture did not observe an emitted event: {captured}"
+            );
+            assert!(
+                !captured.contains("sandbox network notification denied"),
+                "a confined setsockopt was mediated and logged: {captured}"
+            );
+            return;
+        }
+
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("resolve test executable"))
+                .args([
+                    "--exact",
+                    "network_broker::tests::denied_setsockopt_is_answered_without_a_denial_log",
+                    "--nocapture",
+                    "--quiet",
+                ])
+                .env(CHILD_MARKER, "1")
+                .output()
+                .expect("run denied-option log capture child");
+        assert!(
+            output.status.success(),
+            "denied-option log capture child failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
     fn external_connect_waits_for_explicit_relay_decision() {
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let client = std::thread::spawn(move || {
             launcher
@@ -3301,8 +3546,8 @@ mod tests {
 
     #[test]
     fn denied_external_connect_keeps_socket_unconnected() {
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let client = std::thread::spawn(move || {
             launcher
@@ -3332,8 +3577,8 @@ mod tests {
 
     #[test]
     fn udp_dns_normalizes_wildcard_source_for_relay_attribution() {
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let dns_address = broker.dns_address();
         let client = std::thread::spawn(move || {
@@ -3372,8 +3617,8 @@ mod tests {
     fn udp_dns_after_connect_sends_with_sendmmsg() {
         // glibc connects the resolver socket to the nameserver, then sends A
         // and AAAA together with sendmmsg and no destination.
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let dns_address = broker.dns_address();
         let client = std::thread::spawn(move || {
@@ -3438,8 +3683,8 @@ mod tests {
         // Ancillary data can carry a per-message routing override such as
         // IP_PKTINFO. The kernel performs mediated DNS sends, so control data
         // is refused.
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let dns_address = broker.dns_address();
         let errno = launcher
@@ -3474,8 +3719,8 @@ mod tests {
 
     #[test]
     fn udp_dns_allows_repeated_destination_sends_to_the_pinned_relay() {
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let dns_address = broker.dns_address();
         let client = std::thread::spawn(move || {
@@ -3525,8 +3770,8 @@ mod tests {
 
     #[test]
     fn udp_port_zero_route_probes_are_local_and_reusable() {
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         launcher
             .execute(|| -> io::Result<()> {
@@ -3604,8 +3849,8 @@ mod tests {
 
     #[test]
     fn tcp_dns_preserves_length_framing() {
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (launcher, listener) = crate::linux::workload_launcher::start(&DENIED_SOCKET_OPTIONS)
+            .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let dns_address = broker.dns_address();
         let client = std::thread::spawn(move || {
