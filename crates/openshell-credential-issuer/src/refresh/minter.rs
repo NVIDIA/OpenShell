@@ -629,21 +629,26 @@ async fn request_token(
         let body = read_bounded_oauth_error_body(response).await;
         return Err(classify_oauth_token_error(status, &body, grant_kind));
     }
-    let token = response.json::<TokenResponse>().await.map_err(|_| {
-        if grant_kind == OAuthGrantKind::UserRefreshToken {
-            return RefreshFailure::reauthorize(
-                Status::failed_precondition(
-                    "refresh token exchange returned an unusable response; reauthorize the grant",
-                ),
-                "oauth_refresh_exchange_uncertain",
-                None,
-            );
-        }
-        RefreshFailure::investigate(
-            Status::failed_precondition("token endpoint returned invalid JSON"),
-            "oauth_invalid_success_response",
-        )
-    })?;
+    let body = response
+        .bytes()
+        .await
+        .map_err(|_| unusable_token_response(grant_kind))?;
+    let Ok(token) = serde_json::from_slice::<TokenResponse>(&body) else {
+        // RFC 6749 section 5.2 puts token endpoint errors on 4xx, but some
+        // issuers (Slack's oauth.v2.access, for example) answer HTTP 200
+        // with an `error` body. An error name the classifier recognizes is
+        // an explicit answer from the issuer, so it is classified like any
+        // other token error. Anything it does not recognize keeps the
+        // uncertain-exchange handling: a user grant parks for
+        // reauthorization because the refresh token may already have been
+        // consumed.
+        return Err(serde_json::from_slice::<OAuthErrorResponse>(&body)
+            .ok()
+            .and_then(|error_response| {
+                classify_oauth_error_response(status, &error_response, grant_kind)
+            })
+            .unwrap_or_else(|| unusable_token_response(grant_kind)));
+    };
     if token.access_token.trim().is_empty() {
         if grant_kind == OAuthGrantKind::UserRefreshToken {
             return Err(RefreshFailure::reauthorize(
@@ -678,6 +683,22 @@ async fn request_token(
             .filter(|refresh_token| !refresh_token.trim().is_empty()),
         additional_credentials: HashMap::new(),
     })
+}
+
+fn unusable_token_response(grant_kind: OAuthGrantKind) -> RefreshFailure {
+    if grant_kind == OAuthGrantKind::UserRefreshToken {
+        return RefreshFailure::reauthorize(
+            Status::failed_precondition(
+                "refresh token exchange returned an unusable response; reauthorize the grant",
+            ),
+            "oauth_refresh_exchange_uncertain",
+            None,
+        );
+    }
+    RefreshFailure::investigate(
+        Status::failed_precondition("token endpoint returned invalid JSON"),
+        "oauth_invalid_success_response",
+    )
 }
 
 async fn read_bounded_oauth_error_body(mut response: reqwest::Response) -> Vec<u8> {
@@ -716,7 +737,34 @@ fn classify_oauth_token_error(
         );
     };
 
-    match error_response.error.as_str() {
+    classify_oauth_error_response(status, &error_response, grant_kind).unwrap_or_else(|| {
+        RefreshFailure::investigate(
+            Status::failed_precondition(format!(
+                "token endpoint returned HTTP {status} with an unrecognized OAuth error"
+            )),
+            "oauth_unrecognized_error",
+        )
+    })
+}
+
+/// Classifies a parsed OAuth error response, returning `None` when the error
+/// name is not one the gateway recognizes.
+fn classify_oauth_error_response(
+    status: reqwest::StatusCode,
+    error_response: &OAuthErrorResponse,
+    grant_kind: OAuthGrantKind,
+) -> Option<RefreshFailure> {
+    // Issuer-specific vocabulary is only consulted for errors that arrived in
+    // a 2xx envelope (see `request_token`); RFC 6749 error responses keep the
+    // RFC-only table below so no existing 4xx classification changes.
+    if status.is_success()
+        && let Some(failure) =
+            classify_issuer_token_error(error_response.error.as_str(), grant_kind)
+    {
+        return Some(failure);
+    }
+
+    let failure = match error_response.error.as_str() {
         "invalid_grant" if grant_kind == OAuthGrantKind::UserRefreshToken => {
             let subtype = error_response
                 .error_subtype
@@ -800,13 +848,82 @@ fn classify_oauth_token_error(
             Status::unavailable("OAuth token endpoint reported a temporary failure"),
             "oauth_token_endpoint_retryable",
         ),
-        _ => RefreshFailure::investigate(
-            Status::failed_precondition(format!(
-                "token endpoint returned HTTP {status} with an unrecognized OAuth error"
-            )),
-            "oauth_unrecognized_error",
-        ),
+        _ => return None,
+    };
+    Some(failure)
+}
+
+/// Issuer-specific token endpoint error names (Slack's oauth.v2.access uses
+/// these instead of the RFC 6749 vocabulary). Each group folds onto the
+/// closest RFC failure code so status consumers keep a stable vocabulary; the
+/// issuer's own name is preserved as the provider error subtype.
+const ISSUER_INVALID_GRANT_ERRORS: &[&str] = &[
+    "invalid_refresh_token",
+    "token_revoked",
+    "token_expired",
+    "account_inactive",
+    "invalid_auth",
+];
+const ISSUER_INVALID_CLIENT_ERRORS: &[&str] = &["invalid_client_id", "bad_client_secret"];
+const ISSUER_UNSUPPORTED_GRANT_TYPE_ERRORS: &[&str] = &["invalid_grant_type"];
+const ISSUER_RETRYABLE_ERRORS: &[&str] = &[
+    "ratelimited",
+    "accesslimited",
+    "request_timeout",
+    "service_unavailable",
+    "internal_error",
+    "fatal_error",
+];
+
+fn known_issuer_error(names: &'static [&'static str], error: &str) -> Option<&'static str> {
+    names.iter().copied().find(|name| *name == error)
+}
+
+fn classify_issuer_token_error(error: &str, grant_kind: OAuthGrantKind) -> Option<RefreshFailure> {
+    if let Some(name) = known_issuer_error(ISSUER_INVALID_GRANT_ERRORS, error) {
+        return Some(if grant_kind == OAuthGrantKind::UserRefreshToken {
+            RefreshFailure::reauthorize(
+                Status::failed_precondition(format!(
+                    "OAuth refresh grant is no longer usable ({name}); user reauthorization is required"
+                )),
+                "oauth_invalid_grant",
+                Some(name),
+            )
+        } else {
+            RefreshFailure::fix_configuration_with_subtype(
+                Status::failed_precondition(format!(
+                    "OAuth token endpoint rejected the non-interactive grant ({name})"
+                )),
+                "oauth_invalid_grant",
+                name,
+            )
+        });
     }
+    if let Some(name) = known_issuer_error(ISSUER_INVALID_CLIENT_ERRORS, error) {
+        return Some(RefreshFailure::fix_configuration_with_subtype(
+            Status::failed_precondition(format!(
+                "OAuth token endpoint rejected the client configuration ({name})"
+            )),
+            "oauth_invalid_client",
+            name,
+        ));
+    }
+    if let Some(name) = known_issuer_error(ISSUER_UNSUPPORTED_GRANT_TYPE_ERRORS, error) {
+        return Some(RefreshFailure::fix_configuration_with_subtype(
+            Status::failed_precondition(format!(
+                "OAuth token endpoint rejected the configured grant type ({name})"
+            )),
+            "oauth_unsupported_grant_type",
+            name,
+        ));
+    }
+    if ISSUER_RETRYABLE_ERRORS.contains(&error) {
+        return Some(RefreshFailure::retryable(
+            Status::unavailable("OAuth token endpoint reported a temporary failure"),
+            "oauth_token_endpoint_retryable",
+        ));
+    }
+    None
 }
 
 pub fn refresh_scopes(state: &MintRequest) -> Vec<String> {
@@ -1250,6 +1367,265 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(minted.access_token, "minted-token");
+    }
+
+    #[test]
+    fn issuer_invalid_grant_errors_map_onto_oauth_invalid_grant_by_grant_kind() {
+        for name in [
+            "invalid_refresh_token",
+            "token_revoked",
+            "token_expired",
+            "account_inactive",
+            "invalid_auth",
+        ] {
+            let body = format!(r#"{{"ok":false,"error":"{name}","needed":"chat:write"}}"#);
+
+            let user_failure = classify_oauth_token_error(
+                reqwest::StatusCode::OK,
+                body.as_bytes(),
+                OAuthGrantKind::UserRefreshToken,
+            );
+            assert_eq!(
+                user_failure.recovery_action,
+                ProviderCredentialRefreshRecoveryAction::Reauthorize,
+                "{name}"
+            );
+            assert_eq!(user_failure.failure_code, "oauth_invalid_grant");
+            assert_eq!(user_failure.provider_error_subtype, Some(name));
+            assert_eq!(user_failure.retry_schedule, RefreshRetrySchedule::Parked);
+            assert!(!user_failure.status.message().contains("chat:write"));
+
+            let service_failure = classify_oauth_token_error(
+                reqwest::StatusCode::OK,
+                body.as_bytes(),
+                OAuthGrantKind::NonInteractive,
+            );
+            assert_eq!(
+                service_failure.recovery_action,
+                ProviderCredentialRefreshRecoveryAction::FixConfiguration,
+                "{name}"
+            );
+            assert_eq!(service_failure.failure_code, "oauth_invalid_grant");
+            assert_eq!(service_failure.provider_error_subtype, Some(name));
+            assert_eq!(
+                service_failure.retry_schedule,
+                RefreshRetrySchedule::Configuration
+            );
+        }
+    }
+
+    #[test]
+    fn issuer_error_names_on_rfc_error_responses_stay_unrecognized() {
+        let failure = classify_oauth_token_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            br#"{"error":"token_expired"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Investigate
+        );
+        assert_eq!(failure.failure_code, "oauth_unrecognized_error");
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Short);
+    }
+
+    #[test]
+    fn issuer_client_and_transient_errors_keep_rfc_failure_codes() {
+        let client_failure = classify_oauth_token_error(
+            reqwest::StatusCode::OK,
+            br#"{"ok":false,"error":"bad_client_secret"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            client_failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration
+        );
+        assert_eq!(client_failure.failure_code, "oauth_invalid_client");
+        assert_eq!(
+            client_failure.provider_error_subtype,
+            Some("bad_client_secret")
+        );
+
+        let grant_type_failure = classify_oauth_token_error(
+            reqwest::StatusCode::OK,
+            br#"{"ok":false,"error":"invalid_grant_type"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            grant_type_failure.failure_code,
+            "oauth_unsupported_grant_type"
+        );
+        assert_eq!(
+            grant_type_failure.provider_error_subtype,
+            Some("invalid_grant_type")
+        );
+
+        let transient_failure = classify_oauth_token_error(
+            reqwest::StatusCode::OK,
+            br#"{"ok":false,"error":"ratelimited"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            transient_failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Retry
+        );
+        assert_eq!(
+            transient_failure.failure_code,
+            "oauth_token_endpoint_retryable"
+        );
+        assert_eq!(
+            transient_failure.retry_schedule,
+            RefreshRetrySchedule::Short
+        );
+
+        let unknown_failure = classify_oauth_token_error(
+            reqwest::StatusCode::OK,
+            br#"{"ok":false,"error":"not_a_known_error"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            unknown_failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Investigate
+        );
+        assert_eq!(unknown_failure.failure_code, "oauth_unrecognized_error");
+    }
+
+    async fn request_token_with_200_body(
+        body: serde_json::Value,
+        grant_kind: OAuthGrantKind,
+    ) -> RefreshFailure {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        request_token(
+            &format!("{}/token", mock_server.uri()),
+            &[("grant_type".to_string(), "refresh_token".to_string())],
+            60,
+            grant_kind,
+        )
+        .await
+        .err()
+        .expect("a 2xx body without an access token must fail")
+    }
+
+    #[tokio::test]
+    async fn http_200_ratelimited_error_stays_retryable_instead_of_uncertain() {
+        for grant_kind in [
+            OAuthGrantKind::UserRefreshToken,
+            OAuthGrantKind::NonInteractive,
+        ] {
+            let failure = request_token_with_200_body(
+                serde_json::json!({ "ok": false, "error": "ratelimited" }),
+                grant_kind,
+            )
+            .await;
+            assert_eq!(
+                failure.recovery_action,
+                ProviderCredentialRefreshRecoveryAction::Retry
+            );
+            assert_eq!(failure.failure_code, "oauth_token_endpoint_retryable");
+            assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Short);
+            assert_eq!(failure.status.code(), Code::Unavailable);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_200_invalid_refresh_token_parks_with_issuer_subtype() {
+        let failure = request_token_with_200_body(
+            serde_json::json!({
+                "ok": false,
+                "error": "invalid_refresh_token",
+                "needed": "provider-controlled detail"
+            }),
+            OAuthGrantKind::UserRefreshToken,
+        )
+        .await;
+        assert_eq!(
+            failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Reauthorize
+        );
+        assert_eq!(failure.failure_code, "oauth_invalid_grant");
+        assert_eq!(
+            failure.provider_error_subtype,
+            Some("invalid_refresh_token")
+        );
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Parked);
+        assert!(
+            !failure
+                .status
+                .message()
+                .contains("provider-controlled detail")
+        );
+
+        let service_failure = request_token_with_200_body(
+            serde_json::json!({ "ok": false, "error": "token_revoked" }),
+            OAuthGrantKind::NonInteractive,
+        )
+        .await;
+        assert_eq!(
+            service_failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration
+        );
+        assert_eq!(service_failure.failure_code, "oauth_invalid_grant");
+        assert_eq!(
+            service_failure.provider_error_subtype,
+            Some("token_revoked")
+        );
+        assert_eq!(
+            service_failure.retry_schedule,
+            RefreshRetrySchedule::Configuration
+        );
+    }
+
+    #[tokio::test]
+    async fn http_200_rfc_error_name_is_classified_by_the_rfc_table() {
+        let failure = request_token_with_200_body(
+            serde_json::json!({ "error": "invalid_grant" }),
+            OAuthGrantKind::UserRefreshToken,
+        )
+        .await;
+        assert_eq!(
+            failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Reauthorize
+        );
+        assert_eq!(failure.failure_code, "oauth_invalid_grant");
+        assert_eq!(failure.provider_error_subtype, None);
+    }
+
+    #[tokio::test]
+    async fn unrecognized_http_200_body_keeps_uncertain_exchange_handling() {
+        for body in [
+            serde_json::json!({ "ok": true }),
+            serde_json::json!({ "ok": false, "error": "not_a_known_error" }),
+        ] {
+            let user_failure =
+                request_token_with_200_body(body.clone(), OAuthGrantKind::UserRefreshToken).await;
+            assert_eq!(
+                user_failure.failure_code, "oauth_refresh_exchange_uncertain",
+                "{body}"
+            );
+            assert_eq!(
+                user_failure.recovery_action,
+                ProviderCredentialRefreshRecoveryAction::Reauthorize
+            );
+            assert_eq!(user_failure.retry_schedule, RefreshRetrySchedule::Parked);
+            assert_eq!(user_failure.provider_error_subtype, None);
+
+            let service_failure =
+                request_token_with_200_body(body.clone(), OAuthGrantKind::NonInteractive).await;
+            assert_eq!(
+                service_failure.failure_code, "oauth_invalid_success_response",
+                "{body}"
+            );
+            assert_eq!(
+                service_failure.recovery_action,
+                ProviderCredentialRefreshRecoveryAction::Investigate
+            );
+        }
     }
 
     #[test]
