@@ -158,7 +158,6 @@ impl Keycloak {
                     .kill_on_drop(true)
                     .output()
                     .await
-                    .map_err(|error| Error::from_error(&error))
                     .context("run curl")?;
                 Ok(if output.status.success() {
                     Poll::Ready(())
@@ -186,9 +185,8 @@ impl Keycloak {
         .await
         .context("Keycloak password grant")?;
 
-        let response: Value = serde_json::from_slice(&stdout)
-            .map_err(|error| Error::from_error(&error))
-            .context("decode Keycloak grant response")?;
+        let response: Value =
+            serde_json::from_slice(&stdout).context("decode Keycloak grant response")?;
         let token = |name: &str| {
             response
                 .get(name)
@@ -253,20 +251,14 @@ async fn post_form(url: &str, fields: &[&str], secret: (&str, &str)) -> Result<V
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|error| Error::from_error(&error))
         .context("run curl")?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
     stdin
         .write_all(secret.1.as_bytes())
         .await
-        .map_err(|error| Error::from_error(&error))
         .context("write request body")?;
     drop(stdin);
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| Error::from_error(&error))
-        .context("wait for curl")?;
+    let output = child.wait_with_output().await.context("wait for curl")?;
     testkit::ensure!(
         output.status.success(),
         "POST {url} failed ({}): {}{}",

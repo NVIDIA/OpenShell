@@ -11,7 +11,6 @@
 //! driver created, through the same engine.
 
 use container_engine_support::{Engine, Image};
-use serde_json::Value;
 use testkit::{Context, Error, Result, ResultExt as _};
 
 /// Sandbox condition reason for an image `WORKDIR` the sandbox identity
@@ -87,10 +86,9 @@ USER 2345:2346
                 ),
             )
             .await?;
-        let policy = PolicyFile::new(IMAGE_IDENTITY_POLICY)?;
         let checks = workspace_checks("2345:2346", "/home/app/project", true);
         let sandbox = oci
-            .create_sandbox("pu", &image, Some(policy.path()?), &checks)
+            .create_sandbox("pu", &image, Some(IMAGE_IDENTITY_POLICY), &checks)
             .await?;
         oci.container_checks(&sandbox, &image, "2345:2346").await
     })
@@ -106,13 +104,12 @@ async fn userless_image_uses_default_identity(cx: &mut Context) -> testkit::Resu
         let image = oci
             .build_image("userless", &format!("FROM {}\n", oci.base_image))
             .await?;
-        let policy = PolicyFile::new(IMAGE_IDENTITY_POLICY)?;
         let checks = format!(
             "{} test \"$(id -G)\" = 1000;",
             workspace_checks("1000:1000", "/sandbox", false)
         );
         let sandbox = oci
-            .create_sandbox("ud", &image, Some(policy.path()?), &checks)
+            .create_sandbox("ud", &image, Some(IMAGE_IDENTITY_POLICY), &checks)
             .await?;
         oci.container_checks(&sandbox, &image, "1000:1000").await
     })
@@ -137,19 +134,19 @@ USER root
                 ),
             )
             .await?;
-        let policy = PolicyFile::new(&format!(
+        let policy = format!(
             "{IMAGE_IDENTITY_POLICY}
 process:
   run_as_user: \"4234\"
   run_as_group: \"4235\"
 "
-        ))?;
+        );
         let checks = format!(
             "{} test \"$(id -G)\" = 4235;",
             workspace_checks("4234:4235", "/sandbox", false)
         );
         let sandbox = oci
-            .create_sandbox("pr", &image, Some(policy.path()?), &checks)
+            .create_sandbox("pr", &image, Some(&policy), &checks)
             .await?;
         oci.container_checks(&sandbox, &image, "4234:4235").await
     })
@@ -198,22 +195,12 @@ USER app
                     ),
                 )
                 .await?;
-            let name = oci.track(suffix);
-            let create = oci
-                .cx
-                .cli([
-                    "sandbox",
-                    "create",
-                    "--name",
-                    &name,
-                    "--from",
-                    &image.tag,
-                    "--no-tty",
-                    "--",
-                    "sh",
-                    "-c",
-                    "echo workspace-access-marker",
-                ])
+            let builder = oci.cx.cli_sandbox(suffix);
+            let name = builder.name().to_string();
+            let create = builder
+                .image(&image.tag)
+                .command(["sh", "-c", "echo workspace-access-marker"])
+                .run()
                 .await?;
             if writable {
                 let create = create
@@ -238,12 +225,7 @@ USER app
             );
             // Require the condition reason, so another provisioning failure
             // cannot pass as a workspace rejection.
-            let sandbox: Value = oci
-                .cx
-                .cli(["sandbox", "get", &name, "--output", "json"])
-                .await?
-                .success()?
-                .json()?;
+            let sandbox = oci.cx.adopt(&name).await?.get_json().await?;
             let reasons: Vec<&str> = sandbox["conditions"]
                 .as_array()
                 .into_iter()
@@ -278,27 +260,12 @@ async fn run(cx: &Context, test: impl AsyncFnOnce(&Oci<'_>) -> Result) -> Result
 }
 
 impl Oci<'_> {
-    /// Build `containerfile` with a tag unique to this run, and remove the
-    /// image when the test ends. Cleanup runs last registered first, so the
-    /// sandboxes created from the image are deleted before it is removed.
+    /// Build `containerfile` as a test image named `oci-<name>`, removed when
+    /// the test ends.
     async fn build_image(&self, name: &str, containerfile: &str) -> Result<Image> {
-        let tag = format!("localhost/openshell-test-oci-{name}:{}", self.cx.run_id());
-        self.engine.build_image(&tag, containerfile).await?;
-        let (engine, built) = (self.engine.clone(), tag.clone());
-        self.cx
-            .on_cleanup(format!("remove image {tag}"), async move || {
-                engine.remove_image(&built).await
-            });
-        self.engine.image(&tag).await
-    }
-
-    /// Name a sandbox for this test and register it for cleanup. Sandbox
-    /// names are limited to 19 characters on some drivers, so keep `short`
-    /// to a few characters.
-    fn track(&self, short: &str) -> String {
-        let name = self.cx.name(short);
-        self.cx.track(&name);
-        name
+        self.engine
+            .build_test_image(self.cx, &format!("oci-{name}"), containerfile)
+            .await
     }
 
     /// Create a detached sandbox whose main process runs `checks` and writes
@@ -311,21 +278,21 @@ impl Oci<'_> {
         policy: Option<&str>,
         checks: &str,
     ) -> Result<String> {
-        let name = self.track(short);
         let main = format!(
             "(set -eu; {checks} touch main-write) >/tmp/oci-main.log 2>&1; \
              echo $? >/tmp/oci-main.status; exec sleep infinity"
         );
-        let mut args = vec!["sandbox", "create", "--name", &name, "--from", &image.tag];
+        let mut builder = self.cx.cli_sandbox(short).image(&image.tag);
         if let Some(policy) = policy {
-            args.extend(["--policy", policy]);
+            builder = builder.policy_yaml(policy);
         }
-        args.extend(["--detach", "--", "sh", "-c", &main]);
-        self.cx
-            .cli(args)
-            .await?
-            .success()
-            .context("sandbox starts from the test image")?;
+        let name = builder
+            .command(["sh", "-c", &main])
+            .create()
+            .await
+            .context("sandbox starts from the test image")?
+            .name()
+            .to_string();
 
         let script = format!(
             "set -eu; i=0; \
@@ -346,9 +313,7 @@ impl Oci<'_> {
 
     /// Upload and download default to paths relative to the image workspace.
     async fn file_transfer_uses_workspace(&self, sandbox: &str) -> Result {
-        let local = tempfile::tempdir()
-            .map_err(|error| Error::from_error(&error))
-            .context("create temp dir")?;
+        let local = tempfile::tempdir().context("create temp dir")?;
         let upload = local.path().join("oci-transfer.txt");
         write(&upload, "oci-transfer-ok")?;
         self.cx
@@ -381,9 +346,7 @@ impl Oci<'_> {
             .await?
             .success()
             .context("download resolves relative paths in the workspace")?;
-        let downloaded = std::fs::read_to_string(&download)
-            .map_err(|error| Error::from_error(&error))
-            .context("read download")?;
+        let downloaded = std::fs::read_to_string(&download).context("read download")?;
         testkit::ensure!(
             downloaded == "oci-transfer-ok",
             "downloaded file has unexpected content: {downloaded:?}"
@@ -391,9 +354,7 @@ impl Oci<'_> {
 
         // A directory upload merges into an existing workspace directory.
         let merge = local.path().join("merge-upload");
-        std::fs::create_dir(&merge)
-            .map_err(|error| Error::from_error(&error))
-            .context("create merge dir")?;
+        std::fs::create_dir(&merge).context("create merge dir")?;
         write(&merge.join("conflict.txt"), "local-conflict")?;
         write(&merge.join("added.txt"), "local-added")?;
         self.exec(
@@ -527,27 +488,8 @@ fn workspace_checks(identity: &str, workspace: &str, image_file: bool) -> String
     checks
 }
 
-/// A sandbox policy written to a temporary file for `sandbox create --policy`.
-struct PolicyFile(tempfile::NamedTempFile);
-
-impl PolicyFile {
-    fn new(contents: &str) -> Result<Self> {
-        let file = tempfile::NamedTempFile::new()
-            .map_err(|error| Error::from_error(&error))
-            .context("create policy file")?;
-        write(file.path(), contents)?;
-        Ok(Self(file))
-    }
-
-    fn path(&self) -> Result<&str> {
-        utf8(self.0.path())
-    }
-}
-
 fn write(path: &std::path::Path, contents: &str) -> Result {
-    std::fs::write(path, contents)
-        .map_err(|error| Error::from_error(&error))
-        .context(format!("write {}", path.display()))
+    std::fs::write(path, contents).context(format!("write {}", path.display()))
 }
 
 fn utf8(path: &std::path::Path) -> Result<&str> {

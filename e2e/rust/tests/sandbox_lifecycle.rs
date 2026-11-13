@@ -9,9 +9,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use openshell_e2e::harness::binary::{openshell_cmd, openshell_tty_cmd};
-use openshell_e2e::harness::cli::{
-    run_cli, wait_for_sandbox_exec_contains, wait_for_sandbox_phase,
-};
+use openshell_e2e::harness::cli::{run_cli, wait_for_sandbox_exec_contains};
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
 use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard, unique_sandbox_name};
 use serial_test::serial;
@@ -112,28 +110,6 @@ async fn delete_sandbox(name: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let _ = cmd.status().await;
-}
-
-#[tokio::test]
-#[serial(sandbox_lifecycle)]
-async fn sandbox_exec_outlives_startup_recovery_deadline() {
-    let mut sandbox = SandboxGuard::create(&[])
-        .await
-        .expect("create sandbox for exec recovery deadline");
-    let output = tokio::time::timeout(
-        Duration::from_secs(60),
-        sandbox.exec(&["sh", "-c", "sleep 31; printf past-recovery-deadline"]),
-    )
-    .await;
-    let next = sandbox.exec(&["printf", "fresh-exec"]).await;
-    sandbox.cleanup().await;
-
-    assert_eq!(
-        output.expect("exec timed out").expect("exec failed"),
-        "past-recovery-deadline",
-        "expiration must not terminate an admitted command"
-    );
-    assert_eq!(next.expect("fresh exec after expiration"), "fresh-exec");
 }
 
 #[tokio::test]
@@ -387,39 +363,6 @@ async fn piped_exec_stdin_crosses_grpc_message_limit() {
     sandbox.cleanup().await;
 }
 
-async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
-    let mut cmd = openshell_cmd();
-    cmd.args(["sandbox", operation, name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = cmd
-        .output()
-        .await
-        .unwrap_or_else(|error| panic!("spawn openshell sandbox {operation}: {error}"));
-    let combined = normalize_output(&format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    ));
-    assert!(
-        output.status.success(),
-        "sandbox {operation} should succeed (exit {:?}):\n{combined}",
-        output.status.code(),
-    );
-    combined
-}
-
-async fn sandbox_details(name: &str) -> String {
-    let (details, exit_code) = run_cli(&["sandbox", "get", name]).await;
-    let details = normalize_output(&details);
-    assert_eq!(
-        exit_code, 0,
-        "sandbox get should succeed for {name}:\n{details}"
-    );
-    details
-}
-
 async fn reconnect_with_input_ownership(
     sandbox_name: &str,
 ) -> (tokio::process::Child, Vec<String>) {
@@ -549,125 +492,6 @@ async fn wait_for_process_with_args(expected_args: &[&str]) -> u32 {
 
 #[tokio::test]
 #[serial(sandbox_lifecycle)]
-async fn sandbox_stop_start_preserves_workspace() {
-    const SENTINEL: &str = "openshell-stop-start-sentinel";
-    const SENTINEL_PATH: &str = "/sandbox/.openshell-stop-start-e2e";
-    const RUN_COUNT_PATH: &str = "/sandbox/.openshell-main-run-count";
-    let write_sentinel = format!("printf '%s\\n' '{SENTINEL}' > '{SENTINEL_PATH}'");
-    let main = format!(
-        "count=0; test ! -f '{RUN_COUNT_PATH}' || count=$(cat '{RUN_COUNT_PATH}'); \
-         count=$((count + 1)); printf '%s\\n' \"$count\" > '{RUN_COUNT_PATH}'; \
-         echo lifecycle-ready-$count; exec sleep infinity"
-    );
-
-    let mut sandbox = SandboxGuard::create_keep(&["sh", "-c", &main], "lifecycle-ready")
-        .await
-        .expect("sandbox create should start a durable main process");
-    sandbox
-        .exec(&["sh", "-lc", &write_sentinel])
-        .await
-        .expect("sandbox exec should write the workspace sentinel");
-
-    let stop_output = run_sandbox_lifecycle_command("stop", &sandbox.name).await;
-    assert!(
-        stop_output.contains("Stopped sandbox"),
-        "expected stop confirmation in:\n{stop_output}",
-    );
-
-    let mut exec_cmd = openshell_cmd();
-    exec_cmd
-        .args([
-            "sandbox",
-            "exec",
-            "--name",
-            &sandbox.name,
-            "--no-tty",
-            "--",
-            "cat",
-            SENTINEL_PATH,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let stopped_exec = exec_cmd
-        .output()
-        .await
-        .expect("spawn openshell sandbox exec while stopped");
-    assert!(
-        !stopped_exec.status.success(),
-        "sandbox exec should fail while stopped"
-    );
-
-    let start_output = run_sandbox_lifecycle_command("start", &sandbox.name).await;
-    assert!(
-        start_output.contains("Started sandbox"),
-        "expected start confirmation in:\n{start_output}",
-    );
-
-    let sentinel = sandbox
-        .exec(&["cat", SENTINEL_PATH])
-        .await
-        .expect("sandbox exec should succeed after start");
-    assert!(
-        sentinel.lines().any(|line| line.trim() == SENTINEL),
-        "workspace sentinel should survive stop and start:\n{sentinel}",
-    );
-    let run_count = sandbox
-        .exec(&["cat", RUN_COUNT_PATH])
-        .await
-        .expect("sandbox exec should read the canonical main run count");
-    assert_eq!(
-        run_count.trim(),
-        "2",
-        "start should launch a fresh canonical main instance:\n{run_count}",
-    );
-
-    sandbox.cleanup().await;
-}
-
-#[tokio::test]
-#[serial(sandbox_lifecycle)]
-async fn sandbox_can_be_deleted_while_stopped() {
-    let mut sandbox = SandboxGuard::create_keep(
-        &["sh", "-c", "echo stop-ready; exec sleep infinity"],
-        "stop-ready",
-    )
-    .await
-    .expect("sandbox create should start a durable main process");
-
-    let stop_output = run_sandbox_lifecycle_command("stop", &sandbox.name).await;
-    assert!(
-        stop_output.contains("Stopped sandbox"),
-        "expected stop confirmation in:\n{stop_output}",
-    );
-
-    let delete_output = run_sandbox_lifecycle_command("delete", &sandbox.name).await;
-    // Deletion may return before the owned cleanup worker finishes. Both
-    // outcomes must still reach absence, which is checked below.
-    assert!(
-        delete_output.contains(&format!("Deleted sandbox {}", sandbox.name))
-            || delete_output.contains(&format!(
-                "Sandbox {} deletion accepted; cleanup is pending",
-                sandbox.name
-            )),
-        "expected completed or accepted deletion in:\n{delete_output}",
-    );
-
-    if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox.name, false).await {
-        sandbox.cleanup().await;
-        panic!(
-            "stopped sandbox {} should be deleted without starting after \
-             {SANDBOX_PRESENCE_TIMEOUT:?}; last observed sandbox list: {last_sandbox_list:?}",
-            sandbox.name,
-        );
-    }
-
-    // Mark the guard cleaned up. Its idempotent delete is harmless now that
-    // the lifecycle operation above has removed the sandbox.
-    sandbox.cleanup().await;
-}
-
-#[tokio::test]
-#[serial(sandbox_lifecycle)]
 async fn canonical_main_exit_zero_completes_persistent_sandbox() {
     // Armed before create so a failed create or parse still cleans up.
     let sandbox_name = unique_sandbox_name();
@@ -777,166 +601,6 @@ async fn canonical_main_nonzero_exit_preserves_status() {
         details.contains("Exit Code: 7"),
         "missing exit code:\n{details}"
     );
-}
-
-#[tokio::test]
-#[serial(sandbox_lifecycle)]
-async fn detached_canonical_main_exit_zero_reaches_completed() {
-    const RELEASE_PATH: &str = "/sandbox/.openshell-detached-success-release";
-    let script = format!("while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 0");
-    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
-        .await
-        .expect("create detached successful canonical main");
-    sandbox
-        .exec(&["touch", RELEASE_PATH])
-        .await
-        .expect("release detached successful canonical main");
-
-    wait_for_sandbox_phase(&sandbox.name, "Completed", SANDBOX_PRESENCE_TIMEOUT)
-        .await
-        .unwrap_or_else(|err| panic!("detached successful main did not complete:\n{err}"));
-    let details = sandbox_details(&sandbox.name).await;
-    assert!(
-        details.contains("Phase: Completed"),
-        "detached successful main should retain Completed status:\n{details}"
-    );
-
-    sandbox.cleanup().await;
-}
-
-#[tokio::test]
-#[serial(sandbox_lifecycle)]
-async fn detached_canonical_main_nonzero_exit_reaches_error() {
-    const RELEASE_PATH: &str = "/sandbox/.openshell-detached-failure-release";
-    let script = format!("while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 11");
-    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
-        .await
-        .expect("create detached failing canonical main");
-    sandbox
-        .exec(&["touch", RELEASE_PATH])
-        .await
-        .expect("release detached failing canonical main");
-
-    wait_for_sandbox_phase(&sandbox.name, "Error", SANDBOX_PRESENCE_TIMEOUT)
-        .await
-        .unwrap_or_else(|err| panic!("detached failing main did not reach Error:\n{err}"));
-    let details = sandbox_details(&sandbox.name).await;
-    assert!(
-        details.contains("Phase: Error") && details.contains("Exit Code: 11"),
-        "detached failing main should retain its terminal result:\n{details}"
-    );
-
-    sandbox.cleanup().await;
-}
-
-#[tokio::test]
-#[serial(sandbox_lifecycle)]
-async fn canonical_main_and_exec_receive_declared_environment() {
-    for mode in ["--tty", "--no-tty"] {
-        let script = r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}"; while true; do sleep 1; done"#;
-        let mut sandbox = SandboxGuard::create_keep_with_args(
-            &[
-                mode,
-                "--no-auto-providers",
-                "--env",
-                "REPRO_SENTINEL=present",
-            ],
-            &["sh", "-c", script],
-            "declared_env=",
-        )
-        .await
-        .expect("create canonical process with declared environment");
-        let initial = normalize_output(&sandbox.create_output);
-        let later = sandbox
-            .exec(&[
-                "sh",
-                "-c",
-                r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}""#,
-            ])
-            .await;
-        sandbox.cleanup().await;
-
-        assert!(
-            initial.lines().any(|line| line == "declared_env=present"),
-            "initial process must receive declared environment ({mode}): {initial}"
-        );
-        let later = normalize_output(&later.expect("exec environment probe"));
-        assert!(
-            later.lines().any(|line| line == "declared_env=present"),
-            "exec must receive the same declared environment ({mode}): {later}"
-        );
-    }
-}
-
-#[tokio::test]
-#[serial(sandbox_lifecycle)]
-async fn detached_main_exit_during_provisioning_is_classified_as_workload_result() {
-    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", "exit 11"])
-        .await
-        .expect("fast detached main exit should not be reported as a provisioning failure");
-
-    wait_for_sandbox_phase(&sandbox.name, "Error", SANDBOX_PRESENCE_TIMEOUT)
-        .await
-        .unwrap_or_else(|err| panic!("fast detached main did not reach Error:\n{err}"));
-
-    let mut get_cmd = openshell_cmd();
-    get_cmd
-        .args(["sandbox", "get", &sandbox.name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let get_output = get_cmd.output().await.expect("spawn openshell sandbox get");
-    let details = normalize_output(&format!(
-        "{}{}",
-        String::from_utf8_lossy(&get_output.stdout),
-        String::from_utf8_lossy(&get_output.stderr),
-    ));
-    assert!(
-        get_output.status.success(),
-        "sandbox get failed:\n{details}"
-    );
-    assert!(
-        details.contains("Phase: Error") && details.contains("Exit Code: 11"),
-        "fast detached main should retain its workload result:\n{details}"
-    );
-
-    sandbox.cleanup().await;
-}
-
-#[tokio::test]
-#[serial(sandbox_lifecycle)]
-async fn canonical_tty_main_uses_sandbox_environment() {
-    let script = r#"printf 'canonical_env home=%s user=%s term=%s\n' "$HOME" "$USER" "$TERM"; while true; do sleep 1; done"#;
-    let mut sandbox =
-        SandboxGuard::create_keep_with_args(&["--tty"], &["sh", "-lc", script], "canonical_env")
-            .await
-            .expect("create canonical TTY process");
-
-    let output = normalize_output(&sandbox.create_output);
-    let environment = output
-        .lines()
-        .find(|line| line.contains("canonical_env"))
-        .expect("canonical environment output");
-    let field = |name: &str| {
-        environment
-            .split_whitespace()
-            .find_map(|value| value.strip_prefix(&format!("{name}=")))
-            .unwrap_or_default()
-    };
-
-    assert!(
-        !field("home").is_empty() && field("home") != "/root",
-        "canonical process must not inherit the supervisor HOME: {environment}"
-    );
-    assert!(
-        !field("user").is_empty(),
-        "canonical process USER must identify the sandbox user: {environment}"
-    );
-    assert!(
-        !field("term").is_empty() && field("term") != "dumb",
-        "canonical TTY process must receive a usable TERM: {environment}"
-    );
-
-    sandbox.cleanup().await;
 }
 
 #[tokio::test]
@@ -1300,95 +964,6 @@ async fn canonical_main_exit_255_is_not_retried_as_transport_failure() {
 }
 
 #[tokio::test]
-#[serial(sandbox_lifecycle)]
-async fn on_failure_policy_replaces_runtime_and_preserves_workspace() {
-    const SCRIPT: &str = r#"
-marker=/sandbox/.openshell-restart-e2e
-if [ -e "$marker" ]; then
-  printf 'replacement-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/replacement-run
-  sleep 300
-else
-  touch "$marker"
-  printf 'initial-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/initial-run
-  while [ ! -e /sandbox/.openshell-restart-release ]; do sleep 0.05; done
-  exit 17
-fi
-"#;
-
-    let mut sandbox = SandboxGuard::manage_existing(unique_sandbox_name());
-    let (output, exit_code) = run_cli(&[
-        "sandbox",
-        "create",
-        "--name",
-        &sandbox.name,
-        "--from",
-        E2E_WORKLOAD_IMAGE,
-        "--detach",
-        "--restart-policy",
-        "on-failure",
-        "--",
-        "sh",
-        "-lc",
-        SCRIPT,
-    ])
-    .await;
-    assert_eq!(
-        exit_code, 0,
-        "create sandbox with OnFailure policy: {output}"
-    );
-    wait_for_sandbox_exec_contains(
-        &sandbox.name,
-        &["cat", "/sandbox/initial-run"],
-        "initial-",
-        SANDBOX_RESTART_TIMEOUT,
-    )
-    .await
-    .expect("initial main process should write its workspace marker");
-
-    let initial_details = sandbox_details(&sandbox.name).await;
-    let initial_instance = extract_field(&initial_details, "Main process instance")
-        .expect("initial main process instance");
-    sandbox
-        .exec(&["touch", "/sandbox/.openshell-restart-release"])
-        .await
-        .expect("release initial main process");
-
-    let deadline = Instant::now() + SANDBOX_RESTART_TIMEOUT;
-    let mut last_runs = Err("replacement is not ready".to_string());
-    let final_details = loop {
-        let details = sandbox_details(&sandbox.name).await;
-        let replacement_instance = extract_field(&details, "Main process instance")
-            .is_some_and(|instance| instance != "-" && instance != initial_instance);
-        if details.contains("Phase: Ready")
-            && extract_field(&details, "Restart count").as_deref() == Some("1")
-            && replacement_instance
-        {
-            last_runs = sandbox
-                .exec(&["cat", "/sandbox/initial-run", "/sandbox/replacement-run"])
-                .await;
-            if let Ok(runs) = &last_runs
-                && runs.contains("initial-")
-                && runs.contains("replacement-")
-            {
-                break details;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "sandbox did not complete its policy-driven restart within \
-             {SANDBOX_RESTART_TIMEOUT:?}; last details:\n{details}\nworkspace: {last_runs:?}"
-        );
-        sleep(Duration::from_millis(250)).await;
-    };
-
-    assert!(
-        final_details.contains("Restart policy: on-failure"),
-        "restart policy should remain visible after replacement:\n{final_details}"
-    );
-    sandbox.cleanup().await;
-}
-
-#[tokio::test]
 async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
     let name = format!("tty-{:015x}", rand::random::<u64>() & 0x0fff_ffff_ffff_ffff);
     // Capture startup diagnostics before --no-keep removes a failed container.
@@ -1512,4 +1087,106 @@ async fn sandbox_create_with_no_keep_preserves_failure_then_cleans_up() {
              {SANDBOX_PRESENCE_TIMEOUT:?}; last observed sandbox list: {last_sandbox_list:?}"
         );
     }
+}
+
+async fn sandbox_details(name: &str) -> String {
+    let (details, exit_code) = run_cli(&["sandbox", "get", name]).await;
+    let details = normalize_output(&details);
+    assert_eq!(
+        exit_code, 0,
+        "sandbox get should succeed for {name}:\n{details}"
+    );
+    details
+}
+
+// The conformance suite has no counterpart for this test: on the VM driver the
+// replacement never starts (https://github.com/NVIDIA/OpenShell/issues/5507),
+// and the legacy lanes that run this file are Docker and Kubernetes.
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn on_failure_policy_replaces_runtime_and_preserves_workspace() {
+    const SCRIPT: &str = r#"
+marker=/sandbox/.openshell-restart-e2e
+if [ -e "$marker" ]; then
+  printf 'replacement-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/replacement-run
+  sleep 300
+else
+  touch "$marker"
+  printf 'initial-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/initial-run
+  while [ ! -e /sandbox/.openshell-restart-release ]; do sleep 0.05; done
+  exit 17
+fi
+"#;
+
+    let mut sandbox = SandboxGuard::manage_existing(unique_sandbox_name());
+    let (output, exit_code) = run_cli(&[
+        "sandbox",
+        "create",
+        "--name",
+        &sandbox.name,
+        "--from",
+        E2E_WORKLOAD_IMAGE,
+        "--detach",
+        "--restart-policy",
+        "on-failure",
+        "--",
+        "sh",
+        "-lc",
+        SCRIPT,
+    ])
+    .await;
+    assert_eq!(
+        exit_code, 0,
+        "create sandbox with OnFailure policy: {output}"
+    );
+    wait_for_sandbox_exec_contains(
+        &sandbox.name,
+        &["cat", "/sandbox/initial-run"],
+        "initial-",
+        SANDBOX_RESTART_TIMEOUT,
+    )
+    .await
+    .expect("initial main process should write its workspace marker");
+
+    let initial_details = sandbox_details(&sandbox.name).await;
+    let initial_instance = extract_field(&initial_details, "Main process instance")
+        .expect("initial main process instance");
+    sandbox
+        .exec(&["touch", "/sandbox/.openshell-restart-release"])
+        .await
+        .expect("release initial main process");
+
+    let deadline = Instant::now() + SANDBOX_RESTART_TIMEOUT;
+    let mut last_runs = Err("replacement is not ready".to_string());
+    let final_details = loop {
+        let details = sandbox_details(&sandbox.name).await;
+        let replacement_instance = extract_field(&details, "Main process instance")
+            .is_some_and(|instance| instance != "-" && instance != initial_instance);
+        if details.contains("Phase: Ready")
+            && extract_field(&details, "Restart count").as_deref() == Some("1")
+            && replacement_instance
+        {
+            last_runs = sandbox
+                .exec(&["cat", "/sandbox/initial-run", "/sandbox/replacement-run"])
+                .await;
+            if let Ok(runs) = &last_runs
+                && runs.contains("initial-")
+                && runs.contains("replacement-")
+            {
+                break details;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sandbox did not complete its policy-driven restart within \
+             {SANDBOX_RESTART_TIMEOUT:?}; last details:\n{details}\nworkspace: {last_runs:?}"
+        );
+        sleep(Duration::from_millis(250)).await;
+    };
+
+    assert!(
+        final_details.contains("Restart policy: on-failure"),
+        "restart policy should remain visible after replacement:\n{final_details}"
+    );
+    sandbox.cleanup().await;
 }

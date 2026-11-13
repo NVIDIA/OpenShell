@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use testkit::{Error, Result, ResultExt as _};
+use testkit::{Context, Error, Result, ResultExt as _};
 use tokio::process::Command;
 
 pub const ENGINE_ENV: &str = "OPENSHELL_TEST_CONTAINER_ENGINE";
@@ -64,17 +64,11 @@ impl Engine {
         Ok(Self { command })
     }
 
-    /// Build `containerfile` as `tag`. The build context is empty. Remove
-    /// the image with [`Engine::remove_image`], for example in a cleanup
-    /// hook registered right after the build.
-    pub async fn build_image(&self, tag: &str, containerfile: &str) -> Result {
-        let context = tempfile::tempdir()
-            .map_err(|error| Error::from_error(&error))
-            .context("create build context")?;
+    /// Build `containerfile` as `tag`. The build context is empty.
+    async fn build_image(&self, tag: &str, containerfile: &str) -> Result {
+        let context = tempfile::tempdir().context("create build context")?;
         let file = context.path().join("Containerfile");
-        std::fs::write(&file, containerfile)
-            .map_err(|error| Error::from_error(&error))
-            .context("write Containerfile")?;
+        std::fs::write(&file, containerfile).context("write Containerfile")?;
         self.output([
             "build",
             "--file",
@@ -85,6 +79,25 @@ impl Engine {
         ])
         .await
         .map(drop)
+    }
+
+    /// Build `containerfile` as `localhost/openshell-test-<name>:<run id>`
+    /// and remove the image when the test ends. Cleanup runs last registered
+    /// first, so sandboxes created from the image afterwards are deleted
+    /// before it is removed.
+    pub async fn build_test_image(
+        &self,
+        cx: &Context,
+        name: &str,
+        containerfile: &str,
+    ) -> Result<Image> {
+        let tag = format!("localhost/openshell-test-{name}:{}", cx.run_id());
+        self.build_image(&tag, containerfile).await?;
+        let (engine, built) = (self.clone(), tag.clone());
+        cx.on_cleanup(format!("remove image {tag}"), async move || {
+            engine.remove_image(&built).await
+        });
+        self.image(&tag).await
     }
 
     /// Image `tag` and the ID it has now.
@@ -157,7 +170,6 @@ impl Engine {
             .kill_on_drop(true)
             .output()
             .await
-            .map_err(|error| Error::from_error(&error))
             .context(format!("run {command}"))?;
         testkit::ensure!(
             output.status.success(),

@@ -300,12 +300,10 @@ fn load(name: &str) -> Result<Scenario> {
             "{SCENARIOS_ENV} is not set; the environment must publish the scenario expectations"
         ))
     })?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(Error::from_display)
-        .context(format!("read scenario expectations {path}"))?;
-    let document: Value = serde_json::from_str(&text)
-        .map_err(Error::from_display)
-        .context(format!("parse scenario expectations {path}"))?;
+    let text =
+        std::fs::read_to_string(&path).context(format!("read scenario expectations {path}"))?;
+    let document: Value =
+        serde_json::from_str(&text).context(format!("parse scenario expectations {path}"))?;
     scenario_expectations(&document, name)
 }
 
