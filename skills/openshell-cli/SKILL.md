@@ -36,6 +36,7 @@ Use `openshell --help` and nested `--help` output as the authority for the insta
 
 - [Manage gateways](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/overview)
 - [Manage sandboxes](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview)
+- [Child sandboxes](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/child-sandboxes)
 - [Manage providers](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview)
 - [Profiles](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles)
 - [Sandbox policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview)
@@ -388,6 +389,30 @@ Template `--image` accepts an OCI image reference. If omitted, the gateway
 applies its default sandbox image when creating a sandbox from the template.
 Create-time policy, providers, labels, uploads, forwarding, editor launch, and
 the initial command stay on `sandbox create`.
+
+### Create child sandboxes (experimental)
+
+Needs `experimental_enable_child_sandboxes` on the gateway. A child is created
+under a root, uses the root's policy, and can use only the root's providers;
+a child cannot have children.
+
+```bash
+openshell sandbox create --name reviewer --parent lead --provider anthropic
+openshell sandbox list --parent lead
+openshell sandbox delete reviewer   # delete children before their parent
+openshell sandbox delete lead
+```
+
+Do not pass `--policy` with `--parent`; change the parent's policy instead. A
+provider the parent lacks is refused. `sandbox list` shows a `PARENT` column
+when the page holds a child.
+
+### Serve the sandbox tools to an MCP client (experimental)
+
+`openshell mcp serve` runs a local MCP server over stdio that forwards tool
+calls to the active gateway with the CLI login, acting in `--workspace`. Add it
+to the MCP client's configuration as the command `openshell mcp serve`. Its
+stdout carries only MCP messages; diagnostics go to stderr.
 
 ### List and inspect sandboxes
 

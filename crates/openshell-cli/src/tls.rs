@@ -337,6 +337,22 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         .into_diagnostic()
 }
 
+/// Build the SDK client itself. With `refresh`, an OIDC login is refreshed
+/// for as long as the client lives, not only when the command starts.
+pub async fn sdk_client(
+    server: &str,
+    tls: &TlsOptions,
+    refresh: Option<std::sync::Arc<dyn openshell_sdk::Refresh>>,
+) -> Result<OpenShellClient> {
+    let mut config = sdk_client_config(server, tls)?;
+    if let (Some(refresher), Some(AuthConfig::Oidc { refresh, .. })) = (refresh, &mut config.auth) {
+        *refresh = Some(refresher);
+    }
+    Box::pin(OpenShellClient::connect(config))
+        .await
+        .into_diagnostic()
+}
+
 /// Build the SDK client and return its raw gRPC escape hatch.
 ///
 /// The returned client carries a [`GatewayInterceptor`] that injects

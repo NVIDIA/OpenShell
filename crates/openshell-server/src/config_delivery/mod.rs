@@ -1474,6 +1474,142 @@ mod tests {
         assert!(!rejected.configuration_error.is_empty());
     }
 
+    /// Store `version` of a policy for `sandbox_id` as loaded.
+    async fn put_loaded_policy(state: &ServerState, sandbox_id: &str, version: i64, host: &str) {
+        use crate::policy_store::PolicyStoreExt as _;
+        use prost::Message as _;
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "api".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "api".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: host.to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        state
+            .store
+            .put_policy_revision(
+                &uuid::Uuid::new_v4().to_string(),
+                sandbox_id,
+                "default",
+                version,
+                &policy.encode_to_vec(),
+                &crate::grpc::policy::deterministic_policy_hash(&policy),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .update_policy_status(sandbox_id, version, "loaded", None, Some(1))
+            .await
+            .unwrap();
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        sandbox.set_current_policy_version(u32::try_from(version).unwrap());
+        state.store.put_message(&sandbox).await.unwrap();
+    }
+
+    /// Receive the next configuration update and acknowledge it, as a
+    /// supervisor does before it is sent another.
+    async fn next_applied_config(
+        harness: &mut SupervisorStreamHarness,
+        what: &str,
+    ) -> SandboxConfigSnapshot {
+        let message = next_update(harness, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|| panic!("{what}"));
+        let Some(gateway_message::Payload::ConfigUpdate(update)) = message.payload else {
+            panic!("expected a configuration update: {what}");
+        };
+        harness
+            .outbound
+            .send(openshell_core::proto::SupervisorMessage {
+                payload: Some(
+                    openshell_core::proto::supervisor_message::Payload::ConfigUpdateResult(
+                        session::applied_result(&update),
+                    ),
+                ),
+            })
+            .await
+            .unwrap();
+        update.sandbox_config.expect("sandbox configuration")
+    }
+
+    #[tokio::test]
+    async fn a_child_behind_its_parent_is_pushed_not_admitted_until_its_copy_lands() {
+        let state = push_state().await;
+        put_sandbox(&state, "lead", &[]).await;
+        put_loaded_policy(&state, "lead", 1, "v1.example.com").await;
+        let worker = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "worker".into(),
+                name: "worker".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec::default()),
+            parent: Some(openshell_core::proto::SandboxParent {
+                name: "lead".into(),
+                id: "lead".into(),
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&worker).await.unwrap();
+        // Every child sync takes the parent's lock; connecting does not.
+        let child_lock = || {
+            state
+                .compute
+                .mutation_guard(crate::compute::MutationScope::sandbox("default", "lead"))
+        };
+
+        // The child has no copy yet. Holding the parent's lock keeps the sync
+        // that connecting starts from landing before the bootstrap is built.
+        let guard = child_lock().await.unwrap();
+        let (mut harness, _, bootstrap) = accepted_session_with_bootstrap(&state, "worker").await;
+        let bootstrap = bootstrap.expect("push bootstrap");
+        let config = bootstrap.sandbox_config.expect("sandbox configuration");
+        assert!(!config.configuration_admitted, "the bootstrap refuses it");
+        assert!(
+            config.configuration_error.contains("Waiting for a copy"),
+            "{}",
+            config.configuration_error
+        );
+
+        // Once the copy lands, the sync pushes an admitted configuration.
+        drop(guard);
+        let admitted = next_applied_config(&mut harness, "update after the copy").await;
+        assert!(admitted.configuration_admitted);
+
+        // The parent loads a new version that no sync has copied: a push
+        // republish refuses the child again.
+        let guard = child_lock().await.unwrap();
+        put_loaded_policy(&state, "lead", 2, "v2.example.com").await;
+        publish_sandbox(&state, "worker");
+        let refused = next_applied_config(&mut harness, "update after the parent's change").await;
+        assert!(!refused.configuration_admitted);
+        drop(guard);
+        let admitted = next_applied_config(&mut harness, "update after the second copy").await;
+        assert!(admitted.configuration_admitted);
+        assert!(
+            admitted
+                .policy
+                .expect("policy")
+                .network_policies
+                .values()
+                .any(|rule| rule.endpoints.iter().any(|e| e.host == "v2.example.com"))
+        );
+    }
+
     #[tokio::test]
     async fn provider_change_reaches_only_attached_sessions() {
         let state = push_state().await;

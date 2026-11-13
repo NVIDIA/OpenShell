@@ -19,6 +19,7 @@
 #   OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/... mise run gateway:docker
 #   OPENSHELL_SANDBOX_RUNTIME_IMAGE=ghcr.io/... mise run gateway:docker
 #   OPENSHELL_DEV_OTLP_ENDPOINT=http://127.0.0.1:4317 mise run gateway:docker
+#   OPENSHELL_EXPERIMENTAL_CHILD_SANDBOXES=1 mise run gateway:docker
 #
 # After the gateway is running, point the CLI at it with either:
 #   openshell --gateway docker-dev <command>
@@ -162,6 +163,7 @@ version = 2
 name = "${GATEWAY_NAME}"
 compute_driver = "docker"
 disable_tls = true
+$([[ "${OPENSHELL_EXPERIMENTAL_CHILD_SANDBOXES:-0}" == "1" ]] && echo "experimental_enable_child_sandboxes = true")
 
 [openshell.gateway.auth]
 allow_unauthenticated_users = true

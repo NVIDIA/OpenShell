@@ -430,6 +430,16 @@ impl ComputeRuntime {
         id: &str,
         now: tokio::time::Instant,
     ) -> Result<(), Status> {
+        // The recovery future carries full persisted sandbox records; keep it
+        // off the caller's stack (clippy::large_futures).
+        Box::pin(self.recover_one_sandbox_update_at_unboxed(id, now)).await
+    }
+
+    async fn recover_one_sandbox_update_at_unboxed(
+        &self,
+        id: &str,
+        now: tokio::time::Instant,
+    ) -> Result<(), Status> {
         let Some(_gate) = self.lifecycle_gates.try_lock_for(id) else {
             return Ok(());
         };

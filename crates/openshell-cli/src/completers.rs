@@ -35,6 +35,7 @@ pub fn complete_sandbox_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
                 page_size: 200,
                 page_token: String::new(),
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     workspace_from_args(),
                 )),

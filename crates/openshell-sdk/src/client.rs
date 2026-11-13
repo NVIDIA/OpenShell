@@ -31,6 +31,25 @@ use std::time::{Duration, Instant};
 use tonic::metadata::AsciiMetadataValue;
 use tonic::transport::Channel;
 
+const MCP_PATH: &str = "/mcp";
+/// The workspace a user acts in over MCP, read by the gateway's `/mcp`.
+const MCP_WORKSPACE_HEADER: &str = "x-openshell-workspace";
+/// A `/mcp` call's own limit, longer than the SDK's RPCs: `wait` can take
+/// 45 s and a foreground `exec` about 50 s.
+const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(90);
+/// Largest `/mcp` reply read.
+const MAX_MCP_REPLY_BYTES: usize = 8 * 1024 * 1024;
+
+/// The gateway's HTTP answer to one `/mcp` message.
+#[derive(Debug)]
+pub struct McpReply {
+    /// HTTP status: 200 with a JSON-RPC reply, 202 for a notification, or an
+    /// error such as 401 or 403 with a short text body.
+    pub status: http::StatusCode,
+    /// The response body.
+    pub body: Vec<u8>,
+}
+
 /// Async client for a single `OpenShell` gateway.
 ///
 /// Cheap to clone — the underlying tonic [`Channel`] multiplexes RPCs over a
@@ -172,6 +191,77 @@ impl OpenShellClient {
     /// raw RPC returns `Unauthenticated` to recover before reissuing it.
     pub async fn force_refresh(&self) -> Result<bool> {
         self.refresh_on_unauthorized().await
+    }
+
+    /// Send one MCP message to the gateway's `/mcp`, acting in `workspace`,
+    /// with this client's credentials and over its own connection (TLS, mTLS
+    /// and the edge tunnel included).
+    ///
+    /// A token near expiry is refreshed first. Only an HTTP 401 is retried,
+    /// once, after a forced refresh: the request reached no handler, so
+    /// sending it again is safe. Timeouts, resets and server errors are not
+    /// retried, since a tool call such as `exec` may already have run.
+    pub async fn post_mcp(&self, body: &[u8], workspace: &str) -> Result<McpReply> {
+        self.post_mcp_within(body, workspace, MCP_CALL_TIMEOUT)
+            .await
+    }
+
+    async fn post_mcp_within(
+        &self,
+        body: &[u8],
+        workspace: &str,
+        timeout: Duration,
+    ) -> Result<McpReply> {
+        self.ensure_fresh().await?;
+        let reply = self.send_mcp(body, workspace, timeout).await?;
+        if reply.status == http::StatusCode::UNAUTHORIZED && self.refresh_on_unauthorized().await? {
+            return self.send_mcp(body, workspace, timeout).await;
+        }
+        Ok(reply)
+    }
+
+    async fn send_mcp(&self, body: &[u8], workspace: &str, timeout: Duration) -> Result<McpReply> {
+        use http_body_util::BodyExt;
+        use tonic::service::Interceptor;
+        use tower::ServiceExt;
+
+        let credentials = self
+            .interceptor
+            .clone()
+            .call(tonic::Request::new(()))
+            .map_err(|status| SdkError::auth(status.message()))?;
+        let mut request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(MCP_PATH)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(MCP_WORKSPACE_HEADER, workspace)
+            .body(tonic::body::Body::new(http_body_util::Full::new(
+                hyper::body::Bytes::copy_from_slice(body),
+            )))
+            .map_err(|e| SdkError::invalid_config(format!("invalid /mcp request: {e}")))?;
+        request
+            .headers_mut()
+            .extend(credentials.metadata().clone().into_headers());
+
+        let call = async {
+            let response = self
+                .channel
+                .clone()
+                .oneshot(request)
+                .await
+                .map_err(|e| SdkError::connect(format!("/mcp request failed: {e}")))?;
+            let status = response.status();
+            let body = http_body_util::Limited::new(response.into_body(), MAX_MCP_REPLY_BYTES)
+                .collect()
+                .await
+                .map_err(|e| SdkError::connect(format!("/mcp reply failed: {e}")))?
+                .to_bytes()
+                .to_vec();
+            Ok(McpReply { status, body })
+        };
+        tokio::time::timeout(timeout, call)
+            .await
+            .map_err(|_| SdkError::connect("the gateway did not answer /mcp in time"))?
     }
 
     /// Gateway health snapshot.
@@ -367,6 +457,7 @@ impl OpenShellClient {
                             page_size: opts.page_size,
                             page_token,
                             label_selector: opts.label_selector.clone().unwrap_or_default(),
+                            parent: String::new(),
                             workspace_scope: Some(proto::workspace_selector("default")),
                         };
                         async move { grpc.list_sandboxes(request).await }
@@ -557,6 +648,7 @@ impl OpenShellClient {
                             page_size: opts.page_size,
                             page_token,
                             label_selector: opts.label_selector.clone().unwrap_or_default(),
+                            parent: String::new(),
                             workspace_scope: Some(proto::all_workspaces_selector()),
                         };
                         async move { grpc.list_sandboxes(request).await }
@@ -1182,6 +1274,7 @@ impl WorkspaceScopedClient {
                             page_size: opts.page_size,
                             page_token,
                             label_selector: opts.label_selector.clone().unwrap_or_default(),
+                            parent: String::new(),
                             workspace_scope: Some(proto::workspace_selector(&workspace)),
                         };
                         async move { grpc.list_sandboxes(request).await }
@@ -1508,6 +1601,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         gpu: Some(proto::GpuResourceRequirements { count: None }),
     });
     proto::CreateSandboxRequest {
+        parent: String::new(),
         request_id: String::new(),
         spec: Some(proto::SandboxSpec {
             environment,
@@ -1552,6 +1646,7 @@ fn create_sandbox_from_template_request(
         service_exposures,
     } = spec;
     proto::CreateSandboxRequest {
+        parent: String::new(),
         request_id: String::new(),
         spec: Some(proto::SandboxSpec {
             providers,
@@ -1682,6 +1777,45 @@ mod tests {
                     + 3600,
             ))
         }
+    }
+
+    /// A request the gateway never answers ends at the call's own limit and
+    /// is not sent again: `exec` may already be running.
+    #[tokio::test]
+    async fn a_mcp_call_that_times_out_is_not_retried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(move |_request| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<
+                    std::result::Result<
+                        http::Response<http_body_util::Empty<hyper::body::Bytes>>,
+                        std::convert::Infallible,
+                    >,
+                >()
+            });
+            let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await;
+        });
+        let client = OpenShellClient::connect(ClientConfig::new(endpoint))
+            .await
+            .unwrap();
+
+        let error = client
+            .post_mcp_within(b"{}", "default", Duration::from_millis(200))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("did not answer /mcp in time"),
+            "{error}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     struct FailingRefresher;

@@ -1061,6 +1061,7 @@ mod tests {
         let codec =
             ProtoJsonCodec::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         let request = CreateSandboxRequest {
+            parent: String::new(),
             request_id: String::new(),
             spec: Some(SandboxSpec {
                 template: Some(SandboxTemplate {

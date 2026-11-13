@@ -179,11 +179,11 @@ mod tests {
     // updates use a separate capability/service and add one classified RPC.
     // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "daa132037ee47c7a46b08dfab9bab379961bc06ff3e9ebbb329809b724f2a4f6";
+        "0df475a95527383cdbe27578981e28ac5121ed44b8dbdfb68b5752aeca1d605d";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "2a083a2260a8c970978646213bc3e0e521c385f0c76a677e002c318b87ae99bb";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
+        "20603be85ae99f182026f4cde691eedbb3698be087055c44c249e7113a36d1ae";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -726,9 +726,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (344, 31),
-                (100, 22),
-                (86, 22),
+                (345, 31),
+                (101, 22),
+                (87, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -811,6 +811,16 @@ mod tests {
         assert!(credential.required);
         assert_eq!(credential.auth_style, "bearer");
         assert!(!credential.stable_placeholder);
+    }
+
+    #[test]
+    fn sandbox_payload_without_parent_decodes_as_root() {
+        use openshell_core::proto::Sandbox;
+
+        let sandbox = Sandbox::decode(legacy_bytes(SANDBOX_WITHOUT_ENDPOINT_STATUS).as_slice())
+            .expect("stored sandbox without a parent must decode");
+        assert!(sandbox.parent.is_none());
+        assert!(sandbox.created_by.is_empty());
     }
 
     #[test]

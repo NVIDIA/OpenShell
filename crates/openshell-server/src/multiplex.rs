@@ -346,9 +346,22 @@ impl MultiplexService {
         .with_operator(operator)
         .with_connection_source(source)
         .with_logons(self.state.logons.clone());
+        let caller_authenticator = grpc_service.caller_authenticator();
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
-        let http_service = http_router(self.state.clone());
+        // `/mcp` re-enters this connection's gRPC stack, so its tool calls are
+        // authenticated, rate limited and intercepted like any other request.
+        let mcp_connection = crate::mcp::McpConnection::new(
+            caller_authenticator,
+            grpc_service
+                .clone()
+                .map_request(|req: Request<tonic::body::Body>| {
+                    let (parts, body) = req.into_parts();
+                    Request::from_parts(parts, BoxBody(body.map_err(Into::into).boxed_unsync()))
+                }),
+        )
+        .with_store(self.state.store.clone());
+        let http_service = http_router(self.state.clone()).layer(axum::Extension(mcp_connection));
 
         let grpc_service = request_id_middleware!(grpc_service);
         let http_service = request_id_middleware!(http_service);
@@ -947,6 +960,21 @@ impl<S> GrpcRateLimitService<S> {
     }
 }
 
+/// The refusal for a call over the gRPC rate limit, tagged `RATE_LIMITED` so
+/// clients can tell it from other `ResourceExhausted` errors and retry later.
+fn rate_limit_exceeded() -> tonic::Status {
+    use openshell_core::rpc_error::StatusExt;
+    tonic::Status::with_error_details(
+        tonic::Code::ResourceExhausted,
+        "gRPC rate limit exceeded",
+        openshell_core::rpc_error::ErrorDetails::with_error_info(
+            "RATE_LIMITED",
+            openshell_core::rpc_error::ERROR_DOMAIN,
+            std::collections::HashMap::new(),
+        ),
+    )
+}
+
 impl<S, B> tower::Service<Request<B>> for GrpcRateLimitService<S>
 where
     S: tower::Service<Request<B>, Response = Response<tonic::body::Body>>,
@@ -987,8 +1015,7 @@ where
         // Tower contract forbids forwarding to an inner service that did not
         // report readiness.
         if std::mem::take(&mut self.rate_limited) {
-            let response =
-                tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
+            let response = rate_limit_exceeded().into_http();
             return Box::pin(async move { Ok(response) });
         }
         if self
@@ -996,8 +1023,7 @@ where
             .as_ref()
             .is_some_and(|limiter| !limiter.allow())
         {
-            let response =
-                tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
+            let response = rate_limit_exceeded().into_http();
             return Box::pin(async move { Ok(response) });
         }
         let future = self.inner.call(req);
@@ -1188,7 +1214,7 @@ pub struct AuthGrpcRouter<S> {
 
 impl<S> AuthGrpcRouter<S> {
     #[cfg(test)]
-    fn new(
+    pub(crate) fn new(
         inner: S,
         authenticator_chain: Option<AuthenticatorChain>,
         authz_policy: Option<AuthzPolicy>,
@@ -1240,12 +1266,133 @@ impl<S> AuthGrpcRouter<S> {
         self.logons = logons;
         self
     }
+
+    /// The caller resolution this router applies, for the HTTP `/mcp` endpoint.
+    pub(crate) fn caller_authenticator(&self) -> CallerAuthenticator {
+        CallerAuthenticator {
+            authenticator_chain: self.authenticator_chain.clone(),
+            peer_identity: self.peer_identity.clone(),
+            mtls_auth_enabled: self.mtls_auth_enabled,
+            allow_unauthenticated_users: self.allow_unauthenticated_users,
+            operator: self.operator.clone(),
+            connection_source: self.connection_source,
+        }
+    }
 }
+
+/// Who is calling: the connection's credentials and settings that the gateway
+/// authenticates every request against. Shared by the gRPC auth router and
+/// the HTTP `/mcp` endpoint so both resolve callers the same way.
+#[derive(Clone)]
+pub struct CallerAuthenticator {
+    authenticator_chain: Option<AuthenticatorChain>,
+    peer_identity: Option<Identity>,
+    mtls_auth_enabled: bool,
+    allow_unauthenticated_users: bool,
+    operator: Option<OperatorPrincipal>,
+    connection_source: Option<ConnectionSource>,
+}
+
+impl CallerAuthenticator {
+    /// Where this connection came from, for audit events.
+    pub const fn connection_source(&self) -> Option<ConnectionSource> {
+        self.connection_source
+    }
+
+    /// Resolve the caller of `path` from `headers` and the connection, or the
+    /// status to refuse it with. Authentication failures are audited here.
+    pub async fn authenticate(
+        &self,
+        headers: &http::HeaderMap,
+        path: &str,
+    ) -> Result<Principal, tonic::Status> {
+        let chain = self.authenticator_chain.clone();
+        let peer_identity = self.peer_identity.clone();
+        let mtls_auth_enabled = self.mtls_auth_enabled;
+        let allow_unauthenticated_users = self.allow_unauthenticated_users;
+        let operator = self.operator.clone();
+        let connection_source = self.connection_source;
+        let origin = |headers: &http::HeaderMap| RequestOrigin::new(connection_source, headers);
+        let principal = if let Some(operator) = operator {
+            if headers.contains_key(http::header::AUTHORIZATION) {
+                audit::emit_authentication_failure(
+                    path,
+                    &origin(headers),
+                    Some(AuthMechanism::Mtls),
+                    AuthFailureReason::ConflictingCredentials,
+                );
+                return Err(tonic::Status::unauthenticated(
+                    "operator certificates must not be combined with authorization headers",
+                ));
+            }
+            Principal::Operator(operator)
+        } else if let Some(chain) = chain {
+            match chain.authenticate(headers, path).await {
+                Ok(Authentication::Accepted(p)) => p,
+                Ok(outcome) => match (mtls_auth_enabled, peer_identity) {
+                    (true, Some(identity)) => Principal::User(UserPrincipal { identity }),
+                    _ if allow_unauthenticated_users => unauthenticated_dev_user_principal(),
+                    _ => {
+                        let (mechanism, reason) = match outcome {
+                            Authentication::Declined(decline) => {
+                                (Some(decline.mechanism), decline.reason)
+                            }
+                            _ => (None, AuthFailureReason::MissingCredential),
+                        };
+                        audit::emit_authentication_failure(
+                            path,
+                            &origin(headers),
+                            mechanism,
+                            reason,
+                        );
+                        return Err(tonic::Status::unauthenticated(
+                            "missing authorization header",
+                        ));
+                    }
+                },
+                Err(rejection) => {
+                    audit::emit_authentication_failure(
+                        path,
+                        &origin(headers),
+                        Some(rejection.mechanism),
+                        rejection.reason,
+                    );
+                    return Err(rejection.status);
+                }
+            }
+        } else if mtls_auth_enabled {
+            let Some(identity) = peer_identity else {
+                audit::emit_authentication_failure(
+                    path,
+                    &origin(headers),
+                    Some(AuthMechanism::Mtls),
+                    AuthFailureReason::MissingCredential,
+                );
+                return Err(tonic::Status::unauthenticated("missing client certificate"));
+            };
+            Principal::User(UserPrincipal { identity })
+        } else if allow_unauthenticated_users {
+            unauthenticated_dev_user_principal()
+        } else {
+            audit::emit_authentication_failure(
+                path,
+                &origin(headers),
+                None,
+                AuthFailureReason::MissingCredential,
+            );
+            return Err(tonic::Status::unauthenticated("authentication required"));
+        };
+        Ok(principal)
+    }
+}
+
+/// Subject of the built-in user on gateways that allow unauthenticated users.
+pub const UNAUTHENTICATED_DEV_SUBJECT: &str = "unauthenticated-local-dev";
 
 fn unauthenticated_dev_user_principal() -> Principal {
     Principal::User(UserPrincipal {
         identity: Identity {
-            subject: "unauthenticated-local-dev".to_string(),
+            subject: UNAUTHENTICATED_DEV_SUBJECT.to_string(),
             display_name: Some("Unauthenticated Local Dev".to_string()),
             roles: vec!["openshell-user".to_string(), "openshell-admin".to_string()],
             scopes: vec!["openshell:all".to_string()],
@@ -1274,12 +1421,10 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let chain = self.authenticator_chain.clone();
+        let caller_authenticator = self.caller_authenticator();
+        // Service discovery rechecks a bearer token later with the same chain.
+        let chain = caller_authenticator.authenticator_chain.clone();
         let authz_policy = self.authz_policy.clone();
-        let peer_identity = self.peer_identity.clone();
-        let mtls_auth_enabled = self.mtls_auth_enabled;
-        let allow_unauthenticated_users = self.allow_unauthenticated_users;
-        let operator = self.operator.clone();
         let connection_source = self.connection_source;
         let logons = self.logons.clone();
         let peer_certificate_sha256 = self.peer_certificate_sha256.clone();
@@ -1293,84 +1438,21 @@ where
 
             let path = req.uri().path().to_string();
             let origin = |headers: &http::HeaderMap| RequestOrigin::new(connection_source, headers);
+            // Set only by the in-process `/mcp` dispatch; tonic never fills
+            // request extensions from the network.
+            let mcp_origin = req.extensions().get::<crate::mcp::McpOrigin>().is_some();
 
             // Health probes and reflection — truly unauthenticated.
             if oidc::is_unauthenticated_method(&path) {
                 return inner.ready().await?.call(req).await;
             }
 
-            let principal = if let Some(operator) = operator {
-                if req.headers().contains_key(http::header::AUTHORIZATION) {
-                    audit::emit_authentication_failure(
-                        &path,
-                        &origin(req.headers()),
-                        Some(AuthMechanism::Mtls),
-                        AuthFailureReason::ConflictingCredentials,
-                    );
-                    return Ok(status_response(tonic::Status::unauthenticated(
-                        "operator certificates must not be combined with authorization headers",
-                    )));
-                }
-                Principal::Operator(operator)
-            } else if let Some(chain) = &chain {
-                match chain.authenticate(req.headers(), &path).await {
-                    Ok(Authentication::Accepted(p)) => p,
-                    Ok(outcome) => match (mtls_auth_enabled, peer_identity) {
-                        (true, Some(identity)) => Principal::User(UserPrincipal { identity }),
-                        _ if allow_unauthenticated_users => unauthenticated_dev_user_principal(),
-                        _ => {
-                            let (mechanism, reason) = match outcome {
-                                Authentication::Declined(decline) => {
-                                    (Some(decline.mechanism), decline.reason)
-                                }
-                                _ => (None, AuthFailureReason::MissingCredential),
-                            };
-                            audit::emit_authentication_failure(
-                                &path,
-                                &origin(req.headers()),
-                                mechanism,
-                                reason,
-                            );
-                            return Ok(status_response(tonic::Status::unauthenticated(
-                                "missing authorization header",
-                            )));
-                        }
-                    },
-                    Err(rejection) => {
-                        audit::emit_authentication_failure(
-                            &path,
-                            &origin(req.headers()),
-                            Some(rejection.mechanism),
-                            rejection.reason,
-                        );
-                        return Ok(status_response(rejection.status));
-                    }
-                }
-            } else if mtls_auth_enabled {
-                let Some(identity) = peer_identity else {
-                    audit::emit_authentication_failure(
-                        &path,
-                        &origin(req.headers()),
-                        Some(AuthMechanism::Mtls),
-                        AuthFailureReason::MissingCredential,
-                    );
-                    return Ok(status_response(tonic::Status::unauthenticated(
-                        "missing client certificate",
-                    )));
-                };
-                Principal::User(UserPrincipal { identity })
-            } else if allow_unauthenticated_users {
-                unauthenticated_dev_user_principal()
-            } else {
-                audit::emit_authentication_failure(
-                    &path,
-                    &origin(req.headers()),
-                    None,
-                    AuthFailureReason::MissingCredential,
-                );
-                return Ok(status_response(tonic::Status::unauthenticated(
-                    "authentication required",
-                )));
+            let principal = match caller_authenticator
+                .authenticate(req.headers(), &path)
+                .await
+            {
+                Ok(principal) => principal,
+                Err(status) => return Ok(status_response(status)),
             };
             let origin = origin(req.headers());
             audit::emit_logon(
@@ -1404,7 +1486,8 @@ where
                     .and_then(|policy| policy.check(&user.identity, &path).err())
                     .map(|rbac| (rbac.denial, rbac.status)),
                 Principal::Sandbox(_)
-                    if !crate::auth::sandbox_methods::is_sandbox_callable(&path) =>
+                    if !(crate::auth::sandbox_methods::is_sandbox_callable(&path)
+                        || (mcp_origin && crate::mcp::is_sandbox_tool_method(&path))) =>
                 {
                     method_denied("sandbox principals may not call this method")
                 }
@@ -2454,6 +2537,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grpc_status_from_response(&second), "8");
+        let status = tonic::Status::from_header_map(second.headers()).expect("grpc status");
+        let details = openshell_core::rpc_error::decode_details(&status).expect("error details");
+        let info = details.error_info().expect("error info");
+        assert_eq!(
+            (info.reason.as_str(), info.domain.as_str()),
+            ("RATE_LIMITED", openshell_core::rpc_error::ERROR_DOMAIN)
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
@@ -4216,6 +4306,51 @@ mod tests {
 
                 assert!(seen.lock().unwrap().is_none(), "{path} reached handler");
                 assert_eq!(grpc_status(&res).as_deref(), Some("7"), "{path}");
+            }
+        }
+
+        #[tokio::test]
+        async fn sandbox_principal_reaches_mcp_methods_only_with_the_mcp_marker() {
+            for (path, tool_method) in [
+                ("/openshell.v1.OpenShell/CreateSandbox", true),
+                ("/openshell.v1.OpenShell/ListSandboxes", true),
+                ("/openshell.v1.OpenShell/ExecSandbox", true),
+                ("/openshell.v1.OpenShell/DeleteSandbox", true),
+                ("/openshell.v1.OpenShell/GetSandboxLogs", true),
+                ("/openshell.v1.OpenShell/ListSandboxTemplates", true),
+                ("/openshell.v1.OpenShell/GetSandboxTemplate", false),
+                ("/openshell.v1.OpenShell/CreateProvider", false),
+            ] {
+                // Without the marker is a direct gRPC call with a sandbox token.
+                for marked in [true, false] {
+                    let mock = Arc::new(MockAuthenticator::returning(Ok(
+                        Authentication::Accepted(sandbox("sandbox-a")),
+                    )));
+                    let (recorder, seen) = PrincipalRecorder::new();
+                    let mut router = AuthGrpcRouter::new(
+                        recorder,
+                        Some(AuthenticatorChain::new(vec![mock])),
+                        None,
+                    );
+                    let mut request = empty_request(path);
+                    if marked {
+                        request.extensions_mut().insert(crate::mcp::McpOrigin);
+                    }
+
+                    let res = router.call(request).await.unwrap();
+
+                    if tool_method && marked {
+                        assert!(grpc_status(&res).is_none(), "{path}");
+                        assert!(matches!(*seen.lock().unwrap(), Some(Principal::Sandbox(_))));
+                    } else {
+                        assert!(seen.lock().unwrap().is_none(), "{path} marked={marked}");
+                        assert_eq!(
+                            grpc_status(&res).as_deref(),
+                            Some("7"),
+                            "{path} marked={marked}"
+                        );
+                    }
+                }
             }
         }
 

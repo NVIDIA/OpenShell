@@ -42,6 +42,8 @@ navigation:
       path: how-it-works/sandboxes/overview.mdx
     - page: "Templates"
       path: how-it-works/sandboxes/templates.mdx
+    - page: "Child Sandboxes"
+      path: how-it-works/sandboxes/child-sandboxes.mdx
     - page: "Runtimes"
       path: how-it-works/sandboxes/runtimes.mdx
   - section: "Providers"

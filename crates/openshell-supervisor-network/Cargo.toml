@@ -29,6 +29,7 @@ aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 http = { workspace = true }
+http-body-util = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 flate2 = "1"
@@ -56,6 +57,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tonic = { workspace = true }
+tower = { workspace = true }
 tower-mcp-types = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
@@ -67,6 +69,8 @@ default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
 
 [dev-dependencies]
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 
 openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }

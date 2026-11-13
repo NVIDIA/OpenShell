@@ -116,7 +116,9 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
     ) -> Result<SyntheticAnswer, PolicyDnsError> {
         let normalized_name =
             NormalizedName::parse(raw_name).map_err(|_| PolicyDnsError::InvalidName)?;
-        if normalized_name.as_str() == crate::policy_local::POLICY_LOCAL_HOST {
+        if normalized_name.as_str() == crate::policy_local::POLICY_LOCAL_HOST
+            || normalized_name.as_str() == crate::gateway_mcp_door::DOOR_HOST
+        {
             return if family == AddressFamily::Ipv4 {
                 Ok(SyntheticAnswer {
                     address: POLICY_LOCAL_ADDRESS.into(),
@@ -750,6 +752,17 @@ mod tests {
                 .await,
             Err(PolicyDnsError::Resolver(resolver::ResolveError::NoData))
         ));
+    }
+
+    #[tokio::test]
+    async fn the_gateway_door_resolves_to_the_sandbox_local_address() {
+        let service = service("network_policies: {}\n", vec![]);
+        let answer = service
+            .answer_query("openshell.local", AddressFamily::Ipv4, Instant::now())
+            .await
+            .expect("sandbox-local address");
+        assert_eq!(answer.address, IpAddr::V4(POLICY_LOCAL_ADDRESS));
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
     }
 
     const BASE_POLICY: &str = r"

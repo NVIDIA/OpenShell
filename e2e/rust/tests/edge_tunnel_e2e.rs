@@ -139,8 +139,9 @@ async fn gateway_status_reports_healthy() {
 ///
 /// Note: The dummy token won't be validated (no edge auth middleware on
 /// the plaintext gateway), but it triggers the CLI's tunnel proxy codepath.
-#[tokio::test]
-async fn ws_tunnel_status_through_edge_proxy() {
+/// The live gateway's endpoint when it is healthy and plaintext, which the
+/// edge tunnel tests need; otherwise say why the test is skipped.
+async fn plaintext_gateway_endpoint(test: &str) -> Option<String> {
     let (original_status, _) = run_cli(&["status"]).await;
     let clean_status = strip_ansi(&original_status);
 
@@ -150,8 +151,8 @@ async fn ws_tunnel_status_through_edge_proxy() {
         && !clean_status.to_lowercase().contains("connected")
         && !clean_status.contains("✓")
     {
-        eprintln!("Skipping ws_tunnel test: no healthy gateway available");
-        return;
+        eprintln!("Skipping {test}: no healthy gateway available");
+        return None;
     }
 
     // Get the gateway endpoint from the gateway metadata.
@@ -163,7 +164,8 @@ async fn ws_tunnel_status_through_edge_proxy() {
     // Extract the gateway endpoint from the info output.
     // The format varies, but it should contain a URL-like string.
     let endpoint = info_clean.lines().find_map(|line| {
-        if line.to_lowercase().contains("endpoint") || line.to_lowercase().contains("gateway") {
+        let lower = line.to_lowercase();
+        if lower.contains("endpoint") || lower.contains("gateway") || lower.contains("server") {
             // Try to extract a URL from the line
             line.split_whitespace()
                 .find(|word| word.starts_with("http://") || word.starts_with("https://"))
@@ -174,10 +176,8 @@ async fn ws_tunnel_status_through_edge_proxy() {
     });
 
     let Some(endpoint) = endpoint else {
-        eprintln!(
-            "Skipping ws_tunnel test: could not extract gateway endpoint from:\n{info_clean}"
-        );
-        return;
+        eprintln!("Skipping {test}: could not extract gateway endpoint from:\n{info_clean}");
+        return None;
     };
 
     // For the WS tunnel test, we need the endpoint to be HTTP (plaintext).
@@ -185,11 +185,19 @@ async fn ws_tunnel_status_through_edge_proxy() {
     // complicates things. Skip if the gateway isn't plaintext.
     if !endpoint.starts_with("http://") {
         eprintln!(
-            "Skipping ws_tunnel test: gateway endpoint is not plaintext HTTP: {endpoint}\n\
+            "Skipping {test}: gateway endpoint is not plaintext HTTP: {endpoint}\n\
              Use a plaintext local gateway such as `mise run gateway:docker` for this test."
         );
-        return;
+        return None;
     }
+    Some(endpoint)
+}
+
+#[tokio::test]
+async fn ws_tunnel_status_through_edge_proxy() {
+    let Some(endpoint) = plaintext_gateway_endpoint("ws_tunnel test").await else {
+        return;
+    };
 
     // Seed a temporary config directory with edge auth metadata pointing at
     // the live gateway. The dummy token triggers the WS tunnel codepath
@@ -217,4 +225,82 @@ async fn ws_tunnel_status_through_edge_proxy() {
             || clean.contains("✓"),
         "status through WS tunnel should report healthy:\n{clean}"
     );
+}
+
+// -------------------------------------------------------------------
+// MCP through the WS tunnel proxy
+// -------------------------------------------------------------------
+
+/// `openshell mcp serve` sends MCP over the same connection as the CLI's
+/// gRPC calls, so with edge auth it goes through the WebSocket tunnel. Needs
+/// a plaintext gateway with child sandboxes, and so `/mcp`, enabled. No CI
+/// gateway is plaintext, so it is ignored unless run by hand:
+/// `OPENSHELL_E2E_CHILD_SANDBOXES=1 cargo test --manifest-path e2e/rust/Cargo.toml
+/// --test edge_tunnel_e2e -- --ignored mcp_serve_through_edge_proxy`.
+#[tokio::test]
+#[ignore = "needs a plaintext gateway with child sandboxes enabled"]
+async fn mcp_serve_through_edge_proxy() {
+    if std::env::var("OPENSHELL_E2E_CHILD_SANDBOXES").as_deref() != Ok("1") {
+        eprintln!(
+            "Skipping mcp_serve test: set OPENSHELL_E2E_CHILD_SANDBOXES=1 on a gateway with /mcp"
+        );
+        return;
+    }
+    let Some(endpoint) = plaintext_gateway_endpoint("mcp_serve test").await else {
+        return;
+    };
+    let tmpdir = tempfile::tempdir().expect("create temp config dir");
+    seed_edge_gateway_config(
+        tmpdir.path(),
+        "edge-tunnel-mcp",
+        &endpoint,
+        "dummy-test-jwt",
+    );
+
+    let mut cmd = openshell_cmd();
+    cmd.args(["--gateway", "edge-tunnel-mcp", "mcp", "serve"])
+        .env("XDG_CONFIG_HOME", tmpdir.path())
+        .env("HOME", tmpdir.path())
+        .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn openshell mcp serve");
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child.stdin.take().expect("bridge stdin");
+        stdin
+            .write_all(
+                concat!(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                    "\n",
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write to the bridge");
+    }
+    let output = tokio::time::timeout(std::time::Duration::from_mins(1), child.wait_with_output())
+        .await
+        .expect("the bridge exits once stdin closes")
+        .expect("bridge output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let replies: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|_| panic!("not JSON-RPC: {line}")))
+        .collect();
+    let tools = replies
+        .iter()
+        .find(|reply| reply["id"] == 2)
+        .and_then(|reply| reply["result"]["tools"].as_array())
+        .unwrap_or_else(|| {
+            panic!(
+                "no tools/list result through the tunnel: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert_eq!(tools.len(), 6, "{stdout}");
 }

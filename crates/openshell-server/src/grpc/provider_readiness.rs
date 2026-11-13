@@ -224,10 +224,9 @@ async fn current_target_identity(
     sandbox: &Sandbox,
     provider_name: &str,
 ) -> Result<ProviderDesiredIdentity, Status> {
-    let attached = sandbox
-        .spec
-        .as_ref()
-        .is_some_and(|spec| spec.providers.iter().any(|name| name == provider_name));
+    let attached = super::sandbox::provider_attached_for_delivery(state, sandbox, provider_name)
+        .await
+        .map_err(|_| registry_unavailable())?;
     let provider = if attached {
         state
             .store

@@ -31,6 +31,7 @@ mod gateway_ocsf;
 mod gateway_ring;
 mod grpc;
 mod http;
+mod mcp;
 mod middleware;
 mod multiplex;
 mod network_trust;
@@ -1294,6 +1295,16 @@ pub(crate) async fn run_server(
     }
 
     startup_tx.send_replace(true);
+    // Catch up children whose parent's policy sync was lost while the gateway
+    // was down.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) = grpc::sync_all_children(&state).await {
+                warn!(error = %error, "startup child sandbox policy sync failed");
+            }
+        });
+    }
     // The poller and sweeper exist to observe writes made by other replicas.
     // Single-replica backends have none, so they would only add load.
     if !store.is_single_replica() {
