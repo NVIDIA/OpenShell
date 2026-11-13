@@ -3839,18 +3839,27 @@ struct PolicyStatusUpdate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PolicyStatusSuccessEvent {
-    InitialAcknowledgement { policy_hash: String },
-    UnchangedAcknowledgement { policy_hash: String },
+    /// `active_generation` is the policy engine generation pinned when startup
+    /// installed the acknowledged policy. Decision events carry the same value
+    /// in `firewall_rule.version`.
+    InitialAcknowledgement {
+        policy_hash: String,
+        active_generation: u64,
+    },
+    UnchangedAcknowledgement {
+        policy_hash: String,
+    },
 }
 
 impl PolicyStatusUpdate {
-    fn initial_loaded(ack: &InitialPolicyAck) -> Self {
+    fn initial_loaded(ack: &InitialPolicyAck, active_generation: u64) -> Self {
         Self {
             version: ack.version,
             loaded: true,
             error: String::new(),
             success_event: Some(PolicyStatusSuccessEvent::InitialAcknowledgement {
                 policy_hash: ack.policy_hash.clone(),
+                active_generation,
             }),
         }
     }
@@ -4241,34 +4250,41 @@ async fn run_policy_status_reporter<C: PolicyGatewayClient>(
         }
 
         if let Some(event) = update.success_event {
-            let (policy_hash, message) = match event {
-                PolicyStatusSuccessEvent::InitialAcknowledgement { policy_hash } => (
-                    policy_hash,
-                    format!(
-                        "Acknowledged initial policy revision as loaded [version:{}]",
-                        update.version
-                    ),
-                ),
-                PolicyStatusSuccessEvent::UnchangedAcknowledgement { policy_hash } => (
-                    policy_hash,
-                    format!(
-                        "Acknowledged unchanged policy revision as loaded [version:{}]",
-                        update.version
-                    ),
-                ),
-            };
-            ocsf_emit!(
-                ConfigStateChangeBuilder::new(ocsf_ctx())
-                    .severity(SeverityId::Informational)
-                    .status(StatusId::Success)
-                    .state(StateId::Enabled, "loaded")
-                    .unmapped("version", serde_json::json!(update.version))
-                    .unmapped("policy_hash", serde_json::json!(policy_hash))
-                    .message(message)
-                    .build()
-            );
+            ocsf_emit!(policy_status_success_event(update.version, event));
         }
     }
+}
+
+/// Build the CONFIG event recorded when the gateway acknowledges a policy
+/// revision as loaded. The initial acknowledgement also records the policy
+/// engine generation that startup installed, so decision events can be joined
+/// to this policy hash by `firewall_rule.version`.
+fn policy_status_success_event(version: u32, event: PolicyStatusSuccessEvent) -> OcsfEvent {
+    let (policy_hash, active_generation, message) = match event {
+        PolicyStatusSuccessEvent::InitialAcknowledgement {
+            policy_hash,
+            active_generation,
+        } => (
+            policy_hash,
+            Some(active_generation),
+            format!("Acknowledged initial policy revision as loaded [version:{version}]"),
+        ),
+        PolicyStatusSuccessEvent::UnchangedAcknowledgement { policy_hash } => (
+            policy_hash,
+            None,
+            format!("Acknowledged unchanged policy revision as loaded [version:{version}]"),
+        ),
+    };
+    let mut builder = ConfigStateChangeBuilder::new(ocsf_ctx())
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .state(StateId::Enabled, "loaded")
+        .unmapped("version", serde_json::json!(version))
+        .unmapped("policy_hash", serde_json::json!(policy_hash));
+    if let Some(active_generation) = active_generation {
+        builder = builder.unmapped("active_generation", serde_json::json!(active_generation));
+    }
+    builder.message(message).build()
 }
 
 fn enqueue_policy_status(sender: &UnboundedSender<PolicyStatusUpdate>, update: PolicyStatusUpdate) {
@@ -4425,7 +4441,7 @@ async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<(
         Vec::new(),
     )
     .await?;
-    opa_engine.replace_middleware_registry(registry)
+    opa_engine.replace_middleware_registry(registry).map(|_| ())
 }
 
 /// Wait the configured poll interval, but never past the point at which an
@@ -4471,6 +4487,25 @@ struct MiddlewareRegistryReconciliation<'a> {
     status: &'a mut MiddlewareRegistryStatus,
 }
 
+/// Build the CONFIG event recorded when a new middleware registry is
+/// installed. Installing it advances the policy engine generation, so the
+/// event records the generation it activated.
+fn middleware_registry_reloaded_event(service_count: usize, active_generation: u64) -> OcsfEvent {
+    ConfigStateChangeBuilder::new(ocsf_ctx())
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .state(StateId::Enabled, "loaded")
+        .unmapped(
+            "supervisor_middleware_service_count",
+            serde_json::json!(service_count),
+        )
+        .unmapped("active_generation", serde_json::json!(active_generation))
+        .message(format!(
+            "Supervisor middleware registry reloaded [service_count:{service_count}]"
+        ))
+        .build()
+}
+
 async fn reconcile_middleware_registry(
     opa_engine: &OpaEngine,
     middleware_connector: &MiddlewareConnector,
@@ -4487,7 +4522,7 @@ async fn reconcile_middleware_registry(
     .await
     .and_then(|registry| opa_engine.replace_middleware_registry(registry))
     {
-        Ok(()) => {
+        Ok(active_generation) => {
             retain_extension_credentials(
                 reconciliation.extension_credentials,
                 reconciliation.desired_services,
@@ -4498,21 +4533,10 @@ async fn reconcile_middleware_registry(
                 .current_services
                 .extend_from_slice(reconciliation.desired_services);
             *reconciliation.status = MiddlewareRegistryStatus::Synchronized;
-            ocsf_emit!(
-                ConfigStateChangeBuilder::new(ocsf_ctx())
-                    .severity(SeverityId::Informational)
-                    .status(StatusId::Success)
-                    .state(StateId::Enabled, "loaded")
-                    .unmapped(
-                        "supervisor_middleware_service_count",
-                        serde_json::json!(reconciliation.current_services.len())
-                    )
-                    .message(format!(
-                        "Supervisor middleware registry reloaded [service_count:{}]",
-                        reconciliation.current_services.len()
-                    ))
-                    .build()
-            );
+            ocsf_emit!(middleware_registry_reloaded_event(
+                reconciliation.current_services.len(),
+                active_generation,
+            ));
         }
         Err(error) => {
             // Emit only on the transition into the failed state to avoid
@@ -7768,6 +7792,51 @@ network_policies:
                 .as_str()
                 .unwrap()
                 .contains("previous policy IS active")
+        );
+    }
+
+    #[test]
+    fn initial_policy_acknowledgement_records_active_generation() {
+        let ack = InitialPolicyAck {
+            version: 4,
+            policy_hash: "sha256:initial".to_string(),
+            config_revision: 11,
+        };
+        let update = PolicyStatusUpdate::initial_loaded(&ack, 3);
+        let event = policy_status_success_event(
+            update.version,
+            update.success_event.expect("initial acknowledgement event"),
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["unmapped"]["policy_hash"], "sha256:initial");
+        assert_eq!(json["unmapped"]["version"], 4);
+        assert_eq!(json["unmapped"]["active_generation"], 3);
+    }
+
+    #[test]
+    fn unchanged_policy_acknowledgement_omits_active_generation() {
+        let update = PolicyStatusUpdate::unchanged_loaded(5, "sha256:same".to_string());
+        let event = policy_status_success_event(
+            update.version,
+            update
+                .success_event
+                .expect("unchanged acknowledgement event"),
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["unmapped"]["policy_hash"], "sha256:same");
+        assert!(json["unmapped"].get("active_generation").is_none());
+    }
+
+    #[test]
+    fn middleware_registry_reload_records_active_generation() {
+        let json = middleware_registry_reloaded_event(2, 7).to_json().unwrap();
+        assert_eq!(json["unmapped"]["supervisor_middleware_service_count"], 2);
+        assert_eq!(json["unmapped"]["active_generation"], 7);
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("Supervisor middleware registry reloaded [service_count:2]")
         );
     }
 }
