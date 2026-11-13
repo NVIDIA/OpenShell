@@ -259,6 +259,42 @@ checksum = "sha256:83a7d5955c7ac96ede5d896ac9ede5f7ecce9ece0e95d9e47acd766b09e2e
 url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/426566657"
 
+[[tools.go]]
+version = "1.26.7"
+backend = "core:go"
+
+[tools.go."platforms.linux-arm64"]
+checksum = "sha256:5a4ec883379d51ee9ce1040d5e87f8d35e20387574dd8c947feb01eabc3c1b37"
+url = "https://dl.google.com/go/go1.26.7.linux-arm64.tar.gz"
+
+[tools.go."platforms.linux-x64"]
+checksum = "sha256:ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca"
+url = "https://dl.google.com/go/go1.26.7.linux-amd64.tar.gz"
+
+[tools.go."platforms.macos-arm64"]
+checksum = "sha256:020a1e8224811be75163e920bc77e0926a1390a6aeea19bdcf23f74b9d749f6d"
+url = "https://dl.google.com/go/go1.26.7.darwin-arm64.tar.gz"
+
+[tools.go."platforms.windows-arm64"]
+checksum = "sha256:6f1b08de9e2dd94f69c52e524ab6834737275253291e8fd7f1c12ed4eceeda89"
+url = "https://dl.google.com/go/go1.26.7.windows-arm64.zip"
+
+[tools.go."platforms.windows-x64"]
+checksum = "sha256:f4f534a486e4bc3387fa18f08208f2f854b7aaea8a08f2a2d829a914a05abb11"
+url = "https://dl.google.com/go/go1.26.7.windows-amd64.zip"
+
+[[tools."go:github.com/google/go-jsonnet/cmd/jsonnet"]]
+version = "0.22.0"
+backend = "go:github.com/google/go-jsonnet/cmd/jsonnet"
+
+[[tools."go:github.com/google/go-jsonnet/cmd/jsonnetfmt"]]
+version = "0.22.0"
+backend = "go:github.com/google/go-jsonnet/cmd/jsonnetfmt"
+
+[[tools."go:github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb"]]
+version = "0.6.0"
+backend = "go:github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb"
+
 [[tools.helm]]
 version = "4.2.0"
 backend = "aqua:helm/helm"
