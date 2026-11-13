@@ -5,9 +5,10 @@
 #
 # `podman_userns_mode` is default, auto, keep-id or private. Every mode except
 # default writes its `[openshell.drivers.podman]` settings to
-# `/etc/openshell-test/gateway-overrides.toml`, which every installer applies to the active
-# gateway-overrides.toml (the openshell_gateway role for `binaries`, the
-# openshell_packaged_gateway role for the packages); default removes the file. The
+# `/etc/openshell-test/gateway-overrides.toml`, which every installer installs as a
+# `gateway.d` drop-in next to the active gateway.toml (the openshell_gateway role
+# for `binaries`, the openshell_packaged_gateway role for the packages); default
+# removes the file. The
 # Podman support crate (tests/support/podman) reads the published mode and
 # runs Podman's own reference container in it.
 ---
@@ -19,12 +20,18 @@
     podman_userns_settings:
       default: ""
       auto: |
+        [openshell]
+        version = 2
         [openshell.drivers.podman]
         userns = "auto"
       keep-id: |
+        [openshell]
+        version = 2
         [openshell.drivers.podman]
         userns = "keep-id"
       private: |
+        [openshell]
+        version = 2
         [openshell.drivers.podman]
         userns = "private"
         uidmap = ["0:0:1", "1:1:65535"]
@@ -62,7 +69,7 @@
         mode: "0644"
       when: podman_userns_mode != "default"
 
-    # The fragment is the only source of userns, uidmap and gidmap settings in
+    # The drop-in config is the only source of userns, uidmap and gidmap settings in
     # the gateway's configuration, so default mode leaves them unset.
     - name: Remove Podman driver user-namespace settings for default mode
       become: true

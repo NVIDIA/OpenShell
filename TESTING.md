@@ -593,27 +593,26 @@ nix run .#openshell-test-runner -- run \
 
 An environment overrides gateway settings by writing the tables to change to
 `/etc/openshell-test/gateway-overrides.toml` in a playbook that runs before the
-installer. The file holds whole tables, such as `[openshell.gateway]` or
-`[openshell.drivers.podman]`, and is not a complete configuration. Each
-installer applies it to the gateway's own file:
+installer. The file declares `[openshell] version = 2` and the tables to change, such as
+`[openshell.gateway]` or `[openshell.drivers.podman]`. Each
+installer installs it as the drop-in config `gateway.d/90-test-overrides.toml`
+next to the gateway's own `gateway.toml`, and the gateway merges it over that
+file. The base file is never edited:
 
-- `binaries` applies it to the `/etc/openshell/gateway.toml` it generates.
-- `deb` and `rpm` apply it to the service user's
+- `binaries` installs it beside the `/etc/openshell/gateway.toml` it generates.
+- `deb` and `rpm` install it beside the service user's
   `~/.config/openshell/gateway.toml`, the file the packaged service reads. The
-  file starts as a copy of the rpm's
-  `/usr/share/openshell-gateway/gateway.toml.default`, where the service would
-  seed it on first start, or as a minimal `version = 2` file when the package
-  has no default. No environment replaces the packaged file, and an environment
-  with no overrides leaves it untouched.
+  rpm still seeds that file from
+  `/usr/share/openshell-gateway/gateway.toml.default` on first start. A package
+  with no default gets a minimal `version = 2` base file for the drop-in config
+  to merge over. An environment with no overrides leaves the
+  packaged configuration untouched.
 - `k3s` installers ignore the file.
 
-`tests/tmachine/ansible/roles/openshell_gateway/files/merge-gateway-toml.py`
-does the work. Each key in the overrides replaces the same key in the table, or
-is added to it, and a table the file lacks is appended. The rest of the file,
-comments included, stays. The script parses the result and fails the setup,
-leaving the file unchanged, when it isn't valid TOML. It can't remove a key.
-Settings that the packaged service reads from `gateway.env` instead of the
-TOML are not covered.
+A key in the drop-in config replaces the same key in the base file's table, or is
+added to it, and a table the base lacks is added. Arrays replace the base
+array. A drop-in config can't remove a key. Settings that the packaged service reads
+from `gateway.env` instead of the TOML are not covered.
 
 The `oci-image` feature suite (`tests/suites/features/oci-image`) checks OCI
 image identity and working-directory behavior shared by the Docker and Podman

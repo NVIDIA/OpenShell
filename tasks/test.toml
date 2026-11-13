@@ -26,13 +26,8 @@ depends = [
   "test:maintainer-approval",
   "test:cargo-lockfile-alignment",
   "test:review-readiness",
-  "test:merge-gateway-toml",
   "test:accepted-work",
 ]
-
-["test:merge-gateway-toml"]
-description = "Test the tmachine gateway TOML merge script"
-run = "uv run --no-project --with pytest pytest tests/tmachine/ansible/roles/openshell_gateway/files/merge_gateway_toml_test.py"
 
 ["test:cargo-lockfile-alignment"]
 description = "Test the Cargo lockfile alignment check"
