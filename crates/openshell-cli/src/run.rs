@@ -458,6 +458,7 @@ pub struct SandboxCreateConfig<'a> {
     pub detach: bool,
     pub suppress_credential_warnings: bool,
     pub restart_policy: &'a str,
+    pub provision_timeout_secs: Option<u32>,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -489,6 +490,7 @@ impl Default for SandboxCreateConfig<'_> {
             detach: false,
             suppress_credential_warnings: false,
             restart_policy: "never",
+            provision_timeout_secs: None,
         }
     }
 }
@@ -528,6 +530,7 @@ pub async fn sandbox_create(
         detach,
         suppress_credential_warnings,
         restart_policy,
+        provision_timeout_secs,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -841,9 +844,13 @@ pub async fn sandbox_create(
     let mut last_error_reason = String::new();
     let mut last_condition_message = provisioning_blocker_message(sandbox.status.as_ref());
     let provision_timeout = Duration::from_secs(
-        std::env::var("OPENSHELL_PROVISION_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        provision_timeout_secs
+            .map(u64::from)
+            .or_else(|| {
+                std::env::var("OPENSHELL_PROVISION_TIMEOUT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
             .unwrap_or(300),
     );
     let mut provisioning_idle_deadline = Instant::now() + provision_timeout;
