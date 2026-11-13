@@ -14,6 +14,7 @@ nextest run the tests as the library's unit tests. The crate also builds the
 | `persistent-workspace` | Files in `/sandbox` survive stop and start |
 | `policy-advisor` | `policy.local` accepts a proposed rule; a denied address or hostname yields one draft rule |
 | `file-transfer` | `sandbox upload` and `download`: round trips, file modes and symlinks outside the workspace, `.gitignore` filtering, workspace-escape and option-looking names, a large upload |
+| `create-upload` | `sandbox create --upload`: directory basename and nested files, multiple uploads, a single file |
 | `credential-gating` | Provider credentials: admission of credentialed endpoints, REST body placeholders and rewriting, WebSocket binary frames, live policy binding |
 | `image` | A sandbox runs the default image or the one it is created from |
 | `labels` | Labels are stored and select sandboxes in `sandbox list` |
