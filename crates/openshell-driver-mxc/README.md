@@ -382,6 +382,18 @@ gateway are tracked, so other sandboxes on the host are left alone. It relies on
 each sandbox generation's kill-on-close job object; no workload outlives the
 gateway. Select it with `-Scenario gateway-kill`.
 
+The default `gateway-restart` scenario covers a graceful gateway stop with
+persisted state. It runs the gateway on a SQLite file, creates a sandbox with a
+long-running workload, sends a real Ctrl-C, and requires the gateway to log a
+graceful shutdown and exit, every recorded sandbox process to end, and a restart
+on the same database to start. After the restart the sandbox record must still be
+listed (the observed phase is `Provisioning` and does not change), its workload
+must not be running (MXC has no restart recovery), and the record must be
+deletable with its name reusable. The scenario pins today's no-recovery behavior,
+so it needs updating when recovery is added. A graceful stop ends the workloads
+with or without the per-generation job; the job is what covers a hard kill.
+Select it with `-Scenario gateway-restart`.
+
 The `ws-agent.yaml` and `openclaw-gateway.yaml` policies preserve the Windows
 branch's workload grants. `inference.yaml` is a template: replace its filesystem,
 curl executable, inference host, and port placeholders before use. Authorize
