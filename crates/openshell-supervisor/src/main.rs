@@ -675,11 +675,14 @@ fn main() -> Result<()> {
                         args.attach_request_timeout_seconds,
                     ),
                     trace_context: openshell_supervisor::trace_context_from_environment(),
-                    provider_workload_api_socket: std::env::var_os(
-                        openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
-                    )
-                    .filter(|path| !path.is_empty())
-                    .map(PathBuf::from),
+                    provider_identity:
+                        openshell_supervisor_network::run::ProviderIdentitySource::WorkloadApi(
+                            std::env::var_os(
+                                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+                            )
+                            .filter(|path| !path.is_empty())
+                            .map(PathBuf::from),
+                        ),
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
                     takeover: None,
                     supervisor_recovery_timeout_secs: None,

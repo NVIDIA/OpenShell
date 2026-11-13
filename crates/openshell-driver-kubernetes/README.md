@@ -261,8 +261,14 @@ fails closed.
   when the token that opened it expires. Sandboxes cannot reach the stream,
   and the routing preface only selects which generation-pinned TLS identity
   the supervisor demands.
+- **Workload identity.** The gateway owns SPIFFE Broker API identity acquisition and provider-token
+  exchange when `openshell.gateway.spiffe_broker` is configured.
+  Shared supervisors receive final access tokens through their authenticated
+  sessions. No SPIFFE socket is mounted in a shared supervisor or workload Pod.
+  The existing Workload API option supplies the gateway's component identity
+  for the RFC 8693 intermediate exchange.
 
-The topology does not support upstream proxies or provider SPIFFE identity.
+The topology does not support upstream proxies.
 With a live replacement supervisor and a takeover-capable runtime, the gateway
 can move a paused sandbox generation to the replacement using a signed takeover
 grant. Recovery preserves workload processes and memory, but proxied connections

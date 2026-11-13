@@ -758,6 +758,12 @@ fn prepare_server_config_with_drivers(
     // the generated TLS bundle so upgrades pick up sandbox auth without a
     // user-authored config file.
     config.gateway_jwt = gateway_jwt;
+    config.spiffe_broker = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.spiffe_broker.clone());
+
+    // Reject invalid broker before startup; gateway state parses it later.
+    crate::spiffe_broker::validate_config(&config).map_err(|error| miette::miette!("{error}"))?;
 
     if let Some(normalized) = normalized_network_trust.as_ref() {
         // Use the same resolver as runtime construction, with the explicit

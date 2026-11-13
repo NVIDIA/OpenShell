@@ -407,6 +407,10 @@ topologySpreadConstraints: []
 gatewayConfig:
   openshell:
     version: 2
+  # openshell.gateway.spiffe_broker enables gateway-owned sandbox JWT-SVID
+  # acquisition over mTLS. Configure the Broker endpoint, exact agent SPIFFE
+  # identity, Workload API socket, and stable sandbox SPIFFE ID prefix. SPIRE
+  # must authorize the gateway and attest its Sandbox object references.
 
 # Server configuration
 server:

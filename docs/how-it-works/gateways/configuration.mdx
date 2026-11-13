@@ -1447,6 +1447,38 @@ The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
 
+### Sandbox identity through the SPIFFE Broker API
+
+For shared-supervisor Kubernetes sandboxes, the gateway can obtain sandbox
+JWT-SVIDs through SPIRE's experimental Broker API. This uses the gateway's own
+X.509-SVID over mTLS.
+
+```toml
+[openshell.gateway.spiffe_broker]
+spiffe_id_prefix = "spiffe://example.org/openshell"
+endpoint = "https://spire-broker.spire.svc:8443"
+server_spiffe_id = "spiffe://example.org/spire/agent/k8s_psat/cluster/node-uid"
+workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
+```
+
+Gateway session JWTs with a positive TTL are required.
+The gateway fetches fresh X.509 credentials and trust bundles for each token
+acquisition, so Workload API rotation does not require a gateway restart.
+
+The operator must enable SPIRE's Broker endpoint, authorize the gateway SPIFFE
+ID for `KubernetesObjectReference` over TCP, and configure the Kubernetes
+attestor with `access_policy = "enforced"`. Give the agent permission to look
+up Sandbox resources and create SubjectAccessReviews. Grant the gateway's
+SPIFFE ID the `impersonate-via-spire` verb on Sandbox resources only in its
+permitted namespaces.
+
+Register each sandbox's stable SPIFFE ID against its attested Sandbox resource
+UID. The gateway supplies the UID from its persisted compute-runtime identity;
+workload Pod replacement does not change it. Registrations must reach every
+agent that serves the configured endpoint. `server_spiffe_id` must match that
+endpoint's agent certificate exactly. The installed SPIRE version and operator
+must support the experimental API; this configuration alone does not enable it.
+
 ### MXC
 
 The MXC driver runs native Windows workloads through `wxc-exec`. Use this

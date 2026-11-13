@@ -104,3 +104,42 @@ tests:
             name: supervisor-token
             secret:
               secretName: openshell-supervisor-token
+  - it: omits the gateway admin socket when delegation is disabled
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+          provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: spiffe-workload-api
+            mountPath: /spiffe-workload-api
+            readOnly: true
+      - notExists:
+          path: spec.template.spec.volumes[*].hostPath
+  - it: uses only the Workload API CSI mount for broker identity
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          spiffe_id_prefix: spiffe://example.org/openshell
+          endpoint: https://spire-broker.spire.svc:8443
+          server_spiffe_id: spiffe://example.org/spire/agent/node
+          workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - notExists:
+          path: spec.template.spec.securityContext.supplementalGroups
+      - notExists:
+          path: spec.template.spec.volumes[*].hostPath
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spiffe-workload-api
+            csi:
+              driver: csi.spiffe.io
+              readOnly: true

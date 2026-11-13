@@ -107,6 +107,22 @@ OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
   mise run e2e:kubernetes:shared-supervisor
 ```
 
+`mise run e2e:kubernetes:shared-supervisor-spiffe` installs pinned SPIRE charts
+(`ci/values-spire-broker-stack.yaml`) and the `openshell.gateway.spiffe_broker`
+overlay (`ci/values-supervisor-spiffe.yaml`). It exercises provider exchange and
+abrupt supervisor takeover over TLS, using Sandbox CR UID registrations and
+enforced Kubernetes authorization. Workload generation, Pod, process, and stable
+SPIFFE identity survive; the new owner acquires a fresh provider token and the
+broker rejects the old bearer. The fixture's 30-second workload X.509-SVIDs
+exercise acquisition after credential rotation. The gateway Pod must pass
+Restricted Pod Security admission. The task owns its SPIRE install and cluster.
+
+The fixture supplies the single agent's exact SPIFFE ID. Multi-agent endpoints
+need matching peer identity configuration and registrations for every selected
+agent. The installed SPIRE version and operator must expose the experimental
+Broker API. `e2e/kubernetes/spiffe-broker/README.md` describes independent
+protocol and negative authorization checks.
+
 ### Shared supervisor high availability
 
 The shared supervisor is always a pool of `supervisor.replicas` members

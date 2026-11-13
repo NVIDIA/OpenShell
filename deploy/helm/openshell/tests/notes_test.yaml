@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: install notes
+templates:
+  - templates/NOTES.txt
+release:
+  name: openshell
+  namespace: gateway
+tests:
+  - it: describes enforced Broker API authorization
+    set:
+      gatewayConfig:
+        openshell.gateway.spiffe_broker:
+          spiffe_id_prefix: spiffe://example.org/openshell
+          endpoint: https://spire-broker.spire.svc:8443
+          server_spiffe_id: spiffe://example.org/spire/agent/node
+          workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - matchRegexRaw:
+          pattern: "gateway uses mTLS"
+      - matchRegexRaw:
+          pattern: "impersonate-via-spire"

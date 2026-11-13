@@ -4,6 +4,8 @@
 //! Rustls adapter. Explicit configurations use this provider. Library callers
 //! may retain an embedder's process default; that default is not attested here.
 
+pub mod spiffe;
+
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use std::sync::Arc;
 

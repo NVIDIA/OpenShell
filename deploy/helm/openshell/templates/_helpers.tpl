@@ -393,6 +393,22 @@ fullname, so the name never collapses into another release resource's name.
 {{- printf "%s%s" $base $suffix -}}
 {{- end }}
 
+{{/* Validate gateway-owned SPIFFE Broker API settings. */}}
+{{- define "openshell.validateSpiffeBroker" -}}
+{{- $broker := .broker -}}
+{{- if not (regexMatch "^https://[^/]+/?$" (get $broker "endpoint" | default "")) -}}
+{{- fail "spiffe_broker.endpoint must be an HTTPS endpoint" -}}
+{{- end -}}
+{{- if not (regexMatch "^(/[A-Za-z0-9_.-]+){2,}$" (get $broker "workload_api_socket_path" | default "")) -}}
+{{- fail "spiffe_broker.workload_api_socket_path must be an absolute UNIX socket path" -}}
+{{- end -}}
+{{- range $field := list "server_spiffe_id" "spiffe_id_prefix" -}}
+{{- if not (regexMatch "^spiffe://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*$" (get $broker $field | default "")) -}}
+{{- fail (printf "spiffe_broker.%s must be a SPIFFE ID" $field) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{/*
 Pod labels of the shared supervisor; its Service selects exactly these.
 */}}
@@ -753,8 +769,8 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if ne (get $gateway "compute_driver" | default "kubernetes") "kubernetes" -}}
 {{- fail "supervisor_topology requires the kubernetes compute driver" -}}
 {{- end -}}
-{{- if or (get $kubernetes "https_proxy") (get $kubernetes "proxy_ca_bundle") (get $kubernetes "proxy_auth_secret_name") (get $kubernetes "provider_spiffe_workload_api_socket_path") -}}
-{{- fail "supervisor_topology=gateway does not support upstream proxy settings or provider SPIFFE identity" -}}
+{{- if or (get $kubernetes "https_proxy") (get $kubernetes "proxy_ca_bundle") (get $kubernetes "proxy_auth_secret_name") -}}
+{{- fail "supervisor_topology=gateway does not support upstream proxy settings" -}}
 {{- end -}}
 {{- if .Values.server.disableTls -}}
 {{- fail "supervisor_topology=gateway requires gateway TLS; the supervisor token travels only over TLS" -}}
@@ -762,6 +778,13 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (eq (get $kubernetes "workspace_mode" | default "shared") "operator") (not (regexMatch "^[A-Za-z0-9][-A-Za-z0-9_./]*==?[-A-Za-z0-9_.]*$" (get $kubernetes "operator_namespace_label" | default ""))) -}}
 {{- fail "supervisor_topology=gateway in operator workspace mode requires operator_namespace_label of the form key=value" -}}
 {{- end -}}
+{{- end -}}
+{{- $broker := get (.Values.gatewayConfig | default dict) "openshell.gateway.spiffe_broker" | default dict -}}
+{{- if $broker -}}
+{{- if ne (get $kubernetes "supervisor_topology" | default "") "gateway" -}}
+{{- fail "spiffe_broker requires supervisor_topology=gateway" -}}
+{{- end -}}
+{{- include "openshell.validateSpiffeBroker" (dict "broker" $broker) -}}
 {{- end -}}
 {{- if hasKey (get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict) "shared_supervisor" -}}
 {{- fail "shared_supervisor is rendered by the chart; set only supervisor_topology" -}}

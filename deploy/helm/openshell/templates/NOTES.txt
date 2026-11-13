@@ -1,0 +1,14 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+*/ -}}
+{{- $broker := get (.Values.gatewayConfig | default dict) "openshell.gateway.spiffe_broker" | default dict -}}
+{{- if $broker }}
+SPIFFE Broker API (openshell.gateway.spiffe_broker) is enabled.
+The gateway uses mTLS with X.509-SVIDs from its CSI Workload API socket.
+Enable the experimental Broker endpoint on SPIRE, allowlist the gateway SPIFFE
+ID and KubernetesObjectReference over TCP, and configure enforced Kubernetes
+SubjectAccessReview authorization (impersonate-via-spire) for Sandbox resources.
+Registrations must match the attested Sandbox resource UID on every selected
+agent. The configured server_spiffe_id must match that endpoint's agent SVID.
+{{- end }}

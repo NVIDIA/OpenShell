@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# The wrapper supplies this fixture's node-specific server_spiffe_id.
+supervisor:
+  replicas: 2
+  recoveryTimeoutSeconds: 60
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+    provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+  openshell.gateway.spiffe_broker:
+    spiffe_id_prefix: spiffe://openshell.local/openshell
+    endpoint: https://spire-broker.spire.svc:8443
+    server_spiffe_id: spiffe://openshell.local/spire/agent/fixture
+    workload_api_socket_path: /spiffe-workload-api/spire-agent.sock

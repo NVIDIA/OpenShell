@@ -313,7 +313,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         main_exit_marker: None,
         attach_request_timeout: Duration::from_mins(5),
         trace_context: None,
-        provider_workload_api_socket: None,
+        provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::default(),
         proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
         takeover: None,
         supervisor_recovery_timeout_secs: None,
