@@ -1010,8 +1010,16 @@ enum StreamEnd {
         redial: Option<String>,
     },
     /// The gateway sent the host to another replica; dial it at once.
-    Redirected { peer_endpoint: String },
+    /// `accepted` records whether the gateway had accepted the host.
+    Redirected {
+        peer_endpoint: String,
+        accepted: bool,
+    },
 }
+
+/// Redirects a host follows in a row: the replica a redirect names may find
+/// itself full and send the host on once more.
+const REDIRECT_HOPS: u32 = 2;
 
 /// What a gateway sends a host on its assignment stream.
 type GatewayInbound = std::pin::Pin<
@@ -1097,10 +1105,10 @@ async fn attach_with(
     // unanswered ones is still quick.
     let mut unanswered = 0_u32;
     let mut redial = None;
-    // `redirected`: this attempt follows a redirect. `stay`: the attempt after
-    // a failed redirect stays wherever the Service lands it, so a stale ring
-    // cannot send it back to the replica it could not reach.
-    let mut redirected = false;
+    // `hops`: redirects followed since the host was last placed. `stay`: the
+    // attempt after a failed redirect stays wherever the Service lands it, so
+    // a stale ring cannot send it back to the replica it could not reach.
+    let mut hops = 0_u32;
     let mut stay = false;
     tokio::pin!(shutdown);
     loop {
@@ -1112,25 +1120,40 @@ async fn attach_with(
                 member_id: host.pool.member_id.clone(),
                 runtime_address: host.pool.runtime_address.to_string(),
             }),
-            accepts_redirect: !stay && redial.is_none(),
+            accepts_redirect: !stay
+                && if hops == 0 {
+                    redial.is_none()
+                } else {
+                    hops < REDIRECT_HOPS
+                },
         };
+        let accepts_redirect = hello.accepts_redirect;
         let attempt_timeout = timings.attempt_timeout(unanswered);
         let end = tokio::select! {
             end = run_stream(&host, connector.as_ref(), &reconciler, hello, &timings, attempt_timeout, redial.as_deref()) => end,
             () = &mut shutdown => return reconciler.shut_down().await,
         };
         let (accepted, next) = match end {
-            StreamEnd::Redirected { peer_endpoint } if !redirected => {
+            StreamEnd::Redirected {
+                peer_endpoint,
+                accepted,
+            } if accepted || accepts_redirect => {
                 tracing::info!(%peer_endpoint, "gateway redirected the supervisor host");
+                if accepted {
+                    failed = 0;
+                    unanswered = 0;
+                    hops = 0;
+                }
+                hops += 1;
+                stay = false;
                 redial = Some(peer_endpoint);
-                redirected = true;
                 continue;
             }
-            StreamEnd::Redirected { .. } => (false, None),
+            StreamEnd::Redirected { accepted, .. } => (accepted, None),
             StreamEnd::Lost { accepted, redial } => (accepted, redial),
         };
-        stay = redirected && !accepted;
-        redirected = false;
+        stay = hops > 0 && !accepted;
+        hops = 0;
         redial = next;
         if accepted {
             failed = 0;
@@ -1498,7 +1521,7 @@ async fn run_stream(
                         break lost(accepted);
                     }
                     Some(host_gateway_message::Payload::Redirect(redirect)) if !redirect.peer_endpoint.is_empty() => {
-                        break StreamEnd::Redirected { peer_endpoint: redirect.peer_endpoint };
+                        break StreamEnd::Redirected { peer_endpoint: redirect.peer_endpoint, accepted };
                     }
                     Some(host_gateway_message::Payload::Redirect(_)) => break lost(accepted),
                     Some(host_gateway_message::Payload::Assignments(snapshot)) => {
@@ -1979,6 +2002,7 @@ mod tests {
     }
 
     /// How one connection attempt to a [`FakeGateway`] goes.
+    #[derive(Clone, Copy)]
     enum Attempt {
         /// Never opens.
         Hang,
@@ -2337,45 +2361,87 @@ mod tests {
         assert_eq!(next.endpoint, None);
     }
 
-    fn hello_stays(message: Option<HostMessage>) -> bool {
+    fn accepts_redirect(message: Option<HostMessage>) -> bool {
         match message {
             Some(HostMessage {
                 payload: Some(host_message::Payload::Hello(hello)),
-            }) => !hello.accepts_redirect,
+            }) => hello.accepts_redirect,
             other => panic!("expected a hello, got {other:?}"),
         }
     }
 
-    /// A redirected host dials the named replica at once and asks to stay;
-    /// when that replica does not accept it, the host asks the replica the
-    /// Service picks to keep it.
+    fn redirect_to(peer_endpoint: &str) -> HostGatewayMessage {
+        openshell_supervisor_control::controller::redirect(peer_endpoint.to_string())
+    }
+
+    /// A redirected host dials the named replica at once and takes one more
+    /// redirect from it, then stays; when the replica it was sent to does not
+    /// accept it, the host asks the replica the Service picks to keep it.
     #[tokio::test(start_paused = true)]
-    async fn a_redirected_host_dials_the_replica_at_once_and_stays() {
-        let (_host, _gateway, mut streams, _root) =
-            attach_pool_host(vec![Attempt::Now, Attempt::Now, Attempt::Now, Attempt::Now]);
+    async fn a_redirected_host_follows_at_most_two_redirects_then_stays() {
+        let (_host, _gateway, mut streams, _root) = attach_pool_host(vec![Attempt::Now; 5]);
         let mut first = streams.recv().await.unwrap();
-        assert!(!hello_stays(first.outbound.recv().await));
+        assert!(accepts_redirect(first.outbound.recv().await));
         first
             .inbound
-            .send(Ok(openshell_supervisor_control::controller::redirect(
-                "https://gw-b:8443".to_string(),
-            )))
+            .send(Ok(redirect_to("https://gw-b:8443")))
             .await
             .unwrap();
 
-        let mut redirected = streams.recv().await.unwrap();
-        assert_eq!(redirected.endpoint.as_deref(), Some("https://gw-b:8443"));
-        assert_eq!(redirected.at, first.at);
-        assert!(hello_stays(redirected.outbound.recv().await));
-        drop(redirected);
+        let mut second = streams.recv().await.unwrap();
+        assert_eq!(second.endpoint.as_deref(), Some("https://gw-b:8443"));
+        assert_eq!(second.at, first.at);
+        assert!(accepts_redirect(second.outbound.recv().await));
+        second
+            .inbound
+            .send(Ok(redirect_to("https://gw-c:8443")))
+            .await
+            .unwrap();
+
+        let mut third = streams.recv().await.unwrap();
+        assert_eq!(third.endpoint.as_deref(), Some("https://gw-c:8443"));
+        assert_eq!(third.at, first.at);
+        assert!(!accepts_redirect(third.outbound.recv().await));
+        drop(third);
 
         let mut fallback = streams.recv().await.unwrap();
         assert_eq!(fallback.endpoint, None);
-        assert!(hello_stays(fallback.outbound.recv().await));
+        assert!(!accepts_redirect(fallback.outbound.recv().await));
         drop(fallback);
 
         let mut next = streams.recv().await.unwrap();
-        assert!(!hello_stays(next.outbound.recv().await));
+        assert!(accepts_redirect(next.outbound.recv().await));
+    }
+
+    /// A host accepted where a redirect sent it follows that replica's own
+    /// redirect when it stops, at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_host_follows_a_later_handoff_redirect() {
+        let (_host, _gateway, mut streams, _root) = attach_pool_host(vec![Attempt::Now; 3]);
+        let first = streams.recv().await.unwrap();
+        first
+            .inbound
+            .send(Ok(redirect_to("https://gw-b:8443")))
+            .await
+            .unwrap();
+
+        let second = streams.recv().await.unwrap();
+        second
+            .inbound
+            .send(Ok(accepted_by("https://gw-b:8443")))
+            .await
+            .unwrap();
+        let handed_off = tokio::time::Instant::now();
+        second
+            .inbound
+            .send(Ok(redirect_to("https://gw-c:8443")))
+            .await
+            .unwrap();
+
+        let mut third = streams.recv().await.unwrap();
+        assert_eq!(third.endpoint.as_deref(), Some("https://gw-c:8443"));
+        assert_eq!(third.at, handed_off);
+        assert!(accepts_redirect(third.outbound.recv().await));
     }
 
     /// A replica that keeps writing but stops reading fills the host's

@@ -167,8 +167,6 @@ pub struct MemberView {
     pub runtime_address: String,
     /// The member announced it is leaving the pool.
     pub leaving: bool,
-    /// Gateway replica serving the member's stream.
-    pub gateway_replica: String,
 }
 
 /// The gateway's durable view of a supervisor pool, replaced as a whole by
@@ -1493,7 +1491,6 @@ mod tests {
             process_id: process.to_string(),
             runtime_address: format!("10.0.0.{}:5500", member.len()),
             leaving: false,
-            gateway_replica: String::new(),
         }
     }
 

@@ -77,6 +77,7 @@ use crate::gateway_ring::GatewayRing;
 use crate::persistence::{
     AtomicWrite, ObjectCursor, ObjectRecord, PersistenceError, Store, WriteCondition,
 };
+use crate::supervisor_spread::SupervisorSpread;
 
 const MEMBER_OBJECT_TYPE: &str = "supervisor_pool_member";
 const OWNER_OBJECT_TYPE: &str = "supervisor_instance_owner";
@@ -392,6 +393,7 @@ pub struct SupervisorPool {
     /// Keeps the pool's launch material.
     credentials: CredentialRuntime,
     replica_id: String,
+    spread: Arc<SupervisorSpread>,
     member_ttl: Duration,
     /// How often the records of served members are refreshed.
     member_refresh: Duration,
@@ -770,6 +772,7 @@ impl SupervisorPool {
         authority: Arc<SandboxSessionJwtAuthority>,
         credentials: CredentialRuntime,
         replica_id: String,
+        spread: Arc<SupervisorSpread>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -777,6 +780,7 @@ impl SupervisorPool {
             authority,
             credentials,
             replica_id,
+            spread,
             member_ttl: MEMBER_TTL,
             member_refresh: openshell_supervisor_control::pool_timing::MEMBER_REFRESH_INTERVAL,
             unowned_grace: UNOWNED_GRACE,
@@ -2132,6 +2136,7 @@ impl SupervisorPool {
         }
         self.remove_withdrawn().await;
         let members = self.live_members().await?;
+        self.spread.observe(&members);
         let ring = ring_of(&members);
         let listed_at = tokio::time::Instant::now();
         // Listed before the owners, so a report row of a term newer than the
@@ -2828,7 +2833,6 @@ impl SupervisorPool {
                     process_id: member.process_id.clone(),
                     runtime_address: member.runtime_address.clone(),
                     leaving: member.leaving,
-                    gateway_replica: member.gateway_replica.clone(),
                 })
                 .collect(),
             owners: BTreeMap::new(),
@@ -3056,6 +3060,7 @@ mod tests {
                 self.authority.clone(),
                 self.credentials.clone(),
                 replica_id.to_string(),
+                Arc::default(),
             );
             let unique = Arc::get_mut(&mut pool).expect("unique");
             unique.unowned_grace = Duration::ZERO;
@@ -3088,6 +3093,7 @@ mod tests {
                 self.authority.clone(),
                 self.credentials.clone(),
                 replica_id.to_string(),
+                Arc::default(),
             )
         }
 
