@@ -16,8 +16,11 @@
 //!
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+pub use openshell_driver_sdk::net::{
+    connect_std_tcp_nodelay_best_effort, connect_tcp_nodelay_best_effort,
+    set_tcp_nodelay_best_effort,
+};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use tokio::net::TcpStream;
 
 /// Check if a hostname is a known cloud metadata hostname that resolves to an
 /// always-blocked metadata service.
@@ -163,15 +166,25 @@ pub fn is_always_blocked_net(net: IpNet) -> bool {
 }
 
 const RFC1918_10_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 8);
+
 const RFC1918_172_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(172, 16, 0, 0), 12);
+
 const RFC1918_192_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(192, 168, 0, 0), 16);
+
 const CGNAT_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(100, 64, 0, 0), 10);
+
 const IETF_PROTOCOL_ASSIGNMENTS_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 0, 0), 24);
+
 const TEST_NET_1: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 2, 0), 24);
+
 const BENCHMARKING_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 15);
+
 const TEST_NET_2: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(198, 51, 100, 0), 24);
+
 const TEST_NET_3: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(203, 0, 113, 0), 24);
+
 const LIMITED_BROADCAST_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::BROADCAST, 32);
+
 const IPV6_ULA_NET: Ipv6Net = Ipv6Net::new_assert(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7);
 
 const NON_HARD_INTERNAL_V4_NETS: [Ipv4Net; 10] = [
@@ -283,46 +296,6 @@ fn is_internal_v4(v4: Ipv4Addr) -> bool {
         return true;
     }
     false
-}
-
-/// Enable `TCP_NODELAY` on a stream, logging (not returning) any failure.
-///
-/// Disabling Nagle's algorithm keeps small writes from waiting on delayed ACKs.
-/// It's a latency optimization: if it fails the connection still works, just a
-/// bit slower, so there is nothing for the caller to act on — we log and move on.
-pub fn set_tcp_nodelay_best_effort(stream: &TcpStream) {
-    if let Err(e) = stream.set_nodelay(true) {
-        tracing::debug!(error = %e, "failed to set TCP_NODELAY");
-    }
-}
-
-/// Connect to `addr`, then enable `TCP_NODELAY` on a best-effort basis, propagating
-/// any errors from `TcpStream::connect`.
-///
-/// The returned stream is not *guaranteed* to have `TCP_NODELAY` set.
-pub async fn connect_tcp_nodelay_best_effort(
-    addr: impl tokio::net::ToSocketAddrs,
-) -> std::io::Result<TcpStream> {
-    #[allow(clippy::disallowed_methods, reason = "the one sanctioned async dial")]
-    let stream = TcpStream::connect(addr).await?;
-    set_tcp_nodelay_best_effort(&stream);
-    Ok(stream)
-}
-
-/// Blocking counterpart of [`connect_tcp_nodelay_best_effort`] for threads that
-/// cannot use the async helper, such as a `setns` worker.
-pub fn connect_std_tcp_nodelay_best_effort(
-    addr: impl std::net::ToSocketAddrs,
-) -> std::io::Result<std::net::TcpStream> {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "the one sanctioned blocking dial"
-    )]
-    let stream = std::net::TcpStream::connect(addr)?;
-    if let Err(e) = stream.set_nodelay(true) {
-        tracing::debug!(error = %e, "failed to set TCP_NODELAY");
-    }
-    Ok(stream)
 }
 
 #[cfg(test)]
@@ -744,33 +717,5 @@ mod tests {
     fn test_internal_ip_ipv6_mapped_cgnat() {
         let v6 = Ipv4Addr::new(100, 64, 0, 1).to_ipv6_mapped();
         assert!(is_internal_ip(IpAddr::V6(v6)));
-    }
-
-    // -- tcp_nodelay helpers --
-
-    #[tokio::test]
-    async fn set_tcp_nodelay_best_effort_enables_nodelay() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("local addr");
-        #[allow(clippy::disallowed_methods, reason = "needs a stream without nodelay")]
-        let stream = TcpStream::connect(addr).await.expect("connect");
-
-        set_tcp_nodelay_best_effort(&stream);
-        assert!(stream.nodelay().expect("query TCP_NODELAY"));
-    }
-
-    #[tokio::test]
-    async fn connect_tcp_nodelay_best_effort_sets_nodelay() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("local addr");
-
-        let stream = connect_tcp_nodelay_best_effort(addr)
-            .await
-            .expect("connect");
-        assert!(stream.nodelay().expect("query TCP_NODELAY"));
     }
 }

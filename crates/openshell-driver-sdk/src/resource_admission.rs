@@ -4,13 +4,12 @@
 //! Operator-owned external resource admission. GPU attachments are temporarily
 //! exempt; this policy must not be interpreted as permission to attach host paths.
 
+use crate::driver_utils::{LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_SANDBOX_WORKSPACE};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-
-use crate::driver_utils::{LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_SANDBOX_WORKSPACE};
-
 const WORKSPACE_PLACEHOLDER: &str = "${workspace}";
+
 const RESERVED_LABEL_KEYS: [&str; 3] =
     [LABEL_MANAGED_BY, LABEL_GATEWAY_ID, LABEL_SANDBOX_WORKSPACE];
 
@@ -87,20 +86,6 @@ impl std::str::FromStr for DriverAdmissionConfig {
         let policy: Self = serde_json::from_str(value).map_err(|error| error.to_string())?;
         policy.validate()?;
         Ok(policy)
-    }
-}
-
-/// Reserved driver-owned runtime metadata; caller labels must never override it.
-pub const CONFIG_USED_LABEL: &str = "openshell.ai/caller-driver-config-used";
-pub const IDENTITIES_LABEL: &str = "openshell.ai/resource-admission-identities";
-
-pub fn check_config_provenance(allowed: bool, recorded: Option<&str>) -> Result<(), tonic::Status> {
-    match recorded {
-        Some("false") => Ok(()),
-        Some("true") if allowed => Ok(()),
-        _ => Err(tonic::Status::failed_precondition(
-            "sandbox uses forbidden driver config or lacks admission provenance; recreate it",
-        )),
     }
 }
 

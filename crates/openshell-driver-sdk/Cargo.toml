@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-driver-sdk"
+description = "Narrow shared contract for OpenShell compute drivers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+openshell-crypto = { workspace = true, optional = true }
+openshell-otel = { path = "../openshell-otel", optional = true }
+base64 = { workspace = true }
+clap = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true, features = ["channel"] }
+tonic-prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+rustls = { workspace = true }
+miette = { workspace = true }
+url = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+nix = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+openshell-crypto = { workspace = true }
+rcgen = { workspace = true }
+base64 = { workspace = true }
+tempfile = "3"
+
+[features]
+default = []
+## Report anonymous telemetry as enabled unless the environment disables it. When
+## off, drivers always report it disabled.
+telemetry = []
+## Strict Ed25519 JWT issuance and verification for authenticated sandbox sessions.
+jwt = ["dep:openshell-crypto", "dep:jsonwebtoken", "dep:zeroize"]
+## Conversions to `openshell-otel` types.
+otel = ["dep:openshell-otel"]
+## Command-line flags shared by compute drivers.
+clap = ["dep:clap"]
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
+
+[lints]
+workspace = true

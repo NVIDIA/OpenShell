@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-container-runtime"
+description = "Code shared by the OpenShell desktop compute drivers (Docker, Podman, VM)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+miette = { workspace = true }
+serde = { workspace = true }
+tonic = { workspace = true }
+rustls = { workspace = true }
+tar = "0.4"
+tempfile = "3"
+openshell-driver-sdk = { path = "../openshell-driver-sdk" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,156 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use std::env;
+use std::path::PathBuf;
+
+mod build_version;
+
+const PROTO_REL: &str = "../../proto";
+
+/// Proto files that make up the compute-driver contract. Their transitive
+/// imports are `options`, `extension`, `datamodel`, and `sandbox`; no other
+/// proto file is needed.
+const PROTO_FILES: &[&str] = &[
+    "options.proto",
+    "extension.proto",
+    "datamodel.proto",
+    "sandbox.proto",
+    "compute_driver.proto",
+];
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A caller-supplied PROTOC (for example a distro package's system
+    // compiler) is used as-is and prost resolves its own includes. Without it,
+    // use the vendored compiler and include tree.
+    println!("cargo:rerun-if-env-changed=PROTOC");
+    println!("cargo:rerun-if-env-changed=PROTOC_INCLUDE");
+    let use_vendored_protoc = env::var_os("PROTOC").is_none();
+
+    // In vendored mode, preserve the vendored include-tree guarantee even when
+    // the caller has PROTOC_INCLUDE set: prost validates that ambient path
+    // independently of explicit includes. Re-enter with a child-only
+    // environment override.
+    if use_vendored_protoc && env::var_os("PROTOC_INCLUDE").is_some() {
+        let status = std::process::Command::new(env::current_exe()?)
+            .env_remove("PROTOC_INCLUDE")
+            .status()?;
+        if !status.success() {
+            return Err(format!("vendored protobuf build failed: {status}").into());
+        }
+        return Ok(());
+    }
+
+    // --- Git-derived version ---
+    // Compute a version from tags and commit metadata for local builds. In
+    // Docker/CI builds where .git is absent, this silently does nothing and
+    // the binary falls back to CARGO_PKG_VERSION (which is already sed-patched
+    // by the build pipeline).
+    for path in git_rerun_paths() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
+    if let Some(version) = git_version() {
+        println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");
+    }
+
+    // --- Protobuf compilation ---
+    println!("cargo:rerun-if-changed={PROTO_REL}");
+    let mut proto_config = tonic_prost_build::Config::new();
+    let proto_include = if use_vendored_protoc {
+        proto_config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
+        Some(protoc_bin_vendored::include_path()?)
+    } else {
+        None
+    };
+
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let proto_root = manifest_dir.join(PROTO_REL);
+    let proto_files: Vec<PathBuf> = PROTO_FILES.iter().map(|f| proto_root.join(f)).collect();
+
+    let mut include_dirs = vec![proto_root];
+    include_dirs.extend(proto_include);
+
+    tonic_prost_build::configure()
+        .type_attribute(
+            ".openshell.sandbox.v1.SupervisorMiddlewareBinding",
+            r#"#[derive(serde::Serialize, serde::Deserialize)] #[serde(rename_all = "snake_case")]"#,
+        )
+        .build_server(true)
+        .build_client(true)
+        .include_file("openshell.rs")
+        .compile_with_config(proto_config, &proto_files, &include_dirs)?;
+
+    Ok(())
+}
+
+/// Git metadata files whose changes affect [`git_version`].
+///
+/// In a linked worktree `.git` is a file, so `HEAD` and `logs/HEAD` live in the
+/// per-worktree git dir while branch and tag refs live in the common git dir. Cargo treats a
+/// missing `rerun-if-changed` path as always stale, so only existing paths are
+/// returned. Without git metadata nothing is returned.
+fn git_rerun_paths() -> Vec<PathBuf> {
+    let resolve = |args: &[&str]| {
+        let dir = PathBuf::from(git_output(args)?);
+        // Relative output is relative to the build script's working directory.
+        Some(env::current_dir().ok()?.join(dir))
+    };
+    let mut paths = Vec::new();
+    if let Some(git_dir) = resolve(&["rev-parse", "--git-dir"]) {
+        paths.push(git_dir.join("HEAD"));
+        paths.push(git_dir.join("logs/HEAD"));
+    }
+    if let Some(common_dir) = resolve(&["rev-parse", "--git-common-dir"]) {
+        paths.push(common_dir.join("refs/tags"));
+        paths.push(common_dir.join("packed-refs"));
+        // A new worktree has no `logs/HEAD` until its first ref update, so also
+        // watch the checked-out branch ref, which moves on every commit.
+        if let Some(branch) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
+            paths.push(common_dir.join(branch));
+        }
+    }
+    paths.retain(|path| path.exists());
+    paths
+}
+
+/// Derive the release or development version from git metadata.
+///
+/// Implements the "guess-next-dev" convention used by the release pipeline
+/// (`tasks/scripts/release.py`): exact stable and prerelease tags retain their
+/// version. Otherwise, the latest merged stable release gets a patch bump and
+/// `-dev.<N>+g<sha>` is appended.
+///
+/// Examples:
+///   on tag v0.1.0-pre.1    → "0.1.0-pre.1"
+///   3 commits past v0.0.3  → "0.0.4-dev.3+g2bf9969ab"
+///
+/// Returns `None` when git metadata cannot be read.
+fn git_version() -> Option<String> {
+    let exact_tags = git_output(&["tag", "--points-at", "HEAD"])?;
+    if let Some(version) = build_version::exact_release_version(exact_tags.lines()) {
+        return Some(version);
+    }
+
+    let merged_tags = git_output(&["tag", "--merged", "HEAD", "--list", "v*.*.*"])?;
+    let latest_tag = build_version::latest_stable_tag(merged_tags.lines());
+    let revision_range = latest_tag
+        .as_deref()
+        .map_or_else(|| "HEAD".to_string(), |tag| format!("{tag}..HEAD"));
+    let distance = git_output(&["rev-list", "--count", &revision_range])?
+        .parse()
+        .ok()?;
+    let sha = git_output(&["rev-parse", "--short=9", "HEAD"])?;
+
+    build_version::next_dev_version(latest_tag.as_deref(), distance, &sha)
+}
+
+fn git_output(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|output| output.trim().to_string())
+}

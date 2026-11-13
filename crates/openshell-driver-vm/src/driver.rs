@@ -44,17 +44,17 @@ use oci_client::manifest::{
 };
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
-use openshell_core::UpstreamProxyConfig;
-use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
-use openshell_core::driver_mounts;
-use openshell_core::gpu::{
-    driver_gpu_requirements, effective_driver_gpu_count, validate_specific_gpu_device_request,
-};
-use openshell_core::progress::{
+use openshell_container_runtime::gpu::validate_specific_gpu_device_request;
+use openshell_container_runtime::proto_struct::deserialize_optional_non_empty_string_list;
+use openshell_driver_sdk::UpstreamProxyConfig;
+use openshell_driver_sdk::config::DEFAULT_STOP_TIMEOUT_SECS;
+use openshell_driver_sdk::driver_mounts;
+use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
+use openshell_driver_sdk::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
-use openshell_core::proto::compute::v1::{
+use openshell_driver_sdk::proto::compute::v1::{
     CpuResourceCapabilities, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
     DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
@@ -69,10 +69,8 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     WorkloadIdentityRequest, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
-use openshell_core::proto_struct::{
-    deserialize_optional_non_empty_string_list, struct_to_json_value,
-};
-use openshell_core::{
+use openshell_driver_sdk::proto_struct::struct_to_json_value;
+use openshell_driver_sdk::{
     NetworkSupervisorTrustBundle, network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES,
 };
 use openshell_sandbox_backend::boundary_protocol::{
@@ -204,12 +202,13 @@ const HOST_LOOPBACK_ALIASES: &[&str] = &[
     "host.docker.internal",
 ];
 #[allow(dead_code)]
-const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_PATH;
+const GUEST_SSH_SOCKET_PATH: &str = openshell_driver_sdk::container_paths::SSH_SOCKET_PATH;
 #[allow(dead_code)]
-const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
+const GUEST_TLS_CA_PATH: &str = openshell_driver_sdk::container_paths::VM_GUEST_TLS_CA_PATH;
 #[allow(dead_code)]
-const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
-const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
+const GUEST_SANDBOX_TOKEN_PATH: &str =
+    openshell_driver_sdk::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
+const GUEST_INIT_DROPIN_DIR: &str = openshell_driver_sdk::container_paths::VM_GUEST_INIT_DROPIN_DIR;
 const GUEST_BOUNDARY_CONFIG_DIR: &str = "/.openshell/state";
 const GUEST_BOUNDARY_CONFIG_ENV: &str = "OPENSHELL_VM_SANDBOX_BOOTSTRAP";
 const HOST_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
@@ -238,7 +237,7 @@ const VM_CONTROL_PORT: u32 = 5500;
 /// guest image — is ignored. The driver writes this file into the overlay
 /// upperdir on every launch, so the image cannot forge or shadow it.
 const GUEST_INIT_DROPIN_MANIFEST: &str =
-    openshell_core::container_paths::VM_GUEST_INIT_DROPIN_MANIFEST;
+    openshell_driver_sdk::container_paths::VM_GUEST_INIT_DROPIN_MANIFEST;
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
 const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
@@ -346,12 +345,12 @@ pub struct VmDriverConfig {
     pub allow_driver_config: bool,
     /// Operator-owned external attachment approval policy.
     #[serde(default)]
-    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
+    pub resource_admission: openshell_driver_sdk::resource_admission::ResourceAdmissionConfig,
     pub grpc_endpoint: String,
     /// OTLP exports passed to supervisors. The gateway supplies them from
     /// `[otlp]`; driver TOML cannot set them.
     #[serde(skip)]
-    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
+    pub supervisor_otlp: openshell_driver_sdk::sandbox_env::SupervisorOtlp,
     /// Gateway name passed to supervisors for their telemetry.
     pub supervisor_gateway_name: Option<String>,
     pub state_dir: PathBuf,
@@ -495,11 +494,11 @@ impl Default for VmDriverConfig {
     fn default() -> Self {
         Self {
             grpc_endpoint: String::new(),
-            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
+            supervisor_otlp: openshell_driver_sdk::sandbox_env::SupervisorOtlp::default(),
             supervisor_gateway_name: None,
             allow_driver_config: false,
             resource_admission:
-                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
+                openshell_driver_sdk::resource_admission::ResourceAdmissionConfig::default(),
             state_dir: PathBuf::from("target/openshell-vm-driver"),
             launcher_bin: None,
             default_image: String::new(),
@@ -554,7 +553,7 @@ impl VmDriverConfig {
             }
         }
         if let Some(endpoint) = self.provider_spiffe_workload_api_tcp_endpoint.as_deref() {
-            openshell_core::driver_utils::validate_guest_spiffe_tcp_endpoint(
+            openshell_driver_sdk::driver_utils::validate_guest_spiffe_tcp_endpoint(
                 endpoint,
                 self.provider_spiffe_allow_guest_tcp,
             )?;
@@ -1371,7 +1370,7 @@ impl VmDriver {
         state_dir: &Path,
         tls_paths: Option<&VmDriverTlsPaths>,
         runtime_descriptor: &SandboxRuntimeDescriptor,
-        auth_bundle: &openshell_core::jwt::SupervisorAuthBundle,
+        auth_bundle: &openshell_driver_sdk::jwt::SupervisorAuthBundle,
         sandbox_owner: SandboxOwnerIdentity,
     ) -> Result<(Child, Option<fs::File>), Status> {
         // The destination CA is staged on the host before either resolving
@@ -1416,10 +1415,11 @@ impl VmDriver {
             .map_err(|error| {
                 Status::internal(format!("restrict host runtime descriptor: {error}"))
             })?;
-        let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
-            sandbox.spec.as_ref(),
-        )
-        .map_err(|error| Status::internal(format!("encode main process spec: {error}")))?;
+        let main_process_spec =
+            openshell_driver_sdk::sandbox_env::MainProcessConfig::encode_driver_spec(
+                sandbox.spec.as_ref(),
+            )
+            .map_err(|error| Status::internal(format!("encode main process spec: {error}")))?;
         let upstream_proxy_args = upstream_proxy_cli_args(&self.config)
             .map_err(|error| Status::invalid_argument(format!("render upstream proxy: {error}")))?;
         let mut command = Command::new(&supervisor_binary);
@@ -1445,51 +1445,57 @@ impl VmDriver {
             .args(upstream_proxy_args)
             .args(network_trust_args)
             .env(
-                openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND,
+                openshell_driver_sdk::sandbox_env::ADMITTED_ISOLATION_BACKEND,
                 DRIVER_ADMITTED_BACKEND,
             )
             .env(
-                openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
+                openshell_driver_sdk::sandbox_env::MAIN_PROCESS_SPEC,
                 main_process_spec,
             )
-            .env(openshell_core::sandbox_env::ENDPOINT, openshell_endpoint)
-            .env(openshell_core::sandbox_env::SANDBOX_ID, &sandbox.id)
-            .env(openshell_core::sandbox_env::SANDBOX, &sandbox.name)
             .env(
-                openshell_core::sandbox_env::SSH_SOCKET_PATH,
+                openshell_driver_sdk::sandbox_env::ENDPOINT,
+                openshell_endpoint,
+            )
+            .env(openshell_driver_sdk::sandbox_env::SANDBOX_ID, &sandbox.id)
+            .env(openshell_driver_sdk::sandbox_env::SANDBOX, &sandbox.name)
+            .env(
+                openshell_driver_sdk::sandbox_env::SSH_SOCKET_PATH,
                 sandbox_socket_dir(&self.socket_root, &sandbox.id).join("ssh.sock"),
             )
             .env(
-                openshell_core::sandbox_env::PROXY_TLS_DIR,
+                openshell_driver_sdk::sandbox_env::PROXY_TLS_DIR,
                 state_dir.join("proxy-tls"),
             )
             .env(
-                openshell_core::sandbox_env::SANDBOX_UID,
+                openshell_driver_sdk::sandbox_env::SANDBOX_UID,
                 sandbox_owner.uid.to_string(),
             )
             .env(
-                openshell_core::sandbox_env::SANDBOX_GID,
+                openshell_driver_sdk::sandbox_env::SANDBOX_GID,
                 sandbox_owner.gid.to_string(),
             )
-            .env(openshell_core::sandbox_env::OCI_IMAGE_USER, "")
+            .env(openshell_driver_sdk::sandbox_env::OCI_IMAGE_USER, "")
             .env(
-                openshell_core::sandbox_env::LOG_LEVEL,
-                openshell_core::driver_utils::sandbox_log_level(sandbox, &self.config.log_level),
+                openshell_driver_sdk::sandbox_env::LOG_LEVEL,
+                openshell_driver_sdk::driver_utils::sandbox_log_level(
+                    sandbox,
+                    &self.config.log_level,
+                ),
             )
             .env(
-                openshell_core::sandbox_env::TELEMETRY_ENABLED,
-                openshell_core::telemetry::enabled_env_value(),
+                openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED,
+                openshell_driver_sdk::telemetry::enabled_env_value(),
             );
         command.envs(supervisor_otlp_environment(&self.config));
         if let Some(server_name) = gateway_tls_server_name {
             command.env(
-                openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
+                openshell_driver_sdk::sandbox_env::GATEWAY_TLS_SERVER_NAME,
                 server_name,
             );
         }
         configure_main_exit_marker(&mut command, state_dir);
         if let Some(tls) = tls_paths {
-            command.env(openshell_core::sandbox_env::TLS_CA, &tls.ca);
+            command.env(openshell_driver_sdk::sandbox_env::TLS_CA, &tls.ca);
         }
         #[cfg(unix)]
         let (liveness_read, liveness_write) = nix::unistd::pipe().map_err(|error| {
@@ -1535,23 +1541,24 @@ impl VmDriver {
 
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
-        let mut extension = openshell_core::extension_protocol::extension_metadata(
-            openshell_core::extension_protocol::ExtensionFamily::Compute,
+        let mut extension = openshell_driver_sdk::extension_protocol::extension_metadata(
+            openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
             "openshell/vm",
-            openshell_core::VERSION,
+            openshell_driver_sdk::VERSION,
             [],
         );
-        extension
-            .required_capabilities
-            .push(openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+        extension.required_capabilities.push(
+            openshell_driver_sdk::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION.to_string(),
+        );
         GetCapabilitiesResponse {
-            resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
-                allow_driver_config: self.config.allow_driver_config,
-                resource_admission: self.config.resource_admission.clone(),
-            }
-            .acknowledgement(),
+            resource_admission_policy:
+                openshell_driver_sdk::resource_admission::DriverAdmissionConfig {
+                    allow_driver_config: self.config.allow_driver_config,
+                    resource_admission: self.config.resource_admission.clone(),
+                }
+                .acknowledgement(),
             driver_name: DRIVER_NAME.to_string(),
-            driver_version: openshell_core::VERSION.to_string(),
+            driver_version: openshell_driver_sdk::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
@@ -1582,7 +1589,7 @@ impl VmDriver {
     // gRPC API surface; boxing here would diverge from every other handler.
     #[allow(clippy::result_large_err)]
     pub fn validate_sandbox(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        openshell_core::resource_admission::check_sandbox_driver_config(
+        openshell_driver_sdk::resource_admission::check_sandbox_driver_config(
             self.config.allow_driver_config,
             sandbox,
         )?;
@@ -2429,7 +2436,7 @@ impl VmDriver {
         if !sandbox_id.is_empty() {
             validate_sandbox_id(sandbox_id)?;
         }
-        let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+        let generation = openshell_driver_sdk::sandbox_generation::SandboxGenerationId::parse(
             generation_id.to_string(),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -5296,15 +5303,17 @@ fn configure_main_exit_marker(command: &mut Command, state_dir: &Path) {
 }
 
 #[tonic::async_trait]
-impl openshell_core::compute::ComputeDriver for VmDriver {}
+impl openshell_driver_sdk::compute::ComputeDriver for VmDriver {}
 
 #[tonic::async_trait]
 impl ComputeDriver for VmDriver {
     async fn authenticate_sandbox(
         &self,
-        _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
-    {
+        _request: Request<openshell_driver_sdk::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<
+        Response<openshell_driver_sdk::proto::compute::v1::AuthenticateSandboxResponse>,
+        Status,
+    > {
         Err(Status::unimplemented(
             "VM driver does not authenticate sandbox credentials",
         ))
@@ -5315,8 +5324,8 @@ impl ComputeDriver for VmDriver {
         request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         let capabilities = self.capabilities();
-        openshell_core::extension_protocol::validate_gateway_metadata(
-            openshell_core::extension_protocol::ExtensionFamily::Compute,
+        openshell_driver_sdk::extension_protocol::validate_gateway_metadata(
+            openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
             DRIVER_NAME,
             capabilities.extension.as_ref(),
             request.into_inner().gateway,
@@ -5519,7 +5528,7 @@ fn check_gpu_privileges() -> Result<(), String> {
 #[allow(clippy::result_large_err)]
 fn decode_launch_authentication(
     encoded: &[u8],
-) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
+) -> Result<openshell_driver_sdk::jwt::SandboxLaunchAuthentication, Status> {
     if encoded.is_empty() {
         return Err(Status::failed_precondition(
             "VM sandbox launch authentication is required; configure the gateway's \
@@ -5528,11 +5537,10 @@ fn decode_launch_authentication(
     }
     // Serde errors may quote an unexpected field or value from the secret
     // bundle. Return fixed diagnostics rather than forwarding those details.
-    let authentication =
-        serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(encoded)
-            .map_err(|_| {
-                Status::failed_precondition("VM sandbox launch authentication is malformed")
-            })?;
+    let authentication = serde_json::from_slice::<
+        openshell_driver_sdk::jwt::SandboxLaunchAuthentication,
+    >(encoded)
+    .map_err(|_| Status::failed_precondition("VM sandbox launch authentication is malformed"))?;
     authentication.validate().map_err(|_| {
         Status::failed_precondition("VM sandbox launch authentication has invalid fields")
     })?;
@@ -6740,20 +6748,20 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
     );
     environment.insert("TERM".to_string(), "xterm".to_string());
     environment.insert(
-        openshell_core::sandbox_env::SANDBOX_ID.to_string(),
+        openshell_driver_sdk::sandbox_env::SANDBOX_ID.to_string(),
         sandbox.id.clone(),
     );
     environment.insert(
-        openshell_core::sandbox_env::SANDBOX.to_string(),
+        openshell_driver_sdk::sandbox_env::SANDBOX.to_string(),
         sandbox.name.clone(),
     );
     environment.insert(
-        openshell_core::sandbox_env::LOG_LEVEL.to_string(),
-        openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
+        openshell_driver_sdk::sandbox_env::LOG_LEVEL.to_string(),
+        openshell_driver_sdk::driver_utils::sandbox_log_level(sandbox, &config.log_level),
     );
     environment.insert(
-        openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
-        openshell_core::telemetry::enabled_env_value().to_string(),
+        openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED.to_string(),
+        openshell_driver_sdk::telemetry::enabled_env_value().to_string(),
     );
     let mut pairs = environment.into_iter().collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
@@ -7277,7 +7285,7 @@ fn bootstrap_image_cache_identity(image_identity: &str) -> String {
     let image_identity = compute_bytes_sha256_hex(image_identity.as_bytes());
     format!(
         "{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:guest-{}:{image_identity}",
-        openshell_core::VERSION,
+        openshell_driver_sdk::VERSION,
         sandbox_guest_runtime_identity()
     )
 }
@@ -7297,7 +7305,7 @@ fn prepared_image_cache_identity(image_identity: &str, config: &VmDriverConfig) 
     );
     format!(
         "{PREPARED_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:{identity}:{image_identity}",
-        openshell_core::VERSION
+        openshell_driver_sdk::VERSION
     )
 }
 
@@ -7330,7 +7338,7 @@ fn sanitize_image_identity(image_identity: &str) -> String {
 
 fn unique_image_cache_suffix() -> String {
     let counter = IMAGE_CACHE_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{counter}", openshell_core::time::now_ms())
+    format!("{}-{counter}", openshell_driver_sdk::time::now_ms())
 }
 
 async fn write_sandbox_image_metadata(
@@ -7959,7 +7967,7 @@ fn overlay_staging_dir(overlay_disk: &Path) -> PathBuf {
     parent.join(format!(
         ".openshell-overlay-staging-{}-{}",
         std::process::id(),
-        openshell_core::time::now_ms()
+        openshell_driver_sdk::time::now_ms()
     ))
 }
 
@@ -8083,7 +8091,10 @@ fn supervisor_otlp_environment(config: &VmDriverConfig) -> Vec<(&'static str, St
         environment.extend(openshell_otel::current_trace_context_environment());
     }
     if let Some(name) = &config.supervisor_gateway_name {
-        environment.push((openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
+        environment.push((
+            openshell_driver_sdk::sandbox_env::GATEWAY_NAME,
+            name.clone(),
+        ));
     }
     environment
 }
@@ -8209,8 +8220,10 @@ fn error_condition(reason: &str, message: &str) -> SandboxCondition {
 
 fn platform_event(source: &str, event_type: &str, reason: &str, message: String) -> PlatformEvent {
     let mut event = PlatformEvent {
-        event_time: openshell_core::time::timestamp_from_millis(openshell_core::time::now_ms())
-            .ok(),
+        event_time: openshell_driver_sdk::time::timestamp_from_millis(
+            openshell_driver_sdk::time::now_ms(),
+        )
+        .ok(),
         source: source.to_string(),
         r#type: event_type.to_string(),
         reason: reason.to_string(),
@@ -8310,11 +8323,11 @@ fn pulling_layer_detail(metadata: &HashMap<String, String>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::gpu::allocate_vsock_cid;
-    use openshell_core::progress::{
+    use openshell_driver_sdk::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
     };
-    use openshell_core::proto::compute::v1::{
+    use openshell_driver_sdk::proto::compute::v1::{
         DriverSandboxSpec as SandboxSpec, DriverSandboxTemplate as SandboxTemplate,
         GpuResourceRequirements, ResourceRequirements,
     };
@@ -8775,7 +8788,7 @@ mod tests {
     }
 
     type TestDriverClient =
-        openshell_core::proto::compute::v1::compute_driver_client::ComputeDriverClient<
+        openshell_driver_sdk::proto::compute::v1::compute_driver_client::ComputeDriverClient<
             tonic::transport::Channel,
         >;
 
@@ -8817,7 +8830,7 @@ mod tests {
     }
 
     async fn traced_driver_client(driver: VmDriver) -> TracedDriverClient {
-        use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+        use openshell_driver_sdk::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -8854,8 +8867,8 @@ mod tests {
 
         client
             .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {
-                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
-                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                gateway: Some(openshell_driver_sdk::extension_protocol::gateway_metadata(
+                    openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
                 )),
             }))
             .await
@@ -8890,8 +8903,8 @@ mod tests {
 
         client
             .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {
-                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
-                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                gateway: Some(openshell_driver_sdk::extension_protocol::gateway_metadata(
+                    openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
                 )),
             }))
             .await
@@ -9947,7 +9960,7 @@ mod tests {
 
     #[test]
     fn validate_vm_sandbox_accepts_template_resources_as_noop() {
-        use openshell_core::proto::compute::v1::DriverResourceRequirements;
+        use openshell_driver_sdk::proto::compute::v1::DriverResourceRequirements;
 
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
@@ -10837,7 +10850,7 @@ mod tests {
             .await
             .expect("persisted sandbox request");
         let persisted_authentication =
-            serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(
+            serde_json::from_slice::<openshell_driver_sdk::jwt::SandboxLaunchAuthentication>(
                 &persisted
                     .spec
                     .expect("persisted sandbox spec")
@@ -11235,22 +11248,25 @@ mod tests {
         }
     }
 
-    fn test_launch_authentication(label: &str) -> (Vec<u8>, openshell_core::SandboxSessionId) {
-        use openshell_core::jwt::{
+    fn test_launch_authentication(
+        label: &str,
+    ) -> (Vec<u8>, openshell_driver_sdk::SandboxSessionId) {
+        use openshell_driver_sdk::jwt::{
             SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey, SupervisorAuthBundle,
         };
 
-        let session_id = openshell_core::SandboxSessionId::new();
+        let session_id = openshell_driver_sdk::SandboxSessionId::new();
         let authentication = SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
                 session_id,
-                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
-                    "generation-1",
-                )
-                .expect("runtime generation"),
-                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                runtime_generation:
+                    openshell_driver_sdk::sandbox_generation::SandboxGenerationId::parse(
+                        "generation-1",
+                    )
+                    .expect("runtime generation"),
+                session_rotation: openshell_driver_sdk::jwt::SessionRotation::new(1)
                     .expect("session rotation"),
-                auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("auth epoch"),
+                auth_epoch: openshell_driver_sdk::jwt::CredentialEpoch::new(1).expect("auth epoch"),
                 gateway_token: SecretJwt::parse(format!("gateway-{label}")).expect("gateway token"),
                 gateway_expires_at: 1,
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
@@ -11373,18 +11389,18 @@ mod tests {
         };
 
         assert_eq!(driver.capabilities().default_image, "openshell/sandbox:dev");
-        let gateway = openshell_core::extension_protocol::gateway_metadata(
-            openshell_core::extension_protocol::ExtensionFamily::Compute,
+        let gateway = openshell_driver_sdk::extension_protocol::gateway_metadata(
+            openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
         );
-        let negotiated = openshell_core::extension_protocol::negotiate(
-            openshell_core::extension_protocol::ExtensionFamily::Compute,
+        let negotiated = openshell_driver_sdk::extension_protocol::negotiate(
+            openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
             "vm",
             &gateway,
             driver.capabilities().extension,
         )
         .unwrap();
         assert!(negotiated.required_capabilities.iter().any(|capability| {
-            capability == openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION
+            capability == openshell_driver_sdk::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION
         }));
     }
 
@@ -11903,10 +11919,9 @@ mod tests {
 
         assert!(!env.iter().any(|entry| entry.starts_with("LD_PRELOAD=")));
         assert!(!env.iter().any(|entry| entry.starts_with("BAD;")));
-        assert!(
-            !env.iter()
-                .any(|entry| { entry.starts_with(openshell_core::sandbox_env::USER_ENVIRONMENT) })
-        );
+        assert!(!env.iter().any(|entry| {
+            entry.starts_with(openshell_driver_sdk::sandbox_env::USER_ENVIRONMENT)
+        }));
         let child_env = merged_environment(&sandbox);
         assert_eq!(
             child_env.get("LD_PRELOAD"),
@@ -11930,7 +11945,7 @@ mod tests {
             spec: Some(SandboxSpec {
                 sandbox_token: "secret.jwt.value".to_string(),
                 environment: HashMap::from([(
-                    openshell_core::sandbox_env::SANDBOX_TOKEN.to_string(),
+                    openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN.to_string(),
                     "user-provided-token".to_string(),
                 )]),
                 ..Default::default()
@@ -11942,11 +11957,11 @@ mod tests {
 
         assert!(!env.iter().any(|v| v.starts_with(&format!(
             "{}=",
-            openshell_core::sandbox_env::SANDBOX_TOKEN
+            openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN
         ))));
         assert!(!env.iter().any(|v| v.starts_with(&format!(
             "{}=",
-            openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
+            openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN_FILE
         ))));
     }
 
@@ -11961,7 +11976,7 @@ mod tests {
             name: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
                 environment: HashMap::from([(
-                    openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+                    openshell_driver_sdk::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
                     "evil.attacker.example.com".to_string(),
                 )]),
                 ..Default::default()
@@ -11974,7 +11989,7 @@ mod tests {
         assert!(
             !env.iter().any(|v| v.starts_with(&format!(
                 "{}=",
-                openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME
+                openshell_driver_sdk::sandbox_env::GATEWAY_TLS_SERVER_NAME
             ))),
             "GATEWAY_TLS_SERVER_NAME must be stripped from the guest environment"
         );
@@ -11985,7 +12000,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         temp_env::with_vars(
             [(
-                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED,
                 Some("false"),
             )],
             || {
@@ -11998,7 +12013,7 @@ mod tests {
                     name: "sandbox-123".to_string(),
                     spec: Some(SandboxSpec {
                         environment: HashMap::from([(
-                            openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+                            openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED.to_string(),
                             "true".to_string(),
                         )]),
                         ..Default::default()
@@ -12012,7 +12027,7 @@ mod tests {
                     .filter(|entry| {
                         entry.starts_with(&format!(
                             "{}=",
-                            openshell_core::sandbox_env::TELEMETRY_ENABLED
+                            openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED
                         ))
                     })
                     .collect::<Vec<_>>();
@@ -12020,7 +12035,10 @@ mod tests {
                 assert_eq!(telemetry_entries.len(), 1);
                 assert_eq!(
                     telemetry_entries[0],
-                    &format!("{}=false", openshell_core::sandbox_env::TELEMETRY_ENABLED)
+                    &format!(
+                        "{}=false",
+                        openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED
+                    )
                 );
             },
         );
@@ -12713,7 +12731,7 @@ mod tests {
 
     #[test]
     fn supervisor_otlp_environment_carries_only_configured_signals() {
-        use openshell_core::sandbox_env::{
+        use openshell_driver_sdk::sandbox_env::{
             GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT,
             OTLP_OCSF_ENDPOINT, OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol,
         };
@@ -12805,7 +12823,7 @@ mod tests {
             image_account,
             format!(
                 "sandbox-prepared-rootfs-ext4-umoci-v4:openshell-{}:image-account:{image_hash}",
-                openshell_core::VERSION
+                openshell_driver_sdk::VERSION
             )
         );
 
@@ -12847,7 +12865,7 @@ mod tests {
         let identity = bootstrap_image_cache_identity("sha256:bootstrap-image");
         assert!(identity.starts_with(&format!(
             "sandbox-bootstrap-rootfs-ext4-v6:openshell-{}:guest-",
-            openshell_core::VERSION
+            openshell_driver_sdk::VERSION
         )));
         assert!(identity.ends_with(&compute_bytes_sha256_hex(b"sha256:bootstrap-image")));
         assert!(identity.contains(&sandbox_guest_runtime_identity()));

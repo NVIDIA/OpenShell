@@ -813,11 +813,11 @@ impl PodmanClient {
     ) -> Result<(), PodmanApiError> {
         let labels = HashMap::from([
             (
-                openshell_core::driver_utils::LABEL_SANDBOX_ID.to_string(),
+                openshell_driver_sdk::driver_utils::LABEL_SANDBOX_ID.to_string(),
                 sandbox_id.to_string(),
             ),
             (
-                openshell_core::driver_utils::LABEL_SANDBOX_WORKSPACE.to_string(),
+                openshell_driver_sdk::driver_utils::LABEL_SANDBOX_WORKSPACE.to_string(),
                 workspace.to_string(),
             ),
         ]);
@@ -858,7 +858,7 @@ impl PodmanClient {
             Err(PodmanApiError::NotFound(_)) => return Ok(()),
             Err(error) => return Err(error),
         };
-        let reason = match labels.get(openshell_core::driver_utils::LABEL_SANDBOX_ID) {
+        let reason = match labels.get(openshell_driver_sdk::driver_utils::LABEL_SANDBOX_ID) {
             Some(owner) if owner == sandbox_id => return self.remove_volume(name).await,
             Some(_) => "sandbox ID label names another sandbox",
             None => "sandbox ID label is missing",

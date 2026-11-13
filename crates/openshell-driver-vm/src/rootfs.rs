@@ -24,8 +24,9 @@ const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 /// without trusting the file name.
 pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
-const SANDBOX_SUPERVISOR_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
-const SANDBOX_UMOCI_PATH: &str = openshell_core::container_paths::VM_UMOCI_PATH;
+const SANDBOX_SUPERVISOR_PATH: &str =
+    openshell_driver_sdk::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+const SANDBOX_UMOCI_PATH: &str = openshell_driver_sdk::container_paths::VM_UMOCI_PATH;
 const SANDBOX_VM_INIT_PATH: &str = "/opt/openshell/bin/openshell-vm-init";
 const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
@@ -672,7 +673,7 @@ fn round_up_to_mib(bytes: u64) -> u64 {
 }
 
 fn format_ext4_image_from_dir(source: &Path, image_path: &Path) -> Result<(), String> {
-    let path = openshell_core::e2fsprogs::resolve(&["mke2fs", "mkfs.ext4"])?;
+    let path = openshell_driver_sdk::e2fsprogs::resolve(&["mke2fs", "mkfs.ext4"])?;
     let output = Command::new(&path)
         .arg("-q")
         .arg("-F")
@@ -1028,7 +1029,9 @@ fn run_debugfs(image_path: &Path, command: &str) -> Result<(), String> {
 fn e2fs_command(tool: &str) -> Result<Command, String> {
     // Preflight and image operations must execute the same selected file with
     // the same inherited environment, including when PATH is restricted.
-    Ok(Command::new(openshell_core::e2fsprogs::resolve(&[tool])?))
+    Ok(Command::new(openshell_driver_sdk::e2fsprogs::resolve(&[
+        tool,
+    ])?))
 }
 
 fn temporary_injection_path(image_path: &Path) -> PathBuf {

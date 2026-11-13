@@ -4,9 +4,9 @@
 use clap::Parser;
 use futures::Stream;
 use miette::{IntoDiagnostic, Result};
-use openshell_core::VERSION;
-use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_core::sandbox_env::SupervisorOtlpArgs;
+use openshell_driver_sdk::VERSION;
+use openshell_driver_sdk::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_driver_sdk::sandbox_env::SupervisorOtlpArgs;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
@@ -32,7 +32,7 @@ struct Args {
         env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON",
         default_value = "{}"
     )]
-    admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
+    admission_config_json: openshell_driver_sdk::resource_admission::DriverAdmissionConfig,
     #[arg(long, hide = true, default_value_t = false)]
     internal_run_vm: bool,
 
@@ -347,7 +347,7 @@ async fn main() -> Result<()> {
         additional_ca_digest: args.additional_ca_digest.clone(),
         additional_ca_certificate_count: args.additional_ca_certificate_count,
         additional_ca_snapshot: None,
-        upstream_proxy: openshell_core::UpstreamProxyConfig {
+        upstream_proxy: openshell_driver_sdk::UpstreamProxyConfig {
             https_proxy: args.upstream_proxy.clone(),
             no_proxy: args.upstream_no_proxy.clone(),
             proxy_auth_file: args.upstream_proxy_auth_file.clone(),
