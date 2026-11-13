@@ -38,6 +38,8 @@ hex = "0.4"
 hickory-proto = "0.26.1"
 ipnet = "2"
 miette = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 prost-types = { workspace = true }
 rcgen = { workspace = true }
 regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
@@ -56,6 +58,7 @@ tokio-rustls = { workspace = true }
 tonic = { workspace = true }
 tower-mcp-types = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 uuid = { workspace = true }
 webpki-roots = { workspace = true, optional = true }
 

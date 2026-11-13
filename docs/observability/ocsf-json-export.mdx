@@ -311,11 +311,99 @@ HTTP Activity and API Activity records emitted inside a sampled OpenTelemetry sp
 
 OTLP log export links every OCSF record, whatever its class, to the active sampled span through the log record's own trace and span ID fields. Use those fields for log-to-trace links in your backend.
 
-With OTLP trace export enabled on a dedicated supervisor, denied HTTP requests can create an INFO `supervisor.egress.deny` span around the audit records for that decision. The span records the policy, reason, and destination when available. At the default log level, every deny span is a root span. At debug level, FORWARD policy, destination, credential-binding, and request middleware denials can join the available connect trace and its authorization, resolve, and dial spans. Other deny spans, including L7 denials inside CONNECT tunnels and response middleware denials, remain root spans. Shared supervisor hosts do not initialize OTLP exporters, so their records carry no trace correlation. Workload `traceparent` headers never supply supervisor correlation.
+With OTLP trace export enabled on a dedicated supervisor, each inspected HTTP request has an INFO `openshell.http.request` span for its allowed, denied or failed outcome. Children measure the policy, middleware, credential, upstream and response stages that actually run. HTTP upgrade tracing ends before the upgraded WebSocket session.
 
-To bound telemetry volume when a workload retries blocked destinations, the supervisor creates at most 10 deny spans per destination at once and one more per second after that. A process-wide budget also allows at most 100 spans at once and refills at 100 per second across destinations. Rate-limited decisions create no additional deny span, while all audit records are still emitted. Records can retain correlation to an already active sampled span, including a connect span at debug level.
+The request span ends after its owned stages, not when response headers are logged. `openshell.upstream.send` measures request writes and flush, not the full upstream round trip. Response handling has a separate span.
+
+The supervisor owns the request trace. A valid workload `traceparent`, sampled or unsampled, becomes an explicitly untrusted link, never its parent. Invalid or duplicate context is ignored; workload `tracestate` is not adopted. Your backend may show the agent and supervisor as separate linked traces rather than one nested tree.
+
+Inspected requests do not also create a denial-only `supervisor.egress.deny` span. Other denied HTTP decisions retain that legacy span: a root at the default log level, or a child of an available connect span at debug level. Shared supervisor hosts do not initialize OTLP exporters, so their records carry no trace correlation.
+
+The legacy deny-span limiter allows at most 10 spans per destination at once and one more per second after that. A process-wide budget also allows at most 100 spans at once and refills at 100 per second across destinations. Rate-limited decisions create no additional deny span, while all audit records are still emitted. These denial-specific budgets do not select inspected request spans, which cover every outcome rather than denials alone.
 
 Gateway records and their OTLP trace context can inherit the caller's incoming `traceparent`, including before authentication succeeds. The caller also decides whether they are correlated at all, because an unsampled `traceparent` suppresses `trace.uid`. Treat gateway trace IDs as correlation hints, not evidence of the caller's identity, and do not treat a missing `trace.uid` as meaningful.
+
+## Join Inspected HTTP Requests
+
+The supervisor assigns each inspected HTTP request a UUID shared by middleware
+`RequestContext.request_id`, OCSF `metadata.correlation_uid`, and the
+`x-openshell-request-id` response header. It also exports the ID as the OTLP log
+attribute `ocsf.metadata.correlation_uid`.
+
+This header is reserved for OpenShell: workload and upstream values are removed,
+and middleware cannot set or remove it. Use a different header for
+application-owned correlation. The receipt is a join key, not proof of identity,
+authorization or downstream execution. L4 and uninspected traffic do not provide
+this receipt guarantee.
+
+One primary HTTP Activity record is emitted when the final response head is
+written, with `unmapped.http_event_kind: "request"`. If the request ends earlier,
+a guard emits the available outcome. The response header does not prove that
+the body was delivered.
+
+Per-middleware HTTP Activity records remain available with their existing
+attribution, transformation flags and response-stage fields. They carry the same
+request ID, `unmapped.http_event_kind: "middleware_invocation"`, and
+`unmapped.middleware_phase: "request"` or `"response"`. Response observations can
+arrive after the primary record. Their status describes that invocation, not a
+second request decision. Security findings and late failure records remain
+separate. Collection and the existing diagnostic limits remain best-effort.
+
+The request ID join and enforcement work without tracing, when spans are not
+sampled, and when the collector is unavailable. Sampled OCSF trace fields identify
+the supervisor trace; the request ID remains the join key when those fields are
+absent. An instrumented client can record the receipt on its own trace and use it
+to find OpenShell's security records; it does not need to receive those records
+inside the sandbox.
+
+### Update Existing Queries
+
+Existing middleware queries can continue using their original fields and
+messages. To count inspected request decisions, select primary records rather
+than counting every HTTP Activity or every `action: "Denied"` record:
+
+```shell
+jq 'select(.class_uid == 4002 and .unmapped.http_event_kind == "request")' supervisor.jsonl
+```
+
+Add `.action == "Denied"` to count refused inspected requests. To inspect the
+middleware work for one receipt, select `metadata.correlation_uid` with that
+UUID and `unmapped.http_event_kind == "middleware_invocation"`. Do not count
+companion observations as extra requests, or discard them when auditing what
+middleware changed. These filters apply to inspected HTTP, not L4 decisions.
+
+For inspected-request traces, query span name `openshell.http.request` instead
+of `supervisor.egress.deny`. `openshell.request.outcome == "denied"` selects
+classified denials, but is not a complete replacement for the old denial query:
+a fail-closed platform error or admission refusal can have outcome `"failed"`.
+For all refusals, select primary OCSF records with `action: "Denied"`, then join
+spans through `openshell.request.id`. Policy name (`firewall_rule.name`) and
+reason (`status_detail`) remain on the OCSF primary; those legacy policy
+attributes are not copied to the new root. Keep the legacy span query separately
+for non-inspected egress paths.
+
+### Size Supervisor Trace Collection
+
+The old deny-span budgets do not bound inspected request spans. With supervisor
+trace export enabled, allowed traffic also creates spans at INFO level. At
+`R` inspected requests per second and an average of `S` descendant spans per
+request, expect approximately `R × (1 + S)` spans per second before exporter or
+collector loss. Include middleware RPCs and repeated stages in `S`; background
+and lifecycle spans add separate volume. This is not a fixed per-request count.
+
+The exporter queue is bounded, but queue bounds do not cap span generation or
+preserve the previous collector load. Collector-side sampling can reduce stored
+traces; it does not remove the supervisor's span-generation cost. The gateway's
+`OTEL_TRACES_SAMPLER` setting does not configure supervisor sampling. Operator
+control of supervisor sampling is tracked in
+[#5362](https://github.com/NVIDIA/OpenShell/issues/5362).
+
+Before enabling supervisor trace export, update dashboards and size the collector
+for the inspected request rate. If the old denial budget is required for your
+current deployment, leave supervisor trace export disabled until a suitable
+sampling or capacity policy is available. OCSF records and request receipts
+continue to work without it. This change does not itself add a sampling setting
+or restore denial-only spans.
 
 ## OCSF Event Classes in JSON
 

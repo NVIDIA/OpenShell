@@ -37,6 +37,7 @@ fn assert_json_response(
     expected_status: &str,
     expected_error: &str,
     expected_detail: &str,
+    expected_request_id: Option<&str>,
 ) {
     let (headers, body) = response
         .windows(4)
@@ -48,12 +49,19 @@ fn assert_json_response(
     assert!(headers.contains("Content-Type: application/json\r\n"));
     assert!(headers.contains(&format!("Content-Length: {}\r\n", body.len())));
     assert!(headers.contains("Connection: close\r\n"));
+    if let Some(request_id) = expected_request_id {
+        assert!(headers.contains(&format!("x-openshell-request-id: {request_id}\r\n")));
+    }
+    let mut expected = serde_json::json!({
+        "error": expected_error,
+        "detail": expected_detail,
+    });
+    if let Some(request_id) = expected_request_id {
+        expected["request_id"] = serde_json::json!(request_id);
+    }
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(body).unwrap(),
-        serde_json::json!({
-            "error": expected_error,
-            "detail": expected_detail,
-        })
+        expected
     );
 }
 
@@ -111,9 +119,26 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             "HTTP/1.1 403 Forbidden\r\n",
             "ssrf_denied",
             &format!("CONNECT target.example:8443 blocked: {detail}"),
+            None,
         );
 
         let (mut app, mut proxy) = tcp_pair().await;
+        let request = crate::l7::provider::L7Request {
+            action: "POST".to_string(),
+            target: "/v1/items".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"POST /v1/items HTTP/1.1\r\nHost: target.example:8080\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let correlation = crate::l7::correlation::RequestCorrelation::with_request_id(
+            &request,
+            &crate::l7::relay::L7EvalContext {
+                host: "target.example".to_string(),
+                port: 8080,
+                ..Default::default()
+            },
+            "test-request-id".to_string(),
+        );
         deny_forward_destination(
             &mut proxy,
             &tracing::Span::none(),
@@ -134,6 +159,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             )),
             None,
             None,
+            Some(&correlation),
         )
         .await
         .unwrap();
@@ -145,6 +171,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             "HTTP/1.1 403 Forbidden\r\n",
             "ssrf_denied",
             &format!("POST target.example:8080 blocked: {detail}"),
+            Some("test-request-id"),
         );
     }
 }

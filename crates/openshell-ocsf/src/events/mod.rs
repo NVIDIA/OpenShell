@@ -169,6 +169,11 @@ impl OcsfEvent {
         }
     }
 
+    /// Associate this event with other events produced for the same operation.
+    pub fn set_correlation_uid(&mut self, uid: impl Into<String>) {
+        self.base_mut().metadata.correlation_uid = Some(uid.into());
+    }
+
     /// Returns mutable base data common to all event classes.
     pub(crate) fn base_mut(&mut self) -> &mut BaseEventData {
         match self {
@@ -279,6 +284,29 @@ mod tests {
         let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
         assert!(matches!(deserialized, OcsfEvent::DetectionFinding(_)));
         assert_eq!(deserialized.class_uid(), 2004);
+    }
+
+    #[test]
+    fn correlation_uid_can_be_set_on_any_event_class() {
+        let ctx = test_sandbox_context();
+        let mut event = AuthenticationBuilder::new(
+            &ctx,
+            User::other("user-1", "User"),
+            Service::new("gateway"),
+        )
+        .status(StatusId::Success)
+        .build();
+
+        event.set_correlation_uid("request-123");
+
+        assert_eq!(
+            event.base().metadata.correlation_uid.as_deref(),
+            Some("request-123")
+        );
+        assert_eq!(
+            serde_json::to_value(&event).unwrap()["metadata"]["correlation_uid"],
+            "request-123"
+        );
     }
 
     #[test]

@@ -1,7 +1,44 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Credential, executable identity, and socket-owner subprocess fixtures.
+//! Credential, identity, socket-owner and request-tracing fixtures.
+
+pub mod request_tracing;
+
+pub fn response_request_id(response: &[u8]) -> &str {
+    let end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("complete response headers");
+    std::str::from_utf8(&response[..end])
+        .expect("ASCII response headers")
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("x-openshell-request-id")
+                .then(|| value.trim())
+        })
+        .expect("response carries a request receipt")
+}
+
+pub fn assert_http_request_records(
+    events: &[serde_json::Value],
+    expected_invocations: usize,
+) -> (&serde_json::Value, Vec<&serde_json::Value>) {
+    let (primary, invocations): (Vec<_>, Vec<_>) = events
+        .iter()
+        .filter(|event| event["class_uid"] == 4002)
+        .partition(|event| event["unmapped"]["http_event_kind"] == "request");
+    assert_eq!(primary.len(), 1, "{events:?}");
+    assert_eq!(invocations.len(), expected_invocations, "{events:?}");
+    assert!(
+        invocations
+            .iter()
+            .all(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation"),
+        "unexpected HTTP Activity record: {events:?}"
+    );
+    (primary[0], invocations)
+}
 
 pub fn header_placement_metadata(
     keys: &[&str],

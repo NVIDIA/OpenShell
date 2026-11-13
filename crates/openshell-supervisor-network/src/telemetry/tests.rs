@@ -81,6 +81,10 @@ static REGISTER: LazyLock<()> = LazyLock::new(|| {
     ));
 });
 
+pub fn init_trace_extractor() {
+    LazyLock::force(&REGISTER);
+}
+
 fn capture(
     log_level: &str,
     provider: &opentelemetry_sdk::trace::SdkTracerProvider,
@@ -599,4 +603,83 @@ async fn disabled_deny_spans_spend_no_tokens() {
     });
     assert!(super::LIMITER.lock().unwrap().buckets.is_empty());
     assert!(super::LIMITER.lock().unwrap().global.is_none());
+}
+
+#[tokio::test]
+async fn inspected_audit_records_do_not_depend_on_sampling_or_create_deny_spans() {
+    let _lock = tracing_test_lock().await;
+    LazyLock::force(&REGISTER);
+    for sampled in [false, true] {
+        super::reset_deny_span_limiter();
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let sampler = if sampled {
+            opentelemetry_sdk::trace::Sampler::AlwaysOn
+        } else {
+            opentelemetry_sdk::trace::Sampler::AlwaysOff
+        };
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_sampler(sampler)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let events = capture("warn", &provider, || {
+            let request = tracing::info_span!(parent: None, "openshell.http.request");
+            let mut denied = http_deny("blocked.example", "middleware_blocked");
+            denied.set_correlation_uid(request_id.clone());
+            super::emit_inspected_decision([denied], Some(&request));
+        });
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), usize::from(sampled));
+        assert!(
+            spans
+                .iter()
+                .all(|span| span.name == "openshell.http.request")
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["metadata"]["correlation_uid"], request_id);
+        assert_eq!(events[0]["action_id"], 2);
+        if sampled {
+            assert_eq!(
+                events[0]["trace"]["uid"],
+                spans[0].span_context.trace_id().to_string()
+            );
+        } else {
+            assert!(events[0].get("trace").is_none());
+        }
+        assert!(super::LIMITER.lock().unwrap().buckets.is_empty());
+        assert!(super::LIMITER.lock().unwrap().global.is_none());
+        provider.shutdown().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn inspected_emission_without_a_request_span_never_falls_back_to_deny_tracing() {
+    let (events, received) = exported("warn", || {
+        use opentelemetry::trace::TraceContextExt as _;
+        let ambient = opentelemetry::trace::SpanContext::new(
+            opentelemetry::trace::TraceId::from(1),
+            opentelemetry::trace::SpanId::from(2),
+            opentelemetry::trace::TraceFlags::SAMPLED,
+            true,
+            opentelemetry::trace::TraceState::default(),
+        );
+        let _ambient = opentelemetry::Context::new()
+            .with_remote_span_context(ambient.clone())
+            .attach();
+        super::emit_inspected_decision([http_deny("blocked.example", "no_parent")], None);
+        super::emit_inspected_decision(
+            [http_deny("blocked.example", "disabled_parent")],
+            Some(&tracing::Span::none()),
+        );
+        assert_eq!(
+            opentelemetry::Context::current().span().span_context(),
+            &ambient
+        );
+    })
+    .await;
+    assert_eq!(events.len(), 2);
+    assert!(received.spans.is_empty());
+    assert!(events.iter().all(|event| event["action_id"] == 2));
+    assert_no_deny(&events, &received);
 }
