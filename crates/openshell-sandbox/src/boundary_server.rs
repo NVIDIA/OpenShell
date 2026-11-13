@@ -249,11 +249,10 @@ mod linux {
         install_boundary_signal_handlers()?;
         make_boundary_nondumpable()?;
         disable_core_dumps()?;
-        let bytes = std::fs::read(config_path)
-            .map_err(|error| format!("read boundary config {}: {error}", config_path.display()))?;
-        let config: BoundaryConfig = serde_json::from_slice(&bytes).map_err(|error| {
-            format!("decode boundary config {}: {error}", config_path.display())
-        })?;
+        // A protobuf JSON config beside the legacy file is preferred.
+        let config: BoundaryConfig =
+            openshell_driver_sdk::legacy_contract::read_document(config_path)
+                .map_err(|error| format!("read boundary config: {error}"))?;
         validate_config(&config)?;
         validate_runtime_resource_claims(&config)?;
         validate_running_identity(
@@ -263,6 +262,16 @@ mod linux {
         std::fs::remove_file(config_path).map_err(|error| {
             format!("consume boundary config {}: {error}", config_path.display())
         })?;
+        // The config is single-use whichever form it was read from.
+        match std::fs::remove_file(openshell_driver_sdk::legacy_contract::protobuf_json_path(
+            config_path,
+        )) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("consume boundary config: {error}"));
+            }
+        }
         crate::process::install_boundary_user_environment(config.child_env.clone())?;
         crate::sandbox::apply_supervisor_startup_hardening()
             .map_err(|error| format!("install sandbox process prelude: {error}"))?;

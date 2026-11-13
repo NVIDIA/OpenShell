@@ -286,8 +286,11 @@ fn backend_descriptor(args: &Args, admitted_backend: &str) -> Result<BackendDesc
     let path = args.backend_descriptor_file.as_deref().ok_or_else(|| {
         miette::miette!("--backend-descriptor-file is required for --role=isolation-backend")
     })?;
-    let payload = std::fs::read(path)
-        .map_err(|error| miette::miette!("read backend descriptor {}: {error}", path.display()))?;
+    // The built-in runtime prefers a protobuf JSON descriptor beside the legacy
+    // file; any other backend's payload is opaque.
+    let payload =
+        openshell_driver_sdk::legacy_contract::read_descriptor_payload(path, admitted_backend)
+            .map_err(|error| miette::miette!("read backend descriptor: {error}"))?;
     Ok(BackendDescriptor {
         backend_name: admitted_backend.to_string(),
         payload,

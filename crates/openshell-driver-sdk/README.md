@@ -78,7 +78,13 @@ reading the protobuf JSON example must give back the legacy example. The
 examples are the reference for a driver in any language. Regenerate them from
 the legacy examples with `UPDATE_EXAMPLES=1` and review the diff.
 
-No driver or reader uses the new format yet.
+The Docker driver writes the new files beside the legacy ones, and the
+supervisor and the sandbox boundary prefer them (see `legacy_contract::document`
+and the file naming rule in `proto/README.md`). A driver gets both files of a
+document from one value with `ContractDocument::to_files`, so they cannot
+disagree, and delivers them by its own means; the supervisor reads the built-in
+descriptor with `read_descriptor_payload`. Other drivers write only the legacy
+files, which readers still accept.
 
 ### Migrating
 
