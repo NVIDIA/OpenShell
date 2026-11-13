@@ -19,6 +19,7 @@ nextest run the tests as the library's unit tests. The crate also builds the
 | `labels` | Labels are stored and select sandboxes in `sandbox list` |
 | `templates` | A sandbox created from a template uses its workload; duplicate, deleted and missing templates return the right errors |
 | `settings` | Sandbox-scoped settings |
+| `workspaces` | Workspace create, get, list and delete; a template is scoped to its workspace; a workspace holding a resource goes Terminating, rejects creates and deletes once empty |
 | `process` | Core dumps are disabled for sandbox processes |
 | `filesystem-policy` | Landlock: a hard requirement accepts added device paths; a replaced policy path rejects the next launch |
 

@@ -21,3 +21,4 @@ mod process;
 mod settings;
 mod smoke;
 mod templates;
+mod workspaces;
