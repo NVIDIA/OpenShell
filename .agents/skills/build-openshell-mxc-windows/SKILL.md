@@ -476,7 +476,7 @@ variable by default). Require both a nonempty response and the OpenShell proxy
 CA issuer; never replace these assertions with an insecure TLS request. This
 fixture permits unavailable CRL information using best-effort Schannel revocation
 for the ephemeral private CA; this is not revocation qualification. This
-scenario is not part of the default seven offline-capable E2E scenarios.
+scenario is not part of the default offline-capable E2E scenarios.
 
 The default `host-service` scenario runs the HTTP fixture on host `127.0.0.1`
 and a dynamic port, then checks two nonce-bound replies from direct curl requests

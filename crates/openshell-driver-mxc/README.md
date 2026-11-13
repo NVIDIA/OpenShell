@@ -349,7 +349,7 @@ explicitly loads the boundary-injected CA bundle and records the peer certificat
 success requires a nonempty response and the OpenShell proxy CA issuer. It does
 not install a host trust root or disable CA/hostname verification. The fixture
 uses best-effort Schannel revocation because the ephemeral private CA has no CRL
-distribution point; it does not qualify revocation enforcement. The default seven E2E
+distribution point; it does not qualify revocation enforcement. The default E2E
 scenarios remain independent of Internet access.
 
 The `forwarding` scenario starts a TCP listener inside MXC, then verifies two
@@ -373,12 +373,21 @@ host service is checked before launch and stopped after testing. Select it with
 `-Scenario host-service`; no Internet access, LAN address, or firewall changes
 are required. This verifies direct localhost connectivity.
 
+The default `gateway-kill` scenario checks sandbox cleanup when the gateway dies
+without warning. It creates a sandbox with a long-running workload, records the
+sandbox process tree under that gateway, hard-kills the gateway, and requires
+every recorded process to end and the gateway port to be bindable again (a
+replacement gateway must start on it). Only processes under the scenario's own
+gateway are tracked, so other sandboxes on the host are left alone. It relies on
+each sandbox generation's kill-on-close job object; no workload outlives the
+gateway. Select it with `-Scenario gateway-kill`.
+
 The `ws-agent.yaml` and `openclaw-gateway.yaml` policies preserve the Windows
 branch's workload grants. `inference.yaml` is a template: replace its filesystem,
 curl executable, inference host, and port placeholders before use. Authorize
 curl, which owns the network socket, not its cmd launcher. These policies have
 parser/mapper regression coverage; they do not add live WebSocket, OpenClaw,
-or provider-backed inference scenarios to the seven-scenario E2E runner.
+or provider-backed inference scenarios to the E2E runner.
 
 With `-KeepRunning`, the runner restores the caller's environment but retains
 the disposable CLI/runtime directory for the live gateway and prints its path.

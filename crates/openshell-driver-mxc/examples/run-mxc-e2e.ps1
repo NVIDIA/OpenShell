@@ -37,6 +37,8 @@
 #   forwarding       - two TCP request/reply exchanges through OpenShell ingress.
 #   service-forwarding - named HTTP service routing and endpoint deletion.
 #   host-service     - workload reaches an HTTP service on host 127.0.0.1.
+#   gateway-kill     - hard-killing the gateway ends every sandbox process and
+#                      frees its port. processcontainer only.
 #   https-ca         - opt-in outbound HTTPS using the injected proxy CA.
 
 [CmdletBinding()]
@@ -545,6 +547,23 @@ function Test-ServiceForwarding([string]$sandboxName, [string]$readyFile, [strin
 # Detect an agent *launch* failure (binary not found / not implemented) vs a
 # legitimate policy denial. Used to avoid false-passing a deny scenario when the
 # agent never actually ran.
+# All descendants of a process, found by walking ParentProcessId links in one
+# snapshot. Orphans keep their ParentProcessId, so the walk is still correct
+# for a tree whose root has since died, but it must run while the root lives.
+function Get-DescendantPids([int]$rootPid) {
+    $all = @(Get-CimInstance Win32_Process)
+    $found = New-Object System.Collections.Generic.HashSet[int]
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    $queue.Enqueue($rootPid)
+    while ($queue.Count -gt 0) {
+        $parent = $queue.Dequeue()
+        foreach ($p in $all) {
+            if ($p.ParentProcessId -eq $parent -and $found.Add([int]$p.ProcessId)) { $queue.Enqueue([int]$p.ProcessId) }
+        }
+    }
+    return @($found)
+}
+
 function Launch-Failed([string]$gwText) {
     if ($null -eq $gwText) { return $false }
     return ($gwText -match 'CreateProcessW failed error:2' `
@@ -790,10 +809,15 @@ try {
             Name = 'host-service'; PolicyFile = Join-Path $policyDir 'host-service.yaml'
             SandboxId = 'host'; Backends = 'process_container'; Kind = 'host-service'
             Description = 'workload connects directly to an HTTP service on host 127.0.0.1'
+        },
+        @{
+            Name = 'gateway-kill'; PolicyFile = Join-Path $policyDir 'fs-rw.yaml'
+            SandboxId = 'gk'; Backends = 'process_container'; Kind = 'gateway-kill'
+            Description = 'hard-killing the gateway ends every sandbox process and frees its port'
         }
     )
 
-    # External connectivity is deliberately opt-in; the default seven scenarios
+    # External connectivity is deliberately opt-in; the default scenarios
     # remain runnable without Internet access. Use the same authenticated
     # gateway launch path as every other workload, not a bare driver fixture.
     if ($Scenario -eq 'https-ca') {
@@ -916,6 +940,11 @@ try {
                 } else {
                     $command = @($cmdExe, "/c", "echo denied 1> $denied")
                 }
+            } elseif ($sc.Kind -eq 'gateway-kill') {
+                # A long-running workload carrying a unique marker, so its process
+                # can be identified without matching unrelated cmd.exe instances.
+                $killNonce = [guid]::NewGuid().ToString('N')
+                $command = @($cmdExe, '/d', '/c', "for /l %i in (1,1,2000000000) do @rem $killNonce")
             } elseif ($sc.Kind -eq 'host-service') {
                 Remove-Item -Path (Join-Path $DemoDir 'host-service.*') -Force -ErrorAction SilentlyContinue
                 $batch = Join-Path $DemoDir 'host-service.cmd'
@@ -990,7 +1019,7 @@ try {
                     "--policy", [string]$policyUsed,
                     "--driver-config-json", $driverConfig
                 )
-                $createArguments += if ($sc.Kind -eq 'host-service') { '--detach' } else { '--no-tty' }
+                $createArguments += if ($sc.Kind -in @('host-service', 'gateway-kill')) { '--detach' } else { '--no-tty' }
                 $createResult = Invoke-NativeCaptured $cli $createArguments
                 $createOut = $createResult.Output
                 $createExitCode = $createResult.ExitCode
@@ -1012,6 +1041,53 @@ try {
                     $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'PASS'; Reason = $reason }
                 } catch {
                     Bad "host-service: $($_.Exception.Message)"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'FAIL'; Reason = $_.Exception.Message }
+                }
+            } elseif ($sc.Kind -eq 'gateway-kill') {
+                try {
+                    if ($createExitCode -ne 0) { throw "sandbox creation failed: $createOutStr" }
+                    # Wait for the whole sandbox tree to exist, then record it.
+                    # Only processes under THIS gateway (plus the marked workload)
+                    # are tracked, so unrelated MXC sandboxes on the host are never
+                    # counted or touched.
+                    $victims = @{}
+                    $deadline = (Get-Date).AddSeconds(60)
+                    do {
+                        Start-Sleep -Milliseconds 500
+                        $victims = @{}
+                        foreach ($id in (Get-DescendantPids $gw.Id)) {
+                            $proc = Get-Process -Id $id -ErrorAction SilentlyContinue
+                            if ($proc) { $victims[$id] = $proc.ProcessName }
+                        }
+                        foreach ($proc in @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*$killNonce*" -and $_.ProcessId -ne $PID })) {
+                            $victims[[int]$proc.ProcessId] = $proc.Name
+                        }
+                        $names = @($victims.Values | ForEach-Object { $_ -replace '\.exe$', '' })
+                        $ready = ($names -contains 'wxc-exec') -and ($names -contains 'openshell-supervisor') -and (@(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*$killNonce*" -and $_.ProcessId -ne $PID }).Count -gt 0)
+                    } while (-not $ready -and (Get-Date) -lt $deadline)
+                    if (-not $ready) { throw "sandbox process tree did not come up (saw: $(($victims.Values) -join ', '))" }
+                    Info "tracking $($victims.Count) sandbox processes: $((($victims.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Value)($($_.Key))" })) -join ', ')"
+
+                    Info "hard-killing gateway pid $($gw.Id)"
+                    Stop-Process -Id $gw.Id -Force
+                    $gw.WaitForExit()
+                    $survivors = @()
+                    $deadline = (Get-Date).AddSeconds(30)
+                    do {
+                        Start-Sleep -Milliseconds 500
+                        $survivors = @($victims.Keys | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+                    } while ($survivors.Count -gt 0 -and (Get-Date) -lt $deadline)
+                    if ($survivors.Count -gt 0) {
+                        $left = ($survivors | ForEach-Object { "$($victims[$_])($_)" }) -join ', '
+                        throw "sandbox processes survived the gateway's death: $left"
+                    }
+                    # The port must be free again: a replacement gateway must bind it.
+                    $gw = Start-Gw
+                    Info "replacement gateway pid $($gw.Id) bound port $Port"
+                    Ok "gateway-kill: all $($victims.Count) sandbox processes ended; port rebound"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'PASS'; Reason = "$($victims.Count) sandbox processes ended, port rebound" }
+                } catch {
+                    Bad "gateway-kill: $($_.Exception.Message)"
                     $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'FAIL'; Reason = $_.Exception.Message }
                 }
             } elseif ($sc.Kind -eq 'socket-owner') {
@@ -1208,6 +1284,9 @@ admission and execution, not network enforcement. Forwarding proves managed
 ingress works, not that direct host ingress is blocked.
 Host-service verifies two exact direct HTTP replies from a service bound to
 host 127.0.0.1, with host-side request evidence. It checks localhost connectivity.
+Gateway-kill creates a sandbox, hard-kills the gateway, and requires every process
+that was under that gateway (and the marked workload) to end and the port to be
+bindable by a replacement gateway.
 "@
     Set-Content -Path (Join-Path $resultDir "summary.txt") -Value $summary -Encoding UTF8
     Write-Host $summary -ForegroundColor ($(if ($verdict -eq "PASS") { "Green" } else { "Red" }))
