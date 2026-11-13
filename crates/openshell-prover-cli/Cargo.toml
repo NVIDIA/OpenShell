@@ -19,6 +19,8 @@ vendored-z3 = ["openshell-prover/vendored-z3"]
 prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
 
 [dependencies]
+# Product backend selection also applies when building without default features.
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 clap.workspace = true
 openshell-prover = { path = "../openshell-prover" }
 serde.workspace = true

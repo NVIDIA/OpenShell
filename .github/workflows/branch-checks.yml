@@ -342,6 +342,7 @@ jobs:
             exit 1
           fi
           cargo test --locked -p openshell-crypto --no-default-features --test independent_backend
+          mise run rust:verify:library-crypto
 
       - name: Verify OpenSSL backend
         shell: nix develop .#crypto -c bash -euo pipefail {0}

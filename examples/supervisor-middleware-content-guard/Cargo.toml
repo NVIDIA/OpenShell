@@ -13,6 +13,7 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
+openshell-crypto = { path = "../../crates/openshell-crypto" }
 clap = { version = "4.5", features = ["derive"] }
 openshell-core = { path = "../../crates/openshell-core", default-features = false }
 prost-types = "0.14"
