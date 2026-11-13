@@ -134,10 +134,11 @@ duplicates either replay its confirmed success or return
 `REQUEST_OUTCOME_UNCERTAIN`. Disconnecting or cancelling the client does not stop
 admitted work. An error, interrupted process, or failed success-record write
 leaves the admission unresolved. No gateway replica takes over that admission,
-even after restart or after 24 hours. Status codes alone do not prove that the
-attempt had no effects.
+even after restart or after the replay window. Status codes alone do not prove
+that the attempt had no effects.
 
-Successful results have a 24-hour replay window, measured from durable completion.
+Successful results have a replay window, measured from durable completion. It is
+24 hours unless the operator sets `mutation_replay_window_seconds`.
 A successful replay includes `openshell-replayed: true` response metadata and
 does not extend the window. After it expires, the same ID can admit a new
 execution. Do not retry an old operation after that window without reconciling
@@ -183,8 +184,10 @@ Replay rows contain fingerprints, resource references, and explicitly selected
 public diagnostic or scalar outcomes, not credential-bearing response snapshots.
 Completed receipts are limited to 64 KiB. A failure to capture a bounded receipt
 after execution leaves the admission unresolved. Each caller can
-hold at most 1,000 durable admissions. At capacity, the gateway removes expired
-successes; if no space remains, it rejects new admissions with
+hold at most 1,000 durable admissions across all replicas sharing a database,
+unless the operator sets `mutation_admission_limit_per_caller`. Successful
+admissions count until their replay window ends. At capacity, the gateway
+removes expired successes; if no space remains, it rejects new admissions with
 `RESOURCE_EXHAUSTED`. Existing records remain protected. Unresolved records
 require operator investigation; there is no automatic reset or takeover API.
 The gateway also limits detached admission workers to 64 per process and these

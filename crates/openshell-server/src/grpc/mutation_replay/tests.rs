@@ -417,7 +417,7 @@ async fn exercise_expiry_and_uncertainty(state: &Arc<ServerState>) {
         })
         .unwrap();
     let mut expired: Admission = serde_json::from_slice(&row.payload).unwrap();
-    expired.completed_at_ms = Some(current_time_ms() - SUCCESS_TTL_MS);
+    expired.completed_at_ms = Some(current_time_ms() - replay_window_ms(&state.config));
     state
         .store
         .put_if(
@@ -484,7 +484,11 @@ async fn exercise_expiry_and_uncertainty(state: &Arc<ServerState>) {
         reason(&run(state, authed_request(req)).await.unwrap_err()),
         "REQUEST_OUTCOME_UNCERTAIN"
     );
-    assert!(!prune_expired(&state.store, &row.workspace).await.unwrap());
+    assert!(
+        !sweep_expired(&state.store, None, replay_window_ms(&state.config))
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -735,6 +739,11 @@ async fn cancellation_keeps_owned_work_and_duplicate_cannot_take_over() {
 #[tokio::test]
 async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work() {
     let state = test_server_state().await;
+    let limit = state.config.mutation_admission_limit_per_caller;
+    assert_eq!(
+        limit,
+        openshell_core::config::DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER
+    );
     let req = create("quota-replay");
     run(&state, authed_request(req.clone())).await.unwrap();
     let original = state
@@ -753,19 +762,11 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
         completed_at_ms: None,
     };
     let payload = serde_json::to_vec(&pending).unwrap();
-    for i in 1..MAX_ADMISSIONS_PER_CALLER - 1 {
+    for i in 1..limit - 1 {
         let id = format!("quota-{i}");
         state
             .store
-            .create_if_workspace_count_below(
-                OBJECT_TYPE,
-                &id,
-                &id,
-                &original.workspace,
-                &payload,
-                None,
-                u64::from(MAX_ADMISSIONS_PER_CALLER),
-            )
+            .create_mutation_admission(&id, &id, &original.workspace, &payload, limit)
             .await
             .unwrap()
             .unwrap();
@@ -811,6 +812,7 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
         )
         .await
         .unwrap();
+    state.store.backdate(&original.id, 0).await.unwrap();
     run(&state, authed_request(new_req)).await.unwrap();
     assert_eq!(
         state
@@ -818,12 +820,293 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
             .count_in_workspace(OBJECT_TYPE, &original.workspace)
             .await
             .unwrap(),
-        u64::from(MAX_ADMISSIONS_PER_CALLER)
+        u64::from(limit)
     );
     assert!(
         state
             .store
             .get(OBJECT_TYPE, "quota-1")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+async fn age_success(state: &Arc<ServerState>, req: &CreateWorkspaceRequest, age_ms: i64) {
+    let hash = fingerprint(req).unwrap();
+    let row = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, None, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            serde_json::from_slice::<Admission>(&row.payload)
+                .unwrap()
+                .payload_hash
+                == hash
+        })
+        .unwrap();
+    let mut admission: Admission = serde_json::from_slice(&row.payload).unwrap();
+    assert!(admission.success.is_some());
+    admission.completed_at_ms = Some(current_time_ms() - age_ms);
+    state
+        .store
+        .put_if(
+            OBJECT_TYPE,
+            &row.id,
+            &row.name,
+            &row.workspace,
+            &serde_json::to_vec(&admission).unwrap(),
+            None,
+            WriteCondition::MatchResourceVersion(row.resource_version),
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .backdate(&row.id, current_time_ms() - age_ms)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn expiry_sweeper_removes_only_expired_successes() {
+    let state = test_server_state().await;
+    let window_ms = replay_window_ms(&state.config);
+    let expired = create("sweep-expired");
+    let fresh = create("sweep-fresh");
+    run(&state, authed_request(expired.clone())).await.unwrap();
+    run(&state, authed_request(fresh.clone())).await.unwrap();
+    let bucket = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, None, 1)
+        .await
+        .unwrap()
+        .remove(0)
+        .workspace;
+    let pending = Admission {
+        protection: None,
+        format_version: 1,
+        payload_hash: "unused".into(),
+        workspace_id: None,
+        target_id: None,
+        success: None,
+        completed_at_ms: None,
+    };
+    state
+        .store
+        .create_mutation_admission(
+            "sweep-pending",
+            "sweep-pending",
+            &bucket,
+            &serde_json::to_vec(&pending).unwrap(),
+            state.config.mutation_admission_limit_per_caller,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    state.store.backdate("sweep-pending", 0).await.unwrap();
+    age_success(&state, &expired, window_ms + 1).await;
+
+    assert!(
+        !sweep_expired(&state.store, Some("_mutation/other"), window_ms)
+            .await
+            .unwrap()
+    );
+    assert!(sweep_expired(&state.store, None, window_ms).await.unwrap());
+    assert!(!sweep_expired(&state.store, None, window_ms).await.unwrap());
+    assert_eq!(
+        state
+            .store
+            .count_in_workspace(OBJECT_TYPE, &bucket)
+            .await
+            .unwrap(),
+        2
+    );
+    let replay = run(&state, authed_request(fresh)).await.unwrap();
+    assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+    assert!(
+        state
+            .store
+            .get(OBJECT_TYPE, "sweep-pending")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn full_counters_recount_after_admission_deletions_or_a_minute() {
+    let mut state = test_server_state().await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .config
+        .mutation_admission_limit_per_caller = 2;
+    let exhausted = |name: &'static str| {
+        let state = state.clone();
+        async move {
+            run(&state, authed_request(create(name)))
+                .await
+                .unwrap_err()
+                .code()
+                == Code::ResourceExhausted
+        }
+    };
+    run(&state, authed_request(create("counter-a")))
+        .await
+        .unwrap();
+    run(&state, authed_request(create("counter-b")))
+        .await
+        .unwrap();
+    assert!(exhausted("counter-c").await);
+    let rows = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, None, 2)
+        .await
+        .unwrap();
+
+    // A deletion outside the admission store, as by an older gateway, leaves the
+    // counter unmarked, so rejections read only the counter until it is stale.
+    assert!(state.store.delete(OBJECT_TYPE, &rows[0].id).await.unwrap());
+    assert!(exhausted("counter-d").await);
+    let counter = state
+        .store
+        .list_by_type_after("mutation_admission_count_v1", None, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    state
+        .store
+        .backdate(&counter.id, current_time_ms() - 60_000)
+        .await
+        .unwrap();
+    run(&state, authed_request(create("counter-e")))
+        .await
+        .unwrap();
+    assert!(exhausted("counter-f").await);
+
+    assert_eq!(
+        state
+            .store
+            .delete_mutation_admissions(std::slice::from_ref(&rows[1].id))
+            .await
+            .unwrap(),
+        1
+    );
+    run(&state, authed_request(create("counter-g")))
+        .await
+        .unwrap();
+    assert!(exhausted("counter-h").await);
+}
+
+#[tokio::test]
+async fn expiry_sweep_continues_past_a_full_batch() {
+    let state = test_server_state().await;
+    let expired = Admission {
+        protection: None,
+        format_version: 1,
+        payload_hash: "unused".into(),
+        workspace_id: None,
+        target_id: None,
+        success: Some(Success::StreamTerminal),
+        completed_at_ms: Some(0),
+    };
+    let payload = serde_json::to_vec(&expired).unwrap();
+    let bucket = "_mutation/sweep-page";
+    for i in 0..=SWEEP_BATCH {
+        let id = format!("sweep-page-{i}");
+        let write = state
+            .store
+            .create_mutation_admission(&id, &id, bucket, &payload, 2 * SWEEP_BATCH)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .store
+            .put_if(
+                OBJECT_TYPE,
+                &id,
+                &id,
+                bucket,
+                &payload,
+                None,
+                WriteCondition::MatchResourceVersion(write.resource_version),
+            )
+            .await
+            .unwrap();
+        state.store.backdate(&id, 0).await.unwrap();
+    }
+
+    assert!(
+        sweep_expired(&state.store, None, replay_window_ms(&state.config))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .store
+            .count_in_workspace(OBJECT_TYPE, bucket)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn configured_limit_and_replay_window_govern_admission() {
+    let mut state = test_server_state().await;
+    {
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.mutation_admission_limit_per_caller = 2;
+        config.mutation_replay_window_seconds = 60;
+    }
+    let first = create("configured-first");
+    run(&state, authed_request(first.clone())).await.unwrap();
+    run(&state, authed_request(create("configured-second")))
+        .await
+        .unwrap();
+    let third = create("configured-third");
+    assert_eq!(
+        run(&state, authed_request(third.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+
+    age_success(&state, &first, 30_000).await;
+    let replay = run(&state, authed_request(first.clone())).await.unwrap();
+    assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+    assert_eq!(
+        run(&state, authed_request(third.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+
+    age_success(&state, &first, 60_000).await;
+    run(&state, authed_request(third.clone())).await.unwrap();
+    let bucket = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, None, 1)
+        .await
+        .unwrap()
+        .remove(0)
+        .workspace;
+    assert_eq!(
+        state
+            .store
+            .count_in_workspace(OBJECT_TYPE, &bucket)
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(
+        state
+            .store
+            .get_message_by_name::<Workspace>("", &third.name)
             .await
             .unwrap()
             .is_some()
