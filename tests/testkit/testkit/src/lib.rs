@@ -28,10 +28,12 @@
 
 mod cleanup;
 mod cli;
+mod cli_sandbox;
 mod context;
 mod error;
 pub mod gateway;
 mod image;
+mod output;
 pub mod policy;
 mod poll;
 pub mod program;
@@ -43,6 +45,7 @@ mod yaml_file;
 
 pub use cleanup::CLEANUP_TIMEOUT;
 pub use cli::{CLI_TIMEOUT, Cli, CliOutput};
+pub use cli_sandbox::CliSandboxBuilder;
 pub use context::{
     Context, DELETE_TIMEOUT, EXEC_TIMEOUT, ExecOutput, READY_TIMEOUT, STOP_TIMEOUT, Sandbox,
     SandboxBuilder,
@@ -51,7 +54,7 @@ pub use error::{Error, Result, ResultExt};
 pub use gateway::Gateway;
 pub use image::{PYTHON_BINARIES, base_image, python_image};
 pub use openshell_sdk as sdk;
-pub use poll::{Poll, poll_until};
+pub use poll::{Poll, poll_until, with_deadline};
 pub use program::main;
 pub use ready::check as check_ready;
 pub use registry::Test;

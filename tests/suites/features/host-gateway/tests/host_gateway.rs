@@ -11,7 +11,8 @@
 
 use host_server_support::HttpRecorder;
 use testkit::policy;
-use testkit::{Context, PYTHON_BINARIES, Result, ResultExt as _, YamlFile};
+use testkit::sdk::raw::proto;
+use testkit::{Context, PYTHON_BINARIES, ResultExt as _};
 
 /// The image's Python, which needs nothing beyond its standard library. The
 /// policy allows [`PYTHON_BINARIES`], the real paths behind `python3` in
@@ -42,8 +43,6 @@ print(response.decode(errors="replace"))
 async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result {
     let marker = format!("host-gateway-{}", cx.run_id());
     let server = HttpRecorder::start(marker.clone()).await?;
-    let policy = YamlFile::new(&policy(server.port)?)?;
-    let port = server.port.to_string();
     let image = testkit::python_image();
 
     // The client runs through `sandbox exec` in a Ready sandbox, not as the
@@ -51,33 +50,17 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
     // attach to a main process that already finished with "sandbox is not
     // ready" when the request reaches a replica that doesn't hold the
     // sandbox's session.
-    let name = cx.name("hg");
-    cx.track(&name);
-    cx.cli([
-        "sandbox",
-        "create",
-        "--name",
-        &name,
-        "--from",
-        &image,
-        "--policy",
-        policy.path()?,
-        "--detach",
-        "--no-tty",
-        "--",
-        "sh",
-        "-c",
-        "exec sleep infinity",
-    ])
-    .await?
-    .success()
-    .context(format!("create a sandbox from {image}"))?;
-    cx.adopt(&name).await?.wait_ready().await?;
+    let sandbox = cx
+        .sandbox("hg")
+        .image(image.clone())
+        .policy(policy(server.port))
+        .command(["sh", "-c", "exec sleep infinity"])
+        .create_ready()
+        .await
+        .context(format!("create a sandbox from {image}"))?;
 
-    let client = cx
-        .cli([
-            "sandbox", "exec", "--name", &name, "--no-tty", "--", PYTHON, "-c", CLIENT, &port,
-        ])
+    let client = sandbox
+        .exec([PYTHON, "-c", CLIENT, &server.port.to_string()])
         .await?
         .success()
         .context("run the client in the sandbox")?;
@@ -94,7 +77,7 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
 /// connect to `host.openshell.internal` on `port`. The endpoint names only the
 /// host and port, as the policy docs describe, so the driver's address for the
 /// name is what makes it reachable, not an `allowed_ips` range.
-fn policy(port: u16) -> Result<String> {
+fn policy(port: u16) -> proto::SandboxPolicy {
     let mut policy = policy::base();
     policy::allow(
         &mut policy,
@@ -103,5 +86,5 @@ fn policy(port: u16) -> Result<String> {
         port,
         PYTHON_BINARIES,
     );
-    policy::to_yaml(&policy)
+    policy
 }

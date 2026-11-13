@@ -242,6 +242,22 @@ system Z3 development package; `z3-sys` discovers it through `pkg-config`.
 The linker uses the installed static or shared library. The Nix development
 shell provides a static Z3 library.
 
+Without Z3, linking fails with `ld: library 'z3' not found`. To run a command
+that links Z3 from a plain terminal, wrap it in the Nix shell:
+
+```bash
+nix develop --command cargo test -p openshell-server --lib
+```
+
+If every crate then fails to compile with `Set a global default version with
+one of the following:`, the `RUSTC_WRAPPER=sccache` setting from `mise.toml`
+resolves to a mise shim with no installed `sccache`. Run `mise install`, or
+clear the wrapper for the command:
+
+```bash
+RUSTC_WRAPPER= nix develop --command cargo test -p openshell-server --lib
+```
+
 ```bash
 # macOS
 brew install z3

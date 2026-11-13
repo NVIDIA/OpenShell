@@ -849,7 +849,7 @@ cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test sync
 Run a single Docker-only test directly with cargo:
 
 ```shell
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test docker_preflight
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test docker_corporate_proxy
 ```
 
 The harness (`e2e/rust/src/harness/`) provides:

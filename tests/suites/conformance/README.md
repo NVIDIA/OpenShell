@@ -9,12 +9,18 @@ nextest run the tests as the library's unit tests. The crate also builds the
 | Suite | Covers |
 |---|---|
 | `smoke` | Create a sandbox, run `echo` in it, delete it |
-| `lifecycle` | SDK: long-running and run-to-completion sandboxes, prompt delete when the workload is slow to handle TERM, the default command, restart of a stopped sandbox, deleting a stopped sandbox |
+| `lifecycle` | SDK: long-running and run-to-completion sandboxes, prompt delete when the workload is slow to handle TERM, the default command, restart of a stopped sandbox, deleting a stopped sandbox, exec past the startup recovery deadline, the final phase when the main command exits, the main command's environment, `--no-keep` cleanup |
 | `cli` | The same lifecycle through the `openshell` CLI: status, create, get, list, exec, stop, start, delete |
 | `persistent-workspace` | Files in `/sandbox` survive stop and start |
 | `policy-advisor` | `policy.local` accepts a proposed rule; a denied address or hostname yields one draft rule |
-| `file-transfer` | `sandbox upload` and `download`: round trips, `.gitignore` filtering, workspace-escape and option-looking names |
+| `file-transfer` | `sandbox upload` and `download`: round trips, file modes and symlinks outside the workspace, `.gitignore` filtering, workspace-escape and option-looking names, a large upload |
 | `credential-gating` | Provider credentials: admission of credentialed endpoints, REST body placeholders and rewriting, WebSocket binary frames, live policy binding |
+| `image` | A sandbox runs the default image or the one it is created from |
+| `labels` | Labels are stored and select sandboxes in `sandbox list` |
+| `templates` | A sandbox created from a template uses its workload; duplicate, deleted and missing templates return the right errors |
+| `settings` | Sandbox-scoped settings |
+| `process` | Core dumps are disabled for sandbox processes |
+| `filesystem-policy` | Landlock: a hard requirement accepts added device paths; a replaced policy path rejects the next launch |
 
 `smoke` is the smallest end-to-end check that the runner can run a real test in a
 tmachine environment on CI. The other suites are ports of the old

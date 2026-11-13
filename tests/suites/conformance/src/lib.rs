@@ -11,7 +11,13 @@
 mod cli;
 mod credential_gating;
 mod file_transfer;
+mod filesystem_policy;
+mod image;
+mod labels;
 mod lifecycle;
 mod persistent_workspace;
 mod policy_advisor;
+mod process;
+mod settings;
 mod smoke;
+mod templates;

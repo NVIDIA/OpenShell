@@ -129,18 +129,6 @@ impl SandboxGuard {
     /// Returns an error if the CLI exits with a non-zero status or the sandbox
     /// name cannot be parsed from the output.
     pub async fn create(args: &[&str]) -> Result<Self, String> {
-        Self::create_inner(args, true).await
-    }
-
-    /// Create a sandbox using the gateway's configured default image.
-    ///
-    /// Most E2E tests use [`Self::create`], which supplies the tool-capable E2E
-    /// image. This variant is reserved for coverage of the product default.
-    pub async fn create_with_gateway_default(args: &[&str]) -> Result<Self, String> {
-        Self::create_inner(args, false).await
-    }
-
-    async fn create_inner(args: &[&str], use_test_image: bool) -> Result<Self, String> {
         let separator = args.iter().position(|arg| *arg == "--");
         let (create_args, command) = separator.map_or((args, &[][..]), |index| {
             (&args[..index], &args[index + 1..])
@@ -156,9 +144,7 @@ impl SandboxGuard {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
         add_unique_name_if_missing(&mut cmd, create_args);
-        if use_test_image {
-            add_test_image_if_missing(&mut cmd, create_args);
-        }
+        add_test_image_if_missing(&mut cmd, create_args);
         for arg in create_args {
             cmd.arg(arg);
         }
