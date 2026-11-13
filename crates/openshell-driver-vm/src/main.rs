@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
+use openshell_driver_vm::driver::image_cache_admin::{self, LockMode};
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
@@ -26,6 +27,9 @@ use tracing::info;
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    #[command(subcommand)]
+    cache_command: Option<CacheCommand>,
+
     /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
     #[arg(
         long,
@@ -113,12 +117,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_BOOTSTRAP_IMAGE", default_value = "")]
     bootstrap_image: String,
 
-    #[arg(
-        long,
-        env = "OPENSHELL_VM_DRIVER_STATE_DIR",
-        default_value = "target/openshell-vm-driver"
-    )]
-    state_dir: PathBuf,
+    #[arg(long, env = "OPENSHELL_VM_DRIVER_STATE_DIR")]
+    state_dir: Option<PathBuf>,
 
     #[arg(long = "guest-tls-ca", env = "OPENSHELL_VM_TLS_CA")]
     guest_tls_ca: Option<PathBuf>,
@@ -275,9 +275,98 @@ struct Args {
     vm_mount: Vec<String>,
 }
 
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Inspect or prune the VM driver's prepared-image cache.
+    ImageCache {
+        #[command(subcommand)]
+        action: ImageCacheAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ImageCacheAction {
+    /// List committed root disks and their persisted sandbox references.
+    List,
+    /// Remove only entries unreferenced by persisted sandboxes.
+    Prune {
+        #[arg(long, required = true)]
+        unused: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+fn run_cache_command(state_dir: &Path, command: &CacheCommand) -> Result<()> {
+    match command {
+        CacheCommand::ImageCache {
+            action: ImageCacheAction::List,
+        } => {
+            let lease = image_cache_admin::lock_existing_cache(state_dir, LockMode::Shared)
+                .into_diagnostic()?;
+            println!(
+                "ENTRY\tIMAGE\tALLOCATED_BYTES\tAPPARENT_BYTES\tLAST_USED_UNIX_MS\tCACHE_VERSION\tSANDBOXES"
+            );
+            for entry in lease.list().into_diagnostic()? {
+                let image = entry.image_ref.unwrap_or_else(|| "-".to_owned());
+                let image = image.replace(['\t', '\n', '\r'], " ");
+                let sandboxes = if entry.sandboxes.is_empty() {
+                    "-".to_owned()
+                } else {
+                    entry.sandboxes.join(",")
+                };
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    entry.id,
+                    image,
+                    entry.allocated_bytes,
+                    entry.apparent_bytes,
+                    entry
+                        .last_used_unix_ms
+                        .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+                    entry.cache_version,
+                    sandboxes,
+                );
+            }
+        }
+        CacheCommand::ImageCache {
+            action: ImageCacheAction::Prune { unused, dry_run },
+        } => {
+            if !unused {
+                return Err(miette::miette!("prune requires --unused"));
+            }
+            let mode = if *dry_run {
+                LockMode::Shared
+            } else {
+                LockMode::Exclusive
+            };
+            let lease =
+                image_cache_admin::lock_existing_cache(state_dir, mode).into_diagnostic()?;
+            let report = lease.prune_unused(*dry_run).into_diagnostic()?;
+            let action = if *dry_run { "would remove" } else { "removed" };
+            println!(
+                "{action} {} entries, {} allocated bytes",
+                report.entries.len(),
+                report.allocated_bytes,
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(command) = &args.cache_command {
+        let state_dir = args.state_dir.as_deref().ok_or_else(|| {
+            miette::miette!("image-cache requires --state-dir or OPENSHELL_VM_DRIVER_STATE_DIR")
+        })?;
+        return run_cache_command(state_dir, command);
+    }
+    let state_dir = args
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("target/openshell-vm-driver"));
     if let Some(request) = args.internal_prepare_image {
         openshell_driver_vm::driver::run_image_preparation_worker(&request)
             .await
@@ -292,6 +381,9 @@ async fn main() -> Result<()> {
         run_vm(&config).map_err(|err| miette::miette!("{err}"))?;
         return Ok(());
     }
+
+    let _cache_lease =
+        image_cache_admin::lock_cache(&state_dir, LockMode::Shared).into_diagnostic()?;
 
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_vm::otel_tracing::TRACING,
@@ -331,7 +423,7 @@ async fn main() -> Result<()> {
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
         supervisor_otlp,
         supervisor_gateway_name: args.gateway_name.clone(),
-        state_dir: args.state_dir.clone(),
+        state_dir,
         launcher_bin: None,
         default_image: args.default_image.clone(),
         bootstrap_image: args.bootstrap_image.clone(),
@@ -783,11 +875,49 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
-        compute_driver_listen_mode, parse_vm_mount_arg,
+        Args, CacheCommand, ComputeDriverListenMode, ImageCacheAction, PeerCredentials,
+        authorize_peer_credentials, compute_driver_listen_mode, parse_vm_mount_arg,
     };
     use clap::Parser;
     use std::path::PathBuf;
+
+    #[test]
+    fn image_cache_commands_parse_and_prune_requires_unused() {
+        let list = Args::try_parse_from([
+            "openshell-driver-vm",
+            "--state-dir",
+            "/tmp/vm-state",
+            "image-cache",
+            "list",
+        ])
+        .unwrap();
+        assert!(matches!(
+            list.cache_command,
+            Some(CacheCommand::ImageCache {
+                action: ImageCacheAction::List
+            })
+        ));
+        assert_eq!(list.state_dir, Some(PathBuf::from("/tmp/vm-state")));
+
+        assert!(Args::try_parse_from(["openshell-driver-vm", "image-cache", "prune"]).is_err());
+        let prune = Args::try_parse_from([
+            "openshell-driver-vm",
+            "image-cache",
+            "prune",
+            "--unused",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(matches!(
+            prune.cache_command,
+            Some(CacheCommand::ImageCache {
+                action: ImageCacheAction::Prune {
+                    unused: true,
+                    dry_run: true
+                }
+            })
+        ));
+    }
 
     #[test]
     fn corporate_proxy_flags_parse_into_driver_settings() {
