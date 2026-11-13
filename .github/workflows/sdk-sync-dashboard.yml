@@ -1,0 +1,148 @@
+name: SDK Sync Dashboard
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+  packages: read
+  issues: write
+
+concurrency:
+  group: sdk-sync-dashboard
+  cancel-in-progress: true
+
+jobs:
+  sdk_sync_check:
+    name: Sync Check (${{ matrix.sdk.name }})
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk:
+          - name: go
+            build_task: "go:proto:build-check"
+            label: "sdk-sync:go"
+    outputs:
+      drift_report: ${{ steps.drift.outputs.report }}
+      has_drift: ${{ steps.drift.outputs.has_drift }}
+      build_report: ${{ steps.build.outputs.report || '' }}
+      build_failed: ${{ steps.build.outputs.build_failed || 'false' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Check proto drift
+        id: drift
+        run: |
+          REPORT=$(uv run python tasks/scripts/sdk_sync.py drift-report \
+            --sdk ${{ matrix.sdk.name }} \
+            --upstream-path proto \
+            --sdk-path sdk/${{ matrix.sdk.name }}/proto 2>/dev/null) || true
+
+          if echo "$REPORT" | jq -e '.synced' >/dev/null 2>&1; then
+            SYNCED=$(echo "$REPORT" | jq -r '.synced')
+            {
+              echo "report<<REPORT_EOF"
+              echo "$REPORT"
+              echo "REPORT_EOF"
+            } >> "$GITHUB_OUTPUT"
+            [ "$SYNCED" = "true" ] && echo "has_drift=false" >> "$GITHUB_OUTPUT" || echo "has_drift=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Proto drift check failed"
+            echo "report={}" >> "$GITHUB_OUTPUT"
+            echo "has_drift=error" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run build check
+        id: build
+        if: steps.drift.outputs.has_drift == 'true'
+        env:
+          BUILD_TASK: ${{ matrix.sdk.build_task }}
+        run: |
+          REPORT=$(mise run "$BUILD_TASK" 2>&1) && BUILD_OK=true || BUILD_OK=false
+          if echo "$REPORT" | jq -e '.sdk' >/dev/null 2>&1; then
+            { echo "report<<REPORT_EOF"; echo "$REPORT"; echo "REPORT_EOF"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "report={}" >> "$GITHUB_OUTPUT"
+          fi
+          [ "$BUILD_OK" = "true" ] && echo "build_failed=false" >> "$GITHUB_OUTPUT" || echo "build_failed=true" >> "$GITHUB_OUTPUT"
+
+  wiki_dashboard:
+    name: Update Wiki Dashboard
+    needs: sdk_sync_check
+    if: always() && needs.sdk_sync_check.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Generate and push dashboard
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRIFT_REPORT: ${{ needs.sdk_sync_check.outputs.drift_report }}
+          BUILD_REPORT: ${{ needs.sdk_sync_check.outputs.build_report }}
+        run: |
+          DASHBOARD=$(mktemp)
+          uv run python tasks/scripts/sdk_sync.py dashboard \
+            --drift-report "${DRIFT_REPORT:-{}}" \
+            --build-report "${BUILD_REPORT:-{}}" \
+            --output "$DASHBOARD"
+
+          uv run python tasks/scripts/sdk_sync.py wiki-push \
+            --content "$DASHBOARD" \
+            --page-name SDK-Sync-Status \
+            --repo "$GITHUB_REPOSITORY"
+
+  issue_management:
+    name: Manage Drift Issues
+    needs: sdk_sync_check
+    if: needs.sdk_sync_check.outputs.has_drift == 'true' && needs.sdk_sync_check.outputs.build_failed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      issue_url: ${{ steps.issue.outputs.issue_url }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Create or update drift issue
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRIFT_REPORT: ${{ needs.sdk_sync_check.outputs.drift_report }}
+          BUILD_REPORT: ${{ needs.sdk_sync_check.outputs.build_report }}
+        run: |
+          RESULT=$(uv run python tasks/scripts/sdk_sync.py manage-issue \
+            --drift-report "${DRIFT_REPORT:-{}}" \
+            --build-report "${BUILD_REPORT:-{}}" \
+            --sdk go \
+            --repo "$GITHUB_REPOSITORY" \
+            --label "sdk-sync:go")
+          echo "issue_url=$(echo "$RESULT" | jq -r '.issue_url')" >> "$GITHUB_OUTPUT"
+
+      - name: Fire repository_dispatch
+        if: steps.issue.outputs.issue_url != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRIFT_REPORT: ${{ needs.sdk_sync_check.outputs.drift_report }}
+        run: |
+          DRIFT_SUMMARY=$(echo "${DRIFT_REPORT:-{}}" | jq -r '.summary // "unknown"')
+          uv run python tasks/scripts/sdk_sync.py dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --issue-url "${{ steps.issue.outputs.issue_url }}" \
+            --sdk go \
+            --drift-summary "$DRIFT_SUMMARY"

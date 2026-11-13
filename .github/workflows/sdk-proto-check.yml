@@ -1,0 +1,83 @@
+name: SDK Proto Check
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr_metadata:
+    name: Resolve PR metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - id: gate
+        uses: ./.github/actions/pr-gate
+
+  sdk_proto_drift:
+    name: Proto Drift (${{ matrix.sdk.name }})
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk:
+          - name: go
+            drift_task: "go:proto:drift"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Check proto drift
+        id: drift
+        run: |
+          REPORT=$(uv run python tasks/scripts/sdk_sync.py drift-report \
+            --sdk ${{ matrix.sdk.name }} \
+            --upstream-path proto \
+            --sdk-path sdk/${{ matrix.sdk.name }}/proto 2>&1) || true
+
+          if echo "$REPORT" | jq -e '.synced' >/dev/null 2>&1; then
+            SYNCED=$(echo "$REPORT" | jq -r '.synced')
+            {
+              echo "report<<REPORT_EOF"
+              echo "$REPORT"
+              echo "REPORT_EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "synced=$SYNCED" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Proto drift check failed: $REPORT"
+            echo "synced=error" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Annotate drift warning
+        if: steps.drift.outputs.synced == 'false'
+        env:
+          DRIFT_REPORT: ${{ steps.drift.outputs.report }}
+          SDK_NAME: ${{ matrix.sdk.name }}
+        run: |
+          SUMMARY=$(echo "$DRIFT_REPORT" | jq -r '.summary')
+          FILES=$(echo "$DRIFT_REPORT" | jq -r '.files[] | select(.status != "synced") | "  - \(.name) (\(.status), \(.diff_lines) lines changed)"' | sed ':a;N;$!ba;s/\n/%0A/g')
+          echo "::warning::SDK proto drift detected for ${SDK_NAME}: ${SUMMARY}%0A${FILES}"
