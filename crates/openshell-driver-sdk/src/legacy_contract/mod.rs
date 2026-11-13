@@ -40,6 +40,8 @@ pub const SUPERVISOR_CA_RUNTIME_DIR: &str = "/run/openshell-supervisor-ca/materi
 #[cfg(feature = "legacy-contract")]
 pub mod boundary;
 #[cfg(feature = "legacy-contract")]
+pub mod convert;
+#[cfg(feature = "legacy-contract")]
 pub mod identity;
 
 #[cfg(feature = "legacy-contract")]

@@ -3,8 +3,12 @@
 
 //! Generated protocol buffer code for the compute-driver contract.
 //!
-//! Covers `compute_driver.proto` and the protos it imports. `openshell-core`
-//! compiles the remaining protos and refers to these types by extern path.
+//! Covers `compute_driver.proto`, `sandbox_runtime.proto`, and the protos they
+//! import. `openshell-core` compiles the remaining protos and refers to these
+//! types by extern path.
+
+/// Encoded `FileDescriptorSet` of the protos in this module.
+pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(env!("OPENSHELL_DRIVER_SDK_DESCRIPTOR_PATH"));
 
 #[allow(
     clippy::all,
@@ -33,4 +37,8 @@ pub mod compute {
 
 pub mod extension {
     pub use super::generated::openshell::extension::v1;
+}
+
+pub mod sandbox_runtime {
+    pub use super::generated::openshell::sandbox::runtime::v1;
 }

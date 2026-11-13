@@ -40,6 +40,7 @@ nix = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+prost-reflect = { workspace = true }
 openshell-crypto = { workspace = true }
 rcgen = { workspace = true }
 base64 = { workspace = true }

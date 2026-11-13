@@ -1,0 +1,238 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.sandbox.runtime.v1;
+
+import "compute_driver.proto";
+import "options.proto";
+
+// EXPERIMENTAL: This contract is under active development. Its API and wire
+// format may change incompatibly before stabilization.
+//
+// Language-neutral specification of what a compute driver produces for the
+// supervisor and the sandbox boundary, besides the ComputeDriver gRPC service in
+// compute_driver.proto: the runtime descriptor, the boundary configuration, and
+// the endpoint, transport, TLS and gateway trust messages they contain. A driver
+// in any language and repository builds these documents from this file alone.
+//
+// Encoding. A document stored in a file or carried as an opaque `bytes` field
+// is the canonical protobuf JSON mapping of its message, encoded as UTF-8
+// without a byte-order mark. A writer emits the canonical form (lowerCamelCase
+// names, 64-bit integers as strings, enum values by name). A reader also
+// accepts the original field names and numbers in place of strings, as every
+// protobuf JSON implementation does. A reader rejects unknown fields: a
+// document is trusted launch material that one side produces and the other
+// validates, and ignoring a field it does not understand would silently skip a
+// security-relevant claim.
+//
+// Versioning. `contract_version` is "<major>.<minor>". A reader rejects a
+// document whose major version it does not implement or whose minor version is
+// newer than its own. Version 1.0 is defined by this file.
+//
+// Relation to the legacy format. Drivers currently write the JSON that the Rust
+// types in openshell-driver-sdk (`legacy_contract`) produce. These messages
+// describe the replacement. A document in this encoding is told apart from a
+// legacy one by `contract_version`, which legacy documents do not carry. The
+// identity, evidence and claim messages are the existing ones from
+// compute_driver.proto, not redefinitions.
+//
+// Producers and validators. The driver produces the runtime descriptor and the
+// boundary configuration. The supervisor validates the descriptor; the sandbox
+// boundary validates BoundaryConfig. A validator never repairs a document.
+//
+// Platform neutrality. Paths are native to the side that reads them and are
+// never interpreted by the other side. Nothing here assumes a Linux container,
+// POSIX paths, or which side connects: every link has an inbound form and a
+// runtime-initiated form.
+//
+// Secrets. Fields marked secret never appear in logs, errors, or status.
+//
+// Fixed identifiers a driver sets:
+//
+//   backend name:
+//     "openshell-sandbox" is the built-in runtime. It is reserved: no
+//     externally registered isolation backend may use it. Any other name is an
+//     isolation backend registered through IsolationBackendRegistration in
+//     compute_driver.proto, for example "openshell-mxc" for the native Windows
+//     boundary.
+//
+//   resource claim keys (DriverFenceEvidence.resource_claims):
+//     "openshell.gpu"                                       the workload
+//       requested GPU access.
+//     "openshell.identity.allow_extra_supplementary_groups" the runtime may
+//       keep supplementary groups beyond the image-derived identity.
+//     Driver-specific keys, such as a container id or a pod UID, are opaque to
+//     the contract. A key or value is non-empty and contains no whitespace.
+//
+//   supervisor CA paths of POSIX runtimes:
+//     "/run/openshell-supervisor-ca"           memory-backed parent
+//     "/run/openshell-supervisor-ca/material"  workload-visible directory
+
+// Which side opens the connection. The other side listens. This is the only
+// difference between an inbound link and a runtime-initiated one.
+enum ConnectionInitiator {
+  CONNECTION_INITIATOR_UNSPECIFIED = 0;
+  // The supervisor dials the boundary, which listens.
+  CONNECTION_INITIATOR_SUPERVISOR = 1;
+  // The boundary dials the supervisor, which listens. Required for a boundary
+  // that cannot accept inbound connections, such as one that connects outward
+  // to the host.
+  CONNECTION_INITIATOR_RUNTIME = 2;
+}
+
+// An address the listening side binds and the dialing side dials.
+message Endpoint {
+  oneof kind {
+    UnixEndpoint unix = 1;
+    TcpEndpoint tcp = 2;
+    VsockEndpoint vsock = 3;
+  }
+}
+
+message UnixEndpoint {
+  // Absolute path in the namespace of the side that reads this document.
+  string socket_path = 1;
+}
+
+message TcpEndpoint {
+  // Logical HTTP authority used for routing and diagnostics.
+  string authority = 1;
+  // Socket addresses ("host:port", IPv6 hosts in brackets). The dialing side
+  // tries them in order; the listening side binds them. Each has a nonzero
+  // port. An unspecified IP is valid only for a bind. May be empty only in a
+  // SandboxTransport that has a `route`, where the shared supervisor's
+  // listener is owned by the gateway.
+  repeated string addresses = 2;
+}
+
+message VsockEndpoint {
+  // Context id of the peer. Unset where the peer is implied: the host for a
+  // listener that dials the host, the guest for one that accepts from the host.
+  optional uint32 cid = 1;
+  uint32 port = 2;
+}
+
+// How the supervisor reaches the boundary, in the supervisor's namespace.
+message SandboxTransport {
+  ConnectionInitiator initiator = 1;
+  Endpoint endpoint = 2;
+  // Names this instance on a supervisor shared by several sandbox instances.
+  // The runtime sends it before the pinned TLS handshake. Only with RUNTIME.
+  // 16 to 64 lowercase ASCII letters, digits or hyphens.
+  optional string route = 3;
+}
+
+// Boundary-side listener provisioned by the compute driver. It describes the
+// same link as SandboxTransport from the boundary's side, so `endpoint` values
+// are in the boundary's namespace.
+message BoundaryListener {
+  ConnectionInitiator initiator = 1;
+  // Bound by the boundary when `initiator` is SUPERVISOR. Dialed by the
+  // boundary when `initiator` is RUNTIME: a TCP endpoint lists the
+  // driver-resolved supervisor addresses, tried in order, and a vsock endpoint
+  // names the host port.
+  Endpoint endpoint = 2;
+  TlsServerConfig tls = 3;
+  // Route handle sent before TLS to a supervisor shared by several sandbox
+  // instances. Only with RUNTIME. Absent for a dedicated supervisor.
+  optional string route = 4;
+}
+
+// Supervisor-side, generation-pinned TLS server authentication.
+message TlsClientConfig {
+  string server_name = 1;
+  // The generation's public CA certificate.
+  string trust_anchor_pem = 2;
+}
+
+// Sandbox-side TLS server files staged by the compute driver, as paths in the
+// boundary's namespace.
+message TlsServerConfig {
+  string certificate_chain_path = 1;
+  string private_key_path = 2;
+}
+
+// Public verification key staged in the sandbox's immutable auth bundle.
+message GatewayVerificationKey {
+  string key_id = 1;
+  string public_key_pem = 2;
+}
+
+// The minimum every isolation backend, built-in or external, must receive to
+// verify the supervisor's Sandbox Protocol bearer. The driver provisions it
+// before the backend serves a launch; how it is delivered is private to the
+// driver and the backend. The gateway identity and key set stay fixed for a
+// runtime generation. Bearers may be renewed with the provisioned keys, but
+// changing the identity or the key set requires a fresh launch.
+message GatewayTrust {
+  // Gateway identity expected in Sandbox Protocol JWTs. Non-empty with no
+  // whitespace.
+  string gateway_id = 1;
+  // Immutable current and staged-next verification keys. Non-empty, with
+  // unique key ids.
+  repeated GatewayVerificationKey verification_keys = 2;
+  // Monotonic signed supervisor replacement within this generation. Nonzero.
+  uint64 session_rotation = 3;
+  // Durable authorization epoch required in every Sandbox Protocol JWT.
+  // Nonzero.
+  uint64 auth_epoch = 4;
+}
+
+// Protected runtime descriptor. Produced by the compute driver and validated by
+// the supervisor. Carried as a file, or as the payload of the backend
+// descriptor whose backend name names the isolation backend (for the built-in
+// runtime, OpenBoundaryRequest.driver_descriptor).
+message SandboxRuntimeDescriptor {
+  // "1.0".
+  string contract_version = 1;
+  // Stable identity of the boundary, normally the sandbox id.
+  string boundary_id = 2;
+  // Immutable driver-owned workload generation: 1 to 64 lowercase letters,
+  // digits or hyphens.
+  string generation = 3;
+  // Fresh gateway-issued identity for this exact launch: a non-nil canonical
+  // lowercase UUID.
+  string session_id = 4;
+  openshell.compute.v1.ResolvedWorkloadIdentity workload_identity = 5;
+  SandboxTransport transport = 6;
+  TlsClientConfig tls = 7;
+  // Trusted dial target for well-known host-gateway aliases, when the network
+  // supervisor cannot use the boundary's resolver view.
+  optional string host_gateway_ip = 8;
+  // The digest binds the fence to `generation`: the lowercase hexadecimal
+  // SHA-256 over the big-endian 64-bit length of the generation, the generation
+  // bytes, then the driver's native enforcement evidence. The claims are the
+  // immutable coordinates the boundary requires before accepting attachment.
+  openshell.compute.v1.DriverFenceEvidence fence_evidence = 9;
+}
+
+// Protected bootstrap configuration of the built-in openshell-sandbox runtime.
+// Produced by the compute driver, staged in the boundary's namespace outside
+// workload mounts, and validated by the sandbox boundary before it opens its
+// listener.
+//
+// An external isolation backend is not required to consume this message. It must
+// receive `trust` and may reuse the rest, as the native Windows MXC backend does
+// by wrapping a BoundaryConfig in its own launch envelope.
+message BoundaryConfig {
+  // "1.0".
+  string contract_version = 1;
+  string boundary_id = 2;
+  string generation = 3;
+  string session_id = 4;
+  GatewayTrust trust = 5;
+  BoundaryListener listener = 6;
+  openshell.compute.v1.ResolvedWorkloadIdentity workload_identity = 7;
+  // Must equal the runtime descriptor's fence evidence for this launch.
+  openshell.compute.v1.DriverFenceEvidence fence_evidence = 8;
+  // Built-in runtime only. Maps a claim key to an absolute file whose trimmed
+  // contents must equal the claim's value before the boundary opens its
+  // listener, which lets a driver bind a one-use bootstrap bundle to a runtime
+  // object the workload cannot forge.
+  map<string, string> resource_claim_files = 9;
+  // Built-in runtime only. Driver-resolved environment exposed only to workload
+  // processes. Contains secrets.
+  map<string, string> child_env = 10 [(openshell.options.v1.secret) = true];
+}
