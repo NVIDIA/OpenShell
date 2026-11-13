@@ -579,7 +579,7 @@ pub fn print_sandbox_header(
 /// scheduler's "0/N nodes are available" message) is preferred because the
 /// `Ready` condition may be replaced by a less specific reason such as
 /// `ConfigurationPending` while the pod cannot be placed.
-pub fn ready_false_condition_message(
+pub fn provisioning_blocker_message(
     status: Option<&openshell_core::proto::SandboxStatus>,
 ) -> Option<String> {
     let conditions = &status?.conditions;
