@@ -188,7 +188,9 @@ spec:
             secretName: {{ get $appDeployment "tls_secret_name" | quote }}
         {{- end }}
         - name: run
-          emptyDir: {}
+          # Per-instance proxy CA private keys must not use node-backed storage.
+          emptyDir:
+            medium: Memory
         - name: logs
           emptyDir: {}
         - name: supervisor-token
