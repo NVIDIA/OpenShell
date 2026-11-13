@@ -37,6 +37,12 @@
 #   forwarding       - two TCP request/reply exchanges through OpenShell ingress.
 #   service-forwarding - named HTTP service routing and endpoint deletion.
 #   host-service     - workload reaches an HTTP service on host 127.0.0.1.
+#   gateway-kill     - hard-killing the gateway ends every sandbox process and
+#                      frees its port. processcontainer only.
+#   gateway-restart  - a graceful gateway stop (Ctrl-C) ends every sandbox process;
+#                      after a restart on the same database the sandbox record is
+#                      still there but its workload is not recovered, and the
+#                      record can be deleted and its name reused. processcontainer only.
 #   https-ca         - opt-in outbound HTTPS using the injected proxy CA.
 
 [CmdletBinding()]
@@ -315,8 +321,12 @@ function Test-PortListening {
     return @([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq $Port }).Count -gt 0
 }
 
-function Start-Gw {
+function Start-Gw([string]$DbUrl = "sqlite::memory:") {
     Remove-Item $gwLog, $gwErrLog -Force -ErrorAction SilentlyContinue
+    # A parent that ignores Ctrl-C (some ssh/service sessions do) passes that on to
+    # the gateway, which would then never see a graceful-stop request. Clear it for
+    # this process so the gateway starts with the default handling.
+    [void][OpenShellMxcCtrlC]::EnableCtrlC()
     # Ephemeral in-memory DB: this is a test harness, so it must NOT write sandbox
     # records to the persistent default store (%LOCALAPPDATA%\openshell\gateway\
     # openshell.db). Without this, sandbox names persist across gateway restarts
@@ -327,7 +337,7 @@ function Start-Gw {
     # config path containing a space gets split and the gateway's arg parser rejects it.
     $env:OPENSHELL_GATEWAY_CONFIG = $toml
     $p = Start-Process -FilePath $gateway `
-        -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--port", $Port, "--log-level", "info") `
+        -ArgumentList @("--disable-tls", "--db-url", $DbUrl, "--port", $Port, "--log-level", "info") `
         -WorkingDirectory $here -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
     $deadline = (Get-Date).AddSeconds(30)
@@ -337,6 +347,7 @@ function Start-Gw {
             throw "gateway exited early (code $($p.ExitCode)). See $gwLog."
         }
         if (Test-PortListening) {
+            $null = $p.Handle   # keep the handle so ExitCode is available later
             return $p
         }
         Start-Sleep -Milliseconds 400
@@ -545,6 +556,107 @@ function Test-ServiceForwarding([string]$sandboxName, [string]$readyFile, [strin
 # Detect an agent *launch* failure (binary not found / not implemented) vs a
 # legitimate policy denial. Used to avoid false-passing a deny scenario when the
 # agent never actually ran.
+if (-not ("OpenShellMxcCtrlC" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class OpenShellMxcCtrlC
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+
+    // Restore default Ctrl-C handling for this process (and what it starts).
+    public static bool EnableCtrlC() { return SetConsoleCtrlHandler(IntPtr.Zero, false); }
+}
+'@
+}
+
+# Deliver a real Ctrl-C to another console process. Attaching to its console
+# detaches the caller from its own, so this runs in a throwaway PowerShell.
+function Send-CtrlC([int]$ProcessId) {
+    $script = @"
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class SendCtrlC {
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool FreeConsole();
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool AttachConsole(uint pid);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetConsoleCtrlHandler(IntPtr h, bool add);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GenerateConsoleCtrlEvent(uint ev, uint grp);
+  public static string Run(uint pid) {
+    FreeConsole();
+    if (!AttachConsole(pid)) return "AttachConsole failed: " + Marshal.GetLastWin32Error();
+    SetConsoleCtrlHandler(IntPtr.Zero, true);
+    bool ok = GenerateConsoleCtrlEvent(0, 0);
+    int err = Marshal.GetLastWin32Error();
+    FreeConsole();
+    return ok ? "sent" : "GenerateConsoleCtrlEvent failed: " + err;
+  }
+}
+'@
+[SendCtrlC]::Run($ProcessId)
+"@
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+    $result = Invoke-NativeCaptured "powershell.exe" @("-NoProfile", "-NonInteractive", "-EncodedCommand", $encoded) 30
+    # An encoded command also emits CLIXML progress noise on stderr; the verdict is
+    # the one line that starts with one of the helper's results.
+    $verdict = @($result.Output | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^(sent|AttachConsole failed|GenerateConsoleCtrlEvent failed)' })
+    if ($verdict.Count -eq 0) { return "no result from the Ctrl-C helper (exit $($result.ExitCode))" }
+    return $verdict[0]
+}
+
+# Wait until a sandbox's whole process tree exists, then return it as
+# @{ pid = name }. Only processes under $gwProc, plus the process whose command
+# line carries $nonce, are included, so unrelated MXC sandboxes on the host are
+# never counted or touched. Throws if the tree does not come up.
+function Wait-SandboxTree($gwProc, [string]$nonce) {
+    $victims = @{}
+    $deadline = (Get-Date).AddSeconds(60)
+    do {
+        Start-Sleep -Milliseconds 500
+        $victims = @{}
+        foreach ($id in (Get-DescendantPids $gwProc.Id)) {
+            $proc = Get-Process -Id $id -ErrorAction SilentlyContinue
+            if ($proc) { $victims[$id] = $proc.ProcessName }
+        }
+        $marked = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*$nonce*" -and $_.ProcessId -ne $PID })
+        foreach ($proc in $marked) { $victims[[int]$proc.ProcessId] = $proc.Name }
+        $names = @($victims.Values | ForEach-Object { $_ -replace '\.exe$', '' })
+        $ready = ($names -contains 'wxc-exec') -and ($names -contains 'openshell-supervisor') -and ($marked.Count -gt 0)
+    } while (-not $ready -and (Get-Date) -lt $deadline)
+    if (-not $ready) { throw "sandbox process tree did not come up (saw: $(($victims.Values) -join ', '))" }
+    return $victims
+}
+
+# Processes from a recorded tree that are still alive after waiting up to
+# $seconds for them to end.
+function Wait-TreeGone($victims, [int]$seconds = 30) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    do {
+        Start-Sleep -Milliseconds 500
+        $survivors = @($victims.Keys | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    } while ($survivors.Count -gt 0 -and (Get-Date) -lt $deadline)
+    return ($survivors | ForEach-Object { "$($victims[$_])($_)" })
+}
+
+# All descendants of a process, found by walking ParentProcessId links in one
+# snapshot. Orphans keep their ParentProcessId, so the walk is still correct
+# for a tree whose root has since died, but it must run while the root lives.
+function Get-DescendantPids([int]$rootPid) {
+    $all = @(Get-CimInstance Win32_Process)
+    $found = New-Object System.Collections.Generic.HashSet[int]
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    $queue.Enqueue($rootPid)
+    while ($queue.Count -gt 0) {
+        $parent = $queue.Dequeue()
+        foreach ($p in $all) {
+            if ($p.ParentProcessId -eq $parent -and $found.Add([int]$p.ProcessId)) { $queue.Enqueue([int]$p.ProcessId) }
+        }
+    }
+    return @($found)
+}
+
 function Launch-Failed([string]$gwText) {
     if ($null -eq $gwText) { return $false }
     return ($gwText -match 'CreateProcessW failed error:2' `
@@ -790,10 +902,20 @@ try {
             Name = 'host-service'; PolicyFile = Join-Path $policyDir 'host-service.yaml'
             SandboxId = 'host'; Backends = 'process_container'; Kind = 'host-service'
             Description = 'workload connects directly to an HTTP service on host 127.0.0.1'
+        },
+        @{
+            Name = 'gateway-kill'; PolicyFile = Join-Path $policyDir 'fs-rw.yaml'
+            SandboxId = 'gk'; Backends = 'process_container'; Kind = 'gateway-kill'
+            Description = 'hard-killing the gateway ends every sandbox process and frees its port'
+        },
+        @{
+            Name = 'gateway-restart'; PolicyFile = Join-Path $policyDir 'fs-rw.yaml'
+            SandboxId = 'gr'; Backends = 'process_container'; Kind = 'gateway-restart'
+            Description = 'graceful gateway stop ends sandbox processes; the record persists but is not recovered'
         }
     )
 
-    # External connectivity is deliberately opt-in; the default seven scenarios
+    # External connectivity is deliberately opt-in; the default scenarios
     # remain runnable without Internet access. Use the same authenticated
     # gateway launch path as every other workload, not a bare driver fixture.
     if ($Scenario -eq 'https-ca') {
@@ -916,6 +1038,11 @@ try {
                 } else {
                     $command = @($cmdExe, "/c", "echo denied 1> $denied")
                 }
+            } elseif ($sc.Kind -in @('gateway-kill', 'gateway-restart')) {
+                # A long-running workload carrying a unique marker, so its process
+                # can be identified without matching unrelated cmd.exe instances.
+                $killNonce = [guid]::NewGuid().ToString('N')
+                $command = @($cmdExe, '/d', '/c', "for /l %i in (1,1,2000000000) do @rem $killNonce")
             } elseif ($sc.Kind -eq 'host-service') {
                 Remove-Item -Path (Join-Path $DemoDir 'host-service.*') -Force -ErrorAction SilentlyContinue
                 $batch = Join-Path $DemoDir 'host-service.cmd'
@@ -974,7 +1101,11 @@ try {
             # policyUsed already lives in the result bundle and is the exact
             # rendered policy passed to OpenShell.
 
-            $gw = Start-Gw
+            # gateway-restart needs state that survives the gateway; every other
+            # scenario keeps the ephemeral in-memory database.
+            $persistedDb = Join-Path $resultDir "gateway.$($sc.Name).db"
+            $gwDbUrl = if ($sc.Kind -eq 'gateway-restart') { "sqlite:${persistedDb}?mode=rwc" } else { "sqlite::memory:" }
+            $gw = Start-Gw $gwDbUrl
             Info "gateway pid $($gw.Id)"
             Register-Cli
 
@@ -990,7 +1121,7 @@ try {
                     "--policy", [string]$policyUsed,
                     "--driver-config-json", $driverConfig
                 )
-                $createArguments += if ($sc.Kind -eq 'host-service') { '--detach' } else { '--no-tty' }
+                $createArguments += if ($sc.Kind -in @('host-service', 'gateway-kill', 'gateway-restart')) { '--detach' } else { '--no-tty' }
                 $createResult = Invoke-NativeCaptured $cli $createArguments
                 $createOut = $createResult.Output
                 $createExitCode = $createResult.ExitCode
@@ -1012,6 +1143,80 @@ try {
                     $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'PASS'; Reason = $reason }
                 } catch {
                     Bad "host-service: $($_.Exception.Message)"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'FAIL'; Reason = $_.Exception.Message }
+                }
+            } elseif ($sc.Kind -eq 'gateway-kill') {
+                try {
+                    if ($createExitCode -ne 0) { throw "sandbox creation failed: $createOutStr" }
+                    # Wait for the whole sandbox tree to exist, then record it.
+                    $victims = Wait-SandboxTree $gw $killNonce
+                    Info "tracking $($victims.Count) sandbox processes: $((($victims.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Value)($($_.Key))" })) -join ', ')"
+
+                    Info "hard-killing gateway pid $($gw.Id)"
+                    Stop-Process -Id $gw.Id -Force
+                    $gw.WaitForExit()
+                    $survivors = @(Wait-TreeGone $victims 30)
+                    if ($survivors.Count -gt 0) {
+                        throw "sandbox processes survived the gateway's death: $($survivors -join ', ')"
+                    }
+                    # The port must be free again: a replacement gateway must bind it.
+                    $gw = Start-Gw
+                    Info "replacement gateway pid $($gw.Id) bound port $Port"
+                    Ok "gateway-kill: all $($victims.Count) sandbox processes ended; port rebound"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'PASS'; Reason = "$($victims.Count) sandbox processes ended, port rebound" }
+                } catch {
+                    Bad "gateway-kill: $($_.Exception.Message)"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'FAIL'; Reason = $_.Exception.Message }
+                }
+            } elseif ($sc.Kind -eq 'gateway-restart') {
+                # Documents today's behavior (MXC has no restart recovery): a graceful
+                # gateway stop ends the workloads, the persisted record is left
+                # behind, and nothing restarts it. Revisit the "not recovered" check
+                # when recovery is added.
+                try {
+                    if ($createExitCode -ne 0) { throw "sandbox creation failed: $createOutStr" }
+                    $victims = Wait-SandboxTree $gw $killNonce
+                    Info "tracking $($victims.Count) sandbox processes: $((($victims.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Value)($($_.Key))" })) -join ', ')"
+
+                    Info "sending Ctrl-C to gateway pid $($gw.Id)"
+                    $sent = Send-CtrlC $gw.Id
+                    if ($sent -ne 'sent') { throw "could not send Ctrl-C to the gateway: $sent" }
+                    if (-not $gw.WaitForExit(60000)) { throw 'gateway did not exit within 60 s of Ctrl-C (no graceful shutdown)' }
+                    Info "gateway exited (exit code $($gw.ExitCode))"
+                    if (-not (Select-String -Path $gwLog, $gwErrLog -Pattern 'Shutdown signal received' -Quiet -ErrorAction SilentlyContinue)) {
+                        throw 'gateway exited without logging a graceful shutdown (it was not a graceful stop)'
+                    }
+                    $survivors = @(Wait-TreeGone $victims 30)
+                    if ($survivors.Count -gt 0) {
+                        throw "sandbox processes survived a graceful gateway stop: $($survivors -join ', ')"
+                    }
+                    Copy-Item $gwLog "$gwLog.first" -Force -ErrorAction SilentlyContinue
+                    Copy-Item $gwErrLog "$gwErrLog.first" -Force -ErrorAction SilentlyContinue
+
+                    # Restart on the same database: the record persists; nothing recovers it.
+                    $gw = Start-Gw $gwDbUrl
+                    Info "restarted gateway pid $($gw.Id) on the same database"
+                    $listed = Invoke-NativeCaptured $cli @('sandbox', 'list')
+                    $row = @($listed.Output | Where-Object { $_ -match [regex]::Escape($sandboxName) }) | Select-Object -First 1
+                    if (-not $row) { throw "persisted sandbox record '$sandboxName' is missing after restart: $($listed.Output -join ' ')" }
+                    Info "record after restart: $(($row -replace '\s+', ' ').Trim())"
+                    Start-Sleep -Seconds 10
+                    $running = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*$killNonce*" -and $_.ProcessId -ne $PID })
+                    if ($running.Count -gt 0) { throw "workload was running after restart ($($running.Count) process(es)); recovery behavior changed, update this scenario and the Windows docs" }
+
+                    # The stale record must be manageable: delete it, then reuse the name.
+                    $deleted = Invoke-NativeCaptured $cli @('sandbox', 'delete', $sandboxName)
+                    if ($deleted.ExitCode -ne 0) { throw "deleting the stale record failed: $($deleted.Output -join ' ')" }
+                    $listed = Invoke-NativeCaptured $cli @('sandbox', 'list')
+                    if (@($listed.Output | Where-Object { $_ -match [regex]::Escape($sandboxName) }).Count -gt 0) { throw 'record still listed after delete' }
+                    $again = Invoke-NativeCaptured $cli $createArguments
+                    if ($again.ExitCode -ne 0) { throw "re-creating '$sandboxName' failed: $($again.Output -join ' ')" }
+                    $null = Wait-SandboxTree $gw $killNonce
+
+                    Ok "gateway-restart: graceful stop ended $($victims.Count) processes; record persisted, not recovered; delete and re-create work"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'PASS'; Reason = "graceful stop ended $($victims.Count) processes; record persisted, not recovered, name reusable" }
+                } catch {
+                    Bad "gateway-restart: $($_.Exception.Message)"
                     $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'FAIL'; Reason = $_.Exception.Message }
                 }
             } elseif ($sc.Kind -eq 'socket-owner') {
@@ -1208,6 +1413,12 @@ admission and execution, not network enforcement. Forwarding proves managed
 ingress works, not that direct host ingress is blocked.
 Host-service verifies two exact direct HTTP replies from a service bound to
 host 127.0.0.1, with host-side request evidence. It checks localhost connectivity.
+Gateway-kill creates a sandbox, hard-kills the gateway, and requires every process
+that was under that gateway (and the marked workload) to end and the port to be
+bindable by a replacement gateway. Gateway-restart stops the gateway gracefully
+(Ctrl-C) with a persisted database, requires the same, then restarts it and checks
+that the sandbox record is still listed, its workload is not recovered, and the
+record can be deleted and its name reused.
 "@
     Set-Content -Path (Join-Path $resultDir "summary.txt") -Value $summary -Encoding UTF8
     Write-Host $summary -ForegroundColor ($(if ($verdict -eq "PASS") { "Green" } else { "Red" }))

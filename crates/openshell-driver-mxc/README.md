@@ -222,7 +222,8 @@ not required; driver-owned guest TLS fields are rejected.
 | Exec, signals, retained output | Authenticated Sandbox Protocol; ConPTY resize is not yet supported |
 | Dynamic forwarding | Standard supervisor `ForwardTcp` path through sandbox loopback connect |
 | ETW/OCSF audit | Optional Windows Sandboxing ETW consumer |
-| Gateway restart recovery | Not yet supported; live MXC generations remain in-memory |
+| Gateway exit | Ends the sandbox processes, workloads included ([details](#gateway-exit-and-restart)) |
+| Gateway restart recovery | Not supported; live MXC generations remain in-memory and are not recovered |
 
 Workloads receive the proxy CA in `NODE_EXTRA_CA_CERTS` and `DENO_CERT`, and a
 combined bundle in `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and
@@ -253,6 +254,43 @@ containment targets are rejected before provisioning. MXC advertises
 explicit UI policy (including `{}`) for drivers missing this capability; those
 drivers need no UI-specific handling. UI policy itself does not require the
 `allow_driver_config` opt-in. Recreate the sandbox to change these settings.
+
+## Gateway exit and restart
+
+The driver runs inside the gateway. Each sandbox generation runs in its own
+Windows job object with kill-on-close: the host supervisor and `wxc-exec` are
+started inside it, and the boundary and workload processes below them inherit
+it. When a generation stops, the job is terminated, and when the gateway process
+ends for any reason Windows closes the job and ends everything in it. In
+practice:
+
+- **Stop and delete** end the whole generation: supervisor, `wxc-exec`, boundary
+  and workload, not only the two direct children.
+- **Graceful gateway stop** (Ctrl-C) ends every sandbox process, workloads
+  included, and frees the gateway port.
+- **Gateway crash or hard kill** ends every sandbox process through the job, and
+  the listening socket is not inherited by any child, so a new gateway can bind
+  the port at once.
+
+MXC does not recover sandboxes across a gateway restart. The Docker, Podman and
+VM drivers stop their sandboxes on a graceful gateway stop and recover them when
+the gateway starts again; MXC reports `gateway_manages_lifecycle: false`, so the
+gateway skips that shutdown sweep and startup recovery for it, and live
+generations exist only in the driver's memory. After a restart on the same
+database:
+
+- each sandbox record is still listed, with the phase it had when the gateway
+  went away (for example `Provisioning` after a graceful stop, `Ready` after a
+  hard kill); nothing updates it to show that the workload ended;
+- no workload is running, and nothing restarts it;
+- `openshell sandbox delete <name>` removes the record, and the name can then be
+  created again.
+
+Treat a sandbox that was running when the gateway exited as lost, delete its
+record, and create it again. The `gateway-kill` and `gateway-restart` E2E
+scenarios (see [Validation](#validation)) check this behavior. Behavior for a
+driver that runs as its own process, separate from the gateway, is not defined
+yet.
 
 ## Validation
 
@@ -349,7 +387,7 @@ explicitly loads the boundary-injected CA bundle and records the peer certificat
 success requires a nonempty response and the OpenShell proxy CA issuer. It does
 not install a host trust root or disable CA/hostname verification. The fixture
 uses best-effort Schannel revocation because the ephemeral private CA has no CRL
-distribution point; it does not qualify revocation enforcement. The default seven E2E
+distribution point; it does not qualify revocation enforcement. The default E2E
 scenarios remain independent of Internet access.
 
 The `forwarding` scenario starts a TCP listener inside MXC, then verifies two
@@ -373,12 +411,33 @@ host service is checked before launch and stopped after testing. Select it with
 `-Scenario host-service`; no Internet access, LAN address, or firewall changes
 are required. This verifies direct localhost connectivity.
 
+The default `gateway-kill` scenario checks sandbox cleanup when the gateway dies
+without warning. It creates a sandbox with a long-running workload, records the
+sandbox process tree under that gateway, hard-kills the gateway, and requires
+every recorded process to end and the gateway port to be bindable again (a
+replacement gateway must start on it). Only processes under the scenario's own
+gateway are tracked, so other sandboxes on the host are left alone. It relies on
+each sandbox generation's kill-on-close job object; no workload outlives the
+gateway. Select it with `-Scenario gateway-kill`.
+
+The default `gateway-restart` scenario covers a graceful gateway stop with
+persisted state. It runs the gateway on a SQLite file, creates a sandbox with a
+long-running workload, sends a real Ctrl-C, and requires the gateway to log a
+graceful shutdown and exit, every recorded sandbox process to end, and a restart
+on the same database to start. After the restart the sandbox record must still be
+listed (the observed phase is `Provisioning` and does not change), its workload
+must not be running (MXC has no restart recovery), and the record must be
+deletable with its name reusable. The scenario pins today's no-recovery behavior,
+so it needs updating when recovery is added. A graceful stop ends the workloads
+with or without the per-generation job; the job is what covers a hard kill.
+Select it with `-Scenario gateway-restart`.
+
 The `ws-agent.yaml` and `openclaw-gateway.yaml` policies preserve the Windows
 branch's workload grants. `inference.yaml` is a template: replace its filesystem,
 curl executable, inference host, and port placeholders before use. Authorize
 curl, which owns the network socket, not its cmd launcher. These policies have
 parser/mapper regression coverage; they do not add live WebSocket, OpenClaw,
-or provider-backed inference scenarios to the seven-scenario E2E runner.
+or provider-backed inference scenarios to the E2E runner.
 
 With `-KeepRunning`, the runner restores the caller's environment but retains
 the disposable CLI/runtime directory for the live gateway and prints its path.
