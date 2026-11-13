@@ -35,8 +35,8 @@ $env:AWS_LC_SYS_CFLAGS = if ($Architecture -eq 'arm64') {
 }
 # Match the existing release version-stamping convention without inventing a tag.
 $cargo = Get-Content -Raw Cargo.toml
-if ($cargo -notmatch '(?m)^version = "0\.0\.0"$') { throw 'Unexpected workspace version' }
-[IO.File]::WriteAllText((Join-Path $source 'Cargo.toml'), ($cargo -replace '(?m)^version = "0\.0\.0"$', 'version = "0.1.8"'))
+if ($cargo -notmatch '(?m)^version = "0\.0\.0"\r?$') { throw 'Unexpected workspace version' }
+[IO.File]::WriteAllText((Join-Path $source 'Cargo.toml'), ($cargo -replace '(?m)^version = "0\.0\.0"\r?$', 'version = "0.1.8"'))
 # Git-derived development versions must not override the stamped package version.
 $env:GIT_DIR = Join-Path $env:RUNNER_TEMP 'absent-release-git'
 & mise run --skip-tools "windows:build:$Architecture"

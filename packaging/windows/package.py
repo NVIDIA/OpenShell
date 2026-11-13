@@ -15,6 +15,10 @@ VERSION = '0.1.8'
 RUN = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
 TEMPLATES = Path(__file__).parent / 'templates'
 PE_FILES = ('openshell.exe', 'openshell-gateway.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe', 'libz3.dll')
+Z3_HASHES = {
+    'arm64': '8bf540e8ab0fc43462bd64ff85deb02b1c655bdac14f4f9c40187fedf9532e7c',
+    'x64': 'f4ea9e799e13b64dc748415c5f7ec34fa0d885cb32e243ec991c973329bca1fb',
+}
 
 
 def digest(path):
@@ -27,6 +31,10 @@ def audit(path):
     encoded = [s.lower().encode(e) for s in needles for e in ('utf-8', 'utf-16-le')]
 
     def check(name, data):
+        if name == 'libz3.dll' and hashlib.sha256(data).hexdigest() in Z3_HASHES.values():
+            # The checksum-pinned upstream DLL contains public Z3 CI source paths.
+            # Keep the official DLL unchanged; these are not local build/test paths.
+            data = data.replace(b'D:\\a\\z3\\z3\\', b'/upstream-z3/')
         if any(n in data.lower() for n in encoded):
             raise ValueError(f'Unsanitized build path in {name}')
         if Path(name).suffix.lower() in ('.pdb', '.pem', '.key'):
@@ -74,6 +82,8 @@ for arch, machine in (('arm64', 0xAA64), ('x64', 0x8664)):
         assert struct.unpack_from('<H', data, offset+4)[0] == machine, name
         entry = next(f for f in record['files'] if f['file'] == name)
         assert entry['sha256'] == digest(binary)
+        if name == 'libz3.dll':
+            assert digest(binary) == Z3_HASHES[arch], 'Unexpected upstream Z3 DLL'
         assert entry['signature'] == 'NotSigned', 'Unexpected signature state; review before packaging'
         shutil.copy2(binary, kit / 'bin' / name)
         inventory.append({'architecture': arch, 'file': f'{kit.name}/bin/{name}', 'sha256': digest(binary), 'authenticode': 'pending'})
