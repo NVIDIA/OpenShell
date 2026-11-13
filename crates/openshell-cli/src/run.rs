@@ -2166,6 +2166,13 @@ pub async fn service_forward_tcp(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
+    let target_host = openshell_core::net::normalize_tcp_forward_host(target_host)
+        .map_err(|message| miette::miette!(message))?;
+    if target_port == 0 {
+        return Err(miette::miette!(
+            "tcp target port must be between 1 and 65535"
+        ));
+    }
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
@@ -2214,7 +2221,7 @@ pub async fn service_forward_tcp(
                 let mut client = client.clone();
                 let sandbox_name = sandbox_name.clone();
                 let sandbox_workspace = sandbox_workspace.clone();
-                let target_host = target_host.to_string();
+                let target_host = target_host.clone();
                 let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
                 let fatal_tx = fatal_tx.clone();
                 let legacy_session_tokens = legacy_session_tokens.clone();
@@ -7143,6 +7150,36 @@ mod tests {
         service_url_for_gateway, workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
+
+    #[tokio::test]
+    async fn forward_rejects_invalid_target_before_gateway_or_local_bind() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap().to_string();
+        for (host, port, message) in [
+            ("example.com", 8080, "tcp target host must be loopback"),
+            ("192.0.2.1", 8080, "tcp target host must be loopback"),
+            ("::ffff:127.0.0.1", 8080, "tcp target host must be loopback"),
+            ("", 8080, "tcp target host is required"),
+            (
+                "127.0.0.1",
+                0,
+                "tcp target port must be between 1 and 65535",
+            ),
+        ] {
+            let error = super::service_forward_tcp(
+                "invalid gateway",
+                "sandbox",
+                Some(&local),
+                host,
+                port,
+                &crate::tls::TlsOptions::default(),
+                "default",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), message);
+        }
+    }
 
     #[test]
     fn lifecycle_wait_fails_fast_on_phases_that_block_the_target() {

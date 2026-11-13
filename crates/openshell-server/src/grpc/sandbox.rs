@@ -51,7 +51,6 @@ use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
 use prost_types::{Struct, Value, value::Kind};
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3156,28 +3155,12 @@ fn validate_tcp_forward_target(target: &TcpRelayTarget) -> Result<TcpRelayTarget
         ));
     }
 
-    validate_tcp_target_parts(target.host.trim(), target.port).map(|host| TcpRelayTarget {
-        host,
-        port: target.port,
-    })
-}
-
-fn validate_tcp_target_parts(host: &str, _port: u32) -> Result<String, Status> {
-    if host.is_empty() {
-        return Err(Status::invalid_argument("tcp target host is required"));
-    }
-    if host.eq_ignore_ascii_case("localhost") {
-        return Ok("127.0.0.1".to_string());
-    }
-
-    let ip: IpAddr = host
-        .parse()
-        .map_err(|_| Status::invalid_argument("tcp target host must be loopback"))?;
-    if ip.is_loopback() {
-        Ok(ip.to_string())
-    } else {
-        Err(Status::invalid_argument("tcp target host must be loopback"))
-    }
+    openshell_core::net::normalize_tcp_forward_host(&target.host)
+        .map_err(Status::invalid_argument)
+        .map(|host| TcpRelayTarget {
+            host,
+            port: target.port,
+        })
 }
 
 async fn bridge_forward_tcp_stream<S>(
@@ -5084,7 +5067,14 @@ mod tests {
 
     #[test]
     fn tcp_forward_init_allows_loopback_targets() {
-        for host in ["127.0.0.1", "::1", "localhost"] {
+        for host in [
+            "127.0.0.1",
+            "127.2.3.4",
+            "::1",
+            "0:0:0:0:0:0:0:1",
+            " localhost ",
+            "LOCALHOST",
+        ] {
             let init = TcpForwardInit {
                 sandbox: "sbx".to_string(),
                 workspace: String::new(),
