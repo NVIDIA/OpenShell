@@ -71,7 +71,8 @@ pub const CONTROL_HEALTH_PORT: u16 = 5501;
 /// `ConfigMap` volume name reserved for gateway-normalized destination trust.
 pub const ADDITIONAL_CA_VOLUME_NAME: &str = "openshell-additional-ca";
 /// The only destination-trust path exposed to the dedicated supervisor Pod.
-pub const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
+pub const ADDITIONAL_CA_MOUNT_PATH: &str =
+    openshell_driver_sdk::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
 const ADDITIONAL_CA_KEY: &str = "ca.crt";
 pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
 pub const NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME: &str = "openshell-sandbox-supervisors";
@@ -380,23 +381,23 @@ pub fn supervisor_pod(
             "/var/run/secrets/openshell/token",
         ),
         env_var("OPENSHELL_SSH_SOCKET_PATH", "/run/openshell/ssh.sock"),
-        env_var(openshell_core::sandbox_env::SSH_SOCKET_SHARED, "true"),
+        env_var(openshell_driver_sdk::sandbox_env::SSH_SOCKET_SHARED, "true"),
         env_var("OPENSHELL_PROXY_TLS_DIR", "/run/openshell/proxy-tls"),
         env_var(
-            openshell_core::sandbox_env::PROXY_CA_CERT,
+            openshell_driver_sdk::sandbox_env::PROXY_CA_CERT,
             PROXY_CA_CERTIFICATE_PATH,
         ),
         env_var(
-            openshell_core::sandbox_env::PROXY_CA_KEY,
+            openshell_driver_sdk::sandbox_env::PROXY_CA_KEY,
             PROXY_CA_PRIVATE_KEY_PATH,
         ),
         env_var("OPENSHELL_LOG_LEVEL", log_level),
         env_var(
-            openshell_core::sandbox_env::TELEMETRY_ENABLED,
-            openshell_core::telemetry::enabled_env_value(),
+            openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED,
+            openshell_driver_sdk::telemetry::enabled_env_value(),
         ),
         env_var(
-            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+            openshell_driver_sdk::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
             "",
         ),
     ];
@@ -413,7 +414,7 @@ pub fn supervisor_pod(
     }
     if let Some(server_name) = gateway_tls_server_name(grpc_endpoint) {
         environment.push(env_var(
-            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
+            openshell_driver_sdk::sandbox_env::GATEWAY_TLS_SERVER_NAME,
             &server_name,
         ));
     }
@@ -491,7 +492,7 @@ pub fn supervisor_pod(
     if proxy_auth_secret.is_some() {
         command.extend([
             "--upstream-proxy-auth-file".to_string(),
-            openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH.to_string(),
+            openshell_driver_sdk::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH.to_string(),
         ]);
     }
     if proxy_auth_allow_insecure {
@@ -525,7 +526,8 @@ pub fn supervisor_pod(
         ));
     }
     if let Some((secret_name, secret_key)) = proxy_auth_secret {
-        let auth_path = Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH);
+        let auth_path =
+            Path::new(openshell_driver_sdk::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH);
         let mount_path = auth_path
             .parent()
             .and_then(Path::to_str)
@@ -549,7 +551,7 @@ pub fn supervisor_pod(
     }
     if let Some(socket_path) = provider_spiffe_socket_path {
         environment.push(env_var(
-            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+            openshell_driver_sdk::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
             socket_path,
         ));
         let mount_path = Path::new(socket_path)
@@ -1436,15 +1438,15 @@ mod tests {
                 .and_then(|variable| variable.value.as_deref())
         };
         assert_eq!(
-            env_value(openshell_core::sandbox_env::SSH_SOCKET_SHARED),
+            env_value(openshell_driver_sdk::sandbox_env::SSH_SOCKET_SHARED),
             Some("true")
         );
         assert_eq!(
-            env_value(openshell_core::sandbox_env::PROXY_CA_CERT),
+            env_value(openshell_driver_sdk::sandbox_env::PROXY_CA_CERT),
             Some(PROXY_CA_CERTIFICATE_PATH)
         );
         assert_eq!(
-            env_value(openshell_core::sandbox_env::PROXY_CA_KEY),
+            env_value(openshell_driver_sdk::sandbox_env::PROXY_CA_KEY),
             Some(PROXY_CA_PRIVATE_KEY_PATH)
         );
         let mount = container

@@ -298,7 +298,7 @@ async fn image_update_preflight_validates_without_writes_and_apply_rechecks() {
 async fn image_update_capability_is_optional() {
     let (driver, _) = fixture(SANDBOX_VERSION_V1BETA1, false);
     let metadata = driver.capabilities().unwrap().extension.unwrap();
-    let capability = openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION;
+    let capability = openshell_driver_sdk::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION;
     assert!(
         metadata
             .supported_capabilities
@@ -685,14 +685,14 @@ async fn image_update_conflict_does_not_blindly_retry_or_recreate() {
 
 #[tokio::test]
 async fn image_update_grpc_maps_validation_and_precondition_errors() {
-    use openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates;
+    use openshell_driver_sdk::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates;
     let (driver, state) = fixture(SANDBOX_VERSION_V1BETA1, false);
     let service = crate::ComputeDriverService::new(driver);
     let mut invalid = request();
     invalid.image = "https://registry.example/image:v2".into();
     let error = service
         .update_sandbox_configuration(tonic::Request::new(
-            openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest {
+            openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationRequest {
                 preconditions: Some(invalid),
                 ..Default::default()
             },
@@ -705,7 +705,7 @@ async fn image_update_grpc_maps_validation_and_precondition_errors() {
     conflict.expected_image = "other:v1".into();
     let error = service
         .update_sandbox_configuration(tonic::Request::new(
-            openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest {
+            openshell_driver_sdk::proto::compute::v1::UpdateSandboxConfigurationRequest {
                 preconditions: Some(conflict),
                 ..Default::default()
             },
@@ -793,7 +793,7 @@ async fn image_update_serializes_with_other_lifecycle_operations() {
 
 #[tokio::test]
 async fn configuration_update_atomically_changes_restart_inputs_and_retries_without_writes() {
-    use openshell_core::proto::compute::v1::{
+    use openshell_driver_sdk::proto::compute::v1::{
         SandboxEnvironmentUpdate, SandboxMainProcessUpdate, UpdateSandboxConfigurationRequest,
     };
     for version in [SANDBOX_VERSION_V1ALPHA1, SANDBOX_VERSION_V1BETA1] {
@@ -802,7 +802,8 @@ async fn configuration_update_atomically_changes_restart_inputs_and_retries_with
             let mut state = state.lock().unwrap();
             state.sandbox["metadata"]["annotations"]
                 [ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC] = serde_json::json!(
-                openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(None).unwrap()
+                openshell_driver_sdk::sandbox_env::MainProcessConfig::encode_driver_spec(None)
+                    .unwrap()
             );
             state.sandbox["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
                 .as_array_mut()
@@ -855,7 +856,7 @@ async fn configuration_update_atomically_changes_restart_inputs_and_retries_with
                 .as_str()
                 .unwrap();
             assert_eq!(
-                openshell_core::sandbox_env::MainProcessConfig::decode(encoded)
+                openshell_driver_sdk::sandbox_env::MainProcessConfig::decode(encoded)
                     .unwrap()
                     .command,
                 update.main_process.as_ref().unwrap().command
@@ -898,7 +899,7 @@ async fn configuration_update_atomically_changes_restart_inputs_and_retries_with
             [ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC]
             .as_str()
             .unwrap();
-        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded).unwrap();
+        let main = openshell_driver_sdk::sandbox_env::MainProcessConfig::decode(encoded).unwrap();
         assert!(main.command.is_empty() && main.tty);
         assert_eq!(
             state.sandbox["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
@@ -912,7 +913,7 @@ async fn configuration_update_atomically_changes_restart_inputs_and_retries_with
 
 #[tokio::test]
 async fn configuration_update_rejects_oversized_encoded_annotations_without_writes() {
-    use openshell_core::proto::compute::v1::{
+    use openshell_driver_sdk::proto::compute::v1::{
         SandboxMainProcessUpdate, UpdateSandboxConfigurationRequest,
     };
     // Both commands fit the gateway's count, per-argument, and total byte
@@ -927,7 +928,8 @@ async fn configuration_update_rejects_oversized_encoded_annotations_without_writ
             let (driver, state) = fixture(version, false);
             state.lock().unwrap().sandbox["metadata"]["annotations"]
                 [ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC] = serde_json::json!(
-                openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(None).unwrap()
+                openshell_driver_sdk::sandbox_env::MainProcessConfig::encode_driver_spec(None)
+                    .unwrap()
             );
             let before = state.lock().unwrap().sandbox.clone();
             let mut update = UpdateSandboxConfigurationRequest {
@@ -984,7 +986,7 @@ async fn image_update_annotation_budget_includes_existing_keys_and_values() {
 
 #[tokio::test]
 async fn configuration_update_rejects_reserved_environment_without_writes() {
-    use openshell_core::proto::compute::v1::{
+    use openshell_driver_sdk::proto::compute::v1::{
         SandboxEnvironmentUpdate, UpdateSandboxConfigurationRequest,
     };
     let (driver, state) = fixture(SANDBOX_VERSION_V1BETA1, false);

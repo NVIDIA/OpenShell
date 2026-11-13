@@ -20,10 +20,10 @@ use k8s_openapi::api::networking::v1::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
-use openshell_isolation_interface::contract::{
+use openshell_driver_sdk::legacy_contract::{
     BackendError, ProvisioningEvidence, ResolvedWorkloadIdentity,
 };
-use openshell_sandbox_backend::boundary_protocol::{
+use openshell_driver_sdk::legacy_contract::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
@@ -98,7 +98,7 @@ impl KubernetesOuterFenceEvidence<'_> {
 }
 
 /// Isolation backend implemented by the `OpenShell` sandbox runtime.
-pub const BACKEND_NAME: &str = openshell_sandbox_backend::BACKEND_NAME;
+pub const BACKEND_NAME: &str = openshell_driver_sdk::legacy_contract::BUILTIN_BACKEND_NAME;
 
 /// Label that binds the workload and supervisor pods in one unique pair.
 pub const BOUNDARY_PAIR_LABEL: &str = "openshell.ai/boundary-pair";
@@ -390,9 +390,9 @@ pub enum KubernetesControlPath {
 pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub boundary_id: String,
     pub generation: String,
-    pub session_id: openshell_core::SandboxSessionId,
-    pub session_rotation: openshell_core::jwt::SessionRotation,
-    pub auth_epoch: openshell_core::jwt::CredentialEpoch,
+    pub session_id: openshell_driver_sdk::SandboxSessionId,
+    pub session_rotation: openshell_driver_sdk::jwt::SessionRotation,
+    pub auth_epoch: openshell_driver_sdk::jwt::CredentialEpoch,
     pub gateway_id: String,
     pub verification_keys: Vec<GatewayVerificationKey>,
     pub namespace_uid: String,
@@ -638,9 +638,9 @@ mod tests {
         KubernetesSandboxRuntimeBoundarySpec {
             boundary_id: "sandbox-1".to_string(),
             generation: "generation-1".to_string(),
-            session_id: openshell_core::SandboxSessionId::new(),
-            session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
-            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            session_id: openshell_driver_sdk::SandboxSessionId::new(),
+            session_rotation: openshell_driver_sdk::jwt::SessionRotation::new(1).unwrap(),
+            auth_epoch: openshell_driver_sdk::jwt::CredentialEpoch::new(1).unwrap(),
             gateway_id: "gateway-1".to_string(),
             verification_keys: vec![GatewayVerificationKey {
                 key_id: "key-1".to_string(),

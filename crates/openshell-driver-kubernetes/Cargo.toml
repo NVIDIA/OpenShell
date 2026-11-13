@@ -16,12 +16,10 @@ path = "src/main.rs"
 
 [dependencies]
 openshell-crypto = { workspace = true, features = ["tls-kube"] }
-openshell-core = { path = "../openshell-core", default-features = false, features = ["jwt", "otel", "clap"] }
-openshell-isolation-interface = { path = "../openshell-isolation-interface" }
-openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
+openshell-core = { path = "../openshell-core", default-features = false }
+openshell-driver-sdk = { path = "../openshell-driver-sdk", features = ["jwt", "otel", "clap", "legacy-contract"] }
 openshell-supervisor-control = { path = "../openshell-supervisor-control" }
 openshell-otel = { path = "../openshell-otel" }
-openshell-policy = { path = "../openshell-policy" }
 
 opentelemetry = { workspace = true }
 tokio = { workspace = true }
