@@ -18,13 +18,12 @@ description: |
 
   **Setup instructions**
 
-    1. The snap uses the VM compute driver when the gateway user has read/write
-       access to /dev/kvm, unless `compute_driver` is set in gateway.toml or
-       OPENSHELL_COMPUTE_DRIVER is set in the service environment. Without that
-       access, the gateway tries to detect another runtime and fails to start if
-       none is available. Desktop sessions commonly receive access
-       automatically; otherwise add the gateway user to the kvm group and start
-       a new login session:
+    1. On a fresh installation with no gateway database or configuration, the
+       snap writes a gateway.toml selecting the VM compute driver when the
+       gateway user has read/write access to /dev/kvm. Existing gateway state
+       and users without KVM access retain normal runtime detection. Desktop
+       sessions commonly receive KVM access automatically; otherwise add the
+       gateway user to the kvm group and start a new login session:
 
          sudo usermod -aG kvm "$USER"
 
@@ -145,10 +144,11 @@ apps:
     # This compatibility daemon runs as root. The wrapper serves TLS from the bundle
     # generated in $SNAP_COMMON/tls, and the default config requires client
     # certificates; the legacy installer path copies the client bundle to the
-    # target user. The wrapper uses $SNAP_COMMON/gateway.db. Before startup it
-    # bootstraps package-managed credentials and validates the selected
-    # operator-provided config without creating or rewriting it. A nonempty
-    # OPENSHELL_GATEWAY_CONFIG takes precedence over gateway.toml.
+    # target user. The wrapper uses $SNAP_COMMON/gateway.db. On completely fresh
+    # KVM-capable state it creates gateway.toml with the VM driver selected,
+    # then bootstraps package-managed credentials and validates the effective
+    # config. A nonempty OPENSHELL_GATEWAY_CONFIG takes precedence over the
+    # compatibility path.
     environment:
       XDG_DATA_HOME: "$SNAP_COMMON"
       OPENSHELL_SNAP_CONFIG_FILE: "$SNAP_COMMON/gateway.toml"

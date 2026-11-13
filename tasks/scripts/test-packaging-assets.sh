@@ -135,18 +135,17 @@ assert_file_exists "$package_deb"
 assert_contains "$service" "ExecStartPre=/usr/bin/openshell-gateway config preflight"
 assert_contains "$package_deb" "\$src_dir/openshell-gateway.service"
 assert_contains "$package_deb" "\$pkgroot/usr/lib/systemd/user/openshell-gateway.service"
-assert_contains "$snap_wrapper" '[ -z "${OPENSHELL_GATEWAY_CONFIG:-}" ]'
-assert_contains "$snap_wrapper" '[ -e "$OPENSHELL_SNAP_CONFIG_FILE" ] || [ -L "$OPENSHELL_SNAP_CONFIG_FILE" ]'
-assert_contains "$snap_wrapper" 'export OPENSHELL_GATEWAY_CONFIG="$OPENSHELL_SNAP_CONFIG_FILE"'
-assert_contains "$snap_wrapper" '[ -z "${OPENSHELL_COMPUTE_DRIVER+x}" ]'
-assert_contains "$snap_wrapper" '[ -z "${OPENSHELL_DRIVERS+x}" ]'
-assert_contains "$snap_wrapper" "(compute_driver|\\\"compute_driver\\\"|'compute_driver')"
-assert_contains "$snap_wrapper" "(openshell|\\\"openshell\\\"|'openshell')"
+assert_contains "$snap_wrapper" 'database_file=${OPENSHELL_DB_URL#sqlite:}'
+assert_contains "$snap_wrapper" '[ ! -e "$config_file" ]'
+assert_contains "$snap_wrapper" '[ ! -e "$database_file" ]'
 assert_contains "$snap_wrapper" '[ -r "$kvm_device" ]'
 assert_contains "$snap_wrapper" '[ -w "$kvm_device" ]'
-assert_contains "$snap_wrapper" 'export OPENSHELL_COMPUTE_DRIVER=vm'
+assert_contains "$snap_wrapper" 'compute_driver = "vm"'
+assert_contains "$snap_wrapper" 'should_write_default_vm_config()'
+assert_contains "$snap_wrapper" 'sqlite::memory:* | sqlite:*mode=memory*'
+assert_not_contains "$snap_wrapper" 'compute_driver = "docker"'
+assert_not_contains "$snap_wrapper" 'export OPENSHELL_COMPUTE_DRIVER'
 assert_contains "$snap_wrapper" 'config preflight -- "$@"'
-assert_not_contains "$snap_wrapper" "CANONICAL_CONFIG_FILE"
 bash "$ROOT/tasks/scripts/test-snap-gateway-wrapper.sh" "$snap_wrapper"
 
 # Store installs autoconnect all required interfaces and require snapd 2.76 for

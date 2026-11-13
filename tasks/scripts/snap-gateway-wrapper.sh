@@ -7,50 +7,19 @@
 
 set -eu
 
-if [ -z "${OPENSHELL_GATEWAY_CONFIG:-}" ] \
-    && [ -n "${OPENSHELL_SNAP_CONFIG_FILE:-}" ] \
-    && { [ -e "$OPENSHELL_SNAP_CONFIG_FILE" ] || [ -L "$OPENSHELL_SNAP_CONFIG_FILE" ]; }
-then
-    export OPENSHELL_GATEWAY_CONFIG="$OPENSHELL_SNAP_CONFIG_FILE"
+config_file=
+if [ -n "${OPENSHELL_GATEWAY_CONFIG:-}" ]; then
+    config_file="$OPENSHELL_GATEWAY_CONFIG"
+elif [ -n "${OPENSHELL_SNAP_CONFIG_FILE:-}" ]; then
+    config_file="$OPENSHELL_SNAP_CONFIG_FILE"
+elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    config_file="${XDG_CONFIG_HOME}/openshell/gateway.toml"
 fi
 
-# The snap prefers the bundled VM driver when KVM is usable. Preserve an
-# explicit service environment selector, then a selector in the effective
-# gateway TOML.
-if [ -z "${OPENSHELL_COMPUTE_DRIVER+x}" ] \
-    && [ -z "${OPENSHELL_DRIVERS+x}" ]
-then
-    kvm_device=/dev/kvm
-    config_file=""
-    expect_config_path=false
-    for arg in "$@"; do
-        if [ "$expect_config_path" = true ]; then
-            config_file="$arg"
-            expect_config_path=false
-            continue
-        fi
-        case "$arg" in
-            --config) expect_config_path=true ;;
-            --config=*) config_file=${arg#--config=} ;;
-        esac
-    done
-    if [ -z "$config_file" ]; then
-        config_file="${OPENSHELL_GATEWAY_CONFIG:-}"
-    fi
-    if [ -z "$config_file" ] && [ -n "${XDG_CONFIG_HOME:-}" ]; then
-        config_file="${XDG_CONFIG_HOME}/openshell/gateway.toml"
-    fi
-    if { [ -z "$config_file" ] \
-            || [ ! -f "$config_file" ] \
-            || ! grep -Eq \
-                -e "^[[:space:]]*(compute_driver|\"compute_driver\"|'compute_driver')[[:space:]]*=" \
-                -e "^[[:space:]]*(openshell|\"openshell\"|'openshell')[[:space:]]*\.[[:space:]]*(gateway|\"gateway\"|'gateway')[[:space:]]*\.[[:space:]]*(compute_driver|\"compute_driver\"|'compute_driver')[[:space:]]*=" \
-                "$config_file"; } \
-        && [ -r "$kvm_device" ] \
-        && [ -w "$kvm_device" ]
-    then
-        export OPENSHELL_COMPUTE_DRIVER=vm
-    fi
+if [ -z "${OPENSHELL_DB_URL:-}" ] && [ -n "${XDG_STATE_HOME:-}" ]; then
+    umask 077
+    mkdir -p "${XDG_STATE_HOME}/openshell/gateway"
+    export OPENSHELL_DB_URL="sqlite:${XDG_STATE_HOME}/openshell/gateway/openshell.db?mode=rwc"
 fi
 
 if [ -z "${OPENSHELL_LOCAL_TLS_DIR:-}" ]; then
@@ -59,6 +28,47 @@ if [ -z "${OPENSHELL_LOCAL_TLS_DIR:-}" ]; then
         exit 1
     fi
     export OPENSHELL_LOCAL_TLS_DIR="${XDG_STATE_HOME}/openshell/tls"
+fi
+
+should_write_default_vm_config() {
+    [ -n "$config_file" ] || return 1
+    [ ! -e "$config_file" ] && [ ! -L "$config_file" ] || return 1
+    kvm_device=/dev/kvm
+    [ -r "$kvm_device" ] && [ -w "$kvm_device" ] || return 1
+
+    case "${OPENSHELL_DB_URL:-}" in
+        sqlite::memory:* | sqlite:*mode=memory*)
+            return 0
+            ;;
+        sqlite:*)
+            database_file=${OPENSHELL_DB_URL#sqlite:}
+            database_file=${database_file%%\?*}
+            [ -n "$database_file" ] || return 1
+            [ ! -e "$database_file" ] && [ ! -L "$database_file" ]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+if should_write_default_vm_config; then
+    umask 077
+    mkdir -p "$(dirname "$config_file")"
+    printf '%s\n' \
+        '[openshell]' \
+        'version = 2' \
+        '' \
+        '[openshell.gateway]' \
+        'compute_driver = "vm"' >"$config_file"
+fi
+
+# Only export OPENSHELL_GATEWAY_CONFIG if it actually exists, otherwise the
+# gateway will error
+if [ -n "$config_file" ] \
+    && { [ -e "$config_file" ] || [ -L "$config_file" ]; }
+then
+    export OPENSHELL_GATEWAY_CONFIG="$config_file"
 fi
 
 "${SNAP}/bin/openshell-gateway" config preflight -- "$@"

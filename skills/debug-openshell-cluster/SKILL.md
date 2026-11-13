@@ -1236,7 +1236,9 @@ getfacl /dev/kvm
 snap run --shell openshell.user-gateway -c 'command -v mke2fs; command -v debugfs; command -v e2fsck'
 ```
 
-When `gateway.toml` has no `compute_driver`, the snap wrapper selects `vm`.
+For fresh state, the snap wrapper creates `gateway.toml` selecting `vm` only
+when no local SQLite database exists and the gateway user can access KVM. It
+does not replace existing configuration or select a default for existing state.
 Set `[openshell.gateway].compute_driver` explicitly to choose another installed
 driver. Snap VM support is CPU-only and does not include VFIO passthrough.
 

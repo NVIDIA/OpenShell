@@ -325,9 +325,10 @@ includes `openshell-gateway` and `openshell-driver-vm`, but leaves
 `OPENSHELL_COMPUTE_DRIVER` unset so the gateway uses its normal runtime
 auto-detection. Set `OPENSHELL_COMPUTE_DRIVER=vm` to force the VM driver.
 
-The OpenShell snap also bundles `openshell-driver-vm` and e2fsprogs. Its gateway
-wrapper selects `vm` when neither the service environment nor gateway TOML sets
-`compute_driver`. The confined VM path supports CPU-only libkrun sandboxes and
+The OpenShell snap also bundles `openshell-driver-vm` and e2fsprogs. For fresh
+gateway state, its wrapper creates a gateway TOML selecting `vm` when the user
+can access KVM. Existing state and users without KVM access retain normal
+runtime detection. The confined VM path supports CPU-only libkrun sandboxes and
 requires the `kvm` interface plus read/write access to `/dev/kvm`.
 
 On RPM-family Linux x86_64 and aarch64 systems, `install.sh` installs the

@@ -74,8 +74,9 @@ NOTES:
     OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
     that already have the OpenShell snap keep refreshing it. snap installs use
     latest/stable by default and latest/edge for dev, and do not support
-    explicit release tags or prereleases. The snap uses its bundled VM driver
-    by default; select a different compute driver in gateway.toml if needed.
+    explicit release tags or prereleases. On fresh KVM-capable state, the snap
+    creates gateway.toml with its bundled VM driver selected. Existing gateway
+    state and hosts without KVM access retain runtime detection.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF

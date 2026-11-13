@@ -37,7 +37,7 @@ compute_driver = "docker"
 
 Every gateway TOML file must start with the `[openshell]` table and `version = 2`, or `openshell-gateway config preflight` rejects it with `missing_version`. The remaining examples on this page show only the tables they change.
 
-When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected by the gateway binary. The snap wrapper supplies `vm` as its package default when neither the service environment nor gateway TOML selects a driver.
+When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected by the gateway binary. For completely fresh gateway state, the snap creates a gateway TOML selecting `vm` when the gateway user can read and write `/dev/kvm`. It leaves existing state and gateways without KVM access to normal auto-detection.
 
 Configure driver-specific values, such as images, endpoints, and sizing, under `[openshell.drivers.<name>]`. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference for every option.
 
