@@ -1,0 +1,54 @@
+name: Windows validated signing handoff
+
+on:
+  push:
+    branches: [shailendra-nv/windows-runner-packages]
+    paths: ['.github/workflows/windows-signing-handoff.yml', 'signing-handoff/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  attestations: read
+
+jobs:
+  handoff:
+    if: github.repository == 'NVIDIA/OpenShell'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: OpenShell-Windows-0.1.8-signing-candidates
+          run-id: 43341610986
+          github-token: ${{ github.token }}
+          path: handoff
+      - name: Verify original GitHub-built ZIP attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for arch in arm64 x64; do
+            gh attestation verify "handoff/OpenShell-Windows-0.1.8-$arch-unsigned-candidate.zip" \
+              --repo NVIDIA/OpenShell \
+              --signer-workflow NVIDIA/OpenShell/.github/workflows/windows-packages.yml \
+              --signer-digest 9d656b5e5216a53095ccc419f2cb1e8f31a25911 \
+              --deny-self-hosted-runners \
+              --bundle handoff/github-attestation.sigstore.json
+          done
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          install: false
+          experimental: true
+      - name: Bind external validation report and stage signing inputs
+        run: |
+          mise install --locked uv python
+          mise exec uv python -- uv run --no-project python signing-handoff/assemble.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: OpenShell-Windows-0.1.8-validated-signing-handoff
+          path: handoff/
+          if-no-files-found: error
+          retention-days: 30

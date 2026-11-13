@@ -1,0 +1,124 @@
+{
+  "source": {
+    "repository": "NVIDIA/OpenShell",
+    "branch": "windows",
+    "commit": "5b9e5b91afb10afbce8d9be09e2513a7efc22a21"
+  },
+  "workflowRun": "https://github.com/NVIDIA/OpenShell/actions/runs/43341610986",
+  "authenticode": "pending",
+  "finalSignedBytesValidated": false,
+  "githubCandidateAttestations": "verified-with-detached-bundle-and-workflow-identity",
+  "reportLocation": "separate-from-unchanged-attested-archives",
+  "architectures": {
+    "arm64": {
+      "archive": "OpenShell-Windows-0.1.8-arm64-unsigned-candidate.zip",
+      "archiveSha256": "3a4ef6be04c3a8463b76189bdaefa6143cc4d362c073a8ca9e91f0521c832149",
+      "nativeRunnerExecutableLaunchChecks": "passed",
+      "downloadedPackageChecks": {
+        "scriptSyntax": "passed",
+        "unsignedRejectedByDefault": "passed",
+        "hostProbe": "passed",
+        "tamperedContentRejected": "passed",
+        "hashesArchitectureAndLaunch": "passed"
+      },
+      "localExecutionMode": "native-arm64",
+      "nativeMxcRuntime": "passed",
+      "binaries": [
+        {
+          "status": "NotSigned",
+          "sha256": "8bf540e8ab0fc43462bd64ff85deb02b1c655bdac14f4f9c40187fedf9532e7c",
+          "file": "libz3.dll"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "4c71bd7af51618ebfd35d8dbd18cc136a32fe09c339a6f72baee46e33668a274",
+          "file": "openshell-gateway.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "4e321a01b8aac59eb2391c7bcfacdd96a0a4b3930cd5ac245b98316b69422ca6",
+          "file": "openshell-supervisor.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "f1811dba132c8fb3123a20ae45c69c18f6adbffc9cb24460dc8eeccb4fa152ff",
+          "file": "openshell-windows-sandbox.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "5cef4686b6d901ef821850e06b5f55b78433d22e999f427d8e415705439c597b",
+          "file": "openshell.exe"
+        }
+      ],
+      "mxcE2E": {
+        "passed": 7,
+        "failed": 0,
+        "skipped": 0,
+        "binaryHashesUnchanged": true
+      },
+      "examples": {
+        "gatewayStartAndInfo": "passed",
+        "initialization": "passed",
+        "typescriptHarness": "passed",
+        "powershellHarness": "passed",
+        "pythonHealth": "blocked-native-dependency-installation"
+      },
+      "pythonHealthNote": "No compatible stable grpcio wheel was available for the native Windows ARM64 Python 3.14.5 interpreter; Python health did not run."
+    },
+    "x64": {
+      "archive": "OpenShell-Windows-0.1.8-x64-unsigned-candidate.zip",
+      "archiveSha256": "6cbdfbd038b6befb71285e727d171d523915dd44f26e58234e9928898e3d0097",
+      "nativeRunnerExecutableLaunchChecks": "passed",
+      "downloadedPackageChecks": {
+        "scriptSyntax": "passed",
+        "nonNativeHostRejected": "passed",
+        "unsignedRejectedByDefault": "passed",
+        "tamperedContentRejected": "passed",
+        "hashesArchitectureAndLaunch": "passed"
+      },
+      "localExecutionMode": "x64-emulation-on-arm64",
+      "nativeMxcRuntime": "unqualified-not-tested",
+      "binaries": [
+        {
+          "status": "NotSigned",
+          "sha256": "f4ea9e799e13b64dc748415c5f7ec34fa0d885cb32e243ec991c973329bca1fb",
+          "file": "libz3.dll"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "22af0d2452cde029d718ca92c0520cc6e96198c6a79d36e1652a77ce9ad71785",
+          "file": "openshell-gateway.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "1913f509cc1c4e13695a9b9bce902305a54c6752161e27eb0fc077a6ea666661",
+          "file": "openshell-supervisor.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "1d8584bcfb2f5f14825d1453759d976a15050110df8fa8aa7fecd5b8550414d5",
+          "file": "openshell-windows-sandbox.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "acb37ce6d45db055795f2b5701672bcffc29785995878c9e8975e892d76fd456",
+          "file": "openshell.exe"
+        }
+      ]
+    }
+  },
+  "afterTesting": {
+    "testFixturesExcluded": true,
+    "allManifestFilesUnchanged": true
+  },
+  "privacyScan": {
+    "status": "passed",
+    "filesAndNestedMembersChecked": 228
+  },
+  "limitations": [
+    "Unsigned candidates are prepared for Authenticode signing, not publication as signed releases.",
+    "x64 runtime remains unqualified; emulation smoke checks do not establish native MXC support.",
+    "Passing MXC scenarios does not verify exclusive network mediation or live revocation.",
+    "The broader source SBOM retains 22 unresolved package license declarations."
+  ]
+}

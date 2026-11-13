@@ -307,6 +307,9 @@ Its build and package failures are blocking. Validate downloaded bytes by hash
 on a supported native host without rebuilding; keep test fixtures and local
 reports outside public ZIPs. Authenticode signing requires updated manifests,
 retesting, new archives, and new attestations. See `packaging/windows/README.md`.
+`windows-signing-handoff.yml` can combine those unchanged ZIPs with a sanitized
+external validation report after checking archive and executable hashes. It
+preserves the original attestations and does not claim to run external tests.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
