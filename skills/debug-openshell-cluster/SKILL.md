@@ -511,6 +511,21 @@ the release. Look for failed installs, unexpected values, missing namespace, wro
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+For a gateway published as a LoadBalancer Service, check that
+`kubectl -n openshell get svc openshell` shows an external address, and read
+the Service's events for load-balancer errors. The Service exposes
+`service.servicePort` (default `service.port`) and forwards to the gateway's
+`service.port` listener. Sandboxes keep the callback port they were created
+with, so a sandbox created before a `service.servicePort` change can't reach the
+gateway until it's recreated. `service.loadBalancerSourceRanges` limits only
+the load balancer: it doesn't cover the node port a LoadBalancer Service also
+gets, and enforcement depends on the load-balancer implementation. A
+LoadBalancer also publishes the plaintext metrics port while `metrics.enabled`
+is true. The gateway certificate must name the external address; the chart's
+built-in certificate hook writes its Secrets only at first install. The gateway
+API reports service URLs with `service.port`, and the CLI rewrites them to the
+registered endpoint's port.
+
 When checking a Helm values migration, compare the rendered `gateway.toml`
 with the intended `gatewayConfig` tables. Explicit resource-admission settings
 and the Kubernetes Secrets credential namespace take precedence over deprecated

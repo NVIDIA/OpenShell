@@ -1,0 +1,260 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway Service exposure
+templates:
+  - templates/service.yaml
+  - templates/peer-service.yaml
+  - templates/grpcroute.yaml
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+release:
+  name: openshell
+  namespace: openshell
+
+tests:
+  - it: keeps the default Service unchanged
+    template: templates/service.yaml
+    asserts:
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - notExists:
+          path: metadata.annotations
+      - notExists:
+          path: spec.loadBalancerClass
+      - notExists:
+          path: spec.loadBalancerSourceRanges
+      - equal:
+          path: spec.ports[0]
+          value:
+            port: 8080
+            targetPort: grpc
+            protocol: TCP
+            name: grpc
+            appProtocol: grpc
+
+  - it: renders Service annotations
+    template: templates/service.yaml
+    set:
+      service.annotations:
+        service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+        example.com/health-check-path: /healthz
+    asserts:
+      - equal:
+          path: metadata.annotations
+          value:
+            service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+            example.com/health-check-path: /healthz
+
+  - it: renders load balancer class and source ranges for a LoadBalancer Service
+    template: templates/service.yaml
+    set:
+      service.type: LoadBalancer
+      service.loadBalancerClass: service.k8s.aws/nlb
+      service.loadBalancerSourceRanges:
+        - 10.0.0.0/8
+        - 203.0.113.0/24
+    asserts:
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+      - equal:
+          path: spec.loadBalancerClass
+          value: service.k8s.aws/nlb
+      - equal:
+          path: spec.loadBalancerSourceRanges
+          value:
+            - 10.0.0.0/8
+            - 203.0.113.0/24
+
+  - it: leaves load balancer fields unset on a LoadBalancer Service by default
+    template: templates/service.yaml
+    set:
+      service.type: LoadBalancer
+    asserts:
+      - notExists:
+          path: spec.loadBalancerClass
+      - notExists:
+          path: spec.loadBalancerSourceRanges
+      - equal:
+          path: spec.ports[0].port
+          value: 8080
+
+  - it: exposes a LoadBalancer on servicePort and targets the gateway listener
+    template: templates/service.yaml
+    set:
+      service.type: LoadBalancer
+      service.servicePort: 443
+    asserts:
+      - equal:
+          path: spec.ports[0].port
+          value: 443
+      - equal:
+          path: spec.ports[0].targetPort
+          value: grpc
+      - notExists:
+          path: spec.ports[0].nodePort
+      - equal:
+          path: spec.ports[1]
+          value:
+            port: 9090
+            targetPort: metrics
+            protocol: TCP
+            name: metrics
+
+  - it: keeps the gateway listening on service.port when servicePort differs
+    template: templates/statefulset.yaml
+    set:
+      service.type: LoadBalancer
+      service.servicePort: 443
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "openshell-gateway")].ports[?(@.name == "grpc")].containerPort
+          value: 8080
+
+  - it: binds the gateway to service.port and points sandboxes at servicePort
+    template: templates/gateway-config.yaml
+    set:
+      service.type: LoadBalancer
+      service.servicePort: 443
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^bind_address\s*=\s*"0\.0\.0\.0:8080"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^grpc_endpoint\s*=\s*"https://openshell\.openshell\.svc\.cluster\.local:443"$'
+
+  - it: keeps the peer Service on the gateway listener port
+    template: templates/peer-service.yaml
+    set:
+      service.servicePort: 443
+    asserts:
+      - equal:
+          path: spec.ports[0].port
+          value: 8080
+
+  - it: routes the GRPCRoute to the gateway Service on servicePort
+    template: templates/grpcroute.yaml
+    set:
+      grpcRoute.enabled: true
+      service.servicePort: 443
+    asserts:
+      - equal:
+          path: spec.rules[0].backendRefs[0]
+          value:
+            name: openshell
+            port: 443
+
+  - it: exposes a NodePort Service on servicePort with a fixed node port
+    template: templates/service.yaml
+    set:
+      service.type: NodePort
+      service.nodePort: 30443
+      service.servicePort: 443
+    asserts:
+      - equal:
+          path: spec.ports[0]
+          value:
+            port: 443
+            targetPort: grpc
+            protocol: TCP
+            name: grpc
+            appProtocol: grpc
+            nodePort: 30443
+
+  - it: allows servicePort to equal the metrics port when metrics are disabled
+    template: templates/service.yaml
+    set:
+      service.servicePort: 9090
+      metrics.enabled: false
+    asserts:
+      - equal:
+          path: spec.ports
+          value:
+            - port: 9090
+              targetPort: grpc
+              protocol: TCP
+              name: grpc
+              appProtocol: grpc
+
+  - it: rejects servicePort 0
+    template: templates/statefulset.yaml
+    set:
+      service.servicePort: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.servicePort must be an integer between 1 and 65535"
+
+  - it: rejects servicePort above the valid port range
+    template: templates/statefulset.yaml
+    set:
+      service.servicePort: 65536
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.servicePort must be an integer between 1 and 65535"
+
+  - it: rejects a boolean servicePort
+    template: templates/statefulset.yaml
+    set:
+      service.servicePort: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.servicePort must be an integer between 1 and 65535"
+
+  - it: rejects servicePort colliding with the metrics Service port
+    template: templates/statefulset.yaml
+    set:
+      service.servicePort: 9090
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.servicePort must differ from service.metricsPort"
+
+  - it: rejects source ranges on a Service that is not a LoadBalancer
+    template: templates/statefulset.yaml
+    set:
+      service.type: NodePort
+      service.loadBalancerSourceRanges:
+        - 10.0.0.0/8
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.loadBalancerSourceRanges requires service.type=LoadBalancer"
+
+  - it: rejects a load balancer class on a Service that is not a LoadBalancer
+    template: templates/statefulset.yaml
+    set:
+      service.loadBalancerClass: service.k8s.aws/nlb
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.loadBalancerClass requires service.type=LoadBalancer"
+
+  - it: keeps replica backends on the listener port while the main backend uses servicePort
+    template: templates/grpcroute.yaml
+    set:
+      replicaCount: 2
+      server.externalDbSecret: openshell-db
+      workload.kind: statefulset
+      workload.allowMultiReplicaStatefulSet: true
+      grpcRoute.enabled: true
+      grpcRoute.replicaRouting.enabled: true
+      service.servicePort: 443
+    asserts:
+      - lengthEqual:
+          path: spec.rules
+          count: 3
+      - equal:
+          path: spec.rules[0].backendRefs[0]
+          value:
+            name: openshell-replica-0
+            port: 8080
+      - equal:
+          path: spec.rules[1].backendRefs[0]
+          value:
+            name: openshell-replica-1
+            port: 8080
+      - equal:
+          path: spec.rules[2].backendRefs[0]
+          value:
+            name: openshell
+            port: 443

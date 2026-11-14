@@ -35,5 +35,5 @@ spec:
     {{- end }}
     - backendRefs:
         - name: {{ $fullname }}
-          port: {{ .Values.service.port }}
+          port: {{ include "openshell.servicePort" . }}
 {{- end }}
