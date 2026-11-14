@@ -1,10 +1,9 @@
 # Labeling agent runtime integration
 
-These modules select labeling invocations and return an unvalidated JSON
-classification proposal. The shared `/label-issue` helper from
-[#5355](https://github.com/NVIDIA/OpenShell/pull/5355) owns eligibility, evidence,
-validation, label writes, checkpoints, and local reporting. Activation
-prerequisites are tracked in [#5276](https://github.com/NVIDIA/OpenShell/issues/5276).
+The runtime selects invocations and returns unvalidated proposals. The shared
+`/label-issue` helper owns eligibility, evidence, validation, writes, checkpoints,
+and reporting. See [#5276](https://github.com/NVIDIA/OpenShell/issues/5276) for
+activation prerequisites.
 
 ## Execution boundary
 
@@ -19,13 +18,13 @@ Include the result schema and referenced classification guidance in the trusted
 instructions: the runtime cannot fetch referenced files or expand evidence.
 
 Use a dedicated single-agent CMA configuration and an environment without
-preinstalled secrets. The pinned agent version, not this adapter, selects the model.
+preinstalled secrets. Pin a Sonnet configuration for initial observed runs; the
+pinned agent version, not this adapter, selects the model. Verify CMA consumption
+on representative evidence before rollout; CLI cost estimates are not CMA measurements.
 
 `force` bypasses only the shared helper's unchanged-item check.
 
 ## Smoke-test CLI
-
-This CLI previews or submits prepared inputs.
 
 ```shell
 uv run --no-project python tasks/scripts/managed_label_classifier.py \

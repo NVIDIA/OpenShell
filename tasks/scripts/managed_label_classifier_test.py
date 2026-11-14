@@ -70,7 +70,7 @@ class RequestTests(unittest.TestCase):
             json.loads(request["initial_events"][0]["content"][0]["text"]), evidence
         )
         self.assertEqual(
-            request["budget"]["max_list_cost"], {"amount": "25", "currency": "USD"}
+            request["budget"]["max_list_cost"], {"amount": "50", "currency": "USD"}
         )
 
     def test_empty_inputs_and_invalid_configuration_are_rejected(self):
@@ -191,6 +191,30 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(
             [call[1] for call in transport.calls if call[0] == "POST"],
             ["/sessions", "/sessions/sesn_test/archive"],
+        )
+
+    def test_malformed_proposal_archives_session_without_retry(self):
+        events = [
+            event(
+                "agent.message",
+                "message",
+                content=[{"type": "text", "text": '{"area": "area:platform",}'}],
+            ),
+            proposal_events()[1],
+        ]
+        transport = FakeTransport([{"data": events}])
+        with self.assertRaisesRegex(
+            ClassifierError,
+            "sesn_test: Classifier proposal is not a JSON object; session archived",
+        ):
+            classify(transport, {})
+        self.assertEqual(
+            [(call[0], call[1]) for call in transport.calls],
+            [
+                ("POST", "/sessions"),
+                ("GET", "/sessions/sesn_test/events?order=asc&limit=100"),
+                ("POST", "/sessions/sesn_test/archive"),
+            ],
         )
 
     def test_timeout_archives_session(self):
