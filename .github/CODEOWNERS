@@ -35,6 +35,8 @@
 /REVIEWERS.md @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /tasks/scripts/check_review_readiness.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /tasks/scripts/check_review_readiness_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/check_reviewer_collaborators.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/check_reviewer_collaborators_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 
 # PR issue acceptance checks
 /tasks/scripts/check_issue_acceptance.cjs @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr

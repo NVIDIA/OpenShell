@@ -106,7 +106,7 @@ hide = true
 
 ["test:review-readiness"]
 description = "Test PR review readiness and reviewer reconciliation"
-run = "uv run --no-project python -m unittest discover -s tasks/scripts -p check_review_readiness_test.py"
+run = "uv run --no-project python -m unittest discover -s tasks/scripts -p 'check_review*_test.py'"
 hide = true
 
 ["test:accepted-work"]

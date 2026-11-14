@@ -125,6 +125,10 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+For Branch Checks `Reviewer Roster` failures, the log lists non-collaborators in
+`REVIEWERS.md`. Remove those entries or arrange repository access before rerunning.
+Lookup errors fail the check rather than treating missing results as eligibility.
+
 For Kubernetes app-listener E2E failures during kind setup, inspect the uploaded
 `results/app-listener/cni-setup/` evidence. It includes node and Calico pod
 descriptions, events, and current/previous container logs. A CNI rollout timeout

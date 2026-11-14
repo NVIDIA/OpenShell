@@ -50,6 +50,23 @@ jobs:
             echo "number=0" >> "$GITHUB_OUTPUT"
           fi
 
+  reviewer-roster:
+    name: Reviewer Roster
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate reviewer collaborator membership
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 tasks/scripts/check_reviewer_collaborators.py --repo "$GH_REPO"
+
   compatibility-review:
     name: Compatibility Review (advisory)
     needs: pr_metadata
