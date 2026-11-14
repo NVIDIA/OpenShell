@@ -66,7 +66,11 @@ message StdinClosed {}
 // negotiating the receiver's supporting capability. No client digest required.
 // Replayable mutations: Attach, Confirm, StartAgent, UpdateProviderEnvironment,
 // Exec, Signal, Terminate, TerminateBoundary, and Resize. Exec outcomes remain
-// retained through the deadline even after process exit.
+// retained through the deadline even after process exit. Attach and Confirm
+// replays must return the original result for the whole generation: after
+// confirmation, the supervisor replays both on every reconnect, and Confirm
+// alone to renew its credential and probe liveness. It checks every reply
+// against the launch.
 message RequestEnvelope {
   string request_id = 1;
   oneof request {

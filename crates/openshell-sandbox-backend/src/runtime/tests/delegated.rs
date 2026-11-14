@@ -27,6 +27,7 @@ async fn external_backend(
                     .await
                     .unwrap();
                 let service = TestGrpcBoundary {
+                    attach_generation: "test-generation".to_string(),
                     wait_for_half_close: false,
                     expected_token: "a".repeat(32),
                     requests: Arc::default(),
