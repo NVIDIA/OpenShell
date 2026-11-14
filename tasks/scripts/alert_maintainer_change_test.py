@@ -10,6 +10,11 @@ sibling script imports directly.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import textwrap
+from pathlib import Path
+
 import alert_maintainer_change as alert
 
 MARKER = "<!-- maintainer-approval-delta -->"
@@ -85,3 +90,64 @@ def test_login_pattern_matches_the_gate() -> None:
     import check_maintainer_approval as gate
 
     assert alert.MAINTAINER_RE.pattern == gate.MAINTAINER_RE.pattern
+
+
+def run_alert_step(tmp_path, merge_parents):
+    """Run the actual workflow step against a controlled GitHub API fixture."""
+    import json
+
+    root = Path(__file__).resolve().parents[2]
+    workflow = (root / ".github/workflows/maintainers-change-alert.yml").read_text()
+    script = textwrap.dedent(workflow.split("        run: |\n", 1)[1])
+    (tmp_path / "merge.json").write_text(
+        json.dumps({"sha": "merge", "parents": [{"sha": p} for p in merge_parents]})
+    )
+    (tmp_path / "base.md").write_text(TABLE)
+    (tmp_path / "merged.md").write_text(
+        TABLE + "| Jim | [@purp](https://github.com/purp) | NVIDIA |\n"
+    )
+    gh = tmp_path / "gh"
+    gh.write_text(
+        textwrap.dedent("""\
+        #!/bin/sh
+        case "$*" in
+          *commits/refs/pull/42/merge*) cat merge.json ;;
+          *contents/MAINTAINERS.md?ref=base*) cat base.md ;;
+          *contents/MAINTAINERS.md?ref=merge*) cat merged.md ;;
+          *issues/42/comments*--jq*) printf '1\\n' ;;
+          *issues/comments/1*) cp body.md posted.md ;;
+          *) echo "unexpected gh call: $*" >&2; exit 1 ;;
+        esac
+    """)
+    )
+    gh.chmod(0o755)
+    env = os.environ | {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "GH_REPO": "NVIDIA/OpenShell",
+        "PR_NUMBER": "42",
+        "BASE_SHA": "base",
+        "HEAD_SHA": "head",
+        "COMMENT_MARKER": MARKER,
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+    }
+    (tmp_path / "tasks/scripts").mkdir(parents=True)
+    (tmp_path / "tasks/scripts/alert_maintainer_change.py").symlink_to(
+        root / "tasks/scripts/alert_maintainer_change.py"
+    )
+    return subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+
+
+def test_workflow_reports_delta_from_verified_merge(tmp_path):
+    result = run_alert_step(tmp_path, ["base", "head"])
+    assert result.returncode == 0, result.stderr
+    body = (tmp_path / "posted.md").read_text()
+    assert "@purp" in body
+    assert "Loses approval rights" not in body
+
+
+def test_workflow_rejects_merge_for_different_head(tmp_path):
+    result = run_alert_step(tmp_path, ["base", "other-head"])
+    assert result.returncode != 0
+    assert not (tmp_path / "posted.md").exists()

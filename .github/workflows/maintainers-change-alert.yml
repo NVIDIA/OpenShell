@@ -6,6 +6,7 @@ name: Maintainers Change Alert
 on:
   pull_request_target:
     types: [opened, reopened, synchronize]
+    branches: [main]
     paths:
       - MAINTAINERS.md
 
@@ -76,8 +77,28 @@ jobs:
             return 1
           }
 
+          # GitHub computes the prospective merge asynchronously. Never compare
+          # the head file directly: it may omit changes already on main.
+          merge_info="$(mktemp)"
+          for attempt in 1 2 3 4 5; do
+            if gh api "repos/$GH_REPO/commits/refs/pull/$PR_NUMBER/merge" > "$merge_info"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::Could not obtain the prospective merge commit"
+              exit 1
+            fi
+            sleep 2
+          done
+          if ! MERGE_SHA=$(jq -er --arg base "$BASE_SHA" --arg head "$HEAD_SHA" \
+            'select(.parents | length == 2 and .[0].sha == $base and .[1].sha == $head) | .sha' "$merge_info"); then
+            echo "::error::Prospective merge does not match this event's base and head"
+            exit 1
+          fi
+          rm -f "$merge_info"
+
           fetch_maintainers "$BASE_SHA" before.md
-          fetch_maintainers "$HEAD_SHA" after.md
+          fetch_maintainers "$MERGE_SHA" after.md
 
           # An unparseable result exits non-zero, but the comment explaining
           # why still has to be posted before this job fails.
