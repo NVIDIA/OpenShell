@@ -36,6 +36,8 @@ spec:
               value: http://token-issuer.default.svc.cluster.local
             - name: SPIRE_JWKS_URI
               value: https://spire-spiffe-oidc-discovery-provider.spire.svc.cluster.local/keys
+            - name: SPIRE_JWKS_CA_FILE
+              value: /etc/x509/spiffe-bundle/bundle.pem
             - name: SPIRE_ISSUER
               value: https://spire-spiffe-oidc-discovery-provider.spire.svc.cluster.local
             - name: JWT_SVID_AUDIENCE
@@ -50,10 +52,35 @@ spec:
             - name: scripts
               mountPath: /demo
               readOnly: true
+            - name: spiffe-bundle
+              mountPath: /etc/x509/spiffe-bundle
+              readOnly: true
+        - name: spiffe-helper
+          image: ghcr.io/spiffe/spiffe-helper:0.11.0
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/etc/spiffe-helper/spiffe-helper.conf"]
+          volumeMounts:
+            - name: spiffe-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: spiffe-bundle
+              mountPath: /target
+            - name: helper-config
+              mountPath: /etc/spiffe-helper
+              readOnly: true
       volumes:
         - name: scripts
           configMap:
             name: openshell-spiffe-token-demo-scripts
+        - name: helper-config
+          configMap:
+            name: openshell-spiffe-token-demo-helper
+        - name: spiffe-socket
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+        - name: spiffe-bundle
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
