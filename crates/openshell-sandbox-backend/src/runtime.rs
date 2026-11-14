@@ -3,9 +3,9 @@
 
 //! Host-side RFC 0012 backend for an already-provisioned remote boundary.
 
-#[cfg(test)]
 use rustls::pki_types::pem::PemObject as _;
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

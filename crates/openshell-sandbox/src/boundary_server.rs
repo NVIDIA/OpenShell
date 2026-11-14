@@ -9,12 +9,11 @@
 
 #![allow(unsafe_code)]
 
-use rustls::pki_types::pem::PemObject as _;
-
 use std::path::Path;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use rustls::pki_types::pem::PemObject as _;
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::mem::size_of;
