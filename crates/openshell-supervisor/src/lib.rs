@@ -4367,7 +4367,9 @@ struct PolicyPollLoopContext {
     endpoint_observation_tx: Option<openshell_core::endpoint_status::EndpointObservationSender>,
     /// Single FIFO consumed by the endpoint status reporter.
     endpoint_status_rx: Option<openshell_core::endpoint_status::EndpointStatusReceiver>,
-    /// Gateway policy currently installed in OPA, absent for local overrides.
+    /// Policy installed at startup, including its filesystem prerequisites.
+    /// Kept unchanged when gateway updates replace the policy in OPA.
+    /// Absent for local overrides.
     endpoint_policy: Option<openshell_core::proto::SandboxPolicy>,
     /// Session accepted by `ConnectSupervisor`; `None` suspends endpoint reports.
     supervisor_session_id: tokio::sync::watch::Receiver<Option<String>>,
