@@ -188,16 +188,33 @@ running sandbox. The startup sections do not:
 
 | Change | Effect on a running sandbox | Required action |
 |---|---|---|
-| Network rules | The sandbox loads the new rules. Connections opened under the previous rules close. | Apply the change, then retry the request. |
+| Network rules | The sandbox loads the new rules. Open connections whose rules changed close; other connections stay open. | Apply the change, then retry the request. |
 | Middleware in `network_middlewares` | You can add, remove, or reconfigure built-in middleware and external services already registered with the gateway. | Apply the change with `openshell policy set`. |
 | External middleware registration | Policy changes cannot register a service or change its gateway connection settings. | Update the gateway configuration and restart the gateway. |
 | Added filesystem paths | The saved policy can change, but the running workload keeps its existing filesystem permissions. | Recreate the sandbox. |
 | Removed filesystem paths, or changed `include_workdir`, Landlock, or process settings | OpenShell rejects the change after the workload starts. | Recreate the sandbox. |
 
-When new network rules take effect, OpenShell closes connections that were
-opened under the previous rules, including HTTP keep-alive connections, tunnels,
-WebSocket connections, and long-lived streams. Clients must reconnect, and their
+When new network rules take effect, OpenShell re-checks every open connection,
+including HTTP keep-alive connections, tunnels, WebSocket connections, and
+long-lived streams, against the new rules. A connection stays open only if the
+new rules treat it exactly as the old ones did: the same allow decision, the
+same matching policies and endpoints (including their L7 rules), and the same
+middleware. Otherwise OpenShell closes it, the client must reconnect, and its
 next requests are checked against the new rules.
+
+For example, approving an endpoint for one host leaves connections to other
+hosts open, while changing the rules for a host closes that host's
+connections. Some changes always close connections:
+
+- A fail-closed quarantine after an invalid policy, even if the previous policy
+  is restored before the connection is checked.
+- A change to the middleware services registered with the gateway, for
+  connections that run middleware.
+- A change to a provider credential that a connection has already had
+  injected, such as rotating it, detaching its provider, or the sandbox
+  revoking it after a failed provider refresh. Connections that never carried
+  that credential stay open, including when other providers are attached,
+  detached, or rotated.
 
 OpenShell validates every change twice before it takes effect:
 
@@ -207,7 +224,7 @@ flowchart TD
     B -->|Invalid| C["Change rejected<br/>Current policy stays active"]
     B -->|Valid| D["Gateway saves a new revision"]
     D --> E{"Sandbox validates<br/>and loads the revision"}
-    E -->|Loads| F["New rules active<br/>Old connections close"]
+    E -->|Loads| F["New rules active<br/>Affected connections close"]
     E -->|Fails| G["Failure mode applies<br/>Block traffic or keep the last valid policy"]
 ```
 

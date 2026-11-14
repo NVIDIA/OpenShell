@@ -224,7 +224,9 @@ pub(crate) async fn prepare_inspected_request(
             &owners,
             request_id,
             observation_context.filter(|context| {
-                context.matches_config(&config.policy_hash, Some(snapshot.revision))
+                let policy_hash =
+                    crate::l7::observation_policy_hash(config, Some(engine.generation_guard()));
+                context.matches_config(&policy_hash, Some(snapshot.revision))
             }),
         )
         .await?
@@ -3855,6 +3857,11 @@ where
         let mut live_body = None;
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
+            // Give a revalidating guard the chance to re-pin through an
+            // unrelated reload before comparing raw generation numbers.
+            if generation_guard.is_stale() {
+                return Ok(());
+            }
             let (chain, generation) = engine.query_middleware_chain_with_generation(&input)?;
             if generation != generation_guard.captured_generation() {
                 return Ok(());
@@ -14860,5 +14867,207 @@ network_policies:
             .expect("relay should complete")
             .unwrap()
             .unwrap();
+    }
+
+    // --- Passthrough middleware across policy reloads ---
+
+    const PASSTHROUGH_RELOAD_POLICY: &str = r#"
+network_middlewares:
+  scheme:
+    middleware: test/scheme
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  passthrough_api:
+    name: passthrough_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+    /// [`PASSTHROUGH_RELOAD_POLICY`] after approving an endpoint for another host.
+    const PASSTHROUGH_RELOAD_AND_OTHER_POLICY: &str = r#"
+network_middlewares:
+  scheme:
+    middleware: test/scheme
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  passthrough_api:
+    name: passthrough_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+  other:
+    name: other
+    endpoints:
+      - host: other.example.test
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+    /// [`PASSTHROUGH_RELOAD_POLICY`] with this host's chain made fail-open.
+    const PASSTHROUGH_RELOAD_CHAIN_CHANGED_POLICY: &str = r#"
+network_middlewares:
+  scheme:
+    middleware: test/scheme
+    on_error: fail_open
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  passthrough_api:
+    name: passthrough_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+    fn passthrough_reload_input() -> NetworkInput {
+        NetworkInput {
+            host: "api.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        }
+    }
+
+    /// The guard the proxy pins for an established passthrough connection:
+    /// it re-pins through reloads that leave the connection's contract intact.
+    fn established_passthrough_guard(
+        engine: &Arc<OpaEngine>,
+        input: &NetworkInput,
+    ) -> PolicyGenerationGuard {
+        let generation = engine.authorize_egress(input).unwrap().generation;
+        assert!(
+            crate::opa::PolicyRevalidator::capture(engine, input.clone(), generation, None)
+                .is_some(),
+            "fixture must authorize the connection"
+        );
+        engine
+            .revalidating_generation_guard(input.clone(), generation, None)
+            .unwrap()
+    }
+
+    async fn read_http_head<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = reader.read(&mut byte).await.unwrap();
+            assert!(n > 0, "peer closed before a complete HTTP head");
+            head.push(byte[0]);
+        }
+        head
+    }
+
+    /// Send one request on a kept-alive passthrough connection with
+    /// middleware, reload the policy to `reload_data`, then send a second.
+    ///
+    /// Returns how many requests reached middleware and whether the second
+    /// request reached upstream.
+    async fn second_passthrough_request_after_reload(reload_data: &str) -> (usize, bool) {
+        use openshell_supervisor_middleware::{ChainRunner, MiddlewareRegistry};
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine =
+            Arc::new(OpaEngine::from_strings(TEST_POLICY, PASSTHROUGH_RELOAD_POLICY).unwrap());
+        let registry = MiddlewareRegistry::connect_services(
+            vec![Arc::new(SchemeRecorder(seen.clone()))],
+            Vec::new(),
+        )
+        .await
+        .expect("connect named middleware services");
+        engine.set_middleware_runner_for_tests(ChainRunner::from_registry(registry));
+        let generation_guard = established_passthrough_guard(&engine, &passthrough_reload_input());
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            request_default_port: Some(443),
+            policy_name: "passthrough_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay_engine = Arc::clone(&engine);
+        let relay = tokio::spawn(async move {
+            relay_passthrough_with_credentials(
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+                &generation_guard,
+                Some(relay_engine.as_ref()),
+            )
+            .await
+        });
+        let timeout = std::time::Duration::from_secs(1);
+        let request = b"GET /v1/messages HTTP/1.1\r\nHost: api.example.test\r\n\r\n";
+
+        app.write_all(request).await.unwrap();
+        tokio::time::timeout(timeout, read_http_head(&mut upstream))
+            .await
+            .expect("first request should reach upstream");
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(timeout, read_http_head(&mut app))
+            .await
+            .expect("first response should reach the client");
+        assert!(String::from_utf8_lossy(&response).contains("204 No Content"));
+
+        engine.reload(TEST_POLICY, reload_data).unwrap();
+
+        app.write_all(request).await.unwrap();
+        let mut second = [0u8; 1024];
+        let forwarded = matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), upstream.read(&mut second))
+                .await,
+            Ok(Ok(n)) if n > 0
+        );
+        let middleware_calls = seen.lock().unwrap().len();
+
+        drop(app);
+        drop(upstream);
+        let _ = tokio::time::timeout(timeout, relay).await;
+        (middleware_calls, forwarded)
+    }
+
+    #[tokio::test]
+    async fn passthrough_middleware_connection_serves_next_request_after_unrelated_reload() {
+        let (middleware_calls, forwarded) =
+            second_passthrough_request_after_reload(PASSTHROUGH_RELOAD_AND_OTHER_POLICY).await;
+
+        assert_eq!(middleware_calls, 2, "both requests ran through middleware");
+        assert!(
+            forwarded,
+            "approving another host must not end the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_middleware_connection_drops_next_request_after_its_chain_changes() {
+        let (middleware_calls, forwarded) =
+            second_passthrough_request_after_reload(PASSTHROUGH_RELOAD_CHAIN_CHANGED_POLICY).await;
+
+        assert_eq!(
+            middleware_calls, 1,
+            "only the first request reached middleware"
+        );
+        assert!(
+            !forwarded,
+            "a changed chain must not apply to the old connection"
+        );
     }
 }

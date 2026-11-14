@@ -180,6 +180,17 @@ pub fn pin_live_credentials(ctx: &mut L7EvalContext) -> Option<Arc<ProviderCrede
     Some(snapshot)
 }
 
+/// Record on the connection which grants it is about to inject, so it closes
+/// when one of them, and only one of them, changes.
+fn record_credential_use(ctx: &L7EvalContext, selected: &[(String, ProviderProfileCredential)]) {
+    let Some(credentials) = ctx.provider_credentials.as_ref() else {
+        return;
+    };
+    for (key, _) in selected {
+        credentials.record_grant_use(key);
+    }
+}
+
 /// Inject the grants whose endpoint selectors match the request.
 ///
 /// L4-only forwarding uses this selector contract; it has no per-request L7
@@ -270,6 +281,12 @@ async fn inject_or_report(
     if selected.as_ref().is_ok_and(Vec::is_empty) {
         // Most requests need no grant; keep that path free of allocation.
         return Ok((req, InjectedHeaders::default()));
+    }
+    if let Ok(selected) = &selected {
+        // Record before injecting: a grant that reaches upstream must make the
+        // connection close when that grant changes. Recording a grant that
+        // then fails is harmless; it can only close more connections.
+        record_credential_use(ctx, selected);
     }
     let method = req.action.clone();
     let request_path = request_path(&req.target).to_string();
@@ -1368,6 +1385,73 @@ mod tests {
         assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
         fixture.assert_one_request("api.example.com\t443\t/v1/**\tprovider:access_token");
         assert_eq!(fixture.requested_ids(), [REQUEST_ID]);
+    }
+
+    fn tracked_grant_context(fixture: &TokenGrantTestFixture) -> L7EvalContext {
+        L7EvalContext {
+            host: "api.example.com".into(),
+            port: 443,
+            policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            provider_credentials: Some(fixture.provider_credentials().with_use_tracking()),
+            token_grant_resolver: Some(fixture.resolver()),
+            ..Default::default()
+        }
+    }
+
+    fn grant_request_for(target: &str) -> L7Request {
+        L7Request {
+            action: "GET".to_string(),
+            target: target.to_string(),
+            query_params: HashMap::new(),
+            raw_header: format!("GET {target} HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+                .into_bytes(),
+            body_length: BodyLength::None,
+        }
+    }
+
+    #[tokio::test]
+    async fn injecting_a_grant_records_credential_use_on_the_connection() {
+        let fixture = TokenGrantTestFixture::success(
+            "api.example.com\t443\t/v1/**\tprovider:access_token",
+            "grant-token",
+        );
+        let ctx = tracked_grant_context(&fixture);
+        let credentials = ctx.provider_credentials.clone().unwrap();
+        assert!(credentials.credential_uses().unwrap().is_empty());
+
+        inject_if_needed(grant_request_for("/v1/projects"), &ctx, REQUEST_ID)
+            .await
+            .expect("fake token grant should inject");
+
+        let uses = credentials.credential_uses().unwrap();
+        assert_eq!(
+            uses.grant_versions.keys().collect::<Vec<_>>(),
+            ["provider:access_token"],
+            "the connection must record which grant it carried"
+        );
+        assert!(credentials.credential_uses_current());
+    }
+
+    #[tokio::test]
+    async fn requests_that_select_no_grant_record_no_credential_use() {
+        let fixture = TokenGrantTestFixture::success(
+            "api.example.com\t443\t/v1/**\tprovider:access_token",
+            "grant-token",
+        );
+        let ctx = tracked_grant_context(&fixture);
+
+        inject_if_needed(grant_request_for("/public/status"), &ctx, REQUEST_ID)
+            .await
+            .expect("no grant applies to this path");
+
+        assert!(
+            ctx.provider_credentials
+                .unwrap()
+                .credential_uses()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

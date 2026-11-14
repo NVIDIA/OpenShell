@@ -218,6 +218,102 @@ pub struct SecretResolver {
     denied_env_keys: HashSet<String>,
     identity_bound_env_keys: HashSet<String>,
     revision_fallback_allowed_revisions: HashMap<String, Arc<HashSet<u64>>>,
+    /// Where to report that this resolver handed out a real secret.
+    use_record: Option<ResolverUseRecord>,
+}
+
+/// Version that never matches a live credential version.
+///
+/// Recorded for a value served from an older generation, which by definition
+/// is no longer current, so the connection closes at its next check.
+pub const STALE_CREDENTIAL_VERSION: u64 = 0;
+
+/// Records which provider credentials a connection injected, by version.
+///
+/// The supervisor attaches one marker per proxied connection. Every resolver
+/// derived for that connection reports each real secret it hands out, and
+/// token-grant injection reports each grant before adding it. An empty marker
+/// means the connection has never carried a provider credential upstream, so
+/// no credential change can leave it holding stale material.
+///
+/// The provider credential state owns one version per credential, assigned
+/// by comparing content whenever its snapshot changes; a connection keeps only
+/// the version it used:
+///
+/// - static credentials by environment key;
+/// - token grants by `provider:credential` identity.
+///
+/// A use that cannot be attributed to a credential is recorded under its raw
+/// placeholder or key at [`STALE_CREDENTIAL_VERSION`], so the connection
+/// closes on the next credential check rather than never.
+///
+/// Each key keeps its first recorded version. Recording is a superset by
+/// design: some callers resolve to validate rather than to send, which can
+/// only make a connection close more often.
+#[derive(Debug, Default)]
+pub struct CredentialUseMarker {
+    uses: std::sync::Mutex<CredentialUses>,
+}
+
+/// The credentials one connection has injected; see [`CredentialUseMarker`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CredentialUses {
+    /// Static credential environment key to the version sent.
+    pub static_versions: std::collections::BTreeMap<String, u64>,
+    /// Token grant `provider:credential` identity to the version injected.
+    pub grant_versions: std::collections::BTreeMap<String, u64>,
+}
+
+impl CredentialUses {
+    /// Whether nothing has been injected.
+    pub fn is_empty(&self) -> bool {
+        self.static_versions.is_empty() && self.grant_versions.is_empty()
+    }
+}
+
+impl CredentialUseMarker {
+    /// Record that version `version` of the static credential `env_key` was sent.
+    pub fn record_static(&self, env_key: &str, version: u64) {
+        self.with_uses(|uses| {
+            uses.static_versions
+                .entry(env_key.to_owned())
+                .or_insert(version);
+        });
+    }
+
+    /// Record that version `version` of the token grant `identity` was used.
+    pub fn record_grant(&self, identity: &str, version: u64) {
+        self.with_uses(|uses| {
+            uses.grant_versions
+                .entry(identity.to_owned())
+                .or_insert(version);
+        });
+    }
+
+    /// A copy of everything recorded so far.
+    pub fn uses(&self) -> CredentialUses {
+        self.uses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn with_uses(&self, update: impl FnOnce(&mut CredentialUses)) {
+        // A poisoned lock still holds a valid record; never lose a use.
+        let mut uses = self
+            .uses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        update(&mut uses);
+    }
+}
+
+/// A resolver's link to its connection's [`CredentialUseMarker`].
+#[derive(Clone)]
+struct ResolverUseRecord {
+    marker: Arc<CredentialUseMarker>,
+    /// Static credential versions of that installation.
+    static_versions: Arc<HashMap<String, u64>>,
 }
 
 #[derive(Clone)]
@@ -242,6 +338,76 @@ impl fmt::Debug for SecretResolver {
 }
 
 impl SecretResolver {
+    /// Report every real secret this resolver hands out to `marker`.
+    ///
+    /// `static_versions` is the version of each static credential in the
+    /// installation the resolver was built from.
+    #[must_use]
+    pub fn with_use_marker(
+        mut self,
+        marker: Arc<CredentialUseMarker>,
+        static_versions: Arc<HashMap<String, u64>>,
+    ) -> Self {
+        self.use_record = Some(ResolverUseRecord {
+            marker,
+            static_versions,
+        });
+        self
+    }
+
+    /// Each environment key's current-generation value.
+    ///
+    /// Only canonical entries are read; revision-scoped and stable-handle
+    /// placeholders alias them or carry older generations.
+    pub(crate) fn canonical_values(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.by_placeholder
+            .iter()
+            .filter_map(|(placeholder, secret)| {
+                let key = placeholder.strip_prefix(PLACEHOLDER_PREFIX)?;
+                (placeholder_env_key(placeholder) == Some(key))
+                    .then_some((key, secret.value.as_ref()))
+            })
+    }
+
+    /// The current-generation value of `env_key`, if configured.
+    pub(crate) fn canonical_value(&self, env_key: &str) -> Option<&str> {
+        self.by_placeholder
+            .get(&placeholder_for_env_key(env_key))
+            .map(|secret| secret.value.as_ref())
+    }
+
+    /// Report that this resolver handed out `served` for `placeholder`.
+    ///
+    /// The use is current when `served` is its key's current value, whichever
+    /// placeholder form named it: canonical, stable handle, the current
+    /// revision, a retained revision whose value has not changed since, or an
+    /// aged-out revision that fell back. Revisions are sandbox-wide, so an older
+    /// revision usually means another provider changed, not this credential.
+    /// A retained revision whose value has changed, or a key with no current
+    /// value, records [`STALE_CREDENTIAL_VERSION`]; so does a placeholder with
+    /// no recognisable key, under the placeholder itself.
+    fn note_use(&self, placeholder: &str, served: &str) {
+        let Some(record) = &self.use_record else {
+            return;
+        };
+        let Some(env_key) = placeholder_env_key(placeholder) else {
+            record
+                .marker
+                .record_static(placeholder, STALE_CREDENTIAL_VERSION);
+            return;
+        };
+        let version = if self.canonical_value(env_key) == Some(served) {
+            record
+                .static_versions
+                .get(env_key)
+                .copied()
+                .unwrap_or(STALE_CREDENTIAL_VERSION)
+        } else {
+            STALE_CREDENTIAL_VERSION
+        };
+        record.marker.record_static(env_key, version);
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_provider_env(
         provider_env: HashMap<String, String>,
@@ -330,6 +496,7 @@ impl SecretResolver {
                 denied_env_keys: HashSet::new(),
                 identity_bound_env_keys: HashSet::new(),
                 revision_fallback_allowed_revisions: HashMap::new(),
+                use_record: None,
             })
         };
         (
@@ -388,6 +555,7 @@ impl SecretResolver {
                     denied_env_keys: HashSet::new(),
                     identity_bound_env_keys: HashSet::new(),
                     revision_fallback_allowed_revisions: HashMap::new(),
+                    use_record: None,
                 }),
             )
         }
@@ -418,6 +586,7 @@ impl SecretResolver {
                 denied_env_keys,
                 identity_bound_env_keys,
                 revision_fallback_allowed_revisions,
+                use_record: None,
             })
         }
     }
@@ -454,6 +623,7 @@ impl SecretResolver {
             denied_env_keys,
             identity_bound_env_keys: bound_keys.clone(),
             revision_fallback_allowed_revisions,
+            use_record: self.use_record.clone(),
         }
     }
 
@@ -605,7 +775,11 @@ impl SecretResolver {
             let canonical = placeholder_for_env_key(key);
             self.by_placeholder.get(&canonical)?
         };
-        resolve_secret_value(secret)
+        let resolved = resolve_secret_value(secret);
+        if let Some(served) = resolved {
+            self.note_use(value, served);
+        }
+        resolved
     }
 
     /// Resolve the current value for an environment key selected by trusted
@@ -628,10 +802,14 @@ impl SecretResolver {
             });
         }
         let placeholder = placeholder_for_env_key(key);
-        Ok(self
+        let resolved = self
             .by_placeholder
             .get(&placeholder)
-            .and_then(resolve_secret_value))
+            .and_then(resolve_secret_value);
+        if let Some(served) = resolved {
+            self.note_use(&placeholder, served);
+        }
+        Ok(resolved)
     }
 
     /// Resolve a placeholder while preserving endpoint-denial information.
