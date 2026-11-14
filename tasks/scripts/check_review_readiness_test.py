@@ -139,6 +139,30 @@ class PlanningTests(unittest.TestCase):
             {"alice", "bob", "carol"},
         )
 
+    def test_multiple_area_labels_message(self):
+        with self.assertRaises(routing.LabelRoutingError) as caught:
+            routing.select_reviewers(CATEGORIES, {"area:runtime", "area:build"})
+        message = str(caught.exception)
+        self.assertIn("found: area:build, area:runtime", message)
+        self.assertIn("only one area: label remains", message)
+
+    def test_missing_area_label_message(self):
+        with self.assertRaises(routing.LabelRoutingError) as caught:
+            routing.select_reviewers(CATEGORIES, {"topic:policy"})
+        self.assertIn("found: none", str(caught.exception))
+
+    def test_unknown_label_message(self):
+        with self.assertRaises(routing.LabelRoutingError) as caught:
+            routing.select_reviewers(CATEGORIES, {"area:runtime", "topic:nope"})
+        message = str(caught.exception)
+        self.assertIn("topic:nope", message)
+        self.assertIn("REVIEWERS.md", message)
+
+    def test_area_count_is_checked_before_unknown_labels(self):
+        with self.assertRaises(routing.LabelRoutingError) as caught:
+            routing.select_reviewers(CATEGORIES, {"area:nope", "area:other"})
+        self.assertIn("exactly one area label", str(caught.exception))
+
     def test_requires_one_known_area_and_known_topics(self):
         for labels in (
             set(),

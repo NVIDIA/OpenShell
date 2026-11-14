@@ -135,11 +135,19 @@ def parse_reviewers(markdown: str) -> dict[str, set[str]]:
 def select_reviewers(categories: dict[str, set[str]], labels: set[str]) -> set[str]:
     """Return matching handles for one primary area and any number of topics."""
     relevant = {label for label in labels if label.startswith(("area:", "topic:"))}
-    if sum(label.startswith("area:") for label in relevant) != 1:
-        raise ValueError("a ready PR must have exactly one area label")
+    areas = sorted(label for label in relevant if label.startswith("area:"))
+    if len(areas) != 1:
+        raise LabelRoutingError(
+            "a ready PR must have exactly one area label; "
+            f"found: {', '.join(areas) or 'none'}. "
+            "Edit the PR labels so only one area: label remains."
+        )
     unknown = relevant - categories.keys()
     if unknown:
-        raise ValueError("unknown area/topic labels: " + ", ".join(sorted(unknown)))
+        raise LabelRoutingError(
+            f"unknown area/topic labels: {', '.join(sorted(unknown))}. "
+            "Define them in REVIEWERS.md or remove them from the PR."
+        )
     return set().union(*(categories[label] for label in relevant))
 
 
