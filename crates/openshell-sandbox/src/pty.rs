@@ -60,15 +60,17 @@ pub fn install_pre_exec(
     policy: SandboxPolicy,
     _workdir: Option<String>,
     slave_fd: RawFd,
-    #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    #[cfg(target_os = "linux")] child_hardening: crate::linux::child_seccomp::ChildHardeningProgram,
+    #[cfg(target_os = "linux")] install: crate::sandbox::linux::ChildSandboxInstall,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
-    let mut prepared = prepared;
-    #[cfg(target_os = "linux")]
-    let mut child_hardening = child_hardening;
-    // SAFETY: all allocations and policy compilation happened before spawn;
-    // the hook performs only the audited child transition.
+    let mut install = install;
+    // SAFETY: the hook runs after fork in the child of a multithreaded
+    // process. It uses raw session/TTY syscalls and installs only
+    // parent-prebuilt sandbox state (Landlock rulesets, seccomp filters);
+    // a best-effort Landlock failure crosses to the parent as one
+    // fixed-size pipe record. The success and degradation paths allocate
+    // nothing and emit no tracing or OCSF; only a hard error return may
+    // allocate, like std's own pre_exec error reporting.
     unsafe {
         command.pre_exec(move || {
             setsid().map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -76,9 +78,7 @@ pub fn install_pre_exec(
             enter_sandbox(
                 &policy,
                 #[cfg(target_os = "linux")]
-                prepared.take(),
-                #[cfg(target_os = "linux")]
-                &mut child_hardening,
+                &mut install,
             )
         });
     }
@@ -94,15 +94,17 @@ pub fn install_pre_exec_no_pty(
     command: &mut Command,
     policy: SandboxPolicy,
     _workdir: Option<String>,
-    #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    #[cfg(target_os = "linux")] child_hardening: crate::linux::child_seccomp::ChildHardeningProgram,
+    #[cfg(target_os = "linux")] install: crate::sandbox::linux::ChildSandboxInstall,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
-    let mut prepared = prepared;
-    #[cfg(target_os = "linux")]
-    let mut child_hardening = child_hardening;
-    // SAFETY: all allocations and policy compilation happened before spawn;
-    // the hook performs only the audited child transition.
+    let mut install = install;
+    // SAFETY: the hook runs after fork in the child of a multithreaded
+    // process. It uses raw process-group syscalls and installs only
+    // parent-prebuilt sandbox state (Landlock rulesets, seccomp filters);
+    // a best-effort Landlock failure crosses to the parent as one
+    // fixed-size pipe record. The success and degradation paths allocate
+    // nothing and emit no tracing or OCSF; only a hard error return may
+    // allocate, like std's own pre_exec error reporting.
     unsafe {
         command.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
@@ -111,9 +113,7 @@ pub fn install_pre_exec_no_pty(
             enter_sandbox(
                 &policy,
                 #[cfg(target_os = "linux")]
-                prepared.take(),
-                #[cfg(target_os = "linux")]
-                &mut child_hardening,
+                &mut install,
             )
         });
     }
@@ -122,18 +122,15 @@ pub fn install_pre_exec_no_pty(
 
 fn enter_sandbox(
     policy: &SandboxPolicy,
-    #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    #[cfg(target_os = "linux")]
-    child_hardening: &mut crate::linux::child_seccomp::ChildHardeningProgram,
+    #[cfg(target_os = "linux")] install: &mut crate::sandbox::linux::ChildSandboxInstall,
 ) -> std::io::Result<()> {
     crate::process::harden_child_process()
         .map_err(|error| std::io::Error::other(error.to_string()))?;
 
     #[cfg(target_os = "linux")]
-    if let Some(prepared) = prepared {
-        crate::sandbox::linux::enforce_capability_free(prepared, child_hardening)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-    }
+    install
+        .enforce()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
 
     #[cfg(not(target_os = "linux"))]
     crate::sandbox::apply(policy, None)
