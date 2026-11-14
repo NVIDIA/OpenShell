@@ -1326,7 +1326,7 @@ describe('sandbox templates', () => {
 });
 
 describe('waits', () => {
-  it('waitReady accepts successful main-process completion', async () => {
+  it('waitReady rejects main-process completion without waiting for timeout', async () => {
     const sandbox = client({
       getSandbox: () => ({
         sandbox: {
@@ -1335,7 +1335,10 @@ describe('waits', () => {
         },
       }),
     });
-    await expect(sandbox.waitReady('sb', 1)).resolves.toMatchObject({ phase: 'completed', exitCode: 0 });
+    await expect(sandbox.waitReady('sb', 30)).rejects.toMatchObject({
+      code: 'connect',
+      message: expect.stringContaining('completed before becoming ready'),
+    });
   });
 
   it('waitReady rejects stopped main-process results without waiting for timeout', async () => {
