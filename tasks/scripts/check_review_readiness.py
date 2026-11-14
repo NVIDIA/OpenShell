@@ -164,9 +164,15 @@ def select_reviewers(categories: dict[str, set[str]], labels: set[str]) -> set[s
         )
     unknown = relevant - categories.keys()
     if unknown:
+        names = ", ".join(sorted(unknown))
+        if len(unknown) == 1:
+            raise LabelRoutingError(
+                f"There is an invalid area or topic label on this PR: {names}. "
+                "Replace it with a valid label."
+            )
         raise LabelRoutingError(
-            f"This PR's area and topic labels {', '.join(sorted(unknown))} have no "
-            "reviewers in REVIEWERS.md. Replace them with labels listed there."
+            f"There are invalid area and topic labels on this PR: {names}. "
+            "Replace them with valid labels."
         )
     return set().union(*(categories[label] for label in relevant))
 

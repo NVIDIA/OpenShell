@@ -163,8 +163,17 @@ class PlanningTests(unittest.TestCase):
             )
         self.assertEqual(
             str(caught.exception),
-            "This PR's area and topic labels topic:nope, topic:zzz have no "
-            "reviewers in REVIEWERS.md. Replace them with labels listed there.",
+            "There are invalid area and topic labels on this PR: topic:nope, "
+            "topic:zzz. Replace them with valid labels.",
+        )
+
+    def test_single_unknown_label_message(self):
+        with self.assertRaises(routing.LabelRoutingError) as caught:
+            routing.select_reviewers(CATEGORIES, {"area:runtime", "topic:nope"})
+        self.assertEqual(
+            str(caught.exception),
+            "There is an invalid area or topic label on this PR: topic:nope. "
+            "Replace it with a valid label.",
         )
 
     def test_area_count_is_checked_before_unknown_labels(self):
