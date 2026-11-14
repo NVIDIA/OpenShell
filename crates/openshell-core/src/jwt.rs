@@ -1419,6 +1419,11 @@ mod session {
 #[cfg(feature = "jwt")]
 pub use session::*;
 
+#[cfg(feature = "jwt")]
+mod launch_binding;
+#[cfg(feature = "jwt")]
+pub use launch_binding::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;

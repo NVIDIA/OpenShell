@@ -136,6 +136,8 @@ const RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const MAIN_PROCESS_SPEC_FILE: &str = "main-process.json";
 const WORKSPACE_ROOT_FILE: &str = "workspace-root";
 const BOUNDARY_CONFIG_FILE: &str = "boundary-bootstrap.json";
+/// The driver's private record of a boundary; see [`isolation::DockerBoundaryState`].
+const BOUNDARY_STATE_FILE: &str = "boundary-state.json";
 const BOUNDARY_CERTIFICATE_FILE: &str = "boundary-server.crt";
 const BOUNDARY_PRIVATE_KEY_FILE: &str = "boundary-server.key";
 const SUPERVISOR_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
@@ -2216,7 +2218,7 @@ impl DockerComputeDriver {
         if let Some(stale) = stale {
             stop_docker_control_process(stale).await;
         }
-        if read_docker_runtime_descriptor(&sandbox.id, &self.config)
+        if read_docker_boundary_state(&sandbox.id, &self.config)
             .await?
             .is_none()
         {
@@ -2584,23 +2586,22 @@ impl DockerComputeDriver {
             )
             .await?;
         }
-        let Some(runtime_descriptor) =
-            read_docker_runtime_descriptor(resolved_sandbox_id, &self.config).await?
+        let Some(state) = read_docker_boundary_state(resolved_sandbox_id, &self.config).await?
         else {
             return Err(Status::failed_precondition(
                 "Docker sandbox runtime descriptor is missing; refusing to start the workload without its supervisor",
             ));
         };
-        let boundary_config = tokio::fs::read(
-            docker_boundary_state_dir_by_id(resolved_sandbox_id, &self.config)?
-                .join(BOUNDARY_CONFIG_FILE),
-        )
-        .await
-        .map_err(|error| {
+        let provisioning = state.provision().map_err(|error| {
             Status::failed_precondition(format!(
-                "read Docker sandbox bootstrap for restart: {error}"
+                "regenerate Docker sandbox bootstrap for restart: {error}"
             ))
         })?;
+        let boundary_config = provisioning
+            .boundary_config
+            .encode()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let runtime_descriptor = provisioning.runtime_descriptor;
         let boundary_directory =
             docker_boundary_state_dir_by_id(resolved_sandbox_id, &self.config)?;
         let boundary_certificate =
@@ -4708,7 +4709,7 @@ async fn prepare_docker_boundary_files(
     let tls = generate_sandbox_tls_material(session_id)
         .map_err(|error| Status::internal(format!("generate Docker boundary TLS: {error}")))?;
     let verification_keys = gateway_verification_keys(&launch_authentication.verification_keys)?;
-    let provisioning = isolation::DockerBoundarySpec {
+    let spec = isolation::DockerBoundarySpec {
         boundary_id: sandbox.id.clone(),
         generation: launch_authentication
             .supervisor
@@ -4735,14 +4736,16 @@ async fn prepare_docker_boundary_files(
         host_gateway_ip: config.host_gateway_ip,
         workload_identity: workload_identity.clone(),
         child_env: docker_child_environment(sandbox),
-    }
-    .provision()
-    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    };
+    let state = isolation::DockerBoundaryState::from_spec(&spec);
+    let provisioning = spec
+        .provision()
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
     let boundary_config = provisioning
         .boundary_config
         .encode()
         .map_err(|error| Status::internal(error.to_string()))?;
-    write_docker_boundary_file(&directory.join(BOUNDARY_CONFIG_FILE), &boundary_config).await?;
+    write_docker_boundary_state(&directory, &state).await?;
     write_docker_boundary_file(
         &directory.join(BOUNDARY_CERTIFICATE_FILE),
         tls.certificate_chain_pem.as_bytes(),
@@ -4764,15 +4767,6 @@ async fn prepare_docker_boundary_files(
             private_key: tls.private_key_pem.as_bytes(),
         },
         &workspace_root,
-    )
-    .await?;
-    let descriptor = provisioning
-        .runtime_descriptor
-        .backend_descriptor()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    write_docker_boundary_file(
-        &directory.join(RUNTIME_DESCRIPTOR_FILE),
-        &descriptor.payload,
     )
     .await?;
     let supervisor_auth = serde_json::to_vec(&launch_authentication.supervisor)
@@ -4804,9 +4798,17 @@ async fn docker_supervisor_bundle_archive(
     config: &DockerDriverRuntimeConfig,
 ) -> Result<Vec<u8>, Status> {
     let directory = docker_boundary_state_dir(sandbox, config)?;
-    let runtime_descriptor = tokio::fs::read(directory.join(RUNTIME_DESCRIPTOR_FILE))
-        .await
-        .map_err(|error| Status::internal(format!("read Docker runtime descriptor: {error}")))?;
+    let runtime_descriptor = read_docker_boundary_state_in(&directory)
+        .await?
+        .ok_or_else(|| Status::internal("read Docker runtime descriptor: no boundary state"))?
+        .provision()
+        .map_err(|error| {
+            Status::internal(format!("regenerate Docker runtime descriptor: {error}"))
+        })?
+        .runtime_descriptor
+        .backend_descriptor()
+        .map_err(|error| Status::internal(error.to_string()))?
+        .payload;
     let auth_bundle = tokio::fs::read(directory.join(SUPERVISOR_AUTH_BUNDLE_FILE))
         .await
         .map_err(|error| {
@@ -4911,65 +4913,34 @@ async fn refresh_docker_boundary_authentication(
 ) -> Result<(), Status> {
     let authentication = decode_docker_launch_authentication(encoded_authentication)?;
     let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
-    let mut boundary_config = serde_json::from_slice::<BoundaryConfig>(
-        &tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
-            .await
-            .map_err(|error| {
-                Status::failed_precondition(format!(
-                    "read Docker sandbox bootstrap for authentication rotation: {error}"
-                ))
-            })?,
-    )
-    .map_err(|error| {
-        Status::failed_precondition(format!(
-            "decode Docker sandbox bootstrap for authentication rotation: {error}"
-        ))
-    })?;
-    let Some(mut runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await?
-    else {
+    let Some(mut state) = read_docker_boundary_state(sandbox_id, config).await? else {
         return Err(Status::failed_precondition(
             "Docker sandbox runtime descriptor is missing during authentication rotation",
         ));
     };
-    let session_id = authentication.supervisor.session_id;
-    let tls = generate_sandbox_tls_material(session_id)
+    let tls = generate_sandbox_tls_material(authentication.supervisor.session_id)
         .map_err(|error| Status::internal(format!("rotate Docker boundary TLS: {error}")))?;
-    boundary_config.session_id = session_id;
-    boundary_config.generation = authentication.supervisor.runtime_generation.to_string();
     // The stopped container retains its resource identity, but each new launch
-    // binds both protocol peers and their provisioning evidence to a fresh generation.
-    let container_id = boundary_config
-        .resource_claims
-        .get("docker.container_id")
-        .ok_or_else(|| Status::failed_precondition("Docker sandbox container claim is missing"))?;
-    boundary_config.provisioning_evidence =
-        isolation::provisioning_evidence(container_id, &boundary_config.generation)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    runtime_descriptor.generation = boundary_config.generation.clone();
-    runtime_descriptor.provisioning_evidence = boundary_config.provisioning_evidence.clone();
-    boundary_config.session_rotation = authentication.supervisor.session_rotation;
-    boundary_config.auth_epoch = authentication.supervisor.auth_epoch;
-    boundary_config.gateway_id = authentication.gateway_id;
-    boundary_config.verification_keys =
-        gateway_verification_keys(&authentication.verification_keys)?;
-    runtime_descriptor.session_id = session_id;
-    runtime_descriptor.tls = SandboxTlsClientConfig {
-        server_name: tls.server_name,
-        trust_anchor_pem: tls.trust_anchor_pem,
-    };
-    let encoded_boundary_config = boundary_config
-        .encode()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    let descriptor = runtime_descriptor
-        .backend_descriptor()
-        .map_err(|error| Status::internal(error.to_string()))?;
+    // binds both protocol peers and their provisioning evidence to a fresh
+    // generation. The evidence follows from the container and the generation
+    // when the documents are generated.
+    state
+        .launch
+        .rebind(
+            &authentication,
+            openshell_core::jwt::LaunchTls {
+                server_name: tls.server_name,
+                trust_anchor_pem: tls.trust_anchor_pem,
+            },
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    // Keep the record only if it still produces valid documents.
+    state
+        .provision()
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
     let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
         .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
-    write_docker_boundary_file(
-        &directory.join(BOUNDARY_CONFIG_FILE),
-        &encoded_boundary_config,
-    )
-    .await?;
+    write_docker_boundary_state(&directory, &state).await?;
     write_docker_boundary_file(
         &directory.join(BOUNDARY_CERTIFICATE_FILE),
         tls.certificate_chain_pem.as_bytes(),
@@ -4978,11 +4949,6 @@ async fn refresh_docker_boundary_authentication(
     write_docker_boundary_file(
         &directory.join(BOUNDARY_PRIVATE_KEY_FILE),
         tls.private_key_pem.as_bytes(),
-    )
-    .await?;
-    write_docker_boundary_file(
-        &directory.join(RUNTIME_DESCRIPTOR_FILE),
-        &descriptor.payload,
     )
     .await?;
     write_docker_boundary_file(
@@ -4999,21 +4965,16 @@ async fn refresh_docker_supervisor_authentication(
 ) -> Result<(), Status> {
     let authentication = decode_docker_launch_authentication(encoded_authentication)?;
     let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
-    let Some(runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await? else {
+    if read_docker_boundary_state(sandbox_id, config)
+        .await?
+        .is_none()
+    {
         return Err(Status::failed_precondition(
             "Docker sandbox runtime descriptor is missing during supervisor authentication rotation",
         ));
-    };
-    let descriptor = runtime_descriptor
-        .backend_descriptor()
-        .map_err(|error| Status::internal(error.to_string()))?;
+    }
     let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
         .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
-    write_docker_boundary_file(
-        &directory.join(RUNTIME_DESCRIPTOR_FILE),
-        &descriptor.payload,
-    )
-    .await?;
     write_docker_boundary_file(
         &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
         &supervisor_auth,
@@ -5021,27 +4982,137 @@ async fn refresh_docker_supervisor_authentication(
     .await
 }
 
-async fn read_docker_runtime_descriptor(
+/// Persist the driver's private record of a boundary. See
+/// [`isolation::DockerBoundaryState`].
+async fn write_docker_boundary_state(
+    directory: &Path,
+    state: &isolation::DockerBoundaryState,
+) -> Result<(), Status> {
+    let encoded = serde_json::to_vec(state)
+        .map_err(|error| Status::internal(format!("encode Docker boundary state: {error}")))?;
+    write_docker_boundary_file_atomically(&directory.join(BOUNDARY_STATE_FILE), &encoded).await
+}
+
+/// Write `path` so a crash never leaves it truncated: write an owner-only
+/// temporary file in the same directory, then rename it over `path`. The
+/// temporary file is removed if either step fails.
+async fn write_docker_boundary_file_atomically(path: &Path, contents: &[u8]) -> Result<(), Status> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            Status::internal(format!(
+                "Docker boundary file {} has no name",
+                path.display()
+            ))
+        })?;
+    let temporary = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = async {
+        write_docker_boundary_file(&temporary, contents).await?;
+        tokio::fs::rename(&temporary, path).await.map_err(|error| {
+            Status::internal(format!(
+                "replace Docker boundary file {}: {error}",
+                path.display()
+            ))
+        })
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result
+}
+
+async fn read_docker_boundary_state(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
-) -> Result<Option<SandboxRuntimeDescriptor>, Status> {
-    let path = docker_boundary_state_dir_by_id(sandbox_id, config)?.join(RUNTIME_DESCRIPTOR_FILE);
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(Status::internal(format!(
-                "read Docker runtime descriptor {}: {error}",
-                path.display()
-            )));
+) -> Result<Option<isolation::DockerBoundaryState>, Status> {
+    read_docker_boundary_state_in(&docker_boundary_state_dir_by_id(sandbox_id, config)?).await
+}
+
+/// The record of the boundary whose state lives in `directory`, if it has one.
+///
+/// The contract documents are generated from this record for each launch; the
+/// driver never reads one back, except once to migrate a sandbox that an older
+/// driver left without a record.
+async fn read_docker_boundary_state_in(
+    directory: &Path,
+) -> Result<Option<isolation::DockerBoundaryState>, Status> {
+    let path = directory.join(BOUNDARY_STATE_FILE);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let state: isolation::DockerBoundaryState =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    Status::internal(format!(
+                        "decode Docker boundary state {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            if state.version != isolation::DOCKER_BOUNDARY_STATE_VERSION {
+                return Err(Status::failed_precondition(format!(
+                    "Docker boundary state {} has unsupported version {}",
+                    path.display(),
+                    state.version
+                )));
+            }
+            Ok(Some(state))
         }
-    };
-    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-        Status::internal(format!(
-            "decode Docker runtime descriptor {}: {error}",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            migrate_docker_boundary_documents(directory).await
+        }
+        Err(error) => Err(Status::internal(format!(
+            "read Docker boundary state {}: {error}",
             path.display()
+        ))),
+    }
+}
+
+/// Build the record of a sandbox that an older driver provisioned.
+///
+/// Those drivers kept the boundary configuration and the runtime descriptor
+/// themselves as their state and edited them in place. This is the only code
+/// that reads them back, and only when the record does not exist yet; it writes
+/// the record, which every later read uses. The old files are left as they are.
+///
+/// TODO: remove once no supported release provisions sandboxes without a record.
+async fn migrate_docker_boundary_documents(
+    directory: &Path,
+) -> Result<Option<isolation::DockerBoundaryState>, Status> {
+    let boundary = read_optional_docker_state_file(&directory.join(BOUNDARY_CONFIG_FILE)).await?;
+    let descriptor =
+        read_optional_docker_state_file(&directory.join(RUNTIME_DESCRIPTOR_FILE)).await?;
+    let (Some(boundary), Some(descriptor)) = (boundary, descriptor) else {
+        return Ok(None);
+    };
+    let decode_error = |error: serde_json::Error| {
+        Status::internal(format!(
+            "decode Docker boundary documents from an older driver: {error}"
         ))
-    })
+    };
+    let boundary: BoundaryConfig = serde_json::from_slice(&boundary).map_err(decode_error)?;
+    let descriptor: SandboxRuntimeDescriptor =
+        serde_json::from_slice(&descriptor).map_err(decode_error)?;
+    let state = isolation::DockerBoundaryState::from_documents(&boundary, &descriptor)
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    write_docker_boundary_state(directory, &state).await?;
+    Ok(Some(state))
+}
+
+/// Read a state file that may not exist.
+async fn read_optional_docker_state_file(path: &Path) -> Result<Option<Vec<u8>>, Status> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Status::internal(format!(
+            "read Docker state file {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 async fn stage_docker_supervisor_bundle(
@@ -5057,8 +5128,11 @@ async fn stage_docker_supervisor_bundle(
             Some(RemoveContainerOptionsBuilder::default().force(true).build()),
         )
         .await;
-    let runtime_initiated = read_docker_runtime_descriptor(&sandbox.id, config).await?
-        .is_some_and(|descriptor| matches!(descriptor.transport, openshell_sandbox_backend::boundary_protocol::SandboxTransport::RuntimeInitiatedUnix { .. }));
+    // Docker provisions only runtime-initiated boundaries; a record exists
+    // only for one.
+    let runtime_initiated = read_docker_boundary_state(&sandbox.id, config)
+        .await?
+        .is_some();
     let mut mounts = vec![Mount {
         target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
         source: Some(docker_supervisor_volume_name(sandbox, config)),
@@ -5340,11 +5414,9 @@ async fn docker_workload_image_environment(
     sandbox: &DriverSandbox,
     directory: &Path,
 ) -> Result<Vec<String>, Status> {
-    let bytes = tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
-        .await
-        .map_err(|error| Status::internal(format!("read Docker image launch identity: {error}")))?;
-    let bootstrap: BoundaryConfig = serde_json::from_slice(&bytes)
-        .map_err(|_| Status::internal("decode Docker image launch identity"))?;
+    let state = read_docker_boundary_state_in(directory)
+        .await?
+        .ok_or_else(|| Status::internal("read Docker image launch identity: no boundary state"))?;
     let mut environment = Vec::new();
     if let Some(image) = sandbox_image(sandbox) {
         environment.push(format!(
@@ -5352,11 +5424,7 @@ async fn docker_workload_image_environment(
             openshell_core::sandbox_env::CONTAINER_IMAGE
         ));
     }
-    if let Some(uid) = bootstrap
-        .resource_claims
-        .get("docker.image_identity")
-        .filter(|uid| !uid.trim().is_empty())
-    {
+    if let Some(uid) = Some(&state.image_identity).filter(|uid| !uid.trim().is_empty()) {
         environment.push(format!(
             "{}={uid}",
             openshell_core::sandbox_env::CONTAINER_IMAGE_UID
@@ -5486,8 +5554,11 @@ async fn spawn_docker_control_process(
         &config.upstream_proxy,
         config.proxy_ca_bundle.is_some(),
     ));
-    let runtime_initiated = read_docker_runtime_descriptor(&sandbox.id, config).await?
-        .is_some_and(|descriptor| matches!(descriptor.transport, openshell_sandbox_backend::boundary_protocol::SandboxTransport::RuntimeInitiatedUnix { .. }));
+    // Docker provisions only runtime-initiated boundaries; a record exists
+    // only for one.
+    let runtime_initiated = read_docker_boundary_state(&sandbox.id, config)
+        .await?
+        .is_some();
     command.extend(docker_network_trust_supervisor_args(
         config.network_trust.as_ref(),
     ));

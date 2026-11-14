@@ -81,8 +81,20 @@ fn test_launch_authentication() -> Vec<u8> {
     .unwrap()
 }
 
+/// A sandbox created by this driver has only its private record.
 #[tokio::test]
 async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together() {
+    restart_rotation(false).await;
+}
+
+/// A sandbox that an older driver provisioned has only the contract documents.
+/// The first read builds the driver's own record from them and leaves them be.
+#[tokio::test]
+async fn a_sandbox_with_only_documents_gets_a_record_and_rotates() {
+    restart_rotation(true).await;
+}
+
+async fn restart_rotation(documents_only: bool) {
     let config = runtime_config();
     let sandbox_id = format!("restart-{}", openshell_core::SandboxSessionId::new());
     let directory = docker_boundary_state_dir_by_id(&sandbox_id, &config).unwrap();
@@ -90,7 +102,7 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
     let mut authentication: SandboxLaunchAuthentication =
         serde_json::from_slice(&test_launch_authentication()).unwrap();
     let tls = generate_sandbox_tls_material(authentication.supervisor.session_id).unwrap();
-    let provisioned = isolation::DockerBoundarySpec {
+    let spec = isolation::DockerBoundarySpec {
         boundary_id: sandbox_id.clone(),
         generation: authentication.supervisor.runtime_generation.to_string(),
         session_id: authentication.supervisor.session_id,
@@ -121,23 +133,42 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
         )
         .unwrap(),
         child_env: HashMap::new(),
-    }
-    .provision()
-    .unwrap();
-    fs::write(
-        directory.join(BOUNDARY_CONFIG_FILE),
-        provisioned.boundary_config.encode().unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        directory.join(RUNTIME_DESCRIPTOR_FILE),
-        provisioned
+    };
+    let state = isolation::DockerBoundaryState::from_spec(&spec);
+    let provisioned = spec.provision().unwrap();
+    if documents_only {
+        let boundary_bytes = provisioned.boundary_config.encode().unwrap();
+        let descriptor_bytes = provisioned
             .runtime_descriptor
             .backend_descriptor()
             .unwrap()
-            .payload,
-    )
-    .unwrap();
+            .payload;
+        fs::write(directory.join(BOUNDARY_CONFIG_FILE), &boundary_bytes).unwrap();
+        fs::write(directory.join(RUNTIME_DESCRIPTOR_FILE), &descriptor_bytes).unwrap();
+        assert!(!directory.join(BOUNDARY_STATE_FILE).exists());
+        // Reading it builds the record the driver keeps from then on.
+        assert_eq!(
+            read_docker_boundary_state(&sandbox_id, &config)
+                .await
+                .unwrap()
+                .unwrap(),
+            state
+        );
+        assert!(directory.join(BOUNDARY_STATE_FILE).exists());
+        // The old files are left as they were.
+        assert_eq!(
+            fs::read(directory.join(BOUNDARY_CONFIG_FILE)).unwrap(),
+            boundary_bytes
+        );
+        assert_eq!(
+            fs::read(directory.join(RUNTIME_DESCRIPTOR_FILE)).unwrap(),
+            descriptor_bytes
+        );
+    } else {
+        write_docker_boundary_state(&directory, &state)
+            .await
+            .unwrap();
+    }
     let previous_evidence = provisioned.boundary_config.provisioning_evidence;
     authentication.supervisor.runtime_generation =
         openshell_core::sandbox_generation::SandboxGenerationId::parse("generation-2").unwrap();
@@ -147,8 +178,18 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
         .await
         .unwrap();
 
-    let bootstrap: BoundaryConfig =
-        serde_json::from_slice(&fs::read(directory.join(BOUNDARY_CONFIG_FILE)).unwrap()).unwrap();
+    // The documents are generated from the driver's record, not stored.
+    let regenerated = read_docker_boundary_state(&sandbox_id, &config)
+        .await
+        .unwrap()
+        .unwrap()
+        .provision()
+        .unwrap();
+    if !documents_only {
+        assert!(!directory.join(BOUNDARY_CONFIG_FILE).exists());
+        assert!(!directory.join(RUNTIME_DESCRIPTOR_FILE).exists());
+    }
+    let bootstrap = regenerated.boundary_config;
     // A restart keeps the original image identity even if the mutable
     // template reference now names another image in the registry.
     let sandbox = test_sandbox();
@@ -164,10 +205,7 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
         openshell_core::sandbox_env::CONTAINER_IMAGE,
         sandbox_image(&sandbox).unwrap()
     )));
-    let descriptor = read_docker_runtime_descriptor(&sandbox_id, &config)
-        .await
-        .unwrap()
-        .unwrap();
+    let descriptor = regenerated.runtime_descriptor;
     let supervisor: SupervisorAuthBundle =
         serde_json::from_slice(&fs::read(directory.join(SUPERVISOR_AUTH_BUNDLE_FILE)).unwrap())
             .unwrap();
@@ -196,14 +234,221 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
     refresh_docker_boundary_authentication(&sandbox_id, &config, &encoded)
         .await
         .unwrap();
-    let retried = read_docker_runtime_descriptor(&sandbox_id, &config)
+    let retried = read_docker_boundary_state(&sandbox_id, &config)
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .provision()
+        .unwrap()
+        .runtime_descriptor;
     assert_eq!(
         retried.provisioning_evidence,
         descriptor.provisioning_evidence
     );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn directory_entries(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn boundary_state_write_replaces_the_record_and_leaves_no_temporary_files() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(BOUNDARY_STATE_FILE);
+    fs::write(&path, b"old").unwrap();
+    write_docker_boundary_file_atomically(&path, b"new")
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+    assert_eq!(directory_entries(directory.path()), [BOUNDARY_STATE_FILE]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_boundary_state_write_leaves_the_existing_record_intact() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(BOUNDARY_STATE_FILE);
+    fs::write(&path, b"old").unwrap();
+    // A directory that cannot take a new file: the temporary file fails first.
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    let writable = fs::write(directory.path().join("probe"), b"").is_ok();
+    let result = if writable {
+        None
+    } else {
+        Some(write_docker_boundary_file_atomically(&path, b"new").await)
+    };
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    if writable {
+        // Running with privileges that ignore directory modes.
+        return;
+    }
+    assert!(result.unwrap().is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"old");
+    assert_eq!(directory_entries(directory.path()), [BOUNDARY_STATE_FILE]);
+}
+
+#[tokio::test]
+async fn boundary_state_write_that_cannot_replace_the_destination_cleans_up() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(BOUNDARY_STATE_FILE);
+    // A non-empty directory cannot be replaced by a file.
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("keep"), b"keep").unwrap();
+    assert!(
+        write_docker_boundary_file_atomically(&path, b"new")
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(path.join("keep")).unwrap(), b"keep");
+    assert_eq!(directory_entries(directory.path()), [BOUNDARY_STATE_FILE]);
+}
+
+#[tokio::test]
+async fn a_record_with_an_unsupported_version_is_refused() {
+    let config = runtime_config();
+    let sandbox_id = format!("version-{}", openshell_core::SandboxSessionId::new());
+    let directory = docker_boundary_state_dir_by_id(&sandbox_id, &config).unwrap();
+    fs::create_dir_all(&directory).unwrap();
+    let authentication: SandboxLaunchAuthentication =
+        serde_json::from_slice(&test_launch_authentication()).unwrap();
+    let mut state =
+        isolation::DockerBoundaryState::from_spec(&docker_test_spec(&sandbox_id, &authentication));
+    assert_eq!(state.version, isolation::DOCKER_BOUNDARY_STATE_VERSION);
+    state.version += 1;
+    write_docker_boundary_state(&directory, &state)
+        .await
+        .unwrap();
+    let error = read_docker_boundary_state(&sandbox_id, &config)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn docker_test_spec(
+    sandbox_id: &str,
+    authentication: &SandboxLaunchAuthentication,
+) -> isolation::DockerBoundarySpec {
+    let tls = generate_sandbox_tls_material(authentication.supervisor.session_id).unwrap();
+    isolation::DockerBoundarySpec {
+        boundary_id: sandbox_id.to_string(),
+        generation: authentication.supervisor.runtime_generation.to_string(),
+        session_id: authentication.supervisor.session_id,
+        session_rotation: authentication.supervisor.session_rotation,
+        auth_epoch: authentication.supervisor.auth_epoch,
+        gateway_id: authentication.gateway_id.clone(),
+        verification_keys: gateway_verification_keys(&authentication.verification_keys).unwrap(),
+        container_id: "container-test".into(),
+        image_identity: "image-test".into(),
+        gpu_requested: false,
+        listener_socket: BOUNDARY_SOCKET_MOUNT_PATH.into(),
+        control_socket: BOUNDARY_SOCKET_MOUNT_PATH.into(),
+        sandbox_tls: SandboxTlsServerConfig {
+            certificate_chain_path: BOUNDARY_CERTIFICATE_MOUNT_PATH.into(),
+            private_key_path: BOUNDARY_PRIVATE_KEY_MOUNT_PATH.into(),
+        },
+        supervisor_tls: SandboxTlsClientConfig {
+            server_name: tls.server_name,
+            trust_anchor_pem: tls.trust_anchor_pem,
+        },
+        host_gateway_ip: None,
+        workload_identity: ResolvedWorkloadIdentity::new(
+            1000,
+            1000,
+            vec![],
+            "image".into(),
+            "image-test".into(),
+        )
+        .unwrap(),
+        child_env: HashMap::new(),
+    }
+}
+
+#[tokio::test]
+async fn migration_refuses_a_boundary_that_is_not_runtime_initiated() {
+    let config = runtime_config();
+    let sandbox_id = format!("legacy-{}", openshell_core::SandboxSessionId::new());
+    let directory = docker_boundary_state_dir_by_id(&sandbox_id, &config).unwrap();
+    fs::create_dir_all(&directory).unwrap();
+    let authentication: SandboxLaunchAuthentication =
+        serde_json::from_slice(&test_launch_authentication()).unwrap();
+    let tls = generate_sandbox_tls_material(authentication.supervisor.session_id).unwrap();
+    let spec = isolation::DockerBoundarySpec {
+        boundary_id: sandbox_id.clone(),
+        generation: authentication.supervisor.runtime_generation.to_string(),
+        session_id: authentication.supervisor.session_id,
+        session_rotation: authentication.supervisor.session_rotation,
+        auth_epoch: authentication.supervisor.auth_epoch,
+        gateway_id: authentication.gateway_id.clone(),
+        verification_keys: gateway_verification_keys(&authentication.verification_keys).unwrap(),
+        container_id: "container-test".into(),
+        image_identity: "image-test".into(),
+        gpu_requested: false,
+        listener_socket: BOUNDARY_SOCKET_MOUNT_PATH.into(),
+        control_socket: BOUNDARY_SOCKET_MOUNT_PATH.into(),
+        sandbox_tls: SandboxTlsServerConfig {
+            certificate_chain_path: BOUNDARY_CERTIFICATE_MOUNT_PATH.into(),
+            private_key_path: BOUNDARY_PRIVATE_KEY_MOUNT_PATH.into(),
+        },
+        supervisor_tls: SandboxTlsClientConfig {
+            server_name: tls.server_name,
+            trust_anchor_pem: tls.trust_anchor_pem,
+        },
+        host_gateway_ip: None,
+        workload_identity: ResolvedWorkloadIdentity::new(
+            1000,
+            1000,
+            vec![],
+            "image".into(),
+            "image-test".into(),
+        )
+        .unwrap(),
+        child_env: HashMap::new(),
+    };
+    let mut provisioned = spec.provision().unwrap();
+    let openshell_sandbox_backend::boundary_protocol::BoundaryListener::RuntimeInitiatedUnix {
+        socket_path,
+        tls,
+    } = provisioned.boundary_config.listener.clone()
+    else {
+        panic!("Docker provisions a runtime-initiated listener");
+    };
+    provisioned.boundary_config.listener =
+        openshell_sandbox_backend::boundary_protocol::BoundaryListener::Unix { socket_path, tls };
+    fs::write(
+        directory.join(BOUNDARY_CONFIG_FILE),
+        provisioned.boundary_config.encode().unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        directory.join(RUNTIME_DESCRIPTOR_FILE),
+        provisioned
+            .runtime_descriptor
+            .backend_descriptor()
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    let error = read_docker_boundary_state(&sandbox_id, &config)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(!directory.join(BOUNDARY_STATE_FILE).exists());
     fs::remove_dir_all(directory).unwrap();
 }
 
