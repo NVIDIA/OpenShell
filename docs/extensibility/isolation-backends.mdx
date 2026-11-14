@@ -34,6 +34,13 @@ The supervisor's concrete RPC client, `OpenShellRuntimeBackend`, lives in
 The admission sequence is Attach, Confirm, then StartAgent. No workload code
 runs before StartAgent.
 
+A backend refuses a policy it cannot enforce by returning `Denied` from Attach.
+The sandbox then reports `ConfigurationReady: False (ConfigurationInvalid)`.
+Transport and backend availability failures remain infrastructure failures.
+Configuration status and policy history omit backend details; the backend's
+reason is in the supervisor log. Delete the sandbox and create it
+again with a policy the backend accepts.
+
 External compute drivers advertise `openshell.compute.isolation-backend` to
 accept an operator-selected `IsolationBackendRegistration`, including its Unix,
 TCP, or vsock endpoint. The driver provisions the resource and delivers the
@@ -50,3 +57,9 @@ backend's trusted launch metadata to the supervisor.
 For how `openshell-sandbox` enforces the boundary, refer to [Inside the Sandbox
 Boundary](/about/architecture#inside-the-sandbox-boundary). For driver-specific
 workload behavior, refer to [Runtimes](/how-it-works/sandboxes/runtimes).
+
+## Release compatibility
+
+These API changes target the next minor release and must not be backported into the `0.1.x` patch series. Upgrade gateway replicas and supervisors together before relying on startup refusal reporting.
+
+For raw Rust and TypeScript message changes, see the [SDK migration notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-sdk/README.md#next-minor-api-migration).
