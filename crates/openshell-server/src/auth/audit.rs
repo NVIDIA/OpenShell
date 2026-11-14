@@ -219,7 +219,8 @@ fn authenticated(principal: &Principal) -> bool {
         Principal::Operator(_)
         | Principal::Sandbox(_)
         | Principal::Peer(_)
-        | Principal::Supervisor(_) => true,
+        | Principal::Supervisor(_)
+        | Principal::SupervisorRegistration(_) => true,
     }
 }
 
@@ -238,6 +239,7 @@ fn mechanism(principal: &Principal) -> Option<AuthMechanism> {
         }),
         Principal::Peer(_) => Some(AuthMechanism::GatewayPeer),
         Principal::Supervisor(_) => Some(AuthMechanism::SupervisorToken),
+        Principal::SupervisorRegistration(_) => Some(AuthMechanism::ComputeDriver),
         Principal::Anonymous => None,
     }
 }
@@ -510,6 +512,9 @@ fn principal_user(principal: &Principal) -> User {
         Principal::Operator(operator) => User::new(&operator.identity.subject, UserTypeId::Admin),
         Principal::Sandbox(sandbox) => User::other(&sandbox.sandbox_id, "Sandbox"),
         Principal::Peer(peer) => User::other(&peer.replica_id, "Gateway Peer"),
+        Principal::SupervisorRegistration(identity) => {
+            User::other(&identity.route, "Supervisor registration")
+        }
         Principal::Supervisor(supervisor) => {
             User::other(&supervisor.identity.subject, "Supervisor")
         }

@@ -25,6 +25,14 @@ import "options.proto";
 // owner fails or leaves. A pool host releases an instance a snapshot omits
 // without stopping its workload; only `stop_routes` stops workloads.
 service SupervisorHost {
+  // Dedicated warm supervisor bootstrap. The stream stays pending until its
+  // physical runtime is claimed, then returns the canonical launch exactly once.
+  // Only driver-authenticated physical supervisor credentials may call it.
+  rpc RegisterSupervisor(RegisterSupervisorRequest) returns (stream RegisterSupervisorResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "supervisor_registration"
+    };
+  }
   // Supervisor-initiated assignment stream. Only the gateway-minted
   // supervisor token may call it.
   rpc Attach(stream HostMessage) returns (stream HostGatewayMessage) {
@@ -32,6 +40,14 @@ service SupervisorHost {
       auth_mode: "supervisor"
     };
   }
+}
+
+message RegisterSupervisorRequest {}
+
+message RegisterSupervisorResponse {
+  // Existing version-locked SandboxInstanceRegistration JSON, including the
+  // assigned identity, credentials, process configuration, and proxy CA.
+  bytes launch_material = 1 [(openshell.options.v1.secret) = true];
 }
 
 // Envelope for host-to-gateway messages.
@@ -130,7 +146,8 @@ message RouteOwner {
   string runtime_address = 2;
 }
 
-// One running generation of a stable Sandbox resource, assigned to the host.
+// One runtime generation assigned to the host, either prepared before a claim
+// or registered to a stable Sandbox resource.
 message SandboxInstanceAssignment {
   // Route handle the sandbox runtime names; the instance's key on the host.
   string route = 1;
@@ -139,12 +156,19 @@ message SandboxInstanceAssignment {
   string generation = 3;
   // Trusted launch material for the generation: the JSON-encoded sandbox
   // instance registration (runtime descriptor, gateway-issued credentials,
-  // proxy CA, main process). Never logged or forwarded.
+  // proxy CA, main process), or prepared runtime registration when prepared
+  // is true. Never logged or forwarded.
   bytes launch_material = 4 [(openshell.options.v1.secret) = true];
   // Present when the host supervises the instance under a later ownership
   // term than its launch: it replaces the previous owner with these
   // credentials and adopts the running workload.
   SandboxInstanceTakeover takeover = 5;
+  // Reserve a slot and hold authenticated runtime connections without a
+  // sandbox identity, operational credentials, or workload. launch_material
+  // contains PreparedRuntimeRegistration; sandbox_id is empty and takeover
+  // is absent. Activation replaces this assignment on the same route with a
+  // matching SandboxInstanceRegistration and prepared=false.
+  bool prepared = 6;
 }
 
 // Credentials of one ownership term after the launch term. The gateway
@@ -189,6 +213,9 @@ enum SandboxInstancePhase {
   SANDBOX_INSTANCE_PHASE_STOPPING = 3;
   SANDBOX_INSTANCE_PHASE_EXITED = 4;
   SANDBOX_INSTANCE_PHASE_FAILED = 5;
+  // A capacity reservation holding a runtime route before sandbox assignment.
+  // This does not imply that the runtime is connected or ready for a workload.
+  SANDBOX_INSTANCE_PHASE_PREPARED = 6;
 }
 
 // Observed state of one hosted sandbox instance.
@@ -197,6 +224,8 @@ message SandboxInstanceStatus {
   string sandbox_id = 2;
   SandboxInstancePhase phase = 3;
   // The gateway currently accepts this instance's supervision session.
+  // For PREPARED only: an authenticated runtime connection is parked. This
+  // does not authorize workload execution or imply an assigned Sandbox.
   bool ready = 4;
   // Workload exit code; meaningful only for EXITED.
   int32 exit_code = 5;

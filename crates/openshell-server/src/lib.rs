@@ -413,6 +413,7 @@ pub struct ServerState {
     /// Optional selected-driver authenticator for the `IssueSandboxToken`
     /// bootstrap path.
     pub compute_driver_authenticator: Option<Arc<auth::compute_driver::ComputeDriverAuthenticator>>,
+    dedicated_warm_pool: Option<Arc<supervisor_pool::SupervisorPool>>,
 
     /// Optional K8s `ServiceAccount` authenticator for gateway peer RPCs.
     pub peer_authenticator: Option<Arc<auth::peer::PeerServiceAccountAuthenticator>>,
@@ -677,6 +678,7 @@ impl ServerState {
             extension_jwt_issuer: None,
             sandbox_session_jwt_authority: None,
             compute_driver_authenticator: None,
+            dedicated_warm_pool: None,
             peer_authenticator: None,
             logons: auth::audit::Logons::default(),
             grpc_rate_limiter,
@@ -1014,6 +1016,26 @@ pub(crate) async fn run_server(
         )
         .start(shutdown_rx.clone());
         spawn_supervisor_token_refresh(authority, ttl, controller.clone(), shutdown_rx.clone());
+    }
+
+    if let Some(supervision) = state.compute.dedicated_warm_supervision() {
+        if config.tls.is_none() {
+            return Err(Error::config(
+                "dedicated warm pools require gateway TLS for supervisor registration",
+            ));
+        }
+        let authority = state.sandbox_session_jwt_authority.clone().ok_or_else(|| {
+            Error::config("dedicated warm pools require gateway JWT signing material")
+        })?;
+        let pool = supervisor_pool::SupervisorPool::new_dedicated(
+            state.store.clone(),
+            supervision.controller().clone(),
+            authority,
+            state.credentials.clone(),
+            state.replica_id.clone(),
+        );
+        pool.start(shutdown_rx.clone());
+        state.dedicated_warm_pool = Some(pool);
     }
 
     if state.sandbox_session_jwt_authority.is_some()
@@ -2104,10 +2126,12 @@ pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
     shared_supervision: &'a OnceLock<openshell_supervisor_control::SharedSupervision>,
+    dedicated_warm_supervision: &'a OnceLock<openshell_supervisor_control::SharedSupervision>,
     app_endpoint_resolver: &'a OnceLock<SharedComputeDriverAppEndpoints>,
     /// Recovery deadline from `[openshell.gateway.supervisor_pool]`, when
     /// configured.
     supervisor_recovery_timeout_secs: Option<u32>,
+    gateway_launch_signing_enabled: bool,
 }
 
 impl ComputeDriverBuildContext<'_> {
@@ -2117,6 +2141,20 @@ impl ComputeDriverBuildContext<'_> {
         self.app_endpoint_resolver
             .set(resolver)
             .map_err(|_| Error::config("application endpoint resolver already registered"))
+    }
+
+    /// Whether this gateway can mint authenticated runtime launch material.
+    #[must_use]
+    pub fn gateway_launch_signing_enabled(&self) -> bool {
+        self.gateway_launch_signing_enabled
+    }
+
+    /// Gateway-owned preparation and claims for dedicated warm capacity.
+    /// This does not enable the shared supervisor stream or mint host tokens.
+    pub fn dedicated_warm_supervision(&self) -> openshell_supervisor_control::SharedSupervision {
+        self.dedicated_warm_supervision
+            .get_or_init(openshell_supervisor_control::SharedSupervision::new)
+            .clone()
     }
 
     /// The gateway's coordination of the shared supervisor pool, for an
@@ -2273,6 +2311,7 @@ async fn build_compute_runtime(
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let shared_supervision = OnceLock::new();
+            let dedicated_warm_supervision = OnceLock::new();
             let app_endpoint_resolver = OnceLock::new();
             let build_context = ComputeDriverBuildContext {
                 config: ComputeDriverConfigContext {
@@ -2284,7 +2323,9 @@ async fn build_compute_runtime(
                 },
                 shutdown_rx,
                 shared_supervision: &shared_supervision,
+                dedicated_warm_supervision: &dedicated_warm_supervision,
                 app_endpoint_resolver: &app_endpoint_resolver,
+                gateway_launch_signing_enabled: config.gateway_jwt.is_some(),
                 supervisor_recovery_timeout_secs: supervisor_pool
                     .and_then(|pool| pool.recovery_timeout_secs),
             };
@@ -2313,6 +2354,7 @@ async fn build_compute_runtime(
                 .map_err(|error| {
                     Error::execution(format!("failed to create compute runtime: {error}"))
                 })?
+                .with_dedicated_warm_supervision(dedicated_warm_supervision.into_inner())
                 .with_supervisor_host(supervisor_host)
                 .with_image_update_driver(image_updates)
                 .with_app_endpoint_resolver(app_endpoint_resolver.into_inner()),
@@ -2957,9 +2999,12 @@ mod tests {
                 },
                 shutdown_rx: shutdown_rx.clone(),
                 shared_supervision: &shared,
+                dedicated_warm_supervision: &std::sync::OnceLock::new(),
                 app_endpoint_resolver: &std::sync::OnceLock::new(),
                 supervisor_recovery_timeout_secs: configured,
+                gateway_launch_signing_enabled: false,
             };
+            assert!(!context.gateway_launch_signing_enabled());
             // The driver asks for shared supervision as before; it is the
             // pool, with the configured recovery deadline or the default.
             let supervision = context.shared_supervision();

@@ -635,6 +635,29 @@ pub fn validate_runtime_coordinates(
             "sandbox identity and generation are required".to_string(),
         ));
     }
+    validate_physical_runtime_coordinates(runtime_descriptor)
+}
+
+/// Validate an unassigned runtime. Its physical identity and TLS pin are
+/// immutable; only the logical sandbox identity may be supplied at activation.
+pub fn validate_prepared_runtime_coordinates(
+    runtime_descriptor: &SandboxRuntimeDescriptor,
+) -> Result<(), BackendError> {
+    if !runtime_descriptor.boundary_id.is_empty()
+        || runtime_descriptor.generation.is_empty()
+        || runtime_descriptor.resource_claims.is_empty()
+    {
+        return Err(BackendError::Descriptor(
+            "prepared runtime requires physical claims and a generation, without a sandbox ID"
+                .to_string(),
+        ));
+    }
+    validate_physical_runtime_coordinates(runtime_descriptor)
+}
+
+fn validate_physical_runtime_coordinates(
+    runtime_descriptor: &SandboxRuntimeDescriptor,
+) -> Result<(), BackendError> {
     let identity = &runtime_descriptor.workload_identity;
     let normalized = ResolvedWorkloadIdentity::new(
         identity.uid,

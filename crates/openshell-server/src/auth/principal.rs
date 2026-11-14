@@ -37,6 +37,8 @@ pub enum Principal {
     /// supervisor token. It may call only the supervisor assignment stream
     /// and never acts for a user or a sandbox.
     Supervisor(SupervisorPrincipal),
+    /// Physical warm supervisor. May only wait for its own committed claim.
+    SupervisorRegistration(openshell_core::proto::compute::v1::SupervisorRegistrationIdentity),
     /// Truly unauthenticated caller (health probes, reflection). Sandbox-class
     /// and user-class methods reject this variant.
     #[allow(dead_code)]
@@ -148,6 +150,9 @@ impl Principal {
             Self::Sandbox(sandbox) => format!("sandbox:{}", sandbox.sandbox_id),
             Self::Peer(peer) => format!("peer:{}", peer.replica_id),
             Self::Supervisor(supervisor) => format!("supervisor:{}", supervisor.identity.subject),
+            Self::SupervisorRegistration(identity) => {
+                format!("supervisor-registration:{}", identity.route)
+            }
             Self::Anonymous => "anonymous".to_string(),
         }
     }

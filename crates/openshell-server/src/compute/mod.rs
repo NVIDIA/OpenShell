@@ -962,6 +962,7 @@ pub struct ComputeRuntime {
     /// Desired assignments of the shared supervisor host, when the gateway
     /// coordinates one for the in-process driver.
     supervisor_host: Option<openshell_supervisor_control::SupervisorHostController>,
+    dedicated_warm_supervision: Option<openshell_supervisor_control::SharedSupervision>,
     service_route_index: Arc<OnceLock<Arc<crate::service_routing::ServiceRouteIndex>>>,
 }
 
@@ -1079,6 +1080,7 @@ impl ComputeRuntime {
             supervisor_otlp_headers: Arc::new(OnceLock::new()),
             supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
+            dedicated_warm_supervision: None,
             service_route_index: Arc::new(OnceLock::new()),
         })
     }
@@ -1091,6 +1093,20 @@ impl ComputeRuntime {
     ) -> Self {
         self.supervisor_host = supervisor_host;
         self
+    }
+
+    pub(crate) fn with_dedicated_warm_supervision(
+        mut self,
+        supervision: Option<openshell_supervisor_control::SharedSupervision>,
+    ) -> Self {
+        self.dedicated_warm_supervision = supervision;
+        self
+    }
+
+    pub(crate) fn dedicated_warm_supervision(
+        &self,
+    ) -> Option<&openshell_supervisor_control::SharedSupervision> {
+        self.dedicated_warm_supervision.as_ref()
     }
 
     /// Gateway-owned assignments of the shared supervisor host, if any.
@@ -1413,6 +1429,15 @@ impl ComputeRuntime {
         &self,
         credential: &str,
     ) -> Result<openshell_core::proto::compute::v1::AuthenticateSandboxResponse, Status> {
+        self.authenticate_compute_credential(credential, false)
+            .await
+    }
+
+    pub(crate) async fn authenticate_compute_credential(
+        &self,
+        credential: &str,
+        supervisor_registration: bool,
+    ) -> Result<openshell_core::proto::compute::v1::AuthenticateSandboxResponse, Status> {
         if !self.supports_sandbox_authentication() {
             return Err(Status::unimplemented(
                 "selected compute driver does not authenticate sandbox credentials",
@@ -1420,6 +1445,7 @@ impl ComputeRuntime {
         }
         let request = AuthenticateSandboxRequest {
             credential: credential.to_string(),
+            supervisor_registration,
         };
         self.driver
             .call(
@@ -7230,7 +7256,9 @@ fn driver_sandbox_from_public(
     })
 }
 
-fn driver_sandbox_spec_from_public(
+pub const WORKLOAD_TEMPLATE_ID_ANNOTATION: &str = "internal.openshell.ai/workload-template-id";
+
+pub fn driver_sandbox_spec_from_public(
     spec: &SandboxSpec,
     driver_name: &str,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
@@ -8515,6 +8543,7 @@ impl ComputeDriver for NoopTestDriver {
                 openshell_core::proto::compute::v1::AuthenticateSandboxResponse {
                     sandbox_id: sandbox_id.clone(),
                     runtime_identity: runtime_identity.clone(),
+                    supervisor_registration: None,
                 },
             )),
             Some(Err((code, message))) => Err(Status::new(*code, message.clone())),
@@ -8784,6 +8813,7 @@ pub fn new_test_runtime_with_driver(
         supervisor_otlp_headers: Arc::new(OnceLock::new()),
         supervisor_otlp_tls: Arc::new(OnceLock::new()),
         supervisor_host: None,
+        dedicated_warm_supervision: None,
         service_route_index: Arc::new(OnceLock::new()),
     }
 }
@@ -10083,6 +10113,7 @@ mod tests {
             supervisor_otlp_headers: Arc::new(OnceLock::new()),
             supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
+            dedicated_warm_supervision: None,
             service_route_index: Arc::new(OnceLock::new()),
         }
     }
@@ -11112,6 +11143,7 @@ mod tests {
             auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("test auth epoch"),
             gateway_token_id: uuid::Uuid::new_v4(),
             refresh_replay: None,
+            prepared_runtime: None,
         }
         .write(&mut annotations);
         let mut sandbox = Sandbox {

@@ -186,6 +186,151 @@ must not create permissive policies, create Pods, read bootstrap Secrets, or
 spoof the OpenShell role labels. Exact supervisor-to-sandbox authorization is
 still enforced by TLS, JWT claims, session generation, and recorded Pod UIDs.
 
+### Prepared runtime bootstrap
+
+The `prepared_runtime` module supplies bootstrap persistence for OpenShell-owned
+warm runtimes. `KubernetesSandboxRuntimeBoundarySpec::provision_prepared`
+builds an unassigned runtime with a shared-supervisor route and physical resource
+claims. `PreparedRuntimeBootstrap::prepare` creates a Pod-owned immutable Secret
+containing its boundary configuration, TLS certificate and private key, and public
+preparation descriptor. It then reserves capacity through `SharedSupervision`.
+It supplies no logical Sandbox ID, gateway session token, or workload credentials.
+
+The controller must persist the physical session, generation and route first,
+admit the Sandbox and gated Pod, and verify the namespace and network fences.
+The provisioning callback builds the boundary configuration and descriptor from
+those observations using the TLS pin supplied by the helper. On retry, the helper
+reads the existing Secret, checks its workspace and Pod UID ownership, and compares
+the complete bootstrap configuration with the expected one. Concurrent creators
+use the winning Secret's identity. Read failures, changed inputs and capacity
+refusals fail without replacing keys, deleting resources or releasing the gate.
+
+`driver::warm_pool` now owns the physical provisioning sequence through
+`prepare_warm_runtime`, `resume_warm_runtime`, and `warm_runtime_inventory`. It
+uses the Agent Sandbox core `Sandbox` API, without extension templates or an
+admission webhook. Each resource records its physical session, public gateway
+trust, requested Pod shape and admission identities before its Pod is created.
+The Pod template references that runtime's own bootstrap Secret from creation.
+The physical CR has no logical Sandbox ID and does not appear as an assigned
+Sandbox in the gateway's watch stream.
+
+Preparation records the first Pod UID, persists bootstrap material, and reserves
+shared-supervisor capacity before releasing the scheduling gate. Immediately
+before release it rechecks the CR, Pod, resource admission, namespace UID and
+network fences. Pod and CR mutations carry resource-version preconditions;
+gate removal preserves gates owned by other controllers. Lost responses recover
+through the CR journal and existing immutable Secret. Replacements, changed
+requests and premature gate removal fail closed. A replacement needs a fresh
+session, generation, route and Secret. Pool controllers must retain request
+identities across uncertain writes and never reuse retired names or sessions.
+
+`retire_warm_runtime` journals retirement before asking the gateway to fence the
+physical route permanently, including when capacity admission never completed.
+Only a confirmed fence permits foreground deletion of the CR with UID and
+resource-version preconditions. Kubernetes collects its Pod, the Pod-owned
+bootstrap Secret and the CR-owned control policy; namespace-wide network fences
+remain. Ambiguous failures leave the journal for retry. Concurrent claims,
+replaced resources and changed reservations do not authorize deletion. If the
+CR is already absent, the controller must reconcile any remaining gateway
+preparation independently from its durable inventory.
+
+These operations support dedicated and shared supervisors in shared and operator
+workspace modes. Managed namespaces need bootstrap journaling in the gateway
+namespace to preserve their create-only Secret permissions. Inventory includes preparing, retiring
+and deleting resources; a released gate does not mean that the supervisor has
+authenticated the runtime or that it is claimable.
+
+Template-driven pooling is enabled by default through `warm_pool.enabled`.
+The gateway supplies stored template targets through the existing in-process
+supervision coordinator. Only templates with `startup.ready_within` and positive
+`startup.max_burst` request spares; the target is capped by `warm_pool.max_size`.
+No new runtime or gateway RPC is used for template discovery. Each pool is keyed
+by the immutable template ID, and creates can claim only their original template.
+The complete admitted workload spec supplies image, environment, resources, and
+driver configuration. Normal Pod admission and shape checks still apply.
+
+The reconciler records a bounded plan in `warm_pool_journal` before creating
+resources. CAS writes coordinate replicas; `warm_pool.revision` fences older
+operator configurations. The fingerprint covers canonical driver settings,
+workload shape and public verification keys. Deleted templates leave journal
+tombstones that drain old inventory, even after restart. Recreating a name gets a
+new pool. Disabling pooling drains spares without affecting claimed sandboxes.
+Recovery requires namespace-scoped Secret `get`, granted by default in shared
+mode and by the operator workspace chart's `gateway.warmPoolSecretReads` setting.
+Kubernetes cannot constrain generated names by prefix; no list/watch is added.
+
+Each pool attempts at most four operations concurrently per pass, retries
+unfinished operations no sooner than 30 seconds later, and bounds an operation
+to 25 seconds. Pending intents, retiring resources and untracked physical CRs
+all consume the pool maximum. Retirement resumes after restart, and late CR
+writes for completed intents are collected as untracked resources. A missing
+or replaced observed CR is retired rather than recreated. Failed inventory or
+journal reads stop the pass. Template deletion and the disable switch both drain unused capacity.
+
+Shared readiness comes from the current supervisor owner's `PREPARED` report with an
+authenticated parked connection. Dedicated spares have a separate supervisor Pod:
+its startup probe succeeds only after TLS authenticates the runtime. Normal Pod
+readiness stays false until the claim has started supervision. The driver checks
+the original supervisor Pod UID, successful startup, and absence of restarts.
+If the parked runtime disconnects before a claim, its dedicated supervisor exits.
+Terminated or restarted supervisors cannot make that spare eligible again; the
+pool retires and replaces it. The startup verdict therefore lasts only as long as
+the process holding the authenticated connection.
+The loop counts reserved or released runtimes as pending until then. A missing
+owner, preparation timeout, maximum age or
+60 seconds without a ready observation retires the spare. Template workloads pass through the normal driver conversion and admission.
+Managed namespace pooling remains unsupported.
+
+A dedicated supervisor starts with public runtime coordinates and gateway TLS trust
+mounted before the scheduling gate opens. It holds the authenticated runtime
+connection and opens the private `RegisterSupervisor` server stream using its
+Pod-bound ServiceAccount token. The gateway keeps the stream pending until the
+durable claim commits, revalidates the physical binding and current credential
+epoch, and returns the canonical `SandboxInstanceRegistration`. The response
+contains the logical identity, credentials, process configuration, and proxy CA.
+No claim-time volume update is needed. The supervisor validates the response
+against its preparation and adopts the existing route. Transport loss or bootstrap
+credential expiry reconnects registration; an unclaimed runtime does not. Gateway
+TLS is required. Shared supervisors keep their existing assignment stream.
+There is no registration RPC, runtime-to-gateway exchange, or claim retry on the
+runtime connection. Both Pods and the TLS pin survive the claim. Stop removes the
+original physical supervisor; restart provisions a fresh generation.
+
+Sandbox creation from a template selects a ready spare from that template's
+current pool revision in the same workspace. Its rendered Pod shape and child environment must match exactly;
+non-matching requests and empty pools use cold creation. The driver writes a
+Pod-owned immutable claim Secret, then CAS-labels the physical CR with the logical
+Sandbox ID before gateway activation. Retirement and competing claims use the
+same CR fence. After this point an error never falls back to a second runtime.
+Activation atomically replaces the proposed cold identity with the physical
+binding and canonical credentials. The canonical registration is persisted under
+the logical Sandbox's generation Secret name for existing recovery. Reconciliation
+finishes interrupted claims. Restart uses a new generation and updates the Pod's
+pair label; the original physical CR name remains unchanged.
+
+The focused gateway-backed claim E2E uses fresh branch images and checks physical
+Pod reuse, refill, exec, and stop/start with a new identity:
+
+```shell
+OPENSHELL_E2E_KUBE_TLS=1 \
+OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-supervisor.yaml:deploy/helm/openshell/ci/values-tls-port-forward.yaml:e2e/kubernetes/values-warm-pool.yaml \
+e2e/with-kube-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml \
+  --features e2e-kubernetes-shared-supervisor --test kubernetes_warm_pool -- --ignored --nocapture
+```
+
+The Kubernetes API integration test exercises real Sandbox CRD defaulting, Pod
+creation, Secret ownership, gate release, journal recovery and conditional
+retirement. It uses an
+in-memory capacity authority; it does not test runtime activation. From the
+repository root, run it in an ephemeral cluster with:
+
+```shell
+OPENSHELL_E2E_KUBE_TLS=1 \
+OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-supervisor.yaml:deploy/helm/openshell/ci/values-tls-port-forward.yaml \
+e2e/with-kube-gateway.sh cargo test -p openshell-driver-kubernetes --lib \
+  warm_runtime_resources_on_kubernetes -- --ignored --nocapture
+```
+
 ### Shared supervisor topology
 
 With `supervisor_topology = "gateway"`, each new runtime

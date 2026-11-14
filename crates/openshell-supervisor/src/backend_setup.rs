@@ -258,6 +258,7 @@ impl BackendSetup for OpenShellBackendSetup {
 pub struct RoutedBackendSetup {
     router: Arc<openshell_sandbox_backend::runtime_routed::RuntimeRouter>,
     route: String,
+    prepared_route: Option<Arc<openshell_sandbox_backend::runtime_routed::RouteRegistration>>,
 }
 
 impl RoutedBackendSetup {
@@ -266,7 +267,21 @@ impl RoutedBackendSetup {
         router: Arc<openshell_sandbox_backend::runtime_routed::RuntimeRouter>,
         route: String,
     ) -> Self {
-        Self { router, route }
+        Self {
+            router,
+            route,
+            prepared_route: None,
+        }
+    }
+
+    /// Adopt a prepared route without closing its authenticated spare streams.
+    #[must_use]
+    pub fn with_prepared_route(
+        mut self,
+        registration: Arc<openshell_sandbox_backend::runtime_routed::RouteRegistration>,
+    ) -> Self {
+        self.prepared_route = Some(registration);
+        self
     }
 }
 
@@ -284,7 +299,15 @@ impl BackendSetup for RoutedBackendSetup {
                 BackendError::Descriptor(format!("decode sandbox runtime descriptor: {error}"))
             })?;
         openshell_sandbox_backend::validate_runtime_coordinates(&descriptor)?;
-        let registration = self.router.register(&self.route, &descriptor.tls)?;
+        let registration = match &self.prepared_route {
+            Some(registration) if registration.handle() == self.route => registration.clone(),
+            Some(_) => {
+                return Err(BackendError::Descriptor(
+                    "prepared registration uses a different route".into(),
+                ));
+            }
+            None => self.router.register(&self.route, &descriptor.tls)?,
+        };
         let transport =
             openshell_sandbox_backend::BoundaryTransport::routed(&descriptor, registration)?;
         let identity = LaunchIdentity {

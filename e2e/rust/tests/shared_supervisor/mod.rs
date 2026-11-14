@@ -125,7 +125,7 @@ pub async fn kubectl_json(args: &[&str]) -> serde_json::Value {
 }
 
 /// The Sandbox resource of an `OpenShell` sandbox.
-async fn sandbox_resource(name: &str) -> serde_json::Value {
+pub async fn sandbox_resource(name: &str) -> serde_json::Value {
     let list = kubectl_json(&[
         "get",
         "sandboxes.agents.x-k8s.io",

@@ -263,6 +263,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
+            warm_pool: openshell_driver_kubernetes::config::WarmPoolSettings::default(),
             supervisor_topology: None,
             shared_supervisor: None,
             allow_driver_config: args.admission_config_json.allow_driver_config,

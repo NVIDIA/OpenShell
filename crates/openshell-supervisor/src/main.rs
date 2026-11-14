@@ -25,6 +25,7 @@ mod shared;
 #[cfg(test)]
 #[path = "../../../tests/support/environment.rs"]
 mod test_environment;
+mod warm;
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
@@ -65,6 +66,14 @@ struct Args {
     /// Supervisor deployment mode.
     #[arg(long, value_enum, default_value_t)]
     mode: SupervisorMode,
+
+    /// Startup probe port opened after the warm runtime authenticates.
+    #[arg(long, requires = "warm_prepared_file")]
+    warm_health_port: Option<u16>,
+
+    /// Public coordinates for a dedicated warm runtime.
+    #[arg(long)]
+    warm_prepared_file: Option<PathBuf>,
 
     /// Gateway endpoint for the shared supervisor's outbound connection.
     #[arg(long, required_if_eq("mode", "shared"))]
@@ -469,14 +478,19 @@ fn main() -> Result<()> {
         openshell_otel::current_ocsf_trace_correlation,
     );
 
-    let args = Args::parse();
+    let mut args = Args::parse();
     if args.mode == SupervisorMode::Shared {
+        if args.warm_prepared_file.is_some() {
+            return Err(miette::miette!(
+                "warm preparation files require a dedicated supervisor"
+            ));
+        }
         return shared::run(args);
     }
     if args.gateway_endpoint.is_some()
         || args.address.is_some()
         || args.token_file.is_some()
-        || args.runtime_listen.is_some()
+        || (args.runtime_listen.is_some() && args.warm_prepared_file.is_none())
         || args.session_root.is_some()
     {
         return Err(miette::miette!(
@@ -486,13 +500,60 @@ fn main() -> Result<()> {
     validate_role_arguments(&args)?;
     arm_parent_liveness(args.parent_liveness_stdin)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .into_diagnostic()?;
+    let warm_claim = if args.warm_prepared_file.is_some() {
+        if args.mode != SupervisorMode::Dedicated || args.role != SupervisorRole::IsolationBackend {
+            return Err(miette::miette!(
+                "warm preparation requires a dedicated isolation supervisor"
+            ));
+        }
+        Some(runtime.block_on(warm::wait_for_claim(&mut args))?)
+    } else {
+        None
+    };
+    // Claim-specific CA material arrives on the authenticated stream. Keep it
+    // in a private process-owned directory for the existing proxy TLS reader.
+    let warm_tls_dir = warm_claim
+        .as_ref()
+        .map(|_| tempfile::tempdir_in("/run/openshell"))
+        .transpose()
+        .into_diagnostic()?;
+    let warm_proxy_tls = warm_claim
+        .as_ref()
+        .zip(warm_tls_dir.as_ref())
+        .map(|((_, registration), dir)| warm::proxy_tls(&registration.proxy_ca, dir.path()))
+        .transpose()?;
+    let warm_image = warm_claim
+        .as_ref()
+        .map(|(_, registration)| registration.container_image.clone());
+    let warm_trace_context = warm_claim
+        .as_ref()
+        .and_then(|(_, registration)| registration.trace_context.clone());
+    let warm_process = warm_claim
+        .as_ref()
+        .map(|(_, registration)| registration.main_process_spec.clone());
     let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
         let admitted_backend =
             std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND)
                 .map_err(|_| miette::miette!("driver must supply an admitted isolation backend"))?;
-        let setup = backend_setup(&args, &admitted_backend)?;
-        let descriptor = backend_descriptor(&args, &admitted_backend)?;
-        let auth = auth_bundle(&args)?;
+        let (setup, descriptor, auth) = match warm_claim {
+            Some((setup, registration)) => (
+                setup,
+                registration
+                    .runtime_descriptor
+                    .backend_descriptor()
+                    .map_err(|e| miette::miette!(e.to_string()))?,
+                registration.auth,
+            ),
+            None => (
+                backend_setup(&args, &admitted_backend)?,
+                backend_descriptor(&args, &admitted_backend)?,
+                auth_bundle(&args)?,
+            ),
+        };
         // Log push and supervision share these credentials, so either one's
         // renewal keeps the other's gateway token current.
         let credentials = openshell_core::grpc_client::GatewayCredentials::from_auth_bundle(&auth)?;
@@ -503,10 +564,6 @@ fn main() -> Result<()> {
 
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .into_diagnostic()?;
     let export_config = |endpoint| openshell_otel::OtlpExportConfig {
         endpoint,
         service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
@@ -597,7 +654,9 @@ fn main() -> Result<()> {
         let workdir = args.workdir.clone();
         let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
             (args.command, args.interactive, false)
-        } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
+        } else if let Some(json) = warm_process
+            .or_else(|| std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC).ok())
+        {
             let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
                 .map_err(|error| miette::miette!("{error}"))?;
             (
@@ -652,8 +711,10 @@ fn main() -> Result<()> {
                     await_main_process_attachment,
                     sandbox_id: args.sandbox_id,
                     sandbox: args.sandbox,
-                    container_image: std::env::var(openshell_core::sandbox_env::CONTAINER_IMAGE)
-                        .unwrap_or_default(),
+                    container_image: warm_image.unwrap_or_else(|| {
+                        std::env::var(openshell_core::sandbox_env::CONTAINER_IMAGE)
+                            .unwrap_or_default()
+                    }),
                     container_image_uid: std::env::var(
                         openshell_core::sandbox_env::CONTAINER_IMAGE_UID,
                     )
@@ -674,13 +735,16 @@ fn main() -> Result<()> {
                     attach_request_timeout: std::time::Duration::from_secs(
                         args.attach_request_timeout_seconds,
                     ),
-                    trace_context: openshell_supervisor::trace_context_from_environment(),
+                    trace_context: warm_trace_context
+                        .or_else(openshell_supervisor::trace_context_from_environment),
                     provider_workload_api_socket: std::env::var_os(
                         openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
                     )
                     .filter(|path| !path.is_empty())
                     .map(PathBuf::from),
-                    proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
+                    proxy_tls: warm_proxy_tls.unwrap_or_else(
+                        openshell_supervisor_network::run::ProxyTlsFiles::from_environment,
+                    ),
                     takeover: None,
                     supervisor_recovery_timeout_secs: None,
                     otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),

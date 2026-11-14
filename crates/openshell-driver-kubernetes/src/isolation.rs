@@ -340,6 +340,7 @@ pub fn shared_runtime_control_policy(
 }
 
 /// The supervisor bound into a generation's resource claims.
+#[derive(Clone)]
 pub enum KubernetesSupervisorClaim {
     /// UID of the generation's dedicated supervisor Pod.
     Pod(String),
@@ -417,6 +418,34 @@ pub struct KubernetesSandboxRuntimeBoundaryProvisioning {
 }
 
 impl KubernetesSandboxRuntimeBoundarySpec {
+    /// Provision an unassigned runtime for a reserved supervisor route.
+    /// The logical Sandbox identity and its credentials arrive only at claim time.
+    pub fn provision_prepared(
+        self,
+    ) -> Result<KubernetesSandboxRuntimeBoundaryProvisioning, BackendError> {
+        if !self.boundary_id.is_empty()
+            || !matches!(
+                (&self.supervisor, &self.control_path),
+                (
+                    KubernetesSupervisorClaim::SandboxInstance(claim),
+                    KubernetesControlPath::RuntimeInitiatedShared { route, .. }
+                ) if claim == route
+            ) && !matches!(
+                (&self.supervisor, &self.control_path),
+                (KubernetesSupervisorClaim::Pod(uid), KubernetesControlPath::RuntimeInitiatedShared { .. }) if !uid.is_empty()
+            )
+        {
+            return Err(BackendError::Descriptor(
+                "prepared Kubernetes runtime requires an unassigned supervisor route".into(),
+            ));
+        }
+        let provisioned = self.provision()?;
+        openshell_sandbox_backend::validate_prepared_runtime_coordinates(
+            &provisioned.runtime_descriptor,
+        )?;
+        Ok(provisioned)
+    }
+
     /// Produce both sides of the common protocol from one observed Kubernetes
     /// resource set so a stale or recreated object cannot be attached.
     pub fn provision(self) -> Result<KubernetesSandboxRuntimeBoundaryProvisioning, BackendError> {

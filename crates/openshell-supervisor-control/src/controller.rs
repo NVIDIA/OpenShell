@@ -69,8 +69,10 @@ const SEND_TIMEOUT: Duration = crate::pool_timing::GATEWAY_SILENCE_TIMEOUT;
 const OUTBOUND_QUEUE: usize = 16;
 /// How long a withdrawn pool instance stays on its owner's stop list.
 const POOL_STOP_RETENTION: Duration = Duration::from_mins(2);
-/// Most sandbox instances one shared supervisor host runs. The gateway
-/// refuses to assign beyond it, and the host refuses snapshots beyond it, so
+/// Most slots one shared supervisor host provides, shared between active
+/// sandbox instances and prepared runtime reservations.
+///
+/// The gateway refuses to assign beyond it, and the host refuses snapshots beyond it, so
 /// a sandbox is never created that its host could not accept.
 pub const MAX_ASSIGNED_INSTANCES: usize = 256;
 /// Most sandbox instances a supervisor pool runs across its members; the
@@ -497,6 +499,16 @@ impl SupervisorHostController {
     /// create before anything runs.
     pub fn assign(&self, assignment: SandboxInstanceAssignment) -> Result<(), AssignmentError> {
         let mut desired = lock(&self.inner.desired);
+        // A delayed preparation response must not undo a claim already seen
+        // on this replica. The host also rejects an active-to-prepared change.
+        if assignment.prepared
+            && desired
+                .assignments
+                .get(&assignment.route)
+                .is_some_and(|current| !current.assignment.prepared)
+        {
+            return Ok(());
+        }
         if !desired.assignments.contains_key(&assignment.route)
             && desired.assignments.len() >= MAX_POOL_INSTANCES
         {
@@ -803,6 +815,11 @@ impl SupervisorHostController {
         if !session.terms.get(route).is_some_and(|(auth_epoch, since)| {
             *auth_epoch == owner.auth_epoch && status.applied_revision >= *since
         }) {
+            return ObservedInstance::Pending;
+        }
+        // Preparation and activation share an ownership term; an older
+        // PREPARED report cannot render a verdict on the new claim.
+        if assigned_revision.is_some_and(|revision| revision > status.applied_revision) {
             return ObservedInstance::Pending;
         }
         if let Some(instance) = status
@@ -1329,6 +1346,7 @@ mod tests {
             generation: "gen".to_string(),
             launch_material: material.to_vec(),
             takeover: None,
+            prepared: false,
         }
     }
 
@@ -1663,6 +1681,53 @@ mod tests {
                 .begin_session(identity(), &member_hello("m-2", "p2", 1))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn activation_waits_for_its_revision_even_with_the_same_owner_term() {
+        let supervision = crate::SharedSupervision::new();
+        let controller = supervision.controller();
+        let (session, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1", 1))
+            .unwrap();
+        let mut view = loaded_view(
+            vec![member_view("m1", "p1")],
+            [("rt-a", owner("m1", "p1", 1))],
+        );
+        let prepared = view.assignments.get_mut("rt-a").unwrap();
+        prepared.prepared = true;
+        prepared.sandbox_id.clear();
+        let prepared = prepared.clone();
+        controller.update_pool(view, tokio::time::Instant::now());
+        let revision = controller.snapshot(session).unwrap().revision;
+        controller.record_sent(session, revision);
+        let mut report = status(revision, &["rt-a"]);
+        report.instances[0].sandbox_id.clear();
+        report.instances[0].phase = crate::proto::SandboxInstancePhase::Prepared as i32;
+        report.instances[0].ready = false;
+        controller.record_status(session, report.clone()).unwrap();
+        assert!(!supervision.prepared_connection_ready("rt-a"));
+        report.instances[0].ready = true;
+        controller.record_status(session, report).unwrap();
+        assert!(supervision.prepared_connection_ready("rt-a"));
+        assert_ne!(
+            supervision.supervision("rt-a", ""),
+            crate::InstanceSupervision::Available
+        );
+        controller.assign(assignment("rt-a", b"claimed")).unwrap();
+        assert_eq!(controller.observed("rt-a"), ObservedInstance::Pending);
+        assert!(!supervision.prepared_connection_ready("rt-a"));
+        controller.assign(prepared).unwrap();
+        assert!(!controller.assignment("rt-a").unwrap().prepared);
+        let revision = controller.snapshot(session).unwrap().revision;
+        controller.record_sent(session, revision);
+        controller
+            .record_status(session, status(revision, &["rt-a"]))
+            .unwrap();
+        assert!(
+            matches!(controller.observed("rt-a"), ObservedInstance::Reported(status) if status.ready)
+        );
+        assert!(!supervision.prepared_connection_ready("rt-a"));
     }
 
     #[test]

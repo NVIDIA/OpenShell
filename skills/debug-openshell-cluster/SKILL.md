@@ -1325,6 +1325,39 @@ and does not redistribute existing owners; check individual Pod memory as well
 as the average. See the published High Availability guide for configuration
 and enabling or disabling autoscaling on an existing release.
 
+Template-driven warm pooling is enabled by default in shared/operator Kubernetes
+workspaces with TLS and JWT signing. No spares exist until a template requests both
+`--ready-within` and positive `--max-burst`. Inspect the template's startup tuning,
+its workload shape, and `warm_pool.enabled` before investigating missing capacity.
+Check gateway logs for `warm template inventory unavailable`,
+`warm pool reconciliation deferred`, and `warm pool operation will be reconciled`.
+Configuration or verification-key changes require increasing `warm_pool.revision`;
+inconsistent revisions across replicas stop stale writers. Pending and deleting
+spares consume `warm_pool.max_size` per template. Missing supervisor capacity keeps
+runtime Pods gated. Recovery requires namespace Secret `get`, granted by default
+in shared mode and by `gateway.warmPoolSecretReads` in operator workspaces.
+A `Forbidden` reading a bootstrap or claim Secret leaves recovery pending.
+A running warm Pod is not proof of an authenticated parked connection.
+Delete a template to drain its unclaimed pool, or set `warm_pool.enabled=false`
+on all replicas to drain all pools. Retain Secret reads until drain completes.
+Creates with `--template` claim only that template's ready spares; unmatched
+requests use cold creation. `warm runtime ready for
+claim` records the first authenticated readiness observation. A claimed sandbox
+keeps its `warm-` physical resource name. `warm claim completion remains pending`
+indicates that recovery is retrying the recorded claim; inspect the reported API
+or supervisor error before deleting anything. Dedicated warm pairs have a separate
+supervisor Pod: its startup probe on port 5502 records TLS authentication, while
+normal readiness on port 5501 remains false until claim. Check the original Pod UID,
+container running/startup state and restart count, gateway TLS trust, and the
+pending `RegisterSupervisor` stream when a dedicated claim stalls. Claims arrive
+over that stream; they do not require a new Secret projection. The bootstrap ServiceAccount token authenticates
+the original physical Pod, and the gateway rechecks the binding before delivery.
+Before claim, losing an authenticated runtime connection terminates the dedicated
+supervisor. A terminated or restarted supervisor makes its spare ineligible;
+the pool replaces it after the disconnected-spare retirement interval.
+The physical supervisor name remains unchanged until restart. See the published
+gateway configuration reference for supported modes and fields.
+
 With `supervisor_topology = "gateway"`, the gateway always coordinates the
 shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
 `supervisor.replicas` members (default 1, which has no failover). The chart

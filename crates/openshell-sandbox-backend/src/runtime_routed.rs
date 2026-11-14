@@ -26,15 +26,15 @@
 //! complete the pinned TLS handshake, and every request still carries the
 //! bearer token.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openshell_isolation_interface::contract::{BackendError, BoundaryDuplexStream};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::boundary_protocol::SandboxTlsClientConfig;
 
@@ -223,8 +223,23 @@ struct Route {
     /// Distinguishes a re-registered handle from the registration it replaced.
     id: u64,
     tls: SandboxTlsClientConfig,
-    spares: mpsc::Sender<BoundaryDuplexStream>,
+    spares: std::sync::Weak<SpareQueue>,
+    parked: Arc<AtomicUsize>,
     pending: Arc<Semaphore>,
+}
+
+impl Drop for Route {
+    fn drop(&mut self) {
+        if let Some(spares) = self.spares.upgrade() {
+            let mut queue = spares
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            spares.closed.store(true, Ordering::Release);
+            queue.clear();
+            spares.changed.notify_one();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -243,7 +258,8 @@ enum Destination {
     /// names as `own`.
     Local {
         tls: SandboxTlsClientConfig,
-        spares: mpsc::Sender<BoundaryDuplexStream>,
+        spares: std::sync::Weak<SpareQueue>,
+        parked: Arc<AtomicUsize>,
         pending: Arc<Semaphore>,
         own: Option<SocketAddr>,
     },
@@ -269,6 +285,7 @@ impl Routes {
             (Some(route), _) => Destination::Local {
                 tls: route.tls.clone(),
                 spares: route.spares.clone(),
+                parked: route.parked.clone(),
                 pending: route.pending.clone(),
                 own: self.own_address,
             },
@@ -342,13 +359,15 @@ impl RuntimeRouter {
         }
         routes.next_id += 1;
         let id = routes.next_id;
-        let (sender, spares) = mpsc::channel(MAX_QUEUED_CONNECTIONS);
+        let spares = Arc::new(SpareQueue::default());
+        let parked = Arc::new(AtomicUsize::new(0));
         routes.by_handle.insert(
             handle.to_string(),
             Route {
                 id,
                 tls: tls.clone(),
-                spares: sender,
+                spares: Arc::downgrade(&spares),
+                parked: parked.clone(),
                 pending: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES_PER_ROUTE)),
             },
         );
@@ -357,7 +376,8 @@ impl RuntimeRouter {
             handle: handle.to_string(),
             id,
             tls: tls.clone(),
-            spares: tokio::sync::Mutex::new(spares),
+            spares,
+            parked,
             connected: AtomicBool::new(false),
         }))
     }
@@ -388,7 +408,8 @@ pub struct RouteRegistration {
     handle: String,
     id: u64,
     tls: SandboxTlsClientConfig,
-    spares: tokio::sync::Mutex<mpsc::Receiver<BoundaryDuplexStream>>,
+    spares: Arc<SpareQueue>,
+    parked: Arc<AtomicUsize>,
     /// The runtime has delivered at least one authenticated connection.
     connected: AtomicBool,
 }
@@ -419,15 +440,37 @@ impl RouteRegistration {
                 "runtime route is registered for a different sandbox instance".to_string(),
             ));
         }
-        let stream = self
-            .spares
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or_else(|| BackendError::Unavailable("runtime router stopped".to_string()))?;
-        self.connected.store(true, Ordering::Relaxed);
-        Ok(stream)
+        let _accept = self.spares.accept.lock().await;
+        loop {
+            let notified = self.spares.changed.notified();
+            if self.spares.closed.load(Ordering::Acquire) {
+                return Err(BackendError::Unavailable("runtime router stopped".into()));
+            }
+            let parked = self
+                .spares
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            let Some(parked) = parked else {
+                notified.await;
+                continue;
+            };
+            let (send, receive) = oneshot::channel();
+            if parked.claim.send(send).is_ok()
+                && let Ok(stream) = receive.await
+            {
+                self.connected.store(true, Ordering::Relaxed);
+                return Ok(stream);
+            }
+        }
+    }
+
+    /// A TLS-authenticated connection is parked and has not reported EOF or an
+    /// I/O error. This is an observation, not a guarantee against later failure.
+    #[must_use]
+    pub fn has_parked_connection(&self) -> bool {
+        self.parked.load(Ordering::Acquire) != 0
     }
 
     /// Whether the runtime has connected for this sandbox instance before.
@@ -520,13 +563,14 @@ async fn route_connection(
     // The handle only selects which pinned identity to expect, or which pool
     // member to name.
     let destination = lock(routes).destination(&handle, negotiated);
-    let (tls, spares, route_pending, own) = match destination {
+    let (tls, spares, parked, route_pending, own) = match destination {
         Destination::Local {
             tls,
             spares,
+            parked,
             pending,
             own,
-        } => (tls, spares, pending, own),
+        } => (tls, spares, parked, pending, own),
         Destination::Owner(owner) if negotiated => {
             send_reply(&mut stream, deadline, &redirect_reply(owner)?).await?;
             tracing::debug!(%owner, "redirected routed runtime connection to the route's owner");
@@ -561,9 +605,123 @@ async fn route_connection(
     .map_err(|error| error.to_string())?;
     // A sender captured before its registration was removed or replaced has
     // no receiver, so the stream cannot reach another generation.
-    spares
-        .try_send(authenticated)
-        .map_err(|_| "runtime route has no free spare slot".to_string())
+    let spares = spares.upgrade().ok_or("runtime route was removed")?;
+    let mut queue = spares
+        .queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if spares.closed.load(Ordering::Acquire) {
+        return Err("runtime route was removed".into());
+    }
+    queue.retain(|connection| !connection.claim.is_closed());
+    if queue.len() >= MAX_QUEUED_CONNECTIONS {
+        return Err("runtime route has no free spare slot".into());
+    }
+    let (claim, receive) = oneshot::channel();
+    let guard = ParkedGuard::new(parked);
+    queue.push_back(ParkedConnection { claim });
+    drop(queue);
+    spares.changed.notify_one();
+    tokio::spawn(monitor_parked(authenticated, receive, guard));
+    Ok(())
+}
+
+#[derive(Default)]
+struct SpareQueue {
+    queue: Mutex<VecDeque<ParkedConnection>>,
+    changed: Notify,
+    accept: tokio::sync::Mutex<()>,
+    closed: AtomicBool,
+}
+
+struct ParkedConnection {
+    claim: oneshot::Sender<oneshot::Sender<BoundaryDuplexStream>>,
+}
+
+struct ParkedGuard(Arc<AtomicUsize>);
+
+impl ParkedGuard {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::Release);
+        Self(count)
+    }
+}
+
+impl Drop for ParkedGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Read TLS while idle so disconnects invalidate readiness. Preserve any HTTP/2
+/// settings bytes for the eventual consumer, with a strict per-connection bound.
+async fn monitor_parked(
+    mut stream: BoundaryDuplexStream,
+    mut claim: oneshot::Receiver<oneshot::Sender<BoundaryDuplexStream>>,
+    _guard: ParkedGuard,
+) {
+    let mut prefix = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        tokio::select! {
+            receiver = &mut claim => {
+                if let Ok(receiver) = receiver {
+                    let _ = receiver.send(Box::new(PrefixedStream {
+                        prefix: std::io::Cursor::new(prefix), stream,
+                    }));
+                }
+                return;
+            }
+            result = stream.read(&mut buffer) => {
+                match result {
+                    Ok(0) | Err(_) => return,
+                    Ok(count) if prefix.len() + count <= 64 * 1024 => prefix.extend_from_slice(&buffer[..count]),
+                    Ok(_) => return,
+                }
+            }
+        }
+    }
+}
+
+struct PrefixedStream {
+    prefix: std::io::Cursor<Vec<u8>>,
+    stream: BoundaryDuplexStream,
+}
+
+impl AsyncRead for PrefixedStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.prefix.position() < self.prefix.get_ref().len() as u64 {
+            std::pin::Pin::new(&mut self.prefix).poll_read(cx, buf)
+        } else {
+            std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+}
+
+impl AsyncWrite for PrefixedStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }
 
 /// Write one version 2 reply within the handshake deadline.
@@ -644,6 +802,91 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(300), registration.accept(tls))
             .await
             .is_ok_and(|accepted| accepted.is_ok())
+    }
+
+    async fn wait_parked(registration: &RouteRegistration, expected: bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while registration.has_parked_connection() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn parked_readiness_tracks_tls_disconnects_and_preserves_early_bytes() {
+        let router = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let identity =
+            generate_sandbox_tls_material(openshell_core::SandboxSessionId::new()).unwrap();
+        let tls = client_tls(&identity);
+        let route = new_route_handle();
+        let registration = router.register(&route, &tls).unwrap();
+        assert!(!registration.has_parked_connection());
+        // Dead spares must not fill the queue and prevent a reconnect.
+        for _ in 0..4 {
+            let mut runtime = runtime_dial(router.local_addr(), &route, &identity)
+                .await
+                .unwrap();
+            wait_parked(&registration, true).await;
+            runtime.shutdown().await.unwrap();
+            drop(runtime);
+            wait_parked(&registration, false).await;
+        }
+        let mut runtime = runtime_dial(router.local_addr(), &route, &identity)
+            .await
+            .unwrap();
+        runtime.write_all(b"early HTTP/2 settings").await.unwrap();
+        wait_parked(&registration, true).await;
+        let mut accepted = registration.accept(&tls).await.unwrap();
+        let mut bytes = [0; 21];
+        accepted.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"early HTTP/2 settings");
+        wait_parked(&registration, false).await;
+        accepted.write_all(b"claim").await.unwrap();
+        let mut bytes = [0; 5];
+        runtime.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"claim");
+    }
+
+    #[tokio::test]
+    async fn idle_input_is_bounded_and_route_withdrawal_closes_parked_streams() {
+        let router = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let identity =
+            generate_sandbox_tls_material(openshell_core::SandboxSessionId::new()).unwrap();
+        let route = new_route_handle();
+        let registration = router.register(&route, &client_tls(&identity)).unwrap();
+        let mut runtime = runtime_dial(router.local_addr(), &route, &identity)
+            .await
+            .unwrap();
+        wait_parked(&registration, true).await;
+        let _ = runtime.write_all(&vec![1; 65 * 1024]).await;
+        wait_parked(&registration, false).await;
+        let mut runtime = runtime_dial(router.local_addr(), &route, &identity)
+            .await
+            .unwrap();
+        wait_parked(&registration, true).await;
+        drop(registration);
+        let result = tokio::time::timeout(Duration::from_secs(3), runtime.read(&mut [0; 1]))
+            .await
+            .unwrap();
+        assert!(result.is_err() || result.unwrap() == 0);
+    }
+
+    #[tokio::test]
+    async fn router_shutdown_wakes_an_accept_waiter() {
+        let router = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let identity =
+            generate_sandbox_tls_material(openshell_core::SandboxSessionId::new()).unwrap();
+        let tls = client_tls(&identity);
+        let registration = router.register(&new_route_handle(), &tls).unwrap();
+        drop(router);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), registration.accept(&tls))
+                .await
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[tokio::test]

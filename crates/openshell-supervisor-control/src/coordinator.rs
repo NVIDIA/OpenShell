@@ -26,7 +26,9 @@ use tokio::sync::watch;
 use crate::controller::{
     AssignmentError, ObservedInstance, SupervisorCredential, SupervisorHostController,
 };
-use crate::registration::{RegistrationError, SandboxInstanceRegistration};
+use crate::registration::{
+    PreparedRuntimeRegistration, RegistrationError, SandboxInstanceRegistration,
+};
 use crate::status::SandboxInstanceStatusReport;
 
 /// Interval at which [`SharedSupervision::wait_for_ready`] re-reads the
@@ -84,6 +86,98 @@ impl std::fmt::Debug for PlacementRequest {
 /// Outcome of one durable pool operation.
 pub type PlacementFuture<T = ()> = Pin<Box<dyn Future<Output = Result<T, String>> + Send>>;
 
+/// A physical runtime's capacity reservation, before a Sandbox exists.
+#[derive(Clone, Debug)]
+pub struct PreparationRequest {
+    pub registration: PreparedRuntimeRegistration,
+    /// Workspace whose warm pool owns this runtime and its stored material.
+    pub workspace: String,
+    /// Epoch installed in the runtime bootstrap; activation must use it.
+    pub auth_epoch: openshell_core::jwt::CredentialEpoch,
+}
+
+/// Exact durable preparation observed by a warm-pool controller. Pass this
+/// unchanged to release; a route alone cannot fence a concurrent claim or a
+/// replacement reservation using the same route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparationRevision {
+    pub workspace: String,
+    pub route: String,
+    pub reservation_id: String,
+    pub resource_version: u64,
+}
+
+/// Permanently retire a single-use physical identity, even before admission.
+///
+/// The durable fence prevents a delayed prepare from reviving
+/// it. It cannot retire an active Sandbox or a different physical generation.
+#[derive(Clone, Debug)]
+pub struct PreparationRetirement {
+    pub workspace: String,
+    pub route: String,
+    pub generation: openshell_core::sandbox_generation::SandboxGenerationId,
+    pub auth_epoch: openshell_core::jwt::CredentialEpoch,
+}
+
+/// The process whose capacity is reserved for an unassigned runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedRuntimeOwner {
+    pub member_id: String,
+    pub process_id: String,
+    /// The original process is live and not leaving at the time of the read.
+    /// This is a hint for reconciliation, not a guarantee that activation succeeds.
+    pub available: bool,
+}
+
+/// Durable warm-runtime inventory with public runtime coordinates.
+///
+/// Contains no private keys or Sandbox session tokens. A listing is not a transaction:
+/// always release conditionally before deleting an unclaimed physical runtime.
+#[derive(Clone, Debug)]
+pub struct PreparedRuntime {
+    pub revision: PreparationRevision,
+    pub registration: PreparedRuntimeRegistration,
+    pub auth_epoch: openshell_core::jwt::CredentialEpoch,
+    pub published_at_ms: i64,
+    /// Missing when no matching reservation owner remains.
+    pub owner: Option<PreparedRuntimeOwner>,
+}
+
+/// Outcome of conditionally withdrawing an unclaimed runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationRelease {
+    /// A durable retirement fence prevents further preparation or activation.
+    /// Host stop and capacity reclamation follow through pool reconciliation.
+    Released,
+    /// No reservation or assignment currently uses the route. This alone is
+    /// not permission to delete resources: an in-flight prepare may publish.
+    Absent,
+    /// The route was claimed, replaced, or otherwise changed. Leave its
+    /// physical resources alone and reconcile again from current records.
+    Changed,
+}
+
+/// Claim a prepared physical generation for the Sandbox's current launch.
+/// The expected identity fences concurrent restart, stop, and takeover.
+#[derive(Clone)]
+pub struct ActivationRequest {
+    pub assignment: crate::proto::SandboxInstanceAssignment,
+    pub expected_generation: openshell_core::sandbox_generation::SandboxGenerationId,
+    pub expected_auth_epoch: openshell_core::jwt::CredentialEpoch,
+}
+
+impl std::fmt::Debug for ActivationRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActivationRequest")
+            .field("route", &self.assignment.route)
+            .field("sandbox_id", &self.assignment.sandbox_id)
+            .field("expected_generation", &self.expected_generation)
+            .field("expected_auth_epoch", &self.expected_auth_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The gateway's durable records of a supervisor pool's instances.
 ///
 /// Installed by the gateway before instances launch, they make the pool's
@@ -91,11 +185,63 @@ pub type PlacementFuture<T = ()> = Pin<Box<dyn Future<Output = Result<T, String>
 /// replica, whichever replica launched an instance or runs the compute
 /// driver's watch.
 pub trait InstancePlacement: Send + Sync + std::fmt::Debug {
+    /// Public trust for preparing runtimes without minting tenant credentials.
+    fn warm_runtime_trust(&self) -> PlacementFuture<crate::warm_pool::WarmRuntimeTrust> {
+        Box::pin(async { Err("warm-pool trust is not supported".into()) })
+    }
+
+    /// Complete template inventory, including deleted pools that must drain.
+    /// A sandbox filter returns only its original template's active pool.
+    fn warm_pool_targets(
+        &self,
+        _sandbox_id: Option<String>,
+    ) -> PlacementFuture<Vec<crate::warm_pool::WarmPoolTarget>> {
+        Box::pin(async { Err("template warm pools are not supported".into()) })
+    }
+
+    /// Read the creation journal; a failed read must never look like an empty pool.
+    fn warm_pool_state(
+        &self,
+        _workspace: String,
+        _pool_id: String,
+    ) -> PlacementFuture<Option<crate::warm_pool::WarmPoolSnapshot>> {
+        Box::pin(async { Err("warm-pool journals are not supported".into()) })
+    }
+
+    /// Compare-and-swap a bounded creation journal. False means another writer won.
+    fn update_warm_pool(&self, _update: crate::warm_pool::WarmPoolUpdate) -> PlacementFuture<bool> {
+        Box::pin(async { Err("warm-pool journals are not supported".into()) })
+    }
     /// Durably record a new instance, launch material included, and the
     /// owner of its launch term: the pool member the consistent-hash ring
     /// prefers among live members with room, and its current process. Fails
     /// when no live member has room.
     fn place_launch(&self, request: PlacementRequest) -> PlacementFuture;
+
+    /// Reserve a live member and one capacity slot before releasing a warm runtime.
+    fn prepare_runtime(&self, request: PreparationRequest) -> PlacementFuture;
+
+    /// List admitted, unclaimed runtimes in exactly one workspace.
+    fn prepared_runtimes(&self, workspace: String) -> PlacementFuture<Vec<PreparedRuntime>>;
+
+    /// Remove only the observed preparation, never a concurrent claim.
+    fn release_preparation(
+        &self,
+        revision: PreparationRevision,
+    ) -> PlacementFuture<PreparationRelease>;
+
+    /// Fence a physical runtime permanently, including before admission. A
+    /// successful retry returns `Released`; this operation never returns `Absent`.
+    fn retire_preparation(
+        &self,
+        retirement: PreparationRetirement,
+    ) -> PlacementFuture<PreparationRelease>;
+
+    /// Atomically claim an existing preparation on its reserved member and slot.
+    fn activate_runtime(
+        &self,
+        request: ActivationRequest,
+    ) -> PlacementFuture<crate::proto::SandboxInstanceAssignment>;
 
     /// Routes of the durably recorded instances, with when each was
     /// published (Unix milliseconds).
@@ -166,6 +312,55 @@ pub struct SharedSupervision {
 }
 
 impl SharedSupervision {
+    pub async fn warm_pool_targets(
+        &self,
+        sandbox_id: Option<String>,
+    ) -> Result<Vec<crate::warm_pool::WarmPoolTarget>, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .warm_pool_targets(sandbox_id)
+            .await
+    }
+
+    pub async fn warm_runtime_trust(&self) -> Result<crate::warm_pool::WarmRuntimeTrust, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .warm_runtime_trust()
+            .await
+    }
+
+    pub async fn warm_pool_state(
+        &self,
+        workspace: &str,
+        pool_id: &str,
+    ) -> Result<Option<crate::warm_pool::WarmPoolSnapshot>, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .warm_pool_state(workspace.into(), pool_id.into())
+            .await
+    }
+
+    pub async fn update_warm_pool(
+        &self,
+        update: crate::warm_pool::WarmPoolUpdate,
+    ) -> Result<bool, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .update_warm_pool(update)
+            .await
+    }
+
+    /// Readiness of a spare, separate from readiness of a supervising Sandbox.
+    /// Only the current owner's acknowledged report is accepted.
+    #[must_use]
+    pub fn prepared_connection_ready(&self, route: &str) -> bool {
+        matches!(self.controller.observed(route), ObservedInstance::Reported(status)
+            if status.sandbox_id.is_empty() && status.phase == crate::proto::SandboxInstancePhase::Prepared as i32 && status.ready)
+    }
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -194,6 +389,94 @@ impl SharedSupervision {
     #[must_use]
     pub fn credentials(&self) -> watch::Receiver<Option<SupervisorCredential>> {
         self.controller.credential()
+    }
+
+    /// Reserve capacity durably before the driver releases the runtime to connect.
+    /// The gateway's reservation is authoritative across gateway restarts.
+    pub async fn prepare(&self, request: PreparationRequest) -> Result<(), String> {
+        request.registration.validate().map_err(|e| e.to_string())?;
+        let placement = self
+            .controller
+            .placement()
+            .ok_or("the supervisor pool is not ready to prepare runtimes")?;
+        // Publish through durable pool reconciliation. A local assign after this
+        // await could revive a route that another replica already retired.
+        placement.prepare_runtime(request).await
+    }
+
+    /// Recover a workspace's admitted warm runtimes independently of assigned
+    /// Sandbox recovery. Failed reads return an error, never an empty inventory.
+    pub async fn prepared_runtimes(&self, workspace: &str) -> Result<Vec<PreparedRuntime>, String> {
+        self.controller
+            .placement()
+            .ok_or("the supervisor pool is not ready to list prepared runtimes")?
+            .prepared_runtimes(workspace.to_string())
+            .await
+    }
+
+    /// Retire exactly the preparation observed in an inventory read. A changed
+    /// result is not permission to delete its Pod or other physical resources.
+    /// Delete infrastructure by its immutable UID after a successful release;
+    /// never reuse a retired route for a new physical runtime.
+    ///
+    /// This does not enqueue an unconditional route withdrawal: that could
+    /// remove a concurrent claim on a later reconciliation pass.
+    pub async fn release_preparation(
+        &self,
+        revision: PreparationRevision,
+    ) -> Result<PreparationRelease, String> {
+        self.controller
+            .placement()
+            .ok_or("the supervisor pool is not ready to release prepared runtimes")?
+            .release_preparation(revision)
+            .await
+    }
+
+    /// Fence a single-use physical identity before deleting its infrastructure.
+    /// The driver must first journal retirement so its own retries cannot launch
+    /// or claim the resource. Only `Released` authorizes UID-fenced deletion.
+    pub async fn retire_preparation(
+        &self,
+        retirement: PreparationRetirement,
+    ) -> Result<PreparationRelease, String> {
+        self.controller
+            .placement()
+            .ok_or("the supervisor pool is not ready to retire prepared runtimes")?
+            .retire_preparation(retirement)
+            .await
+    }
+
+    /// Claim a prepared runtime. Persist the driver's claim before calling this;
+    /// on an ambiguous failure, retry the same registration. The gateway fences
+    /// competing claims and retains the reservation's owner and capacity charge.
+    /// `expected_generation` and `expected_auth_epoch` name the Sandbox launch
+    /// being replaced; the registration names the prepared physical generation.
+    /// The gateway replaces its session tokens and returns the committed launch
+    /// material. Persist that result for driver recovery, never the input tokens.
+    pub async fn activate(
+        &self,
+        registration: &SandboxInstanceRegistration,
+        expected_generation: openshell_core::sandbox_generation::SandboxGenerationId,
+        expected_auth_epoch: openshell_core::jwt::CredentialEpoch,
+    ) -> Result<SandboxInstanceRegistration, String> {
+        registration.validate().map_err(|e| e.to_string())?;
+        let assignment = registration.to_assignment().map_err(|e| e.to_string())?;
+        let placement = self
+            .controller
+            .placement()
+            .ok_or("the supervisor pool is not ready to activate runtimes")?;
+        let assignment = placement
+            .activate_runtime(ActivationRequest {
+                assignment: assignment.clone(),
+                expected_generation,
+                expected_auth_epoch,
+            })
+            .await?;
+        let activated = SandboxInstanceRegistration::from_assignment(&assignment)
+            .map_err(|error| error.to_string())?;
+        // Publication belongs to durable pool reconciliation. An assign after
+        // this await could revive a claim another replica already stopped.
+        Ok(activated)
     }
 
     /// Register a generation's sandbox instance: validate `registration`,
@@ -447,6 +730,33 @@ mod tests {
     }
 
     impl InstancePlacement for std::sync::Arc<RecordedPool> {
+        fn retire_preparation(
+            &self,
+            _: PreparationRetirement,
+        ) -> PlacementFuture<PreparationRelease> {
+            Box::pin(async { Err("retirement not installed in this fixture".into()) })
+        }
+        fn prepare_runtime(&self, _request: PreparationRequest) -> PlacementFuture {
+            Box::pin(async { Err("preparation not installed in this fixture".into()) })
+        }
+
+        fn prepared_runtimes(&self, _workspace: String) -> PlacementFuture<Vec<PreparedRuntime>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn release_preparation(
+            &self,
+            _revision: PreparationRevision,
+        ) -> PlacementFuture<PreparationRelease> {
+            Box::pin(async { Err("preparation release not installed in this fixture".into()) })
+        }
+
+        fn activate_runtime(
+            &self,
+            _request: ActivationRequest,
+        ) -> PlacementFuture<SandboxInstanceAssignment> {
+            Box::pin(async { Err("activation not installed in this fixture".into()) })
+        }
         fn place_launch(&self, request: PlacementRequest) -> PlacementFuture {
             self.created_at_ms
                 .lock()
@@ -476,6 +786,43 @@ mod tests {
                 "record"
             },
         }
+    }
+
+    #[tokio::test]
+    async fn preparation_inventory_and_release_require_installed_placement() {
+        let supervision = SharedSupervision::new();
+        assert!(supervision.prepared_runtimes("default").await.is_err());
+        assert!(
+            supervision
+                .release_preparation(PreparationRevision {
+                    workspace: "default".into(),
+                    route: "rt-prepared-0123456789".into(),
+                    reservation_id: "reservation".into(),
+                    resource_version: 1,
+                })
+                .await
+                .is_err()
+        );
+        assert!(supervision.controller().pool_withdrawals().is_empty());
+    }
+
+    #[test]
+    fn activation_debug_omits_launch_credentials() {
+        let request = ActivationRequest {
+            assignment: SandboxInstanceAssignment {
+                route: "rt-1234567890".into(),
+                launch_material: b"private-credential-material".to_vec(),
+                ..Default::default()
+            },
+            expected_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                "generation",
+            )
+            .unwrap(),
+            expected_auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("private-credential-material"));
+        assert!(!debug.contains("launch_material"));
     }
 
     #[tokio::test]

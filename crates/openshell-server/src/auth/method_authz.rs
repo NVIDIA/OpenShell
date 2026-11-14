@@ -29,6 +29,8 @@ pub enum AuthMode {
     /// Only the gateway's shared supervisor, authenticated by its
     /// gateway-minted supervisor token, may call this method.
     Supervisor,
+    /// Driver-authenticated physical supervisor awaiting a warm claim.
+    SupervisorRegistration,
 }
 
 /// Coarse role mapping. Maps to the configured `admin_role` /
@@ -98,7 +100,8 @@ pub fn is_user_callable(method: &str) -> bool {
             | AuthMode::Unauthenticated
             | AuthMode::Peer
             | AuthMode::Operator
-            | AuthMode::Supervisor,
+            | AuthMode::Supervisor
+            | AuthMode::SupervisorRegistration,
         ) => false,
         Some(AuthMode::Bearer | AuthMode::Dual) | None => true,
     }

@@ -108,7 +108,12 @@ served on the gateway listener but authorized only for the gateway-minted
 supervisor token (`auth_mode: "supervisor"`). It is not imported by
 `openshell.proto`, so SDK generation and
 gRPC reflection exclude it; the server's schema inventory test classifies it
-explicitly. `SandboxInstanceAssignment.launch_material` carries the existing
+explicitly. `RegisterSupervisor` on the same private service is the deferred dedicated warm
+supervisor exchange. It accepts only a driver-authenticated physical supervisor
+(`auth_mode: "supervisor_registration"`), keeps the response stream pending until
+a claim commits, and returns its canonical launch material once. This bootstrap
+identity is separate from both sandbox credentials and shared-host tokens.
+`SandboxInstanceAssignment.launch_material` carries the existing
 JSON sandbox instance registration of `openshell-supervisor-control` and is
 marked secret.
 
