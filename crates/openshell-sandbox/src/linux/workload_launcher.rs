@@ -92,7 +92,16 @@ pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
                 }
             }
             while let Ok(job) = jobs_rx.recv() {
-                job();
+                // Contain a job panic the way the network broker contains a
+                // handler panic. The launcher thread owns the inherited
+                // listener filter, and its state past a mid-job panic is not
+                // known-good, so stop accepting work: the health flag turns
+                // false and every later spawn fails fast instead of hanging
+                // on a launcher that reports healthy.
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+                    tracing::error!("workload launcher job panicked: {}", panic_message(&*panic));
+                    break;
+                }
             }
             thread_alive.store(false, Ordering::Release);
         })
@@ -113,11 +122,22 @@ pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
     ))
 }
 
+/// Render a caught panic payload for a log message.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&'static str>().copied())
+        .unwrap_or("non-string panic payload")
+        .to_string()
+}
+
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod tests {
     use std::mem::size_of;
     use std::os::fd::AsRawFd as _;
+    use std::process::Command;
 
     use super::*;
 
@@ -127,7 +147,7 @@ mod tests {
         let executable = std::env::current_exe().expect("test executable");
         let mut child = launcher
             .execute(move || {
-                let mut command = std::process::Command::new(executable);
+                let mut command = Command::new(executable);
                 command
                     .arg("--exact")
                     .arg("linux::workload_launcher::tests::inherited_listener_child")
@@ -171,6 +191,79 @@ mod tests {
         assert!(child.wait().expect("wait child").success());
         assert!(launcher.is_alive());
         assert!(listener.as_raw_fd() >= 0);
+    }
+
+    #[test]
+    fn panicking_job_marks_the_launcher_unhealthy() {
+        const HELPER_ENV: &str = "OPENSHELL_LAUNCHER_PANIC_TEST_HELPER";
+        if std::env::var_os(HELPER_ENV).is_none() {
+            // The panic hook's backtrace symbolization opens files on the
+            // launcher thread, whose user-notify filter traps opens. Nothing
+            // services that listener here, so run with backtraces off; the
+            // parent environment must not leak RUST_BACKTRACE=1 into the
+            // child.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "linux::workload_launcher::tests::panicking_job_marks_the_launcher_unhealthy",
+                    "--nocapture",
+                ])
+                .env(HELPER_ENV, "1")
+                .env("RUST_BACKTRACE", "0")
+                .output()
+                .expect("start isolated launcher panic test");
+            assert!(
+                output.status.success(),
+                "launcher panic test failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let (launcher, _listener) = start().expect("start launcher");
+        assert!(launcher.is_alive());
+
+        let failure = launcher.execute(|| panic!("launcher job failed"));
+        assert!(
+            failure.is_err(),
+            "a panicking job must fail its caller, not hang it"
+        );
+
+        // The health flag flips when the launcher thread leaves its job loop,
+        // after the caller has already observed the failure.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while launcher.is_alive() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the launcher never reported the job panic"
+            );
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let failure = launcher
+            .execute(|| ())
+            .expect_err("the launcher must refuse work after a job panic");
+        assert_eq!(failure.kind(), io::ErrorKind::BrokenPipe);
+        assert!(
+            failure.to_string().contains("not running"),
+            "unexpected refusal error: {failure}"
+        );
+    }
+
+    #[test]
+    fn panic_message_renders_every_payload_shape() {
+        #[derive(Debug)]
+        struct CustomPayload;
+
+        // A job that panics through a format argument carries a String payload.
+        let formatted = "job failed after 3 attempts".to_string();
+        assert_eq!(panic_message(&formatted), "job failed after 3 attempts");
+
+        // `panic!` with a literal carries a &'static str payload.
+        assert_eq!(panic_message(&"literal panic"), "literal panic");
+
+        // Any other payload type falls back to the placeholder.
+        assert_eq!(panic_message(&CustomPayload), "non-string panic payload");
     }
 
     #[test]
