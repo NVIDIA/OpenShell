@@ -3075,6 +3075,11 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
             &policy_credential_bindings,
         )?;
     }
+    let environment_overrides = super::provider::non_secret_provider_environment_overrides(
+        provider_profile_catalog,
+        provider_records,
+        sandbox,
+    );
     let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
         provider_profile_catalog,
         provider_records,
@@ -3082,6 +3087,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
         policy
             .as_ref()
             .filter(|_| matches!(policy_source, PolicySource::Global)),
+        &environment_overrides,
     )?;
 
     let service_routes = super::service::configured_app_routes(state, sandbox).await?;
@@ -3381,6 +3387,7 @@ fn compute_provider_env_revision_from_records(
         records,
         &HashMap::new(),
         None,
+        &BTreeMap::new(),
     )
 }
 
@@ -3389,6 +3396,7 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
     records: &[super::provider::ProviderEnvironmentRecord],
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
     global_policy: Option<&ProtoSandboxPolicy>,
+    environment_overrides: &BTreeMap<String, String>,
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
     hasher.update(b"openshell-provider-env-revision-v4");
@@ -3430,6 +3438,18 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
         // a provider refetch even when the attached provider records are unchanged.
         hasher.update(b"global-token-grant-authority");
         hasher.update(deterministic_policy_hash(policy).as_bytes());
+    }
+
+    if !environment_overrides.is_empty() {
+        // Hash the same effective values that the environment snapshot installs.
+        // Length prefixes preserve boundaries, including explicitly empty values.
+        hasher.update(b"caller-non-secret-environment");
+        for (key, value) in environment_overrides {
+            hasher.update((key.len() as u64).to_le_bytes());
+            hasher.update(key.as_bytes());
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
     }
 
     let digest = hasher.finalize();
@@ -3898,6 +3918,7 @@ pub async fn build_provider_environment_snapshot(
 /// is resolved.
 struct ProviderEnvironmentTarget<'a> {
     spec: &'a openshell_core::proto::SandboxSpec,
+    environment_overrides: BTreeMap<String, String>,
     effective_policy: ProtoSandboxPolicy,
     policy_source: PolicySource,
     policy_credential_bindings: HashMap<String, Vec<StaticCredentialEndpointBinding>>,
@@ -3929,14 +3950,21 @@ fn provider_environment_target(
         &effective_policy,
         &policy_credential_bindings,
     )?;
+    let environment_overrides = super::provider::non_secret_provider_environment_overrides(
+        provider_profile_catalog,
+        provider_records,
+        sandbox,
+    );
     let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
         provider_profile_catalog,
         provider_records,
         &policy_credential_bindings,
         matches!(policy_source, PolicySource::Global).then_some(&effective_policy),
+        &environment_overrides,
     )?;
     Ok(ProviderEnvironmentTarget {
         spec,
+        environment_overrides,
         effective_policy,
         policy_source,
         policy_credential_bindings,
@@ -3955,6 +3983,7 @@ pub async fn build_provider_environment_snapshot_from_inputs(
     let sandbox_id = inputs.sandbox.object_id().to_string();
     let ProviderEnvironmentTarget {
         spec,
+        environment_overrides,
         effective_policy,
         policy_source,
         policy_credential_bindings,
@@ -3992,6 +4021,12 @@ pub async fn build_provider_environment_snapshot_from_inputs(
             credential.token_grant_owners.clone_from(&owners);
         }
     }
+    // Retain effective non-secret values for both process environments and
+    // supervisor consumers such as metadata. Credential keys are excluded
+    // from overrides and keep their binding and placeholder precedence.
+    provider_environment
+        .environment
+        .extend(environment_overrides);
 
     let mut readiness_reason = provider_environment.readiness_reason;
 
@@ -12907,6 +12942,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             })
             .await
@@ -13014,6 +13050,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             })
             .await
@@ -13073,6 +13110,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             })
             .await
@@ -14565,6 +14603,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             }
         }
@@ -14844,6 +14883,222 @@ mod tests {
                 .files
                 .get("/run/openshell/providers/work-config/client.toml"),
             Some(&"endpoint = 'https://config.example'".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_environment_wins_over_non_secret_profile_defaults_only() {
+        let state = test_server_state().await;
+        let mut profile = openshell_providers::example_profiles::load("github");
+        profile.id = "declared-env".to_string();
+        profile
+            .environment
+            .config
+            .insert("CUSTOM_PROJECT".to_string(), "project".to_string());
+        profile
+            .environment
+            .config
+            .insert("CUSTOM_MISSING".to_string(), "missing".to_string());
+        profile
+            .environment
+            .fixed
+            .insert("CUSTOM_MODE".to_string(), "native".to_string());
+        profile
+            .environment
+            .fixed
+            .insert("CUSTOM_UNSET".to_string(), "default".to_string());
+        state
+            .store
+            .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                profile.to_proto(),
+            ))
+            .await
+            .unwrap();
+
+        let mut provider = test_provider("work-env", "declared-env");
+        provider
+            .config
+            .insert("project".to_string(), "profile-project".to_string());
+        state.store.put_message(&provider).await.unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-caller-env",
+            "caller-env",
+            ProtoSandboxPolicy::default(),
+            vec!["work-env".to_string()],
+        );
+        let spec = sandbox.spec.as_mut().unwrap();
+        spec.environment
+            .insert("CUSTOM_PROJECT".to_string(), "caller-project".to_string());
+        spec.environment
+            .insert("GITHUB_TOKEN".to_string(), "caller-token".to_string());
+        spec.environment
+            .insert("CUSTOM_MISSING".to_string(), " caller value ".to_string());
+        spec.environment
+            .insert("UNRELATED".to_string(), "caller-only".to_string());
+        let template = spec.template.get_or_insert_with(Default::default);
+        template.environment = HashMap::from([
+            ("CUSTOM_PROJECT".to_string(), "template-project".to_string()),
+            ("CUSTOM_MODE".to_string(), String::new()),
+        ]);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let snapshot = load_sandbox_provider_environment(&state, &sandbox, true, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .environment
+                .get("CUSTOM_PROJECT")
+                .map(String::as_str),
+            Some("caller-project")
+        );
+        assert_eq!(
+            snapshot.environment.get("CUSTOM_MODE").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            snapshot
+                .environment
+                .get("CUSTOM_MISSING")
+                .map(String::as_str),
+            Some(" caller value ")
+        );
+        assert!(!snapshot.environment.contains_key("UNRELATED"));
+        assert_eq!(
+            snapshot.environment.get("CUSTOM_UNSET").map(String::as_str),
+            Some("default")
+        );
+        assert_eq!(
+            snapshot.environment.get("GITHUB_TOKEN").map(String::as_str),
+            Some("ghp-test")
+        );
+        assert!(
+            snapshot
+                .static_credential_bindings
+                .contains_key("GITHUB_TOKEN")
+        );
+        assert_eq!(
+            snapshot.non_secret_environment_keys,
+            [
+                "CUSTOM_MISSING",
+                "CUSTOM_MODE",
+                "CUSTOM_PROJECT",
+                "CUSTOM_UNSET"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_environment_revision_tracks_effective_non_secret_values() {
+        let state = test_server_state().await;
+        let mut provider = test_provider("work-gcp", "google-cloud");
+        provider.credentials.clear();
+        state.store.put_message(&provider).await.unwrap();
+        let sandbox = test_sandbox(
+            "sb-caller-revision",
+            "caller-revision",
+            ProtoSandboxPolicy::default(),
+            vec!["work-gcp".to_string()],
+        );
+        let mut inputs = load_sandbox_config_inputs(&state, sandbox).await.unwrap();
+        let mut revisions = Vec::new();
+        for (spec_value, template_value, unrelated, expected) in [
+            (None, None, "one", None),
+            (
+                None,
+                Some("template-project"),
+                "one",
+                Some("template-project"),
+            ),
+            (
+                Some("caller-project"),
+                Some("template-project"),
+                "one",
+                Some("caller-project"),
+            ),
+            (
+                Some("caller-project"),
+                Some("shadowed-project"),
+                "two",
+                Some("caller-project"),
+            ),
+            (Some(""), Some("template-project"), "one", Some("")),
+        ] {
+            let spec = inputs.sandbox.spec.as_mut().unwrap();
+            spec.environment = HashMap::from([("UNRELATED".to_string(), unrelated.to_string())]);
+            if let Some(value) = spec_value {
+                spec.environment
+                    .insert("GCP_PROJECT_ID".to_string(), value.to_string());
+            }
+            spec.template
+                .get_or_insert_with(Default::default)
+                .environment = template_value
+                .map(|value| HashMap::from([("GCP_PROJECT_ID".to_string(), value.to_string())]))
+                .unwrap_or_default();
+            let config = build_sandbox_config_snapshot_from_inputs(&state, &inputs)
+                .await
+                .unwrap();
+            let snapshot =
+                build_provider_environment_snapshot_from_inputs(&state, &inputs, true, true)
+                    .await
+                    .unwrap();
+            assert_eq!(config.provider_env_revision, snapshot.provider_env_revision);
+            let value = snapshot
+                .values
+                .iter()
+                .find(|value| value.name == "GCP_PROJECT_ID");
+            assert_eq!(value.map(|value| value.value.as_str()), expected);
+            if let Some(value) = value {
+                assert_eq!(
+                    value.classification,
+                    ProviderEnvironmentValueClassification::NonSecret as i32
+                );
+            }
+            revisions.push(snapshot.provider_env_revision);
+        }
+        assert_ne!(revisions[0], revisions[1]);
+        assert_ne!(revisions[1], revisions[2]);
+        assert_eq!(revisions[2], revisions[3]);
+        assert_ne!(revisions[2], revisions[4]);
+        assert_ne!(revisions[0], revisions[4]);
+    }
+
+    #[tokio::test]
+    async fn caller_environment_does_not_reclassify_expired_credentials_as_non_secret() {
+        let state = test_server_state().await;
+        let mut provider = test_provider("work-gcp", "google-cloud");
+        provider.credentials.clear();
+        state.store.put_message(&provider).await.unwrap();
+        let mut legacy_provider = test_provider("legacy-project", "legacy-custom");
+        legacy_provider.credentials =
+            HashMap::from([("GCP_PROJECT_ID".to_string(), "expired-secret".to_string())]);
+        legacy_provider.credential_expiration_times.insert(
+            "GCP_PROJECT_ID".to_string(),
+            openshell_core::time::timestamp_from_millis(1).unwrap(),
+        );
+        state.store.put_message(&legacy_provider).await.unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-caller-expired",
+            "caller-expired",
+            ProtoSandboxPolicy::default(),
+            vec!["work-gcp".to_string(), "legacy-project".to_string()],
+        );
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .environment
+            .insert("GCP_PROJECT_ID".to_string(), "caller-project".to_string());
+
+        let snapshot = load_sandbox_provider_environment(&state, &sandbox, true, true)
+            .await
+            .unwrap();
+        assert!(!snapshot.environment.contains_key("GCP_PROJECT_ID"));
+        assert!(
+            !snapshot
+                .non_secret_environment_keys
+                .iter()
+                .any(|key| key == "GCP_PROJECT_ID")
         );
     }
 
@@ -16024,6 +16279,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             }
         }
@@ -16363,6 +16619,7 @@ mod tests {
                         discovery: None,
                         source: String::new(),
                         scope: String::new(),
+                        ..Default::default()
                     }),
                 }],
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -20735,6 +20992,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             })
             .await

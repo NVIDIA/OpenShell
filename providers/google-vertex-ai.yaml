@@ -18,8 +18,8 @@
 # Credential scope:  a gateway-refreshed Google access token, as
 #                    GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN (service-account JWT)
 #                    or GOOGLE_VERTEX_AI_TOKEN (gcloud ADC), sent as a bearer
-#                    authorization header. GOOGLE_SERVICE_ACCOUNT_KEY is refresh
-#                    bootstrap material and is never injected into the sandbox.
+#                    authorization header. Supply service account private keys
+#                    through refresh configuration, not provider credentials.
 # Endpoint access:   the aiplatform.googleapis.com regional and replicated hosts,
 #                    read-write, L7 enforced.
 # Smoke test:        openshell sandbox create --provider <name> -- \
@@ -31,11 +31,17 @@ display_name: Google Vertex AI
 description: Google Vertex AI inference provider (Anthropic Claude, Gemini, and third-party models)
 category: inference
 inference_capable: true
+environment:
+  config:
+    GCP_PROJECT_ID: VERTEX_AI_PROJECT_ID
+    GOOGLE_CLOUD_PROJECT: VERTEX_AI_PROJECT_ID
+    ANTHROPIC_VERTEX_PROJECT_ID: VERTEX_AI_PROJECT_ID
+    CLOUD_ML_REGION: VERTEX_AI_REGION
+    GCP_LOCATION: VERTEX_AI_REGION
+    VERTEX_LOCATION: VERTEX_AI_REGION
+  fixed:
+    GOOSE_PROVIDER: gcp_vertex_ai
 credentials:
-  - name: service_account_key
-    description: Google service account JSON refresh bootstrap material; not injected into sandboxes
-    env_vars: [GOOGLE_SERVICE_ACCOUNT_KEY]
-    required: false
   - name: service_account_token
     description: Google Cloud access token refreshed from service account JWT material
     env_vars: [GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN, VERTEX_AI_SERVICE_ACCOUNT_TOKEN]
@@ -84,6 +90,12 @@ credentials:
           secret: true
 discovery:
   credentials: [service_account_token, gcloud_adc_token]
+  config_env_vars:
+    - VERTEX_AI_PROJECT_ID
+    - VERTEX_AI_REGION
+    - GOOGLE_VERTEX_AI_BASE_URL
+    - VERTEX_AI_BASE_URL
+    - VERTEX_AI_PUBLISHER
 endpoints:
   - host: "*-aiplatform.googleapis.com"
     port: 443

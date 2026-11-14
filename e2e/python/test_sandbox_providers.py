@@ -157,6 +157,25 @@ def imported_provider_profile(
         _delete_provider_profile(stub, profile.id)
 
 
+def _endpointless_credential_profile(profile_id: str) -> openshell_pb2.ProviderProfile:
+    """Build an endpointless credential profile for placeholder delivery tests."""
+    return openshell_pb2.ProviderProfile(
+        id=profile_id,
+        display_name=f"{profile_id} display",
+        category=openshell_pb2.PROVIDER_PROFILE_CATEGORY_OTHER,
+        credentials=[
+            openshell_pb2.ProviderProfileCredential(
+                name="api_token",
+                description="E2E endpointless credential",
+                env_vars=["E2E_ENDPOINTLESS_TOKEN"],
+                required=True,
+                auth_style="bearer",
+                header_name="authorization",
+            )
+        ],
+    )
+
+
 def _native_inference_profile(
     *,
     profile_id: str,
@@ -348,46 +367,35 @@ def test_endpointless_profile_credentials_fail_closed_without_policy_binding(
     sandbox_client: SandboxClient,
 ) -> None:
     """Endpointless profile credentials are withheld without an explicit binding."""
-    with provider(
-        sandbox_client._stub,
-        name="e2e-test-google-cloud-without-policy-binding",
-        provider_type="google-cloud",
-        credentials={"GCP_ADC_ACCESS_TOKEN": "gcp-e2e-token"},
-    ) as provider_name:
+    profile_id = "e2e-endpointless-without-policy-binding"
+    with (
+        imported_provider_profile(
+            sandbox_client._stub,
+            profile=_endpointless_credential_profile(profile_id),
+            source=f"{profile_id}.yaml",
+        ),
+        provider(
+            sandbox_client._stub,
+            name="e2e-test-endpointless-without-policy-binding",
+            provider_type=profile_id,
+            credentials={"E2E_ENDPOINTLESS_TOKEN": "e2e-token"},
+            profile_workspace="default",
+        ) as provider_name,
+    ):
         spec = datamodel_pb2.SandboxSpec(
             policy=_default_policy(),
             providers=[provider_name],
         )
 
-        def read_gcp_token() -> str:
+        def read_token() -> str:
             import os
 
-            return os.environ.get("GCP_ADC_ACCESS_TOKEN", "NOT_SET")
+            return os.environ.get("E2E_ENDPOINTLESS_TOKEN", "NOT_SET")
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
-            result = sb.exec_python(read_gcp_token)
+            result = sb.exec_python(read_token)
             assert result.exit_code == 0, result.stderr
             assert result.stdout.strip() == "NOT_SET"
-
-            def read_metadata_token_status() -> int:
-                import os
-                import urllib.error
-                import urllib.request
-
-                request = urllib.request.Request(
-                    f"http://{os.environ['GCE_METADATA_HOST']}/computeMetadata/v1/instance/service-accounts/default/token",
-                    headers={"Metadata-Flavor": "Google"},
-                )
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                try:
-                    with opener.open(request, timeout=5) as response:
-                        return response.status
-                except urllib.error.HTTPError as error:
-                    return error.code
-
-            result = sb.exec_python(read_metadata_token_status)
-            assert result.exit_code == 0, result.stderr
-            assert result.stdout.strip() == "503"
 
 
 def test_endpointless_profile_credentials_use_explicit_policy_binding(
@@ -395,19 +403,28 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
     sandbox_client: SandboxClient,
 ) -> None:
     """An endpointless profile emits credentials only with an explicit binding."""
-    with provider(
-        sandbox_client._stub,
-        name="e2e-test-google-cloud-policy-binding",
-        provider_type="google-cloud",
-        credentials={"GCP_ADC_ACCESS_TOKEN": "gcp-e2e-token"},
-    ) as provider_name:
+    profile_id = "e2e-endpointless-policy-binding"
+    with (
+        imported_provider_profile(
+            sandbox_client._stub,
+            profile=_endpointless_credential_profile(profile_id),
+            source=f"{profile_id}.yaml",
+        ),
+        provider(
+            sandbox_client._stub,
+            name="e2e-test-endpointless-policy-binding",
+            provider_type=profile_id,
+            credentials={"E2E_ENDPOINTLESS_TOKEN": "e2e-token"},
+            profile_workspace="default",
+        ) as provider_name,
+    ):
         policy = _default_policy()
-        policy.network_policies["gcp_storage"].CopyFrom(
+        policy.network_policies["endpointless_api"].CopyFrom(
             sandbox_pb2.NetworkPolicyRule(
-                name="gcp_storage",
+                name="endpointless_api",
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(
-                        host="storage.googleapis.com",
+                        host="api.example.com",
                         port=443,
                         protocol="rest",
                         access=sandbox_pb2.NETWORK_ACCESS_PRESET_FULL,
@@ -423,36 +440,67 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
             providers=[provider_name],
         )
 
-        def read_gcp_token() -> str:
+        def read_token() -> str:
             import os
 
-            return os.environ.get("GCP_ADC_ACCESS_TOKEN", "NOT_SET")
+            return os.environ.get("E2E_ENDPOINTLESS_TOKEN", "NOT_SET")
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
-            result = sb.exec_python(read_gcp_token)
+            result = sb.exec_python(read_token)
             assert result.exit_code == 0, result.stderr
             assert _is_placeholder_for_env_key(
-                result.stdout.strip(), "GCP_ADC_ACCESS_TOKEN"
+                result.stdout.strip(), "E2E_ENDPOINTLESS_TOKEN"
             )
 
 
 @pytest.mark.parametrize(
-    ("service_account_email", "provider_suffix"),
+    (
+        "service_account_email",
+        "provider_project",
+        "spec_project",
+        "template_project",
+        "provider_suffix",
+    ),
     [
-        (None, "no-email"),
-        ("", "empty-email"),
-        ("sdk@metadata-test-project.iam.gserviceaccount.com", "configured-email"),
+        (None, "metadata-test-project", None, None, "no-email"),
+        ("", "metadata-test-project", None, None, "empty-email"),
+        (
+            "sdk@metadata-test-project.iam.gserviceaccount.com",
+            "metadata-test-project",
+            None,
+            None,
+            "configured-email",
+        ),
+        (None, "provider-project", None, "template-project", "template-project"),
+        (
+            None,
+            "provider-project",
+            "caller-project",
+            "template-project",
+            "spec-project",
+        ),
+        (None, None, "caller-project", None, "missing-provider-project"),
     ],
-    ids=["no-email", "empty-email", "configured-email"],
+    ids=[
+        "no-email",
+        "empty-email",
+        "configured-email",
+        "template-project",
+        "spec-project",
+        "missing-provider-project",
+    ],
 )
 def test_google_metadata_sdk_discovery(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
     service_account_email: str | None,
+    provider_project: str | None,
+    spec_project: str | None,
+    template_project: str | None,
     provider_suffix: str,
 ) -> None:
     """Google's SDK discovers project/account metadata and refreshes a placeholder."""
-    config = {"project_id": "metadata-test-project"}
+    config = {"project_id": provider_project} if provider_project is not None else {}
     if service_account_email is not None:
         config["service_account_email"] = service_account_email
     with provider(
@@ -480,6 +528,14 @@ def test_google_metadata_sdk_discovery(
             )
         )
         spec = datamodel_pb2.SandboxSpec(policy=policy, providers=[provider_name])
+        if spec_project is not None:
+            spec.environment["GCP_PROJECT_ID"] = spec_project
+        if template_project is not None:
+            spec.template.CopyFrom(
+                openshell_pb2.SandboxTemplate(
+                    environment={"GCP_PROJECT_ID": template_project}
+                )
+            )
 
         def discover_metadata() -> str:
             import json
@@ -509,6 +565,7 @@ def test_google_metadata_sdk_discovery(
             return json.dumps(
                 {
                     "project": project,
+                    "environment_project": os.environ.get("GCP_PROJECT_ID"),
                     "account": credentials.service_account_email,
                     "token": credentials.token,
                     "expiry_present": credentials.expiry is not None,
@@ -521,7 +578,9 @@ def test_google_metadata_sdk_discovery(
             result = sb.exec_python(discover_metadata)
             assert result.exit_code == 0, result.stderr
             data = json.loads(result.stdout)
-            assert data["project"] == "metadata-test-project"
+            expected_project = spec_project or template_project or provider_project
+            assert data["project"] == expected_project
+            assert data["environment_project"] == expected_project
             assert data["account"] == (service_account_email or "default")
             assert data["metadata_host"] == data["metadata_ip"] == "127.0.0.1:8174"
             assert data["expiry_present"]

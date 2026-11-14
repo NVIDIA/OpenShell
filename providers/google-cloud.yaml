@@ -10,10 +10,10 @@
 # below, so it has to name the paths in *your* image.
 #
 # Client binaries:   none declared — this profile grants no egress.
-# Reference layout:  any image whose GCP SDKs honour the metadata server. The
-#                    sandbox reaches credentials through OpenShell's GCE metadata
-#                    emulator, so gcloud, google-cloud-* libraries and anything
-#                    else using Application Default Credentials work unmodified.
+# Runtime required:  a Linux sandbox using Docker, Podman, Kubernetes, or VM.
+#                    The supervisor provides the metadata service there;
+#                    Windows/MXC does not. Import and attachment do not check
+#                    runtime support, so verify it before using this profile.
 # Credential scope:  a gateway-refreshed GCP access token, as GCP_SA_ACCESS_TOKEN
 #                    (service-account JWT flow) or GCP_ADC_ACCESS_TOKEN (gcloud
 #                    ADC flow). Configure the refresh material with
@@ -31,6 +31,18 @@ display_name: Google Cloud (GCP APIs)
 description: Native GCP SDK credentials for sandboxes via metadata emulator
 category: other
 inference_capable: false
+
+environment:
+  config:
+    GCP_PROJECT_ID: project_id
+    GOOGLE_CLOUD_PROJECT: project_id
+    CLOUD_ML_REGION: region
+    GCP_LOCATION: region
+    GCP_SERVICE_ACCOUNT_EMAIL: service_account_email
+  fixed:
+    GCE_METADATA_HOST: "127.0.0.1:8174"
+    GCE_METADATA_IP: "127.0.0.1:8174"
+    METADATA_SERVER_DETECTION: assume-present
 
 credentials:
   # Service account JWT flow: gateway signs a JWT and exchanges it for an
