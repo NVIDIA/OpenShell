@@ -76,7 +76,6 @@ const MAX_DENIALS_LIMIT: usize = 100;
 /// most recent two so a request just past midnight still has yesterday's
 /// denials.
 const DENIAL_LOG_FILES_TO_SCAN: usize = 2;
-const LOG_DIR: &str = "/var/log";
 /// `/v1/denials` reads `openshell.YYYY-MM-DD.log`, not the OCSF `.jsonl` files,
 /// which are opt-in via `ocsf_json_enabled`.
 const SHORTHAND_LOG_PREFIX: &str = "openshell.";
@@ -100,7 +99,7 @@ pub enum DenialLogSource {
 
 impl Default for DenialLogSource {
     fn default() -> Self {
-        Self::ShorthandFiles(PathBuf::from(LOG_DIR))
+        Self::ShorthandFiles(PathBuf::from(openshell_core::sandbox_env::DEFAULT_LOG_DIR))
     }
 }
 
@@ -441,7 +440,7 @@ async fn recent_denials_response(
     // `[]` in both cases and cannot tell the difference. The shorthand log is
     // always-on (no setting gates it), so the only way `log_available=false`
     // happens in practice is if the supervisor has not flushed any events to
-    // disk yet, or `/var/log` is not writable in this image.
+    // disk yet, or the log directory is not writable.
     let log_available = matches!(
         collect_shorthand_log_files(&log_dir, 1),
         Ok(files) if !files.is_empty()
@@ -457,7 +456,7 @@ async fn recent_denials_response(
     });
     if !log_available {
         payload["note"] = serde_json::json!(
-            "no shorthand log file is present yet at /var/log/openshell.YYYY-MM-DD.log; the supervisor may not have emitted any events to disk yet"
+            "no shorthand log file is present yet; the supervisor may not have emitted any events to disk yet"
         );
     }
 
@@ -1813,7 +1812,7 @@ mod tests {
             payload["note"]
                 .as_str()
                 .unwrap()
-                .contains("/var/log/openshell.")
+                .contains("no shorthand log file")
         );
     }
 
