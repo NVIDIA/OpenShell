@@ -140,13 +140,17 @@ def select_reviewers(categories: dict[str, set[str]], labels: set[str]) -> set[s
         raise LabelRoutingError(
             "a ready PR must have exactly one area label; "
             f"found: {', '.join(areas) or 'none'}. "
-            "Edit the PR labels so only one area: label remains."
+            + (
+                "Add one area: label."
+                if not areas
+                else "Remove labels until exactly one area: label is applied."
+            )
         )
     unknown = relevant - categories.keys()
     if unknown:
         raise LabelRoutingError(
             f"unknown area/topic labels: {', '.join(sorted(unknown))}. "
-            "Define them in REVIEWERS.md or remove them from the PR."
+            "Remove them from the PR, or add them to REVIEWERS.md on main."
         )
     return set().union(*(categories[label] for label in relevant))
 

@@ -144,19 +144,23 @@ class PlanningTests(unittest.TestCase):
             routing.select_reviewers(CATEGORIES, {"area:runtime", "area:build"})
         message = str(caught.exception)
         self.assertIn("found: area:build, area:runtime", message)
-        self.assertIn("only one area: label remains", message)
+        self.assertIn("Remove labels until exactly one area: label", message)
 
     def test_missing_area_label_message(self):
         with self.assertRaises(routing.LabelRoutingError) as caught:
             routing.select_reviewers(CATEGORIES, {"topic:policy"})
-        self.assertIn("found: none", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("found: none", message)
+        self.assertIn("Add one area: label", message)
+        self.assertNotIn("remains", message)
 
     def test_unknown_label_message(self):
         with self.assertRaises(routing.LabelRoutingError) as caught:
             routing.select_reviewers(CATEGORIES, {"area:runtime", "topic:nope"})
         message = str(caught.exception)
         self.assertIn("topic:nope", message)
-        self.assertIn("REVIEWERS.md", message)
+        self.assertIn("Remove them from the PR", message)
+        self.assertIn("REVIEWERS.md on main", message)
 
     def test_area_count_is_checked_before_unknown_labels(self):
         with self.assertRaises(routing.LabelRoutingError) as caught:
