@@ -18,6 +18,13 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+Reconciliation skips snapshots for sandboxes with an active local lifecycle
+operation or a durably pending driver operation on another replica. It checks
+local lifecycle ownership before and after refreshing the driver observation,
+and resource versions fence intervening lifecycle changes. The lookup does not
+retain the lifecycle gate, so a concurrent deletion can still release driver
+resources. Busy sandboxes are retried on a later sweep.
+
 ## Shared supervisor pool
 
 The `SharedSupervision` the gateway hands a compute driver that asks for it
