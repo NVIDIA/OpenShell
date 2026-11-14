@@ -31,6 +31,31 @@ mount_initial_fs() {
     mount -t tmpfs tmpfs /tmp 2>/dev/null || true
     mount -t tmpfs tmpfs /run 2>/dev/null || true
     mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+    setup_fd_links /dev
+}
+
+setup_fd_links() {
+    local dev_dir="$1"
+    local name target
+    for name in fd stdin stdout stderr; do
+        case "$name" in
+            fd) target=/proc/self/fd ;;
+            stdin) target=/proc/self/fd/0 ;;
+            stdout) target=/proc/self/fd/1 ;;
+            stderr) target=/proc/self/fd/2 ;;
+        esac
+        if [[ -L "$dev_dir/$name" ]] && [[ "$(readlink "$dev_dir/$name")" == "$target" ]]; then
+            continue
+        fi
+        if [[ -e "$dev_dir/$name" || -L "$dev_dir/$name" ]]; then
+            if [[ ! "$dev_dir/$name" -ef "$target" ]]; then
+                printf 'guest init: %s must refer to %s\n' "$dev_dir/$name" "$target" >&2
+                return 1
+            fi
+        else
+            ln -s "$target" "$dev_dir/$name"
+        fi
+    done
 }
 
 bind_mount_into_newroot() {
