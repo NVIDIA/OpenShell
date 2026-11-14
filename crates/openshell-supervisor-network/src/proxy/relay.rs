@@ -362,6 +362,7 @@ fn emit_stale_relay_close(request: &L7EvalContext, guard: &PolicyGenerationGuard
 mod tests {
     use super::super::{EgressIntent, EndpointDecision, ProcessIdentityEvidence};
     use super::*;
+    use rustls::pki_types::pem::PemObject as _;
 
     const POLICY_REGO: &str = include_str!("../../data/sandbox-policy.rego");
     const EMPTY_POLICY_DATA: &str = "network_policies: {}\n";
@@ -475,7 +476,9 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca = SandboxCa::generate().unwrap();
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
+        for cert in
+            rustls::pki_types::CertificateDer::pem_reader_iter(&mut ca.cert_pem().as_bytes())
+        {
             roots.add(cert.unwrap()).unwrap();
         }
         let config = Arc::new(

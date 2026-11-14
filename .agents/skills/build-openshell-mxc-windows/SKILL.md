@@ -301,6 +301,13 @@ and build jobs use job-level `continue-on-error: true`; opt-in PR jobs report
 failures normally. Applying the label alone does not start a run: re-run all
 jobs in the current mirror push run, or push a new mirrored commit. The binaries are not uploaded or published.
 
+The separate `windows-packages.yml` signing-candidate workflow builds its own
+immutable workflow commit on native x64 and ARM64 runners, runs workspace tests,
+checks the TypeScript SDK, and regenerates a source SBOM before assembling and
+attesting candidate ZIPs. Downloaded archive hashes must bind external runtime
+validation. These unsigned candidates require final binary signing and retesting
+before release publication. See `packaging/windows/README.md`.
+
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
 ARM64 compiler and Spectre-mitigated libraries, lets ARM64 crypto crates select

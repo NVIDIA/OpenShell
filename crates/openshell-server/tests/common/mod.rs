@@ -9,6 +9,8 @@
 
 #![allow(dead_code)]
 
+use rustls::pki_types::pem::PemObject as _;
+
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
@@ -33,7 +35,7 @@ use openshell_server::{MultiplexedService, Store, TlsAcceptor, health_router};
 use rcgen::{CertificateParams, IsCa, KeyPair};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
-use rustls_pemfile::certs;
+
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -838,7 +840,7 @@ pub async fn test_health_store() -> Arc<Store> {
 pub fn build_tls_root(cert_pem: &[u8]) -> RootCertStore {
     let mut roots = RootCertStore::empty();
     let mut cursor = std::io::Cursor::new(cert_pem);
-    let parsed = certs(&mut cursor)
+    let parsed = rustls::pki_types::CertificateDer::pem_reader_iter(&mut cursor)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .expect("failed to parse cert pem");
     for cert in parsed {

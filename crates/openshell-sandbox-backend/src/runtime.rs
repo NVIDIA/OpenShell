@@ -4,6 +4,8 @@
 //! Host-side RFC 0012 backend for an already-provisioned remote boundary.
 
 #[cfg(test)]
+use rustls::pki_types::pem::PemObject as _;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -283,11 +285,12 @@ fn validate_client_tls(tls: &SandboxTlsClientConfig) -> Result<(), BackendError>
 
 fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfig, BackendError> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let certificates = rustls_pemfile::certs(&mut tls.trust_anchor_pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            BackendError::Descriptor(format!("parse boundary TLS CA certificate: {error}"))
-        })?;
+    let certificates =
+        rustls::pki_types::CertificateDer::pem_reader_iter(&mut tls.trust_anchor_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                BackendError::Descriptor(format!("parse boundary TLS CA certificate: {error}"))
+            })?;
     if certificates.is_empty() {
         return Err(BackendError::Descriptor(
             "boundary TLS CA certificate PEM contains no certificates".to_string(),
@@ -2771,12 +2774,18 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let material =
             generate_sandbox_tls_material(test_session_id()).expect("generate test material");
-        let certificates = rustls_pemfile::certs(&mut material.certificate_chain_pem.as_bytes())
-            .collect::<Result<Vec<_>, _>>()
-            .expect("parse server certificate");
-        let private_key = rustls_pemfile::private_key(&mut material.private_key_pem.as_bytes())
-            .expect("parse server private key")
-            .expect("server private key");
+        let certificates = rustls::pki_types::CertificateDer::pem_reader_iter(
+            &mut material.certificate_chain_pem.as_bytes(),
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse server certificate");
+        let private_key = rustls::pki_types::PrivateKeyDer::pem_reader_iter(
+            &mut material.private_key_pem.as_bytes(),
+        )
+        .next()
+        .transpose()
+        .expect("parse server private key")
+        .expect("server private key");
         let mut server_config =
             rustls::ServerConfig::builder_with_protocol_versions(protocol_versions)
                 .with_no_client_auth()
