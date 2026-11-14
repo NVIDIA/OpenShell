@@ -1,0 +1,188 @@
+{
+  "source": {
+    "repository": "NVIDIA/OpenShell",
+    "branch": "shailendra-nv/windows-security-backports",
+    "targetBranch": "windows",
+    "pullRequest": "https://github.com/NVIDIA/OpenShell/pull/5558",
+    "commit": "1c2521b7e839ffeb1ae0f37a77f5b9a700d3a536"
+  },
+  "workflowRun": "https://github.com/NVIDIA/OpenShell/actions/runs/43545453103",
+  "authenticode": "pending",
+  "finalSignedBytesValidated": false,
+  "githubCandidateAttestations": "verified-with-detached-bundle-and-workflow-identity",
+  "reportLocation": "separate-from-unchanged-attested-archives",
+  "architectures": {
+    "arm64": {
+      "archive": "OpenShell-Windows-0.1.8-arm64-unsigned-candidate.zip",
+      "archiveSha256": "f11b450beacaa384116048deca7bd465feb9d4b072c91abffb7ddad42794defc",
+      "nativeRunnerExecutableLaunchChecks": "passed",
+      "downloadedPackageChecks": {
+        "scriptSyntax": "passed",
+        "unsignedRejectedByDefault": "passed",
+        "hostProbe": "passed",
+        "tamperedContentRejected": "passed",
+        "hashesArchitectureAndLaunch": "passed"
+      },
+      "localExecutionMode": "native-arm64",
+      "nativeMxcRuntime": "passed",
+      "binaries": [
+        {
+          "status": "NotSigned",
+          "sha256": "8bf540e8ab0fc43462bd64ff85deb02b1c655bdac14f4f9c40187fedf9532e7c",
+          "file": "libz3.dll"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "0c597cb560a82309ca79eba8f4dd631382600ab5d01f5fc87f68a80c1144d7d5",
+          "file": "openshell-gateway.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "67af2fb4392f800f7a176f2bd916da1a8455747d9b4f8b4705e85168b6cc5a57",
+          "file": "openshell-supervisor.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "8ff2a3d5cc40b1cbb8cbbc9bbeb4f8e5a438def759677c2a1ff751119ed022ea",
+          "file": "openshell-windows-sandbox.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "6437dd7562a516bebaafd6a7cf52d191800e8f73407d84d488900b71df5e38ff",
+          "file": "openshell.exe"
+        }
+      ],
+      "mxcE2E": {
+        "passed": 7,
+        "failed": 0,
+        "skipped": 0,
+        "binaryHashesUnchanged": true
+      },
+      "examples": {
+        "gatewayStartAndInfo": "passed",
+        "initialization": "passed",
+        "typescriptHarness": "passed",
+        "powershellHarness": "passed",
+        "pythonHealth": "blocked-native-dependency-installation"
+      },
+      "pythonHealthNote": "No compatible stable grpcio wheel was available for the native Windows ARM64 Python 3.14.5 interpreter; Python health did not run.",
+      "injectedCaHttps": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "binaryHashesUnchanged": true
+      }
+    },
+    "x64": {
+      "archive": "OpenShell-Windows-0.1.8-x64-unsigned-candidate.zip",
+      "archiveSha256": "85afe1d94167e0c19b9421e2b7201645c7a926a8d154c9f4ae4c061a8f7fbd87",
+      "nativeRunnerExecutableLaunchChecks": "passed",
+      "downloadedPackageChecks": {
+        "scriptSyntax": "passed",
+        "nonNativeHostRejected": "passed",
+        "unsignedRejectedByDefault": "passed",
+        "tamperedContentRejected": "passed",
+        "hashesArchitectureAndLaunch": "passed"
+      },
+      "localExecutionMode": "x64-emulation-on-arm64",
+      "nativeMxcRuntime": "unqualified-not-tested",
+      "binaries": [
+        {
+          "status": "NotSigned",
+          "sha256": "f4ea9e799e13b64dc748415c5f7ec34fa0d885cb32e243ec991c973329bca1fb",
+          "file": "libz3.dll"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "e60f29658e41534a66c1ddf0ad9fbcbdece95ee86d5a277715100b2f63cfd49a",
+          "file": "openshell-gateway.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "ca94a6b2435f521bed21b841a5dd35d17f7e4c24098e0c19d3b64beeb7d71192",
+          "file": "openshell-supervisor.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "21e70fbe2b6134ac934ee71d8025525c09ea24b8633a547d4fc02d489b55c0ee",
+          "file": "openshell-windows-sandbox.exe"
+        },
+        {
+          "status": "NotSigned",
+          "sha256": "3b5b46cb706c726cae3014afc727007059a07cf78530f875124f7be24915e06b",
+          "file": "openshell.exe"
+        }
+      ]
+    }
+  },
+  "afterTesting": {
+    "testFixturesExcluded": true,
+    "allManifestFilesUnchanged": true
+  },
+  "privacyScan": {
+    "status": "passed",
+    "filesAndNestedMembersChecked": 249
+  },
+  "nativeRunnerTests": {
+    "arm64": {
+      "passed": 6659,
+      "skipped": 43,
+      "failed": 0,
+      "scope": "Windows-supported workspace; ignored runtime tests excluded"
+    },
+    "x64": {
+      "passed": 6659,
+      "skipped": 43,
+      "failed": 0,
+      "scope": "Windows-supported workspace; ignored runtime tests excluded"
+    }
+  },
+  "nativeRunnerWarnings": [
+    "Rust cache post-job maintenance could not resolve the toolchain outside the source directory; both build and test jobs completed successfully."
+  ],
+  "sourceChecks": {
+    "typeScriptSdkUnitTestsPassed": 196,
+    "pythonSdkUnitTestsPassed": 229,
+    "jwtUnitTestsPassed": 8,
+    "tlsUnitTestsPassed": 21,
+    "unixAffectedLibrariesCompile": "passed",
+    "cargoDenyAdvisoriesAndLicenses": "passed-with-two-documented-exceptions",
+    "trackedCargoLockfiles": "passed",
+    "rustFormatting": "passed"
+  },
+  "dependencyAssessment": {
+    "sourceCommit": "1c2521b7e839ffeb1ae0f37a77f5b9a700d3a536",
+    "previousCandidateAdvisoryGroups": 71,
+    "currentCandidateAdvisoryGroups": 2,
+    "candidateOnlyVersusMain": [],
+    "remaining": [
+      {
+        "id": "RUSTSEC-2026-0459",
+        "name": "libsqlite3-sys",
+        "version": "0.30.1",
+        "scope": "production-dependency"
+      },
+      {
+        "id": "RUSTSEC-2023-0071",
+        "name": "rsa",
+        "version": "0.9.10",
+        "scope": "other-lockfile-dependency"
+      },
+      {
+        "id": "RUSTSEC-2023-0071",
+        "name": "rsa",
+        "version": "0.10.0-rc.18",
+        "scope": "production-dependency"
+      }
+    ],
+    "countsAreExploitabilityClaims": false,
+    "productionSigningVetting": "pending"
+  },
+  "limitations": [
+    "Unsigned candidates require vetting before Authenticode signing and publication as signed releases.",
+    "x64 runtime remains unqualified; emulation smoke checks do not establish native MXC support.",
+    "Passing MXC scenarios does not verify exclusive network mediation or live revocation.",
+    "RSA and SQLx/SQLite advisory exceptions require review; signing vetting remains pending.",
+    "The freshly generated source SBOM is not an exact linked-binary inventory."
+  ]
+}

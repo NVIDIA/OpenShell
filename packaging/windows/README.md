@@ -23,3 +23,9 @@ Each run builds its own immutable Git commit, runs native workspace regression
 tests on both architectures, checks the TypeScript SDK, and generates a new source
 SBOM before attesting the candidate archives. The SBOM covers the broader source
 tree; it is not an exact linked-library inventory or compliance approval.
+
+`windows-signing-handoff.yml` retrieves a pinned successful candidate run,
+verifies the ZIP attestations, and binds sanitized external validation results
+to the unchanged archive and executable hashes. It assembles ten PE signing
+inputs and uploads a consolidated handoff artifact. The handoff does not perform
+external runtime tests, establish signing clearance, or sign executable files.
