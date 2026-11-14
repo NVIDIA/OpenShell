@@ -2153,43 +2153,19 @@ fn policy_static_credential_endpoint_bindings(
         return Ok(bindings);
     };
 
+    openshell_policy::validate_credential_bindings(policy)
+        .map_err(|violations| Status::invalid_argument(violations.join("; ")))?;
     for rule in policy.network_policies.values() {
         for endpoint in &rule.endpoints {
             let Some(binding) = endpoint.credential_binding.as_ref() else {
                 continue;
             };
-            let provider = binding.provider.trim();
-            if provider.is_empty() {
-                return Err(Status::invalid_argument(format!(
-                    "credential_binding.provider is required for endpoint '{}'",
-                    endpoint.host
-                )));
-            }
-            if provider != binding.provider {
-                return Err(Status::invalid_argument(format!(
-                    "credential_binding.provider '{}' must not contain leading or trailing whitespace",
-                    binding.provider
-                )));
-            }
-            if endpoint.host.trim().is_empty() {
-                return Err(Status::invalid_argument(format!(
-                    "credential-bound endpoint for provider '{provider}' must define a host"
-                )));
-            }
+            let provider = binding.provider.as_str();
             let ports = if endpoint.ports.is_empty() {
                 vec![endpoint.port]
             } else {
                 endpoint.ports.clone()
             };
-            if ports
-                .iter()
-                .any(|port| *port == 0 || *port > u32::from(u16::MAX))
-            {
-                return Err(Status::invalid_argument(format!(
-                    "credential-bound endpoint '{}' for provider '{provider}' must define ports in range 1..=65535",
-                    endpoint.host
-                )));
-            }
             let provider_bindings = bindings.entry(provider.to_string()).or_default();
             for port in ports {
                 let candidate = StaticCredentialEndpointBinding {

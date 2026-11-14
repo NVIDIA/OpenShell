@@ -33,6 +33,7 @@ use openshell_core::proto::{
     LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
     SandboxPolicy,
 };
+use prost::Message;
 
 pub use compose::{
     PROVIDER_RULE_NAME_PREFIX, ProviderPolicyLayer, compose_effective_policy,
@@ -1886,6 +1887,118 @@ pub fn validate_and_canonicalize_sandbox_policy(
     Ok(policy)
 }
 
+/// Maximum protobuf-encoded policy size used by sandbox-spec validation and
+/// offline linting, in bytes.
+pub const MAX_AUTHORED_POLICY_SIZE: usize = 262_144;
+
+/// Validate and canonicalize authored policy fields without gateway state.
+///
+/// Provider-composed policies must use [`validate_and_canonicalize_sandbox_policy`]
+/// instead: their generated rule names are not authored input. Endpoint ambiguity
+/// and implementation-owned middleware configuration use their shared validators
+/// separately, including when effective provider layers are available.
+pub fn validate_and_canonicalize_authored_policy(
+    policy: SandboxPolicy,
+) -> std::result::Result<SandboxPolicy, Vec<String>> {
+    let mut violations = validate_authored_rule_names(&policy)
+        .err()
+        .unwrap_or_default();
+    if let Err(errors) = validate_credential_bindings(&policy) {
+        violations.extend(errors);
+    }
+    let original_size = policy.encoded_len();
+    if original_size > MAX_AUTHORED_POLICY_SIZE {
+        violations.push(format!(
+            "policy serialized size exceeds maximum ({original_size} > {MAX_AUTHORED_POLICY_SIZE})"
+        ));
+    }
+    let policy = match validate_and_canonicalize_sandbox_policy(policy) {
+        Ok(policy) => policy,
+        Err(error) => {
+            violations.extend(error.violations().iter().map(ToString::to_string));
+            return Err(violations);
+        }
+    };
+    let size = policy.encoded_len();
+    if original_size <= MAX_AUTHORED_POLICY_SIZE && size > MAX_AUTHORED_POLICY_SIZE {
+        violations.push(format!(
+            "policy serialized size exceeds maximum ({size} > {MAX_AUTHORED_POLICY_SIZE})"
+        ));
+    }
+    if violations.is_empty() {
+        Ok(policy)
+    } else {
+        Err(violations)
+    }
+}
+
+/// Reject authored rule keys reserved for provider composition.
+pub fn validate_authored_rule_names(
+    policy: &SandboxPolicy,
+) -> std::result::Result<(), Vec<String>> {
+    let mut violations = Vec::new();
+    let mut names: Vec<_> = policy.network_policies.keys().collect();
+    names.sort();
+    for name in names {
+        if is_provider_rule_name(name) {
+            violations.push(format!(
+                "network_policies key '{name}' uses reserved '_provider_' prefix for provider composition; use 'openshell policy get <sandbox> --base' for a round-trippable base policy, or use 'openshell policy get <sandbox> --full' to inspect the effective policy including provider entries"
+            ));
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+/// Validate credential-binding structure without resolving attached providers.
+pub fn validate_credential_bindings(
+    policy: &SandboxPolicy,
+) -> std::result::Result<(), Vec<String>> {
+    let mut violations = Vec::new();
+    let mut rules: Vec<_> = policy.network_policies.iter().collect();
+    rules.sort_by_key(|(name, _)| *name);
+    for (_, rule) in rules {
+        for endpoint in &rule.endpoints {
+            let Some(binding) = &endpoint.credential_binding else {
+                continue;
+            };
+            let provider = binding.provider.trim();
+            if provider.is_empty() {
+                violations.push(format!(
+                    "credential_binding.provider is required for endpoint '{}'",
+                    endpoint.host
+                ));
+            } else if provider != binding.provider {
+                violations.push(format!("credential_binding.provider '{}' must not contain leading or trailing whitespace", binding.provider));
+            }
+            if endpoint.host.trim().is_empty() {
+                violations.push(format!(
+                    "credential-bound endpoint for provider '{provider}' must define a host"
+                ));
+            }
+            let invalid_port = if endpoint.ports.is_empty() {
+                !(1..=u32::from(u16::MAX)).contains(&endpoint.port)
+            } else {
+                endpoint
+                    .ports
+                    .iter()
+                    .any(|port| !(1..=u32::from(u16::MAX)).contains(port))
+            };
+            if invalid_port {
+                violations.push(format!("credential-bound endpoint '{}' for provider '{provider}' must define ports in range 1..=65535", endpoint.host));
+            }
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
 /// Replace absent protobuf MCP options and empty revision lists with the
 /// single pinned policy default while preserving every explicit MCP option.
 pub(crate) fn materialize_default_mcp_versions(policy: &mut SandboxPolicy) {
@@ -1950,6 +2063,67 @@ pub use openshell_policy_schema::normalize_path;
 mod tests {
     use super::*;
 
+    #[test]
+    fn authored_policy_collects_gateway_file_violations() {
+        let policy = parse_sandbox_policy(
+            "version: 1\nprocess:\n  run_as_user: '0'\nfilesystem_policy:\n  read_write: [relative]\nnetwork_policies:\n  _provider_private:\n    endpoints:\n      - host: example.com\n        port: 443\n        credential_binding: {provider: ' '}\n",
+        ).unwrap();
+        let errors = validate_and_canonicalize_authored_policy(policy)
+            .unwrap_err()
+            .join("; ");
+        for message in [
+            "run_as_user",
+            "path must be absolute",
+            "reserved '_provider_'",
+            "credential_binding.provider",
+        ] {
+            assert!(errors.contains(message), "missing {message}: {errors}");
+        }
+        let valid = parse_sandbox_policy("version: 1\n").unwrap();
+        assert!(validate_and_canonicalize_authored_policy(valid).is_ok());
+    }
+
+    #[test]
+    fn authored_policy_checks_canonical_encoded_size() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            network_policies: HashMap::from([(
+                "mcp".into(),
+                NetworkPolicyRule {
+                    endpoints: vec![NetworkEndpoint {
+                        host: "mcp.example.com".into(),
+                        port: 443,
+                        protocol: "mcp".into(),
+                        mcp: Some(McpOptions {
+                            allow_all_known_mcp_methods: Some(true),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    name: "x".repeat(MAX_AUTHORED_POLICY_SIZE - 100),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        // Fill the remaining space without assuming a fixed protobuf layout.
+        while policy.encoded_len() < MAX_AUTHORED_POLICY_SIZE {
+            policy
+                .network_policies
+                .get_mut("mcp")
+                .unwrap()
+                .name
+                .push('x');
+        }
+        assert_eq!(policy.encoded_len(), MAX_AUTHORED_POLICY_SIZE);
+        let errors = validate_and_canonicalize_authored_policy(policy)
+            .unwrap_err()
+            .join("; ");
+        assert!(
+            errors.contains("policy serialized size exceeds maximum"),
+            "{errors}"
+        );
+    }
     #[test]
     fn truncate_for_display_handles_multi_byte_utf8_without_panicking() {
         // Byte index 77 falls inside the multi-byte 'é'.

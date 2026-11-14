@@ -7625,6 +7625,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_sandbox_bounds_canonical_mcp_policy_size_for_all_default_spellings() {
+        use openshell_core::rpc_error::StatusExt as _;
+
         let state = test_server_state().await;
         let max_policy_size = super::super::MAX_POLICY_SIZE;
 
@@ -7708,6 +7710,21 @@ mod tests {
                 } else {
                     let error = result.expect_err("oversized canonical policy must be rejected");
                     assert_eq!(error.code(), tonic::Code::InvalidArgument, "{sandbox_name}");
+                    let details = error.get_error_details();
+                    assert_eq!(
+                        details
+                            .bad_request()
+                            .expect("field violation")
+                            .field_violations[0]
+                            .field,
+                        "spec.policy",
+                        "{sandbox_name}"
+                    );
+                    assert_eq!(
+                        details.error_info().expect("error reason").reason,
+                        "INVALID_ARGUMENT",
+                        "{sandbox_name}"
+                    );
                     assert_eq!(
                         error.message(),
                         format!(

@@ -392,7 +392,10 @@ If the user needs access to multiple hosts or the same host with different rules
 
 ## Step 6: Validate and Warn
 
-Before presenting the policy to the user, verify correctness **and** flag breadth concerns.
+Before presenting the policy to the user, run `openshell policy lint policy.yaml`
+to validate the authored file offline, then flag breadth concerns. Provider
+attachments, external middleware registrations, images and drivers still need
+gateway checks.
 
 ### Hard Errors (would block sandbox startup)
 

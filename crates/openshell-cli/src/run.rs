@@ -5424,6 +5424,35 @@ pub async fn sandbox_upload(
 // Sandbox policy commands
 // ---------------------------------------------------------------------------
 
+pub fn sandbox_policy_lint(policy_path: &str) -> Result<()> {
+    let policy = openshell_policy::parse_sandbox_policy_file(Path::new(policy_path))?;
+    let mut violations: Vec<String> = openshell_policy::find_endpoint_ambiguities(&policy)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut middlewares: Vec<_> = policy.network_middlewares.iter().collect();
+    middlewares.sort_by_key(|(name, _)| *name);
+    for (name, middleware) in middlewares {
+        if middleware.middleware.starts_with("openshell/")
+            && let Err(error) = openshell_supervisor_middleware_builtins::validate_config(
+                &middleware.middleware,
+                &middleware.config.clone().unwrap_or_default(),
+            )
+        {
+            violations.push(format!("middleware config '{name}' is invalid: {error}"));
+        }
+    }
+    if let Err(error) = openshell_policy::validate_and_canonicalize_authored_policy(policy) {
+        violations.extend(error);
+    }
+    if !violations.is_empty() {
+        miette::bail!("policy is invalid:\n- {}", violations.join("\n- "));
+    }
+    println!("Policy is valid (offline): {policy_path}");
+    println!("Gateway checks for providers, external middleware, images and drivers are not run.");
+    Ok(())
+}
+
 pub async fn sandbox_policy_set_global(
     server: &str,
     policy_path: &str,

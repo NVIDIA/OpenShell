@@ -138,3 +138,48 @@ async fn policy_only_preserves_all_process_identity_combinations_through_gateway
         }
     }
 }
+
+#[tokio::test]
+async fn authored_policy_lint_matches_gateway_file_validation() {
+    let server = run_server().await;
+    let cases = [
+        (
+            "identity",
+            "process:\n  run_as_user: '0'\nfilesystem_policy:\n  read_write: [relative]\n",
+        ),
+        ("reserved", "network_policies:\n  _provider_private: {}\n"),
+        (
+            "binding",
+            "network_policies:\n  bound:\n    endpoints:\n      - host: example.com\n        port: 443\n        credential_binding: {provider: ' '}\n",
+        ),
+    ];
+    for (name, body) in cases {
+        let policy =
+            openshell_policy::parse_sandbox_policy(&format!("version: 1\n{body}")).unwrap();
+        let violations =
+            openshell_policy::validate_and_canonicalize_authored_policy(policy.clone())
+                .unwrap_err();
+        let mut client = grpc_client(&server.endpoint, &server.tls).await.unwrap();
+        let error = client
+            .create_sandbox(CreateSandboxRequest {
+                name: name.to_string(),
+                spec: Some(SandboxSpec {
+                    policy: Some(policy),
+                    ..Default::default()
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .expect_err("invalid authored file must be rejected by the gateway too");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        for violation in violations {
+            assert!(
+                error.message().contains(&violation),
+                "{name}: {error} did not report {violation}"
+            );
+        }
+    }
+}
