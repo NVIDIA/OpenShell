@@ -790,6 +790,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_error_body_returned_with_http_200_is_classified() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": "invalid_refresh_token",
+                "needed": "provider-controlled detail",
+                "provided": "provider-controlled detail"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let provider = provider("rotated-out-grant", "slack");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "SLACK_USER_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                    ("refresh_token".to_string(), "xoxe-1-used".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "client_secret".to_string(),
+                    "refresh_token".to_string(),
+                ],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: Vec::new(),
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(43_200)),
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let err = refresh_provider_credential(
+            &store,
+            "default",
+            &test_credentials(),
+            None,
+            "rotated-out-grant",
+            "SLACK_USER_TOKEN",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let stored = get_refresh_state(&store, "default", provider.object_id(), "SLACK_USER_TOKEN")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "reauthorization_required");
+        assert_eq!(stored.next_refresh_at_ms, i64::MAX);
+        assert_eq!(
+            stored.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Reauthorize as i32
+        );
+        assert_eq!(stored.failure_code, "oauth_invalid_grant");
+        assert_eq!(stored.provider_error_subtype, "invalid_refresh_token");
+        assert!(!stored.last_error.contains("provider-controlled detail"));
+    }
+
+    #[tokio::test]
+    async fn user_grant_success_body_without_token_or_error_keeps_uncertain_exchange_handling() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let provider = provider("odd-issuer", "slack");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "SLACK_USER_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("refresh_token".to_string(), "xoxe-1-current".to_string()),
+                ]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: Vec::new(),
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        refresh_provider_credential(
+            &store,
+            "default",
+            &test_credentials(),
+            None,
+            "odd-issuer",
+            "SLACK_USER_TOKEN",
+        )
+        .await
+        .unwrap_err();
+
+        // Without an access token or a recognized error name the exchange
+        // outcome is uncertain: the single-use refresh token may already be
+        // spent, so the user grant parks for reauthorization.
+        let stored = get_refresh_state(&store, "default", provider.object_id(), "SLACK_USER_TOKEN")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "reauthorization_required");
+        assert_eq!(stored.failure_code, "oauth_refresh_exchange_uncertain");
+        assert_eq!(
+            stored.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Reauthorize as i32
+        );
+        assert_eq!(stored.next_refresh_at_ms, i64::MAX);
+    }
+
+    #[tokio::test]
+    async fn oauth2_refresh_token_accepts_slack_shaped_success_body() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("client_id=client-id"))
+            .and(body_string_contains("client_secret=client-secret"))
+            .and(body_string_contains("refresh_token=xoxe-1-old"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "access_token": "xoxe.xoxp-1-rotated",
+                "refresh_token": "xoxe-1-new",
+                "expires_in": 43_200,
+                "token_type": "user",
+                "scope": "users:read"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let provider = provider("my-slack", "slack");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "SLACK_USER_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                    ("refresh_token".to_string(), "xoxe-1-old".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "client_secret".to_string(),
+                    "refresh_token".to_string(),
+                ],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: Vec::new(),
+                refresh_before: Some(proto_duration(21_600)),
+                max_lifetime: Some(proto_duration(43_200)),
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
+
+        let before_ms = current_time_ms();
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            &credentials,
+            None,
+            "my-slack",
+            "SLACK_USER_TOKEN",
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+        assert!(
+            refreshed.expires_at_ms >= before_ms + 43_000 * 1000,
+            "12h lifetime must not be clamped when the profile cap allows it"
+        );
+        assert!(
+            refreshed.next_refresh_at_ms >= before_ms + 21_000 * 1000,
+            "next refresh is scheduled refresh_before_seconds ahead of expiry"
+        );
+
+        let stored_state =
+            get_refresh_state(&store, "default", provider.object_id(), "SLACK_USER_TOKEN")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            credentials
+                .resolve_refresh_material(
+                    refresh_material_scope(&stored_state),
+                    &stored_state.secret_material_handles,
+                )
+                .await
+                .unwrap()
+                .get("refresh_token"),
+            Some(&"xoxe-1-new".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn oauth_invalid_grant_persists_terminal_reauthorization_status() {
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
