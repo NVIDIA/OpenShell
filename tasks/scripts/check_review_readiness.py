@@ -36,7 +36,22 @@ PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)",
 
 
 class LabelRoutingError(ValueError):
-    """A PR's area/topic labels cannot be routed to reviewers."""
+    """The PR's area or topic labels prevent requesting reviewers."""
+
+
+def _api_action(method: str, path: str) -> str:
+    """Name the step a failed `gh api` call was performing."""
+    if path.endswith("/requested_reviewers"):
+        return (
+            "Removing reviewer requests"
+            if method == "DELETE"
+            else "Requesting reviewers"
+        )
+    if path.endswith("/labels") and method == "POST":
+        return "Adding labels"
+    if method == "GET":
+        return "Reading the PR from GitHub"
+    return "A GitHub API call"
 
 
 def _escape_annotation(text: str, *, prop: bool = False) -> str:
@@ -50,20 +65,22 @@ def _escape_annotation(text: str, *, prop: bool = False) -> str:
 def describe_failure(exc: Exception) -> tuple[str, str]:
     """Return a short category and an actionable message for a failure."""
     if isinstance(exc, LabelRoutingError):
-        return "label routing", str(exc)
+        return "PR labels", str(exc)
     if isinstance(exc, subprocess.CalledProcessError):
         command = [str(part) for part in exc.cmd]
         method = "GET"
         if "--method" in command[:-1]:
             method = command[command.index("--method") + 1]
         path = command[2] if len(command) > 2 else ""
-        message = f"gh api {method} {path} failed"
+        message = (
+            f"{_api_action(method, path)} failed with a GitHub API error: "
+            f"gh api {method} {path}"
+        )
         detail = (exc.stderr or "").strip()
         if detail:
-            message += f": {detail} (exit status {exc.returncode})"
-        else:
-            message += f" (exit status {exc.returncode})"
-        return "GitHub API", message
+            message += f": {detail}"
+        message += f" (exit status {exc.returncode})"
+        return "GitHub API error", message
     return "error", str(exc)
 
 
@@ -136,21 +153,20 @@ def select_reviewers(categories: dict[str, set[str]], labels: set[str]) -> set[s
     """Return matching handles for one primary area and any number of topics."""
     relevant = {label for label in labels if label.startswith(("area:", "topic:"))}
     areas = sorted(label for label in relevant if label.startswith("area:"))
-    if len(areas) != 1:
+    if not areas:
         raise LabelRoutingError(
-            "a ready PR must have exactly one area label; "
-            f"found: {', '.join(areas) or 'none'}. "
-            + (
-                "Add one area: label."
-                if not areas
-                else "Remove labels until exactly one area: label is applied."
-            )
+            "This PR has no area label. A ready PR needs exactly one; add one."
+        )
+    if len(areas) > 1:
+        raise LabelRoutingError(
+            f"This PR has more than one area label: {', '.join(areas)}. "
+            "A ready PR needs exactly one; remove the others."
         )
     unknown = relevant - categories.keys()
     if unknown:
         raise LabelRoutingError(
-            f"unknown area/topic labels: {', '.join(sorted(unknown))}. "
-            "Remove them from the PR, or add them to REVIEWERS.md on main."
+            f"This PR's area and topic labels {', '.join(sorted(unknown))} have no "
+            "reviewers in REVIEWERS.md. Replace them with labels listed there."
         )
     return set().union(*(categories[label] for label in relevant))
 

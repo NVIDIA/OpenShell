@@ -142,30 +142,35 @@ class PlanningTests(unittest.TestCase):
     def test_multiple_area_labels_message(self):
         with self.assertRaises(routing.LabelRoutingError) as caught:
             routing.select_reviewers(CATEGORIES, {"area:runtime", "area:build"})
-        message = str(caught.exception)
-        self.assertIn("found: area:build, area:runtime", message)
-        self.assertIn("Remove labels until exactly one area: label", message)
+        self.assertEqual(
+            str(caught.exception),
+            "This PR has more than one area label: area:build, area:runtime. "
+            "A ready PR needs exactly one; remove the others.",
+        )
 
     def test_missing_area_label_message(self):
         with self.assertRaises(routing.LabelRoutingError) as caught:
             routing.select_reviewers(CATEGORIES, {"topic:policy"})
-        message = str(caught.exception)
-        self.assertIn("found: none", message)
-        self.assertIn("Add one area: label", message)
-        self.assertNotIn("remains", message)
+        self.assertEqual(
+            str(caught.exception),
+            "This PR has no area label. A ready PR needs exactly one; add one.",
+        )
 
     def test_unknown_label_message(self):
         with self.assertRaises(routing.LabelRoutingError) as caught:
-            routing.select_reviewers(CATEGORIES, {"area:runtime", "topic:nope"})
-        message = str(caught.exception)
-        self.assertIn("topic:nope", message)
-        self.assertIn("Remove them from the PR", message)
-        self.assertIn("REVIEWERS.md on main", message)
+            routing.select_reviewers(
+                CATEGORIES, {"area:runtime", "topic:nope", "topic:zzz"}
+            )
+        self.assertEqual(
+            str(caught.exception),
+            "This PR's area and topic labels topic:nope, topic:zzz have no "
+            "reviewers in REVIEWERS.md. Replace them with labels listed there.",
+        )
 
     def test_area_count_is_checked_before_unknown_labels(self):
         with self.assertRaises(routing.LabelRoutingError) as caught:
             routing.select_reviewers(CATEGORIES, {"area:nope", "area:other"})
-        self.assertIn("exactly one area label", str(caught.exception))
+        self.assertIn("more than one area label", str(caught.exception))
 
     def test_requires_one_known_area_and_known_topics(self):
         for labels in (
@@ -653,7 +658,11 @@ class FailureReportTests(unittest.TestCase):
             stderr="gh: Reviews may only be requested from collaborators. (HTTP 422)\n",
         )
         category, message = routing.describe_failure(error)
-        self.assertEqual(category, "GitHub API")
+        self.assertEqual(category, "GitHub API error")
+        self.assertTrue(
+            message.startswith("Requesting reviewers failed with a GitHub API error"),
+            message,
+        )
         self.assertIn("POST repos/o/r/pulls/42/requested_reviewers", message)
         self.assertIn("exit status 1", message)
         self.assertIn("HTTP 422", message)
@@ -673,10 +682,29 @@ class FailureReportTests(unittest.TestCase):
         _, message = routing.describe_failure(error)
         self.assertIn("GET repos/o/r/pulls/42", message)
 
+    def test_api_failure_names_the_action(self):
+        pull = "repos/o/r/pulls/42"
+        cases = (
+            ("POST", f"{pull}/requested_reviewers", "Requesting reviewers"),
+            ("DELETE", f"{pull}/requested_reviewers", "Removing reviewer requests"),
+            ("POST", "repos/o/r/issues/42/labels", "Adding labels"),
+            ("GET", pull, "Reading the PR from GitHub"),
+        )
+        for method, path, action in cases:
+            error = subprocess.CalledProcessError(
+                1, ["gh", "api", path, "--method", method], stderr="x"
+            )
+            with self.subTest(method=method, path=path):
+                _, message = routing.describe_failure(error)
+                self.assertTrue(
+                    message.startswith(f"{action} failed with a GitHub API error"),
+                    message,
+                )
+
     def test_label_error_category(self):
         self.assertEqual(
             routing.describe_failure(routing.LabelRoutingError("x")),
-            ("label routing", "x"),
+            ("PR labels", "x"),
         )
 
     def test_other_value_error_is_generic(self):
@@ -691,7 +719,7 @@ class FailureReportTests(unittest.TestCase):
         self.assertEqual(
             actions.getvalue(),
             "Review readiness: bad 100%\nlabel\n"
-            "::error title=Review Readiness%3A label routing::bad 100%25%0Alabel\n",
+            "::error title=Review Readiness%3A PR labels::bad 100%25%0Alabel\n",
         )
         self.assertEqual(local.getvalue(), "Review readiness: bad 100%\nlabel\n")
 
@@ -714,7 +742,7 @@ class FailureReportTests(unittest.TestCase):
             )
         self.assertEqual(result, 1)
         self.assertIn(
-            "::error title=Review Readiness%3A label routing::boom", errors.getvalue()
+            "::error title=Review Readiness%3A PR labels::boom", errors.getvalue()
         )
 
 
