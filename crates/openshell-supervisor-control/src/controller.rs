@@ -820,13 +820,14 @@ impl SupervisorHostController {
 
     /// Serve one authenticated host stream. Reads the hello, supersedes any
     /// session it replaces, and returns the host's member ID and the
-    /// gateway-to-host stream. A host that accepts a redirect is redirected,
-    /// without a session, to the peer endpoint `home` names for its member.
+    /// gateway-to-host stream. `home` sees every member and whether its host
+    /// accepts a redirect; a host that does is redirected, without a session,
+    /// to the peer endpoint `home` names.
     pub async fn attach(
         &self,
         identity: HostIdentity,
         mut inbound: Streaming<HostMessage>,
-        home: impl FnOnce(&str) -> Option<String>,
+        home: impl FnOnce(&str, bool) -> Option<String>,
     ) -> Result<(String, ReceiverStream<Result<HostGatewayMessage, Status>>), Status> {
         let hello = match tokio::time::timeout(HELLO_TIMEOUT, inbound.next()).await {
             Ok(Some(Ok(HostMessage {
@@ -860,8 +861,9 @@ impl SupervisorHostController {
         validate_member(member).map_err(Status::invalid_argument)?;
         let member_id = member.member_id.clone();
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let home = home(&member_id, hello.accepts_redirect);
         if hello.accepts_redirect
-            && let Some(peer_endpoint) = home(&member_id)
+            && let Some(peer_endpoint) = home
         {
             tracing::info!(member_id, peer_endpoint, "redirecting supervisor host");
             let _ = tx.try_send(Ok(redirect(peer_endpoint)));

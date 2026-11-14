@@ -70,14 +70,16 @@ impl SupervisorHost for SupervisorHostService {
         }
         let state = self.state.clone();
         let (member_id, outbound) = controller
-            .attach(identity, request.into_inner(), |member_id| {
-                host_home(&state, member_id)
-            })
+            .attach(
+                identity,
+                request.into_inner(),
+                |member_id, accepts_redirect| host_home(&state, member_id, accepts_redirect),
+            )
             .await?;
         let handoff = futures::stream::once(async move {
             let stopping = *state.supervisor_sessions.subscribe_shutdown().borrow();
             stopping
-                .then(|| host_home(&state, &member_id))
+                .then(|| host_home(&state, &member_id, true))
                 .flatten()
                 .map(|peer_endpoint| Ok(redirect(peer_endpoint)))
         })
@@ -94,7 +96,7 @@ impl SupervisorHost for SupervisorHostService {
 /// Peer endpoint of the replica that should serve the shared supervisor
 /// `member_id` when that is not this replica. A stopping replica leaves
 /// itself out.
-fn host_home(state: &ServerState, member_id: &str) -> Option<String> {
+fn host_home(state: &ServerState, member_id: &str, accepts_redirect: bool) -> Option<String> {
     if state.store.is_single_replica() {
         return None;
     }
@@ -104,10 +106,10 @@ fn host_home(state: &ServerState, member_id: &str) -> Option<String> {
     } else {
         ring.clone()
     };
-    let home = state.supervisor_spread.place(&ring, member_id)?;
-    if home == state.replica_id {
-        return None;
-    }
+    let home =
+        state
+            .supervisor_spread
+            .route(&ring, &state.replica_id, member_id, accepts_redirect)?;
     state
         .gateway_peers
         .read()
