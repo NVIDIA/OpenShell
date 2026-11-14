@@ -3506,7 +3506,8 @@ mod linux {
         let certificate_bytes = std::fs::read(&tls.certificate_chain_path)?;
         let certificates =
             rustls::pki_types::CertificateDer::pem_reader_iter(&mut certificate_bytes.as_slice())
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         if certificates.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -3517,7 +3518,8 @@ mod linux {
         let private_key =
             rustls::pki_types::PrivateKeyDer::pem_reader_iter(&mut private_key_bytes.as_slice())
                 .next()
-                .transpose()?
+                .transpose()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,

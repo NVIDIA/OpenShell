@@ -440,7 +440,7 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         File::open(path).map_err(|e| Error::tls(format!("failed to open cert file: {e}")))?;
     let mut reader = BufReader::new(file);
 
-    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_reader_iter(&mut reader)
+    let certs: Vec<_> = CertificateDer::pem_reader_iter(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::tls(format!("failed to parse certificates: {e}")))?;
 
@@ -456,7 +456,7 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(path).map_err(|e| Error::tls(format!("failed to open key file: {e}")))?;
     let mut reader = BufReader::new(file);
 
-    rustls::pki_types::PrivateKeyDer::pem_reader_iter(&mut reader)
+    PrivateKeyDer::pem_reader_iter(&mut reader)
         .next()
         .transpose()
         .map_err(|e| Error::tls(format!("failed to parse key file: {e}")))?

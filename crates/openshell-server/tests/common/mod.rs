@@ -840,7 +840,7 @@ pub async fn test_health_store() -> Arc<Store> {
 pub fn build_tls_root(cert_pem: &[u8]) -> RootCertStore {
     let mut roots = RootCertStore::empty();
     let mut cursor = std::io::Cursor::new(cert_pem);
-    let parsed = rustls::pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+    let parsed = CertificateDer::pem_reader_iter(&mut cursor)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .expect("failed to parse cert pem");
     for cert in parsed {
