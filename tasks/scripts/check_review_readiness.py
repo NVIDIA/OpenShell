@@ -27,11 +27,14 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from check_maintainer_approval import parse_maintainers
-from label_accepted_work import ACCEPTED_LABEL, check_pr_accepted_work
+from label_accepted_work import ACCEPTED_LABEL, evaluate_pr_accepted_work
 
 HEADER = ["Name", "GitHub ID", "Company/Organization"]
 LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:[-:][a-z0-9]+)*")
 PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)", re.I)
+ADD_LABEL = """mutation($input: AddLabelsToLabelableInput!) {
+  addLabelsToLabelable(input: $input) { labelable { __typename } }
+}"""
 
 
 @dataclass(frozen=True)
@@ -212,6 +215,28 @@ def _routing_key(pr: dict):
     )
 
 
+def _add_accepted_label(repository: str, pr: dict, evidence: dict) -> None:
+    label = _api(f"repos/{repository}/labels/state%3Aaccepted")
+    rationale = json.dumps(
+        {"schema": "openshell-acceptance-v1", **evidence}, separators=(",", ":")
+    )
+    result = _api(
+        "graphql",
+        method="POST",
+        data={
+            "query": ADD_LABEL,
+            "variables": {
+                "input": {
+                    "labelableId": pr["node_id"],
+                    "labels": [{"labelId": label["node_id"], "rationale": rationale}],
+                }
+            },
+        },
+    )
+    if result.get("errors") or not result.get("data", {}).get("addLabelsToLabelable"):
+        raise ValueError("Could not apply accepted-work label with evidence")
+
+
 def check_review_readiness(
     categories: dict[str, set[str]],
     repository: str,
@@ -235,17 +260,14 @@ def check_review_readiness(
     add_labels = ()
     labels = {label["name"] for label in pr["labels"]}
     if label_accepted_work:
-        accepted = check_pr_accepted_work(
+        evidence = evaluate_pr_accepted_work(
             repository, pr, maintainers or set(), api=_api
         )
+        accepted = evidence is not None
         if accepted and ACCEPTED_LABEL not in labels:
             add_labels = (ACCEPTED_LABEL,)
             if apply:
-                _api(
-                    f"repos/{repository}/issues/{number}/labels",
-                    method="POST",
-                    data={"labels": list(add_labels)},
-                )
+                _add_accepted_label(repository, pr, evidence)
     if pr["draft"] or not any(label.startswith("area:") for label in labels):
         if pr["draft"] and not label_accepted_work:
             return None
