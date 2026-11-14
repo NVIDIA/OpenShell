@@ -960,6 +960,25 @@ namespace = "openshell"
     }
 
     #[test]
+    fn parse_uds_driver_rejects_overlong_socket_path() {
+        let socket_path_toml = toml_path(&test_absolute_path(
+            &"a".repeat(openshell_core::unix_socket_path::MAX_LEN),
+        ));
+        let err = parse_driver_table(
+            "vault",
+            &driver_table(&format!(
+                r#"
+transport = "uds"
+socket_path = {socket_path_toml}
+"#,
+            )),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("-byte limit"), "{err}");
+    }
+
+    #[test]
     fn parse_uds_driver_rejects_relative_command() {
         let socket_path_toml = toml_path(&test_absolute_path("openshell-enterprise-secrets.sock"));
         let err = parse_driver_table(

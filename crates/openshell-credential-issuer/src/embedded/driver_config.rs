@@ -262,6 +262,11 @@ pub(super) fn parse_driver_table(
                 "[openshell.credential_drivers.{driver_name}] socket_path must be absolute"
             )));
         }
+        openshell_core::unix_socket_path::check(socket_path).map_err(|err| {
+            Error::config(format!(
+                "[openshell.credential_drivers.{driver_name}] socket_path: {err}"
+            ))
+        })?;
         if let Some(command) = command.as_ref()
             && !command.is_absolute()
         {

@@ -107,6 +107,8 @@ pub enum TransportError {
     CustomCaRequiresHttps,
     #[error("unix extension endpoint must contain an absolute socket path")]
     InvalidUnixPath,
+    #[error("unix extension endpoint: {0}")]
+    UnixPathTooLong(std::io::Error),
     #[error("unix extension endpoints are not supported on this platform")]
     UnixUnsupported,
     #[error("invalid extension endpoint: {0}")]
@@ -149,10 +151,11 @@ fn validate_config(config: &ExtensionChannelConfig) -> Result<(), TransportError
     if !matches!(&config.server_trust, ExtensionServerTrust::PlatformRoots) && !is_https {
         return Err(TransportError::CustomCaRequiresHttps);
     }
-    if let Some(path) = config.endpoint.strip_prefix("unix://")
-        && (path.is_empty() || !PathBuf::from(path).is_absolute())
-    {
-        return Err(TransportError::InvalidUnixPath);
+    if let Some(path) = config.endpoint.strip_prefix("unix://") {
+        if path.is_empty() || !PathBuf::from(path).is_absolute() {
+            return Err(TransportError::InvalidUnixPath);
+        }
+        crate::unix_socket_path::check(path.as_ref()).map_err(TransportError::UnixPathTooLong)?;
     }
     Ok(())
 }
@@ -271,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_schemes_and_relative_unix_paths() {
+    fn rejects_unsupported_schemes_and_invalid_unix_paths() {
         assert!(matches!(
             validate_config(&ExtensionChannelConfig::new("tcp://middleware:50051")),
             Err(TransportError::UnsupportedScheme)
@@ -279,6 +282,11 @@ mod tests {
         assert!(matches!(
             validate_config(&ExtensionChannelConfig::new("unix://relative.sock")),
             Err(TransportError::InvalidUnixPath)
+        ));
+        let long = format!("unix:///{}", "a".repeat(crate::unix_socket_path::MAX_LEN));
+        assert!(matches!(
+            validate_config(&ExtensionChannelConfig::new(long)),
+            Err(TransportError::UnixPathTooLong(_))
         ));
     }
 
