@@ -33,6 +33,7 @@
 
 # Reviewer routing registry and helper
 /REVIEWERS.md @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/WATCHERS.md @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /tasks/scripts/check_review_readiness.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /tasks/scripts/check_review_readiness_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 

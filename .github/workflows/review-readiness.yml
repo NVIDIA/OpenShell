@@ -35,6 +35,7 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: |
             REVIEWERS.md
+            WATCHERS.md
             MAINTAINERS.md
             tasks/scripts/check_review_readiness.py
             tasks/scripts/label_accepted_work.py

@@ -7,14 +7,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reconcile PR reviewers from the merged REVIEWERS.md and current PR metadata.
+"""Route PR reviews and watcher mentions from merged membership rosters.
 
-Preview with --repo OWNER/REPO --pr NUMBER; add --apply to update requests.
+Preview with --repo OWNER/REPO --pr NUMBER; add --apply to request reviews and
+post watcher mentions.
 For newly opened PRs, --label-accepted-work also adds state:accepted if qualified.
 Request matching repository collaborators, excluding the author. Report roster
 members GitHub cannot request. Preserve manual choices, unknown request provenance,
-and anyone who commented or reviewed.
-The parser and planning helpers are importable. No state is stored between runs.
+and anyone who commented or reviewed. Mention matching WATCHERS.md members once
+per PR, excluding the author.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ class ReviewPlan:
     accepted_work: bool | None = None
     add_labels: tuple[str, ...] = ()
     skipped_non_collaborators: tuple[str, ...] = ()
+    notify_watchers: tuple[str, ...] = ()
 
 
 def parse_reviewers(markdown: str) -> dict[str, set[str]]:
@@ -183,6 +185,9 @@ def _api(path: str, *, method: str = "GET", data=None, pages: bool = False):
         command.extend(["--paginate", "--slurp"])
     if data is not None:
         command.extend(["--input", "-"])
+    reviewer_write = path.endswith("/requested_reviewers") and data is not None
+    if reviewer_write:
+        print(f"GitHub API {method} {path}; input: {json.dumps(data)}", file=sys.stderr)
     try:
         result = subprocess.run(
             command,
@@ -196,8 +201,15 @@ def _api(path: str, *, method: str = "GET", data=None, pages: bool = False):
         status = re.search(r"\(HTTP (\d{3})\)", exc.stderr or "")
         detail = f"HTTP {status[1]}" if status else f"exit {exc.returncode}"
         message = f"GitHub API {method} {path} failed ({detail})"
-        if path.endswith("/requested_reviewers") and data:
+        if reviewer_write:
+            assert data is not None
             message += "; reviewers: " + ", ".join(data.get("reviewers", []))
+            try:
+                explanation = json.loads(exc.output or "{}").get("message")
+            except (ValueError, AttributeError):
+                explanation = None
+            if isinstance(explanation, str):
+                message += "; GitHub: " + json.dumps(explanation[:1000])
         raise GitHubApiError(exc, message) from exc
     value = json.loads(result.stdout) if result.stdout.strip() else None
     if pages:
@@ -236,6 +248,19 @@ def _routing_key(pr: dict):
     )
 
 
+def pending_watchers(watchers: set[str], comments: list[dict]) -> tuple[str, ...]:
+    notified = set()
+    for comment in comments:
+        user = comment.get("user") or {}
+        if user.get("login") != "github-actions[bot]" or user.get("type") != "Bot":
+            continue
+        for members in re.findall(
+            r"<!-- openshell-watchers: ([a-z0-9,-]+) -->", comment.get("body") or ""
+        ):
+            notified.update(members.split(","))
+    return tuple(sorted(watchers - notified))
+
+
 def check_review_readiness(
     categories: dict[str, set[str]],
     repository: str,
@@ -244,6 +269,7 @@ def check_review_readiness(
     apply=False,
     label_accepted_work=False,
     maintainers: set[str] | None = None,
+    watchers: dict[str, set[str]] | None = None,
 ) -> ReviewPlan | None:
     """Plan labeling and routing; callers serialize runs for the same PR.
 
@@ -298,6 +324,24 @@ def check_review_readiness(
                 login for login in plan.add if login not in collaborators
             ),
         )
+    matched_watchers = set().union(
+        *((watchers or {}).get(label, set()) for label in labels)
+    ) - {pr["user"]["login"].lower()}
+    if matched_watchers:
+        comments = _api(
+            f"repos/{repository}/issues/{number}/comments?per_page=100", pages=True
+        )
+        plan = replace(
+            plan, notify_watchers=pending_watchers(matched_watchers, comments)
+        )
+    print("Review readiness plan: " + json.dumps(asdict(plan)), file=sys.stderr)
+    if plan.skipped_non_collaborators:
+        print(
+            "Cannot request non-collaborators: "
+            + ", ".join(plan.skipped_non_collaborators)
+            + "; move their subscriptions from REVIEWERS.md to WATCHERS.md.",
+            file=sys.stderr,
+        )
     if apply:
         endpoint = f"{pull}/requested_reviewers"
         if plan.add:
@@ -313,12 +357,32 @@ def check_review_readiness(
             plan = replace(plan, remove=refreshed.remove)
             if plan.remove:
                 _api(endpoint, method="DELETE", data={"reviewers": list(plan.remove)})
+        if plan.notify_watchers:
+            mentions = " ".join(f"@{login}" for login in plan.notify_watchers)
+            classification = ", ".join(
+                f"`{label}`" for label in sorted(labels) if LABEL.fullmatch(label)
+            )
+            body = (
+                f"{mentions} — this PR is ready for review and matches your "
+                f"subscriptions in WATCHERS.md ({classification}). Reviews are welcome.\n\n"
+                f"<!-- openshell-watchers: {','.join(plan.notify_watchers)} -->"
+            )
+            print(
+                "Mentioning watchers: " + ", ".join(plan.notify_watchers),
+                file=sys.stderr,
+            )
+            _api(
+                f"repos/{repository}/issues/{number}/comments",
+                method="POST",
+                data={"body": body},
+            )
     return plan
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reviewers", type=Path, default=Path("REVIEWERS.md"))
+    parser.add_argument("--watchers", type=Path, default=Path("WATCHERS.md"))
     parser.add_argument("--maintainers", type=Path, default=Path("MAINTAINERS.md"))
     parser.add_argument(
         "--label-accepted-work",
@@ -335,6 +399,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--repo must be OWNER/REPO and --pr must be positive")
     try:
         categories = parse_reviewers(args.reviewers.read_text(encoding="utf-8"))
+        watchers = parse_reviewers(args.watchers.read_text(encoding="utf-8"))
+        unknown = watchers.keys() - categories.keys()
+        if unknown:
+            raise ValueError(
+                "unknown watcher categories: " + ", ".join(sorted(unknown))
+            )
         maintainers = (
             parse_maintainers(args.maintainers.read_text(encoding="utf-8"))
             if args.label_accepted_work
@@ -347,6 +417,7 @@ def main(argv: list[str] | None = None) -> int:
             apply=args.apply,
             label_accepted_work=args.label_accepted_work,
             maintainers=maintainers,
+            watchers=watchers,
         )
     except (
         OSError,

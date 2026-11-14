@@ -599,6 +599,7 @@ def prepare_snapshot(
     repository, number = facts["repository"], facts["number"]
     root = f"repos/{repository}"
     roster = _roster(repository, "REVIEWERS.md", facts["revision"], api)
+    watchers = _roster(repository, "WATCHERS.md", facts["revision"], api)
     contribution_policy = _roster(repository, "CONTRIBUTING.md", facts["revision"], api)
     definitions = copy.deepcopy(api(f"{root}/labels?per_page=100", pages=True))
     for definition in definitions:
@@ -651,6 +652,7 @@ def prepare_snapshot(
             "protocol": 1,
             "maintainers": facts["maintainers_text"],
             "reviewers": roster,
+            "watchers": watchers,
             "contribution_policy": contribution_policy,
         },
         sort_keys=True,

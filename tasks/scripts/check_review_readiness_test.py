@@ -222,13 +222,33 @@ class TimelineTests(unittest.TestCase):
 
 
 class GitHubTests(unittest.TestCase):
+    def test_reviewer_failure_includes_github_explanation(self):
+        explanation = "Reviews may only be requested from collaborators."
+        error = subprocess.CalledProcessError(
+            1,
+            "gh",
+            output=json.dumps({"message": explanation}),
+            stderr="gh: rejected (HTTP 422)",
+        )
+        with (
+            mock.patch.object(routing.subprocess, "run", side_effect=error),
+            contextlib.redirect_stderr(io.StringIO()) as logs,
+            self.assertRaisesRegex(routing.GitHubApiError, explanation),
+        ):
+            routing._api(
+                f"{PULL}/requested_reviewers",
+                method="POST",
+                data={"reviewers": ["outsider"]},
+            )
+        self.assertIn('"outsider"', logs.getvalue())
+
     def test_api_failure_reports_operation_status_and_reviewers_without_raw_output(
         self,
     ):
         error = subprocess.CalledProcessError(
             1,
             ["gh", "api"],
-            output='{"message":"sensitive-response-body"}',
+            output='{"message":"Rejected","body":"sensitive-response-body"}',
             stderr="gh: sensitive-response-body (HTTP 422)",
         )
         with (
@@ -432,6 +452,98 @@ class GitHubTests(unittest.TestCase):
         )
         self.assertTrue(all(call.kwargs["pages"] for call in api.call_args_list))
         self.assertIn("/timeline?per_page=100", api.call_args.args[0])
+
+
+class WatcherTests(unittest.TestCase):
+    def setUp(self):
+        self.watchers = {
+            "area:runtime": {"outsider", "author"},
+            "topic:policy": {"outsider", "another"},
+        }
+
+    def run_check(self, *, comments=(), apply=True, draft=False, fail_comment=False):
+        comments = list(comments)
+
+        def github(path, *, method="GET", data=None, pages=False):
+            if path == PULL:
+                return pr("area:runtime", "topic:policy", draft=draft)
+            if path.endswith("/comments?per_page=100") and "/issues/" in path:
+                self.assertTrue(pages)
+                return comments
+            if path.endswith("/comments") and method == "POST":
+                assert data is not None
+                if fail_comment:
+                    raise subprocess.CalledProcessError(1, "gh")
+                comments.append(
+                    {
+                        "user": {"login": "github-actions[bot]", "type": "Bot"},
+                        "body": data["body"],
+                    }
+                )
+                return {}
+            raise AssertionError((path, method, data))
+
+        with (
+            mock.patch.object(routing, "_api", side_effect=github) as api,
+            mock.patch.object(
+                routing,
+                "_load_reviewers",
+                return_value=reviewers(requested=("alice", "bob", "carol")),
+            ),
+        ):
+            plan = routing.check_review_readiness(
+                CATEGORIES, REPO, 42, watchers=self.watchers, apply=apply
+            )
+        return plan, api, comments
+
+    def test_mentions_area_and_topic_watchers_once_excluding_author(self):
+        plan, api, comments = self.run_check()
+        self.assertEqual(plan.notify_watchers, ("another", "outsider"))
+        body = comments[-1]["body"]
+        self.assertEqual(body.count("@outsider"), 1)
+        self.assertIn("@another", body)
+        self.assertNotIn("@author", body)
+        self.assertIn("area:runtime", body)
+        self.assertIn("topic:policy", body)
+        self.assertEqual(api.call_args.kwargs["method"], "POST")
+
+        repeated, api, _ = self.run_check(comments=comments)
+        self.assertEqual(repeated.notify_watchers, ())
+        self.assertTrue(
+            all(c.kwargs.get("method", "GET") == "GET" for c in api.call_args_list)
+        )
+
+    def test_label_changes_notify_only_new_watchers(self):
+        _, _, comments = self.run_check()
+        with mock.patch.object(self, "watchers", {"area:runtime": {"new", "outsider"}}):
+            plan, _, _ = self.run_check(comments=comments)
+        self.assertEqual(plan.notify_watchers, ("new",))
+
+    def test_human_or_unrelated_bot_cannot_suppress_notifications(self):
+        _, _, comments = self.run_check()
+        for user in (
+            {"login": "someone", "type": "User"},
+            {"login": "other[bot]", "type": "Bot"},
+        ):
+            with self.subTest(user=user):
+                comments[0]["user"] = user
+                plan, _, _ = self.run_check(comments=comments)
+                self.assertEqual(plan.notify_watchers, ("another", "outsider"))
+
+    def test_preview_is_read_only_and_drafts_do_not_notify(self):
+        plan, api, comments = self.run_check(apply=False)
+        self.assertEqual(plan.notify_watchers, ("another", "outsider"))
+        self.assertEqual(comments, [])
+        self.assertTrue(
+            all(c.kwargs.get("method", "GET") == "GET" for c in api.call_args_list)
+        )
+        plan, api, _ = self.run_check(draft=True)
+        self.assertIsNone(plan)
+        api.assert_called_once_with(PULL)
+
+    def test_failed_comment_is_not_silently_treated_as_delivered(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_check(fail_comment=True)
 
 
 class ReconciliationTests(unittest.TestCase):
@@ -813,6 +925,8 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "REVIEWERS.md"
             path.write_text(DOCUMENT, encoding="utf-8")
+            watchers = Path(directory) / "WATCHERS.md"
+            watchers.write_text("### area:runtime\n\n" + TABLE, encoding="utf-8")
             output = io.StringIO()
             with (
                 mock.patch.object(
@@ -827,6 +941,8 @@ class CliTests(unittest.TestCase):
                         [
                             "--reviewers",
                             str(path),
+                            "--watchers",
+                            str(watchers),
                             "--repo",
                             REPO,
                             "--pr",
@@ -844,6 +960,7 @@ class CliTests(unittest.TestCase):
                     "accepted_work": None,
                     "add_labels": [],
                     "skipped_non_collaborators": [],
+                    "notify_watchers": [],
                 },
             )
             check.assert_called_once_with(
@@ -853,12 +970,15 @@ class CliTests(unittest.TestCase):
                 apply=True,
                 label_accepted_work=False,
                 maintainers=None,
+                watchers={"area:runtime": set()},
             )
 
     def test_opened_pr_option_loads_trusted_maintainer_roster(self):
         with tempfile.TemporaryDirectory() as directory:
             roster = Path(directory) / "REVIEWERS.md"
             roster.write_text(DOCUMENT, encoding="utf-8")
+            watchers = Path(directory) / "WATCHERS.md"
+            watchers.write_text("### area:runtime\n\n" + TABLE, encoding="utf-8")
             maintainers = Path(directory) / "MAINTAINERS.md"
             maintainers.write_text("[@maintainer](https://github.com/maintainer)")
             with (
@@ -877,6 +997,8 @@ class CliTests(unittest.TestCase):
                         "42",
                         "--reviewers",
                         str(roster),
+                        "--watchers",
+                        str(watchers),
                         "--maintainers",
                         str(maintainers),
                         "--label-accepted-work",
@@ -893,12 +1015,14 @@ class CliTests(unittest.TestCase):
                 apply=False,
                 label_accepted_work=True,
                 maintainers={"maintainer"},
+                watchers={"area:runtime": set()},
             )
 
     def test_invalid_registry_fails_before_contacting_github(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "REVIEWERS.md"
             path.write_text("not a registry", encoding="utf-8")
+            watchers = Path(directory) / "WATCHERS.md"
             output, errors = io.StringIO(), io.StringIO()
             with (
                 mock.patch.object(routing, "_api") as api,
@@ -910,6 +1034,8 @@ class CliTests(unittest.TestCase):
                         [
                             "--reviewers",
                             str(path),
+                            "--watchers",
+                            str(watchers),
                             "--repo",
                             REPO,
                             "--pr",

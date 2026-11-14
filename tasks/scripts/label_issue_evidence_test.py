@@ -51,6 +51,7 @@ class API:
             "changed_files": 1,
         }
         self.labels = ["state:accepted", "area:old"]
+        self.watchers = "### topic:sdk\n\nWatcher subscriptions.\n"
         self.definitions: list[dict] = [
             {"name": "area:platform", "node_id": "LA"},
             {"name": "topic:sdk", "node_id": "LT"},
@@ -80,6 +81,8 @@ class API:
             return encoded(MAINTAINERS)
         if path == f"{ROOT}/contents/REVIEWERS.md?ref=trusted-sha":
             return encoded(ROSTER)
+        if path == f"{ROOT}/contents/WATCHERS.md?ref=trusted-sha":
+            return encoded(self.watchers)
         if path == f"{ROOT}/contents/CONTRIBUTING.md?ref=trusted-sha":
             return encoded("Canonical contribution and acceptance policy.")
         if path == f"{ROOT}/issues/3":
@@ -599,6 +602,15 @@ class EvidenceTests(unittest.TestCase):
                 path == f"{ROOT}/contents/CONTRIBUTING.md?ref=trusted-sha"
                 for path, _ in self.api.calls
             )
+        )
+
+    def test_watcher_changes_invalidate_notification_policy(self):
+        before = self.prepare()
+        self.api.watchers += "\nNew subscription.\n"
+        after = self.prepare()
+        self.assertNotEqual(before["policy_version"], after["policy_version"])
+        self.assertIn(
+            (f"{ROOT}/contents/WATCHERS.md?ref=trusted-sha", {}), self.api.calls
         )
 
     def test_comment_candidates_verify_collaborator_authority(self):

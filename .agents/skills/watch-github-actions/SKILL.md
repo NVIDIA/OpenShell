@@ -125,11 +125,12 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
-For `Review Readiness`, the reconciliation JSON reports `skipped_non_collaborators`:
-these roster members cannot receive GitHub review requests. Read and triage
-collaborators remain eligible. GitHub API failures identify the operation and HTTP
-status; reviewer-request failures also identify the submitted reviewers. Resolve
-roster membership/access separately from area/topic label validation failures.
+For `Review Readiness`, logs show the plan before reviewer and watcher writes,
+the submitted reviewer JSON, and API operation/status on failure. Reviewer-request
+errors include GitHub's explanation. `skipped_non_collaborators` identifies roster
+members to move to `WATCHERS.md`; `notify_watchers` lists planned mentions.
+See [review routing](../../../CONTRIBUTING.md#before-you-submit-a-change) for eligibility
+and notification rules. Watcher-comment failures fail the run and can be retried.
 
 For Kubernetes app-listener E2E failures during kind setup, inspect the uploaded
 `results/app-listener/cni-setup/` evidence. It includes node and Calico pod
