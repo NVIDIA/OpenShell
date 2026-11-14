@@ -299,7 +299,8 @@ Only the OpenShell gateway and the Agent Sandbox controller should be able to ma
 | `workspace_storage_class` | `server.workspaceStorageClass` | `StorageClass` for workspace PVCs. Set this if the cluster has no default `StorageClass`. |
 | `allowed_pod_annotations` | `gatewayConfig["openshell.drivers.kubernetes"].allowed_pod_annotations` | Pod annotation keys that sandbox templates may set, as exact keys or `<domain>/*` wildcards. Empty (default) rejects all template annotations. Keys under `openshell.ai` and `agents.x-k8s.io` are reserved and can't be allowlisted. |
 | `allowed_pod_labels` | `gatewayConfig["openshell.drivers.kubernetes"].allowed_pod_labels` | Pod label keys that sandbox templates may set, in the same format as `allowed_pod_annotations`. Empty (default) rejects all template labels. Labels select pods for NetworkPolicy rules and Services, so only allow keys that no other rule in the sandbox namespace selects on. |
-| `sandbox_uid` / `sandbox_gid` | `server.sandboxUid` / `server.sandboxGid` | Sandbox pod UID and GID. Takes priority over OpenShift SCC namespace annotations. `sandbox_gid` defaults to the UID. |
+| `sandbox_uid` / `sandbox_gid` | `server.sandboxUid` / `server.sandboxGid` | Sandbox UID/GID defaults below explicit OpenShell namespace assignments and above OpenShift SCC discovery. `sandbox_gid` defaults to the UID. |
+| `require_namespace_identity` | `gatewayConfig.openshell.drivers.kubernetes.require_namespace_identity` | Require an explicit OpenShell namespace UID/GID pair for new sandboxes. Defaults to `false`. |
 | `https_proxy` | `upstreamProxy.url` | Corporate proxy for sandbox egress. |
 | `no_proxy` | `upstreamProxy.noProxy` | Destinations that bypass the corporate proxy. |
 | `proxy_auth_secret_name` / `proxy_auth_secret_key` | `upstreamProxy.authSecret.name` / `.key` | Secret holding the proxy `user:pass` credential. |
@@ -358,12 +359,12 @@ openshell sandbox create \
 
 ## Sandbox User Identity
 
-On Docker and Podman, set `process.run_as_user` and `process.run_as_group` in the creation policy to choose the sandbox user. Selectors accept `sandbox` or numeric IDs from `1` through `4294967294`. Kubernetes and MicroVM select the identity through driver configuration. When a field is unset, the driver supplies it:
+On Docker and Podman, set `process.run_as_user` and `process.run_as_group` in the creation policy to choose the sandbox user. Selectors accept `sandbox` or numeric IDs from `1` through `4294967294`. Kubernetes resolves namespace assignments and driver defaults; MicroVM uses driver configuration. When a field is unset, the driver supplies it:
 
 | Driver | Default identity |
 |---|---|
 | Docker, Podman | The image's `USER`, otherwise `1000`. |
-| Kubernetes | OpenShift SCC namespace annotations, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
+| Kubernetes | Explicit OpenShell namespace assignment, then driver `sandbox_uid` / `sandbox_gid`, then OpenShift SCC discovery, otherwise `10001:10001`. |
 | MicroVM | The image's `sandbox` account, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 
 MicroVM persists the resolved UID:GID with the writable overlay and retains it across restarts, even if driver defaults change. Explicit policy selectors must match that identity. For example, `run_as_user: "10000"` fails when the overlay owner is `1000:1000`; OpenShell reports both values without changing file ownership. The symbolic selector `sandbox` refers to the guest account for that owner, and each omitted selector accepts its driver default. The `WorkloadIdentity` condition in `openshell sandbox get <name>` shows the resolved pair separately from workload readiness. Canonical and exec processes use this same pair; live policy updates cannot change it.
@@ -371,3 +372,32 @@ MicroVM persists the resolved UID:GID with the writable overlay and retains it a
 On Docker and Podman, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user. Kubernetes and MicroVM always use `/sandbox`.
 
 Custom Docker and Podman workspaces use the workload container's writable layer, not a managed named volume. Files survive stop/start of the same container, but removing or replacing that container removes its workspace changes. Export files you need to retain before deleting the sandbox.
+
+### Namespace workload identity
+
+For Kubernetes tenants, the namespace operator can assign the workload identity:
+
+```shell
+kubectl annotate namespace tenant-a \
+  openshell.ai/sandbox-uid="1500" \
+  openshell.ai/sandbox-gid="1600"
+```
+
+Both annotations are required when either is present. Values must be decimal integers from `1` through `4294967294`. Invalid or incomplete assignments prevent sandbox creation, even when the driver has defaults. The pair overrides driver settings and OpenShift SCC discovery; Kubernetes admission restrictions still apply. Without a namespace assignment, existing driver and SCC precedence remains unchanged, including a driver-configured GID overriding the SCC group.
+
+In operator workspace mode, each workspace maps to its pre-provisioned namespace, so one gateway can serve tenants with different pairs. Restrict annotation writes to namespace operators and grant the gateway ServiceAccount `get` access to the target namespaces. Sandbox creators do not need to add identity selectors to policy. Omitted selectors and `sandbox` accept the assigned identity; explicit numeric selectors must match it.
+
+For tenants that require namespace assignments, set `require_namespace_identity = true` under `[openshell.drivers.kubernetes]`. With Helm, use the literal table key:
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    require_namespace_identity: true
+```
+
+This mode rejects missing annotations, denied namespace reads, and timeouts. Driver defaults and SCC annotations do not satisfy it. With the default `false`, failed namespace reads retain the existing fallback behavior and emit a warning; enable the required mode when fallback is unacceptable.
+
+Kubernetes records the resolved pair at creation. Main processes, exec, workspace initialization, and Pod `fsGroup` use that identity. Stop/start and recovery retain it after namespace annotations or driver defaults change. New sandboxes receive the new assignment; existing volumes are not recursively reassigned. `openshell sandbox get <name> --workspace <workspace>` reports the pair in `WorkloadIdentity`, including while the sandbox is stopped.
+
+After an upgrade, existing sandboxes recover their identity from their stored workload template. Missing or inconsistent identity data prevents restart rather than selecting a new identity.
+An invalid persisted identity record appears as `WorkloadIdentity=False`; the sandbox remains visible for operator diagnosis.

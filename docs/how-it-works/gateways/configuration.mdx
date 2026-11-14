@@ -1407,13 +1407,17 @@ sa_token_ttl_secs              = 3600
 # shared roots such as /run, /var, /tmp, and /etc are rejected.
 # Supervisor-to-gateway auth still uses gateway JWTs.
 provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
-# Explicit sandbox UID/GID for the supervisor container securityContext and
-# PVC init container. When unset, the driver auto-detects from OpenShift SCC
-# namespace annotations (openshift.io/sa.scc.uid-range) if present, falling
-# back to 1000 on non-OpenShift clusters. Any non-root Linux UID/GID is valid.
+# Sandbox UID/GID defaults for workloads, supervisors, and workspace init.
+# An explicit openshell.ai/sandbox-uid and sandbox-gid namespace pair takes
+# precedence. Otherwise these settings override OpenShift SCC discovery,
+# with a final fallback of UID 10001 and GID equal to the UID.
 # Helm sets these with server.sandboxUid and server.sandboxGid.
 # sandbox_uid = 1500
 # sandbox_gid = 1500
+# Require both OpenShell namespace identity annotations for new sandboxes.
+# Missing annotations, denied namespace reads, and timeouts prevent creation.
+# SCC annotations and driver defaults do not satisfy this requirement.
+require_namespace_identity = false
 # Operator-mode namespace discovery. At least one must be set when
 # workspace_mode = "operator". Both can be combined.
 # operator_namespace_label discovers namespaces matching a K8s label selector.

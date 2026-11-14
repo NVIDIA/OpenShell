@@ -72,11 +72,10 @@ async fn wait_sandbox_gone(workspace: &str, sandbox: &str) {
         if ok && !out.contains(sandbox) {
             return;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "sandbox {sandbox} still listed in workspace {workspace} 30s after delete: {out}"
-            );
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sandbox {sandbox} still listed in workspace {workspace} 30s after delete: {out}"
+        );
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -244,9 +243,10 @@ async fn operator_sandbox_in_labeled_namespace() {
         if ok {
             break out;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("sandbox create did not succeed within 30s: {out}");
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sandbox create did not succeed within 30s: {out}"
+        );
         tokio::time::sleep(Duration::from_secs(2)).await;
     };
     assert!(
@@ -288,6 +288,233 @@ async fn operator_sandbox_in_labeled_namespace() {
     assert!(ok, "workspace delete failed: {out}");
 
     delete_namespace(&ns).await;
+}
+
+async fn create_identity_sandbox(namespace: &str, name: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
+    loop {
+        let (ok, out) = run_cli(&[
+            "sandbox", "create", "--workspace", namespace, "--name", name, "--detach", "--",
+            "sh", "-c", "set -eu; if ! test -f /sandbox/canonical-identity; then printf '%s:%s\\n' \"$(id -u)\" \"$(id -g)\" > /sandbox/canonical-identity; sync; fi; exec sleep infinity",
+        ]).await;
+        if ok {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "identity sandbox create failed: {out}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn cli_error_contains(output: &str, expected: &str) -> bool {
+    // Miette wraps identifiers at punctuation and decorates continuation
+    // lines. Compare the error content independently of terminal width.
+    let compact = |text: &str| {
+        text.chars()
+            .filter(|character| !character.is_whitespace() && *character != '│')
+            .collect::<String>()
+    };
+    compact(output).contains(&compact(expected))
+}
+
+async fn assert_identity_create_rejected(namespace: &str, name: &str, expected: &str) {
+    let (ok, out) = run_cli(&[
+        "sandbox",
+        "create",
+        "--workspace",
+        namespace,
+        "--name",
+        name,
+        "--detach",
+        "--",
+        "true",
+    ])
+    .await;
+    assert!(
+        !ok && cli_error_contains(&out, expected),
+        "invalid namespace identity was not rejected and explained: {out}"
+    );
+    let (exists, out) = kubectl(&["get", "sandbox.agents.x-k8s.io", name, "-n", namespace]).await;
+    assert!(
+        !exists,
+        "invalid namespace identity created a workload: {out}"
+    );
+}
+
+async fn assert_tenant_identity(namespace: &str, sandbox: &str, uid: u32, gid: u32) {
+    let script = format!(
+        "set -eu; test \"$(id -u):$(id -g)\" = '{uid}:{gid}'; test \"$(cat /sandbox/canonical-identity)\" = '{uid}:{gid}'; test \"$(stat -c %u:%g /sandbox/canonical-identity)\" = '{uid}:{gid}'; echo tenant-identity-ok"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
+    loop {
+        let (ok, out) = run_cli(&[
+            "sandbox",
+            "exec",
+            "--workspace",
+            namespace,
+            "--name",
+            sandbox,
+            "--no-tty",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .await;
+        if ok {
+            assert!(out.contains("tenant-identity-ok"), "{out}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tenant exec identity failed: {out}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let (ok, out) = run_cli(&[
+        "sandbox",
+        "get",
+        sandbox,
+        "--workspace",
+        namespace,
+        "--output",
+        "json",
+    ])
+    .await;
+    assert!(ok, "sandbox status failed: {out}");
+    let status: serde_json::Value = serde_json::from_str(&out).expect("sandbox status JSON");
+    assert!(
+        status["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|condition| {
+                condition["type"] == "WorkloadIdentity"
+                    && condition["message"] == format!("Resolved workload UID:GID is {uid}:{gid}")
+            }),
+        "status must expose assigned identity: {status}"
+    );
+    let (ok, out) = kubectl(&[
+        "get",
+        "sandbox.agents.x-k8s.io",
+        sandbox,
+        "-n",
+        namespace,
+        "-o",
+        "json",
+    ])
+    .await;
+    assert!(ok, "sandbox template read failed: {out}");
+    let object: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        object["spec"]["podTemplate"]["spec"]["securityContext"]["fsGroup"],
+        gid
+    );
+}
+
+#[tokio::test]
+async fn operator_namespace_workload_identity_is_pinned_across_restart() {
+    let tenant_a = unique_namespace("opidentity-a");
+    let tenant_b = unique_namespace("opidentity-b");
+    let _cleanup_a = OperatorCleanup {
+        workspace: tenant_a.clone(),
+        namespace: tenant_a.clone(),
+        sandboxes: vec![
+            "identity".into(),
+            "new-identity".into(),
+            "invalid-identity".into(),
+            "missing-identity".into(),
+            "incomplete-identity".into(),
+        ],
+    };
+    let _cleanup_b = OperatorCleanup {
+        workspace: tenant_b.clone(),
+        namespace: tenant_b.clone(),
+        sandboxes: vec!["identity".into()],
+    };
+    for (namespace, uid, gid) in [(&tenant_a, 1500, 1600), (&tenant_b, 1700, 1800)] {
+        provision_operator_namespace(namespace).await;
+        let (ok, out) = run_cli(&["workspace", "create", "--name", namespace]).await;
+        assert!(ok, "workspace create failed: {out}");
+        if namespace == &tenant_a
+            && std::env::var("OPENSHELL_E2E_REQUIRE_NAMESPACE_IDENTITY").as_deref() == Ok("1")
+        {
+            assert_identity_create_rejected(
+                namespace,
+                "missing-identity",
+                "namespace identity requires both",
+            )
+            .await;
+        }
+        let (ok, out) = kubectl(&[
+            "annotate",
+            "namespace",
+            namespace,
+            &format!("openshell.ai/sandbox-uid={uid}"),
+            &format!("openshell.ai/sandbox-gid={gid}"),
+        ])
+        .await;
+        assert!(ok, "namespace identity assignment failed: {out}");
+        create_identity_sandbox(namespace, "identity").await;
+        assert_tenant_identity(namespace, "identity", uid, gid).await;
+    }
+    let (ok, out) = kubectl(&[
+        "annotate",
+        "namespace",
+        &tenant_a,
+        "--overwrite",
+        "openshell.ai/sandbox-uid=1900",
+        "openshell.ai/sandbox-gid=2000",
+    ])
+    .await;
+    assert!(ok, "change assignment failed: {out}");
+    assert_tenant_identity(&tenant_a, "identity", 1500, 1600).await;
+    let (ok, out) = run_cli(&["sandbox", "stop", "identity", "--workspace", &tenant_a]).await;
+    assert!(ok, "stop failed: {out}");
+    let (ok, out) = run_cli(&["sandbox", "get", "identity", "--workspace", &tenant_a]).await;
+    assert!(
+        ok && out.contains("1500:1600"),
+        "stopped status lost identity: {out}"
+    );
+    let (ok, out) = run_cli(&["sandbox", "start", "identity", "--workspace", &tenant_a]).await;
+    assert!(ok, "start failed: {out}");
+    assert_tenant_identity(&tenant_a, "identity", 1500, 1600).await;
+    assert_tenant_identity(&tenant_b, "identity", 1700, 1800).await;
+    create_identity_sandbox(&tenant_a, "new-identity").await;
+    assert_tenant_identity(&tenant_a, "new-identity", 1900, 2000).await;
+
+    // An invalid operator assignment must fail before a workload is created.
+    let (ok, out) = kubectl(&[
+        "annotate",
+        "namespace",
+        &tenant_a,
+        "--overwrite",
+        "openshell.ai/sandbox-gid=0",
+    ])
+    .await;
+    assert!(ok, "invalid assignment fixture failed: {out}");
+    assert_identity_create_rejected(
+        &tenant_a,
+        "invalid-identity",
+        "openshell.ai/sandbox-gid must be a decimal integer between 1 and 4294967294",
+    )
+    .await;
+    let (ok, out) = kubectl(&[
+        "annotate",
+        "namespace",
+        &tenant_a,
+        "openshell.ai/sandbox-gid-",
+    ])
+    .await;
+    assert!(ok, "incomplete assignment fixture failed: {out}");
+    assert_identity_create_rejected(
+        &tenant_a,
+        "incomplete-identity",
+        "namespace identity requires both",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -400,9 +627,10 @@ async fn operator_workspace_delete_preserves_namespace() {
         if ok {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("sandbox create did not succeed within 30s: {out}");
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sandbox create did not succeed within 30s: {out}"
+        );
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
@@ -462,9 +690,10 @@ async fn operator_label_removal_blocks_sandbox_creation() {
         if ok {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("sandbox create did not succeed within 30s: {out}");
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sandbox create did not succeed within 30s: {out}"
+        );
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
@@ -501,12 +730,11 @@ async fn operator_label_removal_blocks_sandbox_creation() {
         }
         // Sandbox was created despite label removal — clean it up and retry.
         let _ = run_cli(&["sandbox", "delete", "lbl-sb2", "--workspace", &ns]).await;
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "sandbox creation still succeeds 30s after operator label removal; \
-                 watcher did not remove namespace from allowlist"
-            );
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sandbox creation still succeeds 30s after operator label removal; \
+             watcher did not remove namespace from allowlist"
+        );
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
