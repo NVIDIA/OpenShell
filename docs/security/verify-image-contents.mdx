@@ -4,7 +4,7 @@
 title: "Verify the Contents of Published OpenShell Images"
 sidebar-title: "Verify Image Contents"
 slug: "security/verify-image-contents"
-description: "Read the SBOM attestation attached to published gateway and supervisor images to audit what each image contains."
+description: "Verify OCI artifact signatures and inspect the SBOMs attached to published OpenShell images."
 keywords: "Generative AI, Cybersecurity, Supply Chain, SBOM, Container Images"
 position: 2
 ---
@@ -14,6 +14,24 @@ Published gateway and supervisor images carry one SPDX SBOM per platform as OCI 
 Stable releases publish rebuilt images under version tags such as `0.4.3`.
 Promoting a prerelease preserves its commit-SHA image tags, which continue to
 identify the images used for qualification.
+
+## Verify OCI Signatures
+
+Release, Pre-release, and Release Dev sign the `gateway`, `sandbox`, and `supervisor` images and both OCI charts (`helm-chart` and `openshell-workspace`) with [cosign](https://docs.sigstore.dev/quickstart/quickstart-cosign/). Signatures cover the manifest digest, including the multi-platform image index, and use the publishing workflow's GitHub Actions identity. They are stored alongside the artifacts in GHCR. Older releases may not have signatures.
+
+Use cosign 3 to verify an artifact before using it. Resolve the tag once and verify the digest you intend to deploy:
+
+```shell
+ARTIFACT=ghcr.io/nvidia/openshell/gateway:latest
+DIGEST=$(docker buildx imagetools inspect "${ARTIFACT}" --format '{{.Manifest.Digest}}')
+cosign verify "${ARTIFACT%:*}@${DIGEST}" \
+  --certificate-identity 'https://github.com/NVIDIA/OpenShell/.github/workflows/release-publish.yml@refs/heads/main' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+```
+
+For a chart, set `ARTIFACT` to `ghcr.io/nvidia/openshell/helm-chart:<version>` or `ghcr.io/nvidia/openshell/openshell-workspace:<version>` without the `oci://` prefix.
+
+The identity above applies to releases dispatched from `main`. For a prerelease triggered by a tag, use `refs/tags/vX.Y.Z-pre.N`; for a release from a support branch, use that branch's `refs/heads/...` value. Dev artifacts use `release-dev.yml@refs/heads/main`. Always match the expected workflow and ref, as well as the GitHub Actions issuer.
 
 ## Inspect an Image
 

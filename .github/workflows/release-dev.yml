@@ -520,6 +520,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -531,6 +532,23 @@ jobs:
           app-version: dev
           release-kind: dev
           pin-sha: ${{ github.sha }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Sign OCI artifacts
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for artifact in \
+            "gateway:${IMAGE_TAG}" "sandbox:${IMAGE_TAG}" "supervisor:${IMAGE_TAG}" \
+            helm-chart:0.0.0-dev openshell-workspace:0.0.0-dev \
+            "helm-chart:0.0.0-dev.${IMAGE_TAG}" "openshell-workspace:0.0.0-dev.${IMAGE_TAG}"; do
+            image="ghcr.io/nvidia/openshell/${artifact}"
+            digest=$(docker buildx imagetools inspect "${image}" --format '{{.Manifest.Digest}}')
+            cosign sign --yes "${image%:*}@${digest}"
+          done
 
   publish-fern-docs:
     name: Sync and Publish Fern Docs
