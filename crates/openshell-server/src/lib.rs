@@ -14,6 +14,7 @@
 //! external endpoint; it does not switch on driver names.
 
 mod auth;
+mod bus_sweeper;
 pub mod certgen;
 pub mod cli;
 mod compute;
@@ -1293,13 +1294,18 @@ pub(crate) async fn run_server(
     }
 
     startup_tx.send_replace(true);
-    // The poller exists to observe writes made by other replicas. Single-
-    // replica backends have none, so it would only add load.
+    // The poller and sweeper exist to observe writes made by other replicas.
+    // Single-replica backends have none, so they would only add load.
     if !store.is_single_replica() {
         sandbox_watch::spawn_store_poller(
             store.clone(),
             state.sandbox_watch_bus.clone(),
             sandbox_watch::DEFAULT_STORE_POLL_INTERVAL,
+            shutdown_rx.clone(),
+        );
+        bus_sweeper::spawn(
+            store.clone(),
+            state.tracing_log_bus.clone(),
             shutdown_rx.clone(),
         );
     }

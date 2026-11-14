@@ -170,7 +170,7 @@ Model Context Protocol (MCP) support, server and client implementations, and sta
 
 ### topic:networking
 
-General network transport, connectivity, and proxy behavior not covered by the more specialized L7 category.
+General network transport, connectivity, and proxy behavior.
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
@@ -236,9 +236,42 @@ High availability, failure recovery, retries, graceful degradation, fault tolera
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 
-### topic:sdk
+### topic:sdk:go
 
-Software Development Kit (SDK) creation, maintenance, language bindings, and distribution.
+Go SDK implementation, maintenance, interfaces, and distribution.
+
+| Name | GitHub ID | Company/Organization |
+| --- | --- | --- |
+| Krzysztof Malczuk | [@2000krysztof](https://github.com/2000krysztof) | Red Hat |
+| Max Dubrinsky | [@maxdubrinsky](https://github.com/maxdubrinsky) | Gretel |
+| Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
+| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
+
+### topic:sdk:python
+
+Python SDK implementation, maintenance, interfaces, and distribution.
+
+| Name | GitHub ID | Company/Organization |
+| --- | --- | --- |
+| Krzysztof Malczuk | [@2000krysztof](https://github.com/2000krysztof) | Red Hat |
+| Max Dubrinsky | [@maxdubrinsky](https://github.com/maxdubrinsky) | Gretel |
+| Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
+| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
+
+### topic:sdk:rust
+
+Rust SDK implementation, maintenance, interfaces, and distribution.
+
+| Name | GitHub ID | Company/Organization |
+| --- | --- | --- |
+| Krzysztof Malczuk | [@2000krysztof](https://github.com/2000krysztof) | Red Hat |
+| Max Dubrinsky | [@maxdubrinsky](https://github.com/maxdubrinsky) | Gretel |
+| Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
+| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
+
+### topic:sdk:typescript
+
+TypeScript SDK implementation, maintenance, interfaces, and distribution.
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |

@@ -34,61 +34,101 @@ let
     openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
     openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
   };
-  # A fedora-podman-<podman> environment ("rootful" or "rootless") with more
-  # setup playbooks after the base ones.
-  fedoraPodman =
+  fedoraPodman = podman: {
+    machine = "fedora";
+    driver = "podman";
+    use_galaxy = false;
+    playbooks = [
+      "ansible/playbooks/nextest.yaml"
+      "ansible/playbooks/test-tools.yaml"
+      "ansible/playbooks/selinux.yaml"
+      "ansible/playbooks/podman-${podman}.yaml"
+    ];
+  };
+  # Base environments, keyed by name: a machine and the playbooks that set up
+  # its container engine (or k3s).
+  bases = {
+    ubuntu-docker-rootful = {
+      machine = "ubuntu";
+      driver = "docker";
+      use_galaxy = true;
+      playbooks = [
+        "ansible/playbooks/nextest.yaml"
+        "ansible/playbooks/test-tools.yaml"
+        "ansible/playbooks/docker.yaml"
+      ];
+    };
+    ubuntu-k3s = {
+      machine = "ubuntu";
+      use_galaxy = false;
+      playbooks = [
+        "ansible/playbooks/nextest.yaml"
+        "ansible/playbooks/test-tools.yaml"
+        "ansible/playbooks/k3s.yaml"
+      ];
+    };
+    fedora-podman-rootful = fedoraPodman "rootful";
+    fedora-podman-rootless = fedoraPodman "rootless";
+  };
+  dockerBases = [ "ubuntu-docker-rootful" ];
+  podmanBases = [
+    "fedora-podman-rootful"
+    "fedora-podman-rootless"
+  ];
+  # An environment named <base>-<suffix>: a base with more setup playbooks and
+  # the inputs they read, run after the base's own. A base with a compute driver
+  # also passes it as `environment_driver`, for setup that configures the
+  # gateway's driver table.
+  withSetup =
+    base: suffix: setup:
+    let
+      parent = bases.${base};
+    in
     {
-      name,
-      podman,
-      playbooks,
-      inputs,
-    }:
-    {
-      inherit name;
-      machine = "fedora";
+      name = "${base}-${suffix}";
+      inherit (parent) machine;
       setup = {
-        use_galaxy = false;
-        playbooks = [
-          "ansible/playbooks/nextest.yaml"
-          "ansible/playbooks/test-tools.yaml"
-          "ansible/playbooks/selinux.yaml"
-          "ansible/playbooks/podman-${podman}.yaml"
-        ]
-        ++ playbooks;
-        inherit inputs;
+        inherit (parent) use_galaxy;
+        playbooks = parent.playbooks ++ setup.playbooks;
+        inputs =
+          (if parent ? driver then { environment_driver = parent.driver; } else { })
+          // (setup.inputs or { });
       };
     };
-  # fedora-podman-{rootful,rootless}-keycloak run Keycloak for the
-  # keycloak-provider-refresh suite.
-  keycloakEnvironments = map (
-    podman:
-    fedoraPodman {
-      name = "fedora-podman-${podman}-keycloak";
-      inherit podman;
-      playbooks = [ "ansible/playbooks/keycloak.yaml" ];
-      inputs.keycloak_realm_file = "../../scripts/keycloak-realm.json";
-    }
-  ) podmanModes;
-  # fedora-podman-{rootful,rootless}-userns-{default,auto,keep-id,private}
-  # configure the Podman gateway's user-namespace mode, for the Podman driver
-  # suite. Every installer applies the mode through
-  # /etc/openshell-test/gateway-overrides.toml.
+  # Feature environments, <base>-<feature>, one per base the feature supports.
+  # A suite that needs a feature's setup runs in that environment, so the setup
+  # lands in a cached layer and other suites don't carry it.
+  features = {
+    # Keycloak, for the keycloak-provider-refresh suite.
+    keycloak = {
+      bases = dockerBases ++ podmanBases;
+      setup = {
+        playbooks = [ "ansible/playbooks/keycloak.yaml" ];
+        inputs.keycloak_realm_file = "../../scripts/keycloak-realm.json";
+      };
+    };
+    # Hardware-free CDI fixtures, for the cdi suite.
+    cdi = {
+      bases = dockerBases ++ podmanBases;
+      setup.playbooks = [ "ansible/playbooks/cdi.yaml" ];
+    };
+  };
+  featureEnvironments = pkgs.lib.concatMap (
+    feature: map (base: withSetup base feature features.${feature}.setup) features.${feature}.bases
+  ) (builtins.attrNames features);
+  # <podman base>-userns-{default,auto,keep-id,private} configure the Podman
+  # gateway's user-namespace mode, for the Podman driver suite. Every installer
+  # applies the mode through /etc/openshell-test/gateway-overrides.toml.
   podmanUsernsEnvironments = pkgs.lib.concatMap (
-    podman:
+    base:
     map (
       userns:
-      fedoraPodman {
-        name = "fedora-podman-${podman}-userns-${userns}";
-        inherit podman;
+      withSetup base "userns-${userns}" {
         playbooks = [ "ansible/playbooks/drivers/podman/userns.yaml" ];
         inputs.podman_userns_mode = userns;
       }
     ) podmanUsernsModes
-  ) podmanModes;
-  podmanModes = [
-    "rootful"
-    "rootless"
-  ];
+  ) podmanBases;
   podmanUsernsModes = [
     "default"
     "auto"
@@ -107,75 +147,16 @@ let
       }
     ];
 
-    environments = [
-      {
-        name = "ubuntu-docker-rootful";
-        machine = "ubuntu";
+    environments =
+      pkgs.lib.mapAttrsToList (name: base: {
+        inherit name;
+        inherit (base) machine;
         setup = {
-          use_galaxy = true;
-          playbooks = [
-            "ansible/playbooks/nextest.yaml"
-            "ansible/playbooks/test-tools.yaml"
-            "ansible/playbooks/docker.yaml"
-          ];
+          inherit (base) use_galaxy playbooks;
         };
-      }
-      {
-        name = "ubuntu-docker-rootful-keycloak";
-        machine = "ubuntu";
-        setup = {
-          use_galaxy = true;
-          playbooks = [
-            "ansible/playbooks/nextest.yaml"
-            "ansible/playbooks/docker.yaml"
-            "ansible/playbooks/keycloak.yaml"
-          ];
-          inputs = {
-            keycloak_realm_file = "../../scripts/keycloak-realm.json";
-          };
-        };
-      }
-      {
-        name = "ubuntu-k3s";
-        machine = "ubuntu";
-        setup = {
-          use_galaxy = false;
-          playbooks = [
-            "ansible/playbooks/nextest.yaml"
-            "ansible/playbooks/test-tools.yaml"
-            "ansible/playbooks/k3s.yaml"
-          ];
-        };
-      }
-      {
-        name = "fedora-podman-rootful";
-        machine = "fedora";
-        setup = {
-          use_galaxy = false;
-          playbooks = [
-            "ansible/playbooks/nextest.yaml"
-            "ansible/playbooks/test-tools.yaml"
-            "ansible/playbooks/selinux.yaml"
-            "ansible/playbooks/podman-rootful.yaml"
-          ];
-        };
-      }
-      {
-        name = "fedora-podman-rootless";
-        machine = "fedora";
-        setup = {
-          use_galaxy = false;
-          playbooks = [
-            "ansible/playbooks/nextest.yaml"
-            "ansible/playbooks/test-tools.yaml"
-            "ansible/playbooks/selinux.yaml"
-            "ansible/playbooks/podman-rootless.yaml"
-          ];
-        };
-      }
-    ]
-    ++ keycloakEnvironments
-    ++ podmanUsernsEnvironments;
+      }) bases
+      ++ featureEnvironments
+      ++ podmanUsernsEnvironments;
 
     installers = [
       {

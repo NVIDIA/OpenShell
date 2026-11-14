@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use openshell_core::proto::{SandboxLogLine, SandboxStreamEvent};
 use openshell_ocsf::OCSF_TARGET;
@@ -58,6 +59,8 @@ struct PerSandbox {
     /// global seq (the other bus owns the missing seqs), so a resume gap can
     /// only be judged by what *this* bus actually dropped.
     last_trimmed_seq: u64,
+    /// Last publish or subscribe, for the orphan sweeper's idle check.
+    last_active: Instant,
 }
 
 impl PerSandbox {
@@ -66,16 +69,25 @@ impl PerSandbox {
             sender: None,
             tail: VecDeque::new(),
             last_trimmed_seq: 0,
+            last_active: Instant::now(),
         }
     }
 
     fn subscribe(&mut self) -> broadcast::Receiver<Arc<CursoredEvent>> {
+        self.last_active = Instant::now();
         self.sender
             .get_or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
             .subscribe()
     }
 
+    /// No publish or subscribe for at least `min_idle`. Live receivers don't
+    /// count: a logs-only watch never learns of a deletion served elsewhere.
+    fn is_idle(&self, min_idle: Duration) -> bool {
+        self.last_active.elapsed() >= min_idle
+    }
+
     fn push(&mut self, cursored: CursoredEvent, tail_cap: usize) {
+        self.last_active = Instant::now();
         let cursored = Arc::new(cursored);
         if let Some(sender) = &self.sender {
             let _ = sender.send(Arc::clone(&cursored));
@@ -366,6 +378,32 @@ impl TracingLogBus {
     /// store read.
     pub fn is_closed(&self, sandbox_id: &str) -> bool {
         SeqAllocator::is_closed_locked(&self.seq.lock(), sandbox_id)
+    }
+
+    /// Sandboxes buffered on either bus that are idle on every bus holding
+    /// them: no publish or subscribe for `min_idle`.
+    pub(crate) fn idle_sandbox_ids(&self, min_idle: Duration) -> Vec<String> {
+        let mut idle: HashMap<String, bool> = self
+            .inner
+            .lock()
+            .expect("tracing bus lock poisoned")
+            .per_id
+            .iter()
+            .map(|(id, per)| (id.clone(), per.is_idle(min_idle)))
+            .collect();
+        for (id, per) in &self
+            .platform_event_bus
+            .inner
+            .lock()
+            .expect("platform event bus lock poisoned")
+            .per_id
+        {
+            let entry = idle.entry(id.clone()).or_insert(true);
+            *entry &= per.is_idle(min_idle);
+        }
+        idle.into_iter()
+            .filter_map(|(id, idle)| idle.then_some(id))
+            .collect()
     }
 
     /// Remove all bus entries for the given sandbox id, including the platform

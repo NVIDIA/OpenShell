@@ -127,6 +127,7 @@ mod tests {
             issuer: "https://idp.example.com".to_string(),
             dangerously_allow_insecure_http: false,
             jwks_allowed_origins: Vec::new(),
+            ca_bundle: None,
             audience: "cli".to_string(),
             jwks_ttl_secs: 3600,
             roles_claim: String::new(),

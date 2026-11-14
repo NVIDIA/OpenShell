@@ -268,7 +268,7 @@ service:
   port: 8080
   # -- Gateway health service port.
   healthPort: 8081
-  # -- Gateway metrics service port.
+  # -- Gateway metrics service port (1-65535). Disable the endpoint with metrics.enabled, not port 0 or false.
   metricsPort: 9090
 
 # Optional TLS and mTLS configuration for the dedicated metrics listener.
@@ -276,6 +276,8 @@ service:
 # Prometheus deployments. Secrets are supplied by the operator; the chart does
 # not generate metrics-specific PKI in this initial integration.
 metrics:
+  # -- Enable the dedicated Prometheus metrics listener and its container and Service ports.
+  enabled: true
   tls:
     # -- Enable TLS for the dedicated metrics listener.
     enabled: false
@@ -709,7 +711,8 @@ server:
     # -- Dot-separated path to the scopes array in the JWT claims.
     scopesClaim: ""
     # -- Name of a ConfigMap containing a CA certificate bundle (key: ca.crt)
-    # for verifying the OIDC issuer's TLS certificate. Required when the
+    # for verifying the OIDC issuer's TLS certificate. These certificates
+    # augment platform trust roots for OIDC requests only. Required when the
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
 

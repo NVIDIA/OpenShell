@@ -465,10 +465,17 @@ memory-based scaling does not guarantee spare capacity for handoff. See the
 
 ## Secure metrics scraping
 
+Metrics are enabled by default on `service.metricsPort: 9090`. Set
+`metrics.enabled=false` to disable the dedicated listener and its container
+and Service ports while retaining the configured port. This does not disable
+OpenTelemetry export. `service.metricsPort` must remain an integer from 1 to
+65535, even when metrics are disabled.
+
 The dedicated metrics endpoint is plaintext by default for compatibility with
 existing Prometheus deployments. Enable `metrics.tls.enabled` to serve it over
-HTTPS. The initial implementation uses operator-provided Kubernetes Secrets;
-it does not generate metrics PKI or create a `ServiceMonitor`.
+HTTPS; this requires `metrics.enabled=true`. The initial implementation uses
+operator-provided Kubernetes Secrets; it does not generate metrics PKI or
+create a `ServiceMonitor`.
 
 A metrics TLS Secret that exists with malformed contents leaves the metrics
 listener disabled at startup while the gateway keeps serving; it never falls

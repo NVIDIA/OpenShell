@@ -413,6 +413,7 @@ service_name = "openshell-gateway"
 
 [openshell.gateway.oidc]
 issuer                           = "https://idp.example.com/realms/openshell"
+ca_bundle                        = "/etc/openshell/oidc-ca.pem" # Optional private issuer CA.
 audience                         = "openshell-cli"
 jwks_ttl_secs                    = 3600 # Must be greater than zero.
 jwks_allowed_origins             = ["https://keys.example.com"] # Default: issuer origin only.
@@ -477,6 +478,8 @@ authentication mechanism accepts them or `allow_unauthenticated_users = true`.
 
 The client-certificate handshake policy has no `require_client_auth` TOML field. Client certificates are optional at the transport layer; gateway RPC authorization enforces the configured user or sandbox identity.
 
+`[openshell.gateway.oidc] ca_bundle` points to a certificate-only PEM bundle for an issuer signed by a private CA. The path must resolve to a regular file no larger than 1 MiB (1,048,576 bytes). The bundle augments platform trust roots for OIDC discovery and JWKS requests only; it does not replace native CA discovery or change trust for provider refresh, token exchange, telemetry, Vault, or other gateway HTTPS clients. Set the same value with `--oidc-ca-bundle` or `OPENSHELL_OIDC_CA_BUNDLE`. For Helm deployments, `server.oidc.caConfigMapName` mounts the ConfigMap's `ca.crt` key and renders this path automatically.
+
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 
 ## Metrics Listener TLS
@@ -526,7 +529,19 @@ Secret that is missing entirely, or a client CA Secret without a `ca.crt`
 key, never reaches the gateway, because kubelet fails the non-optional volume
 mounts and the pod does not start (`FailedMount`).
 
-For a Helm installation, set `metrics.tls.enabled=true` and provide the
+For Helm installations, `metrics.enabled` defaults to `true` and
+`service.metricsPort` defaults to `9090`. Set `metrics.enabled=false` to disable
+the dedicated listener and its container and Service ports while retaining
+the configured port. This does not disable OpenTelemetry export. The port
+must remain an integer from 1 to 65535, even when metrics are disabled.
+
+To migrate from `service.metricsPort: 0` or `false`, set
+`metrics.enabled=false` and restore a valid port such as `9090` in the same
+upgrade. The chart rejects legacy disable values with migration guidance,
+even when `metrics.enabled` is explicitly set, rather than silently enabling
+the endpoint. Metrics TLS requires `metrics.enabled=true`.
+
+Set `metrics.tls.enabled=true` and provide the
 operator-managed Secret names through `metrics.tls.certSecretName` and, for
 mTLS, `metrics.tls.clientCaSecretName`. The chart does not create
 metrics-specific PKI or monitoring resources. It rejects a
@@ -954,7 +969,7 @@ max_payload_bytes = 262144
 timeout = "500ms"
 ```
 
-Each service advertises operation and phase pairs through `Describe`. A sandbox policy attaches the service by its registration `name`; the gateway operator controls which bindings that attachment can use. Registration names must be unique and cannot start with the reserved `openshell/` namespace. The name in the service manifest is for diagnostics only.
+Each service advertises operation and phase pairs through `Describe`. A sandbox policy attaches the service by its registration `name`; the gateway operator controls which bindings that attachment can use. Registration names must be unique and cannot start with the reserved `openshell/` namespace. The name in the service manifest is for diagnostics only. A service that requires the `openshell.supervisor-middleware.http-hooks` capability receives its HTTP bindings through the [HTTP hooks](/extensibility/supervisor-middleware/operations#http).
 
 | `binding_policy` | What the gateway and supervisor require |
 | --- | --- |
@@ -977,7 +992,7 @@ The gateway connects to every registered service and validates `Describe` before
 
 Startup also requires compatible [extension protocol metadata](/extensibility/overview#protocol-negotiation). Upgrade legacy gateways and operator-run services together during a coordinated outage; neither mixed legacy/current pairing is supported. A service rejects a gateway that omits peer metadata, and a gateway rejects a service that omits metadata, uses another protocol major, or requires unsupported gateway capabilities. Protected `GetGatewayInfo` and `openshell gateway info` report the resulting non-secret snapshot.
 
-`max_payload_bytes` is the shared operator limit for inspectable logical payloads across the bindings authorized for this service. It caps HTTP request and response units, replacement bodies, and complete WebSocket text messages and replacements. Whole-response inspection uses it as the stage's total body limit. Streaming response inspection applies it to each unit. The value must be greater than zero, no larger than each binding's advertised `max_payload_bytes` capability, and no larger than the 4 MiB platform maximum. OpenShell rejects oversized values instead of silently clamping them. Binary WebSocket messages are not exposed to V1 middleware, so this field does not limit binary pass-through. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size payload and its protobuf envelope fit on the transport.
+`max_payload_bytes` is the shared operator limit for inspectable logical payloads across the bindings authorized for this service. It caps HTTP request and response units, replacement bodies, and complete WebSocket text messages and replacements. Whole-response inspection uses it as the stage's total body limit. Streaming response inspection applies it to each unit. HTTP hook bindings that advertise a zero limit are excluded from the limit comparison and always get no body modes. The value must be greater than zero, unless every authorized binding is such a binding. Otherwise it must be no larger than each remaining binding's advertised `max_payload_bytes` capability, and no larger than the 4 MiB platform maximum. OpenShell rejects oversized values instead of silently clamping them. Binary WebSocket messages are not exposed to V1 middleware, so this field does not limit binary pass-through. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size payload and its protobuf envelope fit on the transport.
 
 `timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies to HTTP request evaluation, HTTP response preflight and unit exchanges, WebSocket preflight, and each WebSocket message. Accepted streaming protocols have no connection-wide RPC deadline.
 
