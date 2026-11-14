@@ -3,29 +3,32 @@
 
 //! OpenTelemetry export for the gateway.
 //!
-//! Converts selected Rust `tracing` spans into OpenTelemetry traces and
-//! gateway OCSF events into log records, and exports each over OTLP, gRPC or
-//! HTTP/protobuf per collector, when configured.
+//! Converts selected Rust `tracing` spans into OpenTelemetry traces, gateway
+//! OCSF events into log records, and gateway metrics into OTLP metrics, and
+//! exports each over OTLP, gRPC or HTTP/protobuf per collector, when
+//! configured.
 //!
 //! # Configuration split
 //!
 //! `[openshell.gateway.otlp]` decides **whether and where** to export each
 //! signal: a shared `endpoint` enables traces, `[otlp.traces]` overrides
 //! their endpoint, and `[otlp.ocsf]` with `enabled = true` exports OCSF
-//! records, optionally to their own endpoint. `OTEL_EXPORTER_OTLP_*ENDPOINT` is deliberately not
-//! read, so enablement has one source.
+//! records, optionally to their own endpoint. `[otlp.metrics]` with `enabled = true`
+//! pushes gateway metrics, optionally to their own endpoint.
+//! `OTEL_EXPORTER_OTLP_*ENDPOINT` is deliberately not read, so enablement has one source.
 //!
 //! **How** to export — sampling, batching, span limits, transport headers —
 //! is the SDK's `OTEL_*` environment surface, read as the provider is built
 //! and mirrored nowhere here. `docs/how-it-works/gateways/configuration.mdx` documents
 //! the variables operators are likely to want.
 //!
-//! Diagnostic logs and metrics are not exported over OTLP. They have their own
-//! surfaces (the gateway log stream and the Prometheus `/metrics` endpoint).
+//! Diagnostic logs are not exported over OTLP. They have their own surface, the
+//! gateway log stream. Metrics are always available on the Prometheus `/metrics`
+//! endpoint, and are pushed over OTLP in addition when `[otlp.metrics]` is enabled.
 
 use openshell_core::jwt::{OtlpTlsMaterial, SecretOtlpHeaders};
 use openshell_core::sandbox_env::OtlpProtocol;
-use openshell_otel::{OcsfOtlp, OtlpExportConfig, OtlpTarget, ServiceName};
+use openshell_otel::{OcsfOtlp, OtlpExportConfig, OtlpTarget, SdkMeterProvider, ServiceName};
 pub use openshell_otel::{SetupError, TraceContextInterceptor, mark_error};
 #[cfg(test)]
 use opentelemetry_sdk::Resource;
@@ -38,8 +41,8 @@ use crate::config_file::{OtlpCollectorConfig, OtlpConfig};
 /// `service.name` reported when the config file does not override it.
 const DEFAULT_SERVICE_NAME: &str = "openshell-gateway";
 
-/// Instrumentation scope recorded on spans this gateway emits.
-const INSTRUMENTATION_SCOPE: &str = "openshell-gateway";
+/// Instrumentation scope recorded on spans and metrics this gateway emits.
+pub const INSTRUMENTATION_SCOPE: &str = "openshell-gateway";
 
 /// Gateway identity recorded on every exported span.
 #[derive(Debug, Clone, Copy, Default)]
@@ -114,11 +117,12 @@ fn build_provider(
     openshell_otel::build_provider(&export_config(cfg, endpoint, gateway))
 }
 
-/// OTLP export configured by `[openshell.gateway.otlp]`: gateway spans and
-/// OCSF log records, each sent to its own configured collector.
+/// OTLP export configured by `[openshell.gateway.otlp]`: gateway spans, OCSF
+/// log records, and metrics, each sent to its own configured collector.
 pub struct OtlpExport {
     traces: Option<Signal<SdkTracerProvider>>,
     ocsf: Option<Signal<OcsfOtlp>>,
+    metrics: Option<Signal<SdkMeterProvider>>,
     /// Validated collector that supervisors relay workload traces to. The
     /// gateway itself exports nothing for this signal.
     agent: Option<Signal<()>>,
@@ -189,6 +193,18 @@ impl OtlpExport {
                 })
             })
             .transpose()?;
+        let metrics = cfg
+            .metrics
+            .as_ref()
+            .map(|metrics| {
+                let target = target(&metrics.collector)?;
+                Ok::<_, SetupError>(Signal {
+                    endpoint: target.endpoint().to_string(),
+                    protocol: metrics.collector.protocol,
+                    exporter: target.meter_provider()?,
+                })
+            })
+            .transpose()?;
         let agent = cfg
             .agent
             .as_ref()
@@ -203,6 +219,7 @@ impl OtlpExport {
         Ok(Self {
             traces,
             ocsf,
+            metrics,
             agent,
             traces_transport: cfg
                 .traces
@@ -262,13 +279,35 @@ impl OtlpExport {
         self.ocsf.as_ref().map(|ocsf| &ocsf.exporter)
     }
 
-    /// Flush buffered spans, then export queued OCSF records within their
-    /// shutdown budget.
+    /// The collector receiving metrics, when metrics export is enabled.
+    pub fn metrics_endpoint(&self) -> Option<&str> {
+        self.metrics
+            .as_ref()
+            .map(|metrics| metrics.endpoint.as_str())
+    }
+
+    /// The transport to the metrics collector, when metrics export is enabled.
+    pub fn metrics_protocol(&self) -> Option<OtlpProtocol> {
+        self.metrics.as_ref().map(|metrics| metrics.protocol)
+    }
+
+    /// The meter provider, when metrics export is enabled.
+    pub fn meter_provider(&self) -> Option<&SdkMeterProvider> {
+        self.metrics.as_ref().map(|metrics| &metrics.exporter)
+    }
+
+    /// Flush buffered spans and metrics, then export queued OCSF records
+    /// within their shutdown budget.
     pub async fn shutdown(self) {
         if let Some(traces) = self.traces
             && let Err(err) = traces.exporter.shutdown()
         {
             tracing::warn!(error = %err, "OTLP tracer provider shutdown failed");
+        }
+        if let Some(metrics) = self.metrics
+            && let Err(err) = metrics.exporter.shutdown()
+        {
+            tracing::warn!(error = %err, "OTLP meter provider shutdown failed");
         }
         if let Some(ocsf) = self.ocsf {
             ocsf.exporter.shutdown().await;
@@ -750,7 +789,9 @@ pub mod test_exporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_file::{AgentOtlpConfig, OcsfOtlpConfig, OtlpTracesConfig};
+    use crate::config_file::{
+        AgentOtlpConfig, OcsfOtlpConfig, OtlpMetricsConfig, OtlpTracesConfig,
+    };
     use crate::test_environment::Environment;
     use openshell_core::sandbox_env::OtlpProtocol;
 
@@ -765,7 +806,14 @@ mod tests {
                 collector: OtlpCollectorConfig::new(endpoint, OtlpProtocol::Grpc),
             }),
             ocsf: None,
+            metrics: None,
             agent: None,
+        }
+    }
+
+    fn metrics_config(endpoint: &str) -> OtlpMetricsConfig {
+        OtlpMetricsConfig {
+            collector: OtlpCollectorConfig::new(endpoint, OtlpProtocol::Grpc),
         }
     }
 
@@ -937,6 +985,7 @@ mod tests {
                 collector: collector("https://shared:4317"),
                 schema_version: None,
             }),
+            metrics: None,
             agent: Some(AgentOtlpConfig {
                 collector: collector("https://agents:4318"),
             }),
@@ -973,7 +1022,45 @@ mod tests {
         let export = export.expect("OCSF log export");
         assert!(export.tracer_provider().is_none());
         assert!(export.ocsf().is_some());
+        assert!(export.meter_provider().is_none());
         export.shutdown().await;
+
+        cfg.ocsf = None;
+        cfg.metrics = Some(metrics_config("http://metrics:4317"));
+        let (export, error) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("metrics export");
+        assert_eq!(export.metrics_endpoint(), Some("http://metrics:4317"));
+        assert!(export.meter_provider().is_some());
+        assert!(export.ocsf().is_none());
+        export.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metrics_reach_an_otlp_collector_over_grpc() {
+        let collector = openshell_otel_test_support::OtlpTestServer::start().await;
+        let mut cfg = config();
+        cfg.traces = None;
+        cfg.metrics = Some(metrics_config(collector.endpoint()));
+        let (export, error) = OtlpExport::start(
+            Some(&cfg),
+            GatewayResourceAttributes::new(Some("test-gateway"), Some("docker")),
+        );
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("OTLP export");
+        let recorder =
+            crate::gateway_metrics::otlp_recorder(export.meter_provider().expect("metrics export"));
+        metrics::with_local_recorder(&recorder, || {
+            crate::gateway_metrics::record_relay_expired(2);
+        });
+        export.shutdown().await;
+        let received = collector.shutdown().await;
+
+        assert_eq!(received.gateway_names, ["test-gateway"]);
+        assert_eq!(
+            received.metric_names,
+            [crate::gateway_metrics::RELAY_EXPIRED_TOTAL]
+        );
     }
 
     #[tokio::test]
@@ -1388,6 +1475,8 @@ mod tests {
     async fn misconfigured_endpoint_disables_export_without_failing_startup() {
         let mut bad_ocsf = config();
         bad_ocsf.ocsf = Some(ocsf_config("definitely not a url"));
+        let mut bad_metrics = config();
+        bad_metrics.metrics = Some(metrics_config("definitely not a url"));
         let mut bad_agent = config();
         bad_agent.agent = Some(AgentOtlpConfig {
             collector: OtlpCollectorConfig::new("definitely not a url", OtlpProtocol::Grpc),
@@ -1395,6 +1484,7 @@ mod tests {
         for cfg in [
             with_traces_endpoint("definitely not a url"),
             bad_ocsf,
+            bad_metrics,
             bad_agent,
         ] {
             let (export, err) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());

@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-otel"
-description = "Shared OpenTelemetry trace and log export support for OpenShell services"
+description = "Shared OpenTelemetry trace, log, and metric export support for OpenShell services"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,12 +19,13 @@ http-body-util = { workspace = true, optional = true }
 hyper-rustls = { version = "0.27", default-features = false, optional = true, features = ["http1", "logging", "tls12"] }
 hyper-util = { workspace = true, optional = true, features = ["client-legacy", "http1", "tokio"] }
 metrics = { workspace = true, optional = true }
+metrics-util = { workspace = true, optional = true }
 openshell-crypto = { workspace = true, optional = true }
 openshell-ocsf = { path = "../openshell-ocsf", optional = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-http = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true, features = ["gzip-http", "http-proto", "logs"] }
+opentelemetry-otlp = { workspace = true, optional = true, features = ["gzip-http", "http-proto", "logs", "metrics"] }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -61,6 +62,7 @@ export = [
     "dep:hyper-rustls",
     "dep:hyper-util",
     "dep:metrics",
+    "dep:metrics-util",
     "dep:openshell-crypto",
     "dep:openshell-ocsf",
     "dep:opentelemetry-http",
@@ -74,6 +76,7 @@ export = [
     "dep:tracing-subscriber",
     "dep:zeroize",
     "opentelemetry_sdk/logs",
+    "opentelemetry_sdk/metrics",
 ]
 
 [lints]

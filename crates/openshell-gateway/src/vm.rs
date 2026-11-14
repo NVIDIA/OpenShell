@@ -945,6 +945,7 @@ mod tests {
             service_name: None,
             traces: Some(OtlpTracesConfig { collector }),
             ocsf: None,
+            metrics: None,
             agent: None,
         };
         let mut command = tokio::process::Command::new("openshell-driver-vm");
@@ -982,6 +983,7 @@ mod tests {
                     ),
                 }),
                 ocsf: None,
+                metrics: None,
                 agent: None,
             }),
             "production-us-west",
@@ -1014,6 +1016,7 @@ mod tests {
                     ),
                 }),
                 ocsf: None,
+                metrics: None,
                 agent: None,
             }),
             "production-us-west",
@@ -1049,6 +1052,7 @@ mod tests {
                     ),
                     schema_version: Some("2.0".into()),
                 }),
+                metrics: None,
                 agent: None,
             }),
             "production-us-west",
@@ -1081,6 +1085,7 @@ mod tests {
                 service_name: None,
                 traces: None,
                 ocsf: None,
+                metrics: None,
                 agent: Some(AgentOtlpConfig {
                     collector: OtlpCollectorConfig::new(
                         "http://agents.internal:4318",

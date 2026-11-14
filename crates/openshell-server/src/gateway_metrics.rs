@@ -16,9 +16,15 @@
 use std::time::{Duration, Instant};
 
 use metrics::{
-    Gauge, Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
+    Gauge, Recorder, Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge,
+    histogram,
 };
-use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{
+    BuildError, Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
+};
+use metrics_util::layers::FanoutBuilder;
+use openshell_otel::{MetricsBridge, SdkMeterProvider};
+use opentelemetry::metrics::MeterProvider as _;
 use tonic::{Code, Status};
 
 // Gauges
@@ -241,16 +247,50 @@ pub fn configure_exporter(builder: PrometheusBuilder) -> Result<PrometheusBuilde
         })
 }
 
+/// The recorder that pushes every metric through `provider`. Every histogram uses the latency
+/// buckets, since each one records seconds.
+pub fn otlp_recorder(provider: &SdkMeterProvider) -> MetricsBridge {
+    MetricsBridge::new(
+        provider.meter(crate::otel_tracing::INSTRUMENTATION_SCOPE),
+        LATENCY_BUCKETS_SECONDS.to_vec(),
+    )
+}
+
 /// Install the process-wide recorder, then describe and zero-initialize the catalog. Call
-/// once, from `run_server`. `mutation_lock_connections` is the `PostgreSQL` lock pool size,
-/// `None` on a backend without a lock pool.
+/// once, from `run_server`. Metrics go to the returned Prometheus handle when `prometheus` is
+/// set, and to `otlp` when it is given. With neither, nothing is installed.
+/// `mutation_lock_connections` is the `PostgreSQL` lock pool size, `None` on a backend without a
+/// lock pool.
 pub fn install_global_recorder(
     relay: RelayCapacity,
     mutation_lock_connections: Option<u32>,
-) -> Result<PrometheusHandle, BuildError> {
-    let handle = configure_exporter(PrometheusBuilder::new())?.install_recorder()?;
+    prometheus: bool,
+    otlp: Option<&SdkMeterProvider>,
+) -> Result<Option<PrometheusHandle>, String> {
+    let prometheus = prometheus
+        .then(|| {
+            configure_exporter(PrometheusBuilder::new()).map(PrometheusBuilder::build_recorder)
+        })
+        .transpose()
+        .map_err(|error: BuildError| error.to_string())?;
+    let handle = prometheus.as_ref().map(PrometheusRecorder::handle);
+    match (prometheus, otlp.map(otlp_recorder)) {
+        (None, None) => return Ok(None),
+        (Some(prometheus), None) => set_global_recorder(prometheus)?,
+        (None, Some(otlp)) => set_global_recorder(otlp)?,
+        (Some(prometheus), Some(otlp)) => set_global_recorder(
+            FanoutBuilder::default()
+                .add_recorder(prometheus)
+                .add_recorder(otlp)
+                .build(),
+        )?,
+    }
     describe_and_initialize(relay, mutation_lock_connections);
     Ok(handle)
+}
+
+fn set_global_recorder(recorder: impl Recorder + Sync + 'static) -> Result<(), String> {
+    metrics::set_global_recorder(recorder).map_err(|error| error.to_string())
 }
 
 /// Emit HELP metadata, create every fixed-label series at 0, and publish the relay caps and,
@@ -587,12 +627,11 @@ pub struct MetricsCapture {
 impl MetricsCapture {
     pub fn install() -> Self {
         // Leaked (test only, one small allocation per test) so the guard can borrow it for 'static.
-        let recorder: &'static metrics_exporter_prometheus::PrometheusRecorder =
-            Box::leak(Box::new(
-                configure_exporter(PrometheusBuilder::new())
-                    .expect("valid exporter config")
-                    .build_recorder(),
-            ));
+        let recorder: &'static PrometheusRecorder = Box::leak(Box::new(
+            configure_exporter(PrometheusBuilder::new())
+                .expect("valid exporter config")
+                .build_recorder(),
+        ));
         let handle = recorder.handle();
         let guard = metrics::set_default_local_recorder(recorder);
         Self {
