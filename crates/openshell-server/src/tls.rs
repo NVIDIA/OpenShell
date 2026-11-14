@@ -3,6 +3,8 @@
 
 //! TLS support using tokio-rustls.
 
+use rustls::pki_types::pem::PemObject as _;
+
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -438,7 +440,7 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         File::open(path).map_err(|e| Error::tls(format!("failed to open cert file: {e}")))?;
     let mut reader = BufReader::new(file);
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_reader_iter(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::tls(format!("failed to parse certificates: {e}")))?;
 
@@ -454,20 +456,11 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(path).map_err(|e| Error::tls(format!("failed to open key file: {e}")))?;
     let mut reader = BufReader::new(file);
 
-    loop {
-        let item = rustls_pemfile::read_one(&mut reader)
-            .map_err(|e| Error::tls(format!("failed to parse key file: {e}")))?;
-
-        match item {
-            Some(rustls_pemfile::Item::Pkcs1Key(key)) => return Ok(key.into()),
-            Some(rustls_pemfile::Item::Pkcs8Key(key)) => return Ok(key.into()),
-            Some(rustls_pemfile::Item::Sec1Key(key)) => return Ok(key.into()),
-            None => break,
-            _ => {}
-        }
-    }
-
-    Err(Error::tls("no private key found in file"))
+    rustls::pki_types::PrivateKeyDer::pem_reader_iter(&mut reader)
+        .next()
+        .transpose()
+        .map_err(|e| Error::tls(format!("failed to parse key file: {e}")))?
+        .ok_or_else(|| Error::tls("no private key found in file"))
 }
 
 /// Build an OCSF context for gateway-level (non-sandbox) events.

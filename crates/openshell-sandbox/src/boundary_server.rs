@@ -13,6 +13,7 @@ use std::path::Path;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use rustls::pki_types::pem::PemObject as _;
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::mem::size_of;
@@ -3503,8 +3504,9 @@ mod linux {
     ) -> io::Result<rustls::ServerConfig> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let certificate_bytes = std::fs::read(&tls.certificate_chain_path)?;
-        let certificates = rustls_pemfile::certs(&mut certificate_bytes.as_slice())
-            .collect::<Result<Vec<_>, _>>()?;
+        let certificates =
+            rustls::pki_types::CertificateDer::pem_reader_iter(&mut certificate_bytes.as_slice())
+                .collect::<Result<Vec<_>, _>>()?;
         if certificates.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -3512,13 +3514,16 @@ mod linux {
             ));
         }
         let private_key_bytes = std::fs::read(&tls.private_key_path)?;
-        let private_key = rustls_pemfile::private_key(&mut private_key_bytes.as_slice())?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "boundary TLS private-key file contains no private key",
-                )
-            })?;
+        let private_key =
+            rustls::pki_types::PrivateKeyDer::pem_reader_iter(&mut private_key_bytes.as_slice())
+                .next()
+                .transpose()?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "boundary TLS private-key file contains no private key",
+                    )
+                })?;
         let mut config =
             rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .with_no_client_auth()
@@ -3965,7 +3970,9 @@ mod linux {
 
         fn test_client_config(tls: &SandboxTlsClientConfig) -> rustls::ClientConfig {
             let mut roots = rustls::RootCertStore::empty();
-            for certificate in rustls_pemfile::certs(&mut tls.trust_anchor_pem.as_bytes()) {
+            for certificate in rustls::pki_types::CertificateDer::pem_reader_iter(
+                &mut tls.trust_anchor_pem.as_bytes(),
+            ) {
                 roots
                     .add(certificate.expect("parse test CA"))
                     .expect("add test CA");

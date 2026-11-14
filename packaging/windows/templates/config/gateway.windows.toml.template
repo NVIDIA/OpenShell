@@ -1,0 +1,23 @@
+# OpenShell Windows local developer gateway. Render with Initialize-OpenShell.ps1.
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "mxc"
+
+[openshell.gateway.auth]
+# Only for a trusted, single-user machine. Start script binds IPv4 loopback.
+allow_unauthenticated_users = true
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = @@SIGNING_KEY@@
+public_key_path = @@PUBLIC_KEY@@
+kid_path = @@KID@@
+gateway_id = @@GATEWAY_ID@@
+
+[openshell.drivers.mxc]
+allow_driver_config = true
+wxc_exec_path = @@WXC_EXEC@@
+state_dir = @@MXC_STATE@@
+backend = "process_container"
+debug = false

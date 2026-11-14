@@ -1,0 +1,162 @@
+name: Windows signing candidates
+
+on:
+  push:
+    branches: [shailendra-nv/windows-security-backports]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: ${{ github.sha }}
+  SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL: 0.1.8
+
+jobs:
+  native:
+    name: Native build (${{ matrix.arch }})
+    if: github.repository == 'NVIDIA/OpenShell'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: source
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: automation
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          install: false
+          experimental: true
+          working_directory: source
+      - name: Install pinned Rust toolchain
+        run: |
+          $env:RUSTUP_HOME = "$env:RUNNER_TEMP/openshell-rustup"
+          "RUSTUP_HOME=$env:RUSTUP_HOME" >> $env:GITHUB_ENV
+          rustup set profile minimal
+          rustup toolchain install
+          if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
+      - name: Install cargo-nextest
+        run: mise install --locked github:nextest-rs/nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: source -> target
+          shared-key: windows-security-${{ matrix.arch }}
+          cache-on-failure: true
+          cache-bin: false
+      - name: Build and smoke-test candidate binaries
+        run: ../automation/packaging/windows/build.ps1 -Architecture ${{ matrix.arch }}
+      - name: Native Windows regression tests
+        run: |
+          mise run --skip-tools windows:test:${{ matrix.arch }}
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows regression tests failed' }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-${{ matrix.arch }}
+          path: native-${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: validation-${{ matrix.arch }}
+          path: validation-${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  sdk:
+    name: Build matching SDKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          install: false
+          experimental: true
+      - name: Build SDKs using repository tasks
+        run: |
+          mise install --locked python uv node
+          mise run --skip-tools build:python:wheel
+          mise run --skip-tools sdk:ts:ci
+          mkdir sdk-artifacts
+          cp target/wheels/openshell-0.1.8-py3-none-any.whl sdk-artifacts/
+          cd sdk/typescript
+          npm version 0.1.8 --no-git-tag-version --ignore-scripts
+          npm pack --ignore-scripts --pack-destination ../../sdk-artifacts
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sdk
+          path: sdk-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+  package:
+    name: Package and attest
+    needs: [native, sdk]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: automation
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: inputs
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          install: false
+      - name: Assemble and audit packages
+        run: |
+          cd source
+          mise install --locked uv python github:anchore/syft
+          mise exec uv python github:anchore/syft -- mise run --skip-tools sbom
+          mise exec uv python -- uv run --no-project python ../automation/packaging/windows/package.py
+      - name: Attest candidate ZIP provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*.zip
+          push-to-registry: false
+          create-storage-record: false
+      - name: Save verification bundle
+        run: cp "$BUNDLE_PATH" dist/github-attestation.sigstore.json
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: OpenShell-Windows-0.1.8-signing-candidates
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
