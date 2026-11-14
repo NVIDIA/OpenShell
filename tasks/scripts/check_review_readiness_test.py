@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -602,7 +603,100 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
         load.assert_not_called()
 
 
+class FailureReportTests(unittest.TestCase):
+    GH_COMMAND = (
+        "gh",
+        "api",
+        "repos/o/r/pulls/42/requested_reviewers",
+        "--method",
+        "POST",
+        "--input",
+        "-",
+    )
+
+    def test_escape_data_and_property(self):
+        self.assertEqual(routing._escape_annotation("a%b\r\nc"), "a%25b%0D%0Ac")
+        self.assertEqual(routing._escape_annotation("x:y,z", prop=True), "x%3Ay%2Cz")
+
+    def test_api_failure_includes_method_path_status_and_stderr(self):
+        error = subprocess.CalledProcessError(
+            1,
+            self.GH_COMMAND,
+            stderr="gh: Reviews may only be requested from collaborators. (HTTP 422)\n",
+        )
+        category, message = routing.describe_failure(error)
+        self.assertEqual(category, "GitHub API")
+        self.assertIn("POST repos/o/r/pulls/42/requested_reviewers", message)
+        self.assertIn("exit status 1", message)
+        self.assertIn("HTTP 422", message)
+        self.assertNotIn("--input", message)
+
+    def test_api_failure_with_empty_stderr(self):
+        for stderr in (None, "", "  \n"):
+            error = subprocess.CalledProcessError(1, self.GH_COMMAND, stderr=stderr)
+            _, message = routing.describe_failure(error)
+            self.assertNotIn("None", message)
+            self.assertTrue(message.endswith("(exit status 1)"), message)
+
+    def test_get_is_the_default_method(self):
+        error = subprocess.CalledProcessError(
+            1, ["gh", "api", "repos/o/r/pulls/42", "--method", "GET"], stderr="x"
+        )
+        _, message = routing.describe_failure(error)
+        self.assertIn("GET repos/o/r/pulls/42", message)
+
+    def test_label_error_category(self):
+        self.assertEqual(
+            routing.describe_failure(routing.LabelRoutingError("x")),
+            ("label routing", "x"),
+        )
+
+    def test_other_value_error_is_generic(self):
+        text = "PR routing changed; rerun reconciliation"
+        self.assertEqual(routing.describe_failure(ValueError(text)), ("error", text))
+
+    def test_annotation_only_in_actions(self):
+        error = routing.LabelRoutingError("bad 100%\nlabel")
+        actions, local = io.StringIO(), io.StringIO()
+        routing.report_failure(error, stream=actions, env={"GITHUB_ACTIONS": "true"})
+        routing.report_failure(error, stream=local, env={})
+        self.assertEqual(
+            actions.getvalue(),
+            "Review readiness: bad 100%\nlabel\n"
+            "::error title=Review Readiness%3A label routing::bad 100%25%0Alabel\n",
+        )
+        self.assertEqual(local.getvalue(), "Review readiness: bad 100%\nlabel\n")
+
+    def test_cli_failure_in_actions_prints_annotation(self):
+        errors = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}),
+            mock.patch.object(
+                routing,
+                "check_review_readiness",
+                side_effect=routing.LabelRoutingError("boom"),
+            ),
+            tempfile.TemporaryDirectory() as directory,
+            contextlib.redirect_stderr(errors),
+        ):
+            path = Path(directory) / "REVIEWERS.md"
+            path.write_text(DOCUMENT, encoding="utf-8")
+            result = routing.main(
+                ["--reviewers", str(path), "--repo", REPO, "--pr", "42"]
+            )
+        self.assertEqual(result, 1)
+        self.assertIn(
+            "::error title=Review Readiness%3A label routing::boom", errors.getvalue()
+        )
+
+
 class CliTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("GITHUB_ACTIONS", None)
+
     def test_emits_plan_and_passes_apply_option(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "REVIEWERS.md"

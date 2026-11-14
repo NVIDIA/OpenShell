@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -32,6 +33,49 @@ from label_accepted_work import ACCEPTED_LABEL, check_pr_accepted_work
 HEADER = ["Name", "GitHub ID", "Company/Organization"]
 LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:[-:][a-z0-9]+)*")
 PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)", re.I)
+
+
+class LabelRoutingError(ValueError):
+    """A PR's area/topic labels cannot be routed to reviewers."""
+
+
+def _escape_annotation(text: str, *, prop: bool = False) -> str:
+    """Escape text for a GitHub Actions workflow command."""
+    text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    if prop:
+        text = text.replace(":", "%3A").replace(",", "%2C")
+    return text
+
+
+def describe_failure(exc: Exception) -> tuple[str, str]:
+    """Return a short category and an actionable message for a failure."""
+    if isinstance(exc, LabelRoutingError):
+        return "label routing", str(exc)
+    if isinstance(exc, subprocess.CalledProcessError):
+        command = [str(part) for part in exc.cmd]
+        method = "GET"
+        if "--method" in command[:-1]:
+            method = command[command.index("--method") + 1]
+        path = command[2] if len(command) > 2 else ""
+        message = f"gh api {method} {path} failed"
+        detail = (exc.stderr or "").strip()
+        if detail:
+            message += f": {detail} (exit status {exc.returncode})"
+        else:
+            message += f" (exit status {exc.returncode})"
+        return "GitHub API", message
+    return "error", str(exc)
+
+
+def report_failure(exc: Exception, *, stream=None, env=None) -> None:
+    """Print the failure, plus an Actions error annotation when in Actions."""
+    stream = sys.stderr if stream is None else stream
+    env = os.environ if env is None else env
+    category, message = describe_failure(exc)
+    print(f"Review readiness: {message}", file=stream)
+    if env.get("GITHUB_ACTIONS") == "true":
+        title = _escape_annotation(f"Review Readiness: {category}", prop=True)
+        print(f"::error title={title}::{_escape_annotation(message)}", file=stream)
 
 
 @dataclass(frozen=True)
@@ -315,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
         TypeError,
         subprocess.CalledProcessError,
     ) as exc:
-        print(f"Review readiness: {exc}", file=sys.stderr)
+        report_failure(exc)
         return 1
     print(
         json.dumps(
