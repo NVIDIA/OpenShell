@@ -69,9 +69,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     WorkloadIdentityRequest, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
-use openshell_core::proto_struct::{
-    deserialize_optional_non_empty_string_list, struct_to_json_value,
-};
+use openshell_core::proto_struct::{deserialize_optional_non_empty_string_list, from_struct};
 use openshell_core::{
     NetworkSupervisorTrustBundle, network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES,
 };
@@ -192,8 +190,7 @@ impl VmSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        serde_json::from_value(struct_to_json_value(config))
-            .map_err(|err| format!("invalid vm driver_config: {err}"))
+        from_struct(config).map_err(|err| format!("invalid vm driver_config: {err}"))
     }
 }
 

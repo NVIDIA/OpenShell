@@ -54,9 +54,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
     WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
-use openshell_core::proto_struct::{
-    deserialize_optional_non_empty_string_list, struct_to_json_value,
-};
+use openshell_core::proto_struct::{deserialize_optional_non_empty_string_list, from_struct};
 use openshell_core::{
     AppArmorProfile, Error, ImagePullPolicy, NetworkSupervisorTrustBundle, Result as CoreResult,
     UpstreamProxyConfig,
@@ -786,8 +784,7 @@ impl DockerSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        serde_json::from_value(struct_to_json_value(config))
-            .map_err(|err| format!("invalid docker driver_config: {err}"))
+        from_struct(config).map_err(|err| format!("invalid docker driver_config: {err}"))
     }
 }
 

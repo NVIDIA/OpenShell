@@ -69,7 +69,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
     WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
-use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
+use openshell_core::proto_struct::{from_struct, value_to_json};
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
     GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
@@ -707,8 +707,7 @@ impl KubernetesSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        let json = serde_json::Value::Object(struct_to_json_object(config));
-        let config: Self = serde_json::from_value(json)
+        let config: Self = from_struct(config)
             .map_err(|err| format!("invalid kubernetes driver_config: {err}"))?;
         config
             .validate()
@@ -13113,6 +13112,11 @@ mod tests {
                         "key": "nvidia.com/gpu",
                         "operator": "Exists",
                         "effect": "NoSchedule"
+                    }, {
+                        "key": "maintenance.example.com/pool",
+                        "operator": "Exists",
+                        "effect": "NoExecute",
+                        "tolerationSeconds": 512
                     }]
                 },
                 "containers": {
@@ -13155,6 +13159,10 @@ mod tests {
             pod_template["spec"]["tolerations"][0]["key"],
             serde_json::json!("nvidia.com/gpu")
         );
+        let toleration: k8s_openapi::api::core::v1::Toleration =
+            serde_json::from_value(pod_template["spec"]["tolerations"][1].clone())
+                .expect("transport preserves the integer expected by the Kubernetes API");
+        assert_eq!(toleration.toleration_seconds, Some(512));
         assert_eq!(
             pod_template["spec"]["containers"][0]["resources"]["requests"]["vendor.example/gpu-memory"],
             serde_json::json!("8Gi")

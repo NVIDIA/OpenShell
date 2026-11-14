@@ -3,7 +3,10 @@
 
 //! Helpers for converting `google.protobuf.Struct` values to and from JSON.
 
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::{
+    Deserialize, Deserializer,
+    de::{DeserializeOwned, Error as _},
+};
 
 /// Errors converting JSON values into protobuf well-known types.
 #[derive(Debug, thiserror::Error)]
@@ -11,6 +14,17 @@ pub enum ProtoStructError {
     /// A JSON number cannot be represented exactly by protobuf's double value.
     #[error("JSON number {0} cannot be represented exactly as a protobuf double")]
     UnrepresentableNumber(serde_json::Number),
+}
+
+/// Errors decoding protobuf configuration into a Rust type.
+#[derive(Debug, thiserror::Error)]
+pub enum StructDecodeError {
+    /// A non-finite protobuf number cannot be used as typed configuration.
+    #[error("protobuf configuration contains a non-finite number")]
+    NonFiniteNumber,
+    /// The configuration does not match the requested Rust type.
+    #[error(transparent)]
+    Deserialize(#[from] serde_json::Error),
 }
 
 /// Convert a JSON object into a protobuf Struct.
@@ -69,7 +83,10 @@ fn integer_is_exact_in_f64(integer: u64) -> bool {
             <= f64::MANTISSA_DIGITS
 }
 
-/// Convert a protobuf Struct into a JSON object for typed serde decoding.
+/// Convert a protobuf Struct into a JSON object with lossy numeric conversion.
+///
+/// All numbers become floats, and non-finite numbers become null. Use
+/// [`from_struct`] to decode typed configuration while preserving integers.
 #[must_use]
 pub fn struct_to_json_object(
     config: &prost_types::Struct,
@@ -81,13 +98,95 @@ pub fn struct_to_json_object(
         .collect()
 }
 
-/// Convert a protobuf Struct into a JSON value for typed serde decoding.
+/// Convert a protobuf Struct into a JSON value with lossy numeric conversion.
+///
+/// All numbers become floats, and non-finite numbers become null. Use
+/// [`from_struct`] to decode typed configuration while preserving integers.
 #[must_use]
 pub fn struct_to_json_value(config: &prost_types::Struct) -> serde_json::Value {
     serde_json::Value::Object(struct_to_json_object(config))
 }
 
-/// Convert a protobuf Value into a JSON value for typed serde decoding.
+/// Deserialize protobuf configuration into a Rust type, preserving integers.
+///
+/// Finite integral doubles in the JSON integer range become integers; fractions
+/// and larger finite numbers remain floats. This preserves exactly represented
+/// large integers accepted by [`json_value_to_proto`]. A receiver cannot detect
+/// precision already lost before transport; the producer must enforce exactness.
+/// Use `from_struct::<serde_json::Value>` to obtain the intermediate JSON.
+///
+/// # Errors
+///
+/// Return [`StructDecodeError::NonFiniteNumber`] for non-finite numbers anywhere
+/// in the configuration, or [`StructDecodeError::Deserialize`] if the
+/// configuration does not match the requested type.
+pub fn from_struct<T: DeserializeOwned>(
+    config: &prost_types::Struct,
+) -> Result<T, StructDecodeError> {
+    Ok(serde_json::from_value(struct_to_exact_json(config)?)?)
+}
+
+fn struct_to_exact_json(
+    config: &prost_types::Struct,
+) -> Result<serde_json::Value, StructDecodeError> {
+    config
+        .fields
+        .iter()
+        .map(|(key, value)| value_to_exact_json(value).map(|value| (key.clone(), value)))
+        .collect::<Result<serde_json::Map<_, _>, _>>()
+        .map(serde_json::Value::Object)
+}
+
+// The casts below are preceded by finite, integral and exclusive range guards.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn value_to_exact_json(value: &prost_types::Value) -> Result<serde_json::Value, StructDecodeError> {
+    use prost_types::value::Kind;
+    use serde_json::{Number, Value};
+
+    Ok(match value.kind.as_ref() {
+        Some(Kind::NumberValue(number)) => {
+            if !number.is_finite() {
+                return Err(StructDecodeError::NonFiniteNumber);
+            }
+            // Exclusive upper bounds are intentional: u64::MAX and i64::MAX
+            // round UP when converted to f64. Guard before any integer cast.
+            let integer = if number.fract() == 0.0 {
+                if *number >= 0.0 && *number < u64::MAX as f64 {
+                    Some(Number::from(*number as u64))
+                } else if *number >= i64::MIN as f64 && *number < 0.0 {
+                    Some(Number::from(*number as i64))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Value::Number(
+                integer
+                    .or_else(|| Number::from_f64(*number))
+                    .ok_or(StructDecodeError::NonFiniteNumber)?,
+            )
+        }
+        Some(Kind::StructValue(config)) => struct_to_exact_json(config)?,
+        Some(Kind::ListValue(list)) => Value::Array(
+            list.values
+                .iter()
+                .map(value_to_exact_json)
+                .collect::<Result<_, _>>()?,
+        ),
+        // Only numeric values differ from the compatible general conversion.
+        _ => value_to_json(value),
+    })
+}
+
+/// Convert a protobuf Value into a JSON value with lossy numeric conversion.
+///
+/// All numbers become floats, and non-finite numbers become null. Use
+/// [`from_struct`] to decode typed configuration while preserving integers.
 #[must_use]
 pub fn value_to_json(value: &prost_types::Value) -> serde_json::Value {
     match value.kind.as_ref() {
@@ -175,6 +274,128 @@ mod tests {
             value.as_f64(),
             "protobuf Struct stores all numbers as doubles"
         );
+    }
+
+    #[test]
+    fn typed_configuration_round_trips_recursive_integer_fields() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Limits {
+            max_processes: Option<u32>,
+            max_resident_bytes: u64,
+        }
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Config {
+            service_ports: Vec<u16>,
+            limits: Limits,
+            nested: Vec<Limits>,
+        }
+        let json = serde_json::json!({
+            "service_ports": [8080, 65535],
+            "limits": {"max_processes": 128, "max_resident_bytes": 1_073_741_824},
+            "nested": [{"max_processes": null, "max_resident_bytes": 0}]
+        });
+        let expected: Config = serde_json::from_value(json.clone()).unwrap();
+        let proto = json_object_to_struct(json.as_object().unwrap().clone()).unwrap();
+        let actual: Config = from_struct(&proto).unwrap();
+        assert_eq!(actual, expected);
+        // The general-purpose conversion retains its existing float semantics.
+        assert!(struct_to_json_value(&proto)["service_ports"][0].is_f64());
+    }
+
+    #[test]
+    fn typed_configuration_rejects_nonfinite_numbers() {
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut proto = json_object_to_struct(
+                serde_json::json!({"limits": [{"max_processes": 128}]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+            let Some(prost_types::value::Kind::ListValue(list)) =
+                proto.fields.get_mut("limits").unwrap().kind.as_mut()
+            else {
+                unreachable!();
+            };
+            let Some(prost_types::value::Kind::StructValue(limits)) = list.values[0].kind.as_mut()
+            else {
+                unreachable!();
+            };
+            limits.fields.get_mut("max_processes").unwrap().kind =
+                Some(prost_types::value::Kind::NumberValue(number));
+            assert!(matches!(
+                from_struct::<serde_json::Value>(&proto),
+                Err(StructDecodeError::NonFiniteNumber)
+            ));
+            assert!(struct_to_json_value(&proto)["limits"][0]["max_processes"].is_null());
+        }
+    }
+
+    #[test]
+    fn typed_configuration_preserves_numeric_boundaries() {
+        #[derive(Debug, Deserialize)]
+        struct Limit<T> {
+            limit: T,
+        }
+
+        for integer in [
+            0,
+            9_007_199_254_740_992,
+            9_007_199_254_740_994,
+            1_u64 << 63,
+            u64::MAX - 2047,
+        ] {
+            let proto = json_object_to_struct(
+                serde_json::json!({"limit": integer})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+            let config: Limit<u64> = from_struct(&proto).unwrap();
+            assert_eq!(config.limit, integer);
+        }
+        let proto = json_object_to_struct(
+            serde_json::json!({"limit": i64::MIN})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let config: Limit<i64> = from_struct(&proto).unwrap();
+        assert_eq!(config.limit, i64::MIN);
+        // Fractions and doubles outside the integer range must not be truncated
+        // or saturated into a valid integer configuration value.
+        for number in [1.5, -1.0, 18_446_744_073_709_551_616.0, f64::MAX] {
+            let proto = prost_types::Struct {
+                fields: [(
+                    "limit".to_owned(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::NumberValue(number)),
+                    },
+                )]
+                .into(),
+            };
+            assert!(matches!(
+                from_struct::<Limit<u64>>(&proto),
+                Err(StructDecodeError::Deserialize(_))
+            ));
+        }
+        let below_i64_min = prost_types::Struct {
+            fields: [(
+                "limit".to_owned(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::NumberValue(
+                        -9_223_372_036_854_777_856.0,
+                    )),
+                },
+            )]
+            .into(),
+        };
+        assert!(matches!(
+            from_struct::<Limit<i64>>(&below_i64_min),
+            Err(StructDecodeError::Deserialize(_))
+        ));
     }
 
     #[derive(Debug, Default, Deserialize)]
