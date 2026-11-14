@@ -59,8 +59,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessTelemetryIdInformation};
-use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
+use windows::Wdk::System::Threading::{
+    NtQueryInformationProcess, ProcessBasicInformation, ProcessTelemetryIdInformation,
+};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WIN32_ERROR};
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, ENABLE_TRACE_PARAMETERS,
     ENABLE_TRACE_PARAMETERS_VERSION_2, EVENT_ENABLE_PROPERTY_PROCESS_START_KEY, EVENT_HEADER,
@@ -69,6 +71,9 @@ use windows::Win32::System::Diagnostics::Etw::{
     EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
     PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW, TRACE_EVENT_INFO,
     TRACE_LEVEL_VERBOSE, TdhGetEventInformation, WNODE_FLAG_TRACED_GUID,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
 
@@ -287,6 +292,10 @@ struct CaptureHealth {
     /// Records rejected by the bounded callback queue. A non-zero value means
     /// the OCSF audit trail has a coverage gap.
     dropped_events: AtomicU64,
+    /// Events that reached the consumer but could not be attributed to any
+    /// sandbox before they aged out (or the holding buffer overflowed). A
+    /// non-zero value is an audit coverage gap just like `dropped_events`.
+    unattributed_events: AtomicU64,
     /// Approximate owned bytes currently waiting in the callback queue.
     queued_bytes: AtomicUsize,
     /// Largest observed value of `queued_bytes`, retained for diagnostics.
@@ -337,6 +346,43 @@ impl OverloadReporter {
     }
 }
 
+/// Rate-limited warning for events that arrived but could not be attributed to a
+/// sandbox. Without it such events vanish at `debug` level and the audit trail is
+/// silently empty.
+#[derive(Default)]
+struct UnattributedReporter {
+    last_reported: u64,
+    last_warning: Option<Instant>,
+}
+
+impl UnattributedReporter {
+    fn report_if_due(&mut self, health: &CaptureHealth, force: bool) -> bool {
+        let total = health.unattributed_events.load(Ordering::Relaxed);
+        if total == self.last_reported {
+            return false;
+        }
+        let now = Instant::now();
+        if !force
+            && self
+                .last_warning
+                .is_some_and(|last| now.duration_since(last) < OVERLOAD_WARNING_INTERVAL)
+        {
+            return false;
+        }
+        let since_last_warning = total - self.last_reported;
+        self.last_reported = total;
+        self.last_warning = Some(now);
+        tracing::warn!(
+            target: "mxc_etw",
+            unattributed_events = total,
+            since_last_warning,
+            "MXC ETW audit events could not be attributed to any sandbox and were dropped; \
+             audit coverage has a gap"
+        );
+        true
+    }
+}
+
 /// A running real-time ETW session plus its worker threads. Dropping (or calling
 /// [`EtwSession::stop`]) stops the session and joins the threads.
 pub(crate) struct EtwSession {
@@ -379,6 +425,11 @@ impl EtwSession {
     /// Number of ETW records rejected by the callback queue's count or byte limit.
     pub fn dropped_event_count(&self) -> u64 {
         self.health.dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Events received from the provider that were never attributed to a sandbox.
+    pub fn unattributed_event_count(&self) -> u64 {
+        self.health.unattributed_events.load(Ordering::Relaxed)
     }
 }
 
@@ -426,12 +477,13 @@ pub(crate) fn start_session(
     let health = Arc::new(CaptureHealth::default());
     let consumer_health = health.clone();
     let (tx, rx) = mpsc::sync_channel::<RawEtwEvent>(EVENT_QUEUE_CAPACITY);
-    let processor = EtwEventProcessor::new(index, gateway_name);
+    let processor = EtwEventProcessor::new(index, consumer_health.clone(), gateway_name);
 
     let consumer_thread = std::thread::Builder::new()
         .name("etw-ocsf-consumer".into())
         .spawn(move || {
             let mut overload_reporter = OverloadReporter::default();
+            let mut unattributed_reporter = UnattributedReporter::default();
             // Decode off the pump thread: the callback only copies bytes, so the
             // real-time buffers drain fast and the create burst isn't dropped.
             //
@@ -456,13 +508,16 @@ pub(crate) fn start_session(
                         }
                         processor.drain_and_emit();
                         overload_reporter.report_if_due(&consumer_health, false);
+                        unattributed_reporter.report_if_due(&consumer_health, false);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         processor.drain_and_emit();
                         overload_reporter.report_if_due(&consumer_health, false);
+                        unattributed_reporter.report_if_due(&consumer_health, false);
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         overload_reporter.report_if_due(&consumer_health, true);
+                        unattributed_reporter.report_if_due(&consumer_health, true);
                         break;
                     }
                 }
@@ -1215,8 +1270,12 @@ pub(crate) fn child_process_start_key(child: &tokio::process::Child) -> Result<u
     let expected_pid = child
         .id()
         .ok_or_else(|| "wxc-exec child PID is no longer available".to_string())?;
-    let handle = HANDLE(raw_handle);
+    process_start_key_from_handle(HANDLE(raw_handle), expected_pid)
+}
 
+/// Query the kernel generation key of the process behind `handle`. `expected_pid`
+/// guards against a handle that does not name the process the caller means.
+fn process_start_key_from_handle(handle: HANDLE, expected_pid: u32) -> Result<u64, String> {
     // The fixed telemetry header is followed by optional variable-length
     // strings. Start with ample room and honor the kernel's requested size.
     let mut buffer = vec![0_u8; 4096];
@@ -1259,6 +1318,67 @@ pub(crate) fn child_process_start_key(child: &tokio::process::Child) -> Result<u
     }
 }
 
+/// A process's parent as it is right now: the parent PID and, when the parent is
+/// still reachable, its kernel generation key.
+pub(crate) struct ParentIdentity {
+    pub pid: u32,
+    pub start_key: Option<u64>,
+}
+
+/// Looks up a process's parent. Injected so attribution can be unit-tested
+/// without real processes.
+type ParentLookup = Box<dyn Fn(u32) -> Option<ParentIdentity> + Send>;
+
+struct QueryHandle(HANDLE);
+
+impl Drop for QueryHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `OpenProcess` and is closed exactly once.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn open_for_query(pid: u32) -> Option<QueryHandle> {
+    // SAFETY: plain Win32 call; the returned handle is owned by `QueryHandle`.
+    unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .ok()
+        .map(QueryHandle)
+}
+
+/// Parent of the live process `pid`, with the parent's generation key.
+///
+/// Returns `None` when `pid` is gone or cannot be queried. The generation key
+/// proves *which* process currently owns the parent PID, so a recycled PID cannot
+/// be mistaken for a registered `wxc-exec`.
+pub(crate) fn live_parent_of(pid: u32) -> Option<ParentIdentity> {
+    let child = open_for_query(pid)?;
+    let mut info = PROCESS_BASIC_INFORMATION::default();
+    let mut returned = 0_u32;
+    // SAFETY: `info` outlives the call and the size matches its type.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            child.0,
+            ProcessBasicInformation,
+            std::ptr::addr_of_mut!(info).cast(),
+            u32::try_from(size_of::<PROCESS_BASIC_INFORMATION>()).unwrap_or(u32::MAX),
+            &mut returned,
+        )
+    };
+    if !status.is_ok() {
+        return None;
+    }
+    let parent_pid = u32::try_from(info.InheritedFromUniqueProcessId).ok()?;
+    if parent_pid == 0 {
+        return None;
+    }
+    let start_key = open_for_query(parent_pid)
+        .and_then(|parent| process_start_key_from_handle(parent.0, parent_pid).ok());
+    Some(ParentIdentity {
+        pid: parent_pid,
+        start_key,
+    })
+}
+
 /// A live `wxc-exec` registration. The PID is only an index; the kernel-issued
 /// process start key proves which generation owns it.
 struct PidReg {
@@ -1286,6 +1406,11 @@ pub(crate) struct AttributionIndex {
     /// them here and replay when a later registration/cross-link resolves them.
     /// Bounded by [`PENDING_MAX`] and [`PENDING_TTL`].
     pending: VecDeque<PendingEvent>,
+    /// Events discarded without ever being attributed, not yet added to the
+    /// session's health counter (see [`AttributionIndex::take_unattributed_drops`]).
+    unattributed_dropped: u64,
+    /// Overrides the real parent lookup (tests only).
+    parent_lookup: Option<ParentLookup>,
 }
 
 impl AttributionIndex {
@@ -1450,10 +1575,49 @@ impl AttributionIndex {
                 self.by_pid.get(&ev.process_id).and_then(|r| {
                     (ev.process_start_key == Some(r.process_start_key)).then(|| r.sid.clone())
                 })
-            })?;
+            })
+            .or_else(|| self.resolve_by_launch_ancestry(ev))?;
 
         self.cross_link(&sid, identity, cv, activity);
         Some(sid)
+    }
+
+    /// Attribute a `ProcessLaunched` event through the process it names.
+    ///
+    /// Some OS builds emit every Sandboxing event from the shared broker process
+    /// and none from the `wxc-exec` the driver registered, so the PID match above
+    /// never succeeds and the whole create burst is lost. `ProcessLaunched` names
+    /// the process the OS just started inside the sandbox (`processId`); when that
+    /// process is a child of a live, registered `wxc-exec` it belongs to that
+    /// sandbox. The parent must still carry the registered generation key, so a
+    /// recycled PID cannot hijack the attribution. Resolving this one event
+    /// cross-links its activity id, and the rest of the burst follows through the
+    /// identity/activity/CV correlators.
+    fn resolve_by_launch_ancestry(&self, ev: &DecodedEtwEvent) -> Option<String> {
+        if ev.event_name.as_deref() != Some("ProcessLaunched") {
+            return None;
+        }
+        let launched: u32 = ev.get("processId")?.trim().parse().ok()?;
+        let parent = self
+            .parent_lookup
+            .as_ref()
+            .map_or_else(|| live_parent_of(launched), |lookup| lookup(launched))?;
+        let registration = self.by_pid.get(&parent.pid)?;
+        (parent.start_key == Some(registration.process_start_key)).then(|| registration.sid.clone())
+    }
+
+    /// Record that `ev` is being discarded without ever being attributed. Only
+    /// events that would have been written to the audit trail count as a gap.
+    fn note_unattributed_drop(&mut self, ev: &DecodedEtwEvent, why: &str) {
+        if is_audited_event(ev.event_name.as_deref()) {
+            self.unattributed_dropped += 1;
+        }
+        tracing::debug!(target: "mxc_etw", pid = ev.process_id, "dropping unattributed ({why}) {}", ev.summary());
+    }
+
+    /// Events dropped without attribution since the last call.
+    fn take_unattributed_drops(&mut self) -> u64 {
+        std::mem::take(&mut self.unattributed_dropped)
     }
 
     /// Cross-link the strong keys an event carries to its resolved `sandbox_id`
@@ -1484,7 +1648,7 @@ impl AttributionIndex {
             if now.duration_since(front.at) > PENDING_TTL {
                 let stale = self.pending.pop_front();
                 if let Some(p) = stale {
-                    tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
+                    self.note_unattributed_drop(&p.ev, "aged out");
                 }
             } else {
                 break;
@@ -1493,40 +1657,72 @@ impl AttributionIndex {
         if self.pending.len() >= PENDING_MAX
             && let Some(p) = self.pending.pop_front()
         {
-            tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (buffer full) {}", p.ev.summary());
+            self.note_unattributed_drop(&p.ev, "buffer full");
         }
         self.pending.push_back(PendingEvent { at: now, ev });
     }
 
     /// Re-resolve buffered events. Returns those that now attribute (removed
-    /// from the buffer, in arrival order, ready to emit) and drops any that have
-    /// aged past [`PENDING_TTL`] still unresolved. Callers emit the returned
+    /// from the buffer, ready to emit) and drops any that have aged past
+    /// [`PENDING_TTL`] still unresolved. Resolving one event can teach the index
+    /// a key (activity id, correlation vector, identity) that unlocks another, so
+    /// passes repeat until one resolves nothing new. Callers emit the returned
     /// events *after* releasing the index lock.
     fn drain_resolved(&mut self) -> Vec<(String, String, DecodedEtwEvent)> {
         let now = Instant::now();
         self.purge_expired_retirements(now);
-        if self.pending.is_empty() {
-            return Vec::new();
-        }
-        let drained = std::mem::take(&mut self.pending);
         let mut ready = Vec::new();
-        let mut keep = VecDeque::with_capacity(drained.len());
-        for p in drained {
-            if now.duration_since(p.at) > PENDING_TTL {
-                tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
-                continue;
+        loop {
+            if self.pending.is_empty() {
+                break;
             }
-            match self.resolve(&p.ev) {
-                Some(sid) => {
-                    let name = self.name_of(&sid);
-                    ready.push((sid, name, p.ev));
+            let resolved_before = ready.len();
+            let drained = std::mem::take(&mut self.pending);
+            let mut keep = VecDeque::with_capacity(drained.len());
+            for p in drained {
+                if now.duration_since(p.at) > PENDING_TTL {
+                    self.note_unattributed_drop(&p.ev, "aged out");
+                    continue;
                 }
-                None => keep.push_back(p),
+                match self.resolve(&p.ev) {
+                    Some(sid) => {
+                        let name = self.name_of(&sid);
+                        ready.push((sid, name, p.ev));
+                    }
+                    None => keep.push_back(p),
+                }
+            }
+            self.pending = keep;
+            if ready.len() == resolved_before {
+                break;
             }
         }
-        self.pending = keep;
         ready
     }
+}
+
+/// Whether an event of this name is written to the OCSF audit trail once it is
+/// attributed (the non-default arms of [`EtwEventProcessor::emit_resolved`]).
+///
+/// Losing such an event is an audit gap. Losing any other event (for example a
+/// brokered-launch result that no mapper consumes) is not, so it must not raise
+/// the "events could not be attributed" warning on a healthy host.
+fn is_audited_event(name: Option<&str>) -> bool {
+    matches!(
+        name.unwrap_or(""),
+        "SandboxEngineCreate"
+            | "SandboxCreateWithPolicyEnforcement"
+            | "CreateProcessInSandbox"
+            | "ProcessLaunched"
+            | "SandboxConfig"
+            | "Win32kLockdownApplied"
+            | "ApplyUILimits"
+            | "EnforceOsPolicy"
+            | "SandboxProxyConfigured"
+            | "SandboxConsoleReferencePlumbed"
+            | "ActivityError"
+            | "FallbackError"
+    )
 }
 
 /// Consumer-thread state for attributing ETW events and emitting gateway OCSF.
@@ -1534,14 +1730,31 @@ impl AttributionIndex {
 /// is associated with a potentially different sandbox through `index`.
 struct EtwEventProcessor {
     index: Arc<Mutex<AttributionIndex>>,
+    health: Arc<CaptureHealth>,
     gateway_name: String,
 }
 
 impl EtwEventProcessor {
-    fn new(index: Arc<Mutex<AttributionIndex>>, gateway_name: String) -> Self {
+    fn new(
+        index: Arc<Mutex<AttributionIndex>>,
+        health: Arc<CaptureHealth>,
+        gateway_name: String,
+    ) -> Self {
         Self {
             index,
+            health,
             gateway_name,
+        }
+    }
+
+    /// Move the index's count of never-attributed drops into the session health so
+    /// the warning reporter and `EtwSession::unattributed_event_count` see them.
+    fn publish_unattributed_drops(&self, idx: &mut AttributionIndex) {
+        let dropped = idx.take_unattributed_drops();
+        if dropped > 0 {
+            self.health
+                .unattributed_events
+                .fetch_add(dropped, Ordering::Relaxed);
         }
     }
 
@@ -1571,6 +1784,7 @@ impl EtwEventProcessor {
                     process_start_key = ?ev.process_start_key,
                     "buffering uncorrelated MXC audit event");
                 idx.buffer_unresolved(ev);
+                self.publish_unattributed_drops(&mut idx);
                 None
             }
         };
@@ -1590,7 +1804,9 @@ impl EtwEventProcessor {
                 .index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            idx.drain_resolved()
+            let ready = idx.drain_resolved();
+            self.publish_unattributed_drops(&mut idx);
+            ready
         };
         for (sandbox_id, sandbox_name, ev) in ready {
             self.emit_resolved(&sandbox_id, &sandbox_name, &ev);
@@ -1974,6 +2190,7 @@ mod tests {
     fn event_processor(gateway_name: &str) -> EtwEventProcessor {
         EtwEventProcessor::new(
             Arc::new(Mutex::new(AttributionIndex::new())),
+            Arc::new(CaptureHealth::default()),
             gateway_name.to_string(),
         )
     }
@@ -2468,5 +2685,376 @@ mod tests {
             .push(("commandLine".into(), "\"agent --unique\"".into()));
 
         assert!(idx.resolve(&only_cmd).is_none());
+    }
+
+    /// An instant older than [`PENDING_TTL`], for aging buffered events in tests.
+    fn aged_out() -> Instant {
+        Instant::now()
+            .checked_sub(PENDING_TTL + Duration::from_secs(1))
+            .expect("the monotonic clock has been running longer than the pending TTL")
+    }
+
+    // ---- Launch-ancestry attribution (events emitted only by the OS broker) ----
+
+    /// A broker-emitted event: the emitting PID is the shared broker, never a
+    /// registered `wxc-exec`. `props` are `(name, value)` as TDH decodes them.
+    fn broker_event(name: &str, activity: u128, props: &[(&str, &str)]) -> DecodedEtwEvent {
+        let mut ev = mk_event(11_084, name);
+        ev.process_start_key = Some(5_555);
+        ev.activity_id = GUID::from_u128(activity);
+        ev.props = props
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        ev
+    }
+
+    fn launched(activity: u128, launched_pid: u32) -> DecodedEtwEvent {
+        let pid = launched_pid.to_string();
+        broker_event("ProcessLaunched", activity, &[("processId", &pid)])
+    }
+
+    /// An index whose parent lookup answers from `parents` (child pid -> parent).
+    fn index_with_parents(parents: &[(u32, u32, Option<u64>)]) -> AttributionIndex {
+        let table: Vec<(u32, u32, Option<u64>)> = parents.to_vec();
+        let mut idx = AttributionIndex::new();
+        idx.parent_lookup = Some(Box::new(move |child| {
+            table
+                .iter()
+                .find(|(c, _, _)| *c == child)
+                .map(|&(_, parent, start_key)| ParentIdentity {
+                    pid: parent,
+                    start_key,
+                })
+        }));
+        idx
+    }
+
+    #[test]
+    fn launched_process_child_of_registered_wxc_exec_is_attributed() {
+        // wxc-exec = 100 (start key 1000); the sandbox boundary it spawned = 777.
+        let mut idx = index_with_parents(&[(777, 100, Some(1000))]);
+        idx.register_launch("sbx-1", "one", 100, 1000);
+
+        assert_eq!(
+            idx.resolve(&launched(0xA1, 777)).as_deref(),
+            Some("sbx-1"),
+            "ProcessLaunched must attribute through its parent wxc-exec"
+        );
+    }
+
+    #[test]
+    fn ancestry_anchor_teaches_the_activity_id_to_the_rest_of_the_burst() {
+        let mut idx = index_with_parents(&[(777, 100, Some(1000))]);
+        idx.register_launch("sbx-1", "one", 100, 1000);
+
+        // Arrives first, from the broker, with only an activity id: unresolved.
+        let setup = broker_event("SandboxEngineCreateProcess", 0xA1, &[]);
+        assert!(idx.resolve(&setup).is_none());
+
+        // The anchor resolves and cross-links activity 0xA1 ...
+        assert_eq!(idx.resolve(&launched(0xA1, 777)).as_deref(), Some("sbx-1"));
+        // ... so the event that shares it now resolves.
+        assert_eq!(idx.resolve(&setup).as_deref(), Some("sbx-1"));
+    }
+
+    #[test]
+    fn ancestry_rejects_a_recycled_wxc_exec_pid() {
+        // PID 100 now belongs to a different process: same PID, different key.
+        let mut idx = index_with_parents(&[(777, 100, Some(9_999))]);
+        idx.register_launch("sbx-1", "one", 100, 1000);
+
+        assert!(
+            idx.resolve(&launched(0xA1, 777)).is_none(),
+            "a parent with another generation key must not be attributed"
+        );
+    }
+
+    #[test]
+    fn ancestry_rejects_a_parent_whose_generation_cannot_be_read() {
+        let mut idx = index_with_parents(&[(777, 100, None)]);
+        idx.register_launch("sbx-1", "one", 100, 1000);
+
+        assert!(idx.resolve(&launched(0xA1, 777)).is_none());
+    }
+
+    #[test]
+    fn ancestry_rejects_a_parent_that_is_not_a_registered_wxc_exec() {
+        let mut idx = index_with_parents(&[(777, 555, Some(1000))]);
+        idx.register_launch("sbx-1", "one", 100, 1000);
+
+        assert!(idx.resolve(&launched(0xA1, 777)).is_none());
+    }
+
+    #[test]
+    fn ancestry_rejects_a_process_that_is_gone() {
+        // Lookup finds nothing (the launched process already exited).
+        let mut idx = index_with_parents(&[]);
+        idx.register_launch("sbx-1", "one", 100, 1000);
+
+        assert!(idx.resolve(&launched(0xA1, 777)).is_none());
+    }
+
+    #[test]
+    fn ancestry_applies_only_to_process_launched() {
+        let mut idx = index_with_parents(&[(777, 100, Some(1000))]);
+        idx.register_launch("sbx-1", "one", 100, 1000);
+
+        // Same shape, different event: must not be attributed by ancestry.
+        let other = broker_event("SandboxConfig", 0xA1, &[("processId", "777")]);
+        assert!(idx.resolve(&other).is_none());
+        // And a ProcessLaunched without a usable processId is ignored too.
+        let no_pid = broker_event("ProcessLaunched", 0xA1, &[]);
+        assert!(idx.resolve(&no_pid).is_none());
+        let bad_pid = broker_event("ProcessLaunched", 0xA1, &[("processId", "not-a-pid")]);
+        assert!(idx.resolve(&bad_pid).is_none());
+    }
+
+    #[test]
+    fn concurrent_sandboxes_are_never_mixed_up() {
+        // Two sandboxes share the broker. Each launched process has its own parent.
+        let mut idx = index_with_parents(&[(777, 100, Some(1000)), (888, 200, Some(2000))]);
+        idx.register_launch("sbx-A", "A", 100, 1000);
+        idx.register_launch("sbx-B", "B", 200, 2000);
+
+        assert_eq!(idx.resolve(&launched(0xAA, 777)).as_deref(), Some("sbx-A"));
+        assert_eq!(idx.resolve(&launched(0xBB, 888)).as_deref(), Some("sbx-B"));
+
+        // Events that carry only each sandbox's own activity id stay separate.
+        let a = broker_event("SandboxConfig", 0xAA, &[]);
+        let b = broker_event("SandboxConfig", 0xBB, &[]);
+        assert_eq!(idx.resolve(&a).as_deref(), Some("sbx-A"));
+        assert_eq!(idx.resolve(&b).as_deref(), Some("sbx-B"));
+    }
+
+    /// The create burst as the GB300 build delivers it (names, activity ids,
+    /// identity and correlation vector taken from a real capture): every event
+    /// comes from the broker, and only `ProcessLaunched` names the process.
+    fn gb300_burst() -> Vec<DecodedEtwEvent> {
+        let id = (
+            "identity",
+            "\"Sandbox.{FE39BA46-2C3B-4061-8BB9-539002A0E8EE}\"",
+        );
+        let cv = ("__TlgCV__", "\"Q3DKyR5tV0yIvKC5dt0/1w.0\"");
+        vec![
+            broker_event("SandboxEngineCreateSandbox", 0xC3, &[id, cv]),
+            broker_event("SandboxConfig", 0xC3, &[]),
+            broker_event(
+                "SandboxNetworkFilteringPolicy",
+                0,
+                &[("correlationVector", "\"Q3DKyR5tV0yIvKC5dt0/1w.0\"")],
+            ),
+            broker_event("SandboxCreateWithPolicyEnforcement", 0xC4, &[id, cv]),
+            broker_event(
+                "SandboxLaunchDetails",
+                0,
+                &[id, ("correlationVector", "\"Q3DKyR5tV0yIvKC5dt0/1w.0\"")],
+            ),
+            broker_event("EnforceOsPolicy", 0xC5, &[id, cv]),
+            broker_event("SandboxEngineCreateProcess", 0xC6, &[cv]),
+            broker_event(
+                "SandboxConsoleReferencePlumbed",
+                0,
+                &[("correlationVector", "\"Q3DKyR5tV0yIvKC5dt0/1w.0\"")],
+            ),
+            // Carries no identity, CV or activity id: nothing can attribute it.
+            broker_event("BrokeredCreateProcessLaunchResult", 0, &[]),
+            broker_event("SetUILimitsOnJob", 0x30, &[cv]),
+            launched(0xC6, 777),
+        ]
+    }
+
+    #[test]
+    fn the_gb300_burst_is_attributed_once_process_launched_anchors_it() {
+        let mut idx = index_with_parents(&[(777, 100, Some(1000))]);
+        idx.register_launch("sbx-1", "one", 100, 1000);
+
+        // Everything but the anchor arrives first and is buffered, as on the box.
+        let burst = gb300_burst();
+        let (anchor, rest) = burst.split_last().expect("burst");
+        for ev in rest {
+            assert!(idx.resolve(ev).is_none(), "{} resolved early", ev.summary());
+            idx.buffer_unresolved(ev.clone());
+        }
+        assert_eq!(idx.pending.len(), rest.len());
+
+        // The anchor resolves ...
+        assert_eq!(idx.resolve(anchor).as_deref(), Some("sbx-1"));
+        // ... and one drain replays the chain activity -> CV -> identity.
+        let ready = idx.drain_resolved();
+        let names: Vec<&str> = ready
+            .iter()
+            .map(|(_, _, ev)| ev.event_name.as_deref().unwrap_or(""))
+            .collect();
+        assert!(ready.iter().all(|(sid, _, _)| sid == "sbx-1"));
+        for expected in [
+            "SandboxEngineCreateSandbox",
+            "SandboxConfig",
+            "SandboxNetworkFilteringPolicy",
+            "SandboxCreateWithPolicyEnforcement",
+            "SandboxLaunchDetails",
+            "EnforceOsPolicy",
+            "SandboxEngineCreateProcess",
+            "SandboxConsoleReferencePlumbed",
+            "SetUILimitsOnJob",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} was not attributed: {names:?}"
+            );
+        }
+        // Only the key-less event is left behind.
+        assert_eq!(idx.pending.len(), 1);
+        assert_eq!(
+            idx.pending[0].ev.event_name.as_deref(),
+            Some("BrokeredCreateProcessLaunchResult")
+        );
+    }
+
+    #[test]
+    fn drain_follows_a_chain_of_keys_across_events_in_one_call() {
+        // A->B->C chain buffered in the worst order (the last link first).
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "one", 100, 1000);
+        let mut anchor = mk_event(100, "Anchor");
+        anchor.process_start_key = Some(1000);
+        anchor.activity_id = GUID::from_u128(0x1);
+        let link_b = broker_event("B", 0x1, &[("__TlgCV__", "\"cv1.0\"")]);
+        let link_c = broker_event("C", 0, &[("correlationVector", "\"cv1.0\"")]);
+        let link_c_late = broker_event("D", 0x2, &[("correlationVector", "\"cv1.0\"")]);
+        let link_e = broker_event("E", 0x2, &[]);
+        for ev in [&link_e, &link_c_late, &link_c, &link_b] {
+            assert!(idx.resolve(ev).is_none());
+            idx.buffer_unresolved(ev.clone());
+        }
+        assert_eq!(idx.resolve(&anchor).as_deref(), Some("sbx-1"));
+        let ready = idx.drain_resolved();
+        assert_eq!(
+            ready.len(),
+            4,
+            "every link of the chain must resolve in one drain"
+        );
+        assert!(idx.pending.is_empty());
+    }
+
+    #[test]
+    fn unattributed_events_are_counted_when_they_age_out() {
+        let mut idx = AttributionIndex::new();
+        let mut stale = mk_event(1, "SandboxConfig");
+        stale.process_start_key = None;
+        idx.buffer_unresolved(stale);
+        // Age the buffered event past the TTL.
+        for p in &mut idx.pending {
+            p.at = aged_out();
+        }
+        assert!(idx.drain_resolved().is_empty());
+        assert_eq!(idx.take_unattributed_drops(), 1);
+        assert_eq!(
+            idx.take_unattributed_drops(),
+            0,
+            "the count is consumed once"
+        );
+    }
+
+    #[test]
+    fn dropping_an_event_the_audit_never_writes_is_not_a_gap() {
+        // `BrokeredCreateProcessLaunchResult` carries no key and maps to no OCSF
+        // row. It is dropped on every healthy host, so it must not count.
+        let mut idx = AttributionIndex::new();
+        let mut stray = mk_event(1, "BrokeredCreateProcessLaunchResult");
+        stray.process_start_key = None;
+        idx.buffer_unresolved(stray);
+        for p in &mut idx.pending {
+            p.at = aged_out();
+        }
+        assert!(idx.drain_resolved().is_empty());
+        assert_eq!(idx.take_unattributed_drops(), 0);
+    }
+
+    #[test]
+    fn audited_event_names_match_what_the_emitter_maps() {
+        for audited in [
+            "SandboxConfig",
+            "ProcessLaunched",
+            "EnforceOsPolicy",
+            "SandboxConsoleReferencePlumbed",
+            "SandboxCreateWithPolicyEnforcement",
+        ] {
+            assert!(is_audited_event(Some(audited)), "{audited}");
+        }
+        for ignored in ["BrokeredCreateProcessLaunchResult", "SomethingNew", ""] {
+            assert!(!is_audited_event(Some(ignored)), "{ignored}");
+        }
+        assert!(!is_audited_event(None));
+    }
+
+    #[test]
+    fn unattributed_events_are_counted_when_the_buffer_overflows() {
+        let mut idx = AttributionIndex::new();
+        for pid in 0..(PENDING_MAX as u32 + 5) {
+            idx.buffer_unresolved(mk_event(pid, "SandboxConfig"));
+        }
+        assert_eq!(idx.take_unattributed_drops(), 5);
+    }
+
+    #[test]
+    fn the_processor_publishes_unattributed_drops_to_session_health() {
+        let health = Arc::new(CaptureHealth::default());
+        let index = Arc::new(Mutex::new(AttributionIndex::new()));
+        let processor = EtwEventProcessor::new(index.clone(), health.clone(), "gw".to_string());
+
+        {
+            let mut idx = index.lock().unwrap();
+            let mut stale = mk_event(1, "SandboxConfig");
+            stale.process_start_key = None;
+            idx.buffer_unresolved(stale);
+            for p in &mut idx.pending {
+                p.at = aged_out();
+            }
+        }
+        processor.drain_and_emit();
+
+        assert_eq!(health.unattributed_events.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unattributed_reporter_warns_immediately_then_rate_limits() {
+        let health = CaptureHealth::default();
+        let mut reporter = UnattributedReporter::default();
+
+        assert!(
+            !reporter.report_if_due(&health, false),
+            "nothing to report yet"
+        );
+        health.unattributed_events.store(11, Ordering::Relaxed);
+        assert!(reporter.report_if_due(&health, false));
+        health.unattributed_events.store(12, Ordering::Relaxed);
+        assert!(!reporter.report_if_due(&health, false), "rate limited");
+        assert!(reporter.report_if_due(&health, true), "forced on shutdown");
+        assert_eq!(reporter.last_reported, 12);
+    }
+
+    #[test]
+    fn live_parent_lookup_sees_this_process_as_the_parent_of_its_child() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/c", "ping -n 20 127.0.0.1 >nul"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        let parent = live_parent_of(child.id());
+        let own_key = open_for_query(std::process::id())
+            .and_then(|h| process_start_key_from_handle(h.0, std::process::id()).ok());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let parent = parent.expect("a live child has a parent");
+        assert_eq!(parent.pid, std::process::id());
+        assert!(own_key.is_some());
+        assert_eq!(
+            parent.start_key, own_key,
+            "the parent's generation key must match ours"
+        );
     }
 }
