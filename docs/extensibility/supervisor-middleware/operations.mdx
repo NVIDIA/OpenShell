@@ -161,6 +161,12 @@ Upgrade the gateway before deploying the service. Recreate sandboxes whose super
 
 The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) implements both HTTP operations.
 
+### Failure Attribution in the Runtime
+
+HTTP request outcomes retain a platform-owned failure kind separately from diagnostic text and sandbox-facing failure codes. Runtime callers can distinguish local stage, chain, whole-body, stream-idle and client-progress deadlines from remote gRPC status codes, including a service-reported deadline. An explicit service or policy denial has no platform failure kind. Diagnostic sanitization and enforcement behavior stay the same.
+
+The live request relay also records whether upstream writing was attempted and whether local forwarding completed. A write that fails after partial progress remains started. Local completion does not prove upstream receipt or processing, and does not authorize a retry.
+
 ## WebSocket
 
 WebSocket middleware checks the text messages the sandbox sends over a WebSocket connection.
