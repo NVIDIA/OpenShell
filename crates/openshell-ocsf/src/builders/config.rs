@@ -18,6 +18,7 @@ pub struct ConfigStateChangeBuilder<'a> {
     security_level: Option<SecurityLevelId>,
     prev_security_level: Option<SecurityLevelId>,
     message: Option<String>,
+    correlation_uid: Option<String>,
     unmapped: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -33,6 +34,7 @@ impl<'a> ConfigStateChangeBuilder<'a> {
             security_level: None,
             prev_security_level: None,
             message: None,
+            correlation_uid: None,
             unmapped: serde_json::Map::new(),
         }
     }
@@ -56,6 +58,13 @@ impl<'a> ConfigStateChangeBuilder<'a> {
         self
     }
 
+    /// Set the identifier shared by events about the same request.
+    #[must_use]
+    pub fn correlation_uid(mut self, uid: impl Into<String>) -> Self {
+        self.correlation_uid = Some(uid.into());
+        self
+    }
+
     /// Add an unmapped field.
     #[must_use]
     pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
@@ -65,6 +74,10 @@ impl<'a> ConfigStateChangeBuilder<'a> {
 
     #[must_use]
     pub fn build(self) -> OcsfEvent {
+        let mut metadata = self
+            .ctx
+            .metadata(&["security_control", "container", "host"]);
+        metadata.correlation_uid = self.correlation_uid;
         let mut base = BaseEventData::new(
             5019,
             "Device Config State Change",
@@ -73,8 +86,7 @@ impl<'a> ConfigStateChangeBuilder<'a> {
             1,
             "Log", // activity_id=1 (Log)
             self.severity,
-            self.ctx
-                .metadata(&["security_control", "container", "host"]),
+            metadata,
         );
         if !self.unmapped.is_empty() {
             base.unmapped = Some(serde_json::Value::Object(self.unmapped));
@@ -118,5 +130,25 @@ mod tests {
         assert_eq!(json["state_id"], 2);
         assert_eq!(json["security_level"], "Secure");
         assert_eq!(json["unmapped"]["policy_version"], "v3");
+    }
+
+    #[test]
+    fn test_config_state_change_builder_correlation_uid() {
+        let ctx = test_sandbox_context();
+        let event = ConfigStateChangeBuilder::new(&ctx)
+            .correlation_uid("6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f")
+            .build();
+
+        let json = event.to_json().unwrap();
+        assert_eq!(
+            json["metadata"]["correlation_uid"],
+            "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f"
+        );
+        let event = ConfigStateChangeBuilder::new(&ctx).build();
+        assert!(
+            event.to_json().unwrap()["metadata"]
+                .get("correlation_uid")
+                .is_none()
+        );
     }
 }

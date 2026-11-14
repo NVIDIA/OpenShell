@@ -19,6 +19,7 @@ use openshell_core::proto::{
 use tonic::{Request, Response, Status};
 
 use crate::ServerState;
+use crate::auth::audit::DisclosureAudit;
 use crate::storage_proto::StoredProviderCredentialRefreshStateV2;
 
 #[cfg(test)]
@@ -40,6 +41,18 @@ pub(super) async fn handle(
     state: &Arc<ServerState>,
     request: Request<GetProviderCredentialsRequest>,
 ) -> Result<Response<GetProviderCredentialsResponse>, Status> {
+    let mut audit = DisclosureAudit::begin("GetProviderCredentials", &request);
+    let result = handle_audited(state, request, &mut audit).await;
+    audit.finish(&result);
+    result
+}
+
+async fn handle_audited(
+    state: &Arc<ServerState>,
+    request: Request<GetProviderCredentialsRequest>,
+    audit: &mut DisclosureAudit,
+) -> Result<Response<GetProviderCredentialsResponse>, Status> {
+    attribute_target(audit, request.get_ref());
     let operator = crate::auth::guard::require_operator(&request)?;
     let subject = operator.identity.subject.clone();
     let fingerprint = operator.certificate_sha256.clone();
@@ -81,6 +94,36 @@ pub(super) async fn handle(
         "operator provider credential retrieval"
     );
     result.map(Response::new)
+}
+
+/// Name the target before authorization so denied and invalid attempts stay
+/// attributable. Each identifier is checked on its own; malformed input is
+/// never recorded.
+fn attribute_target(audit: &mut DisclosureAudit, request: &GetProviderCredentialsRequest) {
+    if let Ok(workspace) =
+        crate::auth::workspace_authz::selected_workspace_name(request.workspace_scope.as_ref())
+    {
+        audit.resource("workspace", workspace);
+    }
+    let name = &request.name;
+    if !name.is_empty()
+        && name.len() <= 253
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        audit.resource("provider", name.clone());
+    }
+    let keys: Vec<&str> = request
+        .credential_keys
+        .iter()
+        .take(MAX_KEYS)
+        .map(String::as_str)
+        .filter(|key| key.len() <= 256 && super::provider::is_valid_env_key(key))
+        .collect();
+    if !keys.is_empty() {
+        audit.resource("credential_keys", keys.join(","));
+    }
 }
 
 fn validate(request: &GetProviderCredentialsRequest) -> Result<Duration, Status> {
