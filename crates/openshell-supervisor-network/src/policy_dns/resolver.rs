@@ -13,6 +13,8 @@ use hickory_proto::rr::{Name, RData, RecordType};
 use openshell_core::net::connect_tcp_nodelay_best_effort;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -87,26 +89,68 @@ pub(crate) trait TrustedResolver: Send + Sync {
     ) -> Result<TrustedAnswer, ResolveError>;
 }
 
-/// A DNS client pinned to one operator-supplied upstream socket address.
+/// A DNS client for operator-supplied upstream servers.
+///
+/// With a resolver configuration path, the server list is reread for every
+/// exchange so a host network or VPN change takes effect without a restart.
 pub(crate) struct SocketTrustedResolver {
-    server: SocketAddr,
+    servers: Mutex<Vec<SocketAddr>>,
+    conf_path: Option<PathBuf>,
     exchange_timeout: Duration,
 }
 
 impl SocketTrustedResolver {
+    #[cfg(test)]
     pub(crate) fn new(server: SocketAddr) -> Self {
-        Self {
-            server,
-            exchange_timeout: DEFAULT_EXCHANGE_TIMEOUT,
-        }
+        Self::with_timeout(server, DEFAULT_EXCHANGE_TIMEOUT)
     }
 
     #[cfg(test)]
     pub(crate) fn with_timeout(server: SocketAddr, exchange_timeout: Duration) -> Self {
         Self {
-            server,
+            servers: Mutex::new(vec![server]),
+            conf_path: None,
             exchange_timeout,
         }
+    }
+
+    /// Track the literal `nameserver` entries of a resolv.conf style file.
+    /// Fails when the file has none, so a misconfigured host is caught at start.
+    pub(crate) fn from_resolv_conf(path: impl Into<PathBuf>) -> Result<Self, String> {
+        let path = path.into();
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let servers = parse_resolv_conf(&contents);
+        if servers.is_empty() {
+            return Err(format!(
+                "no literal nameserver is configured in {}",
+                path.display()
+            ));
+        }
+        tracing::info!(?servers, "policy DNS upstream servers");
+        Ok(Self {
+            servers: Mutex::new(servers),
+            conf_path: Some(path),
+            exchange_timeout: DEFAULT_EXCHANGE_TIMEOUT,
+        })
+    }
+
+    /// Servers in configured order. A bad read keeps the last good list.
+    fn current_servers(&self) -> Vec<SocketAddr> {
+        let mut servers = self
+            .servers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(path) = &self.conf_path
+            && let Ok(contents) = std::fs::read_to_string(path)
+        {
+            let fresh = parse_resolv_conf(&contents);
+            if !fresh.is_empty() && fresh != *servers {
+                tracing::info!(servers = ?fresh, "policy DNS upstream servers changed");
+                *servers = fresh;
+            }
+        }
+        servers.clone()
     }
 
     async fn exchange(&self, name: Name, record_type: RecordType) -> Result<Message, ResolveError> {
@@ -117,24 +161,47 @@ impl SocketTrustedResolver {
         request.queries.push(query.clone());
         let wire = request.to_vec().map_err(|_| ResolveError::Malformed)?;
 
-        let udp_response = self.udp_exchange(&wire).await?;
-        let response = parse_response(&udp_response, id, &query)?;
+        // Always start at the configured primary; fall back only on failure.
+        let mut failure = ResolveError::Timeout;
+        for server in self.current_servers() {
+            match self.exchange_with(server, &wire, id, &query).await {
+                Ok(response) => return Ok(response),
+                Err(error @ (ResolveError::Timeout | ResolveError::Io(_))) => failure = error,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(failure)
+    }
+
+    async fn exchange_with(
+        &self,
+        server: SocketAddr,
+        wire: &[u8],
+        id: u16,
+        query: &Query,
+    ) -> Result<Message, ResolveError> {
+        let udp_response = self.udp_exchange(server, wire).await?;
+        let response = parse_response(&udp_response, id, query)?;
         if response.metadata.truncation {
-            let tcp_response = self.tcp_exchange(&wire).await?;
-            parse_response(&tcp_response, id, &query)
+            let tcp_response = self.tcp_exchange(server, wire).await?;
+            parse_response(&tcp_response, id, query)
         } else {
             Ok(response)
         }
     }
 
-    async fn udp_exchange(&self, request: &[u8]) -> Result<Vec<u8>, ResolveError> {
-        let bind = if self.server.is_ipv4() {
+    async fn udp_exchange(
+        &self,
+        server: SocketAddr,
+        request: &[u8],
+    ) -> Result<Vec<u8>, ResolveError> {
+        let bind = if server.is_ipv4() {
             "0.0.0.0:0"
         } else {
             "[::]:0"
         };
         let socket = UdpSocket::bind(bind).await?;
-        socket.connect(self.server).await?;
+        socket.connect(server).await?;
 
         timeout(self.exchange_timeout, socket.send(request))
             .await
@@ -150,10 +217,14 @@ impl SocketTrustedResolver {
         Ok(response)
     }
 
-    async fn tcp_exchange(&self, request: &[u8]) -> Result<Vec<u8>, ResolveError> {
+    async fn tcp_exchange(
+        &self,
+        server: SocketAddr,
+        request: &[u8],
+    ) -> Result<Vec<u8>, ResolveError> {
         let mut stream = timeout(
             self.exchange_timeout,
-            connect_tcp_nodelay_best_effort(self.server),
+            connect_tcp_nodelay_best_effort(server),
         )
         .await
         .map_err(|_| ResolveError::Timeout)??;
@@ -305,6 +376,21 @@ fn parse_answer_records(message: &Message, family: AddressFamily) -> ParsedRecor
 
 fn canonical_name(name: &Name) -> String {
     name.to_ascii().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Literal `nameserver` addresses of a resolv.conf style file, in order.
+fn parse_resolv_conf(contents: &str) -> Vec<SocketAddr> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('#').next()?.split_whitespace();
+            if fields.next() != Some("nameserver") {
+                return None;
+            }
+            fields.next()?.parse::<IpAddr>().ok()
+        })
+        .map(|ip| SocketAddr::new(ip, 53))
+        .collect()
 }
 
 #[cfg(test)]
@@ -511,6 +597,113 @@ mod tests {
             Err(ResolveError::Timeout)
         ));
         drop(udp);
+    }
+
+    #[test]
+    fn resolv_conf_lists_literal_nameservers_in_order() {
+        let conf = "# c\nsearch example\nnameserver 192.0.2.10 # x\nnameserver bogus\nnameserver 2001:db8::1\n";
+        assert_eq!(
+            parse_resolv_conf(conf),
+            [
+                "192.0.2.10:53".parse::<SocketAddr>().unwrap(),
+                "[2001:db8::1]:53".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolv_conf_changes_are_picked_up_and_bad_reads_keep_last_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 192.0.2.10\n").unwrap();
+        let resolver = SocketTrustedResolver::from_resolv_conf(&path).unwrap();
+        assert_eq!(
+            resolver.current_servers(),
+            ["192.0.2.10:53".parse::<SocketAddr>().unwrap()]
+        );
+
+        // A retained server moved behind a new primary stays behind it.
+        std::fs::write(&path, "nameserver 198.51.100.53\nnameserver 192.0.2.10\n").unwrap();
+        assert_eq!(
+            resolver.current_servers(),
+            [
+                "198.51.100.53:53".parse::<SocketAddr>().unwrap(),
+                "192.0.2.10:53".parse().unwrap()
+            ]
+        );
+
+        std::fs::write(&path, "nameserver 198.51.100.53\n").unwrap();
+        assert_eq!(
+            resolver.current_servers(),
+            ["198.51.100.53:53".parse::<SocketAddr>().unwrap()]
+        );
+
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(resolver.current_servers().len(), 1);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(resolver.current_servers().len(), 1);
+    }
+
+    #[test]
+    fn resolv_conf_without_nameserver_is_rejected_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "search example\n").unwrap();
+        assert!(SocketTrustedResolver::from_resolv_conf(&path).is_err());
+    }
+
+    /// Answers each datagram with `address`, ignoring the first `skip`.
+    fn spawn_dns_server(
+        socket: UdpSocket,
+        skip: usize,
+        address: A,
+        answers: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut wire = [0_u8; MAX_DNS_MESSAGE_BYTES];
+            for index in 0..skip + answers {
+                let (length, peer) = socket.recv_from(&mut wire).await.unwrap();
+                if index < skip {
+                    continue;
+                }
+                let request = Message::from_vec(&wire[..length]).unwrap();
+                let mut response = Message::response(request.metadata.id, OpCode::Query);
+                response.queries = request.queries.clone();
+                response.add_answer(Record::from_rdata(
+                    request.queries[0].name.clone(),
+                    10,
+                    RData::A(address),
+                ));
+                socket
+                    .send_to(&response.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn fallback_is_used_only_while_the_primary_fails() {
+        // The primary drops its first query, then recovers.
+        let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fallback = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (primary_addr, fallback_addr) = (
+            primary.local_addr().unwrap(),
+            fallback.local_addr().unwrap(),
+        );
+        let primary_task = spawn_dns_server(primary, 1, A::new(1, 1, 1, 1), 2);
+        // The fallback must see exactly one query.
+        let fallback_task = spawn_dns_server(fallback, 0, A::new(8, 8, 8, 8), 1);
+        let resolver = SocketTrustedResolver::with_timeout(primary_addr, Duration::from_millis(50));
+        resolver.servers.lock().unwrap().push(fallback_addr);
+        let name = NormalizedName::parse("db.example").unwrap();
+
+        for expected in ["8.8.8.8", "1.1.1.1", "1.1.1.1"] {
+            let answer = resolver.resolve(&name, AddressFamily::Ipv4).await.unwrap();
+            assert_eq!(answer.addresses, [expected.parse::<IpAddr>().unwrap()]);
+        }
+        primary_task.await.unwrap();
+        fallback_task.await.unwrap();
     }
 
     #[test]
