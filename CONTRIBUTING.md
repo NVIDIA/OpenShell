@@ -74,6 +74,8 @@ Pull requests that touch the enforcement machinery or reviewer routing — anyth
 
 Once your pull request represents [accepted work](#accepted-work), apply exactly one `area:` label and any relevant `topic:` labels. Follow [Labeling and Notifications](#labeling-and-notifications) before applying classification labels. The [reviewer routing workflow](.github/workflows/review-readiness.yml) requests all matching members of [REVIEWERS.md](REVIEWERS.md), excluding the author, when a PR opens ready for review, leaves draft status, or gains or loses an area/topic label. Reviewers do not need repository write access to receive requests or review PRs. Manual reviewer choices and people who have commented or reviewed are preserved. Propose roster membership changes through a reviewed PR.
 
+Branch Checks rejects accounts in `REVIEWERS.md` that are not repository collaborators. Public read access alone does not qualify; read and triage collaborators are eligible.
+
 If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
 
 ## Agent Skills
