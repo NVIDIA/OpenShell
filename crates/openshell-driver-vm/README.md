@@ -14,6 +14,47 @@ binaries.
 
 The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest sandbox, and the custom kernel runtime. Each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
 
+Guest init creates missing `/dev/fd` and standard-stream links after mounting
+procfs and devtmpfs, before using Bash process substitution. Existing links to
+the expected procfs paths, or entries that resolve to the same files, stay
+intact. Conflicting entries and unrelated dangling links fail boot with a
+diagnostic rather than being replaced.
+
+## Lifecycle extension requirements
+
+Lifecycle extensions declare requirements through `LaunchPlan::require_backend`
+and `require_backend_feature`. An explicit backend stays selected; incompatible
+requirements fail before the workload launcher starts. Without an explicit
+requirement, the driver chooses a backend that supports the requested features.
+
+These are VM-driver-local backend capabilities. The driver resolves the final
+plan after operator-installed extensions contribute their requirements, then
+checks it against the selected backend. The gateway's `GetCapabilities`
+snapshot describes the compute-driver protocol and supported resource request
+forms; it does not describe this per-launch VM plan.
+
+| Feature | libkrun | QEMU |
+|---|---|---|
+| Guest init drop-ins | Supported | Supported |
+| External kernel image | Unsupported | Supported for CPU-only and GPU VMs |
+| PCI passthrough | Unsupported | Requires an assigned GPU device |
+| Host directory mounts | Supported through virtiofs | Unsupported |
+
+For example, an operator-installed extension can set `plan.kernel_image` and
+require `BackendFeature::ExternalKernelImage` for a CPU-only sandbox. The
+resolver selects QEMU with a vsock CID and ordinary CPU sizing, without
+allocating a GPU. Requiring libkrun for that same plan fails with an
+external-kernel diagnostic. Kernel paths remain extension-owned; sandbox
+requests cannot supply them.
+
+The current QEMU launcher requires a Linux x86_64 host with KVM. Other host
+targets fail preflight before the workload launcher starts. External kernels are checked for a
+64-bit little-endian x86_64 ELF header or an x86_64 Linux bzImage header. The
+VMM validates the complete image. Kernel security and boot-driver requirements
+still apply, and authenticated runtime admission confirms enforcement before
+workload code runs. Both workload and image-preparation launchers use the same
+kernel preflight entry point; preparation retains its libkrun bootstrap backend.
+
 ## How it fits together
 
 Caller driver config is disabled by default, including upload workflows
