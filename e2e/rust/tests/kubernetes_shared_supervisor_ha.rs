@@ -17,7 +17,8 @@
 //! The pool sits behind two gateway replicas sharing a database. Every pool
 //! sandbox's session runs on the replica serving its supervisor at start and
 //! after a gateway crash, a gateway rolling restart, and a supervisor crash;
-//! exec reaches every sandbox after each step.
+//! exec reaches every sandbox after each step. Supervisors that restart, and
+//! those of a gateway that stops, spread evenly across the gateways.
 
 mod shared_supervisor;
 
@@ -421,7 +422,7 @@ struct Branch {
     session_gateway: String,
 }
 
-async fn tree(routes: &[String]) -> Vec<Branch> {
+async fn psql(query: &str) -> String {
     kubectl(&[
         "-n",
         &release_namespace(),
@@ -437,23 +438,28 @@ async fn tree(routes: &[String]) -> Vec<Branch> {
         "-F",
         "|",
         "-c",
-        TREE,
+        query,
     ])
     .await
-    .lines()
-    .filter_map(|row| {
-        let mut fields = row.split('|');
-        let route = fields.next()?;
-        if !routes.iter().any(|ours| ours == route) {
-            return None;
-        }
-        Some(Branch {
-            member: fields.next()?.to_string(),
-            supervisor_gateway: fields.next()?.to_string(),
-            session_gateway: fields.next()?.to_string(),
+}
+
+async fn tree(routes: &[String]) -> Vec<Branch> {
+    psql(TREE)
+        .await
+        .lines()
+        .filter_map(|row| {
+            let mut fields = row.split('|');
+            let route = fields.next()?;
+            if !routes.iter().any(|ours| ours == route) {
+                return None;
+            }
+            Some(Branch {
+                member: fields.next()?.to_string(),
+                supervisor_gateway: fields.next()?.to_string(),
+                session_gateway: fields.next()?.to_string(),
+            })
         })
-    })
-    .collect()
+        .collect()
 }
 
 /// Wait until the session of every sandbox on `routes` runs on its
@@ -648,6 +654,97 @@ async fn force_delete(pod: &str) {
         "--force",
     ])
     .await;
+}
+
+const HOMES: &str = "\
+SELECT p->>'member_id', p->>'gateway_replica'
+FROM (SELECT convert_from(payload, 'UTF8')::json AS p FROM objects
+      WHERE object_type = 'supervisor_pool_member') pm";
+
+/// Wait until every live supervisor streams to a live gateway and no gateway
+/// serves more than its even share.
+async fn assert_spread(step: &str) {
+    let mut last = std::collections::BTreeMap::<String, String>::new();
+    let settled = tokio::time::timeout(SETTLE_DEADLINE, async {
+        loop {
+            let members = supervisor_pods().await;
+            let gateways: Vec<String> = kubectl_json(&[
+                "-n",
+                &release_namespace(),
+                "get",
+                "pods",
+                "-l",
+                GATEWAY_SELECTOR,
+                "-o",
+                "json",
+            ])
+            .await["items"]
+                .as_array()
+                .expect("Pod items")
+                .iter()
+                .filter(|pod| pod["metadata"]["deletionTimestamp"].is_null())
+                .filter_map(|pod| pod["metadata"]["name"].as_str().map(str::to_string))
+                .collect();
+            last = psql(HOMES)
+                .await
+                .lines()
+                .filter_map(|row| row.split_once('|'))
+                .filter(|(member, _)| members.iter().any(|live| live == member))
+                .map(|(member, gateway)| (member.to_string(), gateway.to_string()))
+                .collect();
+            let cap = members.len().div_ceil(gateways.len().max(1));
+            if last.len() == members.len()
+                && gateways
+                    .iter()
+                    .all(|gateway| last.values().filter(|home| *home == gateway).count() <= cap)
+                && last.values().all(|home| gateways.contains(home))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "{step}: supervisors did not spread across gateways within {SETTLE_DEADLINE:?}: {last:#?}"
+    );
+}
+
+#[tokio::test]
+async fn supervisors_spread_evenly_across_gateways() {
+    let gateway = gateway_workload().await;
+    let supervisor = format!("deployment.apps/{}-supervisor", release());
+    assert_eq!(
+        gateway_pods().await.len(),
+        2,
+        "the lane runs two gateway replicas"
+    );
+    // A supervisor that restarts picks the first gateway along the ring
+    // below its even share, so restarting each in turn spreads them.
+    let members = supervisor_pods().await;
+    for pod in &members {
+        kubectl(&["-n", &release_namespace(), "delete", "pod", pod]).await;
+        let replaced = tokio::time::timeout(SETTLE_DEADLINE, async {
+            loop {
+                let live = supervisor_pods().await;
+                if live.len() == members.len() && !live.contains(pod) {
+                    return live;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{pod} was not replaced within {SETTLE_DEADLINE:?}"));
+        wait_until_attached(&replaced).await;
+    }
+    rollout("status", &supervisor).await;
+    assert_spread("supervisor restarts").await;
+
+    // A stopping gateway hands its supervisors to the others the same way.
+    kubectl(&["-n", &release_namespace(), "rollout", "restart", &gateway]).await;
+    rollout("status", &gateway).await;
+    assert_spread("gateway rolling restart").await;
 }
 
 #[tokio::test]

@@ -195,6 +195,14 @@ A sandbox on a shared supervisor keeps its session on the gateway replica that
 serves its supervisor, and reconnects there when the supervisor moves to
 another replica.
 
+Shared supervisors spread across gateway replicas. A supervisor that starts,
+restarts, or loses its replica goes to the first replica on the gateway ring
+that serves fewer than its even share of supervisors, and a stopping replica
+hands its supervisors over the same way. A supervisor that reconnects after a
+token refresh or a short interruption stays on its replica, and supervisors
+never move when a replica joins, so a replica added without a rollout fills
+only as supervisors restart.
+
 Established streams do not move between gateway replicas. An interrupted exec,
 forwarding, or service stream must reconnect. File sync retries with a new SSH
 session instead of resuming the interrupted byte stream. Rolling updates can
@@ -212,6 +220,7 @@ configuration, and access control.
 | Signal | Metrics | Use |
 |---|---|---|
 | Sessions per replica | `openshell_server_supervisor_sessions` | Placement and skew. Do not scale on it. |
+| Shared supervisors per replica | `openshell_server_supervisor_hosts`, `openshell_server_supervisor_host_instances_max` | Supervisor spread across replicas, and the busiest supervisor's sandbox count against the 256 per-supervisor limit. |
 | Relay utilization | `openshell_server_relay_pending`, `openshell_server_relay_pending_capacity` | Graph it. It is transient and usually near 0, so alert on rejections instead. |
 | Relay rejections | `openshell_server_relay_rejected_total` | Alert on any increase. |
 | Relay claims | `openshell_server_relay_claim_duration_seconds`, `openshell_server_relay_expired_total` | Supervisor connect-back time for exec, SSH, forwarding, and service traffic, including relays requested through peers. A high 99th percentile while rejections stay flat points at the supervisor or its node, not at relay capacity. Relays not claimed within 10 seconds are missing from the histogram and count as expired, so alert on any increase. |
