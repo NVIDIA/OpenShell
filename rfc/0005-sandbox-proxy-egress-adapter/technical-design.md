@@ -338,26 +338,32 @@ Policy DNS is query-driven rather than a static `/etc/hosts` snapshot.
    upstream query.
 5. Policy DNS resolves an eligible name through trusted upstream DNS and
    filters every answer through endpoint metadata and SSRF controls.
-6. The adapter allocates a supervisor-owned synthetic IP and creates an active
-   mapping containing the synthetic IP, normalized name, endpoint identifier,
-   allowed ports, validated real addresses, policy generation, distinct DNS
-   mapping generation, opaque mapping ID, and expiration.
+6. The adapter allocates a supervisor-owned synthetic IP for the normalized
+   name and address family, and creates an active mapping containing the
+   synthetic IP, normalized name, the real addresses that passed the
+   destination rules of at least one eligible endpoint, the policy generation
+   it was published under, a distinct DNS mapping generation, an opaque
+   mapping ID, and expiration.
 7. The adapter publishes the mapping and capture state atomically before
    returning the synthetic IP to userland with a bounded TTL.
 8. Userland later calls `connect(synthetic_ip:port)`.
 9. Transparent TCP recovers the synthetic original destination and requires an
-   unexpired exact mapping whose allowed ports contain the requested port.
-10. Normal egress authorization and relay selection run against a policy
-    generation consistent with the mapping contract.
-11. The connector dials only a real address pinned in that mapping. It does not
-    re-resolve the name independently at connect time.
+   unexpired exact mapping.
+10. Normal egress authorization and relay selection run against the current
+    policy for the mapped name and the requested port.
+11. The connector dials only a real address pinned in that mapping that the
+    deciding endpoint's destination rules permit. It does not re-resolve the
+    name independently at connect time.
 
 The resolved endpoint store is active state produced by policy-eligible lookups
 and consumed by transparent TCP connects. Policy generation and DNS mapping
 generation are separate values: a DNS refresh can replace mappings without a
-policy reload, while a policy reload can invalidate mappings whose endpoint
-contract is no longer current. A captured connection with no mapping, a stale
-mapping, or a mismatched endpoint/port fails closed. An unrelated bare-IP
+policy reload. A policy reload does not invalidate mappings: every connection
+is decided by the policy current when it is made, and the pinned addresses are
+filtered again through that decision's destination rules, so a reload can never
+add a real address to a kept answer, and the TTL bounds how long it is used. A
+captured connection with no mapping, an expired mapping, or no pinned address
+the deciding endpoint permits fails closed. An unrelated bare-IP
 connection cannot inherit a policy-DNS authorization merely because it targets
 a real IP present in the mapping store. Synthetic IPs are correlation handles,
 not upstream destinations, and must never be routed directly or reassigned
