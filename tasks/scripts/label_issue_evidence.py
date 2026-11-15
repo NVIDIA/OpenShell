@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import copy
 import hashlib
@@ -724,23 +725,110 @@ def _patch_coverage(entry):
     ):
         return "partial"
     plus = minus = 0
-    for line in patch.splitlines():
-        if line.startswith("+"):
+    expected = None
+    old = new = 0
+    lines = patch.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    for line in lines:
+        if line.startswith("@@ "):
+            if expected is not None and (old, new) != expected:
+                return "partial"
+            match = re.fullmatch(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@[^\n]*", line)
+            if not match:
+                return "partial"
+            expected = (int(match[1] or 1), int(match[2] or 1))
+            old = new = 0
+        elif expected is None:
+            return "partial"
+        elif line.startswith("+"):
             plus += 1
+            new += 1
         elif line.startswith("-"):
             minus += 1
-    if plus != entry.get("additions") or minus != entry.get("deletions"):
-        return "partial"
-    # Changed-line counts detect omissions even when the provider sets no flag.
-    for old_count, new_count, body in re.findall(
-        r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@[^\n]*\n(.*?)(?=\n@@|\Z)", patch, re.S
-    ):
-        lines = body.splitlines()
-        old = sum(line.startswith(("-", " ")) for line in lines)
-        new = sum(line.startswith(("+", " ")) for line in lines)
-        if old != int(old_count or 1) or new != int(new_count or 1):
+            old += 1
+        elif line.startswith(" "):
+            old += 1
+            new += 1
+        elif line != "\\ No newline at end of file":
             return "partial"
+    if (
+        expected is None
+        or (old, new) != expected
+        or plus != entry.get("additions")
+        or minus != entry.get("deletions")
+    ):
+        return "partial"
     return "complete"
+
+
+def _diff_path(value, prefix):
+    if value == "/dev/null":
+        return None
+    if value.startswith('"'):
+        # Git quotes UTF-8 bytes using C escapes, including octal sequences.
+        value = ast.literal_eval("b" + value).decode("utf-8")
+    if not value.startswith(prefix):
+        raise ValueError("Unexpected raw diff path prefix")
+    return value[len(prefix) :]
+
+
+def _raw_patches(text):
+    patches = {}
+    for section in re.split(r"^diff --git ", text, flags=re.M)[1:]:
+        header, separator, body = section.partition("\n@@ ")
+        if not separator:
+            continue  # Binary and metadata-only changes have no text hunks.
+        old = re.findall(r"^--- (.+)$", header, re.M)
+        new = re.findall(r"^\+\+\+ (.+)$", header, re.M)
+        if len(old) != 1 or len(new) != 1:
+            raise ValueError("Missing or ambiguous raw diff paths")
+        identity = (_diff_path(old[0], "a/"), _diff_path(new[0], "b/"))
+        if identity in patches:
+            raise ValueError("Duplicate raw diff file identity")
+        patches[identity] = "@@ " + body
+    return patches
+
+
+def _recover_patches(snapshot, entries, api):
+    missing = [entry for entry in entries if _patch_coverage(entry) != "complete"]
+    if not missing:
+        return
+    endpoint = f"repos/{snapshot['repository']}/pulls/{snapshot['number']}"
+    try:
+        text = api(endpoint, diff=True)
+        if not isinstance(text, str):
+            raise ValueError("Raw PR diff is not text")
+        patches = _raw_patches(text)
+    except (subprocess.CalledProcessError, ValueError, SyntaxError) as exc:
+        for entry in missing:
+            entry["patch_recovery_error"] = str(exc)
+        return
+    provenance = {
+        "endpoint": endpoint,
+        "media_type": "application/vnd.github.diff",
+        "source_digest": hashlib.sha256(text.encode()).hexdigest(),
+        "source_bytes": len(text.encode()),
+        "head": snapshot["head"],
+        "base": snapshot["item_material"]["base"]["sha"],
+    }
+    for entry in missing:
+        path, status = entry["filename"], entry.get("status")
+        old = None if status == "added" else entry.get("previous_filename", path)
+        new = None if status == "removed" else path
+        patch = patches.get((old, new))
+        candidate = {**entry, "patch": patch}
+        candidate.pop("truncated", None)
+        candidate.pop("patch_truncated", None)
+        if _patch_coverage(candidate) == "complete":
+            entry.update(candidate)
+            entry.pop("truncated", None)
+            entry.pop("patch_truncated", None)
+            entry["patch_source"] = provenance
+        else:
+            entry["patch_recovery_error"] = (
+                "No complete raw diff patch for file identity and counts"
+            )
 
 
 def _source_slice(snapshot, artifact_id, api):
@@ -819,6 +907,8 @@ def _refresh_collection(snapshot, artifact_id, api):
         _verify_head(snapshot, api)
     content = api(endpoint, pages=True)
     if artifact_id == "files":
+        if isinstance(content, list):
+            _recover_patches(snapshot, content, api)
         _verify_head(snapshot, api)
     if not isinstance(content, list):
         raise ValueError("Collection must be a paginated list")

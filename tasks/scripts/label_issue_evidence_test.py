@@ -17,6 +17,7 @@ from label_issue_evidence import (
     preflight,
     prepare_snapshot,
 )
+from label_issue_github import GitHubError
 
 REPO = "Owner/Repo"
 ROOT = f"repos/{REPO}"
@@ -66,6 +67,7 @@ class API:
         self.closing = []
         self.lifecycle_events = []
         self.fail = None
+        self.diff = ""
 
     def __call__(self, path, **kwargs):
         self.calls.append((path, kwargs))
@@ -85,6 +87,10 @@ class API:
         if path == f"{ROOT}/issues/3":
             return copy.deepcopy(self.item)
         if path == f"{ROOT}/pulls/3":
+            if kwargs.get("diff"):
+                if isinstance(self.diff, Exception):
+                    raise self.diff
+                return self.diff
             return copy.deepcopy(self.pull)
         if path == f"{ROOT}/issues/3/labels?per_page=100":
             return [{"name": name} for name in self.labels]
@@ -452,6 +458,141 @@ class EvidenceTests(unittest.TestCase):
                 )
                 self.assertEqual(snapshot["changed_paths"], ["src/example.py"])
 
+    def raw_patch(self, old="a/src/example.py", new="b/src/example.py"):
+        return f"diff --git {old} {new}\nindex abc..def 100644\n--- {old}\n+++ {new}\n@@ -1 +1 @@\n-old\n+new\n"
+
+    def missing_patch(self, **overrides):
+        self.api = API(pull=True)
+        self.api.collections["files"] = [
+            {
+                "filename": "src/example.py",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+                **overrides,
+            }
+        ]
+        self.api.diff = self.raw_patch()
+
+    def test_raw_diff_recovers_omitted_and_incomplete_patches_with_provenance(self):
+        for partial in ({}, {"patch": "@@ -1 +1 @@\n-old", "patch_truncated": True}):
+            with self.subTest(partial=partial):
+                self.missing_patch(**partial)
+                snapshot = self.prepare()
+                entry = snapshot["evidence_index"]["patch:src/example.py"]
+                self.assertEqual(entry["coverage"], "complete")
+                source = entry["content"]["patch_source"]
+                self.assertEqual(source["head"], "head-one")
+                self.assertEqual(source["base"], "base-one")
+                self.assertEqual(source["source_bytes"], len(self.api.diff.encode()))
+                self.assertEqual(
+                    source["source_digest"],
+                    hashlib.sha256(self.api.diff.encode()).hexdigest(),
+                )
+                digest = entry["source_digest"]
+                expand_evidence(snapshot, ["files"], api=self.api)
+                self.assertEqual(
+                    snapshot["evidence_index"]["patch:src/example.py"]["source_digest"],
+                    digest,
+                )
+                self.assertEqual(
+                    snapshot["evidence_index"]["files"]["coverage"], "complete"
+                )
+
+    def test_raw_diff_matches_add_remove_rename_and_quoted_utf8_paths(self):
+        for overrides, old, new in (
+            (
+                {"status": "renamed", "previous_filename": "old.py"},
+                "a/old.py",
+                "b/src/example.py",
+            ),
+            ({"status": "added", "deletions": 0}, "/dev/null", "b/src/example.py"),
+            ({"status": "removed", "additions": 0}, "a/src/example.py", "/dev/null"),
+            (
+                {"filename": "é name.py"},
+                '"a/\\303\\251 name.py"',
+                '"b/\\303\\251 name.py"',
+            ),
+        ):
+            with self.subTest(overrides=overrides):
+                self.missing_patch(**overrides)
+                self.api.diff = self.raw_patch(old, new)
+                if overrides.get("status") == "added":
+                    self.api.diff = self.api.diff.replace(
+                        "@@ -1 +1 @@\n-old", "@@ -0,0 +1 @@"
+                    )
+                elif overrides.get("status") == "removed":
+                    self.api.diff = self.api.diff.replace(
+                        "@@ -1 +1 @@", "@@ -1 +0,0 @@"
+                    ).replace("+new\n", "")
+                snapshot = self.prepare()
+                self.assertEqual(
+                    snapshot["evidence_index"]["files"]["coverage"], "complete"
+                )
+
+    def test_failed_or_mismatched_recovery_stays_partial(self):
+        self.missing_patch()
+        valid = self.api.diff
+        for raw in (
+            "",
+            valid[:-6],
+            valid.replace("+new", "+new\n+extra"),
+            valid.replace("@@ -1 +1 @@", "@@ broken @@"),
+            valid.replace("@@ -1 +1 @@", "@@ -1,2 +1,2 @@"),
+            valid.replace("src/example.py", "other.py"),
+            valid + valid,
+            valid.replace("+new", "?bad\n+new"),
+            GitHubError("unavailable", status=503),
+            valid.replace("--- a/src/example.py", '--- "unterminated'),
+            "diff --git a/src/example.py b/src/example.py\nBinary files differ\n",
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte"),
+        ):
+            with self.subTest(raw=raw):
+                self.api.diff = raw
+                snapshot = self.prepare()
+                entry = snapshot["evidence_index"]["patch:src/example.py"]
+                self.assertEqual(entry["coverage"], "partial")
+                self.assertNotIn("patch_source", entry["content"])
+                self.assertIn("patch_recovery_error", entry["content"])
+                self.assertEqual(
+                    snapshot["evidence_index"]["files"]["coverage"], "partial"
+                )
+
+    def test_raw_diff_accepts_complete_multiple_hunks_and_no_newline_marker(self):
+        self.missing_patch(additions=2, deletions=2)
+        self.api.diff += "@@ -9 +9 @@\n-old\r\n\\ No newline at end of file\n+new\r\n\\ No newline at end of file\n"
+        snapshot = self.prepare()
+        self.assertEqual(snapshot["evidence_index"]["files"]["coverage"], "complete")
+
+    def test_raw_diff_is_fetched_once_for_multiple_missing_files(self):
+        self.missing_patch()
+        self.api.collections["files"].append(
+            {**self.api.collections["files"][0], "filename": "other.py"}
+        )
+        self.api.pull["changed_files"] = 2
+        self.api.diff += self.raw_patch("a/other.py", "b/other.py")
+        snapshot = self.prepare()
+        self.assertEqual(snapshot["evidence_index"]["files"]["coverage"], "complete")
+        self.assertEqual(
+            sum(bool(kwargs.get("diff")) for _, kwargs in self.api.calls), 1
+        )
+
+    def test_revision_race_during_raw_diff_fetch_rejects_snapshot(self):
+        for revision in ("head", "base"):
+            with self.subTest(revision=revision):
+                self.missing_patch()
+                original = self.api
+
+                def moving(path, original=original, revision=revision, **kwargs):
+                    value = original(path, **kwargs)
+                    if kwargs.get("diff"):
+                        original.pull[revision]["sha"] = "moved"
+                    return value
+
+                self.api = moving
+                with self.assertRaisesRegex(ValueError, "head/base moved"):
+                    self.prepare()
+
     def test_complete_patch_and_pinned_focused_source_slice(self):
         self.api = API(pull=True)
         self.api.collections["files"] = [
@@ -465,6 +606,7 @@ class EvidenceTests(unittest.TestCase):
             }
         ]
         snapshot = self.prepare()
+        self.assertFalse(any(kwargs.get("diff") for _, kwargs in self.api.calls))
         expand_evidence(snapshot, ["files"], api=self.api)
         self.assertEqual(snapshot["evidence_index"]["files"]["coverage"], "complete")
         expand_evidence(snapshot, ["source:src/example.py:2:3"], api=self.api)
