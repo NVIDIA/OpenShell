@@ -23,9 +23,9 @@ Stop when further reading is unlikely to change classification. Technical fetch 
 
 ## Choose the desired set
 
-First identify the requested outcome, affected OpenShell boundary and substantive technical concerns. Choose the area whose reviewers are the right people to review the work. Add every topic whose reviewers would be interested in seeing the change and potentially reviewing it. Supporting documentation or tests can warrant their topic when that reviewer audience is relevant; their presence alone does not. Testing work retains its testing topic.
+First identify the requested outcome, affected OpenShell boundary and substantive technical concerns. Choose the area whose reviewers are the right people to review the work. Add a topic when the work has a clear, substantive connection to it and its reviewers would be interested in seeing and potentially reviewing the change. Omit topics with only incidental or speculative relevance. Supporting documentation or tests can warrant their topic when that reviewer audience is relevant; their presence alone does not. Testing work retains its testing topic.
 
-Choose exactly one area and every supported topic from the canonical scopes. Report missing definitions or routing preparation as prerequisites; do not omit a needed label or invent replacements.
+Choose exactly one area and the topics supported by this rubric from the canonical scopes. Report missing definitions or routing preparation as prerequisites; do not omit a needed label or invent replacements.
 
 Choose the best-supported set despite ordinary uncertainty. Record meaningful alternatives and medium/low confidence in `ambiguity`; use null for high-confidence choices. Ambiguity requires no escalation or extra approval.
 
