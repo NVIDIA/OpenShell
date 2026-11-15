@@ -1717,6 +1717,8 @@ fn is_audited_event(name: Option<&str>) -> bool {
             | "SandboxConfig"
             | "Win32kLockdownApplied"
             | "ApplyUILimits"
+            | "SetUILimitsOnJob"
+            | "SandboxLaunchDetails"
             | "EnforceOsPolicy"
             | "SandboxProxyConfigured"
             | "SandboxConsoleReferencePlumbed"
@@ -1867,6 +1869,7 @@ impl EtwEventProcessor {
             "SandboxConfig"
             | "Win32kLockdownApplied"
             | "ApplyUILimits"
+            | "SetUILimitsOnJob"
             | "EnforceOsPolicy"
             | "SandboxProxyConfigured"
             | "SandboxConsoleReferencePlumbed" => {
@@ -1876,6 +1879,16 @@ impl EtwEventProcessor {
                 tracing::debug!(target: "mxc_etw", pid = ev.process_id, sandbox_id = %sandbox_id, "{}", ev.summary());
                 let ctx = self.event_context(sandbox_id, sandbox_name);
                 emit_ocsf(sandbox_id, map_config_state(&ctx, ev));
+            }
+            // The released MXC folds the launch request and the win32k lockdown flag
+            // into `SandboxLaunchDetails` (it replaces `CreateProcessInSandbox` and
+            // `Win32kLockdownApplied`); emit the same audit rows from it.
+            "SandboxLaunchDetails" => {
+                tracing::debug!(target: "mxc_etw", pid = ev.process_id, sandbox_id = %sandbox_id, "{}", ev.summary());
+                let ctx = self.event_context(sandbox_id, sandbox_name);
+                for row in map_launch_details(&ctx, ev) {
+                    emit_ocsf(sandbox_id, row);
+                }
             }
             // Finding [2004]: MXC surfaces WIL error/fallback activities during
             // sandbox setup. Captured as informational (non-alert) findings so the
@@ -1935,6 +1948,13 @@ fn map_lifecycle_create(ctx: &EventContext, sandbox_name: &str) -> OcsfEvent {
 /// config-ish fields the event carries ride along as `unmapped`, and
 /// `security_level` reflects any hardening signal present.
 fn map_config_state(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
+    map_config_state_as(ctx, ev, ev.event_name.as_deref().unwrap_or(""))
+}
+
+/// Like [`map_config_state`], but labels the row as event kind `kind` instead of
+/// the event's own name. `SandboxLaunchDetails` uses this to also report the
+/// win32k lockdown it carries as a field.
+fn map_config_state_as(ctx: &EventContext, ev: &DecodedEtwEvent, kind: &str) -> OcsfEvent {
     let flag = |k: &str| ev.get(k).is_some_and(|v| v == "1");
     let nonzero = |k: &str| ev.get(k).is_some_and(|v| v != "0");
     let hardened = flag("useLeastPrivilege") || flag("useAppContainer") || nonzero("agenticFlags");
@@ -1944,9 +1964,11 @@ fn map_config_state(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
         SecurityLevelId::Unknown
     };
 
-    let message = match ev.event_name.as_deref().unwrap_or("") {
+    let message = match kind {
         "Win32kLockdownApplied" => "MXC sandbox win32k lockdown applied".to_string(),
-        "ApplyUILimits" => "MXC sandbox UI restrictions applied".to_string(),
+        // `SetUILimitsOnJob` is the released MXC's name for what older builds
+        // called `ApplyUILimits`.
+        "ApplyUILimits" | "SetUILimitsOnJob" => "MXC sandbox UI restrictions applied".to_string(),
         "EnforceOsPolicy" => "MXC sandbox OS policy enforced".to_string(),
         "SandboxConsoleReferencePlumbed" => "MXC sandbox console reference plumbed".to_string(),
         // The one network-plane event the provider emits. Empirically the OS
@@ -1989,6 +2011,7 @@ fn map_config_state(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
         "proxyPort",
         "hasConsoleReference",
         "creationFlags",
+        "disallowWin32kSystemCalls",
     ] {
         if let Some(v) = ev.get(key) {
             builder = builder.unmapped(key, v.trim_matches('"').to_string());
@@ -1996,6 +2019,27 @@ fn map_config_state(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
     }
 
     builder.build()
+}
+
+/// `SandboxLaunchDetails` → the audit rows the older events used to provide:
+///
+/// - Process Activity [1007] "Launch" from `commandLine` (as `CreateProcessInSandbox`
+///   did), with arguments omitted from the output exactly as in
+///   [`map_process_launch`];
+/// - Config State Change [5019] "win32k lockdown applied" when
+///   `disallowWin32kSystemCalls` is `1` (as `Win32kLockdownApplied` did).
+///
+/// Either row is skipped when its field is absent, so a sparse event still
+/// produces whatever it can support.
+fn map_launch_details(ctx: &EventContext, ev: &DecodedEtwEvent) -> Vec<OcsfEvent> {
+    let mut rows = Vec::new();
+    if let Some(cmd) = ev.get_unquoted("commandLine") {
+        rows.push(map_process_launch(ctx, ev, &cmd));
+    }
+    if ev.get_unquoted("disallowWin32kSystemCalls").as_deref() == Some("1") {
+        rows.push(map_config_state_as(ctx, ev, "Win32kLockdownApplied"));
+    }
+    rows
 }
 
 /// `CreateProcessInSandbox` (populated) → Process Activity [1007] "Launch".
@@ -3056,5 +3100,154 @@ mod tests {
             parent.start_key, own_key,
             "the parent's generation key must match ours"
         );
+    }
+
+    // ---- Renamed events in the released MXC (UI limits, launch details) ----
+
+    /// `SandboxLaunchDetails` as the released MXC emits it (values from a real
+    /// capture); `commandLine` and `disallowWin32kSystemCalls` are overridable.
+    fn launch_details(command_line: Option<&str>, win32k: Option<&str>) -> DecodedEtwEvent {
+        let mut ev = mk_event(11_084, "SandboxLaunchDetails");
+        ev.props = vec![
+            (
+                "identity".into(),
+                r#""Sandbox.{FE39BA46-2C3B-4061-8BB9-539002A0E8EE}""#.into(),
+            ),
+            (
+                "applicationName".into(),
+                r#""C:\kit\openshell-windows-sandbox.exe""#.into(),
+            ),
+            ("useAppContainer".into(), "1".into()),
+            ("uiRestrictions".into(), "1023".into()),
+        ];
+        if let Some(cmd) = command_line {
+            ev.props.push(("commandLine".into(), format!("\"{cmd}\"")));
+        }
+        if let Some(flag) = win32k {
+            ev.props
+                .push(("disallowWin32kSystemCalls".into(), flag.to_string()));
+        }
+        ev
+    }
+
+    /// The OCSF `message` field, which is what `run-ocsf-audit.ps1` matches in the
+    /// JSONL log (the one-line shorthand does not always repeat it).
+    fn messages(rows: &[OcsfEvent]) -> Vec<String> {
+        rows.iter()
+            .map(|row| {
+                row.to_json().expect("serialize")["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn set_ui_limits_on_job_reports_ui_restrictions_applied() {
+        let ctx = event_processor("gw").event_context("sbx-1", "one");
+        let mut ev = mk_event(11_084, "SetUILimitsOnJob");
+        ev.props = vec![("uiRestrictions".into(), "32".into())];
+
+        let event = map_config_state(&ctx, &ev);
+
+        assert!(matches!(event, OcsfEvent::DeviceConfigStateChange(_)));
+        assert!(
+            event
+                .format_shorthand()
+                .contains("MXC sandbox UI restrictions applied"),
+            "got: {}",
+            event.format_shorthand()
+        );
+    }
+
+    #[test]
+    fn the_older_apply_ui_limits_name_still_works() {
+        let ctx = event_processor("gw").event_context("sbx-1", "one");
+        let ev = mk_event(1, "ApplyUILimits");
+
+        assert!(
+            map_config_state(&ctx, &ev)
+                .format_shorthand()
+                .contains("MXC sandbox UI restrictions applied")
+        );
+    }
+
+    #[test]
+    fn launch_details_yields_a_launch_row_and_a_win32k_row() {
+        let ctx = event_processor("gw").event_context("sbx-1", "one");
+        let ev = launch_details(
+            Some(r"C:\kit\openshell-windows-sandbox.exe --bootstrap C:\state\boundary.json"),
+            Some("1"),
+        );
+
+        let rows = map_launch_details(&ctx, &ev);
+
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0], OcsfEvent::ProcessActivity(_)));
+        assert!(matches!(rows[1], OcsfEvent::DeviceConfigStateChange(_)));
+        let text = messages(&rows);
+        assert!(
+            text[0].contains("MXC sandbox launched process: openshell-windows-sandbox.exe"),
+            "got: {}",
+            text[0]
+        );
+        assert!(
+            text[1].contains("MXC sandbox win32k lockdown applied"),
+            "got: {}",
+            text[1]
+        );
+    }
+
+    #[test]
+    fn launch_details_omits_command_arguments_from_audit_output() {
+        const SECRET: &str = "secret-value";
+        let ctx = event_processor("gw").event_context("sbx-1", "one");
+        let ev = launch_details(Some(&format!(r"tool.exe --token {SECRET}")), Some("1"));
+
+        for row in map_launch_details(&ctx, &ev) {
+            let json = serde_json::to_string(&row).expect("serialize");
+            assert!(!json.contains(SECRET), "serialized OCSF leaked an argument");
+            assert!(
+                !row.format_shorthand().contains(SECRET),
+                "OCSF shorthand leaked an argument"
+            );
+        }
+    }
+
+    #[test]
+    fn win32k_row_requires_the_flag_to_be_one() {
+        let ctx = event_processor("gw").event_context("sbx-1", "one");
+
+        for flag in [Some("0"), None] {
+            let ev = launch_details(Some(r"C:\kit\boundary.exe"), flag);
+            let rows = map_launch_details(&ctx, &ev);
+            assert_eq!(rows.len(), 1, "flag {flag:?} must not report a lockdown");
+            assert!(matches!(rows[0], OcsfEvent::ProcessActivity(_)));
+        }
+    }
+
+    #[test]
+    fn a_sparse_launch_details_event_yields_only_what_it_supports() {
+        let ctx = event_processor("gw").event_context("sbx-1", "one");
+
+        // No command line: only the lockdown row.
+        let only_flag = map_launch_details(&ctx, &launch_details(None, Some("1")));
+        assert_eq!(only_flag.len(), 1);
+        assert!(matches!(
+            only_flag[0],
+            OcsfEvent::DeviceConfigStateChange(_)
+        ));
+
+        // Neither field: nothing.
+        assert!(map_launch_details(&ctx, &launch_details(None, None)).is_empty());
+    }
+
+    #[test]
+    fn the_renamed_events_are_audited_so_losing_them_counts_as_a_gap() {
+        assert!(is_audited_event(Some("SetUILimitsOnJob")));
+        assert!(is_audited_event(Some("SandboxLaunchDetails")));
+        // Still not audited: no mapper consumes it.
+        assert!(!is_audited_event(Some("BrokeredCreateProcessLaunchResult")));
     }
 }
