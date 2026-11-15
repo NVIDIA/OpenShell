@@ -1236,21 +1236,6 @@ network_policies:
         assert!(guard.is_stale());
     }
 
-    /// A reload between authorization and relay setup refuses the
-    /// relay, whatever the reload changed.
-    #[test]
-    fn reload_between_authorization_and_pin_refuses_the_relay() {
-        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
-        let decision = authorized_decision(&engine);
-        engine
-            .reload(POLICY_REGO, CURL_EXAMPLE_AND_OTHER_POLICY)
-            .unwrap();
-
-        assert!(prepare_raw_relay(None, &engine, &decision).is_none());
-        let request = request_context();
-        assert!(prepare_http_relay(None, &engine, &decision, &request).is_none());
-    }
-
     // --- HTTP passthrough with middleware across reloads ---
 
     /// Policy data for example.com:80 with the built-in regex middleware on
@@ -2383,5 +2368,118 @@ network_policies:
         engine.reload(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap();
 
         assert!(!guard.is_stale());
+    }
+
+    // --- Relays set up across a policy reload ---
+    //
+    // A reload can land between the L4 decision and relay setup. A reload
+    // that leaves the connection's contract unchanged must not refuse it: the
+    // relay starts pinned to the current generation. One that changes the
+    // contract, or a quarantine, still refuses it.
+
+    #[test]
+    fn a_policy_pin_follows_an_unrelated_reload_after_the_decision() {
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
+        let decision = authorized_decision(&engine);
+        engine
+            .reload(POLICY_REGO, CURL_EXAMPLE_AND_OTHER_POLICY)
+            .unwrap();
+        assert!(engine.current_generation() > decision.policy_generation);
+
+        let guard = pin_policy_generation(&engine, &decision, None)
+            .expect("an unrelated reload does not refuse the connection");
+        assert_eq!(guard.captured_generation(), engine.current_generation());
+        assert!(!guard.is_stale());
+    }
+
+    #[test]
+    fn raw_and_passthrough_relays_start_after_an_unrelated_reload() {
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
+        let decision = authorized_decision(&engine);
+        engine
+            .reload(POLICY_REGO, CURL_EXAMPLE_AND_OTHER_POLICY)
+            .unwrap();
+
+        let guard = prepare_raw_relay(None, &engine, &decision).expect("raw relay starts");
+        assert_eq!(guard.captured_generation(), engine.current_generation());
+        let request = request_context();
+        let context = prepare_http_relay(None, &engine, &decision, &request)
+            .expect("passthrough relay starts");
+        let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
+            panic!("route-less relay should use a generation guard");
+        };
+        assert_eq!(
+            generation_guard.captured_generation(),
+            engine.current_generation()
+        );
+    }
+
+    #[test]
+    fn an_inspected_relay_starts_after_an_unrelated_reload() {
+        let engine =
+            Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_REST_POLICY).unwrap());
+        let decision = authorized_decision(&engine);
+        let route = inspected_route(&decision);
+        engine
+            .reload(POLICY_REGO, CURL_EXAMPLE_REST_AND_OTHER_POLICY)
+            .unwrap();
+        let request = request_context();
+
+        let context = prepare_http_relay(Some(&route), &engine, &decision, &request)
+            .expect("inspected relay starts");
+        let PreparedHttpPolicy::Inspect { evaluator, .. } = context.policy else {
+            panic!("a REST route should be inspected");
+        };
+        assert_eq!(
+            evaluator.generation_guard().captured_generation(),
+            engine.current_generation()
+        );
+    }
+
+    /// The CONNECT adapter hydrates the L7 route after the L4 decision; a
+    /// route hydrated after an unrelated reload is the decision's own route.
+    #[test]
+    fn a_route_hydrated_after_an_unrelated_reload_is_accepted() {
+        let engine =
+            Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_REST_POLICY).unwrap());
+        let decision = authorized_decision(&engine);
+        engine
+            .reload(POLICY_REGO, CURL_EXAMPLE_REST_AND_OTHER_POLICY)
+            .unwrap();
+        let mut route = inspected_route(&decision);
+        route.l7_policy_generation = engine.current_generation();
+        let request = request_context();
+
+        assert!(prepare_http_relay(Some(&route), &engine, &decision, &request).is_some());
+        assert!(prepare_raw_relay(Some(&route), &engine, &decision).is_some());
+    }
+
+    #[test]
+    fn a_reload_that_changes_the_connection_still_refuses_relay_setup() {
+        let engine =
+            Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_REST_POLICY).unwrap());
+        let decision = authorized_decision(&engine);
+        let route = inspected_route(&decision);
+        engine
+            .reload(POLICY_REGO, CURL_EXAMPLE_REST_NARROWED_POLICY)
+            .unwrap();
+        let request = request_context();
+
+        assert!(pin_policy_generation(&engine, &decision, None).is_err());
+        assert!(prepare_raw_relay(None, &engine, &decision).is_none());
+        assert!(prepare_http_relay(Some(&route), &engine, &decision, &request).is_none());
+        let mut hydrated_later = route.clone();
+        hydrated_later.l7_policy_generation = engine.current_generation();
+        assert!(prepare_http_relay(Some(&hydrated_later), &engine, &decision, &request).is_none());
+    }
+
+    #[test]
+    fn a_quarantine_after_the_decision_still_refuses_relay_setup() {
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, CURL_EXAMPLE_POLICY).unwrap());
+        let decision = authorized_decision(&engine);
+        engine.enter_fail_closed("test quarantine").unwrap();
+
+        assert!(pin_policy_generation(&engine, &decision, None).is_err());
+        assert!(prepare_raw_relay(None, &engine, &decision).is_none());
     }
 }
