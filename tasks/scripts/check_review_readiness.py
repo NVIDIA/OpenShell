@@ -168,11 +168,10 @@ def select_reviewers(categories: dict[str, set[str]], labels: set[str]) -> set[s
         if len(unknown) == 1:
             raise LabelRoutingError(
                 f"There is an invalid area or topic label on this PR: {names}. "
-                "Replace it with a valid label."
+                "Remove it."
             )
         raise LabelRoutingError(
-            f"There are invalid area and topic labels on this PR: {names}. "
-            "Replace them with valid labels."
+            f"There are invalid area and topic labels on this PR: {names}. Remove them."
         )
     return set().union(*(categories[label] for label in relevant))
 

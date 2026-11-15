@@ -164,7 +164,7 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(
             str(caught.exception),
             "There are invalid area and topic labels on this PR: topic:nope, "
-            "topic:zzz. Replace them with valid labels.",
+            "topic:zzz. Remove them.",
         )
 
     def test_single_unknown_label_message(self):
@@ -173,7 +173,7 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(
             str(caught.exception),
             "There is an invalid area or topic label on this PR: topic:nope. "
-            "Replace it with a valid label.",
+            "Remove it.",
         )
 
     def test_area_count_is_checked_before_unknown_labels(self):
