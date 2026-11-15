@@ -23,7 +23,7 @@ Stop when further reading is unlikely to change classification. Technical fetch 
 
 ## Choose the desired set
 
-First identify the requested outcome, affected OpenShell boundary and substantive technical concerns; topics follow those concerns. Routine implementation or verification alone adds no topic. Testing work retains its testing topic.
+First identify the requested outcome, affected OpenShell boundary and substantive technical concerns. Choose the area whose reviewers are the right people to review the work. Add every topic whose reviewers would be interested in seeing the change and potentially reviewing it. Supporting documentation or tests can warrant their topic when that reviewer audience is relevant; their presence alone does not. Testing work retains its testing topic.
 
 Choose exactly one area and every supported topic from the canonical scopes. Report missing definitions or routing preparation as prerequisites; do not omit a needed label or invent replacements.
 
