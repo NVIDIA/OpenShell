@@ -751,6 +751,17 @@ pub(crate) fn test_service(
     store: Arc<ResolvedEndpointStore>,
     addresses: Vec<std::net::IpAddr>,
 ) -> PolicyDnsService<impl TrustedResolver> {
+    test_service_with_gateway(policy, store, addresses, None)
+}
+
+/// [`test_service`] with a trusted host gateway for the reserved alias.
+#[cfg(test)]
+pub(crate) fn test_service_with_gateway(
+    policy: Arc<OpaEngine>,
+    store: Arc<ResolvedEndpointStore>,
+    addresses: Vec<std::net::IpAddr>,
+    trusted_host_gateway: Option<std::net::IpAddr>,
+) -> PolicyDnsService<impl TrustedResolver> {
     struct FixedResolver(Vec<std::net::IpAddr>);
 
     impl TrustedResolver for FixedResolver {
@@ -766,7 +777,12 @@ pub(crate) fn test_service(
         }
     }
 
-    PolicyDnsService::new(policy, FixedResolver(addresses), store, None)
+    PolicyDnsService::new(
+        policy,
+        FixedResolver(addresses),
+        store,
+        trusted_host_gateway,
+    )
 }
 
 #[cfg(test)]
@@ -1953,5 +1969,128 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             Duration::from_secs(10)
         );
         assert_eq!(clamp_mapping_ttl(Duration::from_mins(5)), MAX_MAPPING_TTL);
+    }
+
+    fn claude_proto(extra_hosts: &[&str]) -> openshell_core::proto::SandboxPolicy {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+        let endpoint = |host: &str| NetworkEndpoint {
+            host: host.to_string(),
+            port: 443,
+            ..Default::default()
+        };
+        let mut endpoints = vec![endpoint("api.anthropic.com")];
+        endpoints.extend(extra_hosts.iter().map(|host| endpoint(host)));
+        openshell_core::proto::SandboxPolicy {
+            version: 1,
+            network_policies: std::iter::once((
+                "claude_code".to_string(),
+                NetworkPolicyRule {
+                    name: "claude_code".to_string(),
+                    endpoints,
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/local/bin/claude".to_string(),
+                    }],
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn proto_service(
+        proto: &openshell_core::proto::SandboxPolicy,
+    ) -> PolicyDnsService<FakeResolver> {
+        let pools = SyntheticPools::new(
+            Ipv4Addr::new(198, 18, 0, 1)..=Ipv4Addr::new(198, 18, 0, 8),
+            "fd00:1::1".parse::<Ipv6Addr>().unwrap()..="fd00:1::8".parse::<Ipv6Addr>().unwrap(),
+        )
+        .unwrap();
+        PolicyDnsService::new(
+            Arc::new(OpaEngine::from_proto(proto).unwrap()),
+            FakeResolver {
+                calls: AtomicUsize::new(0),
+                answer: TrustedAnswer {
+                    addresses: vec!["8.8.8.8".parse().unwrap()],
+                    ttl: Duration::from_mins(5),
+                },
+            },
+            Arc::new(ResolvedEndpointStore::new(
+                StoreConfig::new(pools, 16).unwrap(),
+            )),
+            None,
+        )
+    }
+
+    /// Proto conversion stamps the hash of the complete policy into every
+    /// endpoint, so any policy change changes every endpoint object. The stamp
+    /// is not part of an endpoint's contract: a name whose endpoints did not
+    /// change keeps its synthetic address across the reload, rather than
+    /// taking a new one from the never-reused pool each time.
+    #[tokio::test]
+    async fn proto_reload_keeps_the_synthetic_address_of_an_unchanged_endpoint() {
+        let service = proto_service(&claude_proto(&[]));
+        let stamp = |service: &PolicyDnsService<FakeResolver>| {
+            service
+                .policy
+                .policy_dns_eligibility_snapshot()
+                .unwrap()
+                .endpoints[0]
+                .endpoint["policy_hash"]
+                .clone()
+        };
+        let before_stamp = stamp(&service);
+        assert!(matches!(before_stamp, regorus::Value::String(_)));
+        let before = service
+            .answer_query("api.anthropic.com", AddressFamily::Ipv4, Instant::now())
+            .await
+            .unwrap();
+
+        // Approve another host in the same policy.
+        service
+            .policy
+            .reload_from_proto(&claude_proto(&["github.com"]))
+            .unwrap();
+        assert_ne!(stamp(&service), before_stamp, "the stamp changed");
+
+        let after = service
+            .answer_query("api.anthropic.com", AddressFamily::Ipv4, Instant::now())
+            .await
+            .unwrap();
+        assert!(after.policy_generation > before.policy_generation);
+        assert_eq!(after.address, before.address);
+    }
+
+    /// A name keeps its synthetic address when the endpoint that allows it
+    /// moves within its policy or gains a port: an address stands for a name,
+    /// and the current policy decides what each connection to it may do.
+    #[tokio::test]
+    async fn a_name_keeps_its_address_when_its_endpoint_moves_or_changes() {
+        let service = proto_service(&claude_proto(&[]));
+        let lookup =
+            || service.answer_query("api.anthropic.com", AddressFamily::Ipv4, Instant::now());
+        let before = lookup().await.unwrap();
+
+        // github.com inserted before api.anthropic.com.
+        let mut reordered = claude_proto(&["github.com"]);
+        reordered
+            .network_policies
+            .get_mut("claude_code")
+            .unwrap()
+            .endpoints
+            .reverse();
+        service.policy.reload_from_proto(&reordered).unwrap();
+        assert_eq!(lookup().await.unwrap().address, before.address, "moved");
+
+        let mut widened = reordered.clone();
+        for endpoint in &mut widened
+            .network_policies
+            .get_mut("claude_code")
+            .unwrap()
+            .endpoints
+        {
+            endpoint.ports = vec![443, 8443];
+        }
+        service.policy.reload_from_proto(&widened).unwrap();
+        assert_eq!(lookup().await.unwrap().address, before.address, "new port");
     }
 }

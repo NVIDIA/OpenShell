@@ -9053,6 +9053,30 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         ));
     }
 
+    /// Whether a staged curl open to `destination` is admitted, and the
+    /// decision sent back to the capture socket.
+    async fn admit_staged(
+        store: &Arc<ResolvedEndpointStore>,
+        engine: &OpaEngine,
+        destination: SocketAddr,
+    ) -> (bool, TcpOpenDecision) {
+        let (open, completion) = staged_curl_open(destination, engine.current_generation());
+        let admitted = preauthorize_transparent_open(
+            open,
+            Some(store),
+            engine,
+            &BinaryIdentityCache::new(),
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .is_some();
+        (admitted, completion.await.unwrap())
+    }
+
     /// The upstream addresses the direct transparent TCP path pins for curl
     /// connecting to `destination`, or why it refused. The policy decision is
     /// made for curl's supplied identity, as the connection handler makes it
@@ -9247,6 +9271,541 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         .unwrap();
         assert_eq!(connector.addrs(), &["203.0.113.8:5432".parse().unwrap()]);
         assert_eq!(guard.captured_generation(), decision.policy_generation);
+    }
+
+    /// A client keeps a policy DNS answer and opens a new connection to it
+    /// after a reload that does not touch that endpoint, as Claude Code
+    /// (`node`) does with `api.anthropic.com` when an operator approves another
+    /// host. The answer still stands: nothing it was published for changed.
+    #[tokio::test]
+    async fn policy_dns_answer_survives_a_reload_that_keeps_its_endpoint() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let dns = crate::policy_dns::test_service(
+            engine.clone(),
+            store.clone(),
+            vec!["8.8.8.8".parse().unwrap()],
+        );
+        let open_to = |destination| admit_staged(&store, &engine, destination);
+        let answer = dns
+            .answer_query(
+                "pypi.org",
+                crate::policy_dns::AddressFamily::Ipv4,
+                std::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        let cached = SocketAddr::new(answer.address, 80);
+        assert_eq!(open_to(cached).await, (true, TcpOpenDecision::RelayReady));
+
+        // Approve an endpoint for another host.
+        let approved = POLICY_DNS_OPEN_POLICY.replace(
+            "filesystem_policy:",
+            "  github:\n    name: github\n    endpoints:\n      - { host: github.com, port: 443 }\n    binaries: [{ path: /usr/bin/curl }]\nfilesystem_policy:",
+        );
+        engine
+            .reload(rego, &policy_with_native_executable_paths(&approved))
+            .unwrap();
+        assert!(engine.current_generation() > answer.policy_generation);
+
+        assert_eq!(open_to(cached).await, (true, TcpOpenDecision::RelayReady));
+    }
+
+    /// Publish a policy DNS answer for `name` resolving to `addresses` under
+    /// the engine's current policy (`initial`), check that curl may connect to
+    /// it on `port`, then reload with `reloaded`. Returns the synthetic address
+    /// the client kept.
+    #[allow(
+        clippy::future_not_send,
+        clippy::too_many_arguments,
+        reason = "the test resolver's future is not Send; the helper runs on the test's task"
+    )]
+    async fn keep_answer_across(
+        engine: &Arc<OpaEngine>,
+        store: &Arc<ResolvedEndpointStore>,
+        trusted_host_gateway: Option<IpAddr>,
+        initial: &str,
+        name: &str,
+        port: u16,
+        addresses: Vec<IpAddr>,
+        reloaded: &str,
+    ) -> IpAddr {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let dns = crate::policy_dns::test_service_with_gateway(
+            engine.clone(),
+            store.clone(),
+            addresses,
+            trusted_host_gateway,
+        );
+        let answer = dns
+            .answer_query(
+                name,
+                crate::policy_dns::AddressFamily::Ipv4,
+                std::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            staged_connector(
+                store,
+                engine,
+                SocketAddr::new(answer.address, port),
+                trusted_host_gateway
+            )
+            .await
+            .is_ok(),
+            "{name}:{port} before the reload"
+        );
+        assert_ne!(reloaded, initial);
+        engine
+            .reload(rego, &policy_with_native_executable_paths(reloaded))
+            .unwrap();
+        assert!(engine.current_generation() > answer.policy_generation);
+        answer.address
+    }
+
+    /// Publish a policy DNS answer for `pypi.org` resolving to `8.8.8.8`, check
+    /// that curl may connect to it on port 80, then reload with `reloaded`.
+    /// Returns the synthetic address the client kept.
+    #[allow(
+        clippy::future_not_send,
+        reason = "the test resolver's future is not Send; the helper runs on the test's task"
+    )]
+    async fn keep_pypi_answer_across(
+        engine: &Arc<OpaEngine>,
+        store: &Arc<ResolvedEndpointStore>,
+        reloaded: &str,
+    ) -> IpAddr {
+        keep_answer_across(
+            engine,
+            store,
+            None,
+            POLICY_DNS_OPEN_POLICY,
+            "pypi.org",
+            80,
+            vec!["8.8.8.8".parse().unwrap()],
+            reloaded,
+        )
+        .await
+    }
+
+    /// The upstream addresses a staged curl open to `destination` may dial, or
+    /// the refusal sent back to the capture socket. Policy DNS passes its
+    /// trusted host gateway as the backend gateway.
+    async fn staged_connector(
+        store: &Arc<ResolvedEndpointStore>,
+        engine: &OpaEngine,
+        destination: SocketAddr,
+        trusted_host_gateway: Option<IpAddr>,
+    ) -> std::result::Result<Vec<SocketAddr>, TcpOpenDecision> {
+        let (open, completion) = staged_curl_open(destination, engine.current_generation());
+        let accepted = preauthorize_transparent_open(
+            open,
+            Some(store),
+            engine,
+            &BinaryIdentityCache::new(),
+            trusted_host_gateway,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await;
+        let decision = completion.await.unwrap();
+        match accepted {
+            Some((_, _, _, transparent)) => {
+                assert_eq!(decision, TcpOpenDecision::RelayReady);
+                let (_, connector) = transparent.and_then(|open| open.authorization).unwrap();
+                Ok(connector.addrs().to_vec())
+            }
+            None => Err(decision),
+        }
+    }
+
+    /// curl and its supplied identity may reach `host.openshell.internal`
+    /// through the trusted host gateway, as policy DNS answers for it.
+    const HOST_GATEWAY_CURL_POLICY: &str = r"
+network_policies:
+  gateway:
+    name: gateway
+    endpoints:
+      - { host: host.openshell.internal, port: 8080, protocol: tcp }
+    binaries: [{ path: /usr/bin/curl }]
+filesystem_policy: { include_workdir: true, read_only: [], read_write: [] }
+landlock: { compatibility: best_effort }
+process: { run_as_user: sandbox, run_as_group: sandbox }
+";
+
+    /// Add a policy for another host, the way an operator approves one.
+    fn approve_github(policy: &str) -> String {
+        policy.replace(
+            "filesystem_policy:",
+            "  github:\n    name: github\n    endpoints:\n      - { host: github.com, port: 443 }\n    binaries: [{ path: /usr/bin/curl }]\nfilesystem_policy:",
+        )
+    }
+
+    /// A port the policy does not allow is refused by the policy decision for
+    /// the mapped name, like any other denied connection, and the denial is
+    /// sent to the policy advisor as a proposal.
+    #[tokio::test]
+    async fn policy_dns_answer_on_a_port_the_policy_denies_is_a_proposed_policy_denial() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let kept =
+            keep_pypi_answer_across(&engine, &store, &approve_github(POLICY_DNS_OPEN_POLICY)).await;
+
+        let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
+        let (open, completion) =
+            staged_curl_open(SocketAddr::new(kept, 22), engine.current_generation());
+        let accepted = preauthorize_transparent_open(
+            open,
+            Some(&store),
+            &engine,
+            &BinaryIdentityCache::new(),
+            None,
+            None,
+            false,
+            Some(&denial_tx),
+            None,
+        )
+        .await;
+        assert!(accepted.is_none());
+        assert_eq!(
+            completion.await.unwrap(),
+            TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
+        );
+        let proposal = denial_rx.try_recv().expect("the denial is proposed");
+        assert_eq!((proposal.host.as_str(), proposal.port), ("pypi.org", 22));
+    }
+
+    /// Widening `allowed_ips` never adds an address to a kept answer: it pins
+    /// only what passed when it was published. A fresh lookup pins the
+    /// newly permitted address too.
+    #[tokio::test]
+    async fn a_reload_never_adds_an_address_to_a_kept_answer() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let narrow = POLICY_DNS_OPEN_POLICY.replace(
+            "{ host: pypi.org, port: 80 }",
+            r#"{ host: pypi.org, port: 80, allowed_ips: ["8.8.8.0/24"] }"#,
+        );
+        let wide = POLICY_DNS_OPEN_POLICY.replace(
+            "{ host: pypi.org, port: 80 }",
+            r#"{ host: pypi.org, port: 80, allowed_ips: ["8.8.8.0/24", "9.9.9.0/24"] }"#,
+        );
+        let engine = Arc::new(native_identity_engine(rego, &narrow).unwrap());
+        let store = policy_dns_test_store();
+        let resolved = vec!["8.8.8.8".parse().unwrap(), "9.9.9.9".parse().unwrap()];
+        let kept = keep_answer_across(
+            &engine,
+            &store,
+            None,
+            &narrow,
+            "pypi.org",
+            80,
+            resolved.clone(),
+            &wide,
+        )
+        .await;
+
+        assert_eq!(
+            staged_connector(&store, &engine, SocketAddr::new(kept, 80), None).await,
+            Ok(vec!["8.8.8.8:80".parse().unwrap()])
+        );
+        let fresh = crate::policy_dns::test_service(engine.clone(), store.clone(), resolved)
+            .answer_query(
+                "pypi.org",
+                crate::policy_dns::AddressFamily::Ipv4,
+                std::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            staged_connector(&store, &engine, SocketAddr::new(fresh.address, 80), None).await,
+            Ok(vec![
+                "8.8.8.8:80".parse().unwrap(),
+                "9.9.9.9:80".parse().unwrap()
+            ])
+        );
+    }
+
+    /// The trusted host gateway alias keeps working with a kept answer after
+    /// an unrelated reload, pinned to the gateway alone.
+    #[tokio::test]
+    async fn kept_host_gateway_answer_survives_an_unrelated_reload() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, HOST_GATEWAY_CURL_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let gateway: IpAddr = "172.23.0.1".parse().unwrap();
+        let kept = keep_answer_across(
+            &engine,
+            &store,
+            Some(gateway),
+            HOST_GATEWAY_CURL_POLICY,
+            "host.openshell.internal",
+            8080,
+            Vec::new(),
+            &approve_github(HOST_GATEWAY_CURL_POLICY),
+        )
+        .await;
+
+        assert_eq!(
+            staged_connector(&store, &engine, SocketAddr::new(kept, 8080), Some(gateway)).await,
+            Ok(vec![SocketAddr::new(gateway, 8080)])
+        );
+    }
+
+    /// A name first looked up while unknown gets an observation address. Once
+    /// policy approves the name, the kept observation still cannot reach it;
+    /// a fresh lookup gets a policy-backed address that can.
+    #[tokio::test]
+    async fn a_kept_observation_is_refused_after_its_name_is_approved() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let dns = crate::policy_dns::test_service(
+            engine.clone(),
+            store.clone(),
+            vec!["140.82.112.3".parse().unwrap()],
+        );
+        let lookup = || {
+            dns.answer_query(
+                "github.com",
+                crate::policy_dns::AddressFamily::Ipv4,
+                std::time::Instant::now(),
+            )
+        };
+        let observed = lookup().await.unwrap();
+        engine
+            .reload(
+                rego,
+                &policy_with_native_executable_paths(&approve_github(POLICY_DNS_OPEN_POLICY)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            staged_connector(
+                &store,
+                &engine,
+                SocketAddr::new(observed.address, 443),
+                None
+            )
+            .await,
+            Err(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination))
+        );
+        let approved = lookup().await.unwrap();
+        assert_ne!(approved.address, observed.address);
+        assert_eq!(
+            staged_connector(
+                &store,
+                &engine,
+                SocketAddr::new(approved.address, 443),
+                None
+            )
+            .await,
+            Ok(vec!["140.82.112.3:443".parse().unwrap()])
+        );
+    }
+
+    /// A control-plane port added to an exact host's endpoint is still refused
+    /// by the destination rules with a kept answer, while the old port works.
+    #[tokio::test]
+    async fn kept_answer_on_a_newly_allowed_control_plane_port_is_refused() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let widened = POLICY_DNS_OPEN_POLICY.replace(
+            "{ host: pypi.org, port: 80 }",
+            "{ host: pypi.org, ports: [80, 6443] }",
+        );
+        let kept = keep_pypi_answer_across(&engine, &store, &widened).await;
+
+        assert_eq!(
+            staged_connector(&store, &engine, SocketAddr::new(kept, 6443), None).await,
+            Err(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination))
+        );
+    }
+
+    /// The direct transparent path keeps a kept answer through a reordered
+    /// policy, like the staged path.
+    #[tokio::test]
+    async fn direct_transparent_pin_survives_reordering_its_policy() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let reordered = POLICY_DNS_OPEN_POLICY.replace(
+            "      - { host: pypi.org, port: 80 }",
+            "      - { host: files.pythonhosted.org, port: 80 }\n      - { host: pypi.org, port: 80 }",
+        );
+        let kept = keep_pypi_answer_across(&engine, &store, &reordered).await;
+
+        assert_eq!(
+            direct_connector(&store, &engine, SocketAddr::new(kept, 80)).await,
+            Ok(vec!["8.8.8.8:80".parse().unwrap()])
+        );
+    }
+
+    /// The direct transparent path refuses a kept answer whose addresses the
+    /// reloaded endpoint forbids.
+    #[tokio::test]
+    async fn direct_transparent_pin_refuses_addresses_the_reloaded_endpoint_forbids() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let restricted = POLICY_DNS_OPEN_POLICY.replace(
+            "{ host: pypi.org, port: 80 }",
+            r#"{ host: pypi.org, port: 80, allowed_ips: ["1.1.1.0/24"] }"#,
+        );
+        let kept = keep_pypi_answer_across(&engine, &store, &restricted).await;
+
+        assert!(
+            direct_connector(&store, &engine, SocketAddr::new(kept, 80))
+                .await
+                .is_err()
+        );
+    }
+
+    /// The direct transparent path pins a kept host gateway answer to the
+    /// trusted gateway after an unrelated reload.
+    #[tokio::test]
+    async fn direct_transparent_pin_keeps_the_host_gateway_across_a_reload() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, HOST_GATEWAY_CURL_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let gateway: IpAddr = "172.23.0.1".parse().unwrap();
+        let kept = keep_answer_across(
+            &engine,
+            &store,
+            Some(gateway),
+            HOST_GATEWAY_CURL_POLICY,
+            "host.openshell.internal",
+            8080,
+            Vec::new(),
+            &approve_github(HOST_GATEWAY_CURL_POLICY),
+        )
+        .await;
+
+        assert_eq!(
+            direct_connector(&store, &engine, SocketAddr::new(kept, 8080)).await,
+            Ok(vec![SocketAddr::new(gateway, 8080)])
+        );
+    }
+
+    /// Inserting an endpoint before `pypi.org` in its own policy moves it to a
+    /// new position without changing what it allows.
+    #[tokio::test]
+    async fn policy_dns_answer_survives_reordering_its_policy() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let reordered = POLICY_DNS_OPEN_POLICY.replace(
+            "      - { host: pypi.org, port: 80 }",
+            "      - { host: files.pythonhosted.org, port: 80 }\n      - { host: pypi.org, port: 80 }",
+        );
+        let kept = keep_pypi_answer_across(&engine, &store, &reordered).await;
+
+        assert_eq!(
+            admit_staged(&store, &engine, SocketAddr::new(kept, 80)).await,
+            (true, TcpOpenDecision::RelayReady)
+        );
+    }
+
+    /// A port added to the endpoint can be used with the kept answer, and the
+    /// old port still works.
+    #[tokio::test]
+    async fn policy_dns_answer_serves_a_port_added_to_its_endpoint() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let widened = POLICY_DNS_OPEN_POLICY.replace(
+            "{ host: pypi.org, port: 80 }",
+            "{ host: pypi.org, ports: [80, 443] }",
+        );
+        let kept = keep_pypi_answer_across(&engine, &store, &widened).await;
+
+        for port in [80, 443] {
+            assert_eq!(
+                admit_staged(&store, &engine, SocketAddr::new(kept, port)).await,
+                (true, TcpOpenDecision::RelayReady),
+                "port {port}"
+            );
+        }
+    }
+
+    /// Narrower `allowed_ips` that still permit the resolved address leave the
+    /// kept answer usable.
+    #[tokio::test]
+    async fn policy_dns_answer_survives_allowed_ips_that_still_permit_it() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let restricted = POLICY_DNS_OPEN_POLICY.replace(
+            "{ host: pypi.org, port: 80 }",
+            r#"{ host: pypi.org, port: 80, allowed_ips: ["8.8.8.0/24"] }"#,
+        );
+        let kept = keep_pypi_answer_across(&engine, &store, &restricted).await;
+
+        assert_eq!(
+            admit_staged(&store, &engine, SocketAddr::new(kept, 80)).await,
+            (true, TcpOpenDecision::RelayReady)
+        );
+    }
+
+    /// A reload whose endpoint no longer permits any address the name resolved
+    /// to refuses the kept answer. The name still correlates; the refusal is
+    /// the current endpoint's destination check, and a fresh lookup is refused
+    /// for the same reason.
+    #[tokio::test]
+    async fn policy_dns_answer_whose_addresses_the_reloaded_endpoint_forbids_is_refused() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let restricted = POLICY_DNS_OPEN_POLICY.replace(
+            "{ host: pypi.org, port: 80 }",
+            r#"{ host: pypi.org, port: 80, allowed_ips: ["1.1.1.0/24"] }"#,
+        );
+        let kept = keep_pypi_answer_across(&engine, &store, &restricted).await;
+        let cached = SocketAddr::new(kept, 80);
+
+        assert_eq!(
+            admit_staged(&store, &engine, cached).await,
+            (
+                false,
+                TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination)
+            )
+        );
+        let target = resolve_transparent_target(cached, Some(&store), &engine)
+            .expect("the kept answer still names pypi.org");
+        assert_eq!(target.host, "pypi.org");
+        let (open, _) = staged_curl_open(cached, engine.current_generation());
+        let mut decision = authorize_supplied_identity(
+            &engine,
+            &BinaryIdentityCache::new(),
+            EgressIntent::connect("pypi.org".to_string(), 80),
+            &open.binary_identity,
+        );
+        assert!(matches!(decision.action, NetworkAction::Allow { .. }));
+        hydrate_destination_plan(&mut decision, None, None).unwrap();
+        assert!(matches!(
+            pinned_transparent_plan(&store, cached, &decision),
+            Err(MappingLookupError::InvalidMapping)
+        ));
+
+        let dns = crate::policy_dns::test_service(
+            engine.clone(),
+            store.clone(),
+            vec!["8.8.8.8".parse().unwrap()],
+        );
+        assert!(
+            dns.answer_query(
+                "pypi.org",
+                crate::policy_dns::AddressFamily::Ipv4,
+                std::time::Instant::now(),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]
