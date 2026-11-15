@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "https://github.com/NVIDIA/OpenShell",
+    "branch": "windows",
+    "commit": "e39791be4f47ed6fb6357885ef42ca1339320679",
+    "versionStamp": "0.1.8"
+  },
+  "intendedRelease": {
+    "repository": "NVIDIA/OpenShell",
+    "tag": "v0.1.8",
+    "matchesReleaseTagSource": false
+  },
+  "buildRun": "https://github.com/NVIDIA/OpenShell/actions/runs/43743849384",
+  "buildAutomationCommit": "f258c85b202a78e0b233f39cc8f991069ef509ab",
+  "nativeRunnerTests": {
+    "arm64": {
+      "passed": 6659,
+      "failed": 0,
+      "skipped": 43
+    },
+    "x64": {
+      "passed": 6659,
+      "failed": 0,
+      "skipped": 43
+    }
+  },
+  "sdkRunnerTests": {
+    "pythonPassed": 229,
+    "typescriptPassed": 196
+  },
+  "architectures": {
+    "arm64": {
+      "file": "OpenShell-Windows-0.1.8-arm64.zip",
+      "sha256": "63c3aeb9b19f2cfeadfe9943629d7c53b783f34b3c735811dba21801eb0f275a",
+      "size": 55495163,
+      "authenticode": {
+        "result": "valid-timestamped",
+        "verifiedFiles": 23,
+        "publisher": "NVIDIA Corporation"
+      },
+      "manifestIntegrity": "passed",
+      "executableLaunches": "passed",
+      "launchEnvironment": "native-arm64",
+      "nativeMxcRuntime": {
+        "passed": 7,
+        "failed": 0,
+        "skipped": 0
+      },
+      "injectedCaHttps": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      },
+      "signedPayloadHashesUnchangedAfterTests": true
+    },
+    "x64": {
+      "file": "OpenShell-Windows-0.1.8-x64.zip",
+      "sha256": "db8d321668208961dd35651af4a98d7885893151921cb98dfa2b3eded2d2117b",
+      "size": 59953037,
+      "authenticode": {
+        "result": "valid-timestamped",
+        "verifiedFiles": 23,
+        "publisher": "NVIDIA Corporation"
+      },
+      "manifestIntegrity": "passed",
+      "executableLaunches": "passed",
+      "launchEnvironment": "x64-emulation-on-arm64",
+      "nativeMxcRuntime": "unqualified-not-tested",
+      "injectedCaHttps": "not-tested",
+      "signedPayloadHashesUnchangedAfterTests": true
+    }
+  },
+  "arm64PackageExamples": {
+    "gatewayStartAndInfo": "passed",
+    "initialization": "passed",
+    "typescriptHarness": "passed",
+    "powershellHarness": "passed",
+    "pythonHealth": "blocked-native-dependency-installation"
+  },
+  "signingVerification": {
+    "signatureVerification": "Windows Authenticode and signtool /pa /all /v",
+    "uniqueSignedPayloads": 28,
+    "payloadIdentityPreserved": true,
+    "signedFilesPerPackage": 23,
+    "unsignedSourceExampleTypesCoveredByArchiveAttestation": [
+      ".py",
+      ".mjs"
+    ]
+  },
+  "privacyScan": "passed",
+  "limitations": [
+    "Native x64 MXC remains unqualified; x64 signed-package launches were tested under emulation.",
+    "Passing MXC scenarios does not establish exclusive network mediation or live revocation.",
+    "Windows cfg-gated tests and unsupported-package exclusions are outside the Nextest skipped count.",
+    "The source SBOM covers the broader source tree and is not an exact linked-binary inventory.",
+    "Native ARM64 Python health example remains unqualified because its binary dependencies could not be installed."
+  ]
+}

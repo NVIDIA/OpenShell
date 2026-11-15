@@ -1,0 +1,441 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "https://github.com/NVIDIA/OpenShell",
+    "branch": "windows",
+    "commit": "e39791be4f47ed6fb6357885ef42ca1339320679",
+    "versionStamp": "0.1.8"
+  },
+  "buildRun": "https://github.com/NVIDIA/OpenShell/actions/runs/43743849384",
+  "buildAutomationCommit": "f258c85b202a78e0b233f39cc8f991069ef509ab",
+  "candidateArchives": {
+    "OpenShell-Windows-0.1.8-arm64-unsigned-candidate.zip": "95aa924c1c4a767fd3a3a0757324e3735193a5b1360715e8e1e86a88e749bcfd",
+    "OpenShell-Windows-0.1.8-x64-unsigned-candidate.zip": "b6af0a31ce2e0795433ff46877d49d27b41ccd3bbaad113190d9f2b41159d677"
+  },
+  "finalPackages": {
+    "arm64": {
+      "file": "OpenShell-Windows-0.1.8-arm64.zip",
+      "sha256": "63c3aeb9b19f2cfeadfe9943629d7c53b783f34b3c735811dba21801eb0f275a",
+      "size": 55495163,
+      "authenticode": {
+        "result": "valid-timestamped",
+        "verifiedFiles": 23,
+        "publisher": "NVIDIA Corporation"
+      },
+      "manifestIntegrity": "passed",
+      "executableLaunches": "passed",
+      "launchEnvironment": "native-arm64",
+      "nativeMxcRuntime": {
+        "passed": 7,
+        "failed": 0,
+        "skipped": 0
+      },
+      "injectedCaHttps": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      },
+      "signedPayloadHashesUnchangedAfterTests": true
+    },
+    "x64": {
+      "file": "OpenShell-Windows-0.1.8-x64.zip",
+      "sha256": "db8d321668208961dd35651af4a98d7885893151921cb98dfa2b3eded2d2117b",
+      "size": 59953037,
+      "authenticode": {
+        "result": "valid-timestamped",
+        "verifiedFiles": 23,
+        "publisher": "NVIDIA Corporation"
+      },
+      "manifestIntegrity": "passed",
+      "executableLaunches": "passed",
+      "launchEnvironment": "x64-emulation-on-arm64",
+      "nativeMxcRuntime": "unqualified-not-tested",
+      "injectedCaHttps": "not-tested",
+      "signedPayloadHashesUnchangedAfterTests": true
+    }
+  },
+  "signedPayloads": [
+    {
+      "architecture": "arm64",
+      "path": "bin/libz3.dll",
+      "member": null,
+      "inputSha256": "8bf540e8ab0fc43462bd64ff85deb02b1c655bdac14f4f9c40187fedf9532e7c",
+      "signedSha256": "5e174245cec462276de4be33d4c42dbb68b3a8bf5e430523053d8ede3ea3310e",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "bin/openshell-gateway.exe",
+      "member": null,
+      "inputSha256": "f87da58d688b1b13efe42b5eb2d644ae54265a3c0c63ba213d012c54892b2fb7",
+      "signedSha256": "42baed7a4f330c282b153933edd99fc104e83a86c470d77eef9c4cdd5e79b940",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "bin/openshell-supervisor.exe",
+      "member": null,
+      "inputSha256": "65757da800e1484ceba8ff03be7993f10fa82406b7d97301b2e696c2fe0e7712",
+      "signedSha256": "bcff44e8888d3dec3b99e15d011a80fbbf5b72afbee6083e76f527d61e7d7ea2",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "bin/openshell-windows-sandbox.exe",
+      "member": null,
+      "inputSha256": "c8d1f97a259d0c37c306c5cb91bd09999ea0db6f98869281cf4ad31bd6ebedcf",
+      "signedSha256": "d0728df8998fca424cb252119d6ea3f35b4882c8b286ddffd56ed0327311d20e",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "bin/openshell.exe",
+      "member": null,
+      "inputSha256": "f5d736a07079500c45401ef23076f206540c4e306bea04e58a269f7328429bd8",
+      "signedSha256": "6e907a63db82924053fb7441c4fc9f20e992491f3ea09a7fef86192736f5baa3",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "examples/powershell/harness.ps1",
+      "member": null,
+      "inputSha256": "93af7d01a96dd2d1bee35645321558d25c86daa8835cf957d5a65ddeba2eaf90",
+      "signedSha256": "9d5dd69d349756a47fe161488638a7bced17abef697f647cdf5564a504fec604",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "scripts/Initialize-OpenShell.ps1",
+      "member": null,
+      "inputSha256": "7ccafe6f3c3aa5451d1364b8cc1d93bc416c4c6b6ee99e779b8cc53d0a78ac01",
+      "signedSha256": "a958a7300fbc63be2c07d581afd3a1d4a40366b4bca3b9e1958c4c03bcc93c92",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "scripts/Start-OpenShell.ps1",
+      "member": null,
+      "inputSha256": "7cb05ede78457cf2847288848e3be59a59e29f61569fad47d104629469c54656",
+      "signedSha256": "556dc15ecbf7b93d365aced8bfc20fa94d24eae42b7774776f1a9aad84b21cb7",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "scripts/Test-OpenShellHost.ps1",
+      "member": null,
+      "inputSha256": "755f99090d5ccfcaa6ebc9007510b12ab6a0ebf6ffba04e249328b56bae60f69",
+      "signedSha256": "7bb1dd6b586d3166bd970e1b014c900020a0b347c4db2a8f530f3951ffe4df47",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "scripts/Test-OpenShellPackage.ps1",
+      "member": null,
+      "inputSha256": "0d369e0dbaa588b55fc6c4da41c408c351c0b96e8f7ad699e989819b9e016749",
+      "signedSha256": "bef63f4dce43fcedf122089b554a484c98bbf3a276a58f37e2bd1e6585cc53b5",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/client.js",
+      "inputSha256": "1abd1af252095f0c24c32d7467add934904d1d3d8988e308bb3396a134be78b2",
+      "signedSha256": "cc2321b82e4c2b43410894780a22bb382066c0a511cd5704400497afdd9ed2ae",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/gen/datamodel_pb.js",
+      "inputSha256": "c3207ff5a78ebbc7f89e602c3b1f943216608db17124ff3d69a9323ab68681d6",
+      "signedSha256": "7bb36411a45fe627d8f384ac4fefaa71d04883442b86359054a7f8d9472aaa98",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/gen/google/rpc/error_details_pb.js",
+      "inputSha256": "e81fd405a1115b35cbc07332c4734a8884fc2667d128505338f9e4d08a883e04",
+      "signedSha256": "fd3e95b6a36522f1befca88abb5051909d7495cbc83f3c491f9068ee6ad3ccd8",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/errors.js",
+      "inputSha256": "e83bd51543364e7c6d3720a1e1ef7595d0b38a07d805c7fbb9a5233636c78505",
+      "signedSha256": "73ee3b9bfcc44a417567442188f42761c6ca84b5bbaba01ef7764feeb1401f1a",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/index.js",
+      "inputSha256": "1c204795a5fa29ef2867b234a3d0db7427ddff1a77bc83414da8b9bde09e454a",
+      "signedSha256": "12f58cd0adad086e2d933f5c5c5a89534f1abc463136298b9ed307b03bc155cc",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/oidc.js",
+      "inputSha256": "098210f303b85269d0bbdd93dee322f6198d72f0db05f4829dd4cca0372fc64d",
+      "signedSha256": "2a86dea0f11d26e15214299619e287289a58db9d214a54160ecc65eaa79d8d49",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/gen/openshell_pb.js",
+      "inputSha256": "a5b14ad8d60bb1571d13513a6313bc9a525348142a2ae51929c5862f01cff023",
+      "signedSha256": "f0d4f7959ff8673e36ed10c3bc50e498e79d5d429dc44518a65eddb56a198e0d",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/gen/options_pb.js",
+      "inputSha256": "fa5bf081f0030650a181ee189a553f828a553f6e5708edf2ed057487d8d95d3e",
+      "signedSha256": "2dfc40a0f999be48286e3f87a64240890c50622092a33854a42985aa48e34851",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/providers.js",
+      "inputSha256": "c7c93e1800eee5ac9d5723508dcf8ffa2037f8dae2f6a7fcb144a838b9e7d919",
+      "signedSha256": "6b0504b29d1b3c574cde0113921b9be4879a9fb7cbba19c628e688cdf5b554d9",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/raw.js",
+      "inputSha256": "a9e978d239c9138bdb66e4abfb711e2fc7e6774f33d8a62c6e993527fbd38156",
+      "signedSha256": "45424da2532b8ca97ef4fb3f26a60b93fa805f77c508a3163bf440f68cc332bd",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/gen/sandbox_pb.js",
+      "inputSha256": "a9b0bbf032a848ea3d111d8f225948f5413177ec57a1dee7742788b09eb9d285",
+      "signedSha256": "55103116cbf39213a516fb2d2d28c1d6a6d6bf3f3224ed6e1f37910884bbb6cd",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/ssh-validate.js",
+      "inputSha256": "353a64392126f963926b36ddd2399339131419d2c465722f6bf83a7b46e2c5c6",
+      "signedSha256": "51e648d5871c399edacb41aa6c71fe3434cdecc1cd896974f5054b9318371e9a",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "arm64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/transport.js",
+      "inputSha256": "bc104ca30e9169a1e2e8e44b716e2656b7fe8594e62454d297944890eaa5461a",
+      "signedSha256": "e47cef12751ff17fb82542dde2ea60f4a606b22c4a26fb8cc77982862a4f268f",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "bin/libz3.dll",
+      "member": null,
+      "inputSha256": "f4ea9e799e13b64dc748415c5f7ec34fa0d885cb32e243ec991c973329bca1fb",
+      "signedSha256": "9211e2f44263a42890de77a490db8a153d4b64144b5b7ee005063d266e2ab63e",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "bin/openshell-gateway.exe",
+      "member": null,
+      "inputSha256": "cf9ac08b5df37deb445c652fc07e7cd11b06e411b87774df0f27712b51740a05",
+      "signedSha256": "069b8def833d70e727408b0510870695efc45f9054b3814b7e2b8c77161efd66",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "bin/openshell-supervisor.exe",
+      "member": null,
+      "inputSha256": "abae6a794a7c9a67cea7f0e59623fcece0b83593a29c40868234083e45d0e776",
+      "signedSha256": "8959b36f59efc603f964e7f2cf2e0d21185e740ceb61b41a4dee46efcd5cea30",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "bin/openshell-windows-sandbox.exe",
+      "member": null,
+      "inputSha256": "c6a9ce4fb9e77d767a491a0db93a4548e031d93d58376f48181f82a8945ade2d",
+      "signedSha256": "e80687d00cfe8a580e81ec2c155204dce2f9f75d3bb7e80aa7dd5ebd66a61a2b",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "bin/openshell.exe",
+      "member": null,
+      "inputSha256": "75efc39c9376e9e7ff75a762d3ee5d4f938042b69c215890f3329609d1828c8e",
+      "signedSha256": "ff3e47d0d36fa8bddba51fed3edd373fca22db5a66ff2c9dabc60340fe76bfed",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "examples/powershell/harness.ps1",
+      "member": null,
+      "inputSha256": "93af7d01a96dd2d1bee35645321558d25c86daa8835cf957d5a65ddeba2eaf90",
+      "signedSha256": "9d5dd69d349756a47fe161488638a7bced17abef697f647cdf5564a504fec604",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "scripts/Initialize-OpenShell.ps1",
+      "member": null,
+      "inputSha256": "7ccafe6f3c3aa5451d1364b8cc1d93bc416c4c6b6ee99e779b8cc53d0a78ac01",
+      "signedSha256": "a958a7300fbc63be2c07d581afd3a1d4a40366b4bca3b9e1958c4c03bcc93c92",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "scripts/Start-OpenShell.ps1",
+      "member": null,
+      "inputSha256": "7cb05ede78457cf2847288848e3be59a59e29f61569fad47d104629469c54656",
+      "signedSha256": "556dc15ecbf7b93d365aced8bfc20fa94d24eae42b7774776f1a9aad84b21cb7",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "scripts/Test-OpenShellHost.ps1",
+      "member": null,
+      "inputSha256": "755f99090d5ccfcaa6ebc9007510b12ab6a0ebf6ffba04e249328b56bae60f69",
+      "signedSha256": "7bb1dd6b586d3166bd970e1b014c900020a0b347c4db2a8f530f3951ffe4df47",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "scripts/Test-OpenShellPackage.ps1",
+      "member": null,
+      "inputSha256": "0d369e0dbaa588b55fc6c4da41c408c351c0b96e8f7ad699e989819b9e016749",
+      "signedSha256": "bef63f4dce43fcedf122089b554a484c98bbf3a276a58f37e2bd1e6585cc53b5",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/client.js",
+      "inputSha256": "1abd1af252095f0c24c32d7467add934904d1d3d8988e308bb3396a134be78b2",
+      "signedSha256": "cc2321b82e4c2b43410894780a22bb382066c0a511cd5704400497afdd9ed2ae",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/gen/datamodel_pb.js",
+      "inputSha256": "c3207ff5a78ebbc7f89e602c3b1f943216608db17124ff3d69a9323ab68681d6",
+      "signedSha256": "7bb36411a45fe627d8f384ac4fefaa71d04883442b86359054a7f8d9472aaa98",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/gen/google/rpc/error_details_pb.js",
+      "inputSha256": "e81fd405a1115b35cbc07332c4734a8884fc2667d128505338f9e4d08a883e04",
+      "signedSha256": "fd3e95b6a36522f1befca88abb5051909d7495cbc83f3c491f9068ee6ad3ccd8",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/errors.js",
+      "inputSha256": "e83bd51543364e7c6d3720a1e1ef7595d0b38a07d805c7fbb9a5233636c78505",
+      "signedSha256": "73ee3b9bfcc44a417567442188f42761c6ca84b5bbaba01ef7764feeb1401f1a",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/index.js",
+      "inputSha256": "1c204795a5fa29ef2867b234a3d0db7427ddff1a77bc83414da8b9bde09e454a",
+      "signedSha256": "12f58cd0adad086e2d933f5c5c5a89534f1abc463136298b9ed307b03bc155cc",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/oidc.js",
+      "inputSha256": "098210f303b85269d0bbdd93dee322f6198d72f0db05f4829dd4cca0372fc64d",
+      "signedSha256": "2a86dea0f11d26e15214299619e287289a58db9d214a54160ecc65eaa79d8d49",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/gen/openshell_pb.js",
+      "inputSha256": "a5b14ad8d60bb1571d13513a6313bc9a525348142a2ae51929c5862f01cff023",
+      "signedSha256": "f0d4f7959ff8673e36ed10c3bc50e498e79d5d429dc44518a65eddb56a198e0d",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/gen/options_pb.js",
+      "inputSha256": "fa5bf081f0030650a181ee189a553f828a553f6e5708edf2ed057487d8d95d3e",
+      "signedSha256": "2dfc40a0f999be48286e3f87a64240890c50622092a33854a42985aa48e34851",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/providers.js",
+      "inputSha256": "c7c93e1800eee5ac9d5723508dcf8ffa2037f8dae2f6a7fcb144a838b9e7d919",
+      "signedSha256": "6b0504b29d1b3c574cde0113921b9be4879a9fb7cbba19c628e688cdf5b554d9",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/raw.js",
+      "inputSha256": "a9e978d239c9138bdb66e4abfb711e2fc7e6774f33d8a62c6e993527fbd38156",
+      "signedSha256": "45424da2532b8ca97ef4fb3f26a60b93fa805f77c508a3163bf440f68cc332bd",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/gen/sandbox_pb.js",
+      "inputSha256": "a9b0bbf032a848ea3d111d8f225948f5413177ec57a1dee7742788b09eb9d285",
+      "signedSha256": "55103116cbf39213a516fb2d2d28c1d6a6d6bf3f3224ed6e1f37910884bbb6cd",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/ssh-validate.js",
+      "inputSha256": "353a64392126f963926b36ddd2399339131419d2c465722f6bf83a7b46e2c5c6",
+      "signedSha256": "51e648d5871c399edacb41aa6c71fe3434cdecc1cd896974f5054b9318371e9a",
+      "payloadUnchanged": true
+    },
+    {
+      "architecture": "x64",
+      "path": "sdk/nvidia-openshell-sdk-0.1.8.tgz",
+      "member": "package/dist/transport.js",
+      "inputSha256": "bc104ca30e9169a1e2e8e44b716e2656b7fe8594e62454d297944890eaa5461a",
+      "signedSha256": "e47cef12751ff17fb82542dde2ea60f4a606b22c4a26fb8cc77982862a4f268f",
+      "payloadUnchanged": true
+    }
+  ],
+  "externalFinalization": {
+    "authenticodeSigning": true,
+    "signedPackageAssembly": true,
+    "runtimeValidation": true
+  },
+  "performedByThisWorkflow": [
+    "verify-original-candidate-provenance",
+    "verify-record-consistency",
+    "attest-final-checksums"
+  ],
+  "validationReport": {
+    "file": "OpenShell-Windows-0.1.8-validation.json",
+    "sha256": "9727eda6b5e77034678021ed3a4b69cc804ba25f832df322c6ae10774db37a50"
+  }
+}
