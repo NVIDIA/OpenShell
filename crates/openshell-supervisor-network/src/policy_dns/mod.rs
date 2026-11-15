@@ -743,6 +743,32 @@ fn build_mapping_publication_event(record: &ResolvedEndpointRecord) -> openshell
         .build()
 }
 
+/// A policy DNS service whose trusted resolver answers every name with
+/// `addresses`, for tests outside this module.
+#[cfg(test)]
+pub(crate) fn test_service(
+    policy: Arc<OpaEngine>,
+    store: Arc<ResolvedEndpointStore>,
+    addresses: Vec<std::net::IpAddr>,
+) -> PolicyDnsService<impl TrustedResolver> {
+    struct FixedResolver(Vec<std::net::IpAddr>);
+
+    impl TrustedResolver for FixedResolver {
+        async fn resolve(
+            &self,
+            _name: &NormalizedName,
+            _family: AddressFamily,
+        ) -> Result<TrustedAnswer, resolver::ResolveError> {
+            Ok(TrustedAnswer {
+                addresses: self.0.clone(),
+                ttl: MAX_MAPPING_TTL,
+            })
+        }
+    }
+
+    PolicyDnsService::new(policy, FixedResolver(addresses), store, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
