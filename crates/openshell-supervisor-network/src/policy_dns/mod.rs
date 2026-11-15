@@ -2019,4 +2019,36 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         service.policy.reload_from_proto(&widened).unwrap();
         assert_eq!(lookup().await.unwrap().address, before.address, "new port");
     }
+
+    /// The record pins every answer some eligible endpoint permits, in
+    /// resolver order, and nothing else: here the exact host permits the
+    /// private address, the wildcard the public one, and neither loopback.
+    #[tokio::test]
+    async fn mapping_pins_the_union_of_what_eligible_endpoints_permit() {
+        let policy = BASE_POLICY.replace("db.example", "db.example.com").replace(
+            "filesystem_policy:",
+            "  web:\n    name: web\n    endpoints:\n      - { host: '*.example.com', port: 443 }\n    binaries: [{ path: /usr/bin/curl }]\nfilesystem_policy:",
+        );
+        let service = service(
+            &policy,
+            vec![
+                "8.8.8.8".parse().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+                "10.2.3.4".parse().unwrap(),
+            ],
+        );
+        let now = Instant::now();
+        let answer = service
+            .answer_query("db.example.com", AddressFamily::Ipv4, now)
+            .await
+            .unwrap();
+        let mapping = service.store.lookup(answer.address, 443, now).unwrap();
+        assert_eq!(
+            mapping.record.pinned_addresses,
+            [
+                "8.8.8.8".parse::<IpAddr>().unwrap(),
+                "10.2.3.4".parse().unwrap()
+            ]
+        );
+    }
 }

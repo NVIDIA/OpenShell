@@ -9713,6 +9713,107 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         );
     }
 
+    /// A kept answer gives no access the current policy does not: once its
+    /// host leaves the policy, or the policy is quarantined, it is refused by
+    /// the policy decision.
+    #[tokio::test]
+    async fn policy_dns_answer_is_refused_once_the_policy_no_longer_allows_it() {
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let without_pypi = POLICY_DNS_OPEN_POLICY.replace(
+            "      - { host: pypi.org, port: 80 }",
+            "      - { host: files.pythonhosted.org, port: 80 }",
+        );
+        let kept = keep_pypi_answer_across(&engine, &store, &without_pypi).await;
+        assert_eq!(
+            admit_staged(&store, &engine, SocketAddr::new(kept, 80)).await,
+            (false, TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied))
+        );
+
+        let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
+        let store = policy_dns_test_store();
+        let approved = POLICY_DNS_OPEN_POLICY.replace(
+            "filesystem_policy:",
+            "  github:\n    name: github\n    endpoints:\n      - { host: github.com, port: 443 }\n    binaries: [{ path: /usr/bin/curl }]\nfilesystem_policy:",
+        );
+        let kept = keep_pypi_answer_across(&engine, &store, &approved).await;
+        engine.enter_fail_closed("test quarantine").unwrap();
+        let (admitted, _) = admit_staged(&store, &engine, SocketAddr::new(kept, 80)).await;
+        assert!(!admitted);
+    }
+
+    /// One name allowed for two binaries with different destination rules:
+    /// psql may reach a private address of its exact host, curl only public
+    /// addresses through a wildcard. The answer pins both addresses, and each
+    /// connection reaches only what its own endpoint permits.
+    #[tokio::test]
+    async fn policy_dns_answer_reaches_only_what_the_connecting_binary_may() {
+        let policy = r"
+network_policies:
+  database:
+    name: database
+    endpoints:
+      - { host: db.service.example, port: 5432, protocol: tcp }
+    binaries: [{ path: /usr/bin/psql }]
+  service:
+    name: service
+    endpoints:
+      - { host: '*.service.example', port: 5432, protocol: tcp }
+    binaries: [{ path: /usr/bin/curl }]
+filesystem_policy: { include_workdir: true, read_only: [], read_write: [] }
+landlock: { compatibility: best_effort }
+process: { run_as_user: sandbox, run_as_group: sandbox }
+";
+        let rego = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(
+            native_identity_engine(rego, &policy_with_native_executable_paths(policy)).unwrap(),
+        );
+        let store = policy_dns_test_store();
+        let dns = crate::policy_dns::test_service(
+            engine.clone(),
+            store.clone(),
+            vec!["10.2.3.4".parse().unwrap(), "8.8.8.8".parse().unwrap()],
+        );
+        let answer = dns
+            .answer_query(
+                "db.service.example",
+                crate::policy_dns::AddressFamily::Ipv4,
+                std::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        let mapping = store
+            .lookup(answer.address, 5432, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(
+            mapping.record.pinned_addresses,
+            [
+                "10.2.3.4".parse::<IpAddr>().unwrap(),
+                "8.8.8.8".parse().unwrap()
+            ]
+        );
+
+        let destination = SocketAddr::new(answer.address, 5432);
+        let (open, completion) = staged_curl_open(destination, engine.current_generation());
+        let (_, _, _, transparent) = preauthorize_transparent_open(
+            open,
+            Some(&policy_dns_test_service(&store, &engine)),
+            &engine,
+            &BinaryIdentityCache::new(),
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("curl may reach the public address");
+        assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
+        let (_, connector) = transparent.and_then(|open| open.authorization).unwrap();
+        assert_eq!(connector.addrs(), &["8.8.8.8:5432".parse().unwrap()]);
+    }
+
     #[test]
     fn staged_denial_names_the_mapped_host_and_keeps_the_synthetic_address() {
         let (open, _) = staged_curl_open("198.18.0.2:80".parse().unwrap(), 1);
