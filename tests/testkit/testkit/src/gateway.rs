@@ -121,6 +121,13 @@ impl Gateway {
         })
     }
 
+    /// The directory holding the gateway's CA (`ca.crt`) and the client
+    /// certificate and key (`tls.crt`, `tls.key`) for mTLS, or `None` for a
+    /// gateway testkit reaches without a client certificate.
+    pub fn mtls_dir(&self) -> Option<&Path> {
+        self.mtls_dir.as_deref()
+    }
+
     /// One line naming the gateway, for test logs.
     pub fn describe(&self) -> String {
         let auth = match (&self.mtls_dir, self.endpoint.starts_with("https://")) {
