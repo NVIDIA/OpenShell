@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::proxy::destination::filter_resolved_addresses;
 
 fn authorize_destination(
     declared_host: &str,

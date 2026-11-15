@@ -661,6 +661,7 @@ pub async fn run_networking(
             activity_tx,
             upstream_proxy_args,
             transparent_engine_ready_rx,
+            trusted_gateway,
         )?;
         (Some(dns), Some(transparent))
     } else {
