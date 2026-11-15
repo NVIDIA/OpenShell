@@ -601,6 +601,38 @@ leaving the file unchanged, when it isn't valid TOML. It can't remove a key.
 Settings that the packaged service reads from `gateway.env` instead of the
 TOML are not covered.
 
+#### Conformance with gateway config push
+
+The `ubuntu-docker-rootful-config-push` environment runs the gateway with
+`config_delivery_mode = "push"`, so supervisors receive configuration over
+their session instead of polling for it. Its setup playbook,
+`tests/tmachine/ansible/playbooks/config-delivery.yaml`, writes the mode to the
+gateway overrides and publishes it as `OPENSHELL_TEST_CONFIG_DELIVERY_MODE`.
+The playbook takes `push` or `poll` as `gateway_config_delivery_mode`, so an
+environment for the other mode is one more entry in `config.nix`. k3s
+installers ignore gateway overrides, so it doesn't apply to them.
+
+A push gateway lets a supervisor without push support keep polling, so the
+conformance suite passes either way. The `config-push` feature suite
+(`tests/suites/features/config-push`) fails unless the published mode is
+`push` and a new sandbox's supervisor reports a pushed-configuration session.
+CI runs both in the environment:
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful-config-push --installer deb \
+  --family conformance --package conformance
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful-config-push --installer deb \
+  --family features --package config-push
+```
+
+Without KVM, run both against a local Docker gateway in push mode:
+
+```shell
+mise run e2e:testkit:push
+```
+
 The `oci-image` feature suite (`tests/suites/features/oci-image`) checks OCI
 image identity and working-directory behavior shared by the Docker and Podman
 drivers against installed deb packages on Ubuntu and rpm packages on Fedora.

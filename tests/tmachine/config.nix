@@ -135,6 +135,23 @@ let
           };
         };
       }
+      # ubuntu-docker-rootful with a gateway that pushes configuration to
+      # supervisors (`config_delivery_mode = "push"`), for the conformance
+      # family and the config-push feature suite.
+      {
+        name = "ubuntu-docker-rootful-config-push";
+        machine = "ubuntu";
+        setup = {
+          use_galaxy = true;
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
+            "ansible/playbooks/docker.yaml"
+            "ansible/playbooks/config-delivery.yaml"
+          ];
+          inputs.gateway_config_delivery_mode = "push";
+        };
+      }
       {
         name = "ubuntu-k3s";
         machine = "ubuntu";
