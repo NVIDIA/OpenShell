@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=tasks/scripts/container-engine.sh
 source "${ROOT}/tasks/scripts/container-engine.sh"
-ce_build --load --file "${ROOT}/e2e/python/Dockerfile.workload" \
+ce_build --load --file "${ROOT}/e2e/workload/Dockerfile" \
   --build-arg "PYTHON_VERSION=$(cat "${ROOT}/.python-version")" \
   --tag openshell/e2e-python:dev \
-  "${ROOT}/e2e/python"
+  "${ROOT}/e2e/workload"
