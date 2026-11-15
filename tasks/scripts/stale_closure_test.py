@@ -11,14 +11,14 @@ from stale_closure import STALE_CLOSURE_MARKER, is_stale_closed
 
 class StaleClosureTests(unittest.TestCase):
     def setUp(self):
-        self.issue = {
+        self.issue: dict[str, object] = {
             "state": "closed",
             "state_reason": "not_planned",
             "labels": [{"name": "state:stale"}],
             "closed_at": "2026-11-06T08:22:30Z",
             "closed_by": {"login": "github-actions[bot]", "type": "Bot"},
         }
-        self.event = {
+        self.event: dict[str, object] = {
             "__typename": "ClosedEvent",
             "createdAt": self.issue["closed_at"],
             "actor": {"login": "github-actions[bot]"},
