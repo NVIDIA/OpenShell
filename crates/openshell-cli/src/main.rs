@@ -2580,7 +2580,7 @@ enum WorkspaceMemberCommands {
         workspace: String,
 
         /// OIDC subject claim identifying the principal.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         subject: String,
 
         /// Role to assign (user or admin).
@@ -2596,7 +2596,7 @@ enum WorkspaceMemberCommands {
         workspace: String,
 
         /// OIDC subject claim identifying the principal.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         subject: String,
     },
 
@@ -4805,6 +4805,30 @@ mod tests {
 
         assert_eq!(cli.gateway.as_deref(), Some("demo"));
         assert!(matches!(cli.command, Some(Commands::Status { .. })));
+    }
+
+    #[test]
+    fn workspace_member_subject_accepts_leading_hyphen() {
+        for action in [vec!["add", "--role", "user"], vec!["remove"]] {
+            let mut argv = vec!["openshell", "workspace", "member"];
+            argv.push(action[0]);
+            argv.extend(["--workspace", "ws", "--subject", "-oAbC"]);
+            argv.extend(&action[1..]);
+            let cli = Cli::try_parse_from(argv).expect("hyphen-leading subject should parse");
+
+            let Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Member(member)),
+            }) = cli.command
+            else {
+                panic!("expected workspace member command");
+            };
+            let subject = match member {
+                WorkspaceMemberCommands::Add { subject, .. }
+                | WorkspaceMemberCommands::Remove { subject, .. } => subject,
+                WorkspaceMemberCommands::List { .. } => panic!("unexpected list"),
+            };
+            assert_eq!(subject, "-oAbC");
+        }
     }
 
     #[test]
