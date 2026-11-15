@@ -436,17 +436,40 @@ impl OpaEngine {
     /// Pin `generation` for an established connection with `input`, re-pinning
     /// through later generations that leave its contract intact.
     ///
-    /// The single entry point for relays and their tests. Fails if
-    /// `generation` is no longer current. `credentials` is the connection's
-    /// tracked provider handle when the relay can inject credentials.
+    /// The single entry point for relays and their tests. `generation` may
+    /// already have been replaced when the relay is set up: a reload can land
+    /// between the decision and this call. The connection is then
+    /// re-evaluated against every generation since, as an established one
+    /// would be, and the guard starts at the current generation if its
+    /// contract held. It fails if the contract changed, if `generation` is
+    /// newer than the current one, or, for a denial or a generation no longer
+    /// in the history (which cannot be re-evaluated), if `generation` is not
+    /// current. `credentials` is the connection's tracked provider handle when
+    /// the relay can inject credentials.
     pub(crate) fn revalidating_generation_guard(
         self: &Arc<Self>,
         input: NetworkInput,
         generation: u64,
         credentials: Option<&ProviderCredentialState>,
     ) -> miette::Result<PolicyGenerationGuard> {
-        let guard = self.generation_guard(generation)?;
-        let revalidator = PolicyRevalidator::capture(self, input, generation, credentials);
-        Ok(guard.with_revalidator(revalidator))
+        let Some(revalidator) = PolicyRevalidator::capture(self, input, generation, credentials)
+        else {
+            return self.generation_guard(generation);
+        };
+        let current = self.current_generation();
+        if generation > current {
+            return self.generation_guard(generation);
+        }
+        let guard =
+            PolicyGenerationGuard::pinned(generation, &self.generation, &self.generation_tx)
+                .with_revalidator(Some(revalidator));
+        if guard.is_stale() {
+            return Err(miette::miette!(
+                "policy changed before the relay started in a way that affects this connection \
+                 [authorized_generation:{generation} current_generation:{}]",
+                self.current_generation(),
+            ));
+        }
+        Ok(guard)
     }
 }

@@ -3127,12 +3127,15 @@ async fn handle_mediated_connection(
         return Ok(());
     }
 
-    // CONNECT must use one policy generation from authorization through route
-    // materialization and relay startup.
+    // CONNECT must use one policy contract from authorization through route
+    // materialization and relay startup: a route hydrated after a reload that
+    // left the connection's contract intact is the decision's own route.
     let l7_route = decision.endpoint.l7_route.as_ref();
-    if let Err(error) =
-        relay::validate_route_generation(l7_route, connect_generation_guard.captured_generation())
-    {
+    if let Err(error) = relay::validate_route_generation(
+        l7_route,
+        decision.policy_generation,
+        &connect_generation_guard,
+    ) {
         reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
             .await?;
         return Ok(());

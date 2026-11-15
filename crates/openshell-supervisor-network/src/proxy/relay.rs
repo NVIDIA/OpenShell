@@ -116,11 +116,12 @@ pub(super) fn http_context(
 /// Pin the generation that authorized `decision` for a relay, CONNECT setup,
 /// or the forward HTTP single-request path.
 ///
-/// The pin fails if the policy changed after authorization. Once pinned, the
-/// guard follows later changes that leave the connection's contract intact;
-/// see [`crate::opa::PolicyRevalidator`]. `credentials` is the connection's
-/// tracked provider handle when the guarded path may inject credentials, or
-/// `None` when it never does.
+/// A reload that landed after authorization is re-evaluated: the pin starts
+/// at the current generation if the connection's contract held, and fails if
+/// it changed. Once pinned, the guard follows later changes that leave the
+/// contract intact; see [`crate::opa::PolicyRevalidator`]. `credentials` is
+/// the connection's tracked provider handle when the guarded path may inject
+/// credentials, or `None` when it never does.
 pub(super) fn pin_policy_generation(
     opa_engine: &Arc<OpaEngine>,
     decision: &EgressDecision,
@@ -133,40 +134,77 @@ pub(super) fn pin_policy_generation(
     )
 }
 
+/// Reloads [`pin_l7_evaluator`] follows between pinning and cloning before
+/// it gives up.
+const L7_EVALUATOR_PIN_ATTEMPTS: usize = 3;
+
 /// Clone an L7 evaluator for a relay or the forward HTTP single-request path.
+///
+/// Reloads since `expected_generation` that leave the connection's contract
+/// intact are followed, as [`pin_policy_generation`] does, and the evaluator
+/// is the engine of the generation reached. Its per-request rules read only
+/// the matched endpoints, which the contract shows unchanged.
 pub(super) fn pin_l7_evaluator(
     opa_engine: &Arc<OpaEngine>,
     decision: &EgressDecision,
     expected_generation: u64,
     credentials: Option<&ProviderCredentialState>,
 ) -> Result<TunnelPolicyEngine> {
-    let evaluator = opa_engine.clone_engine_for_tunnel(expected_generation)?;
-    // The baseline must come from the generation the evaluator is pinned to,
-    // so that every later generation is checked.
-    let revalidator = PolicyRevalidator::capture(
-        opa_engine,
-        decision.policy_input(),
-        expected_generation,
-        credentials,
-    );
-    Ok(evaluator.with_revalidator(revalidator))
+    let mut last_error = None;
+    for _ in 0..L7_EVALUATOR_PIN_ATTEMPTS {
+        let generation = opa_engine
+            .revalidating_generation_guard(
+                decision.policy_input(),
+                expected_generation,
+                credentials,
+            )?
+            .captured_generation();
+        match opa_engine.clone_engine_for_tunnel(generation) {
+            Ok(evaluator) => {
+                // The baseline must come from the generation the evaluator is
+                // pinned to, so that every later generation is checked.
+                let revalidator = PolicyRevalidator::capture(
+                    opa_engine,
+                    decision.policy_input(),
+                    generation,
+                    credentials,
+                );
+                return Ok(evaluator.with_revalidator(revalidator));
+            }
+            // Another reload landed after the pin followed: follow it too.
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| miette::miette!("L7 evaluator could not be pinned")))
 }
 
+/// Check that an L7 route hydrated for a decision made at
+/// `authorized_generation` may be used by a relay pinned with `guard`.
+///
+/// The route may have been hydrated at a later generation than the decision.
+/// It is the decision's own route when the connection's contract held in
+/// every generation up to it, which `guard`, pinned at the decision and
+/// following it, shows.
 pub(super) fn validate_route_generation(
     route: Option<&L7RouteSnapshot>,
-    expected_generation: u64,
+    authorized_generation: u64,
+    guard: &PolicyGenerationGuard,
 ) -> Result<()> {
-    if let Some(route) = route
-        && route.l7_policy_generation != expected_generation
+    let Some(route) = route else {
+        return Ok(());
+    };
+    let hydrated = route.l7_policy_generation;
+    if hydrated == authorized_generation
+        || (hydrated > authorized_generation
+            && !guard.is_stale()
+            && hydrated <= guard.captured_generation())
     {
-        return Err(miette::miette!(
-            "policy changed before CONNECT route hydration \
-             [l4_generation:{} l7_generation:{}]",
-            expected_generation,
-            route.l7_policy_generation,
-        ));
+        return Ok(());
     }
-    Ok(())
+    Err(miette::miette!(
+        "policy changed before CONNECT route hydration \
+         [l4_generation:{authorized_generation} l7_generation:{hydrated}]",
+    ))
 }
 
 /// Prepare a generation-pinned HTTP relay at the adapter boundary.
@@ -180,31 +218,31 @@ pub(super) fn prepare_http_relay<'a>(
     decision: &EgressDecision,
     request: &'a L7EvalContext,
 ) -> Option<RelayContext<'a>> {
-    if let Err(error) = validate_route_generation(route, decision.policy_generation) {
+    let refuse = |error| {
         emit_l7_tunnel_close_after_policy_change(
             &decision.intent.destination.host,
             decision.intent.destination.port,
             error,
         );
-        return None;
-    }
-
+    };
     // HTTP relays can inject provider credentials, so they also pin them.
     let credentials = request.provider_credentials.as_ref();
-    let policy = if let Some(route) = route.filter(|route| !route.configs.is_empty()) {
+    let policy = if let Some(inspected) = route.filter(|route| !route.configs.is_empty()) {
         let generation = decision.policy_generation;
         let evaluator = match pin_l7_evaluator(opa_engine, decision, generation, credentials) {
             Ok(evaluator) => evaluator,
             Err(error) => {
-                emit_l7_tunnel_close_after_policy_change(
-                    &decision.intent.destination.host,
-                    decision.intent.destination.port,
-                    error,
-                );
+                refuse(error);
                 return None;
             }
         };
-        let configs = route
+        if let Err(error) =
+            validate_route_generation(route, generation, evaluator.generation_guard())
+        {
+            refuse(error);
+            return None;
+        }
+        let configs = inspected
             .configs
             .iter()
             .map(|snapshot| snapshot.config.clone())
@@ -217,14 +255,16 @@ pub(super) fn prepare_http_relay<'a>(
         let generation_guard = match pin_policy_generation(opa_engine, decision, credentials) {
             Ok(guard) => guard,
             Err(error) => {
-                emit_l7_tunnel_close_after_policy_change(
-                    &decision.intent.destination.host,
-                    decision.intent.destination.port,
-                    error,
-                );
+                refuse(error);
                 return None;
             }
         };
+        if let Err(error) =
+            validate_route_generation(route, decision.policy_generation, &generation_guard)
+        {
+            refuse(error);
+            return None;
+        }
         PreparedHttpPolicy::Passthrough { generation_guard }
     };
 
@@ -245,16 +285,10 @@ pub(super) fn prepare_raw_relay(
     opa_engine: &Arc<OpaEngine>,
     decision: &EgressDecision,
 ) -> Option<PolicyGenerationGuard> {
-    if let Err(error) = validate_route_generation(route, decision.policy_generation) {
-        emit_l7_tunnel_close_after_policy_change(
-            &decision.intent.destination.host,
-            decision.intent.destination.port,
-            error,
-        );
-        return None;
-    }
-
-    match pin_policy_generation(opa_engine, decision, None) {
+    let pinned = pin_policy_generation(opa_engine, decision, None).and_then(|guard| {
+        validate_route_generation(route, decision.policy_generation, &guard).map(|()| guard)
+    });
+    match pinned {
         Ok(guard) => Some(guard),
         Err(error) => {
             emit_l7_tunnel_close_after_policy_change(
