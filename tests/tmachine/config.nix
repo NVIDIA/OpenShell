@@ -147,9 +147,8 @@ let
             "ansible/playbooks/nextest.yaml"
             "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/docker.yaml"
-            "ansible/playbooks/config-delivery.yaml"
+            "ansible/playbooks/config-push.yaml"
           ];
-          inputs.gateway_config_delivery_mode = "push";
         };
       }
       {
