@@ -12,4 +12,4 @@ repository = "https://github.com/NVIDIA/OpenShell"
 [dependencies]
 openshell-conformance = { path = "../../../../crates/openshell-conformance" }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1.43", features = ["macros", "rt"] }
+tokio = { version = "1.53.3", features = ["macros", "rt"] }

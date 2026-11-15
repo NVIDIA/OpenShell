@@ -11,6 +11,8 @@
 //! Algorithm: `EdDSA` (Ed25519). Pinned via `Validation::algorithms` to
 //! prevent algorithm-confusion attacks.
 
+use rustls::pki_types::pem::PemObject as _;
+
 use super::authenticator::{Authenticator, bearer_credential};
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
@@ -22,7 +24,6 @@ pub use openshell_extension_core::{
 };
 use serde::Serialize;
 use std::{
-    io::Cursor,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -439,9 +440,11 @@ impl ExtensionJwtIssuer {
 
 impl GatewayJwks {
     fn from_public_key_pem(public_key_pem: &[u8], kid: String) -> Result<Self, String> {
-        let item = rustls_pemfile::read_one(&mut Cursor::new(public_key_pem))
+        let item = <(rustls::pki_types::pem::SectionKind, Vec<u8>)>::pem_slice_iter(public_key_pem)
+            .next()
+            .transpose()
             .map_err(|e| format!("failed to parse Ed25519 public key PEM for JWKS: {e}"))?;
-        let Some(rustls_pemfile::Item::SubjectPublicKeyInfo(der)) = item else {
+        let Some((rustls::pki_types::pem::SectionKind::PublicKey, der)) = item else {
             return Err("Ed25519 public key PEM does not contain a PUBLIC KEY block".into());
         };
         let (remainder, spki) = SubjectPublicKeyInfo::from_der(der.as_ref())

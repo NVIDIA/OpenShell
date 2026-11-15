@@ -560,7 +560,12 @@ impl MainSession {
     ) {
         match io {
             ProcessIo::Pty(master) => {
-                let master = Arc::new(AsyncFd::new(master).expect("register canonical PTY master"));
+                // SAFETY: `master` owns a valid PTY descriptor and is moved into AsyncFd.
+                // The descriptor is never closed or replaced while registered.
+                #[allow(unsafe_code)]
+                let master =
+                    unsafe { AsyncFd::register(master) }.expect("register canonical PTY master");
+                let master = Arc::new(master);
                 let reader = Arc::clone(&master);
                 let output = Arc::clone(this);
                 tokio::spawn(async move {
