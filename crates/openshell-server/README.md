@@ -401,14 +401,8 @@ equality tokens, not resumable cursors or an ordering across gateway replicas.
 
 ## Application URL publication
 
-`supervisor.app_listener.public_url` is an optional HTTPS origin matching the
-listener domain. It requires explicit listener enablement. Service responses
-return preferred `url`, configured `application_url`, and a gateway alternative
-`gateway_url`. Sandbox creation supplies equivalent service-name maps. Durable
-replays preserve the recorded `url` and `service_urls` values and refresh only
-the explicit application/gateway fields, without repeating the mutation. These
-are configured addresses, not installation, ingress acceptance, or application
-health signals.
+See [Supervisor application listener](../../docs/how-it-works/gateways/configuration.mdx#supervisor-application-listener)
+for public URL configuration, response fields, and replay behavior.
 
 Application hostname mode follows `service_hostname_format` for both access
 paths. The gateway sends each canonical app hostname in `SandboxServiceRoute`;
