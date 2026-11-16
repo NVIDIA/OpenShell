@@ -16,6 +16,12 @@ const PAGE_SIZE: &str = "1000";
 /// looping forever.
 const MAX_PAGES: usize = 1000;
 
+/// Delay before an attached main prints and exits, so the CLI attaches while
+/// the sandbox is Ready. On a multi-replica gateway, attaching after the main
+/// has exited fails unless the request reaches the replica holding the
+/// supervisor session (#4949).
+const ATTACH_BEFORE_EXIT: &str = "sleep 5";
+
 /// `openshell status` succeeds, and a sandbox created with the CLI is
 /// retrievable and Ready, appears in `sandbox list`, runs `sandbox exec`, and is
 /// gone from `sandbox list` after `sandbox delete`.
@@ -91,9 +97,10 @@ async fn cli_stop_start_delete(cx: &mut Context) -> testkit::Result {
 async fn cli_attached_create_streams_main_and_reports_exit(cx: &mut Context) -> testkit::Result {
     let completed = cx.name("ac0");
     cx.track(&completed);
+    let script = format!("{ATTACH_BEFORE_EXIT}; echo OK");
     let output = cx
         .cli([
-            "sandbox", "create", "--name", &completed, "--", "echo", "OK",
+            "sandbox", "create", "--name", &completed, "--", "sh", "-c", &script,
         ])
         .await?
         .success()?;
@@ -113,16 +120,10 @@ async fn cli_attached_create_streams_main_and_reports_exit(cx: &mut Context) -> 
 
     let failed = cx.name("ac7");
     cx.track(&failed);
+    let script = format!("{ATTACH_BEFORE_EXIT}; echo failed-main; exit 7");
     let output = cx
         .cli([
-            "sandbox",
-            "create",
-            "--name",
-            &failed,
-            "--",
-            "sh",
-            "-c",
-            "echo failed-main; exit 7",
+            "sandbox", "create", "--name", &failed, "--", "sh", "-c", &script,
         ])
         .await?;
     testkit::ensure!(
@@ -152,7 +153,7 @@ async fn cli_no_keep_removes_sandbox_after_main_exit(cx: &mut Context) -> testki
     for (suffix, code, marker) in [("nk0", 0, "OK"), ("nk17", 17, "ephemeral-failure")] {
         let name = cx.name(suffix);
         cx.track(&name);
-        let script = format!("echo {marker}; exit {code}");
+        let script = format!("{ATTACH_BEFORE_EXIT}; echo {marker}; exit {code}");
         let output = cx
             .cli([
                 "sandbox",
