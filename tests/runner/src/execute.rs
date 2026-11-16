@@ -20,7 +20,7 @@ use anyhow::{Context, Result, ensure};
 use tmachine::Session;
 use tmachine::config::Config;
 
-use crate::bundle::{Bundle, Kind, PROFILE, PROGRAM_BINARY, READY_BINARY, TEST_TIMEOUT_SECS};
+use crate::bundle::{Bundle, Kind, PROFILE, PROGRAM_BINARY, READY_BINARY};
 use crate::test_env;
 
 const GUEST_DIR: &str = "/var/tmp/openshell-tests";
@@ -31,9 +31,9 @@ const NEXTEST_LOG: &str = "nextest.log";
 // Matches the installers' own wait: an HA k3s gateway booted from a cached
 // disk can take minutes to report healthy.
 const READY_TIMEOUT_SECS: u64 = 300;
-/// How long the nextest run may take in total. Individual tests are bounded
-/// by the nextest profile's slow-timeout; this catches a run that stops
-/// making progress some other way.
+/// How long the test run may take in total. Individual tests are bounded by
+/// the nextest profile's slow-timeout, or by a program's own `run --timeout`
+/// default; this catches a run that stops making progress some other way.
 const RUN_TIMEOUT: Duration = Duration::from_mins(45);
 /// Slack beyond the readiness check's own timeout for SSH and process start.
 const READY_SLACK: Duration = Duration::from_mins(1);
@@ -42,9 +42,6 @@ const READY_SLACK: Duration = Duration::from_mins(1);
 const NEXTEST_TEST_FAILED: i32 = 100;
 /// nextest's exit code when `--no-tests fail` found no tests to run.
 const NEXTEST_NO_TESTS_RUN: i32 = 4;
-/// How long a stopped test has between SIGTERM and SIGKILL. Matches nextest's
-/// default, so both kinds of bundle stop a hung test the same way.
-const TEST_GRACE_SECS: u64 = 10;
 /// A testkit program's exit code when a test failed. It exits 2 when tests
 /// could not run.
 const PROGRAM_TEST_FAILED: i32 = 1;
@@ -311,8 +308,6 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
     let archive = format!("{guest}/tests.tar.zst");
     let extract = format!("{guest}/extract");
     let config = format!("{guest}/nextest.toml");
-    let timeout = TEST_TIMEOUT_SECS.to_string();
-    let grace = TEST_GRACE_SECS.to_string();
     let mut tests = vec!["env"];
     tests.extend(env.iter().map(String::as_str));
     match kind {
@@ -347,16 +342,7 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         // The program runs its tests one at a time, and writes the report
         // where `collect_results` looks for it.
         Kind::Program => {
-            tests.extend([
-                program.as_str(),
-                "run",
-                "--timeout",
-                &timeout,
-                "--grace",
-                &grace,
-                "--junit",
-                &junit,
-            ]);
+            tests.extend([program.as_str(), "run", "--junit", &junit]);
             // `run` takes name filters as arguments, after `--` so that one
             // starting with a dash isn't read as an option.
             if !run.filters.is_empty() {
