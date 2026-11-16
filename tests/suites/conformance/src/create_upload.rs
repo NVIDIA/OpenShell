@@ -28,18 +28,14 @@ async fn create_with_upload_directory_preserves_source_basename(
     write(&source.join("src/main.py"), "print('hello')")?;
 
     let sandbox = create_with_uploads(cx, "cu1", &[(&source, "/sandbox/data")]).await?;
-    expect_file(
-        &sandbox,
-        "/sandbox/data/project/marker.txt",
-        "upload-create-marker",
-    )
-    .await?;
-    expect_file(
-        &sandbox,
-        "/sandbox/data/project/src/main.py",
-        "print('hello')",
-    )
-    .await?;
+    sandbox
+        .exec(["cat", "/sandbox/data/project/marker.txt"])
+        .await?
+        .expect_stdout("upload-create-marker")?;
+    sandbox
+        .exec(["cat", "/sandbox/data/project/src/main.py"])
+        .await?
+        .expect_stdout("print('hello')")?;
     sandbox
         .exec(["sh", "-c", "test ! -e /sandbox/data/marker.txt"])
         .await?
@@ -63,8 +59,14 @@ async fn create_with_multiple_uploads(cx: &mut Context) -> testkit::Result {
         &[(&alpha, "/sandbox/alpha"), (&beta, "/sandbox/beta")],
     )
     .await?;
-    expect_file(&sandbox, "/sandbox/alpha/alpha/a.txt", "content-alpha").await?;
-    expect_file(&sandbox, "/sandbox/beta/beta/b.txt", "content-beta").await?;
+    sandbox
+        .exec(["cat", "/sandbox/alpha/alpha/a.txt"])
+        .await?
+        .expect_stdout("content-alpha")?;
+    sandbox
+        .exec(["cat", "/sandbox/beta/beta/b.txt"])
+        .await?
+        .expect_stdout("content-beta")?;
     sandbox.delete().await
 }
 
@@ -76,7 +78,10 @@ async fn create_with_upload_single_file(cx: &mut Context) -> testkit::Result {
     write(&source, "single-file-upload-test")?;
 
     let sandbox = create_with_uploads(cx, "cu3", &[(&source, "/sandbox")]).await?;
-    expect_file(&sandbox, "/sandbox/config.txt", "single-file-upload-test").await?;
+    sandbox
+        .exec(["cat", "/sandbox/config.txt"])
+        .await?
+        .expect_stdout("single-file-upload-test")?;
     sandbox.delete().await
 }
 
@@ -105,15 +110,4 @@ async fn create_with_uploads(
         ]
     });
     cx.cli_sandbox(suffix).args(args).create_ready().await
-}
-
-/// Require the sandbox file at `path` to contain exactly `expected`.
-async fn expect_file(sandbox: &Sandbox, path: &str, expected: &str) -> testkit::Result {
-    let output = sandbox.exec(["cat", path]).await?.success()?;
-    testkit::ensure!(
-        output.stdout == expected,
-        "{path} contains {:?}; expected {expected:?}",
-        output.stdout
-    );
-    Ok(())
 }
