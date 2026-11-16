@@ -4505,6 +4505,21 @@ fn concurrent_container_removal_is_idempotent() {
     assert!(!is_removal_in_progress_error(&other_conflict));
 }
 
+#[test]
+fn volume_in_use_conflict_is_retryable() {
+    let in_use = BollardError::DockerResponseServerError {
+        status_code: 409,
+        message: "remove openshell-supervisor-abc: volume is in use - [def]".to_string(),
+    };
+    let other_conflict = BollardError::DockerResponseServerError {
+        status_code: 409,
+        message: "container abc123 is running".to_string(),
+    };
+
+    assert!(is_volume_in_use_error(&in_use));
+    assert!(!is_volume_in_use_error(&other_conflict));
+}
+
 #[tokio::test]
 async fn missing_start_generation_is_adopted() {
     let directory = TempDir::new().expect("create temporary directory");
