@@ -177,12 +177,23 @@ pub fn is_proxy_env_var(key: &str) -> bool {
     PROXY_ENV_VARS.contains(&key)
 }
 
-fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
+fn inject_provider_env(
+    cmd: &mut Command,
+    provider_env: &HashMap<String, String>,
+    repair_standard_sbin: bool,
+) {
     for (key, value) in provider_env {
         if is_supervisor_only_env_var(key) {
             continue;
         }
-        cmd.env(key, value);
+        if key == "PATH" {
+            cmd.env(
+                key,
+                child_env::maybe_path_with_standard_sbin_paths(value, repair_standard_sbin),
+            );
+        } else {
+            cmd.env(key, value);
+        }
     }
 }
 
@@ -218,6 +229,7 @@ fn apply_canonical_process_environment(
     workspace: &ResolvedWorkspace,
     interactive: bool,
     user_environment: &HashMap<String, String>,
+    repair_standard_sbin: bool,
 ) {
     // The canonical process inherits the sandbox's environment so the image's
     // own ENV (PATH, LANG, JAVA_HOME, ...) reaches the workload. Remove the
@@ -234,7 +246,16 @@ fn apply_canonical_process_environment(
         }
     }
     cmd.env(openshell_core::sandbox_env::SANDBOX, "1");
-    cmd.envs(user_environment);
+    for (key, value) in user_environment {
+        if key == "PATH" {
+            cmd.env(
+                key,
+                child_env::maybe_path_with_standard_sbin_paths(value, repair_standard_sbin),
+            );
+        } else {
+            cmd.env(key, value);
+        }
+    }
     let (session_user, session_home) = session_user_and_home(policy, workspace.home());
     // Resolve a shell present in the workload image. This code runs inside the
     // workload boundary, where the image filesystem is visible.
@@ -299,10 +320,18 @@ fn compose_canonical_process_environment(
     ca_paths: Option<&(PathBuf, PathBuf)>,
     tls_environment_mode: child_env::TlsEnvironmentMode,
     otlp_relay_active: bool,
+    repair_standard_sbin: bool,
 ) {
-    apply_canonical_process_environment(cmd, policy, workspace, interactive, user_environment);
+    apply_canonical_process_environment(
+        cmd,
+        policy,
+        workspace,
+        interactive,
+        user_environment,
+        repair_standard_sbin,
+    );
     strip_supervisor_only_env(cmd);
-    inject_provider_env(cmd, provider_env);
+    inject_provider_env(cmd, provider_env, repair_standard_sbin);
     strip_proxy_env(cmd);
     // In interception mode OpenShell trust is authoritative. In direct
     // additional-CA mode, retain all caller values and only fill gaps.
@@ -481,6 +510,35 @@ pub enum ProcessIo {
     },
 }
 
+fn shell_command_arg_index(args: &[String]) -> Option<usize> {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "-c" || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c')) {
+            return (index + 1 < args.len()).then_some(index + 1);
+        }
+    }
+    None
+}
+
+pub(crate) fn process_args_with_standard_sbin_paths(
+    program: &str,
+    args: &[String],
+    repair_standard_sbin: bool,
+) -> Vec<String> {
+    let mut args = args.to_vec();
+    if !repair_standard_sbin {
+        return args;
+    }
+
+    let basename = program.rsplit('/').next().unwrap_or(program);
+    if matches!(basename, "bash" | "sh")
+        && let Some(command_index) = shell_command_arg_index(&args)
+    {
+        args[command_index] =
+            child_env::shell_command_with_standard_sbin_paths(&args[command_index]);
+    }
+    args
+}
+
 impl ProcessHandle {
     /// Spawn a new process.
     ///
@@ -497,6 +555,7 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         launch_context: &crate::launch::WorkloadLaunchContext,
+        repair_standard_sbin: bool,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
@@ -510,6 +569,7 @@ impl ProcessHandle {
             interactive,
             policy,
             launch_context,
+            repair_standard_sbin,
             ca_paths,
             tls_environment_mode,
             provider_env,
@@ -530,6 +590,7 @@ impl ProcessHandle {
         workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
+        repair_standard_sbin: bool,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
@@ -541,6 +602,7 @@ impl ProcessHandle {
             workspace,
             interactive,
             policy,
+            repair_standard_sbin,
             ca_paths,
             tls_environment_mode,
             provider_env,
@@ -558,13 +620,17 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         launch_context: &crate::launch::WorkloadLaunchContext,
+        repair_standard_sbin: bool,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
         otlp_relay_active: bool,
     ) -> Result<Self> {
+        let args = process_args_with_standard_sbin_paths(program, args, repair_standard_sbin);
         let mut cmd = Command::new(program);
-        cmd.args(args).kill_on_drop(true);
+        cmd.args(args)
+            .kill_on_drop(true)
+            .env("PATH", child_env::child_path_from_env(repair_standard_sbin));
 
         let mut pty_master = None;
         let mut terminal_slave_fd = None;
@@ -603,6 +669,7 @@ impl ProcessHandle {
             ca_paths,
             tls_environment_mode,
             otlp_relay_active,
+            repair_standard_sbin,
         );
 
         if let Some(dir) = workspace.root() {
@@ -716,13 +783,17 @@ impl ProcessHandle {
         workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
+        repair_standard_sbin: bool,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
         otlp_relay_active: bool,
     ) -> Result<Self> {
+        let args = process_args_with_standard_sbin_paths(program, args, repair_standard_sbin);
         let mut cmd = Command::new(program);
-        cmd.args(args).kill_on_drop(true);
+        cmd.args(args)
+            .kill_on_drop(true)
+            .env("PATH", child_env::child_path_from_env(repair_standard_sbin));
 
         let mut pty_master = None;
         let mut terminal_slave_fd = None;
@@ -761,6 +832,7 @@ impl ProcessHandle {
             ca_paths,
             tls_environment_mode,
             otlp_relay_active,
+            repair_standard_sbin,
         );
 
         if let Some(dir) = workspace.root() {
@@ -1170,6 +1242,35 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Stdio as StdStdio;
 
+    #[test]
+    fn process_args_wrap_shell_c_command_with_standard_sbin_paths() {
+        let args = vec!["-lc".to_string(), "nvidia-smi -L".to_string()];
+
+        let wrapped = process_args_with_standard_sbin_paths("sh", &args, true);
+
+        assert_eq!(wrapped[0], "-lc");
+        assert!(wrapped[1].contains("/usr/sbin"));
+        assert!(wrapped[1].contains("nvidia-smi -L"));
+    }
+
+    #[test]
+    fn process_args_leave_non_shell_commands_unchanged() {
+        let args = vec!["nvidia-smi -L".to_string()];
+
+        let wrapped = process_args_with_standard_sbin_paths("python", &args, true);
+
+        assert_eq!(wrapped, args);
+    }
+
+    #[test]
+    fn process_args_do_not_wrap_when_standard_sbin_repair_disabled() {
+        let args = vec!["-lc".to_string(), "nvidia-smi -L".to_string()];
+
+        let wrapped = process_args_with_standard_sbin_paths("sh", &args, false);
+
+        assert_eq!(wrapped, args);
+    }
+
     /// Helper to create a minimal `SandboxPolicy` with the given process policy.
     fn policy_with_process(process: ProcessPolicy) -> SandboxPolicy {
         SandboxPolicy {
@@ -1198,7 +1299,14 @@ mod tests {
             .env("TERM", "dumb")
             .stdout(StdStdio::piped());
 
-        apply_canonical_process_environment(&mut cmd, &policy, &workspace, true, &HashMap::new());
+        apply_canonical_process_environment(
+            &mut cmd,
+            &policy,
+            &workspace,
+            true,
+            &HashMap::new(),
+            false,
+        );
 
         let output = cmd.output().await.expect("run environment probe");
         assert!(output.status.success());
@@ -1310,6 +1418,7 @@ mod tests {
             &ResolvedWorkspace::default(),
             false,
             &HashMap::from([("DECLARED".into(), "yes".into())]),
+            false,
         );
         let variables = probe_environment(cmd);
         assert!(
@@ -1358,6 +1467,7 @@ mod tests {
                 &ResolvedWorkspace::default(),
                 interactive,
                 &declared,
+                false,
             );
             strip_supervisor_only_env(&mut cmd);
             inject_provider_env(
@@ -1366,6 +1476,7 @@ mod tests {
                     "ANTHROPIC_API_KEY".into(),
                     "openshell:resolve:env:ANTHROPIC_API_KEY".into(),
                 )]),
+                false,
             );
             let output = cmd.output().await.expect("run environment probe");
             assert!(output.status.success());
@@ -1820,11 +1931,59 @@ mod tests {
         ))
         .collect();
 
-        inject_provider_env(&mut cmd, &provider_env);
+        inject_provider_env(&mut cmd, &provider_env, false);
 
         let output = cmd.output().await.expect("spawn env");
         let stdout = String::from_utf8(output.stdout).expect("utf8");
         assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn inject_provider_env_appends_standard_sbin_to_path_when_enabled() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear()
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null());
+
+        let provider_env = HashMap::from([(
+            "PATH".to_string(),
+            "/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        )]);
+
+        inject_provider_env(&mut cmd, &provider_env, true);
+
+        let output = cmd.output().await.expect("spawn env");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert!(stdout.lines().any(|line| {
+            line == "PATH=/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+        }));
+    }
+
+    #[tokio::test]
+    async fn inject_provider_env_leaves_path_unchanged_when_standard_sbin_repair_disabled() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear()
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null());
+
+        let provider_env = HashMap::from([(
+            "PATH".to_string(),
+            "/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        )]);
+
+        inject_provider_env(&mut cmd, &provider_env, false);
+
+        let output = cmd.output().await.expect("spawn env");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| { line == "PATH=/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin" })
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2047,7 +2206,7 @@ mod tests {
             ),
         ]);
 
-        inject_provider_env(&mut cmd, &provider_env);
+        inject_provider_env(&mut cmd, &provider_env, false);
 
         let output = cmd.output().await.expect("spawn env");
         assert!(output.status.success());

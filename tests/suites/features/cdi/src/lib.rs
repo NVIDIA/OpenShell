@@ -86,6 +86,8 @@ enum Check {
     NonRoot { expect: bool },
     /// Whether the workload's groups include the group that owns `path`.
     InGroupOf { path: String, expect: bool },
+    /// Whether a directory is an entry of the workload's `PATH`.
+    PathHas { dir: String, expect: bool },
     /// Connecting to the unix socket at `path` works and it echoes what is
     /// sent. The probe needs `perl`, which the default workload image has.
     EchoSocket { path: String, expect: Access },
@@ -160,6 +162,10 @@ impl Check {
                 path: text("path")?,
                 expect: flag("expect")?,
             }),
+            Some("path-has") => Ok(Self::PathHas {
+                dir: text("dir")?,
+                expect: flag("expect")?,
+            }),
             Some("echo-socket") => Ok(Self::EchoSocket {
                 path: text("path")?,
                 expect: access()?,
@@ -181,6 +187,7 @@ impl Check {
             Self::Write { path, .. } => format!("write:{path}"),
             Self::NonRoot { .. } => "non-root".to_string(),
             Self::InGroupOf { path, .. } => format!("in-group-of:{path}"),
+            Self::PathHas { dir, .. } => format!("path-has:{dir}"),
             Self::EchoSocket { path, .. } => format!("echo-socket:{path}"),
         }
     }
@@ -219,6 +226,9 @@ impl Check {
             Self::InGroupOf { path, .. } => format!(
                 r#"set -- $(ls -ln '{path}' 2>/dev/null); case " $(id -G) " in *" $4 "*) printf ok ;; *) printf missing-group ;; esac"#
             ),
+            Self::PathHas { dir, .. } => format!(
+                r#"case ":$PATH:" in *:'{dir}':*) printf ok ;; *) printf absent ;; esac"#
+            ),
             // `no-client` and `no-echo` are not expected by any scenario, so a
             // workload without perl or a socket that does not echo fails the
             // check with a result that says why.
@@ -244,6 +254,7 @@ impl Check {
             Self::InGroupOf { expect, .. } => {
                 if *expect { "ok" } else { "missing-group" }.to_string()
             }
+            Self::PathHas { expect, .. } => if *expect { "ok" } else { "absent" }.to_string(),
         }
     }
 }
@@ -764,6 +775,21 @@ mod tests {
         assert_eq!(
             observe(json!({"type": "in-group-of", "path": fx.path("nope")})),
             "missing-group"
+        );
+    }
+
+    #[test]
+    fn probe_shell_observes_path_entries() {
+        let fx = Fixtures::new("path-has");
+        let observe = |value: Value| fx.observe(&checks(&[value]).remove(0));
+
+        assert_eq!(
+            observe(json!({"type": "path-has", "dir": "/bin", "expect": true})),
+            "ok"
+        );
+        assert_eq!(
+            observe(json!({"type": "path-has", "dir": "/no/such/directory", "expect": false})),
+            "absent"
         );
     }
 }
