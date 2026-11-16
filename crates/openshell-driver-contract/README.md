@@ -29,6 +29,28 @@ feature.
 `openshell_isolation_interface::contract` re-export these types for code outside
 this repository.
 
+## The protobuf specification
+
+`proto/sandbox_runtime.proto` specifies the replacement: the same documents as
+protobuf messages, written as binary protobuf. It repeats
+`ResolvedWorkloadIdentity` and `DriverFenceEvidence` from `compute_driver.proto`,
+so it does not import that protocol, and adds `contract_version`, which tells a
+new document from a legacy one.
+`crates/openshell-core/tests/duplicated_proto_messages.rs` fails if the copies
+drift. `build.rs` generates the messages with ordered maps, so that equal
+documents encode to equal bytes. They are in `proto::sandbox_runtime`, and
+`proto::FILE_DESCRIPTOR_SET` holds the descriptors, which the tests use to turn
+the protobuf JSON examples into binary.
+
+`convert` converts between the model types and the messages (`From` into a
+message, `TryFrom` back, which applies the validation the legacy readers apply
+later). `tests/driver_contract_proto_json.rs` checks both directions against the
+protobuf JSON examples in `tests/legacy_contract/proto_json/`: the message built
+from a legacy example must equal the protobuf JSON example, and reading the
+example, as binary, must give back the legacy example. The examples are the
+reference for a driver in any language. Regenerate them from the legacy examples
+with `UPDATE_EXAMPLES=1` and review the diff.
+
 ## The current encoding
 
 The encoding the types produce with `serde` is the format that exists today. It

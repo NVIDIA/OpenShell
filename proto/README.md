@@ -121,3 +121,34 @@ control, process I/O, and network mediation over the bound boundary. Both are
 supervisor-to-backend contracts, not gateway RPCs. Backend authors can generate bindings independently
 from these definitions. The negotiated Sandbox Protocol version covers the gRPC
 services, typed messages, streaming, and lifecycle semantics.
+
+## Driver contract documents
+
+[`sandbox_runtime.proto`](sandbox_runtime.proto) specifies the documents a
+compute driver hands to the supervisor and the sandbox boundary, besides the
+`ComputeDriver` service: the runtime descriptor and the boundary configuration. They travel as files or as opaque `bytes`, never as gRPC
+messages, and are the binary protobuf encoding of their messages. A reader skips
+unknown fields, so `contract_version` is what tells it whether it understands a
+document. The file does not import `compute_driver.proto`, so it repeats
+`ResolvedWorkloadIdentity` and `DriverFenceEvidence` (and
+`sandbox_protocol.proto` repeats `ResolvedWorkloadIdentity`). The copies are
+identical, and `crates/openshell-core/tests/duplicated_proto_messages.rs` fails
+if they drift.
+
+These messages replace the legacy documents that the Rust types in
+`openshell-driver-contract` write today. A document in the new
+encoding carries `contract_version`, which a legacy document does not, so a
+reader can tell the two apart. `openshell-driver-contract` converts between the two
+and its tests pin the protobuf JSON examples, which stand for the binary documents in a form that can be reviewed. The file is not imported by
+`openshell.proto`, so the SDKs do not generate it.
+
+During the transition a driver writes each document in the new encoding beside
+its legacy file, in a file named like the legacy one with `.pb` in place of
+`.json` (`bootstrap.json` and `bootstrap.pb`). A reader looks for the new
+file first and falls back to the legacy one. A new file that exists but is
+invalid is an error, not a reason to fall back. A single-use document, such as
+the boundary configuration, is removed in both forms once it has been read.
+An older driver writes only the legacy file and an older reader ignores the new
+one, so each side can be upgraded independently. A driver must not be replaced
+by an older one while it leaves new files behind: the newer readers would prefer
+the stale files.

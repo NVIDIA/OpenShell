@@ -50,6 +50,10 @@ pub mod extension {
     pub use openshell_driver_sdk::proto::extension::v1;
 }
 
+pub mod sandbox_runtime {
+    pub use openshell_driver_sdk::proto::sandbox_runtime::v1;
+}
+
 #[allow(
     clippy::all,
     clippy::pedantic,
