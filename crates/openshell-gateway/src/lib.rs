@@ -180,7 +180,7 @@ impl openshell_server::ComputeDriverFactory for MxcFactory {
     )
 ))]
 fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
-    for registration in [
+    let registrations = [
         #[cfg(feature = "compute-driver-kubernetes")]
         ComputeDriverRegistration::new(
             "kubernetes",
@@ -221,7 +221,8 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
         ComputeDriverRegistration::new("vm", u16::MAX, None, VmFactory).map(|registration| {
             registration.with_telemetry_category(TelemetryComputeDriver::anonymous_category("vm"))
         }),
-    ] {
+    ];
+    for registration in registrations {
         registry
             .install(registration.expect("first-party driver name is valid"))
             .expect("first-party driver names are unique");
