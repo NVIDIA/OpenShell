@@ -142,22 +142,6 @@ pub fn format_timestamp(d: Duration) -> String {
     format!("[{secs:.1}s]")
 }
 
-/// Format a millisecond timestamp into a readable string.
-pub fn format_timestamp_ms(ms: i64) -> String {
-    if ms <= 0 {
-        return "-".to_string();
-    }
-    let secs = ms / 1000;
-    let mins = (secs / 60) % 60;
-    let hours = (secs / 3600) % 24;
-    let days = secs / 86400;
-    if days > 0 {
-        format!("{days}d {hours:02}:{mins:02}")
-    } else {
-        format!("{hours:02}:{mins:02}")
-    }
-}
-
 pub fn truncate_status_field(value: &str, max_chars: usize) -> String {
     if value.is_empty() {
         return "-".to_string();
@@ -1150,6 +1134,15 @@ mod tests {
         let err =
             parse_key_value_pairs(&["=value".to_string()], "--annotation").expect_err("empty key");
         assert!(err.to_string().contains("--annotation key cannot be empty"));
+    }
+
+    #[test]
+    fn format_optional_epoch_ms_shows_date_or_dash() {
+        assert_eq!(
+            format_optional_epoch_ms(1_794_000_000_000),
+            "2026-11-06 21:20:00"
+        );
+        assert_eq!(format_optional_epoch_ms(0), "-");
     }
 
     #[test]
