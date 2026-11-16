@@ -8425,6 +8425,8 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
         "containercreated",
         "healthcheckstarting",
         "inspectfailed",
+        // Agent Sandbox reports workload Pod teardown before confirming stop.
+        "podterminating",
     ];
     !transient_reasons.contains(&reason.as_str())
 }
@@ -12538,6 +12540,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pod_terminating_snapshot_can_settle_to_stopped() {
+        for initial_phase in [SandboxPhase::Ready, SandboxPhase::Stopping] {
+            for session_connected in [false, true] {
+                let mut sandbox = sandbox_record("sb-terminating", "terminating", initial_phase);
+                let mut incoming = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+                incoming.status.as_mut().unwrap().conditions = vec![make_driver_condition(
+                    "PodTerminating",
+                    "Workload pod is terminating",
+                )];
+
+                apply_driver_snapshot(&mut sandbox, &incoming, session_connected, false);
+
+                let expected = if initial_phase == SandboxPhase::Stopping {
+                    SandboxPhase::Stopping
+                } else if session_connected {
+                    SandboxPhase::Ready
+                } else {
+                    SandboxPhase::Provisioning
+                };
+                assert_eq!(sandbox.phase(), expected as i32);
+
+                incoming
+                    .status
+                    .as_mut()
+                    .unwrap()
+                    .conditions
+                    .push(DriverCondition {
+                        r#type: "Suspended".to_string(),
+                        status: "True".to_string(),
+                        reason: "PodTerminated".to_string(),
+                        ..Default::default()
+                    });
+                apply_driver_snapshot(&mut sandbox, &incoming, session_connected, false);
+
+                assert_eq!(sandbox.phase(), SandboxPhase::Stopped as i32);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_failure_snapshot_stays_error_after_stopped_observation() {
+        for reason in ["ImagePullBackOff", "SomeOtherReason"] {
+            let mut sandbox = sandbox_record("sb-failed", "failed", SandboxPhase::Ready);
+            let mut incoming = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            incoming.status.as_mut().unwrap().conditions =
+                vec![make_driver_condition(reason, "Infrastructure failure")];
+
+            apply_driver_snapshot(&mut sandbox, &incoming, true, false);
+            assert_eq!(sandbox.phase(), SandboxPhase::Error as i32);
+
+            incoming.status.as_mut().unwrap().conditions = vec![DriverCondition {
+                r#type: "Suspended".to_string(),
+                status: "True".to_string(),
+                reason: "PodTerminated".to_string(),
+                ..Default::default()
+            }];
+            apply_driver_snapshot(&mut sandbox, &incoming, false, false);
+
+            assert_eq!(sandbox.phase(), SandboxPhase::Error as i32);
+            assert_eq!(
+                sandbox.status.as_ref().unwrap().conditions[0].reason,
+                reason
+            );
+        }
+    }
+
     fn sandbox_watch_event(sandbox: DriverSandbox) -> WatchSandboxesEvent {
         WatchSandboxesEvent {
             payload: Some(watch_sandboxes_event::Payload::Sandbox(
@@ -12653,6 +12722,9 @@ mod tests {
                 "Backend ready; waiting for supervisor session",
             ),
             ("Starting", "VM is starting"),
+            ("PodTerminating", "Workload pod is terminating"),
+            ("podterminating", "lowercase also works"),
+            ("PODTERMINATING", "uppercase also works"),
             (
                 "ContainerCreated",
                 "Podman created the container before starting it",

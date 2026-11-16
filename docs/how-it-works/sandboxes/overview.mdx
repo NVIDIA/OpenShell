@@ -1206,6 +1206,10 @@ After a gateway restart, an existing sandbox can return to `Provisioning`
 temporarily while its supervisor reconnects. Wait for the phase to return to
 `Ready` before you connect to the sandbox or execute commands.
 
+On Kubernetes, `Ready=False` with reason `PodTerminating` describes workload
+Pod teardown. The gateway treats this condition as transitional and moves the
+sandbox to `Stopped` when the backend confirms it has stopped.
+
 The gateway records a successful canonical main-process exit as `Ready=False`
 with reason `MainProcessCompleted`. Nonzero and signal-normalized results use
 `MainProcessFailed` and the `Error` phase. It also sets `status.exit_code`;
