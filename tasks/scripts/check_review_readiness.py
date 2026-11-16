@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -35,6 +36,66 @@ PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)",
 ADD_LABEL = """mutation($input: AddLabelsToLabelableInput!) {
   addLabelsToLabelable(input: $input) { labelable { __typename } }
 }"""
+
+
+class LabelRoutingError(ValueError):
+    """The PR's area or topic labels prevent requesting reviewers."""
+
+
+def _api_action(method: str, path: str) -> str:
+    """Name the step a failed `gh api` call was performing."""
+    if path.endswith("/requested_reviewers"):
+        return (
+            "Removing reviewer requests"
+            if method == "DELETE"
+            else "Requesting reviewers"
+        )
+    if path.endswith("/labels") and method == "POST":
+        return "Adding labels"
+    if method == "GET":
+        return "Reading the PR from GitHub"
+    return "A GitHub API call"
+
+
+def _escape_annotation(text: str, *, prop: bool = False) -> str:
+    """Escape text for a GitHub Actions workflow command."""
+    text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    if prop:
+        text = text.replace(":", "%3A").replace(",", "%2C")
+    return text
+
+
+def describe_failure(exc: Exception) -> tuple[str, str]:
+    """Return a short category and an actionable message for a failure."""
+    if isinstance(exc, LabelRoutingError):
+        return "PR labels", str(exc)
+    if isinstance(exc, subprocess.CalledProcessError):
+        command = [str(part) for part in exc.cmd]
+        method = "GET"
+        if "--method" in command[:-1]:
+            method = command[command.index("--method") + 1]
+        path = command[2] if len(command) > 2 else ""
+        message = (
+            f"{_api_action(method, path)} failed with a GitHub API error: "
+            f"gh api {method} {path}"
+        )
+        detail = (exc.stderr or "").strip()
+        if detail:
+            message += f": {detail}"
+        message += f" (exit status {exc.returncode})"
+        return "GitHub API error", message
+    return "error", str(exc)
+
+
+def report_failure(exc: Exception, *, stream=None, env=None) -> None:
+    """Print the failure, plus an Actions error annotation when in Actions."""
+    stream = sys.stderr if stream is None else stream
+    env = os.environ if env is None else env
+    category, message = describe_failure(exc)
+    print(f"Review readiness: {message}", file=stream)
+    if env.get("GITHUB_ACTIONS") == "true":
+        title = _escape_annotation(f"Review Readiness: {category}", prop=True)
+        print(f"::error title={title}::{_escape_annotation(message)}", file=stream)
 
 
 @dataclass(frozen=True)
@@ -94,11 +155,27 @@ def parse_reviewers(markdown: str) -> dict[str, set[str]]:
 def select_reviewers(categories: dict[str, set[str]], labels: set[str]) -> set[str]:
     """Return matching handles for one primary area and any number of topics."""
     relevant = {label for label in labels if label.startswith(("area:", "topic:"))}
-    if sum(label.startswith("area:") for label in relevant) != 1:
-        raise ValueError("a ready PR must have exactly one area label")
+    areas = sorted(label for label in relevant if label.startswith("area:"))
+    if not areas:
+        raise LabelRoutingError(
+            "This PR has no area label. A ready PR needs exactly one; add one."
+        )
+    if len(areas) > 1:
+        raise LabelRoutingError(
+            f"This PR has more than one area label: {', '.join(areas)}. "
+            "A ready PR needs exactly one; remove the others."
+        )
     unknown = relevant - categories.keys()
     if unknown:
-        raise ValueError("unknown area/topic labels: " + ", ".join(sorted(unknown)))
+        names = ", ".join(sorted(unknown))
+        if len(unknown) == 1:
+            raise LabelRoutingError(
+                f"There is an invalid area or topic label on this PR: {names}. "
+                "Remove it."
+            )
+        raise LabelRoutingError(
+            f"There are invalid area and topic labels on this PR: {names}. Remove them."
+        )
     return set().union(*(categories[label] for label in relevant))
 
 
@@ -337,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
         TypeError,
         subprocess.CalledProcessError,
     ) as exc:
-        print(f"Review readiness: {exc}", file=sys.stderr)
+        report_failure(exc)
         return 1
     print(
         json.dumps(
