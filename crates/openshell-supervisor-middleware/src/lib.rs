@@ -8,6 +8,8 @@ mod diagnostics;
 pub mod headers;
 mod http_hooks;
 mod remote;
+mod request_failure;
+pub use request_failure::HttpRequestFailureKind;
 mod response;
 mod websocket;
 
@@ -679,6 +681,8 @@ pub struct HttpRequestInput {
 
 #[derive(Debug, Clone)]
 pub struct ChainOutcome {
+    /// Failure cause, independent of diagnostic text and explicit denials.
+    pub failure_kind: Option<HttpRequestFailureKind>,
     pub allowed: bool,
     pub reason: String,
     pub body: Vec<u8>,
@@ -710,6 +714,8 @@ pub struct NamespacedFinding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MiddlewareInvocation {
+    /// Failure cause, independent of diagnostic text and explicit denials.
+    pub failure_kind: Option<HttpRequestFailureKind>,
     pub name: String,
     pub implementation: String,
     pub decision: Decision,
@@ -732,11 +738,13 @@ enum OnErrorAction {
 fn apply_on_error(
     entry: &DescribedChainEntry,
     reason: &str,
+    failure_kind: HttpRequestFailureKind,
     applied: &mut Vec<MiddlewareInvocation>,
 ) -> OnErrorAction {
     match entry.entry.on_error {
         OnError::FailOpen => {
             applied.push(MiddlewareInvocation {
+                failure_kind: Some(failure_kind),
                 name: entry.entry.name.clone(),
                 implementation: entry.entry.implementation.clone(),
                 decision: Decision::Allow,
@@ -747,6 +755,7 @@ fn apply_on_error(
         }
         OnError::FailClosed => {
             applied.push(MiddlewareInvocation {
+                failure_kind: Some(failure_kind),
                 name: entry.entry.name.clone(),
                 implementation: entry.entry.implementation.clone(),
                 decision: Decision::Deny,
@@ -2115,6 +2124,7 @@ impl ChainRunner {
             .find(|entry| entry.http_hook_version() == Some(HttpHookVersion::Current))
         {
             return Ok(ChainOutcome {
+                failure_kind: Some(HttpRequestFailureKind::InvalidResult),
                 allowed: false,
                 reason: format!("middleware_failed: {MIDDLEWARE_HOOK_VERSIONS_MIXED}"),
                 body: input.body,
@@ -2122,6 +2132,7 @@ impl ChainRunner {
                 findings: Vec::new(),
                 metadata: BTreeMap::new(),
                 applied: vec![MiddlewareInvocation {
+                    failure_kind: Some(HttpRequestFailureKind::InvalidResult),
                     name: entry.entry.name.clone(),
                     implementation: entry.entry.implementation.clone(),
                     decision: Decision::Deny,
@@ -2180,10 +2191,18 @@ impl ChainRunner {
 
         for entry in entries {
             let Some(_binding) = entry.binding.as_ref() else {
-                match apply_on_error(entry, "binding_not_described", &mut applied) {
+                match apply_on_error(
+                    entry,
+                    "binding_not_described",
+                    HttpRequestFailureKind::of_platform_reason("binding_not_described"),
+                    &mut applied,
+                ) {
                     OnErrorAction::FailOpen => continue,
                     OnErrorAction::FailClosed(reason) => {
                         return Ok(ChainOutcome {
+                            failure_kind: applied
+                                .last()
+                                .and_then(|invocation| invocation.failure_kind),
                             allowed: false,
                             reason,
                             body,
@@ -2197,10 +2216,18 @@ impl ChainRunner {
                 }
             };
             if body.len() > entry.max_payload_bytes {
-                match apply_on_error(entry, "request_body_over_capacity", &mut applied) {
+                match apply_on_error(
+                    entry,
+                    "request_body_over_capacity",
+                    HttpRequestFailureKind::of_platform_reason("request_body_over_capacity"),
+                    &mut applied,
+                ) {
                     OnErrorAction::FailOpen => continue,
                     OnErrorAction::FailClosed(reason) => {
                         return Ok(ChainOutcome {
+                            failure_kind: applied
+                                .last()
+                                .and_then(|invocation| invocation.failure_kind),
                             allowed: false,
                             reason,
                             body,
@@ -2223,10 +2250,18 @@ impl ChainRunner {
                 &entry.entry.implementation,
             );
             if let Err(reason) = validate_request_view(request) {
-                match apply_on_error(entry, reason, &mut applied) {
+                match apply_on_error(
+                    entry,
+                    reason,
+                    HttpRequestFailureKind::of_platform_reason(reason),
+                    &mut applied,
+                ) {
                     OnErrorAction::FailOpen => continue,
                     OnErrorAction::FailClosed(reason) => {
                         return Ok(ChainOutcome {
+                            failure_kind: applied
+                                .last()
+                                .and_then(|invocation| invocation.failure_kind),
                             allowed: false,
                             reason,
                             body,
@@ -2244,10 +2279,18 @@ impl ChainRunner {
             };
             let remaining = chain_deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                match apply_on_error(entry, "middleware_chain_timeout", &mut applied) {
+                match apply_on_error(
+                    entry,
+                    "middleware_chain_timeout",
+                    HttpRequestFailureKind::of_platform_reason("middleware_chain_timeout"),
+                    &mut applied,
+                ) {
                     OnErrorAction::FailOpen => continue,
                     OnErrorAction::FailClosed(reason) => {
                         return Ok(ChainOutcome {
+                            failure_kind: applied
+                                .last()
+                                .and_then(|invocation| invocation.failure_kind),
                             allowed: false,
                             reason,
                             body,
@@ -2260,24 +2303,41 @@ impl ChainRunner {
                     }
                 }
             }
-            let mut result = match call_with_timeout(
+            let mut result = match tokio::time::timeout(
                 entry.timeout.min(remaining),
-                "EvaluateHttpRequest",
                 service.service.evaluate_http_request(request),
             )
             .await
             {
-                Ok(result) => result.into_inner(),
-                Err(err) => {
+                Ok(Ok(result)) => result.into_inner(),
+                error => {
+                    let (err, failure_kind) = match error {
+                        Ok(Err(err)) => {
+                            let kind = HttpRequestFailureKind::RemoteStatus(err.code());
+                            (err, kind)
+                        }
+                        Err(_) => (
+                            tonic::Status::deadline_exceeded("EvaluateHttpRequest timed out"),
+                            if remaining <= entry.timeout {
+                                HttpRequestFailureKind::ChainTimeout
+                            } else {
+                                HttpRequestFailureKind::StageTimeout
+                            },
+                        ),
+                        Ok(Ok(_)) => unreachable!("successful result handled above"),
+                    };
                     let reason = if err.code() == tonic::Code::DeadlineExceeded {
                         "middleware_timeout".to_string()
                     } else {
                         service.diagnostic_policy.error_reason(&err)
                     };
-                    match apply_on_error(entry, &reason, &mut applied) {
+                    match apply_on_error(entry, &reason, failure_kind, &mut applied) {
                         OnErrorAction::FailOpen => continue,
                         OnErrorAction::FailClosed(reason) => {
                             return Ok(ChainOutcome {
+                                failure_kind: applied
+                                    .last()
+                                    .and_then(|invocation| invocation.failure_kind),
                                 allowed: false,
                                 reason,
                                 body,
@@ -2293,10 +2353,18 @@ impl ChainRunner {
             };
 
             if let Err(reason) = validate_response_envelope(&result) {
-                match apply_on_error(entry, reason, &mut applied) {
+                match apply_on_error(
+                    entry,
+                    reason,
+                    HttpRequestFailureKind::of_platform_reason(reason),
+                    &mut applied,
+                ) {
                     OnErrorAction::FailOpen => continue,
                     OnErrorAction::FailClosed(reason) => {
                         return Ok(ChainOutcome {
+                            failure_kind: applied
+                                .last()
+                                .and_then(|invocation| invocation.failure_kind),
                             allowed: false,
                             reason,
                             body,
@@ -2317,10 +2385,18 @@ impl ChainRunner {
             let decision = match Decision::try_from(result.decision) {
                 Ok(decision @ (Decision::Allow | Decision::Deny)) => decision,
                 Ok(Decision::Unspecified) | Err(_) => {
-                    match apply_on_error(entry, "invalid_response_decision", &mut applied) {
+                    match apply_on_error(
+                        entry,
+                        "invalid_response_decision",
+                        HttpRequestFailureKind::of_platform_reason("invalid_response_decision"),
+                        &mut applied,
+                    ) {
                         OnErrorAction::FailOpen => continue,
                         OnErrorAction::FailClosed(reason) => {
                             return Ok(ChainOutcome {
+                                failure_kind: applied
+                                    .last()
+                                    .and_then(|invocation| invocation.failure_kind),
                                 allowed: false,
                                 reason,
                                 body,
@@ -2355,6 +2431,7 @@ impl ChainRunner {
                     );
                 }
                 applied.push(MiddlewareInvocation {
+                    failure_kind: None,
                     name: entry.entry.name.clone(),
                     implementation: entry.entry.implementation.clone(),
                     decision,
@@ -2362,6 +2439,7 @@ impl ChainRunner {
                     failed: false,
                 });
                 return Ok(ChainOutcome {
+                    failure_kind: None,
                     allowed: false,
                     reason: middleware_denial_reason(
                         &denial.config_name,
@@ -2377,10 +2455,18 @@ impl ChainRunner {
             }
 
             if result.has_body && result.body.len() > entry.max_payload_bytes {
-                match apply_on_error(entry, "response_body_over_capacity", &mut applied) {
+                match apply_on_error(
+                    entry,
+                    "response_body_over_capacity",
+                    HttpRequestFailureKind::of_platform_reason("response_body_over_capacity"),
+                    &mut applied,
+                ) {
                     OnErrorAction::FailOpen => continue,
                     OnErrorAction::FailClosed(reason) => {
                         return Ok(ChainOutcome {
+                            failure_kind: applied
+                                .last()
+                                .and_then(|invocation| invocation.failure_kind),
                             allowed: false,
                             reason,
                             body,
@@ -2411,10 +2497,18 @@ impl ChainRunner {
                         let reason = service
                             .diagnostic_policy
                             .header_mutation_error_reason(&error);
-                        match apply_on_error(entry, &reason, &mut applied) {
+                        match apply_on_error(
+                            entry,
+                            &reason,
+                            HttpRequestFailureKind::HeaderMutation,
+                            &mut applied,
+                        ) {
                             OnErrorAction::FailOpen => continue,
                             OnErrorAction::FailClosed(reason) => {
                                 return Ok(ChainOutcome {
+                                    failure_kind: applied
+                                        .last()
+                                        .and_then(|invocation| invocation.failure_kind),
                                     allowed: false,
                                     reason,
                                     body,
@@ -2454,6 +2548,7 @@ impl ChainRunner {
                 );
             }
             applied.push(MiddlewareInvocation {
+                failure_kind: None,
                 name: entry.entry.name.clone(),
                 implementation: entry.entry.implementation.clone(),
                 decision,
@@ -2468,15 +2563,19 @@ impl ChainRunner {
             if body_transformed
                 && let TransformedBodyPolicy::Reevaluate(validate) = transformed_body_policy
             {
-                let denied = match validate(&body) {
-                    Ok(reason) => reason,
-                    Err(error) => Some(format!(
-                        "transformed_body_policy_evaluation_failed: {}",
-                        safe_reason(&error.to_string())
-                    )),
+                let (denied, failure_kind) = match validate(&body) {
+                    Ok(reason) => (reason, None),
+                    Err(error) => (
+                        Some(format!(
+                            "transformed_body_policy_evaluation_failed: {}",
+                            safe_reason(&error.to_string())
+                        )),
+                        Some(HttpRequestFailureKind::PolicyEvaluation),
+                    ),
                 };
                 if let Some(reason) = denied {
                     return Ok(ChainOutcome {
+                        failure_kind,
                         allowed: false,
                         reason,
                         body,
@@ -2491,6 +2590,7 @@ impl ChainRunner {
         }
 
         Ok(ChainOutcome {
+            failure_kind: None,
             allowed: true,
             reason: String::new(),
             body,
@@ -3171,6 +3271,10 @@ mod tests {
             .await
             .expect("evaluate");
         assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.failure_kind,
+            Some(HttpRequestFailureKind::Unavailable)
+        );
         assert!(outcome.reason.starts_with("middleware_failed:"));
     }
 
@@ -3608,6 +3712,10 @@ mod tests {
             .expect("policy evaluator failure should be a chain outcome");
 
         assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.failure_kind,
+            Some(HttpRequestFailureKind::PolicyEvaluation)
+        );
         assert!(
             outcome
                 .reason
@@ -4714,6 +4822,10 @@ mod tests {
             .await
             .expect("operator timeout outcome");
         assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.failure_kind,
+            Some(HttpRequestFailureKind::StageTimeout)
+        );
         assert_eq!(outcome.reason, "middleware_failed: middleware_timeout");
     }
 

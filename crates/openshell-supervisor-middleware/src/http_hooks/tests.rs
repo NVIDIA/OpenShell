@@ -150,6 +150,7 @@ enum Preflight {
     Inspect(HttpBodyMode),
     Deny(&'static str),
     Fail(tonic::Code),
+    Stall,
 }
 
 /// What a scripted stage does with the body it selected.
@@ -172,6 +173,7 @@ struct ScriptedStage {
     inspect_content_type: Option<&'static str>,
     output_content_type: Option<&'static str>,
     output_after_input: bool,
+    output_chunk_size: Option<usize>,
     ended: Arc<Mutex<Vec<i32>>>,
     /// Heads this stage received in `Begin`.
     begun: Arc<Mutex<Vec<Vec<HttpHeader>>>>,
@@ -192,6 +194,7 @@ impl ScriptedStage {
             inspect_content_type: None,
             output_content_type: None,
             output_after_input: false,
+            output_chunk_size: None,
             ended: Arc::default(),
             begun: Arc::default(),
             preflights: Arc::default(),
@@ -274,6 +277,7 @@ impl InProcessMiddleware for ScriptedStage {
         }
         let inspect_content_type = self.inspect_content_type;
         let output_after_input = self.output_after_input;
+        let output_chunk_size = self.output_chunk_size;
         let ended = Arc::clone(&self.ended);
         let begun = Arc::clone(&self.begun);
         let preflights = Arc::clone(&self.preflights);
@@ -345,6 +349,7 @@ impl InProcessMiddleware for ScriptedStage {
                                 }))
                             }
                             Preflight::Fail(code) => Err(tonic::Status::new(*code, "scripted")),
+                            Preflight::Stall => futures::future::pending().await,
                         }
                     }
                     Some(http_request_hook_event::Event::Begin(started)) => {
@@ -393,7 +398,10 @@ impl InProcessMiddleware for ScriptedStage {
                         }
                         result(http_request_hook_result::Result::OutputChunk(
                             HttpOutputChunk {
-                                data: chunk.data.to_ascii_uppercase(),
+                                data: output_chunk_size.map_or_else(
+                                    || chunk.data.to_ascii_uppercase(),
+                                    |size| vec![b'x'; size],
+                                ),
                             },
                         ))
                     }
@@ -1038,13 +1046,27 @@ async fn failures_name_the_failed_stage_and_a_platform_code() {
             HttpFailureCode::Unavailable,
         ),
     ] {
-        let (runner, described) =
-            scripted_chain(vec![scripted("example/a", preflight, Body::Unchanged)]).await;
+        let Preflight::Fail(status) = preflight else {
+            unreachable!()
+        };
+        let (runner, described) = scripted_chain(vec![scripted(
+            "example/a",
+            Preflight::Fail(status),
+            Body::Unchanged,
+        )])
+        .await;
         let preflight = runner
             .preflight_described_http_request(described, request_input(b"hello"))
             .await
             .expect("preflight");
         assert!(!preflight.allowed, "{case}");
+        let kind = Some(crate::HttpRequestFailureKind::RemoteStatus(status));
+        assert_eq!(preflight.diagnostics.failure_kind, kind, "{case}");
+        assert_eq!(
+            preflight.diagnostics.applied()[0].failure_kind,
+            kind,
+            "{case}"
+        );
         assert_eq!(
             preflight.failure,
             Some(MiddlewareFailureDetail {
@@ -1067,6 +1089,8 @@ async fn failures_name_the_failed_stage_and_a_platform_code() {
         .expect("preflight");
     assert!(denied.denial.is_some());
     assert!(denied.failure.is_none());
+    assert_eq!(denied.diagnostics.failure_kind, None);
+    assert_eq!(denied.diagnostics.applied()[0].failure_kind, None);
 }
 
 #[tokio::test]
@@ -1694,5 +1718,154 @@ async fn stages_cannot_change_headers_that_reference_credentials() {
             "{case}: {}",
             result.reason
         );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_deadlines_preserve_their_scope() {
+    use crate::HttpRequestFailureKind;
+    for (timeout, expected) in [
+        (
+            std::time::Duration::from_millis(5),
+            HttpRequestFailureKind::StageTimeout,
+        ),
+        (
+            MAX_MIDDLEWARE_CHAIN_TIMEOUT * 2,
+            HttpRequestFailureKind::ChainTimeout,
+        ),
+    ] {
+        let (runner, mut described) = scripted_chain(vec![scripted(
+            "example/a",
+            Preflight::Stall,
+            Body::Unchanged,
+        )])
+        .await;
+        described[0].timeout = timeout;
+        let outcome = runner
+            .preflight_described_http_request(described, request_input(b"hello"))
+            .await
+            .expect("preflight");
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.diagnostics.failure_kind, Some(expected));
+        assert_eq!(
+            outcome.diagnostics.applied()[0].failure_kind,
+            Some(expected)
+        );
+        assert_eq!(
+            outcome.failure.expect("sandbox detail").code,
+            HttpFailureCode::Timeout
+        );
+    }
+}
+
+#[tokio::test]
+async fn stage_causes_survive_diagnostic_merging_and_compaction() {
+    use crate::HttpRequestFailureKind;
+    let (_, described) = scripted_chain(vec![scripted(
+        "example/a",
+        Preflight::Continue,
+        Body::Unchanged,
+    )])
+    .await;
+    for (reason, expected) in [
+        (
+            "middleware_body_timeout",
+            HttpRequestFailureKind::WholeBodyTimeout,
+        ),
+        (
+            "middleware_stall_timeout",
+            HttpRequestFailureKind::StreamIdleTimeout,
+        ),
+        (
+            "diagnostics_reason_over_capacity",
+            HttpRequestFailureKind::Capacity,
+        ),
+        (
+            "preflight_result_unknown",
+            HttpRequestFailureKind::InvalidResult,
+        ),
+        ("binding_not_described", HttpRequestFailureKind::Unavailable),
+        ("middleware_stream_closed", HttpRequestFailureKind::Io),
+    ] {
+        let failure = entry_failure(&described[0], reason);
+        let mut diagnostics = crate::HttpStageDiagnostics::default();
+        diagnostics.invocations.push(super::pipeline::invocation(
+            &described[0],
+            HttpStageOutcome::Duplex,
+            None,
+        ));
+        diagnostics.extend(*failure.diagnostics);
+        assert_eq!(failure.kind, Some(expected));
+        assert_eq!(diagnostics.failure_kind, Some(expected));
+        let applied = diagnostics.applied();
+        assert_eq!(applied.len(), 1);
+        assert!(applied[0].failed);
+        assert_eq!(applied[0].failure_kind, Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn duplex_chunk_capacity_is_distinct_from_invalid_output() {
+    use crate::HttpRequestFailureKind;
+    for (size, expected) in [
+        (1024, None),
+        (1025, Some(HttpRequestFailureKind::Capacity)),
+        (0, Some(HttpRequestFailureKind::InvalidResult)),
+    ] {
+        let stage = Arc::new(ScriptedStage {
+            output_chunk_size: Some(size),
+            ..ScriptedStage::new(
+                "example/a",
+                Preflight::Inspect(HttpBodyMode::Duplex),
+                Body::Uppercase,
+            )
+        });
+        let (runner, described) = scripted_chain(vec![stage]).await;
+        let preflight = runner
+            .preflight_described_http_request(described, request_input(b"a"))
+            .await
+            .expect("preflight");
+        let (input, inputs) = mpsc::channel(4);
+        input
+            .send(HttpBodyInput::Chunk(b"a".to_vec()))
+            .await
+            .unwrap();
+        input
+            .send(HttpBodyInput::End {
+                trailers: Vec::new(),
+            })
+            .await
+            .unwrap();
+        drop(input);
+        let (output, mut outputs) = mpsc::channel(4);
+        let run = preflight.pipeline.unwrap().run_with_body_policy(
+            inputs,
+            output,
+            TransformedBodyPolicy::NotPolicyRelevant,
+        );
+        let drain = async { while outputs.recv().await.is_some() {} };
+        let (finish, ()) = tokio::join!(run, drain);
+        match expected {
+            None => assert_eq!(
+                finish.expect("exact chunk limit").diagnostics.failure_kind,
+                None
+            ),
+            Some(expected) => {
+                let failure = finish.expect_err("invalid chunk");
+                assert_eq!(failure.kind, Some(expected));
+                assert_eq!(
+                    failure.diagnostics.applied()[0].failure_kind,
+                    Some(expected)
+                );
+                assert_eq!(
+                    failure.reason,
+                    "middleware_failed: stream_output_chunk_invalid"
+                );
+                assert_eq!(
+                    failure.failure.unwrap().code,
+                    HttpFailureCode::LifecycleViolation
+                );
+            }
+        }
     }
 }

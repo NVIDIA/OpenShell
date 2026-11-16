@@ -267,7 +267,13 @@ fn capacity_exhausted(headers: Vec<HttpHeader>) -> HttpRequestPreflightOutcome {
         allowed: false,
         reason: "middleware_failed: session_capacity_exhausted".into(),
         session_capacity_exhausted: true,
-        ..outcome(headers, HttpStageDiagnostics::default())
+        ..outcome(
+            headers,
+            HttpStageDiagnostics {
+                failure_kind: Some(crate::HttpRequestFailureKind::Capacity),
+                ..Default::default()
+            },
+        )
     }
 }
 
