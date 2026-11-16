@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The sole production backend. Backend-specific imports belong here.
+//! The default AWS-LC backend. Backend-specific imports belong here.
 
 use crate::{Capabilities, CryptoBackend, CryptoError, Digest, FipsState, ProtocolBackend};
 use aws_lc_rs::{
@@ -36,6 +36,7 @@ impl CryptoBackend for AwsLc {
                 "ECDSA-P384-SHA384",
                 "ECDSA-P521-SHA512",
                 "Ed25519",
+                "RSA",
             ],
         }
     }

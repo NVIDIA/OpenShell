@@ -73,16 +73,29 @@ impl ComputeDriverTracing {
     pub fn provider_for(
         self,
         endpoint: Option<&str>,
+        transport: &crate::CollectorTransport,
         service_version: &'static str,
         gateway_name: Option<&str>,
         compute_driver: Option<&str>,
     ) -> (Option<SdkTracerProvider>, Option<SetupError>) {
-        crate::provider_for(endpoint.map(|endpoint| OtlpExportConfig {
-            endpoint,
-            service_name: ServiceName::Fixed(self.service_name),
-            service_version: Some(service_version),
-            resource_attributes: crate::gateway_resource_attributes(gateway_name, compute_driver),
-        }))
+        let provider = endpoint.map(|endpoint| {
+            crate::OtlpTarget::new(&OtlpExportConfig {
+                endpoint,
+                service_name: ServiceName::Fixed(self.service_name),
+                service_version: Some(service_version),
+                resource_attributes: crate::gateway_resource_attributes(
+                    gateway_name,
+                    compute_driver,
+                ),
+            })?
+            .with_transport(transport)
+            .tracer_provider()
+        });
+        match provider {
+            None => (None, None),
+            Some(Ok(provider)) => (Some(provider), None),
+            Some(Err(error)) => (None, Some(error)),
+        }
     }
 
     pub fn layer<S>(self, provider: &SdkTracerProvider) -> crate::OtlpLayer<S>
@@ -187,6 +200,11 @@ pub struct DriverTracingHandle {
 #[derive(Debug, Clone, Copy)]
 pub struct DriverTracingConfig<'a> {
     pub endpoint: Option<&'a str>,
+    pub protocol: crate::Protocol,
+    /// PEM files for an `https://` collector; see [`crate::OtlpTls::from_files`].
+    pub ca_file: Option<&'a std::path::Path>,
+    pub cert_file: Option<&'a std::path::Path>,
+    pub key_file: Option<&'a std::path::Path>,
     pub gateway_name: Option<&'a str>,
     pub service_version: &'static str,
     pub log_level: &'a str,
@@ -202,18 +220,33 @@ impl Drop for DriverTracingHandle {
     }
 }
 
+impl DriverTracingConfig<'_> {
+    /// The collector transport, with headers from the environment only.
+    pub fn transport(&self) -> Result<crate::CollectorTransport, crate::TlsFileError> {
+        Ok(crate::CollectorTransport {
+            protocol: self.protocol,
+            headers: http::HeaderMap::new(),
+            tls: crate::OtlpTls::from_files(self.ca_file, self.cert_file, self.key_file)?,
+        })
+    }
+}
+
 /// Install standalone compute-driver logging and OTLP tracing.
 #[must_use]
 pub fn install_driver_tracing(
     descriptor: ComputeDriverTracing,
     config: DriverTracingConfig<'_>,
 ) -> DriverTracingHandle {
-    let (provider, setup_error) = descriptor.provider_for(
-        config.endpoint,
-        config.service_version,
-        config.gateway_name,
-        Some(descriptor.compute_driver()),
-    );
+    let (provider, setup_error) = match config.transport() {
+        Ok(transport) => descriptor.provider_for(
+            config.endpoint,
+            &transport,
+            config.service_version,
+            config.gateway_name,
+            Some(descriptor.compute_driver()),
+        ),
+        Err(error) => (None, config.endpoint.map(|_| error.into())),
+    };
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(config.log_level)),
@@ -241,6 +274,66 @@ mod tests {
 
         assert_eq!(TRACING.service_name(), "openshell-otel");
         assert_eq!(TRACING.in_process_targets()[1], "openshell_otel");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn driver_provider_exports_with_the_configured_protocol_and_headers() {
+        crate::test_environment::Environment::new()
+            .remove("OTEL_EXPORTER_OTLP_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+            .run_async(async {
+                use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+
+                const TRACING: ComputeDriverTracing = crate::compute_driver_tracing!();
+                let mut collector = openshell_otel_test_support::OtlpHttpTestServer::start().await;
+                let (provider, error) = TRACING.provider_for(
+                    Some(collector.endpoint()),
+                    &crate::CollectorTransport {
+                        protocol: crate::Protocol::HttpProtobuf,
+                        headers: crate::parse_otlp_headers("authorization=driver"),
+                        tls: crate::OtlpTls::default(),
+                    },
+                    "1.2.3",
+                    Some("test-gateway"),
+                    Some("docker"),
+                );
+                assert!(error.is_none(), "unexpected setup error: {error:?}");
+                let provider = provider.expect("provider");
+                provider.tracer("test").in_span("driver-span", |_| {});
+                let flush = tokio::task::spawn_blocking(move || provider.force_flush());
+
+                let export = collector.next_export().await;
+                assert_eq!(export.path, "/v1/traces");
+                assert_eq!(export.headers["authorization"], "driver");
+                flush.await.unwrap().expect("flush succeeds");
+            })
+            .await;
+    }
+
+    #[test]
+    fn driver_transport_reads_its_tls_files() {
+        let pki = openshell_otel_test_support::TestPki::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, &pki.ca_pem).unwrap();
+        let config = |ca_file, key_file| DriverTracingConfig {
+            endpoint: Some("https://collector:4317"),
+            protocol: crate::Protocol::Grpc,
+            ca_file,
+            cert_file: None,
+            key_file,
+            gateway_name: None,
+            service_version: "1.2.3",
+            log_level: "info",
+        };
+
+        let transport = config(Some(&ca), None).transport().unwrap();
+        assert_eq!(transport.tls.ca_pem(), Some(pki.ca_pem.as_bytes()));
+        assert!(matches!(
+            config(None, Some(&ca)).transport(),
+            Err(crate::TlsFileError::KeyWithoutCert)
+        ));
     }
 
     #[tokio::test]

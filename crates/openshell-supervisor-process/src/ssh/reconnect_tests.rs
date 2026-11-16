@@ -123,6 +123,7 @@ impl Connection {
         // Preserve whether production enables probes. Only shorten the interval.
         let config_mut = Arc::get_mut(&mut config).unwrap();
         config_mut.keepalive_interval = config_mut.keepalive_interval.map(|_| TEST_INTERVAL);
+        let server_endpoint = Arc::new(ssh_server_endpoint(&socket));
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let _ = handle_connection(
@@ -131,6 +132,7 @@ impl Connection {
                 rpc_test::loopback(Arc::new(TestLoopbackConnector)),
                 rpc_test::exec(Arc::new(RejectingExec)),
                 Some(main),
+                server_endpoint,
                 TEST_INTERVAL * 4,
             )
             .await;

@@ -29,7 +29,7 @@ from ._proto import (
     openshell_pb2,
     openshell_pb2_grpc,
 )
-from .errors import _error_mapping_channel
+from .errors import _error_mapping_channel, from_grpc_error
 from .mutations import DeletionOutcome, DeletionResult
 
 _ClientCallDetailsBase = namedtuple(
@@ -40,6 +40,10 @@ _ClientCallDetailsBase = namedtuple(
 _OAUTH_MAX_RESPONSE_BYTES = 1 << 20
 _PAGER_MAX_CONSUMED_TOKENS = 10_000
 _PAGER_MAX_CONSUMED_TOKEN_BYTES = 1 << 20
+# Replica routing headers and retry rule: docs/kubernetes/ingress.mdx.
+_OWNER_REPLICA_HEADER = "x-openshell-owner"
+_OWNER_REQUEST_HEADER = "x-openshell-want-owner"
+_ROUTE_REPLICA_HEADER = "x-openshell-replica"
 T = TypeVar("T")
 
 
@@ -99,10 +103,60 @@ class Pager(Generic[T]):
         return [item for page in self for item in page.items]
 
 
+class _OwnerCache:
+    """Owner replicas the gateway last reported, keyed by workspace and name.
+
+    An empty owner means the gateway reported none. A stale owner is safe: a
+    live non-owner replica relays the call.
+    """
+
+    _TTL_SECONDS = 30.0
+    _MAX_ENTRIES = 1024
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[str, str], tuple[float, str]] = {}
+
+    def get(self, workspace: str, name: str) -> str | None:
+        with self._lock:
+            entry = self._entries.get((workspace, name))
+        if entry is None or time.monotonic() - entry[0] >= self._TTL_SECONDS:
+            return None
+        return entry[1]
+
+    def put(self, workspace: str, name: str, owner: str) -> None:
+        with self._lock:
+            if len(self._entries) >= self._MAX_ENTRIES:
+                self._entries.clear()
+            self._entries[(workspace, name)] = (time.monotonic(), owner)
+
+    def forget(self, workspace: str, name: str) -> None:
+        with self._lock:
+            self._entries.pop((workspace, name), None)
+
+
+def _retry_unrouted(error: grpc.RpcError) -> bool:
+    """Envoy Gateway answers a replica route with no ready endpoints with
+    UNAVAILABLE and no message; gateway errors always carry one."""
+    status = from_grpc_error(error)
+    details = status.details() or ""
+    return status.code() == grpc.StatusCode.UNAVAILABLE and (
+        details == ""
+        or "no healthy upstream" in details
+        or "connection failure" in details
+    )
+
+
 def _workspace_scope(workspace: str) -> datamodel_pb2.WorkspaceSelector:
     if not workspace:
         raise ValueError("workspace must be non-empty")
     return datamodel_pb2.WorkspaceSelector(workspace=workspace)
+
+
+def _get_sandbox_request(name: str, workspace: str) -> openshell_pb2.GetSandboxRequest:
+    return openshell_pb2.GetSandboxRequest(
+        workspace_scope=_workspace_scope(workspace), name=name
+    )
 
 
 def _all_workspaces_scope() -> datamodel_pb2.WorkspaceSelector:
@@ -626,9 +680,16 @@ class SandboxSession:
             timeout_seconds=timeout_seconds,
         )
 
-    def delete(self, *, allow_missing: bool = False) -> DeletionResult:
+    def delete(
+        self, *, allow_missing: bool = False, timeout_seconds: float | None = None
+    ) -> DeletionResult:
+        # Forward `timeout_seconds` only on opt-in so older clients still work.
+        extra = {} if timeout_seconds is None else {"timeout_seconds": timeout_seconds}
         return self._client.delete(
-            self.sandbox.name, workspace=self._workspace, allow_missing=allow_missing
+            self.sandbox.name,
+            workspace=self._workspace,
+            allow_missing=allow_missing,
+            **extra,
         )
 
     def stop(self) -> SandboxRef:
@@ -637,6 +698,20 @@ class SandboxSession:
 
     def start(self) -> SandboxRef:
         self.sandbox = self._client.start(self.sandbox.name, workspace=self._workspace)
+        return self.sandbox
+
+    def suspend(self) -> SandboxRef:
+        self.sandbox = self._client.suspend(
+            self.sandbox.name, workspace=self._workspace
+        )
+        return self.sandbox
+
+    def resume(self, *, restart_if_restore_fails: bool = False) -> SandboxRef:
+        self.sandbox = self._client.resume(
+            self.sandbox.name,
+            workspace=self._workspace,
+            restart_if_restore_fails=restart_if_restore_fails,
+        )
         return self.sandbox
 
 
@@ -716,6 +791,7 @@ class SandboxClient:
         self._stub = openshell_pb2_grpc.OpenShellStub(
             _error_mapping_channel(self._channel)
         )
+        self._owners = _OwnerCache()
 
     @classmethod
     def from_active_cluster(
@@ -953,10 +1029,7 @@ class SandboxClient:
 
     def get(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
-            openshell_pb2.GetSandboxRequest(
-                workspace_scope=_workspace_scope(workspace),
-                name=name,
-            ),
+            _get_sandbox_request(name, workspace),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
@@ -1072,15 +1145,25 @@ class SandboxClient:
         ]
 
     def delete(
-        self, name: str, *, workspace: str, allow_missing: bool = False
+        self,
+        name: str,
+        *,
+        workspace: str,
+        allow_missing: bool = False,
+        timeout_seconds: float | None = None,
     ) -> DeletionResult:
+        """Delete a sandbox.
+
+        `timeout_seconds` is the gRPC deadline for this call (default: the
+        client timeout).
+        """
         response = self._stub.DeleteSandbox(
             openshell_pb2.DeleteSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
                 name=name,
                 allow_missing=allow_missing,
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout_seconds is None else timeout_seconds,
         )
         return DeletionResult(
             DeletionOutcome(response.outcome), response.sandbox_id or None
@@ -1101,6 +1184,39 @@ class SandboxClient:
             openshell_pb2.StartSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
                 name=name,
+            ),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
+    def suspend(self, name: str, *, workspace: str) -> SandboxRef:
+        """Suspend a ready sandbox, retaining its memory state.
+
+        Requires a compute driver and isolation backend that support suspend
+        and resume.
+        """
+        response = self._stub.SuspendSandbox(
+            openshell_pb2.SuspendSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
+            ),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
+    def resume(
+        self,
+        name: str,
+        *,
+        workspace: str,
+        restart_if_restore_fails: bool = False,
+    ) -> SandboxRef:
+        """Resume a suspended sandbox in a new runtime generation."""
+        response = self._stub.ResumeSandbox(
+            openshell_pb2.ResumeSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
+                restart_if_restore_fails=restart_if_restore_fails,
             ),
             timeout=self._timeout,
         )
@@ -1152,6 +1268,17 @@ class SandboxClient:
             timeout_seconds=timeout_seconds,
         )
 
+    def wait_suspended(
+        self, name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
+        return self._wait_for_phase(
+            name,
+            workspace=workspace,
+            target_phase=openshell_pb2.SANDBOX_PHASE_SUSPENDED,
+            target_name="suspended",
+            timeout_seconds=timeout_seconds,
+        )
+
     def _wait_for_phase(
         self,
         name: str,
@@ -1176,6 +1303,16 @@ class SandboxClient:
                 and sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
             ):
                 raise SandboxError(f"sandbox {name} stopped before becoming ready")
+            if target_phase == openshell_pb2.SANDBOX_PHASE_READY and (
+                sandbox.status.phase
+                in (
+                    openshell_pb2.SANDBOX_PHASE_SUSPENDING,
+                    openshell_pb2.SANDBOX_PHASE_SUSPENDED,
+                )
+            ):
+                raise SandboxError(
+                    f"sandbox {name} is suspended; resume it before waiting for ready"
+                )
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {name} entered error phase")
             time.sleep(1)
@@ -1212,7 +1349,7 @@ class SandboxClient:
         grpc_deadline = self._timeout
         if timeout_seconds and timeout_seconds + 10 > grpc_deadline:
             grpc_deadline = timeout_seconds + 10
-        stream = self._stub.ExecSandbox(request, timeout=grpc_deadline)
+        stream = self._open_exec(request, workspace, grpc_deadline)
 
         stdout_parts: list[bytes] = []
         stderr_parts: list[bytes] = []
@@ -1239,6 +1376,51 @@ class SandboxClient:
             stdout=b"".join(stdout_parts).decode("utf-8", errors="replace"),
             stderr=b"".join(stderr_parts).decode("utf-8", errors="replace"),
         )
+
+    def _owner_of(self, workspace: str, sandbox: str) -> str:
+        """Best effort: a failed lookup leaves the call unrouted."""
+        owner = self._owners.get(workspace, sandbox)
+        if owner is not None:
+            return owner
+        try:
+            _, call = self._stub.GetSandbox.with_call(
+                _get_sandbox_request(sandbox, workspace),
+                timeout=self._timeout,
+                metadata=((_OWNER_REQUEST_HEADER, "1"),),
+            )
+        except grpc.RpcError:
+            return ""
+        value = dict(call.initial_metadata() or ()).get(_OWNER_REPLICA_HEADER)
+        owner = value if isinstance(value, str) else ""
+        self._owners.put(workspace, sandbox, owner)
+        return owner
+
+    def _open_exec(
+        self,
+        request: openshell_pb2.ExecSandboxRequest,
+        workspace: str,
+        timeout: float,
+    ) -> Iterator[openshell_pb2.ExecSandboxEvent]:
+        """Open ExecSandbox on the owner replica, retrying once unrouted."""
+        owner = self._owner_of(workspace, request.sandbox)
+        if owner:
+            events = self._stub.ExecSandbox(
+                request,
+                timeout=timeout,
+                metadata=((_ROUTE_REPLICA_HEADER, owner),),
+            )
+            try:
+                first = next(events, None)
+            except grpc.RpcError as error:
+                if not _retry_unrouted(error):
+                    raise
+                self._owners.forget(workspace, request.sandbox)
+            else:
+                if first is not None:
+                    yield first
+                yield from events
+                return
+        yield from self._stub.ExecSandbox(request, timeout=timeout)
 
     def exec(
         self,
@@ -1586,12 +1768,17 @@ class Sandbox:
         workload_template: str | None = None,
         timeout: float = 30.0,
         ready_timeout_seconds: float = 120.0,
+        delete_timeout_seconds: float | None = None,
         auto_refresh: bool = True,
         write_back: bool = True,
         insecure: bool = False,
         client_credentials: ClientCredentialsAuth | None = None,
     ) -> None:
         """Bind a Sandbox context to the active gateway.
+
+        `delete_timeout_seconds` bounds the delete RPC on exit and defaults to
+        `timeout`. Raise it for drivers that hold the delete open while the
+        workload terminates.
 
         OIDC kwargs (`auto_refresh`, `write_back`, `insecure`, and
         `client_credentials`) forward
@@ -1612,6 +1799,7 @@ class Sandbox:
         self._workload_template = workload_template
         self._timeout = timeout
         self._ready_timeout_seconds = ready_timeout_seconds
+        self._delete_timeout_seconds = delete_timeout_seconds
         self._auto_refresh = auto_refresh
         self._write_back = write_back
         self._insecure = insecure
@@ -1707,7 +1895,9 @@ class Sandbox:
                 and self._session is not None
                 and self._client is not None
             ):
-                result = self._session.delete(allow_missing=True)
+                result = self._session.delete(
+                    allow_missing=True, timeout_seconds=self._delete_timeout_seconds
+                )
                 if result.outcome == DeletionOutcome.ACCEPTED:
                     self._client.wait_deleted(
                         self._session.sandbox.name,

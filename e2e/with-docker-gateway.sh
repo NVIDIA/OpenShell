@@ -114,11 +114,6 @@ GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
 GATEWAY_PID_FILE="${WORKDIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${WORKDIR}/gateway.args"
-DRIVER_BIN=""
-DRIVER_PID=""
-DRIVER_LOG="${WORKDIR}/docker-driver.log"
-DRIVER_SOCKET="${WORKDIR}/compute-driver.sock"
-DRIVER_CONFIG="${WORKDIR}/docker-driver.toml"
 E2E_NAMESPACE=""
 DOCKER_NETWORK_NAME=""
 DOCKER_NETWORK_CONNECTED_CONTAINER=""
@@ -126,6 +121,11 @@ DOCKER_NETWORK_MANAGED=0
 GPU_MODE="${OPENSHELL_E2E_DOCKER_GPU:-0}"
 OIDC_MODE="${OPENSHELL_E2E_OIDC_GATEWAY:-0}"
 OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-}"
+ADDITIONAL_CA_MODE="${OPENSHELL_E2E_ADDITIONAL_CA:-0}"
+ADDITIONAL_CA_SERVER_PID=""
+ADDITIONAL_CA_SERVER_LOG="${WORKDIR}/additional-ca-server.log"
+ADDITIONAL_CA_DIR="${WORKDIR}/additional-ca"
+ADDITIONAL_CA_PORT=""
 
 if [ "${OIDC_MODE}" = "1" ] && [ -z "${OIDC_ISSUER}" ]; then
   echo "ERROR: OPENSHELL_E2E_OIDC_ISSUER is required when OPENSHELL_E2E_OIDC_GATEWAY=1" >&2
@@ -144,7 +144,7 @@ cleanup() {
   local exit_code=$?
 
   e2e_stop_gateway "${GATEWAY_PID}" "${GATEWAY_PID_FILE}"
-  e2e_stop_process "${DRIVER_PID}" "external Docker compute driver"
+  e2e_stop_process "${ADDITIONAL_CA_SERVER_PID}" "additional CA HTTPS fixture"
 
   if [ "${exit_code}" -ne 0 ] \
      && [ -n "${E2E_NAMESPACE}" ] \
@@ -193,10 +193,10 @@ cleanup() {
   fi
 
   e2e_print_gateway_log_on_failure "${exit_code}" "${GATEWAY_LOG}"
-  if [ "${exit_code}" -ne 0 ] && [ -f "${DRIVER_LOG}" ]; then
-    echo "=== external Docker compute driver log ==="
-    cat "${DRIVER_LOG}" || true
-    echo "=== end external Docker compute driver log ==="
+  if [ "${exit_code}" -ne 0 ] && [ -f "${ADDITIONAL_CA_SERVER_LOG}" ]; then
+    echo "=== additional CA HTTPS fixture log ==="
+    cat "${ADDITIONAL_CA_SERVER_LOG}" || true
+    echo "=== end additional CA HTTPS fixture log ==="
   fi
 
   rm -rf "${WORKDIR}" 2>/dev/null || true
@@ -268,6 +268,10 @@ connect_current_container_to_docker_network() {
 }
 
 if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    echo "ERROR: additional CA e2e requires the wrapper-managed Docker gateway." >&2
+    exit 2
+  fi
   case "${OPENSHELL_GATEWAY_ENDPOINT}" in
     http://*) ;;
     https://*)
@@ -520,10 +524,6 @@ ensure_sandbox_image_available() {
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
 export OPENSHELL_BIN="${CLI_BIN}"
-if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
-  e2e_build_external_driver \
-    "${ROOT}" openshell-driver-docker openshell-driver-docker DRIVER_BIN
-fi
 
 SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
 export OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}"
@@ -544,6 +544,15 @@ if ! ensure_sandbox_image_available "${SANDBOX_IMAGE}"; then
   exit 2
 fi
 
+start_additional_ca_fixture() {
+  e2e_start_additional_ca_fixture \
+    "${ADDITIONAL_CA_DIR}" "${ADDITIONAL_CA_SERVER_LOG}" \
+    ADDITIONAL_CA_SERVER_PID ADDITIONAL_CA_PORT
+}
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  start_additional_ca_fixture
+fi
+
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${XDG_STATE_HOME}"
@@ -561,6 +570,10 @@ export OPENSHELL_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 export OPENSHELL_E2E_DRIVER="docker"
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${XDG_STATE_HOME}/openshell/network-supervisor"
+  export OPENSHELL_E2E_GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
+fi
 if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
   echo "Connected CI job container to Docker network ${DOCKER_NETWORK_NAME} (${GATEWAY_HOST_ALIAS_IP})."
   # Container jobs use the host Docker daemon. The host-networked supervisor
@@ -613,48 +626,38 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
       e2e_write_gateway_oidc_config "${OPENSHELL_OIDC_ISSUER}"
     fi
   fi
-  printf '[openshell.drivers.docker]\n'
-  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
-    printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
-  else
-    printf 'allow_driver_config = true\n'
-    printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
-    # Container jobs need their bridge address; host runs exercise discovery.
-    if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
-      printf 'grpc_endpoint = %s\n' "$(toml_string "${GATEWAY_ENDPOINT}")"
-    fi
-    printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
-    printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
-    printf 'enable_bind_mounts = true\n'
-    printf 'sandbox_runtime_image = %s\n' "$(toml_string "${SANDBOX_RUNTIME_IMAGE}")"
-    printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
-    printf '\n[openshell.drivers.docker.resource_admission]\n'
-    printf 'enabled = false\n'
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    printf '[openshell.supervisor.network]\n'
+    printf 'additional_ca_bundle = %s\n\n' \
+      "$(toml_string "${ADDITIONAL_CA_DIR}/ca.crt")"
   fi
-} > "${GATEWAY_CONFIG}"
-
-if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
-  {
-    printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
-    if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
-      printf 'grpc_endpoint = %s\n' "$(toml_string "${GATEWAY_ENDPOINT}")"
+  # Opt-in OTLP export so the otlp_relay e2e can bind a collector stub on
+  # the referenced port. Supervisors connect lazily, so the gateway may
+  # start before the stub exists.
+  if [ -n "${OPENSHELL_E2E_OTLP_ENDPOINT:-}" ]; then
+    printf '[openshell.gateway.otlp]\n'
+    printf 'endpoint = %s\n\n' "$(toml_string "${OPENSHELL_E2E_OTLP_ENDPOINT}")"
+    # The agent trace relay is opt-in; OPENSHELL_E2E_OTLP_AGENT=0 runs the
+    # relay's inert case with trace export still on.
+    if [ "${OPENSHELL_E2E_OTLP_AGENT:-1}" != "0" ]; then
+      printf '[openshell.gateway.otlp.agent]\nenabled = true\n\n'
     fi
-    printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
-    printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
-    printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
-    printf 'enable_bind_mounts = true\n'
-    printf 'sandbox_runtime_image = %s\n' "$(toml_string "${SANDBOX_RUNTIME_IMAGE}")"
-    printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
-  } >"${DRIVER_CONFIG}"
-  "${DRIVER_BIN}" \
-    --bind-socket "${DRIVER_SOCKET}" \
-    --config "${DRIVER_CONFIG}" \
-    --gateway-bind "${GATEWAY_BIND_IP}:${HOST_PORT}" \
-    >"${DRIVER_LOG}" 2>&1 &
-  DRIVER_PID=$!
-  e2e_wait_for_socket \
-    "${DRIVER_SOCKET}" "${DRIVER_PID}" "external Docker compute driver"
-fi
+  fi
+  printf '[openshell.drivers.docker]\n'
+  printf 'allow_driver_config = true\n'
+  printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
+  # Container jobs need their bridge address; host runs exercise discovery.
+  if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
+    printf 'grpc_endpoint = %s\n' "$(toml_string "${GATEWAY_ENDPOINT}")"
+  fi
+  printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
+  printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
+  printf 'enable_bind_mounts = true\n'
+  printf 'sandbox_runtime_image = %s\n' "$(toml_string "${SANDBOX_RUNTIME_IMAGE}")"
+  printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
+  printf '\n[openshell.drivers.docker.resource_admission]\n'
+  printf 'enabled = false\n'
+} > "${GATEWAY_CONFIG}"
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"

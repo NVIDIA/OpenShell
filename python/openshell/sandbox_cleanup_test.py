@@ -3,6 +3,7 @@
 
 """Cleanup status handling through the curated client's real gRPC interceptor."""
 
+import time
 from concurrent import futures
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ def cleanup_client():
     state = SimpleNamespace(
         exists=False,
         code=grpc.StatusCode.NOT_FOUND,
+        delete_delay=0.0,
         calls=[],
         closed=[],
     )
@@ -46,6 +48,7 @@ def cleanup_client():
         assert request.name == "cleanup-test"
         assert request.workspace_scope.workspace == "default"
         assert request.allow_missing
+        time.sleep(state.delete_delay)
         if state.code == grpc.StatusCode.NOT_FOUND:
             return openshell_pb2.DeleteSandboxResponse(
                 outcome=openshell_pb2.DELETION_OUTCOME_ALREADY_ABSENT
@@ -152,6 +155,44 @@ def test_context_cleanup_handles_absence_and_intercepted_errors(
         state.exists = False
     if caught is not None:
         assert_original_call(caught.value, code)
+    assert state.calls == ["GetSandbox", "GetSandbox", "DeleteSandbox"]
+    assert state.closed == [True]
+    assert managed._client is None
+    assert managed._session is None
+
+
+@pytest.mark.parametrize(
+    ("client_timeout", "delete_timeout_seconds", "expect_deadline"),
+    [(0.2, None, True), (0.2, 5, False), (5, 0.2, True)],
+)
+def test_context_cleanup_delete_timeout_is_opt_in(
+    cleanup_client,
+    monkeypatch,
+    client_timeout,
+    delete_timeout_seconds,
+    expect_deadline,
+):
+    client, state = cleanup_client
+    state.exists = True
+    state.delete_delay = 0.5
+    monkeypatch.setattr(
+        SandboxClient,
+        "from_active_cluster",
+        classmethod(lambda _cls, **_kwargs: client),
+    )
+
+    managed = Sandbox(
+        workspace="default",
+        sandbox="cleanup-test",
+        delete_timeout_seconds=delete_timeout_seconds,
+    )
+    expected = pytest.raises(GatewayError) if expect_deadline else nullcontext()
+    with expected as caught, managed:
+        # Only the exit delete runs under the short deadline.
+        client._timeout = client_timeout
+        state.exists = False
+    if caught is not None:
+        assert caught.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
     assert state.calls == ["GetSandbox", "GetSandbox", "DeleteSandbox"]
     assert state.closed == [True]
     assert managed._client is None

@@ -23,6 +23,7 @@ fn ctx() -> EventContext {
         sandbox_id: "sb-7f3a9c2e14b8".to_string(),
         sandbox_name: "agent-workspace-01".to_string(),
         container_image: "nvcr.io/nvidia/base/ubuntu:24.04".to_string(),
+        container_image_uid: None,
         hostname: "openshell-sb-7f3a9c2e14b8".to_string(),
         product_version: "0.42.1".to_string(),
         proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -127,6 +128,7 @@ fn process_activity_round_trips() {
                 .with_cmd_line("python3 -m pytest")
                 .with_parent(Process::new("/bin/sh", 4701)),
         )
+        .actor_process(Process::new("openshell-sandbox", 4700))
         .launch_type(LaunchTypeId::Other)
         .exit_code(0)
         .severity(SeverityId::Informational)

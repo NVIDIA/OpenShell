@@ -18,6 +18,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=tasks/scripts/gateway-pull-policy.sh
 source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
+# shellcheck source=tasks/scripts/gateway-toml.sh
+source "${ROOT}/tasks/scripts/gateway-toml.sh"
 GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
 
 usage() {
@@ -41,6 +43,9 @@ Environment:
                           or ::1 for Podman Machine on macOS.
   OPENSHELL_SERVER_PORT   Gateway port. Defaults to 8080 for Kubernetes,
                           18080 for Podman/Docker, and 18081 for VM.
+  OPENSHELL_DEV_OTLP_ENDPOINT
+                          OTLP collector for trace export, OCSF log export,
+                          and the agent trace relay. Unset disables export.
 Docker, Podman, and VM runs delegate to their gateway:<driver> setup scripts.
 EOF
 }
@@ -262,12 +267,6 @@ name = "${GATEWAY_NAME}"
 compute_driver = "${DRIVER}"
 disable_tls = true
 
-[openshell.gateway.otlp]
-endpoint = "http://127.0.0.1:4317"
-
-[openshell.gateway.otlp.ocsf]
-enabled = true
-
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
 
@@ -289,6 +288,8 @@ EOF
 if [[ -n "${GRPC_ENDPOINT}" ]]; then
   printf 'grpc_endpoint = "%s"\n' "${GRPC_ENDPOINT}" >>"${CONFIG_PATH}"
 fi
+
+append_dev_otlp_config "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"

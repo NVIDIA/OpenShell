@@ -1,0 +1,45 @@
+{
+    "attributes": {
+        "name": {
+            "type": "string_t",
+            "description": "The Tactic name that is associated with the attack technique. For example: <code>Reconnaissance</code> or <code>ML Model Access</code>.",
+            "requirement": "recommended",
+            "caption": "Name",
+            "type_name": "String"
+        },
+        "uid": {
+            "type": "string_t",
+            "description": "The Tactic ID that is associated with the attack technique. For example: <code>TA0043</code>, or <code>AML.TA0000</code>.",
+            "requirement": "recommended",
+            "caption": "Unique ID",
+            "type_name": "String"
+        },
+        "src_url": {
+            "type": "url_t",
+            "description": "The versioned permalink of the Tactic. For example: <code>https://attack.mitre.org/versions/v14/tactics/TA0043/</code>.",
+            "requirement": "optional",
+            "caption": "Source URL",
+            "type_name": "URL String"
+        }
+    },
+    "name": "tactic",
+    "description": "The MITRE Tactic object describes the ATT&CK\u00ae or ATLAS\u2122 Tactic ID and/or name that is associated to an attack.",
+    "extends": "_entity",
+    "constraints": {
+        "at_least_one": [
+            "name",
+            "uid"
+        ]
+    },
+    "references": [
+        {
+            "description": "ATT&CK\u00ae Matrix",
+            "url": "https://attack.mitre.org"
+        },
+        {
+            "description": "ATLAS\u2122 Matrix",
+            "url": "https://atlas.mitre.org/matrices/ATLAS"
+        }
+    ],
+    "caption": "MITRE Tactic"
+}

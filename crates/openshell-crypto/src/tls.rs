@@ -53,34 +53,80 @@ pub fn configuration_provider() -> Arc<CryptoProvider> {
     }
 }
 
-/// Client builder using the same provider as key loading and custom verifiers.
+/// Fallible client builder using the same provider as key loading and verifiers.
+///
+/// Returns a configuration error if the selected provider has no usable cipher
+/// suites or key-exchange groups. Does not change providers or protocol policy.
+pub fn try_client_builder()
+-> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, rustls::Error> {
+    try_client_builder_with_protocol_versions(rustls::DEFAULT_VERSIONS)
+}
+
+/// Fallible client builder preserving an explicit protocol-version policy.
+pub fn try_client_builder_with_protocol_versions(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, rustls::Error> {
+    rustls::ClientConfig::builder_with_provider(configuration_provider())
+        .with_protocol_versions(versions)
+}
+
+/// Fallible server builder using the selected configuration provider.
+///
+/// Returns a configuration error if the selected provider has no usable cipher
+/// suites or key-exchange groups. Does not change providers or protocol policy.
+pub fn try_server_builder()
+-> Result<rustls::ConfigBuilder<rustls::ServerConfig, rustls::WantsVerifier>, rustls::Error> {
+    try_server_builder_with_protocol_versions(rustls::DEFAULT_VERSIONS)
+}
+
+/// Fallible server builder preserving an explicit protocol-version policy.
+pub fn try_server_builder_with_protocol_versions(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> Result<rustls::ConfigBuilder<rustls::ServerConfig, rustls::WantsVerifier>, rustls::Error> {
+    rustls::ServerConfig::builder_with_provider(configuration_provider())
+        .with_protocol_versions(versions)
+}
+
+/// Compatibility client builder. Use [`try_client_builder`] in runtime code.
+///
+/// # Panics
+/// Panics if the selected provider cannot support the default protocol versions.
 #[must_use]
 pub fn client_builder() -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
     client_builder_with_protocol_versions(rustls::DEFAULT_VERSIONS)
 }
 
-/// Client builder preserving an explicit protocol-version policy.
+/// Compatibility client builder preserving an explicit protocol-version policy.
+/// Prefer [`try_client_builder_with_protocol_versions`] in runtime code.
+///
+/// # Panics
+/// Panics if the selected provider cannot support the requested protocol versions.
 #[must_use]
 pub fn client_builder_with_protocol_versions(
     versions: &[&'static rustls::SupportedProtocolVersion],
 ) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
-    rustls::ClientConfig::builder_with_provider(configuration_provider())
-        .with_protocol_versions(versions)
+    try_client_builder_with_protocol_versions(versions)
         .expect("selected TLS provider must support the requested protocol versions")
 }
 
-/// Server builder using the selected configuration provider.
+/// Compatibility server builder. Use [`try_server_builder`] in runtime code.
+///
+/// # Panics
+/// Panics if the selected provider cannot support the default protocol versions.
 #[must_use]
 pub fn server_builder() -> rustls::ConfigBuilder<rustls::ServerConfig, rustls::WantsVerifier> {
     server_builder_with_protocol_versions(rustls::DEFAULT_VERSIONS)
 }
 
-/// Server builder preserving an explicit protocol-version policy.
+/// Compatibility server builder preserving an explicit protocol-version policy.
+/// Prefer [`try_server_builder_with_protocol_versions`] in runtime code.
+///
+/// # Panics
+/// Panics if the selected provider cannot support the requested protocol versions.
 #[must_use]
 pub fn server_builder_with_protocol_versions(
     versions: &[&'static rustls::SupportedProtocolVersion],
 ) -> rustls::ConfigBuilder<rustls::ServerConfig, rustls::WantsVerifier> {
-    rustls::ServerConfig::builder_with_provider(configuration_provider())
-        .with_protocol_versions(versions)
+    try_server_builder_with_protocol_versions(versions)
         .expect("selected TLS provider must support the requested protocol versions")
 }

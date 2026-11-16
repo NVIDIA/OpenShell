@@ -135,6 +135,7 @@ impl NetworkPeer {
                         snapshot: SessionSnapshotWire {
                             generation: "test-generation".into(),
                             processes: Vec::new(),
+                            bound_policy: None,
                         },
                     }
                 }
@@ -345,6 +346,8 @@ impl Fixture {
                 .call_idempotent(Request::Attach {
                     supervisor_instance_id: client.supervisor_instance_id,
                     policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+                    supervisor_takeover: None,
+                    supervisor_recovery_timeout_secs: None,
                 })
                 .await
                 .unwrap();

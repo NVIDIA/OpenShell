@@ -34,12 +34,19 @@ use std::time::Duration;
 use tokio::net::UnixListener;
 use tracing::warn;
 
+/// OCSF destination endpoint for events about this supervisor's SSH server,
+/// which listens on a Unix socket rather than a network address.
+fn ssh_server_endpoint(listen_path: &Path) -> openshell_ocsf::Endpoint {
+    openshell_ocsf::Endpoint::local_service("ssh", Some(&listen_path.display().to_string()))
+}
+
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 const MAIN_DETACH_PREFIX: u8 = 0x10;
 const MAIN_DETACH_KEY: u8 = 0x11;
 const MAIN_DETACH_EOF: u8 = 0x04;
 const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const SSH_PEER_TIMEOUT: Duration = Duration::from_mins(1);
+const STARTUP_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_millis(50);
 
 mod peer_stream;
 
@@ -146,6 +153,7 @@ fn ssh_server_init(
 
     ocsf_emit!(
         SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .dst_endpoint(ssh_server_endpoint(listen_path))
             .activity(ActivityId::Listen)
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
@@ -183,6 +191,7 @@ pub async fn run_ssh_server(
             }
         };
 
+    let server_endpoint = Arc::new(ssh_server_endpoint(&listen_path));
     let mut consecutive_resource_errors = 0;
     let mut consecutive_unknown_errors = 0;
     loop {
@@ -194,6 +203,7 @@ pub async fn run_ssh_server(
                 let port_forward = port_forward.clone();
                 let boundary_exec = boundary_exec.clone();
                 let main_session = main_session.clone();
+                let server_endpoint = server_endpoint.clone();
 
                 tokio::spawn(async move {
                     if let Err(err) = handle_connection(
@@ -202,12 +212,14 @@ pub async fn run_ssh_server(
                         port_forward,
                         boundary_exec,
                         main_session,
+                        server_endpoint.clone(),
                         SSH_PEER_TIMEOUT,
                     )
                     .await
                     {
                         ocsf_emit!(
                             SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                .dst_endpoint((*server_endpoint).clone())
                                 .activity(ActivityId::Fail)
                                 .severity(SeverityId::Low)
                                 .status(StatusId::Failure)
@@ -228,6 +240,7 @@ pub async fn run_ssh_server(
                 SshAcceptAction::Retry { backoff, severity } => {
                     ocsf_emit!(
                         SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .dst_endpoint((*server_endpoint).clone())
                             .activity(ActivityId::Fail)
                             .severity(severity)
                             .status(StatusId::Failure)
@@ -343,6 +356,7 @@ async fn handle_connection(
     port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
     boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
+    server_endpoint: Arc<openshell_ocsf::Endpoint>,
     peer_timeout: Duration,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
@@ -350,6 +364,7 @@ async fn handle_connection(
     // gateway's RelayStream directly into this socket.
     ocsf_emit!(
         SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .dst_endpoint((*server_endpoint).clone())
             .activity(ActivityId::Open)
             .action(ActionId::Allowed)
             .disposition(DispositionId::Allowed)
@@ -359,7 +374,7 @@ async fn handle_connection(
             .build()
     );
 
-    let handler = SshHandler::new(port_forward, boundary_exec, main_session);
+    let handler = SshHandler::new(port_forward, boundary_exec, main_session, server_endpoint);
     let stream = peer_stream::PeerStream::new(stream, peer_timeout);
     russh::server::run_stream(config, stream, handler)
         .await
@@ -378,6 +393,7 @@ async fn handle_connection(
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct ChannelState {
+    output: Option<russh::ChannelWriteHalf<russh::server::Msg>>,
     upload: Option<upload::Upload>,
     command_started: bool,
     input_sender: Option<InputSender>,
@@ -425,6 +441,8 @@ struct SshHandler {
     port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
     boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
+    /// This server's endpoint, named on every SSH event it emits.
+    server_endpoint: Arc<openshell_ocsf::Endpoint>,
     channels: HashMap<ChannelId, ChannelState>,
 }
 
@@ -452,11 +470,13 @@ impl SshHandler {
         port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
         boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
         main_session: Option<Arc<MainSession>>,
+        server_endpoint: Arc<openshell_ocsf::Endpoint>,
     ) -> Self {
         Self {
             port_forward,
             boundary_exec,
             main_session,
+            server_endpoint,
             channels: HashMap::new(),
         }
     }
@@ -472,7 +492,7 @@ impl russh::server::Handler for SshHandler {
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        _public_key: &russh::keys::PublicKey,
+        _public_key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         Ok(Auth::Accept)
     }
@@ -483,7 +503,15 @@ impl russh::server::Handler for SshHandler {
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.channels.insert(channel.id(), ChannelState::default());
+        let id = channel.id();
+        let (_, output) = channel.split();
+        self.channels.insert(
+            id,
+            ChannelState {
+                output: Some(output),
+                ..Default::default()
+            },
+        );
         reply.accept().await;
         Ok(())
     }
@@ -535,6 +563,7 @@ impl russh::server::Handler for SshHandler {
         // check, port 65537 truncates to port 1 (privileged).
         if port_to_connect > u32::from(u16::MAX) {
             ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .dst_endpoint((*self.server_endpoint).clone())
                 .activity(ActivityId::Refuse)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Blocked)
@@ -552,6 +581,7 @@ impl russh::server::Handler for SshHandler {
         let target = direct_tcpip_target(host_to_connect, port_to_connect);
         if target.is_none() {
             ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .dst_endpoint((*self.server_endpoint).clone())
                 .activity(ActivityId::Refuse)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Blocked)
@@ -572,6 +602,7 @@ impl russh::server::Handler for SshHandler {
         let port = u16::try_from(port_to_connect).expect("port range checked above");
         let target = target.expect("loopback target checked above");
         let port_forward = self.port_forward.clone();
+        let server_endpoint = self.server_endpoint.clone();
         reply.accept().await;
 
         tokio::spawn(async move {
@@ -580,6 +611,7 @@ impl russh::server::Handler for SshHandler {
                 Err(err) => {
                     ocsf_emit!(
                         SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .dst_endpoint((*server_endpoint).clone())
                             .activity(ActivityId::Fail)
                             .severity(SeverityId::Low)
                             .status(StatusId::Failure)
@@ -665,11 +697,9 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if self
-            .channels
-            .get(&channel)
-            .is_some_and(|state| state.upload.is_some() || state.command_started)
-        {
+        if self.channels.get(&channel).is_some_and(|state| {
+            state.upload.is_some() || state.command_started || state.main_attached
+        }) {
             session.channel_failure(channel)?;
             return Ok(());
         }
@@ -679,11 +709,15 @@ impl russh::server::Handler for SshHandler {
         // endings.  Forcing a PTY here caused CRLF translation which made
         // VS Code misdetect the platform as Windows (and then try to run
         // `powershell`).
+        let terminal = self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.pty_request.is_some());
         match self.start_shell(channel, session.handle(), None).await {
             Ok(()) => session.channel_success(channel)?,
             Err(error) => {
                 warn!(%error, ?channel, "failed to start boundary shell");
-                session.channel_failure(channel)?;
+                self.finish_failed_start(channel, session, &error, terminal)?;
             }
         }
         Ok(())
@@ -695,11 +729,9 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if self
-            .channels
-            .get(&channel)
-            .is_some_and(|state| state.upload.is_some() || state.command_started)
-        {
+        if self.channels.get(&channel).is_some_and(|state| {
+            state.upload.is_some() || state.command_started || state.main_attached
+        }) {
             session.channel_failure(channel)?;
             return Ok(());
         }
@@ -708,6 +740,10 @@ impl russh::server::Handler for SshHandler {
             session.channel_success(channel)?;
             return Ok(());
         }
+        let terminal = self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.pty_request.is_some());
         match self
             .start_shell(channel, session.handle(), Some(command))
             .await
@@ -715,7 +751,7 @@ impl russh::server::Handler for SshHandler {
             Ok(()) => session.channel_success(channel)?,
             Err(error) => {
                 warn!(%error, ?channel, "failed to start boundary exec");
-                session.channel_failure(channel)?;
+                self.finish_failed_start(channel, session, &error, terminal)?;
             }
         }
         Ok(())
@@ -883,6 +919,7 @@ impl russh::server::Handler for SshHandler {
         } else {
             ocsf_emit!(
                 SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .dst_endpoint((*self.server_endpoint).clone())
                     .activity(ActivityId::Refuse)
                     .action(ActionId::Denied)
                     .disposition(DispositionId::Rejected)
@@ -1214,6 +1251,56 @@ impl SshHandler {
         Ok(())
     }
 
+    /// Complete an accepted command request whose boundary process cannot start.
+    /// Request failure alone leaves clients waiting for command output or exit.
+    fn finish_failed_start(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+        error: &anyhow::Error,
+        terminal: bool,
+    ) -> anyhow::Result<()> {
+        let mut output = None;
+        if let Some(mut state) = self.channels.remove(&channel) {
+            output = state.output.take();
+            state.input_task.take();
+            // A PTY resize can fail after spawning. Release that process too.
+            if let Some(process) = state.process.take() {
+                tokio::spawn(async move {
+                    if let Err(error) = process.terminate().await {
+                        warn!(%error, "failed to terminate exec after startup failure");
+                    }
+                });
+            }
+        }
+        let line_ending = if terminal { "\r\n" } else { "\n" };
+        session.channel_success(channel)?;
+        if let Some(output) = output {
+            let diagnostic =
+                format!("openshell: cannot start command: {error}{line_ending}").into_bytes();
+            tokio::spawn(async move {
+                // Reserve client credit before queueing bytes. Session output
+                // would buffer stderr without credit and block closure and
+                // Handle messages for every channel on this connection.
+                let _ = tokio::time::timeout(
+                    STARTUP_DIAGNOSTIC_TIMEOUT,
+                    output.extended_data_bytes(1, diagnostic),
+                )
+                .await;
+                // Diagnostics may be partial or absent; terminal messages
+                // must still be sent when the peer withholds output credit.
+                let _ = output.exit_status(1).await;
+                let _ = output.eof().await;
+                let _ = output.close().await;
+            });
+        } else {
+            session.exit_status_request(channel, 1)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+        }
+        Ok(())
+    }
+
     async fn start_shell(
         &mut self,
         channel: ChannelId,
@@ -1541,6 +1628,26 @@ fn direct_tcpip_target(
 mod tests {
     use super::*;
 
+    #[test]
+    fn ssh_events_name_their_own_server_socket_and_conform_to_ocsf() {
+        // A shared supervisor runs one SSH server per sandbox; each server's
+        // events must name its own socket.
+        for socket in ["/run/openshell/a/ssh.sock", "/run/openshell/b/ssh.sock"] {
+            let event = SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .dst_endpoint(ssh_server_endpoint(Path::new(socket)))
+                .activity(ActivityId::Open)
+                .action(ActionId::Allowed)
+                .message("SSH connection accepted on supervisor Unix socket")
+                .build();
+            let json = event.to_json().unwrap();
+            assert_eq!(
+                json["dst_endpoint"],
+                serde_json::json!({"name": socket, "svc_name": "ssh"})
+            );
+            openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+
     pub(super) struct AcceptAnyServerKey;
 
     struct PinnedServerKey(String);
@@ -1589,14 +1696,17 @@ mod tests {
             let socket = temp.path().join("ssh.sock");
             let (listener, config, _) =
                 ssh_server_init(&socket, &None, false, key.clone()).unwrap();
+            let server_endpoint = Arc::new(ssh_server_endpoint(&socket));
             let server = tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     let config = config.clone();
+                    let server_endpoint = server_endpoint.clone();
                     tokio::spawn(async move {
                         let handler = SshHandler::new(
                             rpc_test::loopback(Arc::new(TestLoopbackConnector)),
                             rpc_test::exec(Arc::new(RejectingExec)),
                             None,
+                            server_endpoint,
                         );
                         if let Ok(session) =
                             russh::server::run_stream(config, stream, handler).await
@@ -1669,13 +1779,14 @@ mod tests {
             openshell_isolation_interface::contract::BoundaryDuplexStream,
             openshell_isolation_interface::contract::BackendError,
         > {
-            let stream = tokio::net::TcpStream::connect((target.host(), target.port()))
-                .await
-                .map_err(|error| {
-                    openshell_isolation_interface::contract::BackendError::Process(
-                        error.to_string(),
-                    )
-                })?;
+            let stream = openshell_core::net::connect_tcp_nodelay_best_effort((
+                target.host(),
+                target.port(),
+            ))
+            .await
+            .map_err(|error| {
+                openshell_isolation_interface::contract::BackendError::Process(error.to_string())
+            })?;
             Ok(Box::new(stream))
         }
     }
@@ -1733,6 +1844,9 @@ mod tests {
             rpc_test::loopback(Arc::new(TestLoopbackConnector)),
             boundary_exec,
             main_session,
+            Arc::new(ssh_server_endpoint(Path::new(
+                "/run/openshell/test/ssh.sock",
+            ))),
         );
         let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
@@ -1918,6 +2032,125 @@ mod tests {
             next_main_event(&mut channel).await,
             russh::ChannelMsg::Close
         ));
+    }
+
+    async fn assert_boundary_start_failure(shell: bool, terminal: bool) {
+        let client = authenticated_test_client().await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        if terminal {
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_main_event(&mut channel).await,
+                russh::ChannelMsg::Success
+            ));
+        }
+        if shell {
+            channel.request_shell(true).await.unwrap();
+        } else {
+            channel.exec(true, "true").await.unwrap();
+        }
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        match next_main_event(&mut channel).await {
+            russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                let message = String::from_utf8_lossy(&data);
+                assert!(
+                    message.starts_with("openshell: cannot start command: "),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("exec is not used by direct-tcpip tests"),
+                    "{message}"
+                );
+                assert!(message.ends_with(if terminal { "\r\n" } else { "\n" }));
+            }
+            event => panic!("expected startup diagnostic on stderr, got {event:?}"),
+        }
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::ExitStatus { exit_status: 1 }
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Eof
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Close
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), channel.wait())
+                .await
+                .expect("failed command channel must close")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn boundary_exec_start_failure_reports_error_and_closes_channel() {
+        for terminal in [false, true] {
+            assert_boundary_start_failure(false, terminal).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_shell_start_failure_reports_error_and_closes_channel() {
+        for terminal in [false, true] {
+            assert_boundary_start_failure(true, terminal).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn main_attachment_rejects_extra_commands_without_losing_input_lease() {
+        for shell in [false, true] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (main, mut input) = MainSession::inert_with_input();
+                let client = main_test_client(Some(main.clone())).await;
+                let mut attached = client.channel_open_session().await.unwrap();
+                attached
+                    .request_subsystem(true, "openshell-main")
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    next_main_event(&mut attached).await,
+                    russh::ChannelMsg::Success
+                ));
+                if shell {
+                    attached.request_shell(true).await.unwrap();
+                } else {
+                    attached.exec(true, "extra").await.unwrap();
+                }
+                assert!(matches!(
+                    next_main_event(&mut attached).await,
+                    russh::ChannelMsg::Failure
+                ));
+                attached.data(&b"still attached"[..]).await.unwrap();
+                assert_eq!(input.recv().await.unwrap(), b"still attached");
+                attached.close().await.unwrap();
+                // Processing a new channel follows the previous close on the
+                // wire, so the old owner's lease must already be released.
+                let mut fresh = client.channel_open_session().await.unwrap();
+                fresh
+                    .request_subsystem(true, "openshell-main")
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    next_main_event(&mut fresh).await,
+                    russh::ChannelMsg::Success
+                ));
+                fresh.data(&b"new owner"[..]).await.unwrap();
+                assert_eq!(input.recv().await.unwrap(), b"new owner");
+                assert!(!main.finished());
+                fresh.close().await.unwrap();
+            })
+            .await
+            .expect("extra command stranded main attachment or input lease");
+        }
     }
 
     #[tokio::test]

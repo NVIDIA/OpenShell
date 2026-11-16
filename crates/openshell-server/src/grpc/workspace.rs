@@ -68,8 +68,8 @@ fn membership_filter_subject<'a>(
             }
         }
         Principal::Sandbox(_) | Principal::Operator(_) => Ok(None),
-        Principal::Peer(_) => Err(Status::permission_denied(
-            "gateway peer principals cannot list workspaces",
+        Principal::Peer(_) | Principal::Supervisor(_) => Err(Status::permission_denied(
+            "gateway peer and supervisor principals cannot list workspaces",
         )),
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
@@ -130,7 +130,7 @@ pub async fn resolve_workspace(
     let ws: Option<Workspace> = store
         .get_message_by_name("", &name)
         .await
-        .map_err(|e| Status::internal(format!("workspace lookup failed: {e}")))?;
+        .map_err(|e| super::persistence_error_to_status(e, "workspace lookup"))?;
 
     match ws {
         Some(ws) => {

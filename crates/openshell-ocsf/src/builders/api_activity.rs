@@ -3,8 +3,8 @@
 
 //! Builder for API Activity [6003] events.
 
-use crate::builders::{EventContext, EventOrigin};
-use crate::enums::{ActionId, DispositionId, SeverityId, StatusId};
+use crate::builders::{ContextRef, EventOrigin};
+use crate::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{ApiActivityEvent, OcsfEvent};
 use crate::objects::{
@@ -28,7 +28,8 @@ fn sanitize_model_name(name: &str) -> String {
 
 /// Builder for API Activity [6003] events.
 pub struct ApiActivityBuilder<'a> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
+    activity: ActivityId,
     severity: SeverityId,
     status: Option<StatusId>,
     message: Option<String>,
@@ -49,9 +50,10 @@ pub struct ApiActivityBuilder<'a> {
 
 impl<'a> ApiActivityBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a EventContext, operation: impl Into<String>) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>, operation: impl Into<String>) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
+            activity: ActivityId::Other,
             severity: SeverityId::Informational,
             status: None,
             message: None,
@@ -166,10 +168,10 @@ impl<'a> ApiActivityBuilder<'a> {
 
     #[must_use]
     pub fn build(self) -> OcsfEvent {
-        // Gateway events carry a container only when they concern a sandbox.
+        // Only supervisors describe a container on the producing device.
         let mut profiles: Vec<&str> = match self.ctx.origin {
-            EventOrigin::Gateway { .. } if self.ctx.container().is_none() => vec!["host"],
-            _ => vec!["container", "host"],
+            EventOrigin::Gateway { .. } => vec!["host"],
+            EventOrigin::Supervisor => vec!["container", "host"],
         };
         if self.action.is_some() {
             profiles.push("security_control");
@@ -184,8 +186,8 @@ impl<'a> ApiActivityBuilder<'a> {
             "API Activity",
             6,
             "Application Activity",
-            99,
-            "Other",
+            self.activity.as_u8(),
+            self.activity.api_label(),
             self.severity,
             metadata,
         );
@@ -223,18 +225,15 @@ impl<'a> ApiActivityBuilder<'a> {
     }
 }
 
+impl_activity_setter!(ApiActivityBuilder);
 impl_action_disposition_setters!(ApiActivityBuilder);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::builders::{test_gateway_context, test_sandbox_context};
-    use crate::enums::{HttpMethod, UserTypeId};
+    use crate::enums::{ActivityId, HttpMethod, UserTypeId};
     use crate::objects::Url;
-    use crate::validation::schema::{
-        load_class_schema, load_object_schema, validate_enum_value, validate_known_fields,
-        validate_required_fields,
-    };
 
     fn gateway_denial() -> serde_json::Value {
         let ctx = test_gateway_context();
@@ -261,41 +260,8 @@ mod tests {
 
     #[test]
     fn gateway_denial_matches_vendored_schema() {
-        let json = gateway_denial();
-
-        let class = load_class_schema("api_activity");
-        validate_required_fields(&json, &class);
-        validate_known_fields(&json, &class);
-        for field in [
-            "activity_id",
-            "action_id",
-            "disposition_id",
-            "severity_id",
-            "status_id",
-        ] {
-            validate_enum_value(&json, field, &class);
-        }
-
-        let actor = load_object_schema("actor");
-        validate_required_fields(&json["actor"], &actor);
-        validate_known_fields(&json["actor"], &actor);
-        let user = load_object_schema("user");
-        validate_required_fields(&json["actor"]["user"], &user);
-        validate_known_fields(&json["actor"]["user"], &user);
-
-        let api = load_object_schema("api");
-        validate_required_fields(&json["api"], &api);
-        validate_known_fields(&json["api"], &api);
-        let service = load_object_schema("service");
-        validate_required_fields(&json["api"]["service"], &service);
-
-        let resource = load_object_schema("resource_details");
-        validate_required_fields(&json["resources"][0], &resource);
-        validate_known_fields(&json["resources"][0], &resource);
-
-        let metadata = load_object_schema("metadata");
-        validate_required_fields(&json["metadata"], &metadata);
-        validate_known_fields(&json["metadata"], &metadata);
+        openshell_ocsf_validate::validate_event(&gateway_denial())
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]
@@ -333,6 +299,29 @@ mod tests {
             serde_json::json!(["host", "security_control"])
         );
         assert!(json.get("container").is_none());
+    }
+
+    #[test]
+    fn activity_names_the_api_operation_kind() {
+        let ctx = test_gateway_context();
+        for (activity, id, name) in [
+            (ActivityId::Open, 1, "Create"),
+            (ActivityId::Close, 2, "Read"),
+            (ActivityId::Reset, 3, "Update"),
+            (ActivityId::Fail, 4, "Delete"),
+            (ActivityId::Other, 99, "Other"),
+        ] {
+            let json = ApiActivityBuilder::new(&ctx, "DeleteSandbox")
+                .activity(activity)
+                .build()
+                .to_json()
+                .unwrap();
+
+            assert_eq!(json["activity_id"], id, "{name}");
+            assert_eq!(json["activity_name"], name);
+            assert_eq!(json["type_uid"], 600_300 + id, "{name}");
+            openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
+        }
     }
 
     #[test]

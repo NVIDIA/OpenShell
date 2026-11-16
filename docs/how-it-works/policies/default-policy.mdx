@@ -93,12 +93,16 @@ additional paths when the corresponding GPU device is present:
 | Access | Paths |
 |---|---|
 | Read-only | `/run/nvidia-persistenced`, `/usr/lib/wsl` |
-| Read-write | `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset`, `/dev/dxg`, numbered `/dev/nvidia<N>` device nodes, and `/proc` |
+| Read-write | `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset`, `/dev/dxg`, numbered `/dev/nvidia<N>` device nodes |
 
-CUDA writes thread names under `/proc` during initialization, so GPU enrichment
-moves `/proc` from read-only to read-write. OpenShell adds each path only when
-it exists in the workload. These paths apply at runtime and are not saved in
-the sandbox's policy.
+OpenShell adds each path only when it exists in the workload. These paths apply
+at runtime and are not saved in the sandbox's policy. GPU enrichment does not
+change the filesystem policy's access to `/proc`.
+
+CUDA can write thread names during initialization through the runtime's narrow
+`/proc` exception. The runtime brokers supported `comm` writes only for threads
+in the calling process's own thread group. This exception also applies without
+a GPU and does not grant general write access to `/proc`.
 
 ### Protected Paths
 

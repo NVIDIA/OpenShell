@@ -34,7 +34,8 @@ pub fn clone_current_event() -> Option<OcsfEvent> {
 /// as human-readable shorthand and structured JSONL for their configured sinks.
 ///
 /// Both layers receive the event — `clone_current_event()` is non-consuming.
-pub fn emit_ocsf_event(event: OcsfEvent) {
+pub fn emit_ocsf_event(mut event: OcsfEvent) {
+    crate::trace::enrich(&mut event);
     // Store the event in thread-local so layers can access it
     set_current_event(event);
 
@@ -81,7 +82,8 @@ pub fn clear_current_event() {
 /// bare `emit_ocsf_event`, but the gateway hosts many sandboxes, so it stamps a
 /// per-event `sandbox_id` field here instead. One tracing event feeds both the
 /// JSONL audit file and the routing bus.
-pub fn emit_ocsf_event_routed(sandbox_id: &str, event: OcsfEvent) {
+pub fn emit_ocsf_event_routed(sandbox_id: &str, mut event: OcsfEvent) {
+    crate::trace::enrich(&mut event);
     let message = event.format_shorthand();
     set_current_event(event);
     tracing::info!(target: "ocsf", sandbox_id = %sandbox_id, message = %message);

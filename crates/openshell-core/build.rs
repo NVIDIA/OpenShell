@@ -35,10 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Docker/CI builds where .git is absent, this silently does nothing and
     // the binary falls back to CARGO_PKG_VERSION (which is already sed-patched
     // by the build pipeline).
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs/tags");
-    println!("cargo:rerun-if-changed=../../.git/packed-refs");
+    for path in git_rerun_paths() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 
     if let Some(version) = git_version() {
         println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");
@@ -74,6 +73,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure tonic/prost protobuf code generation.
     tonic_prost_build::configure()
         .btree_map(".openshell.sandbox.protocol.v1")
+        .type_attribute(
+            ".openshell.sandbox.v1.SupervisorMiddlewareBinding",
+            r#"#[derive(serde::Serialize, serde::Deserialize)] #[serde(rename_all = "snake_case")]"#,
+        )
         .build_server(true)
         .build_client(true)
         .include_file("openshell.rs")
@@ -100,6 +103,36 @@ fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()
         }
     }
     Ok(())
+}
+
+/// Git metadata files whose changes affect [`git_version`].
+///
+/// In a linked worktree `.git` is a file, so `HEAD` and `logs/HEAD` live in the
+/// per-worktree git dir while branch and tag refs live in the common git dir. Cargo treats a
+/// missing `rerun-if-changed` path as always stale, so only existing paths are
+/// returned. Without git metadata nothing is returned.
+fn git_rerun_paths() -> Vec<PathBuf> {
+    let resolve = |args: &[&str]| {
+        let dir = PathBuf::from(git_output(args)?);
+        // Relative output is relative to the build script's working directory.
+        Some(env::current_dir().ok()?.join(dir))
+    };
+    let mut paths = Vec::new();
+    if let Some(git_dir) = resolve(&["rev-parse", "--git-dir"]) {
+        paths.push(git_dir.join("HEAD"));
+        paths.push(git_dir.join("logs/HEAD"));
+    }
+    if let Some(common_dir) = resolve(&["rev-parse", "--git-common-dir"]) {
+        paths.push(common_dir.join("refs/tags"));
+        paths.push(common_dir.join("packed-refs"));
+        // A new worktree has no `logs/HEAD` until its first ref update, so also
+        // watch the checked-out branch ref, which moves on every commit.
+        if let Some(branch) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
+            paths.push(common_dir.join(branch));
+        }
+    }
+    paths.retain(|path| path.exists());
+    paths
 }
 
 /// Derive the release or development version from git metadata.

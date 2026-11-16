@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "openshell-test-feature-kubernetes-updates"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+openshell-testkit = { path = "../../../testkit/testkit" }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1.43", features = ["process", "time"] }
+tonic = "0.14"
+uuid = { version = "1.10", features = ["v4"] }

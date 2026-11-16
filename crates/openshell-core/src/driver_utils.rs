@@ -3,6 +3,7 @@
 
 //! Utility helpers shared across compute-driver crates.
 
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::path::{Path, PathBuf};
 
 use crate::proto::compute::v1::DriverSandbox;
@@ -405,7 +406,7 @@ pub const MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES: u64 = 4096;
 /// cannot be opened or stat'd, is not a regular file, or exceeds the size
 /// bound.
 pub fn read_upstream_proxy_credential_file(path: &str) -> Result<String, String> {
-    read_regular_file_bounded(path, MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES).map_err(|err| match err {
+    read_regular_utf8_file_bounded(Path::new(path), MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES).map_err(|err| match err {
         BoundedReadError::Open(e) => format!("failed to open proxy auth file '{path}': {e}"),
         BoundedReadError::Stat(e) => format!("failed to stat proxy auth file '{path}': {e}"),
         BoundedReadError::NotRegular => format!("proxy auth file '{path}' is not a regular file"),
@@ -446,19 +447,18 @@ pub const MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
 /// cannot be read, is not a regular file, exceeds the size bound, or holds no
 /// usable certificate.
 pub fn read_upstream_proxy_ca_bundle_file(path: &str, label: &str) -> Result<String, String> {
-    let pem = read_regular_file_bounded(path, MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES).map_err(
-        |err| match err {
-            BoundedReadError::Open(e) | BoundedReadError::Stat(e) | BoundedReadError::Read(e) => {
-                format!("{label} '{path}' could not be read: {e}")
-            }
-            BoundedReadError::NotRegular => {
-                format!("{label} '{path}' is not a regular file")
-            }
-            BoundedReadError::TooLarge => format!(
-                "{label} '{path}' exceeds the {MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES}-byte limit"
-            ),
-        },
-    )?;
+    let pem = read_regular_utf8_file_bounded(Path::new(path), MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES)
+        .map_err(|err| match err {
+        BoundedReadError::Open(e) | BoundedReadError::Stat(e) | BoundedReadError::Read(e) => {
+            format!("{label} '{path}' could not be read: {e}")
+        }
+        BoundedReadError::NotRegular => {
+            format!("{label} '{path}' is not a regular file")
+        }
+        BoundedReadError::TooLarge => {
+            format!("{label} '{path}' exceeds the {MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES}-byte limit")
+        }
+    })?;
     validate_upstream_proxy_ca_bundle_pem(&pem, path, label)?;
     Ok(pem)
 }
@@ -473,7 +473,7 @@ pub fn read_upstream_proxy_ca_bundle_file(path: &str, label: &str) -> Result<Str
 /// Validating that rustls accepts an anchor — rather than only that PEM
 /// framing base64-decodes — is what makes the host-side check equivalent to
 /// the guest-side one: a PEM block holding invalid DER passes
-/// `rustls_pemfile::certs` but is silently dropped by
+/// `CertificateDer::pem_reader_iter` but is silently dropped by
 /// `RootCertStore::add_parsable_certificates`, so counting PEM blocks alone
 /// would accept on the host a bundle that contributes zero anchors at runtime.
 ///
@@ -486,7 +486,7 @@ pub fn validate_upstream_proxy_ca_bundle_pem(
     path: &str,
     label: &str,
 ) -> Result<(), String> {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut pem.as_bytes())
+    let certs: Vec<_> = CertificateDer::pem_reader_iter(&mut pem.as_bytes())
         .flatten()
         .collect();
     if certs.is_empty() {
@@ -507,7 +507,8 @@ pub fn validate_upstream_proxy_ca_bundle_pem(
 
 /// Failure modes of [`read_regular_file_bounded`], so each caller can phrase
 /// them in terms of the operator setting it is reading.
-enum BoundedReadError {
+#[derive(Debug)]
+pub enum BoundedReadError {
     Open(std::io::Error),
     Stat(std::io::Error),
     NotRegular,
@@ -515,13 +516,21 @@ enum BoundedReadError {
     Read(std::io::Error),
 }
 
-/// Read a regular file into a `String`, rejecting anything larger than
+/// Read a regular file into memory, rejecting anything larger than
 /// `max_bytes` and anything that is not a regular file.
 ///
-/// Backs the operator-supplied proxy file readers, which must never let a
-/// hostile or misconfigured path (`/dev/zero`, a FIFO, a directory, a huge
-/// file) exhaust memory or block the caller.
-fn read_regular_file_bounded(path: &str, max_bytes: u64) -> Result<String, BoundedReadError> {
+/// The file is opened nonblocking on Unix so a FIFO with no writer cannot hang
+/// the caller. The size is checked both before and during the read so a file
+/// that grows after it is opened cannot bypass the bound.
+///
+/// This is a blocking read. Async callers should run it with
+/// `tokio::task::spawn_blocking`.
+///
+/// # Errors
+///
+/// Returns the operation that failed, or a dedicated error when the path is
+/// not a regular file or exceeds `max_bytes`.
+pub fn read_regular_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, BoundedReadError> {
     use std::io::Read as _;
 
     // Windows rejects opening a directory before a file handle is available,
@@ -545,7 +554,7 @@ fn read_regular_file_bounded(path: &str, max_bytes: u64) -> Result<String, Bound
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(nix::libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK)
             .open(path)
     };
     #[cfg(not(unix))]
@@ -560,14 +569,21 @@ fn read_regular_file_bounded(path: &str, max_bytes: u64) -> Result<String, Bound
         return Err(BoundedReadError::TooLarge);
     }
     // Bound the read even if the file grows between stat and read.
-    let mut buf = String::new();
-    file.take(max_bytes + 1)
-        .read_to_string(&mut buf)
+    let mut buf = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
         .map_err(BoundedReadError::Read)?;
     if buf.len() as u64 > max_bytes {
         return Err(BoundedReadError::TooLarge);
     }
     Ok(buf)
+}
+
+fn read_regular_utf8_file_bounded(path: &Path, max_bytes: u64) -> Result<String, BoundedReadError> {
+    let bytes = read_regular_file_bounded(path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|error| {
+        BoundedReadError::Read(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })
 }
 
 /// Operator-supplied corporate upstream-proxy settings, as a borrowed view.
@@ -1318,7 +1334,7 @@ mod tests {
 
     #[test]
     fn ca_bundle_rejects_pem_blocks_holding_invalid_der() {
-        // Passes `rustls_pemfile::certs` but contributes no trust anchor, so
+        // Passes `CertificateDer::pem_reader_iter` but contributes no trust anchor, so
         // accepting it on the host would break every guest after boot.
         let err = validate_upstream_proxy_ca_bundle_pem(
             "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",

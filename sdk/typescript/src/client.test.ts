@@ -12,6 +12,7 @@ import type { MessageInitShape } from '@bufbuild/protobuf';
 import { Code, ConnectError, createRouterTransport, type ServiceImpl, type Transport } from '@connectrpc/connect';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  __setSshCleanupTimeoutMsForTests,
   __setWatchLogsBackoffSleepForTests,
   errorCode,
   Pager,
@@ -1349,6 +1350,21 @@ describe('waits', () => {
     await expect(sandbox.waitReady('sb', 30)).rejects.toMatchObject({ code: 'connect' });
   });
 
+  it('waitReady rejects suspended sandboxes without waiting for timeout', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb' },
+          status: { phase: SandboxPhase.SUSPENDED },
+        },
+      }),
+    });
+    await expect(sandbox.waitReady('sb', 30)).rejects.toMatchObject({
+      code: 'connect',
+      message: expect.stringContaining('suspended'),
+    });
+  });
+
   it('waitReady rejects rather than hanging when get() never resolves', async () => {
     const sandbox = client({
       // Only settles when the per-poll deadline signal aborts the call.
@@ -2219,6 +2235,81 @@ describe('forward', () => {
     // The per-connection revoke is best-effort and fires on teardown.
     await new Promise((r) => setTimeout(r, 20));
     expect(revokedToken).toBe('fwd-tok');
+  });
+
+  it('revokes the token of a connection still open at close()', async () => {
+    const revoked: string[] = [];
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-open'),
+      createSshSession: () => ({
+        sandboxId: 'sb-id-open',
+        token: 'open-tok',
+        gatewayHost: 'gw',
+        gatewayPort: 443,
+        gatewayScheme: 'https',
+        hostKeyFingerprint: '',
+        expirationTime: undefined,
+      }),
+      // A real transport never delivers a call whose signal is already aborted.
+      revokeSshSession: (req, ctx) => {
+        if (!ctx.signal.aborted) revoked.push(req.token);
+        return { outcome: 1 };
+      },
+      forwardTcp: async function* (requests) {
+        for await (const frame of requests) {
+          if (frame.payload.case === 'data') yield { payload: { case: 'data', value: frame.payload.value } };
+        }
+      },
+    });
+
+    const handle = await sandbox.forward('sb', { targetPort: 9000 });
+    const socket = net.connect(handle.localPort, handle.localHost);
+    socket.on('error', () => {});
+    await new Promise<void>((resolve) => {
+      socket.once('data', () => resolve());
+      socket.write('ping');
+    });
+
+    await handle.close();
+    expect(revoked).toEqual(['open-tok']);
+  });
+
+  it('close() resolves within the cleanup bound when revoke never resolves', async () => {
+    __setSshCleanupTimeoutMsForTests(100);
+    try {
+      const sandbox = client({
+        getSandbox: () => readySandbox('sb', 'sb-id-stall'),
+        createSshSession: () => ({
+          sandboxId: 'sb-id-stall',
+          token: 'stall-tok',
+          gatewayHost: 'gw',
+          gatewayPort: 443,
+          gatewayScheme: 'https',
+          hostKeyFingerprint: '',
+          expirationTime: undefined,
+        }),
+        revokeSshSession: () => new Promise(() => {}),
+        forwardTcp: async function* (requests) {
+          for await (const frame of requests) {
+            if (frame.payload.case === 'data') yield { payload: { case: 'data', value: frame.payload.value } };
+          }
+        },
+      });
+
+      const handle = await sandbox.forward('sb', { targetPort: 9000 });
+      const socket = net.connect(handle.localPort, handle.localHost);
+      socket.on('error', () => {});
+      await new Promise<void>((resolve) => {
+        socket.once('data', () => resolve());
+        socket.write('ping');
+      });
+
+      const start = Date.now();
+      await handle.close();
+      expect(Date.now() - start).toBeLessThan(2_000);
+    } finally {
+      __setSshCleanupTimeoutMsForTests();
+    }
   });
 
   it('rejects when the sandbox is not ready', async () => {

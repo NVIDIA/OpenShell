@@ -68,6 +68,7 @@ impl TestRegistry {
 
 fn hello() -> SupervisorHello {
     SupervisorHello {
+        supports_service_advertisements: false,
         sandbox_id: Uuid::new_v4().to_string(),
         instance_id: Uuid::new_v4().to_string(),
         connection_epoch: 0,
@@ -188,6 +189,7 @@ fn reporting_requires_own_authenticated_sandbox() {
             sandbox_id: hello.sandbox_id.clone(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "test".to_string(),
+                auth_epoch: None,
             },
             trust_domain: Some("test".to_string()),
         }));
@@ -238,6 +240,7 @@ async fn report_rpc_requires_the_authenticated_sandboxes_current_session() {
                 sandbox_id: sandbox_id.to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "test".to_string(),
+                    auth_epoch: None,
                 },
                 trust_domain: Some("test".to_string()),
             }));

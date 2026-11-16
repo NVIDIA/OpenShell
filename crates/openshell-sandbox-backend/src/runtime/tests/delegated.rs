@@ -34,6 +34,8 @@ async fn external_backend(
                     mediation_ready: false,
                     provider_environment_generation: 0,
                     confirmation,
+                    attach_snapshots: Arc::default(),
+                    received: Arc::default(),
                 };
                 tonic::transport::Server::builder()
                     .add_service(IsolationBackendServer::new(TestIsolationBackend {
@@ -57,7 +59,8 @@ async fn external_backend(
             EXTERNAL_NAME.into(),
             descriptor.clone(),
             OPAQUE_PAYLOAD.to_vec(),
-            bearer.clone()
+            bearer.clone(),
+            ATTACH_REQUEST_TIMEOUT
         )
         .await
         .unwrap(),
@@ -166,7 +169,8 @@ async fn delegated_backend_rejects_reserved_name_and_changed_payload_before_io()
             crate::BACKEND_NAME.into(),
             descriptor,
             OPAQUE_PAYLOAD.to_vec(),
-            test_bearer(&"a".repeat(32))
+            test_bearer(&"a".repeat(32)),
+            ATTACH_REQUEST_TIMEOUT
         )
         .await,
         Err(BackendError::Descriptor(_))

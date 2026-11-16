@@ -39,7 +39,14 @@ def main() -> None:
             "grpc_tools.protoc",
             "-Iproto",
             "--python_out=python/openshell/_proto",
-            *([] if args.no_pyi else ["--pyi_out=python/openshell/_proto"]),
+            *(
+                []
+                if args.no_pyi
+                else [
+                    "--pyi_out=python/openshell/_proto",
+                    "--mypy_grpc_out=generate_concrete_servicer_stubs:python/openshell/_proto",
+                ]
+            ),
             "--grpc_python_out=python/openshell/_proto",
             *PROTO_FILES,
         ],
@@ -52,7 +59,7 @@ def main() -> None:
     pattern = rf"^import ({modules})( as \w+)?$"
     suffixes = ["_pb2.py", "_pb2_grpc.py"]
     if not args.no_pyi:
-        suffixes.append("_pb2.pyi")
+        suffixes.extend(["_pb2.pyi", "_pb2_grpc.pyi"])
     for proto in PROTO_FILES:
         for suffix in suffixes:
             file_path = output_dir / f"{Path(proto).stem}{suffix}"

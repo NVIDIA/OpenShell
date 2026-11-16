@@ -3,7 +3,7 @@
 
 //! Builder for Detection Finding [2004] events.
 
-use crate::builders::{EventContext, EventOrigin};
+use crate::builders::{ContextRef, EventOrigin};
 use crate::enums::{ActionId, ActivityId, ConfidenceId, DispositionId, RiskLevelId, SeverityId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{DetectionFindingEvent, OcsfEvent};
@@ -11,7 +11,7 @@ use crate::objects::{Attack, Evidence, FindingInfo, Remediation};
 
 /// Builder for Detection Finding [2004] events.
 pub struct DetectionFindingBuilder<'a> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
     activity: ActivityId,
     severity: SeverityId,
     action: Option<ActionId>,
@@ -31,9 +31,9 @@ pub struct DetectionFindingBuilder<'a> {
 
 impl<'a> DetectionFindingBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a EventContext) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
             activity: ActivityId::Open,
             severity: SeverityId::Medium,
             action: None,
@@ -123,12 +123,10 @@ impl<'a> DetectionFindingBuilder<'a> {
     #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity.finding_label().to_string();
-        // Gateway events carry a container only when they concern a sandbox.
+        // Only supervisors describe a container on the producing device.
         let profiles: &[&str] = match self.ctx.origin {
-            EventOrigin::Gateway { .. } if self.ctx.container().is_none() => {
-                &["security_control", "host"]
-            }
-            _ => &["security_control", "container", "host"],
+            EventOrigin::Gateway { .. } => &["security_control", "host"],
+            EventOrigin::Supervisor => &["security_control", "container", "host"],
         };
         let mut metadata = self.ctx.metadata(profiles);
         if let Some(source) = self.log_source {
@@ -186,15 +184,12 @@ mod tests {
     use crate::builders::{test_gateway_context, test_sandbox_context};
 
     #[test]
-    fn gateway_finding_declares_container_only_with_a_sandbox() {
+    fn gateway_finding_identifies_context_sandbox_in_unmapped() {
         // Gateway-wide findings name no sandbox; MXC findings name the
         // sandbox they concern.
         for (sandbox_id, profiles) in [
             ("", serde_json::json!(["security_control", "host"])),
-            (
-                "sb-1",
-                serde_json::json!(["security_control", "container", "host"]),
-            ),
+            ("sb-1", serde_json::json!(["security_control", "host"])),
         ] {
             let mut ctx = test_gateway_context();
             ctx.sandbox_id = sandbox_id.to_string();
@@ -213,10 +208,11 @@ mod tests {
                 "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f"
             );
             assert_eq!(json["metadata"]["profiles"], profiles, "{sandbox_id:?}");
+            assert!(json["device"].get("container").is_none());
+            assert!(json.get("resources").is_none());
             assert_eq!(
-                json.get("container").is_some(),
-                !sandbox_id.is_empty(),
-                "{sandbox_id:?}"
+                json["unmapped"]["sandbox_id"].as_str(),
+                (!sandbox_id.is_empty()).then_some(sandbox_id)
             );
         }
     }

@@ -31,6 +31,7 @@ Recognized gateway reasons include the following.
 | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` | Correct the fields listed in `BadRequest`. |
 | `RESOURCE_VERSION_CONFLICT` | `ABORTED` | Read the resource again and construct a new conditional write. `metadata.recovery` is `REFRESH_STATE`; `current_resource_version` is included when known. |
 | `PROFILE_SOURCE_UNAVAILABLE` | `UNAVAILABLE` | Retry a profile snapshot read after at least the supplied delay. |
+| `DATABASE_UNAVAILABLE` | `UNAVAILABLE` | The gateway could not get a database connection within 5 seconds. Retry after at least the supplied delay. |
 | `MUTATION_LOCK_TIMEOUT` | `UNAVAILABLE` | The request waited more than 10 seconds for a concurrent mutation to release a sandbox, workspace, or gateway-wide lock. Retry after at least the supplied delay. A request that carried a `request_id` leaves its admission unresolved, like any other error, so a retry with that ID returns `REQUEST_OUTCOME_UNCERTAIN`. Observe resource state and reconcile effects before you start a new request with a new ID. |
 | `REQUEST_ID_PAYLOAD_MISMATCH` | `FAILED_PRECONDITION` | Keep the original payload for that request ID. Inspect the original operation before submitting a different one. |
 | `REQUEST_OUTCOME_UNCERTAIN` | `FAILED_PRECONDITION` | An attempt is admitted but has no confirmed replayable success. Observe resource state and reconcile effects. Do not switch to a new ID to bypass the admission. |
@@ -56,7 +57,7 @@ guarantee.
 | `ABORTED` | Read fresh state before retrying a conditional operation. |
 | `UNAVAILABLE`, `RESOURCE_EXHAUSTED` | A transient condition may recover. Apply backoff and any minimum retry delay only to a retry-safe operation. |
 | `DEADLINE_EXCEEDED`, `CANCELLED` | A mutation's outcome can be unknown. Cancellation does not imply rollback. |
-| `UNIMPLEMENTED` | Check gateway and SDK version compatibility. |
+| `UNIMPLEMENTED` | Check gateway and SDK version compatibility and whether the compute driver supports the operation. |
 | `INTERNAL`, `UNKNOWN`, `DATA_LOSS` | Preserve the status and correlation metadata for diagnosis. Do not blindly retry mutations. |
 
 ## SDK access
@@ -92,18 +93,22 @@ No SDK automatically retries a mutation as a result of decoding these details.
 
 ## Durable request admission
 
-Thirty user-callable unary RPCs accept an optional `request_id` in their protobuf requests.
+Thirty-one user-callable unary RPCs accept an optional `request_id` in their protobuf requests.
 
 | Resource | RPCs |
 |---|---|
 | Workspace | `CreateWorkspace`, `DeleteWorkspace` |
 | Workspace member | `AddWorkspaceMember`, `RemoveWorkspaceMember` |
 | Sandbox template | `CreateSandboxTemplate`, `DeleteSandboxTemplate` |
-| Sandbox | `CreateSandbox`, `DeleteSandbox`, `StartSandbox`, `StopSandbox`, `AttachSandboxProvider`, `DetachSandboxProvider` |
+| Sandbox | `CreateSandbox`, `UpdateSandbox`, `DeleteSandbox`, `StartSandbox`, `StopSandbox`, `AttachSandboxProvider`, `DetachSandboxProvider` |
 | Service | `ExposeService`, `DeleteService` |
 | Provider | `CreateProvider`, `UpdateProvider`, `DeleteProvider`, `ConfigureProviderRefresh`, `DeleteProviderRefresh`, `RotateProviderCredential` |
 | Provider profile | `ImportProviderProfiles`, `UpdateProviderProfiles`, `DeleteProviderProfile` |
 | Policy and config | `UpdateConfig`, `ApproveDraftChunk`, `RejectDraftChunk`, `EditDraftChunk`, `UndoDraftChunk`, `ApproveAllDraftChunks`, `ClearDraftChunks` |
+
+`UpdateSandbox` belongs to the separate `openshell.v1.SandboxUpdates` service
+on the same authenticated gateway listener. The other RPCs above remain on
+`openshell.v1.OpenShell`.
 
 Use a nonzero, hyphenated UUID of exactly 36 characters. Uppercase and lowercase
 forms identify the same request. An empty ID preserves the existing behavior
@@ -129,10 +134,11 @@ duplicates either replay its confirmed success or return
 `REQUEST_OUTCOME_UNCERTAIN`. Disconnecting or cancelling the client does not stop
 admitted work. An error, interrupted process, or failed success-record write
 leaves the admission unresolved. No gateway replica takes over that admission,
-even after restart or after 24 hours. Status codes alone do not prove that the
-attempt had no effects.
+even after restart or after the replay window. Status codes alone do not prove
+that the attempt had no effects.
 
-Successful results have a 24-hour replay window, measured from durable completion.
+Successful results have a replay window, measured from durable completion. It is
+24 hours unless the operator sets `mutation_replay_window_seconds`.
 A successful replay includes `openshell-replayed: true` response metadata and
 does not extend the window. After it expires, the same ID can admit a new
 execution. Do not retry an old operation after that window without reconciling
@@ -178,8 +184,10 @@ Replay rows contain fingerprints, resource references, and explicitly selected
 public diagnostic or scalar outcomes, not credential-bearing response snapshots.
 Completed receipts are limited to 64 KiB. A failure to capture a bounded receipt
 after execution leaves the admission unresolved. Each caller can
-hold at most 1,000 durable admissions. At capacity, the gateway removes expired
-successes; if no space remains, it rejects new admissions with
+hold at most 1,000 durable admissions across all replicas sharing a database,
+unless the operator sets `mutation_admission_limit_per_caller`. Successful
+admissions count until their replay window ends. At capacity, the gateway
+removes expired successes; if no space remains, it rejects new admissions with
 `RESOURCE_EXHAUSTED`. Existing records remain protected. Unresolved records
 require operator investigation; there is no automatic reset or takeover API.
 The gateway also limits detached admission workers to 64 per process and these
@@ -191,6 +199,35 @@ rootfs staging, and supervisor-authenticated mutations do not gain deduplication
 from this feature. Sandbox principals cannot opt into `UpdateConfig` admission.
 Check gateway compatibility
 before relying on IDs; older protobuf servers can silently ignore unknown fields.
+
+### Sandbox image update recovery
+
+`SandboxUpdates.UpdateSandbox` conditionally updates image, command, environment overrides, labels, and annotations for stopped
+Kubernetes sandboxes. It defaults to disabled and returns `FAILED_PRECONDITION`
+until the operator [activates a compatible deployment](/kubernetes/high-availability#activate-sandbox-updates).
+After activation, unsupported workload changes return `UNIMPLEMENTED`; metadata-only
+updates do not require driver support. For a new update, supply a named
+`workspace_scope`, sandbox `name`, at least one selected update field, and a required nonzero
+`expected_resource_version` read from `sandbox.metadata.resource_version`.
+A stale version returns `ABORTED`; read fresh state before constructing another
+conditional request. The operation does not start compute.
+
+A failed or interrupted update can leave a pending operation. The desired spec
+alone does not prove driver reconciliation completed. Start, stop, and provisioning
+retry return `FAILED_PRECONDITION` until completion. Recovery runs automatically,
+including when new updates are disabled. To resume immediately, read the current
+resource version and send `UpdateSandbox` with no selected fields. The gateway
+loads the stored intent; no pending intent returns `FAILED_PRECONDITION`.
+Explicit delete can reclaim a sandbox whose update cannot complete.
+
+If the original request supplied `request_id`, an error leaves its admission
+unresolved. Reusing that ID returns `REQUEST_OUTCOME_UNCERTAIN`; changing its
+payload returns `REQUEST_ID_PAYLOAD_MISMATCH`. For explicit resume, use the fresh
+version with a new ID or no ID. A confirmed success replays the current sandbox
+without applying another update.
+
+See [Update the Image of a Stopped Sandbox](/how-it-works/sandboxes/overview#update-the-image-of-a-stopped-sandbox)
+for the stop, update, and start workflow and storage guarantees.
 
 ## Exec launch admission
 

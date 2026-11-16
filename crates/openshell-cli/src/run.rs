@@ -13,7 +13,7 @@ use crate::commands::common::{
     format_timestamp_ms, handle_platform_progress_event, is_provisioning_progress_event,
     non_empty_or, parse_cli_setting_value, parse_duration_to_ms, phase_name,
     print_policy_merge_warnings, print_sandbox_header, print_sandbox_policy,
-    provisioning_timeout_message, ready_false_condition_message, scrub_git_env, short_hash,
+    provisioning_blocker_message, provisioning_timeout_message, scrub_git_env, short_hash,
     truncate_status_field,
 };
 pub use crate::commands::gateway::{
@@ -57,12 +57,13 @@ use openshell_core::proto::{
     GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
     ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
-    SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceEndpointResponse, SettingScope,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
+    ResumeSandboxRequest, RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase,
+    SandboxPolicy, SandboxResources, SandboxRestartPolicy, SandboxServiceExposure,
+    SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig,
+    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+    ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
+    SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -457,6 +458,7 @@ pub struct SandboxCreateConfig<'a> {
     pub detach: bool,
     pub suppress_credential_warnings: bool,
     pub restart_policy: &'a str,
+    pub provision_timeout_secs: Option<u32>,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -488,6 +490,7 @@ impl Default for SandboxCreateConfig<'_> {
             detach: false,
             suppress_credential_warnings: false,
             restart_policy: "never",
+            provision_timeout_secs: None,
         }
     }
 }
@@ -527,6 +530,7 @@ pub async fn sandbox_create(
         detach,
         suppress_credential_warnings,
         restart_policy,
+        provision_timeout_secs,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -838,11 +842,15 @@ pub async fn sandbox_create(
     let mut last_phase = sandbox.phase();
     let mut last_sandbox = sandbox.clone();
     let mut last_error_reason = String::new();
-    let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
+    let mut last_condition_message = provisioning_blocker_message(sandbox.status.as_ref());
     let provision_timeout = Duration::from_secs(
-        std::env::var("OPENSHELL_PROVISION_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        provision_timeout_secs
+            .map(u64::from)
+            .or_else(|| {
+                std::env::var("OPENSHELL_PROVISION_TIMEOUT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
             .unwrap_or(300),
     );
     let mut provisioning_idle_deadline = Instant::now() + provision_timeout;
@@ -912,7 +920,7 @@ pub async fn sandbox_create(
                 let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
                 last_phase = s.phase();
                 last_sandbox = s.clone();
-                if let Some(message) = ready_false_condition_message(s.status.as_ref()) {
+                if let Some(message) = provisioning_blocker_message(s.status.as_ref()) {
                     last_condition_message = Some(message);
                 }
 
@@ -2970,8 +2978,8 @@ pub async fn sandbox_list(
             {
                 phase.red().to_string()
             }
-            Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
-            Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
+            Ok(SandboxPhase::Provisioning | SandboxPhase::Suspending) => phase.yellow().to_string(),
+            Ok(SandboxPhase::Deleting | SandboxPhase::Suspended) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
         let created = format_epoch_ms(
@@ -4115,6 +4123,14 @@ pub async fn sandbox_stop(
         .into_inner()
         .sandbox
         .ok_or_else(|| miette!("gateway returned no sandbox after stop"))?;
+    // A successful stop can preserve a canonical result when the transient
+    // compute resource is already gone. There is no Stopped event to wait for.
+    if sandbox.phase() == SandboxPhase::Completed as i32
+        || (sandbox.phase() == SandboxPhase::Error as i32 && has_main_process_result(&sandbox))
+    {
+        println!("{} Sandbox {name} already finished", "✓".green().bold());
+        return Ok(());
+    }
     wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Stopped).await?;
     println!("{} Stopped sandbox {name}", "✓".green().bold());
     Ok(())
@@ -4146,6 +4162,110 @@ pub async fn sandbox_start(
     Ok(())
 }
 
+/// Suspend a ready sandbox, retaining its memory state, and wait until it is suspended.
+pub async fn sandbox_suspend(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .suspend_sandbox(SuspendSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after suspend"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Suspended).await?;
+    if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
+        for port in stopped {
+            eprintln!(
+                "{} Stopped forward of port {port} for sandbox {name}",
+                "✓".green().bold(),
+            );
+        }
+    }
+
+    println!("{} Suspended sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Resume a suspended sandbox and wait until it is ready.
+pub async fn sandbox_resume(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .resume_sandbox(ResumeSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            restart_if_restore_fails: false,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after resume"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Ready).await?;
+    println!("{} Resumed sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Whether `phase` means a lifecycle wait for `target` can no longer succeed
+/// without another lifecycle request.
+fn lifecycle_phase_blocks_target(target: SandboxPhase, phase: SandboxPhase) -> bool {
+    match target {
+        SandboxPhase::Ready => matches!(
+            phase,
+            SandboxPhase::Suspending | SandboxPhase::Suspended | SandboxPhase::Deleting
+        ),
+        SandboxPhase::Suspended => matches!(
+            phase,
+            SandboxPhase::Ready
+                | SandboxPhase::Starting
+                | SandboxPhase::Stopping
+                | SandboxPhase::Stopped
+                | SandboxPhase::Deleting
+        ),
+        SandboxPhase::Stopped => phase == SandboxPhase::Deleting,
+        _ => false,
+    }
+}
+
+fn lifecycle_phase_error(
+    sandbox: &Sandbox,
+    target: SandboxPhase,
+    phase: SandboxPhase,
+) -> Option<miette::Report> {
+    if phase == SandboxPhase::Error {
+        let detail = provisioning_blocker_message(sandbox.status.as_ref())
+            .unwrap_or_else(|| "sandbox entered Error".to_string());
+        return Some(miette!(
+            "{detail} while waiting for {}",
+            phase_name(target as i32)
+        ));
+    }
+    if lifecycle_phase_blocks_target(target, phase) {
+        return Some(miette!(
+            "sandbox entered {} while waiting for {}",
+            phase_name(phase as i32),
+            phase_name(target as i32)
+        ));
+    }
+    None
+}
+
 async fn wait_for_lifecycle_phase(
     client: &mut crate::tls::GrpcClient,
     sandbox: Sandbox,
@@ -4155,10 +4275,8 @@ async fn wait_for_lifecycle_phase(
     if current == target {
         return Ok(sandbox);
     }
-    if current == SandboxPhase::Error {
-        let detail = ready_false_condition_message(sandbox.status.as_ref())
-            .unwrap_or_else(|| "sandbox entered Error".to_string());
-        return Err(miette!("{detail} while waiting for {target:?}"));
+    if let Some(err) = lifecycle_phase_error(&sandbox, target, current) {
+        return Err(err);
     }
 
     let timeout = Duration::from_secs(
@@ -4214,10 +4332,8 @@ async fn wait_for_lifecycle_phase(
             if phase == target {
                 return Ok(sandbox);
             }
-            if phase == SandboxPhase::Error {
-                let detail = ready_false_condition_message(sandbox.status.as_ref())
-                    .unwrap_or_else(|| "sandbox entered Error".to_string());
-                return Err(miette!(detail));
+            if let Some(err) = lifecycle_phase_error(&sandbox, target, phase) {
+                return Err(err);
             }
         }
     }
@@ -4621,6 +4737,7 @@ pub async fn workspace_create(
     server: &str,
     name: &str,
     label_args: &[String],
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     use openshell_core::proto::CreateWorkspaceRequest;
@@ -4648,6 +4765,10 @@ pub async fn workspace_create(
         .workspace
         .ok_or_else(|| miette!("workspace missing from response"))?;
 
+    if crate::output::print_output_single(output, &workspace, workspace_to_json)? {
+        return Ok(());
+    }
+
     println!(
         "{} Created workspace {}",
         "✓".green().bold(),
@@ -4657,7 +4778,7 @@ pub async fn workspace_create(
     Ok(())
 }
 
-pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn workspace_get(server: &str, name: &str, output: &str, tls: &TlsOptions) -> Result<()> {
     use openshell_core::proto::GetWorkspaceRequest;
 
     let mut client = grpc_client(server, tls).await?;
@@ -4672,6 +4793,10 @@ pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result
         .into_inner()
         .workspace
         .ok_or_else(|| miette!("workspace missing from response"))?;
+
+    if crate::output::print_output_single(output, &workspace, workspace_to_json)? {
+        return Ok(());
+    }
 
     println!("{}", "Workspace:".cyan().bold());
     println!();
@@ -7019,12 +7144,47 @@ mod tests {
         has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
         parse_driver_config_json, parse_env_from_pairs, parse_secret_material_env_pairs,
         policy_revision_list_json, policy_revision_to_json, proto_execution_timeout,
-        provisioning_timeout_message, ready_false_condition_message, relay_local_socket,
+        provisioning_blocker_message, provisioning_timeout_message, relay_local_socket,
         resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
         sandbox_upload_plan, service_endpoint_to_json, service_status_error,
         service_url_for_gateway, workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
+
+    #[test]
+    fn lifecycle_wait_fails_fast_on_phases_that_block_the_target() {
+        use super::lifecycle_phase_blocks_target;
+        use openshell_core::proto::SandboxPhase;
+
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Suspended
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Suspending
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Starting
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Stopped
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Ready
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Suspending
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Stopped,
+            SandboxPhase::Suspended
+        ));
+    }
 
     #[test]
     fn draft_approval_error_explains_refreshed_evaluation() {
@@ -8078,7 +8238,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_false_condition_message_prefers_reason_and_message() {
+    fn provisioning_blocker_message_prefers_reason_and_message() {
         let status = SandboxStatus {
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
@@ -8092,13 +8252,13 @@ mod tests {
         };
 
         assert_eq!(
-            ready_false_condition_message(Some(&status)).as_deref(),
+            provisioning_blocker_message(Some(&status)).as_deref(),
             Some("Unschedulable: Another GPU sandbox may already be using the available GPU.")
         );
     }
 
     #[test]
-    fn ready_false_condition_message_ignores_non_ready_conditions() {
+    fn provisioning_blocker_message_ignores_non_ready_conditions() {
         let status = SandboxStatus {
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
@@ -8111,7 +8271,121 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(ready_false_condition_message(Some(&status)).is_none());
+        assert!(provisioning_blocker_message(Some(&status)).is_none());
+    }
+
+    #[test]
+    fn provisioning_blocker_message_prefers_unschedulable_pod_scheduled_condition() {
+        let status = SandboxStatus {
+            agent_pod: "pending-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: "Waiting for effective configuration validation".to_string(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: "Unschedulable".to_string(),
+                    message: "0/11 nodes are available: 11 Insufficient cpu.".to_string(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            provisioning_blocker_message(Some(&status)).as_deref(),
+            Some("Unschedulable: 0/11 nodes are available: 11 Insufficient cpu.")
+        );
+    }
+
+    #[test]
+    fn provisioning_blocker_message_ignores_scheduled_pod_condition() {
+        let status = SandboxStatus {
+            agent_pod: "scheduled-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "True".to_string(),
+                    reason: String::new(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: "Waiting for effective configuration validation".to_string(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            provisioning_blocker_message(Some(&status)).as_deref(),
+            Some("ConfigurationPending: Waiting for effective configuration validation")
+        );
+    }
+
+    #[test]
+    fn provisioning_blocker_message_falls_back_when_pod_scheduled_has_no_detail() {
+        let status = SandboxStatus {
+            agent_pod: "pending-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: String::new(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            provisioning_blocker_message(Some(&status)).as_deref(),
+            Some("ConfigurationPending")
+        );
+    }
+
+    #[test]
+    fn lifecycle_phase_error_reports_scheduling_failure() {
+        use super::lifecycle_phase_error;
+        use openshell_core::proto::SandboxPhase;
+
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                phase: SandboxPhase::Error as i32,
+                conditions: vec![SandboxCondition {
+                    r#type: "PodScheduled".into(),
+                    status: "False".into(),
+                    reason: "Unschedulable".into(),
+                    message: "0/5 nodes are available: 1 Too many pods".into(),
+                    transition_time: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = lifecycle_phase_error(&sandbox, SandboxPhase::Ready, SandboxPhase::Error)
+            .expect("Error phase should fail the wait");
+        assert_eq!(
+            err.to_string(),
+            "Unschedulable: 0/5 nodes are available: 1 Too many pods while waiting for Ready"
+        );
     }
 
     #[test]

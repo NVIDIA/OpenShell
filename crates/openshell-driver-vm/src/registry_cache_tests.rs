@@ -478,3 +478,63 @@ async fn registry_cache_preserves_caller_digest_when_head_uses_another_algorithm
             .all(|request| request == "GET /v2/")
     );
 }
+
+#[tokio::test]
+async fn bootstrap_registry_cache_hit_for_a_digest_pin_makes_no_registry_request() {
+    let body = manifest("pinned");
+    let digest = sha256(&body);
+    let registry = Registry::start(
+        digest.clone(),
+        HashMap::from([("latest".to_string(), body.clone()), (digest.clone(), body)]),
+        None,
+        false,
+    )
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let driver = driver(root.path());
+    let client = client();
+
+    // Not cached yet: a digest pin still authenticates and fetches (and here
+    // fails at the blobs the fixture does not serve).
+    ensure_image(&driver, &registry.reference(Some(&digest)), &client, true)
+        .await
+        .unwrap_err();
+    assert!(
+        registry
+            .requests()
+            .iter()
+            .any(|request| request.contains(&format!("/manifests/{digest}"))),
+        "{:?}",
+        registry.requests()
+    );
+
+    // Cached: the same pin boots from the cache with no request at all.
+    let identity = bootstrap_image_cache_identity(&digest);
+    let path = image_cache_rootfs_image(root.path(), &identity);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"cached disk").unwrap();
+    let before = registry.requests().len();
+    let resolved = ensure_image(&driver, &registry.reference(Some(&digest)), &client, true)
+        .await
+        .unwrap();
+    assert_eq!(resolved, identity);
+    assert_eq!(
+        registry.requests().len(),
+        before,
+        "a digest-pinned cache hit reached the registry: {:?}",
+        &registry.requests()[before..]
+    );
+
+    // A tag naming the same content still resolves through the registry.
+    let resolved = ensure_image(&driver, &registry.reference(None), &client, true)
+        .await
+        .unwrap();
+    assert_eq!(resolved, identity);
+    assert!(
+        registry.requests()[before..]
+            .iter()
+            .any(|request| request == "HEAD /v2/test/image/manifests/latest"),
+        "{:?}",
+        registry.requests()
+    );
+}

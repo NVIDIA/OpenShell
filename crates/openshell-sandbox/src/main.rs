@@ -3,6 +3,11 @@
 
 //! `OpenShell` capability-free in-workload sandbox boundary.
 
+// Crate-scoped: Cargo rejects mixing `[lints] workspace = true` with a
+// crate-specific lint table (see #5188).
+#![warn(clippy::undocumented_unsafe_blocks)]
+#![cfg_attr(test, allow(clippy::undocumented_unsafe_blocks))]
+
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
 use std::path::Path;
@@ -685,6 +690,10 @@ fn probe_socket_virtualization() -> Result<()> {
                 {
                     return Err(std::io::Error::last_os_error()).into_diagnostic();
                 }
+                // SAFETY: the retained source is the exact injected OFD and
+                // the payload buffer stays live for its declared length;
+                // MSG_NOSIGNAL keeps a refused send from raising SIGPIPE in
+                // the dispatcher thread.
                 let sent = unsafe {
                     libc::send(
                         retained.as_raw_fd(),
@@ -770,13 +779,16 @@ fn build_probe_dns_response(query: &[u8]) -> std::io::Result<Vec<u8>> {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn block_launcher_signals() -> std::io::Result<()> {
-    let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-    // SAFETY: `signals` points to writable sigset storage and pthread_sigmask
-    // copies it during the call.
+    // Zeroed storage is required: musl's sigfillset writes only the first
+    // word of the 128-byte sigset_t on x86_64 and aarch64, so the rest must
+    // already be initialized before assume_init below.
+    let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
+    // SAFETY: `signals` points to writable sigset storage.
     if unsafe { libc::sigfillset(signals.as_mut_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: sigfillset initialized the value above.
+    // SAFETY: the storage was zero-initialized above, so the whole value is
+    // initialized regardless of how many bytes sigfillset wrote.
     let signals = unsafe { signals.assume_init() };
     // SAFETY: changing the mask affects only the dedicated launcher thread.
     let result =
@@ -793,6 +805,15 @@ fn set_child_core_limit() -> std::io::Result<()> {
         .map_err(std::io::Error::from)
 }
 
+/// Reset every catchable signal disposition in the calling process to its
+/// default.
+///
+/// # Safety
+///
+/// Destroys all installed handlers for signals 1 through 64 (skipping the
+/// uncatchable SIGKILL and SIGSTOP) in the calling process. Must only run
+/// in the forked pre-exec child, never in the launcher parent, which still
+/// needs its own dispositions.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 unsafe fn reset_child_signal_dispositions() -> std::io::Result<()> {
@@ -825,12 +846,16 @@ unsafe fn reset_child_signal_dispositions() -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn install_child_signal_mask() -> std::io::Result<()> {
-    let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // Zeroed storage is required: musl's sigemptyset writes only the first
+    // word of the 128-byte sigset_t on x86_64 and aarch64, so the rest must
+    // already be initialized before assume_init below.
+    let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
     // SAFETY: `signals` points to writable sigset storage.
     if unsafe { libc::sigemptyset(signals.as_mut_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: sigemptyset initialized the value above.
+    // SAFETY: the storage was zero-initialized above, so the whole value is
+    // initialized regardless of how many bytes sigemptyset wrote.
     let signals = unsafe { signals.assume_init() };
     // SAFETY: this installs the declared empty target mask immediately before
     // exec, after copied sandbox dispositions have been reset.
@@ -1113,6 +1138,10 @@ fn probe_tcp_dns_socket_round_trip() -> Result<()> {
 
     const DNS_QUERY: &[u8] =
         b"\x56\x78\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05probe\x09openshell\x04test\x00\x00\x01\x00\x01";
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the probe checks that setsockopt succeeds through the mediated path"
+    )]
     let mut stream = std::net::TcpStream::connect("127.0.0.53:53").into_diagnostic()?;
     stream.set_nodelay(true).into_diagnostic()?;
     stream
@@ -1210,43 +1239,44 @@ fn probe_child_self_protection(sandbox_tgid: libc::pid_t, socket: libc::c_int) -
         )
     };
     require_probe_errno(read, libc::EPERM, "process_vm_readv sandbox")?;
-    // SAFETY: signal zero would only probe process existence if the filter did
-    // not reject the trusted sandbox target.
     require_probe_errno(
+        // SAFETY: signal zero would only probe process existence if the
+        // filter did not reject the trusted sandbox target.
         isize::try_from(unsafe { libc::kill(sandbox_tgid, 0) }).expect("kill result fits isize"),
         libc::EPERM,
         "kill sandbox",
     )?;
     // SAFETY: scalar syscall arguments request a read-only resource query;
     // the child filter rejects non-self targets.
+    let prlimit_result = isize::try_from(unsafe {
+        libc::syscall(libc::SYS_prlimit64, sandbox_tgid, libc::RLIMIT_CORE, 0, 0)
+    })
+    .expect("prlimit result fits isize");
+    require_probe_errno(prlimit_result, libc::EPERM, "prlimit sandbox")?;
+    // SAFETY: signal zero on the process group would only probe group
+    // existence if the filter did not reject the trusted sandbox target.
+    let group_kill_result = unsafe { libc::kill(-sandbox_tgid, 0) };
     require_probe_errno(
-        isize::try_from(unsafe {
-            libc::syscall(libc::SYS_prlimit64, sandbox_tgid, libc::RLIMIT_CORE, 0, 0)
-        })
-        .expect("prlimit result fits isize"),
-        libc::EPERM,
-        "prlimit sandbox",
-    )?;
-    require_probe_errno(
-        isize::try_from(unsafe { libc::kill(-sandbox_tgid, 0) }).expect("kill result fits isize"),
+        isize::try_from(group_kill_result).expect("kill result fits isize"),
         libc::EPERM,
         "process-group signal",
     )?;
+    // SAFETY: F_SETOWN would only record the sandbox target as the owner of
+    // the child's own socket if the filter did not reject it first.
+    let fcntl_result = unsafe { libc::fcntl(socket, libc::F_SETOWN, sandbox_tgid) };
     require_probe_errno(
-        isize::try_from(unsafe { libc::fcntl(socket, libc::F_SETOWN, sandbox_tgid) })
-            .expect("fcntl result fits isize"),
+        isize::try_from(fcntl_result).expect("fcntl result fits isize"),
         libc::EPERM,
         "fcntl F_SETOWN",
     )?;
     let mut owner = sandbox_tgid;
-    require_probe_errno(
-        isize::try_from(unsafe {
-            libc::syscall(libc::SYS_ioctl, socket, 0x8901_u32, &raw mut owner)
-        })
-        .expect("ioctl result fits isize"),
-        libc::EPERM,
-        "ioctl FIOSETOWN",
-    )?;
+    // SAFETY: FIOSETOWN would only record the sandbox target as the owner of
+    // the child's own socket if the filter did not reject it first.
+    let ioctl_result = isize::try_from(unsafe {
+        libc::syscall(libc::SYS_ioctl, socket, 0x8901_u32, &raw mut owner)
+    })
+    .expect("ioctl result fits isize");
+    require_probe_errno(ioctl_result, libc::EPERM, "ioctl FIOSETOWN")?;
     Ok(())
 }
 
@@ -1828,6 +1858,78 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[allow(unsafe_code)]
+    fn thread_signal_mask() -> libc::sigset_t {
+        // Zeroed storage for the same reason as the production sites: musl
+        // writes only part of sigset_t when reporting the previous mask.
+        let mut mask = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
+        // SAFETY: `mask` points to writable sigset storage.
+        if unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), mask.as_mut_ptr()) }
+            != 0
+        {
+            panic!("pthread_sigmask failed");
+        }
+        // SAFETY: the storage was zero-initialized above, so the whole value
+        // is initialized regardless of how many bytes pthread_sigmask wrote.
+        unsafe { mask.assume_init() }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn block_launcher_signals_blocks_the_caller_thread() {
+        let previous = thread_signal_mask();
+        block_launcher_signals().unwrap();
+        let current = thread_signal_mask();
+        // SAFETY: `current` is an initialized sigset value.
+        assert_ne!(
+            unsafe { libc::sigismember(&raw const current, libc::SIGTERM) },
+            0
+        );
+        // Restore the mask so nothing leaks if libtest reuses this thread.
+        // SAFETY: `previous` is an initialized sigset value.
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const previous, std::ptr::null_mut())
+            },
+            0
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn install_child_signal_mask_clears_the_caller_thread() {
+        let previous = thread_signal_mask();
+        // Block SIGTERM first so the empty mask the function installs is
+        // observable.
+        let mut blocked = previous;
+        // SAFETY: `blocked` points to writable, initialized sigset storage.
+        assert_eq!(
+            unsafe { libc::sigaddset(&raw mut blocked, libc::SIGTERM) },
+            0
+        );
+        // SAFETY: `blocked` is an initialized sigset value.
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const blocked, std::ptr::null_mut())
+            },
+            0
+        );
+        install_child_signal_mask().unwrap();
+        let current = thread_signal_mask();
+        // SAFETY: `current` is an initialized sigset value.
+        assert_eq!(
+            unsafe { libc::sigismember(&raw const current, libc::SIGTERM) },
+            0
+        );
+        // SAFETY: `previous` is an initialized sigset value.
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const previous, std::ptr::null_mut())
+            },
+            0
+        );
+    }
+
     #[test]
     fn kubernetes_bootstrap_stages_private_memory_bundle() {
         if nix::unistd::geteuid().is_root() || nix::unistd::getegid().as_raw() == 0 {
@@ -1959,5 +2061,150 @@ mod tests {
 
         let final_path = dest_dir.join("openshell-sandbox");
         assert!(final_path.exists(), "binary should land inside dest dir");
+    }
+
+    /// Environment variable marking the re-executed probe child process.
+    const PROBE_CHILD_ENV: &str = "OPENSHELL_SANDBOX_PROBE_CHILD";
+
+    /// Re-executes `test_path` (the full libtest path, module prefix
+    /// included) in a fresh process so it can change its rlimits and load
+    /// seccomp filters without contaminating the test harness. The child
+    /// asserts on its own probe results; this parent only requires a
+    /// successful exit. A fresh executable process, unlike a raw `fork` child
+    /// of the multithreaded test harness, may allocate freely after the
+    /// filter is installed.
+    fn run_isolated_probe_child(test_path: &str) {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", test_path, "--nocapture"])
+            .env(PROBE_CHILD_ENV, "1")
+            .output()
+            .expect("start isolated probe child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "isolated probe child failed:\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // `--exact` matches full test paths; a wrong name would silently
+        // select zero tests and exit successfully.
+        assert!(
+            stdout.contains("1 passed"),
+            "isolated probe child matched no test:\nstdout: {stdout}"
+        );
+    }
+
+    /// Prepares a probe child: zeroes the core-dump limit the probe requires
+    /// and allows the unprivileged seccomp install.
+    #[allow(unsafe_code)]
+    fn prepare_probe_child() -> std::io::Result<()> {
+        nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0)
+            .map_err(std::io::Error::from)?;
+        // SAFETY: PR_SET_NO_NEW_PRIVS is a one-way scalar transition required
+        // before loading an unprivileged seccomp filter.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The production child filter rejects every self-protection probe with
+    /// EPERM. Running `probe_child_self_protection` against that exact filter
+    /// keeps each hoisted probe result wired to its own errno check. The test
+    /// re-executes itself in a fresh process so the rlimit and filter changes
+    /// never touch the test harness process.
+    #[test]
+    fn probe_child_self_protection_accepts_the_production_child_filter() {
+        if std::env::var_os(PROBE_CHILD_ENV).is_none() {
+            run_isolated_probe_child(
+                "tests::probe_child_self_protection_accepts_the_production_child_filter",
+            );
+            return;
+        }
+        prepare_probe_child().expect("prepare probe child");
+        let tgid = std::process::id();
+        let sandbox_tgid = libc::pid_t::try_from(tgid).expect("test pid fits pid_t");
+        let mut program = openshell_sandbox::linux::child_seccomp::prepare(tgid)
+            .expect("prepare production child filter");
+        program.install().expect("install production child filter");
+        probe_child_self_protection(sandbox_tgid, -1)
+            .expect("probes pass under the production child filter");
+    }
+
+    /// Denies every probe except the FIOSETOWN ioctl with EPERM; the kernel
+    /// then rejects the ioctl's invalid descriptor with EBADF. The
+    /// distinct errno only satisfies the check that belongs to the ioctl probe
+    /// when every check runs directly after its own syscall.
+    fn probe_adjacency_filter() -> seccompiler::BpfProgram {
+        use seccompiler::{
+            SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+            SeccompRule,
+        };
+        use std::collections::BTreeMap;
+
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        rules.insert(libc::SYS_process_vm_readv, Vec::new());
+        rules.insert(libc::SYS_kill, Vec::new());
+        rules.insert(
+            libc::SYS_prlimit64,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0)
+                        .expect("valid prlimit64 argument condition"),
+                ])
+                .expect("valid prlimit64 rule"),
+            ],
+        );
+        rules.insert(
+            libc::SYS_fcntl,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        1,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Eq,
+                        u64::from(libc::F_SETOWN.cast_unsigned()),
+                    )
+                    .expect("valid fcntl command condition"),
+                ])
+                .expect("valid fcntl rule"),
+            ],
+        );
+        let architecture = std::env::consts::ARCH
+            .try_into()
+            .expect("supported target architecture");
+        SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM.cast_unsigned()),
+            architecture,
+        )
+        .expect("build probe filter")
+        .try_into()
+        .expect("compile probe filter")
+    }
+
+    #[test]
+    fn probe_child_self_protection_checks_each_syscall_errno_independently() {
+        if std::env::var_os(PROBE_CHILD_ENV).is_none() {
+            run_isolated_probe_child(
+                "tests::probe_child_self_protection_checks_each_syscall_errno_independently",
+            );
+            return;
+        }
+        prepare_probe_child().expect("prepare probe child");
+        let filter = probe_adjacency_filter();
+        seccompiler::apply_filter(&filter).expect("install adjacency filter");
+        let sandbox_tgid = libc::pid_t::try_from(std::process::id()).expect("test pid fits pid_t");
+        // The invalid descriptor is enough: the fcntl probe is rejected by
+        // the filter before the kernel validates it, and the unfiltered
+        // ioctl probe reports EBADF from the kernel.
+        let error = probe_child_self_protection(sandbox_tgid, -1)
+            .expect_err("adjacency filter must let the ioctl probe through");
+        assert!(
+            error
+                .to_string()
+                .contains("ioctl FIOSETOWN was not rejected with errno"),
+            "unexpected probe failure: {error}"
+        );
     }
 }

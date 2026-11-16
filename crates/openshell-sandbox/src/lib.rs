@@ -3,6 +3,14 @@
 
 //! Capability-free in-workload sandbox boundary.
 
+// Crate-scoped: Cargo rejects mixing `[lints] workspace = true` with a
+// crate-specific lint table (see #5188).
+#![warn(clippy::undocumented_unsafe_blocks)]
+#![cfg_attr(test, allow(clippy::undocumented_unsafe_blocks))]
+
+#[cfg(target_os = "linux")]
+mod accept_errors;
+pub mod binary_pins;
 #[cfg(target_os = "linux")]
 pub mod boundary_exec;
 #[cfg(target_os = "linux")]

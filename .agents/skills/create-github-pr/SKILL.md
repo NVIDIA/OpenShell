@@ -13,7 +13,7 @@ Create pull requests on GitHub using the `gh` CLI.
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must have commits on a branch that's pushed to the remote
-- Every PR must close an existing issue, except automated dependency updates as described in `CONTRIBUTING.md`. Follow Branch Names in `CONTRIBUTING.md` for contributor branch names.
+- Every PR must close an existing issue, except automated dependency updates and build or flaky-test fixes from authors with write access, as described in `CONTRIBUTING.md`. Follow Branch Names in `CONTRIBUTING.md` for contributor branch names.
 
 ## Before Creating a PR
 
@@ -28,7 +28,8 @@ gh issue view ISSUE_NUMBER --repo OWNER/REPO --json number,url,labels
 ```
 
 Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may proceed without
-`state:accepted`; keep the issue link and note the missing label. Everyone else
+`state:accepted`; keep the issue link. Do not add access or acceptance evidence
+to the PR description. Everyone else
 must link at least one target-repository issue and have `state:accepted` on each.
 Otherwise, preserve local work and report which issue needs acceptance. A direct
 request, roadmap placement, other labels, or vouch status does not bypass this gate.
@@ -126,7 +127,7 @@ gh pr create --title "PR title" --body "PR description"
 
 ### Link to an Issue
 
-Every PR except an automated dependency update must close its own issue. Verify that the issue exists, remains open, and covers the PR scope. Automated dependency updates follow the exception in `CONTRIBUTING.md`. Use `Closes #<issue-number>` in the body so merge closes it:
+Every PR must close its own issue, except automated dependency updates and build or flaky-test fixes from authors with write access; both follow the exceptions in `CONTRIBUTING.md`. A PR without an issue describes the failure it fixes in the Related Issue section. Otherwise, verify that the issue exists, remains open, and covers the PR scope. Use `Closes #<issue-number>` in the body so merge closes it:
 
 ```bash
 gh pr create \
@@ -257,6 +258,11 @@ automatically on issue-label events.
 ```
 Created PR [#123](https://github.com/OWNER/REPO/pull/123)
 ```
+
+Follow the shared [accepted-work definition](../../../CONTRIBUTING.md#accepted-work)
+and [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications)
+when applying classification labels. Review-readiness applies the acceptance label
+to qualifying PRs when they open; this does not replace existing PR requirements.
 
 ### Monitor Workflow Run (Optional)
 

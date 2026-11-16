@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "AWS SigV4 Credential Signing"
 sidebar-title: "AWS"
-description: "Configure proxy-side AWS SigV4 request signing so sandbox agents can reach AWS services through CONNECT tunnels without holding real credentials."
+description: "Configure proxy-side AWS SigV4 request signing so sandbox agents can reach AWS services through CONNECT tunnels using placeholder credentials."
 keywords: "Generative AI, Cybersecurity, AI Agents, AWS, SigV4, Bedrock, S3, Credential Signing, Sandbox"
 ---
 
-AWS SigV4 credential signing lets sandbox agents call AWS services (Bedrock, S3, STS, and others) through the proxy's CONNECT tunnel. The proxy intercepts outbound requests, strips the sandbox client's placeholder `Authorization` header, and re-signs the request with real AWS credentials from the provider. The sandbox never sees the real credentials.
+AWS SigV4 credential signing lets sandbox agents call AWS services (Bedrock, S3, STS, and others) through the proxy's CONNECT tunnel. The proxy intercepts outbound requests, strips the sandbox client's placeholder `Authorization` header, and re-signs the request with real AWS credentials from the provider. The sandbox uses placeholder credentials; signing with the provider's credentials happens in the proxy. See [How Credential Injection Works](/how-it-works/providers/overview#how-credential-injection-works) for credential delivery and response-handling limits.
 
 ## Prerequisites
 
@@ -166,10 +166,11 @@ endpoints:
 - OpenShell rejects a signed sandbox policy before activation unless the endpoint has a resolvable AWS credential source. An endpoint-bearing profile must declare `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and cover the signed host, port, and path. An endpointless profile must declare those keys and be selected with `credential_binding.provider` on the signed endpoint.
 - The `sigv4:body` mode buffers at most 10 MiB. Requests with larger bodies are rejected. Use `sigv4:no_body` or `sigv4` (auto-detect) for large payloads.
 - The active provider must contain current `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values. If either becomes unavailable after policy activation, the request fails closed.
+- AWS signer diagnostics are omitted from supervisor logs, including at `TRACE` level, because they can contain session tokens.
 
 ## Use from a Sandbox
 
-Inside a sandbox, configure the AWS SDK with placeholder credentials. The proxy replaces them with real credentials during re-signing:
+Inside a sandbox, configure the AWS SDK with placeholder credentials. The proxy uses the provider's real credentials to re-sign requests:
 
 ```shell
 export AWS_ACCESS_KEY_ID=placeholder

@@ -22,6 +22,7 @@
 #   OPENSHELL_VM_GATEWAY_NAME=my-vm-gateway mise run gateway:vm
 #   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:vm
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:vm
+#   OPENSHELL_DEV_OTLP_ENDPOINT=http://127.0.0.1:4317 mise run gateway:vm
 #   mise run gateway:vm -- --gpu
 #
 # This script also writes ~/.config/openshell/active_gateway so the
@@ -35,6 +36,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=tasks/scripts/gateway-toml.sh
 source "${ROOT}/tasks/scripts/gateway-toml.sh"
+# shellcheck source=tasks/scripts/build-env.sh
+source "${ROOT}/tasks/scripts/build-env.sh"
+ensure_build_nofile_limit
 PORT="${OPENSHELL_SERVER_PORT:-18081}"
 GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-vm-dev}"
 STATE_DIR="${OPENSHELL_VM_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-vm}"
@@ -85,24 +89,6 @@ port_is_in_use() {
     return $?
   fi
   (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
-}
-
-append_local_otlp_config_if_available() {
-  local config_path=$1
-  if ! port_is_in_use 4317; then
-    echo "OTLP collector not detected on 127.0.0.1:4317; trace and OCSF log export disabled."
-    return
-  fi
-
-  cat >>"${config_path}" <<'EOF'
-
-[openshell.gateway.otlp]
-endpoint = "http://127.0.0.1:4317"
-
-[openshell.gateway.otlp.ocsf]
-enabled = true
-EOF
-  echo "OTLP trace and OCSF log export enabled for http://127.0.0.1:4317."
 }
 
 invoking_user() {
@@ -391,7 +377,7 @@ if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP+x}" ]]; then
   printf 'provider_spiffe_allow_guest_tcp = %s\n' "${OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP}" >>"${CONFIG_PATH}"
 fi
 
-append_local_otlp_config_if_available "${CONFIG_PATH}"
+append_dev_otlp_config "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}" "${VM_DRIVER_STATE_DIR}"

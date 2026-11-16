@@ -11,6 +11,7 @@ use super::sandbox_jwt::{ExtensionJwtIssuer, SandboxSessionJwtAuthority};
 
 pub struct LaunchSigningAuthorities {
     pub extension: Arc<ExtensionJwtIssuer>,
+    /// Also mints and verifies the shared supervisor's token with the same key.
     pub sandbox_session: Arc<SandboxSessionJwtAuthority>,
 }
 

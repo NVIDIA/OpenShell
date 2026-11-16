@@ -11,7 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Share vendored-schema assertions with producer regression tests.
+# Share OCSF event capture and a sandbox test context with producer tests.
 test-support = []
 
 [dependencies]
@@ -24,6 +24,7 @@ uuid = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+openshell-ocsf-validate = { path = "../openshell-ocsf-validate" }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [lints]

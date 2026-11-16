@@ -61,6 +61,24 @@ def is_latest(tag: str) -> bool:
 
 
 def select_candidate(tag: str, branch: str) -> dict:
+    if not tag:
+        versions = {}
+        for candidate in git(
+            "tag", "--merged", "HEAD", "--list", "v*-pre.*"
+        ).splitlines():
+            match = re.fullmatch(
+                r"(v([0-9]+)\.([0-9]+)\.([0-9]+))-pre\.[1-9][0-9]*", candidate
+            )
+            if match:
+                versions[match[1]] = tuple(map(int, match.groups()[1:]))
+        if not versions:
+            raise ValueError(f"No prerelease versions are reachable from {branch}")
+        tag = max(versions, key=versions.__getitem__)
+        if git("tag", "--list", tag):
+            raise ValueError(
+                f"{tag} is already stable; supply its tag explicitly to retry"
+            )
+
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
         raise ValueError("Stable tag must match vMAJOR.MINOR.PATCH")
 
@@ -147,7 +165,7 @@ def select_candidate(tag: str, branch: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("tag")
+    parser.add_argument("tag", nargs="?", default="")
     parser.add_argument("--branch", required=True)
     args = parser.parse_args()
     print(json.dumps(select_candidate(args.tag, args.branch)))

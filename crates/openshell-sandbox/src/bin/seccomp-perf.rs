@@ -3,6 +3,10 @@
 
 //! Microbenchmark entry point for the production seccomp network broker.
 
+// Crate-scoped: Cargo rejects mixing `[lints] workspace = true` with a
+// crate-specific lint table (see #5188).
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 #[cfg(target_os = "linux")]
 use std::net::SocketAddr;
 

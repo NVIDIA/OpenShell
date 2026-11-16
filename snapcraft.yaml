@@ -11,9 +11,9 @@ description: |
   policy-enforced egress routing, credential proxying, and privacy-aware
   profile-backed model-provider access.
 
-  The OpenShell snap ships a CLI (`openshell`), a terminal UI
-  (`openshell.term`), a standalone policy prover (`openshell.prover`), and a
-  managed gateway daemon (`openshell.user-gateway`). The user gateway is
+  The OpenShell snap ships a CLI (`openshell`), a terminal UI (`openshell.term`),
+  a standalone policy prover (`openshell.prover` with alias `openshell-prover`),
+  and a managed gateway daemon (`openshell.user-gateway`). The user gateway is
   disabled by default so that one selected user can run it.
 
   **Setup instructions**

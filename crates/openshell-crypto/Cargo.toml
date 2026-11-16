@@ -15,6 +15,8 @@ repository.workspace = true
 # embedder must install its backend before any crypto operation.
 default = ["aws-lc"]
 aws-lc = ["dep:aws-lc-rs", "rustls/aws_lc_rs", "rcgen/aws_lc_rs", "jsonwebtoken/aws_lc_rs", "tonic?/tls-aws-lc", "kube?/aws-lc-rs", "sqlx?/tls-rustls-aws-lc-rs"]
+# Makes OpenSsl available for explicit context selection; does not change defaults.
+openssl = ["dep:openssl", "dep:rustls-openssl", "dep:jsonwebtoken-openssl", "dep:zeroize"]
 tls-tonic = ["dep:tonic"]
 tls-kube = ["dep:kube", "dep:k8s-openapi"]
 tls-sqlx = ["dep:sqlx"]
@@ -26,6 +28,11 @@ k8s-openapi = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 
 aws-lc-rs = { workspace = true, optional = true }
+openssl = { version = "0.10.79", default-features = false, optional = true }
+rustls-openssl = { version = "=0.4.1", default-features = false, features = ["tls12"], optional = true }
+# Version 1 implements jsonwebtoken 10's provider contract (v2 requires v11).
+jsonwebtoken-openssl = { version = "=1.0.0", optional = true }
+zeroize = { workspace = true, optional = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
 jsonwebtoken = { workspace = true }

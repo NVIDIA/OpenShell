@@ -21,10 +21,12 @@
         state: present
         update_cache: true
 
+    # get.k3s.io serves the latest script, so pin the one from the k3s_version
+    # release tag. Update the checksum whenever k3s_version changes.
     - name: Download K3s installer
       ansible.builtin.get_url:
-        url: https://get.k3s.io
-        checksum: sha256:e5cc3b3d9dfc1662c2d9be6da5abc9a4cd317d6abc3a5ffc02e3dd3248207fee
+        url: "https://raw.githubusercontent.com/k3s-io/k3s/v{{ k3s_version | urlencode }}/install.sh"
+        checksum: sha256:3ce239d57d43b2d836d2b561043433e6decae8b9dc41f5d13908c0fafb0340cd
         dest: /tmp/install-k3s.sh
         mode: "0755"
 

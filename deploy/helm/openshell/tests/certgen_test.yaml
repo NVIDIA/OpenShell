@@ -192,3 +192,77 @@ tests:
             app.kubernetes.io/instance: openshell
             app.kubernetes.io/component: certgen
         documentIndex: 4
+
+  - it: adds configured metadata to both certificate hook Pod templates
+    template: templates/certgen.yaml
+    set:
+      certManager.enabled: true
+      grpcRoute.backendTLSPolicy.enabled: true
+      pkiInitJob.podLabels:
+        example.com/workload: certificate-bootstrap
+      pkiInitJob.podAnnotations:
+        sidecar.istio.io/inject: "false"
+    asserts:
+      - equal:
+          path: spec.template.metadata.labels["example.com/workload"]
+          value: certificate-bootstrap
+        documentIndex: 3
+      - equal:
+          path: spec.template.metadata.annotations["sidecar.istio.io/inject"]
+          value: "false"
+        documentIndex: 3
+      - notExists:
+          path: metadata.labels["example.com/workload"]
+        documentIndex: 3
+      - notExists:
+          path: metadata.annotations["sidecar.istio.io/inject"]
+        documentIndex: 3
+      - equal:
+          path: spec.template.metadata.labels["example.com/workload"]
+          value: certificate-bootstrap
+        documentIndex: 4
+      - equal:
+          path: spec.template.metadata.annotations["sidecar.istio.io/inject"]
+          value: "false"
+        documentIndex: 4
+      - notExists:
+          path: metadata.labels["example.com/workload"]
+        documentIndex: 4
+      - notExists:
+          path: metadata.annotations["sidecar.istio.io/inject"]
+        documentIndex: 4
+
+  - it: preserves chart-owned Pod labels when custom keys conflict
+    template: templates/certgen.yaml
+    set:
+      certManager.enabled: true
+      grpcRoute.backendTLSPolicy.enabled: true
+      pkiInitJob.podLabels:
+        app.kubernetes.io/name: openshell
+        app.kubernetes.io/instance: custom-release
+        app.kubernetes.io/component: gateway
+    asserts:
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/name"]
+          value: openshell-certgen
+        documentIndex: 3
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/instance"]
+          value: openshell
+        documentIndex: 3
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/component"]
+          value: certgen
+        documentIndex: 3
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/name"]
+          value: openshell-certgen
+        documentIndex: 4
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/instance"]
+          value: openshell
+        documentIndex: 4
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/component"]
+          value: certgen
+        documentIndex: 4
