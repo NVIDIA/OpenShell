@@ -812,6 +812,39 @@ class BoundaryTests(unittest.TestCase):
         )
         self.assertEqual(self.apply(snapshot)["status"], "applied")
 
+    def test_failed_raw_patch_recovery_blocks_apply_without_writes(self):
+        self.api.item["pull_request"] = {"url": "pull"}
+        self.api.collections["files"] = [
+            {
+                "filename": "src/example.py",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+            }
+        ]
+        self.api.diff = "diff --git a/other.py b/other.py\n--- a/other.py\n+++ b/other.py\n@@ -1 +1 @@\n-old\n+new\n"
+        snapshot = self.prepared()
+        self.assertEqual(self.apply(snapshot)["status"], "prerequisite")
+        self.assertEqual(self.api.writes, [])
+
+    def test_recovered_patch_survives_exact_preview_and_apply_freshness_checks(self):
+        self.api.item["pull_request"] = {"url": "pull"}
+        self.api.collections["files"] = [
+            {
+                "filename": "src/example.py",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+            }
+        ]
+        self.api.diff = "diff --git a/src/example.py b/src/example.py\n--- a/src/example.py\n+++ b/src/example.py\n@@ -1 +1 @@\n-old\n+new\n"
+        snapshot = self.prepared()
+        confirmed = preview(snapshot, self.result(snapshot), api=self.api)
+        self.assertEqual(confirmed["status"], "preview")
+        self.assertEqual(
+            self.apply(snapshot, expected_preview=confirmed)["status"], "applied"
+        )
+
     def test_deterministic_review_hydration_does_not_authorize_model_evidence(self):
         self.api.item["pull_request"] = {"url": "pull"}
         self.api.pull["changed_files"] = 0

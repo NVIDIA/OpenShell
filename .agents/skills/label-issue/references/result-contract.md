@@ -19,6 +19,8 @@ uv run --no-project python tasks/scripts/label_issue.py expand \
 
 Use evidence IDs from the snapshot; repeat `--evidence-id` as needed. Deferred text uses `text:SOURCE_ID:DIGEST:START:END` with character offsets. PR source slices use `source:PATH:START_LINE:END_LINE`, inclusive, at the prepared head. Inspect returned content and coverage before citing it.
 
+For missing or incomplete per-file patches, the helper tries the raw PR diff and validates file identity, changed-line counts and complete hunks between head/base freshness checks. Recovered content records `patch_source` with endpoint, revisions, source digest and byte count. Failed recovery records `patch_recovery_error` and leaves coverage partial, blocking label writes. Transport size and time bounds apply; source recovery does not resolve classifier context limits.
+
 Write `result.json` using the contract below, then:
 
 ```shell

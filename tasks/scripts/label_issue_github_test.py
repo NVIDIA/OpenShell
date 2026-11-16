@@ -57,6 +57,44 @@ class TransportTests(unittest.TestCase):
             **options,
         )
 
+    def test_diff_preserves_body_bytes_and_uses_bounded_read_transport(self):
+        diff = "diff --git a/a b/a\n@@ -1 +1 @@\n-old\r\n+new\r\n"
+        client = self.client(
+            (0, "HTTP/2.0 200 OK\r\nContent-Type: text/plain\r\n\r\n" + diff, "")
+        )
+        self.assertEqual(client("repos/o/r/pulls/1", diff=True), diff)
+        self.assertIn("Accept: application/vnd.github.diff", self.runner.calls[0][0])
+        client = self.client(
+            (0, "HTTP/2.0 200 OK\n\n" + "x" * 100, ""), max_response_bytes=50
+        )
+        with self.assertRaises(GitHubError) as error:
+            client("repos/o/r/pulls/1", diff=True)
+        self.assertIn("size bound", error.exception.message)
+
+    def test_diff_retries_read_errors_and_preserves_json_error_handling(self):
+        client = self.client(
+            response({"message": "unavailable"}, status=503),
+            (0, "HTTP/2.0 200 OK\n\ndiff", ""),
+        )
+        self.assertEqual(client("repos/o/r/pulls/1", diff=True), "diff")
+        self.assertEqual(client.diagnostics["retries"], 1)
+        client = self.client(response({"message": "missing"}, status=404))
+        with self.assertRaises(GitHubError) as error:
+            client("repos/o/r/pulls/1", diff=True)
+        self.assertEqual(error.exception.status, 404)
+        for options in ({"pages": True}, {"method": "POST"}, {"data": {}}):
+            with self.assertRaises(ValueError):
+                client("repos/o/r/pulls/1", diff=True, **options)
+
+    def test_invalid_utf8_is_not_silently_replaced(self):
+        with self.assertRaises(UnicodeDecodeError):
+            _run_bounded(
+                [sys.executable, "-c", "import os; os.write(1, bytes([255]))"],
+                input=None,
+                timeout=2,
+                output_limit=100,
+            )
+
     def test_pages_follow_links_and_flatten_acceptance_adapter(self):
         client = self.client(
             response(

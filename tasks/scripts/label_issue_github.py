@@ -101,7 +101,7 @@ def _run_bounded(command, *, input, timeout, output_limit, **_options):
         return subprocess.CompletedProcess(
             command,
             process.returncode,
-            chunks["stdout"].decode("utf-8", errors="replace"),
+            chunks["stdout"].decode("utf-8"),
             chunks["stderr"].decode("utf-8", errors="replace"),
         )
     finally:
@@ -164,7 +164,11 @@ class GitHubClient:
     def diagnostics(self):
         return {**self._diagnostics, "elapsed_seconds": self.monotonic() - self.started}
 
-    def __call__(self, path, *, method="GET", data=None, pages=False):
+    def __call__(self, path, *, method="GET", data=None, pages=False, diff=False):
+        if diff:
+            if pages or method != "GET" or data is not None:
+                raise ValueError("Diff responses support unpaginated GET requests only")
+            return self._request(path, diff=True)[0]
         if pages:
             if method != "GET" or data is not None:
                 raise ValueError("Pagination supports GET requests only")
@@ -203,19 +207,23 @@ class GitHubClient:
             raise GitHubError("Invalid GitHub API path")
         return path.lstrip("/")
 
-    def _decode(self, result, write):
+    def _decode(self, result, write, *, diff=False):
         raw = result.stdout or ""
         if len(raw.encode("utf-8")) > self.max_response_bytes:
             raise GitHubError(
                 "GitHub response exceeds size bound", uncertain_write=write
             )
-        raw = raw.replace("\r\n", "\n")
         status, headers = None, {}
-        # gh --include emits the HTTP response status and headers before JSON.
+        # Preserve the body: CRLF may belong to changed file contents.
         while raw.startswith("HTTP/"):
-            head, separator, raw = raw.partition("\n\n")
+            boundary = re.search(r"\r?\n\r?\n", raw)
+            if boundary is None:
+                raise GitHubError(
+                    "Malformed GitHub response headers", uncertain_write=write
+                )
+            head, raw = raw[: boundary.start()], raw[boundary.end() :]
             match = re.match(r"HTTP/\S+\s+(\d{3})", head)
-            if not separator or not match:
+            if not match:
                 raise GitHubError(
                     "Malformed GitHub response headers", uncertain_write=write
                 )
@@ -234,7 +242,13 @@ class GitHubClient:
                     + value.strip()
                 )
         try:
-            payload = json.loads(raw) if raw.strip() else None
+            payload = (
+                raw
+                if diff and status is not None and 200 <= status < 300
+                else json.loads(raw)
+                if raw.strip()
+                else None
+            )
         except (ValueError, TypeError) as exc:
             raise GitHubError(
                 "Malformed GitHub JSON response", status=status, uncertain_write=write
@@ -269,7 +283,7 @@ class GitHubClient:
     def request(self, path: str, *, method: str = "GET", data: dict | None = None):
         return self._request(path, method=method, data=data)[0]
 
-    def _request(self, path, *, method="GET", data=None):
+    def _request(self, path, *, method="GET", data=None, diff=False):
         path = self._path(path)
         method = method.upper()
         graphql_read = (
@@ -289,7 +303,9 @@ class GitHubClient:
             "--method",
             method,
             "-H",
-            "Accept: application/vnd.github+json",
+            "Accept: application/vnd.github.diff"
+            if diff
+            else "Accept: application/vnd.github+json",
             path,
         ]
         if data is not None:
@@ -339,7 +355,7 @@ class GitHubClient:
                 self._wait(self._retry_delay({}, attempt, False), failure=failure)
                 self._diagnostics["retries"] += 1
                 continue
-            status, headers, payload = self._decode(result, write)
+            status, headers, payload = self._decode(result, write, diff=diff)
             if path == "graphql" and not isinstance(payload, dict):
                 raise GitHubError(
                     "Malformed GraphQL response", status=status, uncertain_write=write
