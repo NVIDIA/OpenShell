@@ -57,11 +57,12 @@ async fn authorize_with_chain(
     workspace: &str,
     chain: Option<AuthenticatorChain>,
 ) -> Result<Principal, Status> {
-    if peer
-        .identity
-        .as_ref()
-        .is_some_and(super::discovery::is_certificate)
-    {
+    if peer.identity.as_ref().is_some_and(|identity| {
+        super::discovery::is_certificate(
+            identity,
+            state.config.auth.discovery_grants_file.as_deref(),
+        )
+    }) {
         return Err(Status::permission_denied(
             "discovery certificates cannot access applications",
         ));
@@ -421,6 +422,36 @@ mod tests {
             .unwrap_err()
             .code(),
             tonic::Code::Unauthenticated
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_ou_restricts_application_access_only_when_grants_are_configured() {
+        let mut state = state().await;
+        Arc::get_mut(&mut state).unwrap().config.mtls_auth.enabled = true;
+        member(&state).await;
+        let mut user = identity();
+        user.provider = IdentityProvider::Mtls;
+        user.roles.push("discovery".into());
+        let peer = ServicePeer {
+            identity: Some(user),
+            ..Default::default()
+        };
+        authorize_with_chain(&state, &HeaderMap::new(), &peer, "default", None)
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .auth
+            .discovery_grants_file = Some(directory.path().join("missing-grants.json"));
+        assert_eq!(
+            authorize_with_chain(&state, &HeaderMap::new(), &peer, "default", None)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
         );
     }
 

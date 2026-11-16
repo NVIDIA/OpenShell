@@ -293,7 +293,12 @@ impl MultiplexService {
     {
         let discovery = peer_identity
             .as_ref()
-            .filter(|identity| crate::auth::discovery::is_certificate(identity))
+            .filter(|identity| {
+                crate::auth::discovery::is_certificate(
+                    identity,
+                    self.state.config.auth.discovery_grants_file.as_deref(),
+                )
+            })
             .and(certificate_sha256.as_ref())
             .map(|fingerprint| crate::auth::principal::DiscoveryPrincipal {
                 certificate_sha256: fingerprint.clone(),
