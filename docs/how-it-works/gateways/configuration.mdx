@@ -2482,8 +2482,10 @@ discovery_grants_file = "/run/discovery/grants.json"
 ```
 
 This requires gateway TLS and a configured client CA. Issue each reader a
-client-authentication certificate from that CA with `OU=discovery`. This OU
-restricts the certificate to discovery; it does not grant access. Map the exact
+client-authentication certificate from that CA with `OU=discovery`. When
+`discovery_grants_file` is configured, this OU restricts the certificate to
+discovery; it does not grant access. Without this setting, existing certificates
+retain ordinary mTLS authentication behavior. Map the exact
 lowercase SHA-256 fingerprint of its DER leaf certificate in the grant file:
 
 ```json

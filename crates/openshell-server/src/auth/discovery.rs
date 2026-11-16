@@ -16,10 +16,12 @@ use tonic::Status;
 pub const MAX_WORKSPACES: usize = 64;
 const MAX_FILE_BYTES: usize = 256 * 1024;
 
-/// Certificate OU marks a restricted credential class, never an authority grant.
-/// The separate operator-controlled fingerprint mapping supplies authority.
-pub fn is_certificate(identity: &Identity) -> bool {
-    identity.provider == IdentityProvider::Mtls && identity.roles.iter().any(|r| r == "discovery")
+/// Configuring grants opts into the restricted OU, never an authority grant.
+/// Missing or unreadable configured files must not restore ordinary mTLS access.
+pub fn is_certificate(identity: &Identity, grants_file: Option<&Path>) -> bool {
+    grants_file.is_some()
+        && identity.provider == IdentityProvider::Mtls
+        && identity.roles.iter().any(|r| r == "discovery")
 }
 
 pub fn is_method(path: &str) -> bool {
