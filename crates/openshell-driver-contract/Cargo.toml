@@ -12,6 +12,7 @@ repository.workspace = true
 
 [dependencies]
 openshell-crypto = { workspace = true, optional = true }
+prost = { workspace = true }
 rcgen = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -20,9 +21,14 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+prost-reflect = { workspace = true }
 openshell-crypto = { workspace = true }
 rcgen = { workspace = true }
 tempfile = "3"
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
 
 [features]
 default = []

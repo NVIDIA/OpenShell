@@ -2176,11 +2176,14 @@ name = "openshell-driver-contract"
 version = "0.0.0"
 dependencies = [
  "openshell-crypto",
+ "prost",
+ "protoc-bin-vendored",
  "rcgen",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "tonic-prost-build",
  "uuid",
 ]
 

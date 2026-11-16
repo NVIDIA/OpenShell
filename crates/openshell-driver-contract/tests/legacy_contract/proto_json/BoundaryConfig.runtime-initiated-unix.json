@@ -1,0 +1,46 @@
+{
+  "boundaryId": "sbx-0001",
+  "childEnv": {
+    "HOME": "/home/sandbox"
+  },
+  "contractVersion": "1.0",
+  "fenceEvidence": {
+    "evidenceDigest": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "generation": "g0000000000000001",
+    "resourceClaims": {
+      "docker.container_id": "c0ffee0123",
+      "openshell.gpu": "true"
+    }
+  },
+  "generation": "g0000000000000001",
+  "listener": {
+    "endpoint": {
+      "unix": {
+        "socketPath": "/.openshell/channel/control/supervisor/control.sock"
+      }
+    },
+    "initiator": "CONNECTION_INITIATOR_RUNTIME",
+    "tls": {
+      "certificateChainPath": "/.openshell/tls/server.crt",
+      "privateKeyPath": "/.openshell/tls/server.key"
+    }
+  },
+  "sessionId": "7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14",
+  "trust": {
+    "authEpoch": "1",
+    "gatewayId": "gw-test",
+    "sessionRotation": "1",
+    "verificationKeys": [
+      {
+        "keyId": "k1",
+        "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAexampleexampleexampleexampleexampleexample=\n-----END PUBLIC KEY-----\n"
+      }
+    ]
+  },
+  "workloadIdentity": {
+    "gid": 1000,
+    "resourceDigest": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "source": "image",
+    "uid": 1000
+  }
+}

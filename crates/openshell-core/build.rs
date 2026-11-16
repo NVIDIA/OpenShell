@@ -44,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (".openshell.sandbox.v1", "sandbox"),
         (".openshell.compute.v1", "compute"),
         (".openshell.extension.v1", "extension"),
+        (".openshell.sandbox.runtime.v1", "sandbox_runtime"),
     ] {
         proto_config.extern_path(
             package,
