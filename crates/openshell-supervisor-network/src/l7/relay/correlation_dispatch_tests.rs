@@ -154,6 +154,22 @@ struct Fixture {
     ctx: L7EvalContext,
 }
 
+impl Fixture {
+    fn with_middleware_runner(
+        mut self,
+        runner: openshell_supervisor_middleware::ChainRunner,
+    ) -> Self {
+        self.middleware_engine
+            .set_middleware_runner_for_tests(runner);
+        // Tunnel engines snapshot the runner alongside the policy generation.
+        self.tunnel_engine = self
+            .middleware_engine
+            .clone_engine_for_tunnel(self.middleware_engine.current_generation())
+            .expect("pin injected middleware runner");
+        self
+    }
+}
+
 struct Exchange {
     response: Vec<u8>,
     forwarded: Vec<u8>,
@@ -401,7 +417,10 @@ fn request(host: &str, path: &str, extra_headers: &str, body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-struct BlockingRequestMiddleware;
+#[derive(Default)]
+struct BlockingRequestMiddleware {
+    http_hooks: bool,
+}
 
 #[tonic::async_trait]
 impl openshell_supervisor_middleware::InProcessMiddleware for BlockingRequestMiddleware {
@@ -409,8 +428,13 @@ impl openshell_supervisor_middleware::InProcessMiddleware for BlockingRequestMid
         use openshell_core::proto::{
             MiddlewareBinding, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
         };
+        let name = if self.http_hooks {
+            "test/block-request-hooks"
+        } else {
+            "test/block-request"
+        };
         openshell_core::proto::MiddlewareManifest {
-            name: "test/block-request".into(),
+            name: name.into(),
             service_version: "test".into(),
             bindings: vec![MiddlewareBinding {
                 operation: SupervisorMiddlewareOperation::HttpRequest as i32,
@@ -418,12 +442,16 @@ impl openshell_supervisor_middleware::InProcessMiddleware for BlockingRequestMid
                 max_payload_bytes: 4096,
                 request_timeout: None,
             }],
-            extension: Some(openshell_core::extension_protocol::extension_metadata(
-                openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
-                "openshell/test-block-request",
-                "test",
-                [],
-            )),
+            extension: Some(if self.http_hooks {
+                openshell_core::extension_protocol::http_hooks_middleware_metadata(name, "test")
+            } else {
+                openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    name,
+                    "test",
+                    [],
+                )
+            }),
             ..Default::default()
         }
     }
@@ -450,7 +478,18 @@ fn rest_fixture(method: &str, block_middleware: bool) -> Fixture {
     } else {
         ""
     };
-    let fixture = fixture(
+    let fixture = rest_fixture_with_middlewares(method, middleware);
+    if block_middleware {
+        fixture.with_middleware_runner(openshell_supervisor_middleware::ChainRunner::new(Arc::new(
+            BlockingRequestMiddleware::default(),
+        )))
+    } else {
+        fixture
+    }
+}
+
+fn rest_fixture_with_middlewares(method: &str, middleware: &str) -> Fixture {
+    fixture(
         &format!(
             r"{middleware}
 network_policies:
@@ -470,13 +509,7 @@ network_policies:
         ),
         "rest.example.test",
         "rest_api",
-    );
-    if block_middleware {
-        fixture.middleware_engine.set_middleware_runner_for_tests(
-            openshell_supervisor_middleware::ChainRunner::new(Arc::new(BlockingRequestMiddleware)),
-        );
-    }
-    fixture
+    )
 }
 
 #[tokio::test]
@@ -528,11 +561,17 @@ async fn inspected_allow_creates_only_the_stages_that_run() {
 
 #[tokio::test]
 async fn request_middleware_block_never_creates_a_denial_only_span() {
-    for sampled in [true, false] {
+    for (sampled, service_registered) in [(true, false), (false, false), (true, true)] {
+        let fixture = rest_fixture("POST", true);
+        let fixture = if service_registered {
+            fixture
+        } else {
+            fixture.with_middleware_runner(openshell_supervisor_middleware::ChainRunner::default())
+        };
         let evidence = capture_request_spans(
             sampled,
             Box::pin(run_exchange(
-                rest_fixture("POST", true),
+                fixture,
                 request("rest.example.test", "/item", "", "{}"),
                 None,
             )),
@@ -547,13 +586,35 @@ async fn request_middleware_block_never_creates_a_denial_only_span() {
                 .starts_with(b"HTTP/1.1 403 Forbidden\r\n")
         );
         if sampled {
+            let middleware: Vec<_> = evidence
+                .spans
+                .iter()
+                .filter(|span| span.name == "openshell.middleware.request")
+                .collect();
+            assert_eq!(middleware.len(), 1);
+            if service_registered {
+                assert_eq!(middleware[0].status, opentelemetry::trace::Status::Ok);
+            } else {
+                assert!(matches!(
+                    middleware[0].status,
+                    opentelemetry::trace::Status::Error { .. }
+                ));
+            }
+            let reason = (!service_registered).then_some("request_middleware_failed");
             assert_eq!(
-                evidence
-                    .spans
-                    .iter()
-                    .filter(|span| span.name == "openshell.middleware.request")
-                    .count(),
-                1
+                span_attribute(middleware[0], "openshell.request.failure_reason")
+                    .map(|value| value.as_str()),
+                reason.map(std::borrow::Cow::Borrowed)
+            );
+            assert_request_outcome(
+                &evidence,
+                request_id(&evidence.output.response),
+                if service_registered {
+                    "denied"
+                } else {
+                    "failed"
+                },
+                reason,
             );
             assert!(
                 evidence
@@ -565,7 +626,11 @@ async fn request_middleware_block_never_creates_a_denial_only_span() {
         let records = assert_control_records(
             &evidence,
             &[("l7", "Allowed"), ("middleware", "Denied")],
-            &["openshell.middleware.failure"],
+            if service_registered {
+                &[]
+            } else {
+                &["openshell.middleware.failure"]
+            },
             "/item",
         );
         assert_eq!(records[0]["unmapped"]["http_event_kind"], "decision");
@@ -581,7 +646,16 @@ async fn request_middleware_block_never_creates_a_denial_only_span() {
             "middleware_invocation"
         );
         assert_eq!(records[1]["unmapped"]["middleware_phase"], "request");
+        assert_eq!(records[1]["unmapped"]["failed"], !service_registered);
         assert_eq!(records[1]["status"], "Failure");
+        assert_eq!(
+            records[1]["status_detail"],
+            if service_registered {
+                "middleware_denied:request:test_block"
+            } else {
+                "middleware_failed: binding_not_described"
+            }
+        );
         assert!(
             records[1]["message"]
                 .as_str()
@@ -589,6 +663,89 @@ async fn request_middleware_block_never_creates_a_denial_only_span() {
                 .starts_with("MIDDLEWARE request test/block-request decision=Deny")
         );
     }
+}
+
+#[tokio::test]
+async fn mixed_request_middleware_hooks_fail_the_stage_and_request() {
+    let fixture = rest_fixture_with_middlewares(
+        "POST",
+        r"network_middlewares:
+  legacy:
+    middleware: test/block-request
+    order: 0
+    on_error: fail_closed
+    endpoints:
+      include: [rest.example.test]
+  current:
+    middleware: test/block-request-hooks
+    order: 1
+    on_error: fail_closed
+    endpoints:
+      include: [rest.example.test]
+",
+    );
+    let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+        vec![
+            Arc::new(BlockingRequestMiddleware::default()),
+            Arc::new(BlockingRequestMiddleware { http_hooks: true }),
+        ],
+        vec![],
+    )
+    .await
+    .expect("register both hook versions");
+    let fixture = fixture.with_middleware_runner(
+        openshell_supervisor_middleware::ChainRunner::from_registry(registry),
+    );
+    let evidence = capture_request_spans(
+        true,
+        Box::pin(run_exchange(
+            fixture,
+            request("rest.example.test", "/item", "", "{}"),
+            None,
+        )),
+    )
+    .await;
+
+    assert!(evidence.output.forwarded.is_empty());
+    assert!(
+        evidence
+            .output
+            .response
+            .starts_with(b"HTTP/1.1 403 Forbidden\r\n"),
+        "response: {}",
+        String::from_utf8_lossy(&evidence.output.response)
+    );
+    assert_request_outcome(
+        &evidence,
+        request_id(&evidence.output.response),
+        "failed",
+        Some("request_middleware_failed"),
+    );
+    let records = assert_control_records(
+        &evidence,
+        &[("l7", "Allowed"), ("middleware", "Denied")],
+        &["openshell.middleware.failure"],
+        "/item",
+    );
+    assert_eq!(
+        records[1]["status_detail"],
+        "middleware_failed: middleware_hook_versions_mixed"
+    );
+    let middleware = evidence
+        .spans
+        .iter()
+        .find(|span| span.name == "openshell.middleware.request")
+        .expect("request middleware stage");
+    assert!(matches!(
+        middleware.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    assert_eq!(
+        span_attribute(middleware, "openshell.request.failure_reason")
+            .unwrap()
+            .as_str(),
+        "request_middleware_failed"
+    );
 }
 
 #[tokio::test]

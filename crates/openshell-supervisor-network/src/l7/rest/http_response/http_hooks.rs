@@ -109,7 +109,7 @@ pub(super) async fn relay_response_through_pipeline<U, C>(
     server_wants_close: bool,
     event_stream: bool,
     response_correlation: Option<&RequestCorrelation>,
-) -> Result<Option<RelayOutcome>>
+) -> Result<ResponseMiddlewareResult>
 where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
@@ -179,7 +179,9 @@ where
                 response_correlation,
             )
             .await?;
-            return Ok(Some(RelayOutcome::Consumed));
+            return Ok(ResponseMiddlewareResult::Failed(
+                "middleware_response_preflight",
+            ));
         }
     };
     if let Some(guard) = middleware.generation_guard
@@ -235,12 +237,16 @@ where
             )
             .await?;
         }
-        return Ok(Some(RelayOutcome::Consumed));
+        return Ok(if preflight.denial.is_some() {
+            ResponseMiddlewareResult::Relayed(Some(RelayOutcome::Consumed))
+        } else {
+            ResponseMiddlewareResult::Failed("middleware_response_preflight")
+        });
     }
 
     let Some(session) = preflight.pipeline.take() else {
         if preflight.headers == original_headers {
-            return Ok(None);
+            return Ok(ResponseMiddlewareResult::Relayed(None));
         }
         let outcome = relay_headers_only_response(
             request_method,
@@ -259,7 +265,7 @@ where
         )
         .await?;
         record_allowed_response(response_correlation);
-        return Ok(Some(outcome));
+        return Ok(ResponseMiddlewareResult::Relayed(Some(outcome)));
     };
     // Eligibility offers a bodyless response no body mode, so no stage can
     // have selected one.
@@ -285,7 +291,9 @@ where
             response_correlation,
         )
         .await?;
-        return Ok(Some(RelayOutcome::Consumed));
+        return Ok(ResponseMiddlewareResult::Failed(
+            "middleware_response_preflight",
+        ));
     }
 
     let unit_limit = session.input_unit_limit();
@@ -362,7 +370,7 @@ where
                 })?;
             }
             record_allowed_response(response_correlation);
-            return Ok(Some(
+            return Ok(ResponseMiddlewareResult::Relayed(Some(
                 if server_wants_close
                     || framing == Some(OutputFraming::CloseDelimited)
                     || (matches!(body_length, BodyLength::None) && event_stream)
@@ -371,7 +379,7 @@ where
                 } else {
                     RelayOutcome::Reusable
                 },
-            ));
+            )));
         }
         (Err(failure), relayed) => {
             emit_http_response_stage_events(
@@ -437,7 +445,7 @@ where
                 response_correlation,
             )
             .await?;
-            Ok(Some(RelayOutcome::Consumed))
+            Ok(ResponseMiddlewareResult::Failed(stage))
         }
         Ok(failure) if committed => {
             if let Some(correlation) = response_correlation {
@@ -496,7 +504,11 @@ where
                 )
                 .await?;
             }
-            Ok(Some(RelayOutcome::Consumed))
+            Ok(if failure.denial.is_some() {
+                ResponseMiddlewareResult::Relayed(Some(RelayOutcome::Consumed))
+            } else {
+                ResponseMiddlewareResult::Failed("middleware_response_finalize")
+            })
         }
     }
 }

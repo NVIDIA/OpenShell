@@ -88,7 +88,9 @@ and policy-reload cancellation records the active request before dropping it.
 Idle connection closures have no HTTP receipt.
 The request span ends after its owned stages, not when response headers are logged.
 The `openshell.upstream.send` stage measures request writes and flush; response
-handling is measured separately. Receipt filtering preserves raw HTTP bytes
+handling is measured separately. Handled middleware failures remain stage errors
+even when the local rejection response is delivered successfully. Receipt
+filtering preserves raw HTTP bytes
 and borrows unchanged header blocks. It removes only protected receipt fields
 and their `Connection` or `Trailer` nominations, including folded continuations,
 without adding general response-header validation.

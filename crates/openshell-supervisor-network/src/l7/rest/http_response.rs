@@ -494,6 +494,12 @@ where
     }
 }
 
+/// Preserve the stage's failure when its local 502 was delivered successfully.
+enum ResponseMiddlewareResult {
+    Relayed(Option<RelayOutcome>),
+    Failed(&'static str),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn relay_response_through_middleware<U, C>(
     request_method: &str,
@@ -546,17 +552,25 @@ where
         response_correlation,
         parsed,
     );
-    if let Some(correlation) = response_correlation {
-        Box::pin(correlation.run_stage(
+    let response = if let Some(correlation) = response_correlation {
+        Box::pin(correlation.run_stage_classified(
             RequestStage::ResponseMiddleware,
             HttpOutcome::PlatformError,
             "response_middleware_failed",
             response,
+            |result| match result {
+                ResponseMiddlewareResult::Relayed(_) => None,
+                ResponseMiddlewareResult::Failed(reason) => Some(*reason),
+            },
         ))
         .await
     } else {
         response.await
-    }
+    }?;
+    Ok(match response {
+        ResponseMiddlewareResult::Relayed(outcome) => outcome,
+        ResponseMiddlewareResult::Failed(_) => Some(RelayOutcome::Consumed),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -576,7 +590,7 @@ async fn relay_described_response_through_middleware<U, C>(
         Vec<openshell_supervisor_middleware::DescribedChainEntry>,
         ParsedResponseHead,
     )>,
-) -> Result<Option<RelayOutcome>>
+) -> Result<ResponseMiddlewareResult>
 where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
@@ -607,7 +621,9 @@ where
                 response_correlation,
             )
             .await?;
-            return Ok(Some(RelayOutcome::Consumed));
+            return Ok(ResponseMiddlewareResult::Failed(
+                "response_middleware_headers",
+            ));
         }
     };
     match openshell_supervisor_middleware::chain_http_hook_version(&described) {
@@ -653,7 +669,9 @@ where
                 response_correlation,
             )
             .await?;
-            return Ok(Some(RelayOutcome::Consumed));
+            return Ok(ResponseMiddlewareResult::Failed(
+                "response_middleware_hook_version",
+            ));
         }
     }
     let original_headers = parsed.headers.clone();
@@ -705,7 +723,9 @@ where
                 response_correlation,
             )
             .await?;
-            return Ok(Some(RelayOutcome::Consumed));
+            return Ok(ResponseMiddlewareResult::Failed(
+                "response_middleware_preflight",
+            ));
         }
     };
     if let Some(guard) = middleware.generation_guard
@@ -769,7 +789,11 @@ where
             )
             .await?;
         }
-        return Ok(Some(RelayOutcome::Consumed));
+        return Ok(if preflight.denial.is_some() {
+            ResponseMiddlewareResult::Relayed(Some(RelayOutcome::Consumed))
+        } else {
+            ResponseMiddlewareResult::Failed("response_middleware_preflight")
+        });
     }
     crate::l7::correlation::emit_request_events(
         response_correlation,
@@ -783,7 +807,7 @@ where
 
     let Some(mut session) = preflight.session else {
         if preflight.headers == original_headers {
-            return Ok(None);
+            return Ok(ResponseMiddlewareResult::Relayed(None));
         }
         let status_line = response_status_line(header_bytes)?;
         let outcome = relay_headers_only_response(
@@ -803,7 +827,7 @@ where
         )
         .await?;
         record_allowed_response(response_correlation);
-        return Ok(Some(outcome));
+        return Ok(ResponseMiddlewareResult::Relayed(Some(outcome)));
     };
 
     let status_line = response_status_line(header_bytes)?;
@@ -840,7 +864,9 @@ where
                     response_correlation,
                 )
                 .await?;
-                return Ok(Some(RelayOutcome::Consumed));
+                return Ok(ResponseMiddlewareResult::Failed(
+                    "response_middleware_finish",
+                ));
             }
         };
         if let Some(guard) = middleware.generation_guard {
@@ -872,11 +898,13 @@ where
         client.write_all(&head).await.into_diagnostic()?;
         client.flush().await.into_diagnostic()?;
         record_allowed_response(response_correlation);
-        return Ok(Some(if server_wants_close {
-            RelayOutcome::Consumed
-        } else {
-            RelayOutcome::Reusable
-        }));
+        return Ok(ResponseMiddlewareResult::Relayed(Some(
+            if server_wants_close {
+                RelayOutcome::Consumed
+            } else {
+                RelayOutcome::Reusable
+            },
+        )));
     }
 
     let whole_body = session.requires_whole_body();
@@ -1024,7 +1052,13 @@ where
                 )
                 .await?;
             }
-            return Ok(Some(RelayOutcome::Consumed));
+            return Ok(
+                if middleware_stop.is_some_and(|stop| stop.failure.denial.is_some()) {
+                    ResponseMiddlewareResult::Relayed(Some(RelayOutcome::Consumed))
+                } else {
+                    ResponseMiddlewareResult::Failed("response_middleware_body")
+                },
+            );
         }
     };
 
@@ -1100,7 +1134,11 @@ where
                 )
                 .await?;
             }
-            return Ok(Some(RelayOutcome::Consumed));
+            return Ok(if error.denial.is_some() {
+                ResponseMiddlewareResult::Relayed(Some(RelayOutcome::Consumed))
+            } else {
+                ResponseMiddlewareResult::Failed("response_middleware_finish")
+            });
         }
     };
     if let Some(guard) = middleware.generation_guard {
@@ -1175,7 +1213,7 @@ where
     }
     client.flush().await.into_diagnostic()?;
     record_allowed_response(response_correlation);
-    Ok(Some(
+    Ok(ResponseMiddlewareResult::Relayed(Some(
         if server_wants_close
             || (committed && close_delimited_output)
             || (matches!(body_length, BodyLength::None) && event_stream)
@@ -1184,7 +1222,7 @@ where
         } else {
             RelayOutcome::Reusable
         },
-    ))
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3095,6 +3133,7 @@ mod tests {
     #[tokio::test]
     async fn response_middleware_block_never_creates_a_denial_only_span() {
         use crate::l7::relay::correlation_dispatch_tests::capture_request_spans;
+        use crate::test_support::request_tracing::span_attribute;
 
         for sampled in [true, false] {
             let evidence = Box::pin(capture_request_spans(
@@ -3105,16 +3144,79 @@ mod tests {
             evidence.assert_no_deny_span(sampled);
             assert_response_middleware_block_record(&evidence.events, sampled);
             if sampled {
-                assert_eq!(
-                    evidence
-                        .spans
-                        .iter()
-                        .filter(|span| span.name == "openshell.middleware.response")
-                        .count(),
-                    1
+                let middleware: Vec<_> = evidence
+                    .spans
+                    .iter()
+                    .filter(|span| span.name == "openshell.middleware.response")
+                    .collect();
+                assert_eq!(middleware.len(), 1);
+                assert_eq!(middleware[0].status, opentelemetry::trace::Status::Ok);
+                assert!(
+                    span_attribute(middleware[0], "openshell.request.failure_reason").is_none()
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_operational_failure_marks_child_error_after_delivering_502() {
+        use crate::l7::correlation::RequestStage;
+        use crate::l7::relay::correlation_dispatch_tests::capture_request_spans;
+        use crate::test_support::request_tracing::span_attribute;
+
+        let evidence = Box::pin(capture_request_spans(true, async {
+            let correlation = test_correlation("response-failed");
+            let (runner, chain) =
+                response_middleware_fixture(ResponseRelayScript::InvalidWholeBodySequence);
+            let middleware = response_middleware_context(&runner, &chain, "GET");
+            let mut upstream = &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody"[..];
+            let mut client = Vec::new();
+            let outcome = Box::pin(correlation.run_stage(
+                RequestStage::Response,
+                HttpOutcome::PlatformError,
+                "response_relay_failed",
+                relay_response(
+                    "GET",
+                    &mut upstream,
+                    &mut client,
+                    RelayResponseOptions {
+                        correlation: Some(&correlation),
+                        ..Default::default()
+                    },
+                    Some(middleware),
+                ),
+            ))
+            .await
+            .expect("local failure response is delivered");
+            assert!(matches!(outcome, RelayOutcome::Consumed));
+            assert!(client.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+        }))
+        .await;
+
+        evidence.assert_no_deny_span(true);
+        let middleware: Vec<_> = evidence
+            .spans
+            .iter()
+            .filter(|span| span.name == "openshell.middleware.response")
+            .collect();
+        assert_eq!(middleware.len(), 1);
+        assert!(matches!(
+            middleware[0].status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+        assert_eq!(
+            span_attribute(middleware[0], "openshell.request.failure_reason")
+                .unwrap()
+                .as_str(),
+            "response_middleware_finish"
+        );
+        let response = evidence
+            .spans
+            .iter()
+            .find(|span| span.name == "openshell.http.response")
+            .expect("response delivery stage");
+        assert_eq!(response.status, opentelemetry::trace::Status::Ok);
+        assert!(span_attribute(response, "openshell.request.failure_reason").is_none());
     }
 
     #[tokio::test]

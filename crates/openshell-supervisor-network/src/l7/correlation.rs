@@ -191,9 +191,9 @@ struct StageResult {
 }
 
 impl StageResult {
-    fn record<T, E>(&mut self, result: &Result<T, E>, reason: &'static str) {
+    fn record(&mut self, failure_reason: Option<&'static str>) {
         self.completed = true;
-        if result.is_err() {
+        if let Some(reason) = failure_reason {
             self.span.record("otel.status_code", "ERROR");
             self.span.record("openshell.request.failure_reason", reason);
         } else {
@@ -307,6 +307,18 @@ impl RequestCorrelation {
         reason: &'static str,
         future: impl Future<Output = Result<T, E>>,
     ) -> impl Future<Output = Result<T, E>> {
+        self.run_stage_classified(stage, failure_outcome, reason, future, |_| None)
+    }
+
+    /// Include handled failures returned as successful transport results.
+    pub(crate) fn run_stage_classified<T, E>(
+        &self,
+        stage: RequestStage,
+        failure_outcome: HttpOutcome,
+        reason: &'static str,
+        future: impl Future<Output = Result<T, E>>,
+        classify_failure: impl FnOnce(&T) -> Option<&'static str>,
+    ) -> impl Future<Output = Result<T, E>> {
         let mut stage = StageResult {
             span: self.stage(stage),
             completed: false,
@@ -314,8 +326,9 @@ impl RequestCorrelation {
         let future = future.instrument(stage.span.clone());
         async move {
             let result = future.await;
-            stage.record(&result, reason);
-            if result.is_err() {
+            let failure_reason = result.as_ref().map_or(Some(reason), classify_failure);
+            stage.record(failure_reason);
+            if let Some(reason) = failure_reason {
                 self.record_failure(failure_outcome, reason);
             }
             result
@@ -334,7 +347,7 @@ impl RequestCorrelation {
             completed: false,
         };
         let result = stage.span.in_scope(operation);
-        stage.record(&result, reason);
+        stage.record(result.is_err().then_some(reason));
         if result.is_err() {
             self.record_failure(failure_outcome, reason);
         }

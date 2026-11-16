@@ -1078,11 +1078,25 @@ async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery_correlat
     };
     if has_stages && let Some(correlation) = correlation {
         correlation
-            .run_stage(
+            .run_stage_classified(
                 RequestStage::RequestMiddleware,
                 super::correlation::HttpOutcome::PlatformError,
                 "request_middleware_failed",
                 apply,
+                |outcome| match outcome {
+                    MiddlewareApplyResult::Denied { denial: None, .. } => {
+                        Some("request_middleware_failed")
+                    }
+                    MiddlewareApplyResult::AdmissionExhausted => {
+                        Some("middleware_admission_exhausted")
+                    }
+                    MiddlewareApplyResult::RequestTimeout => Some("request_timeout"),
+                    MiddlewareApplyResult::Allowed(_)
+                    | MiddlewareApplyResult::Streamed { .. }
+                    | MiddlewareApplyResult::Denied {
+                        denial: Some(_), ..
+                    } => None,
+                },
             )
             .await
     } else {
