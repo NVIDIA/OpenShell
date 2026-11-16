@@ -6,6 +6,8 @@
 //! Behind the `write` feature, so that readers do not build the certificate
 //! generation code.
 
+mod document;
 mod tls;
 
+pub use document::{Document, DocumentFile, DocumentFiles, encode};
 pub use tls::generate_sandbox_tls_material;

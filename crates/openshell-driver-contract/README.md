@@ -51,6 +51,27 @@ example, as binary, must give back the legacy example. The examples are the
 reference for a driver in any language. Regenerate them from the legacy examples
 with `UPDATE_EXAMPLES=1` and review the diff.
 
+## Writing and reading the files
+
+A driver gets the files of a document from `write::encode(&document)`. It
+validates the document first, then returns each file's name and bytes: the
+binary protobuf file and the legacy JSON file beside it, encoded from the same
+value so they cannot disagree. The driver delivers them by whatever means it
+uses. The binary file is named like the legacy one with `.pb` in place of
+`.json`; the rule and the fallback are internal to this crate.
+
+The supervisor and the sandbox boundary read through `read`:
+`read::boundary_config(path)` and `read::runtime_descriptor(path)` take the path
+of the legacy file, prefer the binary file beside it, and fall back to the
+legacy one. A binary file that exists but is invalid is an error, not a reason to
+fall back. `read::consume(path)` removes every form of a single-use document.
+`read::descriptor_payload(path, backend)` is transitional: the supervisor still
+passes the descriptor to the built-in runtime as a legacy payload, and the
+function goes away with the legacy encoding. Other drivers write only the
+legacy files, which readers still accept.
+
+`tests/legacy_contract_files.rs` checks the files against the examples.
+
 ## The current encoding
 
 The encoding the types produce with `serde` is the format that exists today. It
