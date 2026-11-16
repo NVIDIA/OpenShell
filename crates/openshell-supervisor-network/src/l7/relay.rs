@@ -1322,15 +1322,6 @@ fn parse_rejection_detail(error: &str, mode: ParseRejectionMode) -> String {
 }
 
 fn emit_parse_rejection(ctx: &L7EvalContext, detail: &str, engine_type: &str) {
-    emit_parse_rejection_correlated(ctx, detail, engine_type, None);
-}
-
-fn emit_parse_rejection_correlated(
-    ctx: &L7EvalContext,
-    detail: &str,
-    engine_type: &str,
-    correlation: Option<&RequestCorrelation>,
-) {
     let policy_name = if ctx.policy_name.is_empty() {
         "-"
     } else {
@@ -1350,11 +1341,7 @@ fn emit_parse_rejection_correlated(
         ))
         .status_detail(detail)
         .build();
-    if let Some(correlation) = correlation {
-        correlation.emit(event);
-    } else {
-        egress_emit!(event);
-    }
+    egress_emit!(event);
     emit_activity(ctx, true, "l7_parse_rejection");
 }
 
@@ -1400,12 +1387,7 @@ where
     if let Some(correlation) = correlation {
         correlation.record_rejection(403, HttpOutcome::Denied, None);
     }
-    emit_parse_rejection_correlated(
-        ctx,
-        detail,
-        engine_type_for_protocol(config.protocol),
-        correlation,
-    );
+    emit_parse_rejection(ctx, detail, engine_type_for_protocol(config.protocol));
     let body = serde_json::json!({
         "error": "unsupported_l7_protocol",
         "detail": detail,
@@ -1597,16 +1579,7 @@ where
         let Some(config) = select_l7_config_for_path(configs, &route_target) else {
             let reason = "no L7 endpoint path matched request";
             correlation.record_rejection(403, HttpOutcome::Denied, None);
-            emit_l7_request_log_correlated(
-                ctx,
-                &req.action,
-                &route_target,
-                "deny",
-                "l7",
-                reason,
-                None,
-                Some(&correlation),
-            );
+            emit_l7_request_log(ctx, &req.action, &route_target, "deny", "l7", reason, None);
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -1646,12 +1619,7 @@ where
             if let Some(observer) = observer.as_ref() {
                 observer.observe(EndpointResult::PolicyDenied);
             }
-            emit_parse_rejection_correlated(
-                ctx,
-                detail,
-                engine_type_for_protocol(config.protocol),
-                Some(&correlation),
-            );
+            emit_parse_rejection(ctx, detail, engine_type_for_protocol(config.protocol));
             correlation.record_rejection(403, HttpOutcome::Denied, None);
             let deny_context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx)
                 .with_request_id(correlation.request_id());
@@ -1705,12 +1673,7 @@ where
                         {
                             correlation.record_outcome(HttpOutcome::Denied);
                         }
-                        emit_parse_rejection_correlated(
-                            ctx,
-                            &detail,
-                            "l7-graphql",
-                            Some(&correlation),
-                        );
+                        emit_parse_rejection(ctx, &detail, "l7-graphql");
                     }
                     return Ok(());
                 }
@@ -1749,12 +1712,7 @@ where
                             {
                                 correlation.record_outcome(HttpOutcome::Denied);
                             }
-                            emit_parse_rejection_correlated(
-                                ctx,
-                                &detail,
-                                "l7-jsonrpc",
-                                Some(&correlation),
-                            );
+                            emit_parse_rejection(ctx, &detail, "l7-jsonrpc");
                         }
                         return Ok(());
                     }
@@ -1854,7 +1812,7 @@ where
         let engine_type = engine_type_for_protocol(config.protocol);
         let protocol_summary =
             l7_protocol_log_summary(graphql_info.as_ref(), jsonrpc_info.as_ref());
-        emit_l7_request_log_correlated(
+        emit_l7_request_log(
             ctx,
             &request_info.action,
             &redacted_target,
@@ -1862,7 +1820,6 @@ where
             engine_type,
             &reason,
             protocol_summary.as_deref(),
-            Some(&correlation),
         );
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
@@ -2008,11 +1965,7 @@ where
                         return Ok(());
                     }
                 };
-                crate::l7::middleware::emit_websocket_preflight_events_correlated(
-                    ctx,
-                    &preflight,
-                    Some(&correlation),
-                );
+                crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
                 if preflight.terminal_reason.is_some() {
                     correlation.record_rejection(
                         403,
@@ -2184,8 +2137,7 @@ fn select_l7_config_for_path<'a>(
         .max_by_key(|config| config.path_specificity())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_l7_request_log_correlated(
+fn emit_l7_request_log(
     ctx: &L7EvalContext,
     action: &str,
     redacted_target: &str,
@@ -2193,7 +2145,6 @@ fn emit_l7_request_log_correlated(
     engine_type: &str,
     reason: &str,
     protocol_summary: Option<&str>,
-    correlation: Option<&RequestCorrelation>,
 ) {
     let event = build_l7_request_event(
         ctx,
@@ -2204,11 +2155,7 @@ fn emit_l7_request_log_correlated(
         reason,
         protocol_summary,
     );
-    if let Some(correlation) = correlation {
-        correlation.emit(event);
-    } else {
-        egress_emit!(event);
-    }
+    egress_emit!(event);
     emit_activity(ctx, decision_str == "deny", "l7_policy");
 }
 
@@ -2897,11 +2844,7 @@ where
                         return Ok(());
                     }
                 };
-                crate::l7::middleware::emit_websocket_preflight_events_correlated(
-                    ctx,
-                    &preflight,
-                    Some(&correlation),
-                );
+                crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
                 if preflight.terminal_reason.is_some() {
                     correlation.record_rejection(
                         403,
@@ -3608,7 +3551,7 @@ where
                     let detail =
                         parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
                     correlation.record_outcome(HttpOutcome::Denied);
-                    emit_parse_rejection_correlated(ctx, &detail, "l7-graphql", Some(&correlation));
+                    emit_parse_rejection(ctx, &detail, "l7-graphql");
                 }
                 return Ok(());
             }

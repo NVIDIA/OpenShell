@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::test_support::request_tracing::RequestTracing;
+use crate::test_support::request_tracing::{RequestTracing, span_attribute};
 use crate::test_support::response_request_id;
 use opentelemetry_sdk::trace::Sampler;
 use tracing::instrument::WithSubscriber as _;
@@ -17,6 +17,7 @@ enum Outcome {
     PolicyDenied,
     MalformedQueryPolicyDenied,
     AuditDenied,
+    UnresolvedCredential,
     UpstreamClosed,
 }
 
@@ -45,6 +46,15 @@ async fn forward_case(ip: Ipv4Addr, outcome: Outcome, sampler: Option<Sampler>) 
         outcome,
         Outcome::PolicyDenied | Outcome::MalformedQueryPolicyDenied
     );
+    let credential_failure = matches!(outcome, Outcome::UnresolvedCredential);
+    let secret_resolver = credential_failure.then(|| {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("OTHER_KEY".into(), "inert-test-value".into())]
+                .into_iter()
+                .collect(),
+        );
+        Arc::new(resolver.expect("test credential resolver"))
+    });
     let mode = if matches!(outcome, Outcome::AuditDenied) {
         "audit"
     } else {
@@ -99,8 +109,13 @@ network_policies:
         "token=SENTINEL-QUERY"
     };
     let target = format!("http://{ip}:{port}{path}?{query}");
+    let credential_header = if credential_failure {
+        "Authorization: Bearer openshell:resolve:env:MISSING\r\n"
+    } else {
+        ""
+    };
     let request = format!(
-        "GET {target} HTTP/1.1\r\nHost: {ip}:{port}\r\ntraceparent: 00-{WORKLOAD_TRACE_ID}-{WORKLOAD_SPAN_ID}-01\r\ntracestate: vendor=SENTINEL-VENDOR\r\nx-openshell-request-id: forged-receipt\r\nConnection: close\r\n\r\n"
+        "GET {target} HTTP/1.1\r\nHost: {ip}:{port}\r\ntraceparent: 00-{WORKLOAD_TRACE_ID}-{WORKLOAD_SPAN_ID}-01\r\ntracestate: vendor=SENTINEL-VENDOR\r\nx-openshell-request-id: forged-receipt\r\n{credential_header}Connection: close\r\n\r\n"
     );
     let exchange = async {
         tokio::join!(
@@ -124,7 +139,7 @@ network_policies:
                     Arc::new(None),
                     Arc::new(None),
                     None,
-                    None,
+                    secret_resolver,
                     None,
                     None,
                     None,
@@ -134,7 +149,7 @@ network_policies:
                 result
             },
             async {
-                if policy_denied {
+                if policy_denied || credential_failure {
                     assert!(
                         tokio::time::timeout(
                             std::time::Duration::from_millis(50),
@@ -142,7 +157,7 @@ network_policies:
                         )
                         .await
                         .is_err(),
-                        "policy denial reached upstream"
+                        "rejected request reached upstream"
                     );
                 } else {
                     let (mut upstream, _) = listener.accept().await.unwrap();
@@ -176,19 +191,25 @@ network_policies:
     let spans = capture.spans();
     let expected = (!matches!(outcome, Outcome::UpstreamClosed)).then_some(if policy_denied {
         403
+    } else if credential_failure {
+        500
     } else {
         200
     });
     let response = String::from_utf8(response).unwrap();
     let records = capture.events.json_events();
-    let expected_records = if policy_denied { 1 } else { 2 };
+    let expected_records = if policy_denied || credential_failure {
+        1
+    } else {
+        2
+    };
     assert_eq!(records.len(), expected_records, "{records:?}");
     assert!(records.iter().all(|record| record["class_uid"] == 4002));
     let record = &records[0];
     let decision = match outcome {
         Outcome::PolicyDenied | Outcome::MalformedQueryPolicyDenied => "deny",
         Outcome::AuditDenied => "audit",
-        Outcome::Allowed | Outcome::UpstreamClosed => "allow",
+        Outcome::Allowed | Outcome::UnresolvedCredential | Outcome::UpstreamClosed => "allow",
     };
     assert!(
         record["message"]
@@ -203,7 +224,7 @@ network_policies:
         assert_eq!(control["http_request"]["url"]["path"], path);
         assert!(control.get("http_response").is_none());
     }
-    if !policy_denied {
+    if !policy_denied && !credential_failure {
         let forwarded = &records[1];
         assert!(
             forwarded["message"]
@@ -325,7 +346,7 @@ network_policies:
             stages
                 .iter()
                 .any(|span| span.name == "openshell.upstream.connect"),
-            !policy_denied
+            !policy_denied && !credential_failure
         );
         assert_eq!(
             stages
@@ -335,9 +356,34 @@ network_policies:
         );
         assert_eq!(
             matches!(root.status, opentelemetry::trace::Status::Error { .. }),
-            matches!(outcome, Outcome::UpstreamClosed),
+            matches!(
+                outcome,
+                Outcome::UpstreamClosed | Outcome::UnresolvedCredential
+            ),
             "a policy refusal is an outcome, not an operational tracing failure"
         );
+        if credential_failure {
+            assert_eq!(
+                span_attribute(root, "openshell.request.failure_reason")
+                    .unwrap()
+                    .as_str(),
+                "credential_injection_failed",
+            );
+            let preparation = stages
+                .iter()
+                .find(|span| span.name == "openshell.credential.prepare")
+                .expect("credential preparation stage");
+            assert!(matches!(
+                preparation.status,
+                opentelemetry::trace::Status::Error { .. }
+            ));
+            assert_eq!(
+                span_attribute(preparation, "openshell.request.failure_reason")
+                    .unwrap()
+                    .as_str(),
+                "credential_resolution_refused",
+            );
+        }
         assert!(
             stages
                 .iter()
@@ -357,6 +403,7 @@ async fn inspected_forward_traces_all_outcomes_without_sampling_or_export_depend
         Outcome::Allowed,
         Outcome::PolicyDenied,
         Outcome::AuditDenied,
+        Outcome::UnresolvedCredential,
         Outcome::UpstreamClosed,
     ] {
         for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {

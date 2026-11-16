@@ -676,6 +676,82 @@ async fn inspected_keep_alive_requests_have_distinct_receipts_without_tracing() 
     }
 }
 
+#[tokio::test]
+async fn keep_alive_parse_rejection_does_not_reuse_the_completed_request_scope() {
+    let Fixture {
+        config,
+        tunnel_engine,
+        middleware_engine,
+        ctx,
+    } = rest_fixture("GET", false);
+    let evidence = capture_request_spans(
+        true,
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut app, mut relay_client) = tokio::io::duplex(8192);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let mut relay = Box::pin(crate::proxy::relay_inspected_http_stream_for_test(
+                &mut relay_client,
+                &mut relay_upstream,
+                vec![config],
+                tunnel_engine,
+                &middleware_engine,
+                &ctx,
+            ));
+            app.write_all(b"GET /item HTTP/1.1\r\nHost: rest.example.test:8000\r\n\r\n")
+                .await
+                .unwrap();
+            let forwarded = tokio::select! {
+                result = relay.as_mut() => panic!("relay stopped before forwarding: {result:?}"),
+                request = read_http_message(&mut upstream) => request,
+            };
+            assert!(forwarded.starts_with(b"GET /item HTTP/1.1\r\n"));
+            upstream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let response = tokio::select! {
+                result = relay.as_mut() => panic!("persistent relay stopped: {result:?}"),
+                response = read_http_message(&mut app) => response,
+            };
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            let receipt = request_id(&response).to_string();
+            assert!(futures::poll!(relay.as_mut()).is_pending());
+            app.write_all(b"GET /item?q=%ff HTTP/1.1\r\nHost: rest.example.test:8000\r\n\r\n")
+                .await
+                .unwrap();
+            relay.await.expect("parse rejection closes the relay");
+            receipt
+        }),
+    )
+    .await;
+    let receipt = evidence
+        .output
+        .as_ref()
+        .expect("keep-alive exchange completes");
+    assert!(uuid::Uuid::parse_str(receipt).is_ok());
+    evidence.assert_no_deny_span(true);
+    let (rejected, completed): (Vec<_>, Vec<_>) = evidence.events.iter().partition(|event| {
+        event["message"]
+            == "HTTP request rejected before policy evaluation for rest.example.test:8000"
+    });
+    assert!(!completed.is_empty());
+    for event in completed {
+        assert_eq!(event["metadata"]["correlation_uid"], receipt.as_str());
+    }
+    assert_eq!(rejected.len(), 1, "actual parse rejection: {rejected:?}");
+    let rejection = rejected[0];
+    assert_eq!(rejection["class_uid"], 4001);
+    assert_eq!(rejection["action"], "Denied");
+    assert_eq!(
+        rejection["status_detail"],
+        "Query component is not valid UTF-8"
+    );
+    assert!(rejection["metadata"]["correlation_uid"].is_null());
+    assert!(rejection["unmapped"]["request_sequence"].is_null());
+    assert!(rejection["unmapped"]["http_event_kind"].is_null());
+    assert!(rejection["trace"]["uid"].is_null());
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ReloadAt {
     BeforeRequest,

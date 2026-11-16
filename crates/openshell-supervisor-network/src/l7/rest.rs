@@ -1259,11 +1259,7 @@ where
                             guard.ensure_current()?;
                         }
 
-                        let signing_span = correlation
-                            .map_or_else(tracing::Span::none, |correlation| {
-                                correlation.stage(RequestStage::CredentialPrepare)
-                            });
-                        let signed = signing_span.in_scope(|| {
+                        let sign = || {
                             crate::sigv4::apply_sigv4_to_request(
                                 &full_request,
                                 options.host,
@@ -1273,23 +1269,26 @@ where
                                 secret_key,
                                 session_token,
                             )
+                        };
+                        let signed = correlation.map_or_else(sign, |correlation| {
+                            correlation.run_stage_sync(
+                                RequestStage::CredentialPrepare,
+                                HttpOutcome::PlatformError,
+                                "credential_signing_failed",
+                                sign,
+                            )
                         })?;
-                        drop(signing_span);
                         ensure_credential_generation_current(options)?;
                         upstream.write_all(&signed).await.into_diagnostic()?;
                     } else {
                         // Sign headers only, stream body through.
-                        let signable_body = match payload_mode {
-                            SigV4PayloadMode::StreamingUnsignedTrailer => {
-                                SignableBody::StreamingUnsignedPayloadTrailer
-                            }
-                            _ => SignableBody::UnsignedPayload,
-                        };
-                        let signing_span = correlation
-                            .map_or_else(tracing::Span::none, |correlation| {
-                                correlation.stage(RequestStage::CredentialPrepare)
-                            });
-                        let signed_headers = signing_span.in_scope(|| {
+                        let sign = || {
+                            let signable_body = match payload_mode {
+                                SigV4PayloadMode::StreamingUnsignedTrailer => {
+                                    SignableBody::StreamingUnsignedPayloadTrailer
+                                }
+                                _ => SignableBody::UnsignedPayload,
+                            };
                             crate::sigv4::apply_sigv4_headers_only_with_body(
                                 &rewrite_result.rewritten,
                                 options.host,
@@ -1300,8 +1299,15 @@ where
                                 session_token,
                                 signable_body,
                             )
+                        };
+                        let signed_headers = correlation.map_or_else(sign, |correlation| {
+                            correlation.run_stage_sync(
+                                RequestStage::CredentialPrepare,
+                                HttpOutcome::PlatformError,
+                                "credential_signing_failed",
+                                sign,
+                            )
                         })?;
-                        drop(signing_span);
                         ensure_credential_generation_current(options)?;
                         upstream
                             .write_all(&signed_headers)
@@ -11881,7 +11887,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_sigv4_body_signing_signs_empty_body_without_content_length() {
+    async fn relay_sigv4_signing_records_success_and_failure() {
+        use crate::test_support::request_tracing::{RequestTracing, span_attribute};
+        use opentelemetry_sdk::trace::Sampler;
+        use tracing::instrument::WithSubscriber as _;
+
+        let _lock = openshell_otel_test_support::tracing_test_lock().await;
         let (_, resolver) = SecretResolver::from_provider_env(
             [
                 ("AWS_ACCESS_KEY_ID".to_string(), "AKIATESTKEY".to_string()),
@@ -11904,57 +11915,83 @@ mod tests {
             raw_header,
             body_length: BodyLength::None,
         };
-        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
-
-        let upstream_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 8192];
-            let mut total = 0usize;
-            loop {
-                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
-                if n == 0 {
-                    break;
+        for signing in [
+            crate::l7::CredentialSigning::SigV4Body,
+            crate::l7::CredentialSigning::SigV4NoBody,
+        ] {
+            for host in ["s3.us-east-1.amazonaws.com", "invalid host"] {
+                let succeeds = host != "invalid host";
+                let capture = RequestTracing::new(Some(Sampler::AlwaysOn));
+                let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+                let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+                upstream_side
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let ctx = crate::l7::relay::L7EvalContext {
+                        host: host.into(),
+                        port: 443,
+                        ..Default::default()
+                    };
+                    let correlation = RequestCorrelation::new(&req, &ctx);
+                    relay_http_request_with_response_middleware_guarded_observed(
+                        &req,
+                        &mut proxy_to_client,
+                        &mut proxy_to_upstream,
+                        RelayRequestOptions {
+                            resolver: Some(&resolver),
+                            credential_signing: signing,
+                            signing_service: "s3",
+                            signing_region: "us-east-1",
+                            host,
+                            port: 443,
+                            ..Default::default()
+                        },
+                        None,
+                        None,
+                        Some(&correlation),
+                    )
+                    .await
+                })
+                .with_subscriber(capture.subscriber())
+                .await
+                .expect("relay must not deadlock");
+                assert_eq!(result.is_ok(), succeeds, "{result:?}");
+                drop(proxy_to_upstream);
+                let mut forwarded = String::new();
+                upstream_side.read_to_string(&mut forwarded).await.unwrap();
+                if succeeds {
+                    assert!(forwarded.contains("authorization:"), "{forwarded}");
+                } else {
+                    assert!(
+                        forwarded.is_empty(),
+                        "signing failure must not reach upstream"
+                    );
                 }
-                total += n;
-                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-                    upstream_side
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                        .await
-                        .unwrap();
-                    upstream_side.flush().await.unwrap();
-                    break;
+                let spans = capture.spans();
+                let stages = spans
+                    .iter()
+                    .filter(|span| span.name == "openshell.credential.prepare")
+                    .collect::<Vec<_>>();
+                assert_eq!(stages.len(), 2, "header resolution and signing");
+                assert_eq!(stages[0].status, opentelemetry::trace::Status::Ok);
+                let signing = stages[1];
+                assert_eq!(
+                    matches!(signing.status, opentelemetry::trace::Status::Error { .. }),
+                    !succeeds,
+                );
+                assert_eq!(
+                    span_attribute(signing, "openshell.request.failure_reason")
+                        .map(|value| value.as_str()),
+                    (!succeeds).then_some(Cow::Borrowed("credential_signing_failed")),
+                );
+                if succeeds {
+                    assert_eq!(signing.status, opentelemetry::trace::Status::Ok);
                 }
+                capture.shutdown();
             }
-            String::from_utf8_lossy(&buf[..total]).to_string()
-        });
-
-        let relay_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            relay_http_request_with_options_guarded(
-                &req,
-                &mut proxy_to_client,
-                &mut proxy_to_upstream,
-                RelayRequestOptions {
-                    resolver: Some(&resolver),
-                    credential_signing: crate::l7::CredentialSigning::SigV4Body,
-                    signing_service: "s3",
-                    signing_region: "us-east-1",
-                    host: "s3.us-east-1.amazonaws.com",
-                    port: 443,
-                    ..Default::default()
-                },
-            ),
-        )
-        .await
-        .expect("relay must not deadlock");
-        drop(proxy_to_upstream);
-        let forwarded = upstream_task.await.expect("upstream task should complete");
-
-        relay_result.expect("bodyless GET with SigV4Body should succeed");
-        assert!(
-            forwarded.contains("authorization:"),
-            "forwarded request should have SigV4 authorization header: {forwarded}"
-        );
+        }
     }
 
     #[tokio::test]

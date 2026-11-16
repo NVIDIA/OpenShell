@@ -81,7 +81,7 @@ collector availability. Inspected requests have a supervisor-owned request span
 and children around stages that actually run, with valid workload W3C context
 only as an untrusted link. Their records never create an extra denial-only span,
 even if the request span is disabled or unsampled. Other egress paths retain the
-legacy bounded deny-span behavior. Both HTTP tracing and the request's ambient
+bounded deny-span behavior. Both HTTP tracing and the request's ambient
 audit scope end before an upgraded session; later WebSocket frames do not reuse
 the handshake receipt. Terminal errors retain their request context explicitly,
 and policy-reload cancellation records the active request before dropping it.

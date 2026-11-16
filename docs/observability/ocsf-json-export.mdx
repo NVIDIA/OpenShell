@@ -317,9 +317,9 @@ The request span ends after its owned stages, not when response headers are logg
 
 The supervisor owns the request trace. A valid workload `traceparent`, sampled or unsampled, becomes an explicitly untrusted link, never its parent. Invalid or duplicate context is ignored; workload `tracestate` is not adopted. Your backend may show the agent and supervisor as separate linked traces rather than one nested tree.
 
-Inspected requests do not also create a denial-only `supervisor.egress.deny` span. Other denied HTTP decisions retain that legacy span: a root at the default log level, or a child of an available connect span at debug level. Shared supervisor hosts do not initialize OTLP exporters, so their records carry no trace correlation.
+Inspected requests do not also create a denial-only `supervisor.egress.deny` span. Non-inspected denials use that span: a root at the default log level, or a child of an available connect span at debug level. Shared supervisor hosts do not initialize OTLP exporters, so their records carry no trace correlation.
 
-The legacy deny-span limiter allows at most 10 spans per destination at once and one more per second after that. A process-wide budget also allows at most 100 spans at once and refills at 100 per second across destinations. Rate-limited decisions create no additional deny span, while all audit records are still emitted. These denial-specific budgets do not select inspected request spans, which cover every outcome rather than denials alone.
+The non-inspected denial-span limiter allows at most 10 spans per destination at once and one more per second after that. A process-wide budget also allows at most 100 spans at once and refills at 100 per second across destinations. Rate-limited decisions create no additional deny span, while all audit records are still emitted. These denial-specific budgets do not select inspected request spans, which cover every outcome rather than denials alone.
 
 Gateway records and their OTLP trace context can inherit the caller's incoming `traceparent`, including before authentication succeeds. The caller also decides whether they are correlated at all, because an unsampled `traceparent` suppresses `trace.uid`. Treat gateway trace IDs as correlation hints, not evidence of the caller's identity, and do not treat a missing `trace.uid` as meaningful.
 
@@ -362,14 +362,14 @@ absent. An instrumented client can record the receipt on its own trace and use i
 to find OpenShell's security records; it does not need to receive those records
 inside the sandbox.
 
-For inspected-request traces, query span name `openshell.http.request` instead
-of `supervisor.egress.deny` and join through `openshell.request.id`. A refusal
+For inspected-request traces, query span name `openshell.http.request`
+and join through `openshell.request.id`. A refusal
 can have outcome `"denied"` or `"failed"`; use the original OCSF control record
-for its policy and reason. Keep the legacy span query for non-inspected egress.
+for its policy and reason. For non-inspected denials, query `supervisor.egress.deny`.
 
 ### Size Supervisor Trace Collection
 
-The old deny-span budgets do not bound inspected request spans, which include
+Denial-span budgets do not bound inspected request spans, which include
 allowed traffic at INFO level. At `R` inspected requests per second and an
 average of `S` descendant spans per request, expect approximately
 `R × (1 + S)` spans per second before exporter or collector loss, plus background
@@ -381,7 +381,7 @@ reduces stored traces, not the supervisor's span-generation cost. The gateway's
 control is tracked in
 [#5362](https://github.com/NVIDIA/OpenShell/issues/5362).
 
-Leave supervisor trace export disabled if your deployment requires the old
+Leave supervisor trace export disabled if your deployment requires a
 denial-only volume bound. OCSF records and request receipts still work without it.
 
 ## OCSF Event Classes in JSON

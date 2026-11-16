@@ -413,40 +413,22 @@ pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: 
     egress_emit!(event.build());
 }
 
-#[cfg(test)]
 pub fn emit_websocket_preflight_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
 ) {
-    emit_websocket_preflight_events_correlated(ctx, outcome, None);
-}
-
-pub fn emit_websocket_preflight_events_correlated(
-    ctx: &L7EvalContext,
-    outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
-    correlation: Option<&super::correlation::RequestCorrelation>,
-) {
-    emit_websocket_invocations_correlated(
+    emit_websocket_invocations(
         ctx,
         &outcome.invocations,
         WebSocketMiddlewarePhase::Preflight,
-        correlation,
     );
-    emit_request_events(
-        correlation,
-        websocket_coverage_events(ctx, &outcome.coverage),
-    );
-    emit_request_events(correlation, websocket_preflight_finding_events(outcome));
+    crate::telemetry::emit_decision(websocket_coverage_events(ctx, &outcome.coverage), None);
+    crate::telemetry::emit_decision(websocket_preflight_finding_events(outcome), None);
     if outcome.saturated {
-        emit_websocket_saturation_correlated(ctx, correlation);
+        emit_websocket_saturation(ctx);
     }
     if outcome.session_capacity_exhausted {
-        emit_middleware_session_capacity_exhausted(
-            ctx,
-            "websocket_message",
-            !outcome.allowed,
-            correlation,
-        );
+        emit_middleware_session_capacity_exhausted(ctx, "websocket_message", !outcome.allowed);
     }
 }
 
@@ -599,15 +581,6 @@ fn emit_websocket_invocations(
     invocations: &[openshell_supervisor_middleware::WebSocketInvocation],
     phase: WebSocketMiddlewarePhase,
 ) {
-    emit_websocket_invocations_correlated(ctx, invocations, phase, None);
-}
-
-fn emit_websocket_invocations_correlated(
-    ctx: &L7EvalContext,
-    invocations: &[openshell_supervisor_middleware::WebSocketInvocation],
-    phase: WebSocketMiddlewarePhase,
-    correlation: Option<&super::correlation::RequestCorrelation>,
-) {
     for invocation in invocations {
         use openshell_supervisor_middleware::WebSocketInvocationOutcome as Outcome;
         let (action, disposition, severity, status, outcome_name) = match invocation.outcome {
@@ -680,7 +653,7 @@ fn emit_websocket_invocations_correlated(
                 invocation.transformed,
             ))
             .build();
-        emit_request_events(correlation, [event]);
+        egress_emit!(event);
         if invocation.failed {
             let fail_closed = invocation.outcome == Outcome::FailClosed;
             let mut finding = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx());
@@ -706,7 +679,7 @@ fn emit_websocket_invocations_correlated(
                 ])
                 .message("WebSocket middleware stage failed")
                 .build();
-            emit_request_events(correlation, [event]);
+            egress_emit!(event);
         }
         if invocation.stage_disabled {
             let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -726,19 +699,12 @@ fn emit_websocket_invocations_correlated(
                     "WebSocket middleware stage stream became unusable and was disabled for this session",
                 )
                 .build();
-            emit_request_events(correlation, [event]);
+            egress_emit!(event);
         }
     }
 }
 
 fn emit_websocket_saturation(ctx: &L7EvalContext) {
-    emit_websocket_saturation_correlated(ctx, None);
-}
-
-fn emit_websocket_saturation_correlated(
-    ctx: &L7EvalContext,
-    correlation: Option<&super::correlation::RequestCorrelation>,
-) {
     let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
@@ -752,15 +718,10 @@ fn emit_websocket_saturation_correlated(
         ])
         .message("WebSocket middleware work waited for admission capacity")
         .build();
-    emit_request_events(correlation, [event]);
+    egress_emit!(event);
 }
 
-fn emit_middleware_session_capacity_exhausted(
-    ctx: &L7EvalContext,
-    operation: &str,
-    denied: bool,
-    correlation: Option<&super::correlation::RequestCorrelation>,
-) {
+fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext, operation: &str, denied: bool) {
     let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
@@ -776,7 +737,7 @@ fn emit_middleware_session_capacity_exhausted(
     if denied {
         event = event.action(ActionId::Denied);
     }
-    emit_request_events(correlation, [event.build()]);
+    egress_emit!(event.build());
 }
 
 fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
@@ -1072,12 +1033,11 @@ async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery_correlat
                     generation_guard,
                     transformed_body_policy,
                     request_id,
-                    correlation,
                 ))
                 .await
             }
             ChainHttpHookVersion::Mixed => {
-                emit_mixed_protocol_denial(ctx, &req, &chain, correlation);
+                emit_mixed_protocol_denial(ctx, &req, &chain);
                 Ok(MiddlewareApplyResult::Denied {
                     denial: None,
                     failure: Some(MiddlewareFailureDetail {
@@ -1142,7 +1102,6 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
     request_id: &str,
-    correlation: Option<&super::correlation::RequestCorrelation>,
 ) -> Result<MiddlewareApplyResult> {
     let admission = if chain.is_empty() {
         None
@@ -1153,7 +1112,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
                 admission,
             ) => Some(admission),
             openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::QueueExhausted => {
-                emit_request_events(correlation, [middleware_admission_exhausted_event(ctx)]);
+                egress_emit!(middleware_admission_exhausted_event(ctx));
                 return Ok(MiddlewareApplyResult::AdmissionExhausted);
             }
         }
@@ -1182,7 +1141,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
                 admission,
             )
             .await?;
-        emit_request_events(correlation, middleware_events(ctx, &req, &outcome));
+        crate::telemetry::emit_decision(middleware_events(ctx, &req, &outcome), None);
         return Ok(if outcome.allowed {
             MiddlewareApplyResult::Allowed(req)
         } else {
@@ -1206,13 +1165,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
     let buffered = match buffer_result {
         crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
         crate::l7::rest::BufferResult::OverCapacity { recoverable } => {
-            return Ok(resolve_unbuffered_body_correlated(
-                ctx,
-                req,
-                &chain,
-                recoverable,
-                correlation,
-            ));
+            return Ok(resolve_unbuffered_body(ctx, req, &chain, recoverable));
         }
     };
     let headers = safe_middleware_headers(&buffered.headers)?;
@@ -1239,7 +1192,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
             Some(admission),
         )
         .await?;
-    emit_request_events(correlation, middleware_events(ctx, &req, &outcome));
+    crate::telemetry::emit_decision(middleware_events(ctx, &req, &outcome), None);
     if !outcome.allowed {
         return Ok(MiddlewareApplyResult::Denied {
             denial: outcome.denial,
@@ -1287,7 +1240,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         .instrument(span.clone())
         .await?;
     if preflight.session_capacity_exhausted {
-        emit_middleware_session_capacity_exhausted(ctx, "http_request", true, correlation);
+        emit_middleware_session_capacity_exhausted(ctx, "http_request", true);
         return Ok(MiddlewareApplyResult::AdmissionExhausted);
     }
     let mut events = RequestEvents {
@@ -1877,11 +1830,10 @@ fn emit_mixed_protocol_denial(
     ctx: &L7EvalContext,
     req: &crate::l7::provider::L7Request,
     chain: &[openshell_supervisor_middleware::DescribedChainEntry],
-    correlation: Option<&super::correlation::RequestCorrelation>,
 ) {
-    emit_request_events(
-        correlation,
+    crate::telemetry::emit_decision(
         mixed_protocol_events(ctx, &req.action, &req.target, chain),
+        None,
     );
 }
 
@@ -2103,42 +2055,27 @@ pub(super) fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
 /// would individually fail with `request_body_over_capacity`; the aggregate is
 /// a deny unless every attached middleware is `fail_open`, and passing the
 /// body through is only safe when no bytes were consumed.
-#[cfg(test)]
 pub(super) fn resolve_unbuffered_body(
     ctx: &L7EvalContext,
     req: crate::l7::provider::L7Request,
     chain: &[openshell_supervisor_middleware::DescribedChainEntry],
     recoverable: bool,
 ) -> MiddlewareApplyResult {
-    resolve_unbuffered_body_correlated(ctx, req, chain, recoverable, None)
-}
-
-fn resolve_unbuffered_body_correlated(
-    ctx: &L7EvalContext,
-    req: crate::l7::provider::L7Request,
-    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
-    recoverable: bool,
-    correlation: Option<&super::correlation::RequestCorrelation>,
-) -> MiddlewareApplyResult {
     let all_fail_open = chain
         .iter()
         .all(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailOpen);
     if recoverable && all_fail_open {
-        emit_middleware_body_unavailable(ctx, false, correlation);
+        emit_middleware_body_unavailable(ctx, false);
         return MiddlewareApplyResult::Allowed(req);
     }
-    emit_middleware_body_unavailable(ctx, true, correlation);
+    emit_middleware_body_unavailable(ctx, true);
     MiddlewareApplyResult::Denied {
         denial: None,
         failure: None,
     }
 }
 
-fn emit_middleware_body_unavailable(
-    ctx: &L7EvalContext,
-    denied: bool,
-    correlation: Option<&super::correlation::RequestCorrelation>,
-) {
+fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
     let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(if denied {
             SeverityId::High
@@ -2162,7 +2099,7 @@ fn emit_middleware_body_unavailable(
     if denied {
         event = event.action(ActionId::Denied);
     }
-    emit_request_events(correlation, [event.build()]);
+    egress_emit!(event.build());
 }
 
 /// Parse the raw header block into middleware-visible headers, preserving
@@ -2572,7 +2509,7 @@ mod trace_tests {
             let (events, received) = exported("warn", || {
                 let ctx = L7EvalContext::default();
                 emit_middleware_uninspectable(&ctx, "unknown protocol", denied);
-                emit_middleware_body_unavailable(&ctx, denied, None);
+                emit_middleware_body_unavailable(&ctx, denied);
             })
             .await;
             assert_eq!(events.len(), 2);

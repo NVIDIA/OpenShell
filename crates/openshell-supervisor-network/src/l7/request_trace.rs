@@ -11,7 +11,6 @@ use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use super::correlation::HttpOutcome;
-use openshell_ocsf::{ActionId, HttpActivityEvent, StatusId};
 
 const MAX_TRACEPARENT_BYTES: usize = 256;
 
@@ -133,23 +132,6 @@ impl RequestTrace {
     pub(super) fn record_unclassified_failure(&mut self) {
         self.record_outcome(HttpOutcome::PlatformError);
         self.record_failure_reason("request_failed");
-    }
-
-    pub(super) fn observe_http(&mut self, event: &HttpActivityEvent) {
-        if let Some(response) = &event.http_response {
-            self.record_status(response.code);
-        }
-        if event.action == Some(ActionId::Denied) {
-            if self.outcome != "failed" {
-                self.record_outcome(HttpOutcome::Denied);
-            }
-        } else if self.outcome == "incomplete" {
-            self.record_outcome(if event.base.status == Some(StatusId::Failure) {
-                HttpOutcome::PlatformError
-            } else {
-                HttpOutcome::Allowed
-            });
-        }
     }
 }
 

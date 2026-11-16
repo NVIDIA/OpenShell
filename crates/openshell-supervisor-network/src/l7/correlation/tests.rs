@@ -115,6 +115,36 @@ fn request_join_does_not_depend_on_export_and_never_creates_denial_spans() {
     }
 }
 
+#[test]
+fn audit_events_do_not_override_the_actual_response_outcome() {
+    let capture = RequestTracing::new(Some(opentelemetry_sdk::trace::Sampler::AlwaysOn));
+    tracing::subscriber::with_default(capture.subscriber(), || {
+        let correlation = RequestCorrelation::new(&request(), &context());
+        correlation.record_response_status(200);
+        correlation.record_outcome(HttpOutcome::Allowed);
+        correlation.emit(deny());
+    });
+    let spans = capture.spans();
+    let root = spans
+        .iter()
+        .find(|span| span.name == "openshell.http.request")
+        .unwrap();
+    assert_eq!(
+        span_attribute(root, "openshell.request.outcome")
+            .unwrap()
+            .as_str(),
+        "allowed"
+    );
+    assert_eq!(
+        span_attribute(root, "http.response.status_code")
+            .unwrap()
+            .as_str(),
+        "200"
+    );
+    assert_eq!(capture.events.json_events()[0]["action"], "Denied");
+    capture.shutdown();
+}
+
 #[tokio::test]
 async fn ambient_scope_stamps_companions_without_call_site_wiring() {
     let capture = OcsfCapture::default();

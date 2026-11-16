@@ -6059,8 +6059,11 @@ async fn handle_forward_proxy_inner(
         };
 
         let Ok(redacted_path) = secrets::redact_target_for_policy(&path) else {
-            correlation.record_outcome(HttpOutcome::PlatformError);
-            correlation.record_response_status(400);
+            correlation.record_rejection(
+                400,
+                HttpOutcome::PlatformError,
+                Some("invalid_credential_placeholder"),
+            );
             respond(
                 client,
                 &build_json_error_response_with_request_id(
@@ -6774,11 +6777,7 @@ async fn handle_forward_proxy_inner(
                 return Ok(());
             }
         };
-        crate::l7::middleware::emit_websocket_preflight_events_correlated(
-            &l7_ctx,
-            &preflight,
-            request_correlation,
-        );
+        crate::l7::middleware::emit_websocket_preflight_events(&l7_ctx, &preflight);
         if preflight.terminal_reason.is_some() {
             correlation.record_rejection(
                 403,
@@ -6787,7 +6786,11 @@ async fn handle_forward_proxy_inner(
                 } else {
                     HttpOutcome::PlatformError
                 },
-                None,
+                Some(if preflight.denial.is_some() {
+                    "websocket_middleware_denied"
+                } else {
+                    "websocket_preflight_failed"
+                }),
             );
             let response = preflight.denial.as_ref().map_or_else(
                 || build_middleware_failure_response(&l7_ctx.policy_name, None, receipt_id),
@@ -6905,6 +6908,11 @@ async fn handle_forward_proxy_inner(
     };
     if let Some(guard) = credential_generation {
         guard.ensure_current().inspect_err(|_| {
+            egress::mark_error(&credential_stage);
+            credential_stage.record(
+                "openshell.request.failure_reason",
+                "credential_generation_stale",
+            );
             correlation.record_failure(HttpOutcome::PlatformError, "credential_generation_stale");
         })?;
     }
@@ -6921,6 +6929,12 @@ async fn handle_forward_proxy_inner(
     });
     if rewrite.is_err() {
         egress::mark_error(&credential_stage);
+        credential_stage.record(
+            "openshell.request.failure_reason",
+            "credential_resolution_refused",
+        );
+    } else {
+        credential_stage.record("otel.status_code", "OK");
     }
     drop(credential_stage);
     let rewritten = match rewrite {
@@ -6984,7 +6998,11 @@ async fn handle_forward_proxy_inner(
                 })
                 .await;
             } else {
-                correlation.record_rejection(500, HttpOutcome::PlatformError, None);
+                correlation.record_rejection(
+                    500,
+                    HttpOutcome::PlatformError,
+                    Some("credential_injection_failed"),
+                );
                 respond(
                     client,
                     &build_json_error_response_with_request_id(

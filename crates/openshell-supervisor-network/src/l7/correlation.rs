@@ -236,6 +236,7 @@ impl RequestCorrelation {
         ctx: &L7EvalContext,
         request_id: String,
     ) -> Self {
+        init_request_correlation().expect("request correlation enricher registration");
         Self::build(&request.action, &request.raw_header, ctx, request_id)
     }
 
@@ -404,16 +405,6 @@ impl RequestCorrelation {
         if !self.scope.inspected {
             crate::telemetry::emit_decision([event], None);
             return;
-        }
-        if let OcsfEvent::HttpActivity(http) = &event
-            && let Some(trace) = self
-                .scope
-                .trace
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_mut()
-        {
-            trace.observe_http(http);
         }
         in_request_scope(&self.scope, || {
             crate::telemetry::emit_inspected_decision([event], Some(&self.scope.span()));
