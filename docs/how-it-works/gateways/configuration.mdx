@@ -2344,9 +2344,10 @@ When configured, service responses return the application address as `url` and
 Create-time exposure returns corresponding preferred, application, and gateway
 URL maps. CLI and SDK callers preserve the application origin, including its
 port, when the gateway is reached through a port-forward. Without `public_url`,
-the existing gateway URL behavior remains. Replayed mutations retain their
-original resource identities and use the current URL configuration. A configured
-URL does not mean that a supervisor installed the route or ingress is ready.
+the existing gateway URL behavior remains. Idempotent retries preserve the
+original `url` and `service_urls` values. The explicit application and gateway
+fields use the current URL configuration. A configured URL does not mean that a
+supervisor installed the route or ingress is ready.
 
 Upgrade the CLI alongside the gateway when enabling `public_url`. Older CLI
 versions can replace the public application port with the gateway connection's

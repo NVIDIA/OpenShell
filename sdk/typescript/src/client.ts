@@ -247,8 +247,8 @@ export interface SandboxRef {
   createdFromWorkloadTemplate?: SandboxWorkloadTemplateProvenance;
   /** Service URLs returned by creation, keyed by service name. */
   serviceUrls: Record<string, string>;
-  applicationServiceUrls: Record<string, string>;
-  gatewayServiceUrls: Record<string, string>;
+  applicationServiceUrls?: Record<string, string>;
+  gatewayServiceUrls?: Record<string, string>;
   restartCount: number;
   /** Creation time in epoch milliseconds; absent when the gateway omits it. */
   createdAtMs?: number;

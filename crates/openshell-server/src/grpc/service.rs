@@ -519,10 +519,15 @@ fn service_endpoint_response(
         ..Default::default()
     };
     refresh_response_urls(state, &mut response);
+    response.url = if response.application_url.is_empty() {
+        response.gateway_url.clone()
+    } else {
+        response.application_url.clone()
+    };
     response
 }
 
-/// Recompute presentation from current configuration, including durable replays.
+/// Refresh explicit access paths without changing a replay's recorded URL.
 pub(super) fn refresh_response_urls(state: &ServerState, response: &mut ServiceEndpointResponse) {
     let Some(endpoint) = response.endpoint.as_ref() else {
         return;
@@ -544,11 +549,6 @@ pub(super) fn refresh_response_urls(state: &ServerState, response: &mut ServiceE
             state.config.service_routing_discriminator(),
         )
         .unwrap_or_default();
-    response.url = if response.application_url.is_empty() {
-        response.gateway_url.clone()
-    } else {
-        response.application_url.clone()
-    };
 }
 
 #[allow(clippy::result_large_err)]
@@ -818,8 +818,9 @@ mod tests {
             domain: "services.example.com".into(),
             public_url: Some("https://services.example.com:10443".into()),
         };
-        let mut response = ServiceEndpointResponse {
-            endpoint: Some(ServiceEndpoint {
+        let response = service_endpoint_response(
+            &state,
+            ServiceEndpoint {
                 metadata: Some(ObjectMeta {
                     workspace: "default".into(),
                     ..Default::default()
@@ -827,10 +828,8 @@ mod tests {
                 sandbox: "demo".into(),
                 name: "web".into(),
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
-        refresh_response_urls(&state, &mut response);
+            },
+        );
         let gateway = url::Url::parse(&response.gateway_url).unwrap();
         let label =
             service_routing::service_route_hash_label("gateway-a", "default", "demo", Some("web"));

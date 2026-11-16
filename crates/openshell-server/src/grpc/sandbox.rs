@@ -4348,15 +4348,14 @@ async fn run_exec_with_russh(
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Replays preserve original service names and sandbox identity while using
-/// current deployment origins. No service mutation is performed here.
+/// Refresh explicit access paths while preserving the recorded service URL map.
 pub(super) fn refresh_response_urls(state: &ServerState, response: &mut SandboxResponse) {
     let Some(sandbox) = response.sandbox.as_ref() else {
         return;
     };
     response.application_service_urls.clear();
     response.gateway_service_urls.clear();
-    for (service, url) in &mut response.service_urls {
+    for service in response.service_urls.keys() {
         let gateway = crate::service_routing::endpoint_url(
             &state.config,
             sandbox.object_workspace(),
@@ -4372,8 +4371,7 @@ pub(super) fn refresh_response_urls(state: &ServerState, response: &mut SandboxR
         );
         response
             .gateway_service_urls
-            .insert(service.clone(), gateway.clone());
-        *url = application.clone().unwrap_or(gateway);
+            .insert(service.clone(), gateway);
         if let Some(application) = application {
             response
                 .application_service_urls

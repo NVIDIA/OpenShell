@@ -660,17 +660,17 @@ mod tests {
         );
         assert_eq!(*hostname, format!("{label}.services.example.com"));
         assert_eq!(*hostname, report.routes[0].application_hostname);
-        let endpoint = state
-            .store
-            .get_message::<openshell_core::proto::ServiceEndpoint>("endpoint")
-            .await
-            .unwrap()
-            .unwrap();
-        let mut response = openshell_core::proto::ServiceEndpointResponse {
-            endpoint: Some(endpoint),
-            ..Default::default()
-        };
-        super::super::service::refresh_response_urls(&state, &mut response);
+        let response = super::super::service::handle_get_service(
+            &state,
+            authed_request(openshell_core::proto::GetServiceRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                sandbox: "demo".into(),
+                name: "web".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
         assert_eq!(
             response.application_url,
             format!("https://{hostname}:10443/")
