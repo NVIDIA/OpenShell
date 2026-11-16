@@ -142,8 +142,10 @@ impl CliChild {
         Ok(())
     }
 
-    /// Kill the CLI and wait for it to exit.
+    /// Close stdin, kill the CLI, and wait for it to exit. Closing stdin ends
+    /// processes that inherited it, such as the `ssh` of `sandbox connect`.
     pub async fn kill(&mut self) -> Result {
+        self.close_stdin();
         self.child
             .kill()
             .await
@@ -362,6 +364,33 @@ mod tests {
         assert_eq!(child.try_wait().unwrap(), None);
         child.signal(libc::SIGTERM).unwrap();
         assert_eq!(child.wait(TIMEOUT).await.unwrap(), 42);
+    }
+
+    /// `sandbox connect` hands its stdin to an `ssh` child, so killing the CLI
+    /// must close stdin for that child to see end of file and exit. A
+    /// background job reads `/dev/null` unless given stdin, hence fd 3.
+    #[tokio::test]
+    async fn kill_closes_stdin_for_processes_that_inherited_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("eof");
+        let mut child = sh()
+            .spawn([
+                "-c",
+                "exec 3<&0; (cat <&3 >/dev/null; touch \"$1\") & echo ready; wait",
+                "sh",
+                marker.to_str().unwrap(),
+            ])
+            .unwrap();
+        assert_eq!(child.stdout_line(TIMEOUT).await.unwrap(), "ready");
+        child.kill().await.unwrap();
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while !marker.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the process that inherited stdin did not read end of file"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
