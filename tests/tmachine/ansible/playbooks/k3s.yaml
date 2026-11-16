@@ -57,23 +57,6 @@
       retries: 12
       delay: 5
 
-    # The k3s-ha installer starts PostgreSQL from this fixture. Its image is
-    # pinned by digest and pulled IfNotPresent, so pulling it here keeps it in
-    # the cached setup layer instead of pulling it on every install.
-    - name: Pull the PostgreSQL fixture image
-      ansible.builtin.command:
-        argv: [/usr/local/bin/k3s, crictl, pull, "{{ postgres_image }}"]
-      vars:
-        postgres_image: >-
-          {{ (lookup('ansible.builtin.file', openshell_postgres_fixture)
-          | ansible.builtin.from_yaml_all
-          | selectattr('kind', 'equalto', 'Deployment') | first)
-          .spec.template.spec.containers[0].image }}
-      register: postgres_pull
-      until: postgres_pull.rc == 0
-      retries: 3
-      delay: 5
-
     - name: Download Helm installer
       ansible.builtin.get_url:
         url: https://raw.githubusercontent.com/helm/helm/06468084e85c244c712834933d25ea232a4c2093/scripts/get-helm-4
