@@ -39,8 +39,17 @@ fn as_http(event: &OcsfEvent) -> Option<&HttpActivityEvent> {
 /// a span. The span describes the denied HTTP record, or the first HTTP record
 /// when only a companion finding is denied. A saved `parent` keeps the span in
 /// the connect trace after authorization exits.
+///
+/// An inspected request already owns an all-outcome span. Its ambient request
+/// scope suppresses denial-only spans even for legacy emitters and when tracing
+/// is disabled, filtered, or unsampled.
 #[allow(clippy::disallowed_macros)]
 pub fn emit_decision(events: impl IntoIterator<Item = OcsfEvent>, parent: Option<&tracing::Span>) {
+    if crate::l7::correlation::is_inspected_request() {
+        let request_span = crate::l7::correlation::current_request_span();
+        emit_inspected_decision(events, request_span.as_ref());
+        return;
+    }
     let events: Vec<_> = events.into_iter().collect();
     let span = if events.iter().any(is_denied) {
         events

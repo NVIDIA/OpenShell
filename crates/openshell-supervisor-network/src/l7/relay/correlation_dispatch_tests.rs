@@ -7,7 +7,7 @@ use super::L7EvalContext;
 use crate::l7::L7EndpointConfig;
 use crate::opa::{NetworkInput, OpaEngine, TunnelPolicyEngine};
 use crate::test_support::request_tracing::RequestTracing;
-use crate::test_support::{assert_http_request_records, response_request_id as request_id};
+use crate::test_support::response_request_id as request_id;
 use opentelemetry_sdk::trace::{Sampler, SpanData};
 use std::future::Future;
 use std::path::PathBuf;
@@ -309,33 +309,61 @@ async fn run_exchange(
     }
 }
 
-fn assert_primary_record<'a>(
+fn assert_control_records<'a>(
     exchange: &'a TracedOperation<Exchange>,
-    engine_type: &str,
-    status: u16,
-    action: &str,
+    expected: &[(&str, &str)],
+    finding_uids: &[&str],
     path: &str,
-) -> &'a serde_json::Value {
+) -> Vec<&'a serde_json::Value> {
     let receipt = request_id(&exchange.output.response);
     assert!(
         uuid::Uuid::parse_str(receipt).is_ok(),
         "canonical receipt: {receipt}"
     );
-    let primary: Vec<_> = exchange
-        .events
-        .iter()
-        .filter(|event| event["class_uid"] == 4002)
-        .collect();
-    assert_eq!(primary.len(), 1, "one HTTP Activity: {:?}", exchange.events);
-    let event = primary[0];
-    assert_eq!(event["metadata"]["correlation_uid"], receipt);
-    assert_eq!(event["firewall_rule"]["type"], engine_type);
-    assert_eq!(event["http_response"]["code"], status);
-    assert_eq!(event["action"], action);
-    assert_eq!(event["http_request"]["url"]["path"], path);
+    assert_eq!(
+        exchange.events.len(),
+        expected.len() + finding_uids.len(),
+        "{:?}",
+        exchange.events
+    );
+    for (sequence, event) in exchange.events.iter().enumerate() {
+        assert_eq!(event["metadata"]["correlation_uid"], receipt);
+        assert_eq!(event["unmapped"]["request_sequence"], sequence + 1);
+    }
+    for (sequence, (event, (engine_type, action))) in
+        exchange.events.iter().zip(expected).enumerate()
+    {
+        assert_eq!(event["class_uid"], 4002);
+        assert_eq!(event["unmapped"]["request_sequence"], sequence + 1);
+        assert_eq!(event["firewall_rule"]["type"], *engine_type);
+        assert_eq!(event["action"], *action);
+        assert_eq!(event["http_request"]["url"]["path"], path);
+        assert!(
+            event.get("http_response").is_none(),
+            "delivery status must not be overlaid on a control decision: {event}"
+        );
+    }
+    for (event, uid) in exchange.events[expected.len()..].iter().zip(finding_uids) {
+        assert_eq!(event["class_uid"], 2004);
+        assert_eq!(event["finding_info"]["uid"], *uid);
+        assert_eq!(event["action"], "Denied");
+        assert!(event.get("trace").is_none());
+    }
+    exchange.events[..expected.len()].iter().collect()
+}
+
+fn assert_policy_record<'a>(
+    exchange: &'a TracedOperation<Exchange>,
+    engine_type: &str,
+    action: &str,
+    path: &str,
+) -> &'a serde_json::Value {
+    let event = assert_control_records(exchange, &[(engine_type, action)], &[], path)[0];
+    assert_eq!(event["unmapped"]["http_event_kind"], "decision");
+    assert!(event.get("status").is_none());
     assert!(
         event.get("trace").is_none(),
-        "receipts must work without tracing"
+        "receipts work without tracing"
     );
     event
 }
@@ -487,12 +515,14 @@ async fn inspected_allow_creates_only_the_stages_that_run() {
                 assert_eq!(names.contains(&name), expected, "{name}: {names:?}");
             }
         }
-        let (record, _) = assert_http_request_records(&evidence.events, 0);
-        assert_eq!(
-            record["metadata"]["correlation_uid"],
-            request_id(&evidence.output.response)
+        let records = assert_control_records(&evidence, &[("l7", "Allowed")], &[], "/item");
+        assert!(records[0].get("status").is_none());
+        assert!(
+            records[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("L7_REQUEST allow ")
         );
-        assert_eq!(record["action"], "Allowed");
     }
 }
 
@@ -532,16 +562,32 @@ async fn request_middleware_block_never_creates_a_denial_only_span() {
                     .all(|span| span.name != "openshell.upstream.send")
             );
         }
-        let (record, companions) = assert_http_request_records(&evidence.events, 1);
-        assert_eq!(companions[0]["unmapped"]["middleware_phase"], "request");
-        assert_eq!(companions[0]["action"], "Denied");
-        assert!(companions[0].get("http_response").is_none());
-        assert_eq!(
-            record["metadata"]["correlation_uid"],
-            request_id(&evidence.output.response)
+        let records = assert_control_records(
+            &evidence,
+            &[("l7", "Allowed"), ("middleware", "Denied")],
+            &["openshell.middleware.failure"],
+            "/item",
         );
-        assert_eq!(record["action"], "Denied");
-        assert_eq!(record["http_response"]["code"], 403);
+        assert_eq!(records[0]["unmapped"]["http_event_kind"], "decision");
+        assert!(records[0].get("status").is_none());
+        assert!(
+            records[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("L7_REQUEST allow ")
+        );
+        assert_eq!(
+            records[1]["unmapped"]["http_event_kind"],
+            "middleware_invocation"
+        );
+        assert_eq!(records[1]["unmapped"]["middleware_phase"], "request");
+        assert_eq!(records[1]["status"], "Failure");
+        assert!(
+            records[1]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("MIDDLEWARE request test/block-request decision=Deny")
+        );
     }
 }
 
@@ -609,13 +655,17 @@ async fn inspected_keep_alive_requests_have_distinct_receipts_without_tracing() 
     assert_eq!(
         records.len(),
         2,
-        "one primary per inspected request: {records:?}"
+        "one policy decision per request: {records:?}"
     );
     for (record, receipt) in records.iter().zip(receipts) {
         assert!(uuid::Uuid::parse_str(receipt).is_ok());
         assert_eq!(record["metadata"]["correlation_uid"], receipt);
         assert_eq!(record["action"], "Allowed");
-        assert_eq!(record["http_response"]["code"], 200);
+        assert!(record.get("http_response").is_none());
+        assert!(record.get("status").is_none());
+        assert_eq!(record["firewall_rule"]["type"], "l7");
+        assert_eq!(record["unmapped"]["http_event_kind"], "decision");
+        assert_eq!(record["unmapped"]["request_sequence"], 1);
         assert_eq!(record["http_request"]["url"]["path"], "/item");
         assert!(record.get("trace").is_none());
         assert!(
@@ -643,7 +693,7 @@ async fn production_single_mcp_allow_correlates_record_and_response_receipt() {
             .starts_with(b"POST /mcp HTTP/1.1\r\n")
     );
     assert!(exchange.output.response.starts_with(b"HTTP/1.1 200 OK\r\n"));
-    assert_primary_record(&exchange, "l7-mcp", 200, "Allowed", "/mcp");
+    assert_policy_record(&exchange, "l7-mcp", "Allowed", "/mcp");
 }
 
 #[tokio::test]
@@ -671,7 +721,7 @@ async fn production_single_mcp_invalid_version_correlates_denial_and_receipt() {
         String::from_utf8_lossy(&exchange.output.response)
             .contains("unsupported_mcp_protocol_version")
     );
-    assert_primary_record(&exchange, "l7-mcp", 400, "Denied", "/mcp");
+    assert_policy_record(&exchange, "l7-mcp", "Denied", "/mcp");
 }
 
 #[tokio::test]
@@ -695,7 +745,7 @@ async fn production_single_mcp_policy_deny_correlates_record_and_receipt() {
             .response
             .starts_with(b"HTTP/1.1 403 Forbidden\r\n")
     );
-    let event = assert_primary_record(&exchange, "l7-mcp", 403, "Denied", "/mcp");
+    let event = assert_policy_record(&exchange, "l7-mcp", "Denied", "/mcp");
     assert!(
         event["message"]
             .as_str()
@@ -741,5 +791,5 @@ network_policies:
             .starts_with(b"POST /graphql HTTP/1.1\r\n")
     );
     assert!(exchange.output.response.starts_with(b"HTTP/1.1 200 OK\r\n"));
-    assert_primary_record(&exchange, "l7-graphql", 200, "Allowed", "/graphql");
+    assert_policy_record(&exchange, "l7-graphql", "Allowed", "/graphql");
 }

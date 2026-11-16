@@ -1031,13 +1031,33 @@ async fn token_grant_refusal_never_creates_a_denial_only_span() {
                     .all(|span| span.name != "openshell.upstream.send")
             );
         }
-        let (record, _) = crate::test_support::assert_http_request_records(&evidence.events, 0);
-        assert_eq!(record["action"], "Denied");
-        assert_eq!(record["http_response"]["code"], 502);
-        assert_eq!(
-            record["metadata"]["correlation_uid"],
-            crate::test_support::response_request_id(evidence.output.as_bytes())
+        let records: Vec<_> = evidence
+            .events
+            .iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(records.len(), 2, "{:?}", evidence.events);
+        assert_eq!(records[0]["action"], "Allowed");
+        assert!(
+            records[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("L7_REQUEST allow ")
         );
+        assert_eq!(records[1]["action"], "Denied");
+        assert!(
+            records[1]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Token grant failed ")
+        );
+        for record in records {
+            assert!(record.get("http_response").is_none());
+            assert_eq!(
+                record["metadata"]["correlation_uid"],
+                crate::test_support::response_request_id(evidence.output.as_bytes())
+            );
+        }
     }
 }
 

@@ -153,7 +153,7 @@ ocsf_emit!(event);
 
 - `crate::ocsf_ctx()` returns the process-wide `EventContext`. It is always available (falls back to defaults in tests).
 - `ocsf_emit!()` is non-blocking and cannot panic. It stores the event in a thread-local and emits via `tracing::info!()`.
-- In `openshell-supervisor-network`, route inspected request records through `RequestCorrelation`, which uses their existing request span without creating a denial-only span. Other egress decisions use `crate::telemetry::egress_emit!` or `crate::telemetry::emit_decision`. Clippy rejects direct `ocsf_emit!` calls there.
+- In `openshell-supervisor-network`, the inspected request scope automatically correlates all OCSF records at emission, including findings, and uses the request span without creating a denial-only span. Emit through `crate::telemetry::egress_emit!` or `crate::telemetry::emit_decision`; Clippy rejects direct `ocsf_emit!` calls there.
 - The shorthand layer and JSONL layer extract the event from the thread-local. The shorthand format is derived automatically from the builder fields.
 - For security findings, **dual-emit**: one domain event (e.g., `SshActivityBuilder`) AND one `DetectionFindingBuilder` for the same incident.
 - Never log secrets, credentials, or query parameters in OCSF messages. The OCSF JSONL file may be shipped to external systems.

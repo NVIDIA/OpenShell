@@ -441,7 +441,6 @@ where
         }
         Ok(failure) if committed => {
             if let Some(correlation) = response_correlation {
-                correlation.record_enforcement_block();
                 correlation.record_failure(
                     if failure.denial.is_some() {
                         HttpOutcome::Denied
@@ -1007,7 +1006,7 @@ mod tests {
     use tracing::instrument::WithSubscriber as _;
 
     #[test]
-    fn response_hook_invocations_survive_request_consolidation_without_tracing() {
+    fn response_hook_invocations_keep_individual_correlated_records_without_tracing() {
         let capture = RequestTracing::new(None);
         tracing::subscriber::with_default(capture.subscriber(), || {
             let request = L7Request {
@@ -1062,16 +1061,18 @@ mod tests {
                     },
                 );
                 if outcome == HttpStageOutcome::WholeBody {
-                    correlation.response_selected(200);
+                    correlation.record_response_status(200);
                 }
             }
         });
 
         let records = capture.events.json_events();
-        let (primary, invocations) = crate::test_support::assert_http_request_records(&records, 2);
-        assert_eq!(primary["firewall_rule"]["type"], "l7-rest");
-        assert_eq!(primary["action"], "Allowed");
-        assert_eq!(primary["http_response"]["code"], 200);
+        assert_eq!(records.len(), 3);
+        let policy = &records[0];
+        assert_eq!(policy["firewall_rule"]["type"], "l7-rest");
+        assert_eq!(policy["action"], "Allowed");
+        assert!(policy.get("http_response").is_none());
+        let invocations = &records[1..];
         for (event, (outcome, input_bytes)) in
             invocations.iter().zip([("wholebody", 0), ("unchanged", 5)])
         {
@@ -1125,9 +1126,8 @@ mod tests {
                 };
                 let (mut relay, mut app) = tokio::io::duplex(4096);
                 {
-                    let mut audited = correlation.observe_response(&mut relay);
                     let mut writer = ResponseWriter {
-                        client: &mut audited,
+                        client: &mut relay,
                         status_line: "HTTP/1.1 200 OK",
                         headers: &parsed.headers,
                         parsed: &parsed,
@@ -1171,10 +1171,7 @@ mod tests {
                 );
                 assert_eq!(receipts.next(), None);
                 assert!(!response.contains("upstream-forgery"));
-                let events = capture.events.json_events();
-                assert_eq!(events.len(), 1);
-                assert_eq!(events[0]["metadata"]["correlation_uid"], "pipeline-receipt");
-                assert_eq!(events[0]["http_response"]["code"], 200);
+                assert!(capture.events.json_events().is_empty());
             }
             .with_subscriber(capture.subscriber())
             .await;

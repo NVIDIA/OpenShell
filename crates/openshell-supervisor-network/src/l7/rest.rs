@@ -940,36 +940,12 @@ where
     U: AsyncRead + AsyncWrite + Unpin,
 {
     relay_http_request_with_response_middleware_guarded_observed(
-        req, client, upstream, options, None, None,
+        req, client, upstream, options, None, None, None,
     )
     .await
 }
 
 pub(crate) async fn relay_http_request_with_response_middleware_guarded_observed<C, U>(
-    req: &L7Request,
-    client: &mut C,
-    upstream: &mut U,
-    options: RelayRequestOptions<'_>,
-    response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
-    observer: Option<&EndpointObserver>,
-) -> Result<RelayOutcome>
-where
-    C: AsyncRead + AsyncWrite + Unpin,
-    U: AsyncRead + AsyncWrite + Unpin,
-{
-    relay_http_request_with_response_middleware_guarded_observed_correlated(
-        req,
-        client,
-        upstream,
-        options,
-        response_middleware,
-        observer,
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn relay_http_request_with_response_middleware_guarded_observed_correlated<C, U>(
     req: &L7Request,
     client: &mut C,
     upstream: &mut U,
@@ -1129,7 +1105,7 @@ where
             raw_header,
             body_length: req.body_length,
         };
-        if !crate::l7::relay::enforce_final_mcp_protocol_version_correlated(
+        if !crate::l7::relay::enforce_final_mcp_protocol_version(
             validation.config,
             &outgoing,
             client,
@@ -6851,6 +6827,7 @@ mod tests {
                     },
                     None,
                     Some(&observer),
+                    None,
                 ),
             )
             .await

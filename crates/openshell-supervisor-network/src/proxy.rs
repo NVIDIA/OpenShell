@@ -2087,24 +2087,6 @@ fn build_forward_allow_ocsf_event(
         .build()
 }
 
-fn build_forward_inspection_rejection_ocsf_event(
-    method: &str,
-    reason: &'static str,
-) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .http_request(HttpRequest {
-            http_method: method.parse().expect("HTTP method parsing is infallible"),
-            url: None,
-        })
-        .action(ActionId::Denied)
-        .disposition(DispositionId::Blocked)
-        .severity(SeverityId::Medium)
-        .status(StatusId::Failure)
-        .status_detail(reason)
-        .message("FORWARD request rejected before policy evaluation")
-        .build()
-}
-
 fn build_forward_rejection_event(
     host: &str,
     port: u16,
@@ -5439,26 +5421,7 @@ struct ForwardResponseMiddleware<'a> {
     exchange: &'a crate::l7::middleware::HttpMiddlewareExchange,
 }
 
-#[cfg(test)]
 async fn relay_rewritten_forward_request<C, U>(
-    method: &str,
-    path: &str,
-    rewritten: Vec<u8>,
-    client: &mut C,
-    upstream: &mut U,
-    options: ForwardRelayOptions<'_>,
-) -> Result<crate::l7::provider::RelayOutcome>
-where
-    C: TokioAsyncRead + TokioAsyncWrite + Unpin,
-    U: TokioAsyncRead + TokioAsyncWrite + Unpin,
-{
-    relay_rewritten_forward_request_correlated(
-        method, path, rewritten, client, upstream, options, None,
-    )
-    .await
-}
-
-async fn relay_rewritten_forward_request_correlated<C, U>(
     method: &str,
     path: &str,
     rewritten: Vec<u8>,
@@ -5492,7 +5455,7 @@ where
             .response_relay(&req, middleware.ctx, middleware.scheme)
     });
 
-    crate::l7::rest::relay_http_request_with_response_middleware_guarded_observed_correlated(
+    crate::l7::rest::relay_http_request_with_response_middleware_guarded_observed(
         &req,
         client,
         upstream,
@@ -5592,6 +5555,54 @@ async fn inject_token_grant_for_forward_request(
 // dispatch; bundling them into a struct would just shift the noise into call sites.
 #[allow(clippy::too_many_arguments)]
 async fn handle_forward_proxy(
+    method: &str,
+    target_uri: &str,
+    buf: &[u8],
+    used: usize,
+    client: &mut ProxyClient,
+    supplied_identity: Option<&Result<ContractBinaryIdentity, ResolveError>>,
+    socket_addrs: Option<(SocketAddr, SocketAddr)>,
+    opa_engine: Arc<OpaEngine>,
+    identity_cache: Arc<BinaryIdentityCache>,
+    entrypoint_pid: Arc<AtomicU32>,
+    policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    agent_proposals: openshell_core::proposals::AgentProposals,
+    backend_host_gateway: Arc<Option<IpAddr>>,
+    trusted_host_gateway: Arc<Option<IpAddr>>,
+    provider_credentials: Option<ProviderCredentialState>,
+    secret_resolver: Option<Arc<SecretResolver>>,
+    denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+    activity_tx: Option<&ActivitySender>,
+    endpoint_observation_tx: Option<EndpointObservationSender>,
+) -> Result<()> {
+    Box::pin(crate::l7::correlation::scope_connection(
+        handle_forward_proxy_inner(
+            method,
+            target_uri,
+            buf,
+            used,
+            client,
+            supplied_identity,
+            socket_addrs,
+            opa_engine,
+            identity_cache,
+            entrypoint_pid,
+            policy_local_ctx,
+            agent_proposals,
+            backend_host_gateway,
+            trusted_host_gateway,
+            provider_credentials,
+            secret_resolver,
+            denial_tx,
+            activity_tx,
+            endpoint_observation_tx,
+        ),
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_forward_proxy_inner(
     method: &str,
     target_uri: &str,
     buf: &[u8],
@@ -5978,30 +5989,6 @@ async fn handle_forward_proxy(
     let request_correlation = inspected.then_some(&correlation);
     let receipt_id =
         request_correlation.map(crate::l7::correlation::RequestCorrelation::request_id);
-    let mut audited_client = correlation.observe_response(client);
-    let client = &mut audited_client;
-    if inspected {
-        let mut primary = build_forward_allow_ocsf_event(
-            workload_addr,
-            method,
-            &host_lc,
-            port,
-            &telemetry_path,
-            &binary_str,
-            &pid_str,
-            &ancestors_str,
-            &cmdline_str,
-            policy_str,
-        );
-        if l7_inspected && let openshell_ocsf::OcsfEvent::HttpActivity(event) = &mut primary {
-            event.action = None;
-            event.disposition = None;
-            event.base.status = None;
-            event.firewall_rule = None;
-            event.base.message = Some("FORWARD request awaiting inspection".into());
-        }
-        correlation.emit(primary);
-    }
     forward_request_bytes = correlation_request.raw_header;
     if let Some(route) = decision
         .endpoint
@@ -6091,33 +6078,7 @@ async fn handle_forward_proxy(
             return Ok(());
         };
         let Some(l7_config) = select_l7_config_for_path(&route.configs, &redacted_path) else {
-            let reason = "no L7 endpoint path matched request";
             correlation.record_rejection(403, HttpOutcome::Denied, None);
-            correlation.emit(
-                HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::for_http_method(method))
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Medium)
-                    .status(StatusId::Failure)
-                    .http_request(HttpRequest::new(
-                        method,
-                        OcsfUrl::new("http", &host_lc, &telemetry_path, port),
-                    ))
-                    .http_response(HttpResponse { code: 403 })
-                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                    .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                    .actor_process(
-                        Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                            .with_cmd_line(&cmdline_str),
-                    )
-                    .firewall_rule(policy_str, "l7")
-                    .message(format!(
-                        "FORWARD_L7 denied {method} {host_lc}:{port}{telemetry_path}"
-                    ))
-                    .status_detail(reason)
-                    .build(),
-            );
             emit_activity_simple(activity_tx, true, "l7_policy");
             respond(
                 client,
@@ -6152,10 +6113,6 @@ async fn handle_forward_proxy(
             && crate::l7::path::canonical_path_has_encoded_slash(&path)
         {
             correlation.record_rejection(400, HttpOutcome::Denied, None);
-            correlation.emit(build_forward_inspection_rejection_ocsf_event(
-                method,
-                "invalid_request_target",
-            ));
             correlation.emit(build_forward_l7_parse_rejection_ocsf_event(
                 workload_addr,
                 method,
@@ -6275,10 +6232,6 @@ async fn handle_forward_proxy(
                 Ok(info) => info,
                 Err(e) => {
                     correlation.record_rejection(400, HttpOutcome::Denied, None);
-                    correlation.emit(build_forward_inspection_rejection_ocsf_event(
-                        method,
-                        "invalid_graphql_request",
-                    ));
                     let event = build_forward_rejection_event(
                         &host_lc,
                         port,
@@ -6333,10 +6286,6 @@ async fn handle_forward_proxy(
                     Ok(body) => body,
                     Err(e) => {
                         correlation.record_rejection(400, HttpOutcome::Denied, None);
-                        correlation.emit(build_forward_inspection_rejection_ocsf_event(
-                            method,
-                            "invalid_jsonrpc_request",
-                        ));
                         let event = build_forward_rejection_event(
                             &host_lc,
                             port,
@@ -6424,11 +6373,6 @@ async fn handle_forward_proxy(
             (false, crate::l7::EnforcementMode::Audit) => "audit",
             (false, crate::l7::EnforcementMode::Enforce) => "deny",
         };
-        if !allowed
-            && (l7_config.config.enforcement != crate::l7::EnforcementMode::Audit || force_deny)
-        {
-            correlation.record_enforcement_block();
-        }
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
@@ -6940,7 +6884,6 @@ async fn handle_forward_proxy(
     };
     if let Some(guard) = credential_generation {
         guard.ensure_current().inspect_err(|_| {
-            correlation.record_enforcement_block();
             correlation.record_outcome(HttpOutcome::PlatformError);
         })?;
     }
@@ -7048,7 +6991,7 @@ async fn handle_forward_proxy(
                 &upstream_target,
                 rewritten,
             )?;
-            if !crate::l7::relay::enforce_final_mcp_protocol_version_correlated(
+            if !crate::l7::relay::enforce_final_mcp_protocol_version(
                 config,
                 &request,
                 client,
@@ -7199,7 +7142,7 @@ async fn handle_forward_proxy(
     let signing_region = forward_upgrade_config
         .as_ref()
         .map_or("", |config| config.signing_region.as_str());
-    let outcome_result = relay_rewritten_forward_request_correlated(
+    let outcome_result = relay_rewritten_forward_request(
         method,
         &upstream_target,
         rewritten,
@@ -7278,20 +7221,21 @@ async fn handle_forward_proxy(
     )
     .await?;
 
-    if !inspected {
-        correlation.emit(build_forward_allow_ocsf_event(
-            workload_addr,
-            method,
-            &host_lc,
-            port,
-            &telemetry_path,
-            &binary_str,
-            &pid_str,
-            &ancestors_str,
-            &cmdline_str,
-            policy_str,
-        ));
-    }
+    // The request has now survived middleware, token grant, credential
+    // rewriting, generation checks, and the HTTP relay. Only now record the
+    // final allowed outcome.
+    correlation.emit(build_forward_allow_ocsf_event(
+        workload_addr,
+        method,
+        &host_lc,
+        port,
+        &telemetry_path,
+        &binary_str,
+        &pid_str,
+        &ancestors_str,
+        &cmdline_str,
+        policy_str,
+    ));
     emit_forward_success_activity(activity_tx, l7_activity_pending);
 
     match outcome {
@@ -12116,6 +12060,7 @@ network_policies:
                 }),
                 endpoint_observer: None,
             },
+            None,
         )
         .await
         .expect("plaintext forward relay");
@@ -12205,6 +12150,7 @@ network_policies:
                 }),
                 endpoint_observer: None,
             },
+            None,
         )
         .await
         .expect("plaintext forward response denial");
@@ -12323,6 +12269,7 @@ network_policies:
                 response_middleware: None,
                 endpoint_observer: None,
             },
+            None,
         )
         .await?;
 
@@ -12627,6 +12574,7 @@ network_policies:
                     response_middleware: None,
                     endpoint_observer: None,
                 },
+                None,
             )
             .await?;
             if let crate::l7::provider::RelayOutcome::Upgraded {
@@ -15210,6 +15158,7 @@ network_policies:
                 response_middleware: None,
                 endpoint_observer: None,
             },
+            None,
         )
         .await
         .expect_err("unresolved body placeholder should fail closed");
@@ -15294,6 +15243,7 @@ network_policies:
                 response_middleware: None,
                 endpoint_observer: None,
             },
+            None,
         )
         .await
         .expect_err("SigV4 endpoint mismatch should fail closed");
@@ -15385,6 +15335,7 @@ network_policies:
                 response_middleware: None,
                 endpoint_observer: None,
             },
+            None,
         )
         .await;
         assert!(
@@ -15438,6 +15389,7 @@ network_policies:
                 response_middleware: None,
                 endpoint_observer: None,
             },
+            None,
         )
         .await;
         assert!(result.is_err(), "forward relay must reject CL/TE ambiguity");

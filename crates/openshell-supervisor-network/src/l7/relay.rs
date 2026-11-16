@@ -293,12 +293,8 @@ async fn reject_request_authority_mismatch<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let activity = build_request_authority_mismatch_event(ctx, method);
-    let finding = build_request_authority_mismatch_finding(ctx);
     if let Some(correlation) = correlation {
         correlation.record_rejection(403, HttpOutcome::Denied, None);
-        correlation.emit(activity);
-        correlation.emit(finding);
         crate::l7::rest::send_json_response_with_request_id(
             &ctx.policy_name,
             serde_json::json!({
@@ -311,7 +307,6 @@ where
         )
         .await?;
     } else {
-        crate::telemetry::emit_decision([activity, finding], None);
         crate::l7::rest::send_json_response(
             &ctx.policy_name,
             serde_json::json!({
@@ -323,6 +318,13 @@ where
         )
         .await?;
     }
+    crate::l7::correlation::emit_request_events(
+        correlation,
+        [
+            build_request_authority_mismatch_event(ctx, method),
+            build_request_authority_mismatch_finding(ctx),
+        ],
+    );
     Ok(())
 }
 
@@ -539,32 +541,8 @@ where
 
 /// Reinspect the buffered outgoing MCP request after request transformations.
 /// The forwarding adapter must call this before any upstream request write.
-#[cfg(test)]
-pub(crate) async fn enforce_final_mcp_protocol_version<W>(
-    config: &L7EndpointConfig,
-    request: &crate::l7::provider::L7Request,
-    client: &mut W,
-    ctx: &L7EvalContext,
-    redacted_target: &str,
-    observer: Option<&EndpointObserver>,
-) -> Result<bool>
-where
-    W: AsyncWrite + Unpin,
-{
-    enforce_final_mcp_protocol_version_correlated(
-        config,
-        request,
-        client,
-        ctx,
-        redacted_target,
-        observer,
-        None,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn enforce_final_mcp_protocol_version_correlated<W>(
+pub(crate) async fn enforce_final_mcp_protocol_version<W>(
     config: &L7EndpointConfig,
     request: &crate::l7::provider::L7Request,
     client: &mut W,
@@ -722,6 +700,24 @@ where
             "message": "Credential placeholder could not be resolved",
         })
     };
+    if let Some(correlation) = correlation {
+        let (response_code, outcome) = if endpoint_mismatch || placement_mismatch {
+            (403, HttpOutcome::Denied)
+        } else {
+            (500, HttpOutcome::PlatformError)
+        };
+        correlation.record_rejection(response_code, outcome, None);
+        crate::l7::rest::send_json_response_with_request_id(
+            &ctx.policy_name,
+            body,
+            client,
+            status,
+            correlation.request_id(),
+        )
+        .await?;
+    } else {
+        crate::l7::rest::send_json_response(&ctx.policy_name, body, client, status).await?;
+    }
     let mut events = if placement_mismatch {
         vec![
             HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -753,28 +749,7 @@ where
     if endpoint_mismatch {
         events.push(build_credential_endpoint_mismatch_finding(ctx));
     }
-    if let Some(correlation) = correlation {
-        let (response_code, outcome) = if endpoint_mismatch || placement_mismatch {
-            (403, HttpOutcome::Denied)
-        } else {
-            (500, HttpOutcome::PlatformError)
-        };
-        correlation.record_rejection(response_code, outcome, None);
-        for event in events {
-            correlation.emit(event);
-        }
-        crate::l7::rest::send_json_response_with_request_id(
-            &ctx.policy_name,
-            body,
-            client,
-            status,
-            correlation.request_id(),
-        )
-        .await?;
-    } else {
-        crate::telemetry::emit_decision(events, None);
-        crate::l7::rest::send_json_response(&ctx.policy_name, body, client, status).await?;
-    }
+    crate::l7::correlation::emit_request_events(correlation, events);
     Ok(())
 }
 
@@ -1076,13 +1051,7 @@ where
                     observer.observe_credential_failure(false);
                 }
                 if let Some(correlation) = correlation {
-                    correlation.record_enforcement_block();
                     correlation.record_outcome(HttpOutcome::PlatformError);
-                    let mut event = build_credential_resolution_event(ctx, &request.action, false);
-                    if let openshell_ocsf::OcsfEvent::HttpActivity(http) = &mut event {
-                        http.http_response = None;
-                    }
-                    correlation.emit(event);
                 }
                 Err(report)
             } else {
@@ -1536,6 +1505,23 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    crate::l7::correlation::scope_connection(relay_with_route_selection_inner(
+        configs, engine, client, upstream, ctx,
+    ))
+    .await
+}
+
+async fn relay_with_route_selection_inner<C, U>(
+    configs: &[L7EndpointConfig],
+    engine: TunnelPolicyEngine,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // Route selection also owns the full keep-alive loop, so buffered bytes
     // remain available across per-request parsing and authorization.
     let mut client_buffer =
@@ -1582,8 +1568,6 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
-        let mut audited_client = correlation.observe_response(client);
-        let client = &mut audited_client;
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation)).await?;
             return Ok(());
@@ -1703,7 +1687,6 @@ where
                         let detail =
                             parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
                         {
-                            correlation.record_enforcement_block();
                             correlation.record_outcome(HttpOutcome::Denied);
                         }
                         emit_parse_rejection_correlated(
@@ -1748,7 +1731,6 @@ where
                                 ParseRejectionMode::L7Endpoint,
                             );
                             {
-                                correlation.record_enforcement_block();
                                 correlation.record_outcome(HttpOutcome::Denied);
                             }
                             emit_parse_rejection_correlated(
@@ -1810,16 +1792,6 @@ where
         if config.protocol == L7Protocol::Websocket && !websocket_request {
             let reason = "websocket endpoint requires a valid WebSocket upgrade request";
             correlation.record_rejection(403, HttpOutcome::Denied, None);
-            emit_l7_request_log_correlated(
-                ctx,
-                &request_info.action,
-                &redacted_target,
-                "deny",
-                "l7-websocket",
-                reason,
-                None,
-                Some(&correlation),
-            );
             let deny_context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx)
                 .with_request_id(correlation.request_id());
             crate::l7::rest::RestProvider::default()
@@ -1855,11 +1827,6 @@ where
             (false, EnforcementMode::Audit) => "audit",
             (false, EnforcementMode::Enforce) => "deny",
         };
-        {
-            if !allowed && (config.enforcement != EnforcementMode::Audit || force_deny) {
-                correlation.record_enforcement_block();
-            }
-        }
         let engine_type = engine_type_for_protocol(config.protocol);
         let protocol_summary =
             l7_protocol_log_summary(graphql_info.as_ref(), jsonrpc_info.as_ref());
@@ -2559,6 +2526,23 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    crate::l7::correlation::scope_connection(relay_rest_inner(
+        config, engine, client, upstream, ctx,
+    ))
+    .await
+}
+
+async fn relay_rest_inner<C, U>(
+    config: &L7EndpointConfig,
+    engine: &TunnelPolicyEngine,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // Build a provider carrying the per-endpoint canonicalization options so
     // request parsing honors the endpoint's `allow_encoded_slash` setting
     // (e.g. APIs like GitLab that embed `%2F` in path segments).
@@ -2598,8 +2582,6 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
-        let mut audited_client = correlation.observe_response(client);
-        let client = &mut audited_client;
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation)).await?;
             return Ok(());
@@ -2643,16 +2625,6 @@ where
         if config.protocol == L7Protocol::Websocket && !websocket_request {
             let reason = "websocket endpoint requires a valid WebSocket upgrade request";
             correlation.record_rejection(403, HttpOutcome::Denied, None);
-            emit_l7_request_log_correlated(
-                ctx,
-                &request_info.action,
-                &redacted_target,
-                "deny",
-                "l7-websocket",
-                reason,
-                None,
-                Some(&correlation),
-            );
             provider
                 .deny_with_redacted_target(
                     &req,
@@ -2697,9 +2669,6 @@ where
             (false, EnforcementMode::Audit, _) => "audit",
             (false, EnforcementMode::Enforce, _) => "deny",
         };
-        if !allowed && config.enforcement != EnforcementMode::Audit {
-            correlation.record_enforcement_block();
-        }
 
         // Log every L7 decision as an OCSF HTTP Activity event.
         // Uses redacted_target (path only, no query params) to avoid logging secrets.
@@ -3074,6 +3043,23 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    crate::l7::correlation::scope_connection(relay_jsonrpc_inner(
+        config, engine, client, upstream, ctx,
+    ))
+    .await
+}
+
+async fn relay_jsonrpc_inner<C, U>(
+    config: &L7EndpointConfig,
+    engine: &TunnelPolicyEngine,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
     loop {
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
@@ -3118,8 +3104,6 @@ where
         let req = parsed.request;
         let jsonrpc_info = parsed.info;
         let correlation = RequestCorrelation::new(&req, ctx);
-        let mut audited_client = correlation.observe_response(client);
-        let client = &mut audited_client;
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
             config,
@@ -3208,9 +3192,6 @@ where
             (false, EnforcementMode::Audit) => "audit",
             (false, EnforcementMode::Enforce) => "deny",
         };
-        if !allowed && (config.enforcement != EnforcementMode::Audit || force_deny) {
-            correlation.record_enforcement_block();
-        }
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
@@ -3411,6 +3392,23 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    crate::l7::correlation::scope_connection(relay_graphql_inner(
+        config, engine, client, upstream, ctx,
+    ))
+    .await
+}
+
+async fn relay_graphql_inner<C, U>(
+    config: &L7EndpointConfig,
+    engine: &TunnelPolicyEngine,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let provider =
         crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
             allow_encoded_slash: config.allow_encoded_slash,
@@ -3450,8 +3448,6 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
-        let mut audited_client = correlation.observe_response(client);
-        let client = &mut audited_client;
 
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation)).await?;
@@ -3489,7 +3485,6 @@ where
                 } else {
                     let detail =
                         parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
-                    correlation.record_enforcement_block();
                     correlation.record_outcome(HttpOutcome::Denied);
                     emit_parse_rejection_correlated(ctx, &detail, "l7-graphql", Some(&correlation));
                 }
@@ -3550,9 +3545,6 @@ where
             (false, EnforcementMode::Audit) => "audit",
             (false, EnforcementMode::Enforce) => "deny",
         };
-        if !allowed && (config.enforcement != EnforcementMode::Audit || force_deny) {
-            correlation.record_enforcement_block();
-        }
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
@@ -4103,7 +4095,7 @@ fn emit_transformed_body_decision(
             SeverityId::Informational,
         ),
     };
-    let mut event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
         .action(action_id)
         .disposition(disposition_id)
@@ -4114,17 +4106,11 @@ fn emit_transformed_body_decision(
         ))
         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
         .firewall_rule(&ctx.policy_name, engine_type)
-        .status_detail(reason)
         .message(format!(
             "L7_REQUEST_TRANSFORMED {decision_str} {} {}:{}{} reason={}",
             request_info.action, ctx.host, ctx.port, request_info.target, reason
         ))
         .build();
-    if decision_str == "audit"
-        && let openshell_ocsf::OcsfEvent::HttpActivity(http) = &mut event
-    {
-        http.base.unmapped = Some(serde_json::json!({"transformed_body_policy": "audit"}));
-    }
     crate::l7::correlation::emit_request_events(correlation, [event]);
 }
 
@@ -4289,6 +4275,27 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    crate::l7::correlation::scope_connection(relay_passthrough_with_credentials_inner(
+        client,
+        upstream,
+        ctx,
+        generation_guard,
+        middleware_engine,
+    ))
+    .await
+}
+
+async fn relay_passthrough_with_credentials_inner<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+    generation_guard: &PolicyGenerationGuard,
+    middleware_engine: Option<&crate::opa::OpaEngine>,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // Passthrough path: no L7 policy is enforced here, so use default
     // (strict) canonicalization options. Calls to GitLab-style APIs that
     // need `%2F` must be configured as L7 endpoints so the per-endpoint
@@ -4338,8 +4345,6 @@ where
             RequestCorrelation::uninspected()
         };
         let receipt = inspected.then_some(&correlation);
-        let mut audited_client = correlation.observe_response(client);
-        let client = &mut audited_client;
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, receipt).await?;
             return Ok(());
@@ -4658,7 +4663,7 @@ mod trace_tests {
 mod tests {
     use super::*;
     use crate::opa::{NetworkInput, OpaEngine};
-    use crate::test_support::{assert_http_request_records, response_request_id};
+    use crate::test_support::response_request_id;
     use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
     use openshell_core::provider_credentials::ProviderCredentialState;
     use openshell_core::token_grant_failure::{
@@ -4668,6 +4673,20 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::PathBuf;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    fn assert_http_control_records(
+        events: &[serde_json::Value],
+        expected_controls: usize,
+        expected_invocations: usize,
+    ) -> (Vec<&serde_json::Value>, Vec<&serde_json::Value>) {
+        let (invocations, controls): (Vec<_>, Vec<_>) = events
+            .iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .partition(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation");
+        assert_eq!(controls.len(), expected_controls, "{events:?}");
+        assert_eq!(invocations.len(), expected_invocations, "{events:?}");
+        (controls, invocations)
+    }
 
     fn relay_grant_failure() -> TokenGrantFailure {
         TokenGrantFailure::new(
@@ -8530,7 +8549,7 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn transformed_jsonrpc_policy_outcome_has_one_primary_and_shared_receipt() {
+    async fn transformed_jsonrpc_policy_records_keep_their_decisions_and_shared_receipt() {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -8545,23 +8564,48 @@ network_policies:
             .await;
             let request_id = response_request_id(response.as_bytes());
             let events = capture.json_events();
-            let (primary, companions) = assert_http_request_records(&events, 1);
+            let (controls, invocations) = assert_http_control_records(&events, 2, 1);
+            let initial = controls[0];
+            let transformed = controls[1];
+            let companions = invocations;
             assert_eq!(companions[0]["unmapped"]["middleware_phase"], "request");
             assert_eq!(companions[0]["unmapped"]["transformed"], true);
             assert_eq!(companions[0]["metadata"]["correlation_uid"], request_id);
-            assert_eq!(primary["metadata"]["correlation_uid"], request_id);
-            assert_eq!(primary["http_request"]["url"]["path"], "/rpc");
-            assert_eq!(primary["firewall_rule"]["type"], "l7-jsonrpc");
+            assert_eq!(initial["action"], "Allowed");
+            assert!(
+                initial["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("JSONRPC_L7_REQUEST decision=allow ")
+            );
+            for control in &controls {
+                assert_eq!(control["metadata"]["correlation_uid"], request_id);
+                assert_eq!(control["http_request"]["url"]["path"], "/rpc");
+                assert_eq!(control["firewall_rule"]["type"], "l7-jsonrpc");
+                assert!(control.get("http_response").is_none());
+            }
+            assert!(
+                transformed["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("middleware transformation denied")
+            );
+            let sequences: Vec<_> = events
+                .iter()
+                .filter(|event| event["class_uid"] == 4002)
+                .filter_map(|event| event["unmapped"]["request_sequence"].as_u64())
+                .collect();
+            assert_eq!(sequences.len(), 3, "{events:?}");
+            assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
             if enforcement == "enforce" {
                 assert_middleware_failure_response(&response, "jsonrpc_api");
                 assert!(upstream_seen.is_none(), "upstream must not see the request");
-                assert_eq!(primary["action"], "Denied");
-                assert_eq!(primary["http_response"]["code"], 403);
+                assert_eq!(transformed["action"], "Denied");
                 assert!(
-                    primary["status_detail"]
+                    transformed["message"]
                         .as_str()
                         .unwrap()
-                        .contains("middleware transformation denied")
+                        .starts_with("L7_REQUEST_TRANSFORMED deny ")
                 );
             } else {
                 assert!(response.contains("204 No Content"), "{response}");
@@ -8570,9 +8614,13 @@ network_policies:
                         .expect("audited request reaches upstream")
                         .contains("admin.delete")
                 );
-                assert_eq!(primary["action"], "Allowed");
-                assert_eq!(primary["http_response"]["code"], 204);
-                assert_eq!(primary["unmapped"]["transformed_body_policy"], "audit");
+                assert_eq!(transformed["action"], "Allowed");
+                assert!(
+                    transformed["message"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("L7_REQUEST_TRANSFORMED audit ")
+                );
             }
         }
     }
@@ -9463,7 +9511,7 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn passthrough_receipts_require_selected_middleware_and_keep_one_primary() {
+    async fn passthrough_receipts_require_selected_middleware_and_preserve_control_records() {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -9561,38 +9609,26 @@ network_policies:
                 "{forwarded}"
             );
             let records = capture.json_events();
-            let http: Vec<_> = records
-                .iter()
-                .filter(|event| event["class_uid"] == 4002)
-                .collect();
-            let primary: Vec<_> = records
-                .iter()
-                .filter(|event| {
-                    event["class_uid"] == 4002
-                        && if selected {
-                            event["unmapped"]["http_event_kind"] == "request"
-                        } else {
-                            event["unmapped"].get("http_event_kind").is_none()
-                        }
-                })
-                .collect();
-            assert_eq!(primary.len(), 1, "selected={selected}: {records:?}");
-            let companions: Vec<_> = http
-                .iter()
-                .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
-                .collect();
-            assert_eq!(companions.len(), usize::from(selected));
-            assert_eq!(http.len(), primary.len() + companions.len());
+            let (controls, companions) =
+                assert_http_control_records(&records, 1, usize::from(selected));
+            let control = controls[0];
             if selected {
                 assert_eq!(companions[0]["unmapped"]["middleware_phase"], "request");
                 assert_eq!(companions[0]["unmapped"]["failed"], false);
                 assert_eq!(
                     companions[0]["metadata"]["correlation_uid"],
-                    primary[0]["metadata"]["correlation_uid"]
+                    control["metadata"]["correlation_uid"]
                 );
             }
-            assert_eq!(primary[0]["action"], "Allowed");
-            assert_eq!(primary[0]["http_request"]["url"]["path"], "/v1/messages");
+            assert_eq!(control["action"], "Allowed");
+            assert_eq!(control["http_request"]["url"]["path"], "/v1/messages");
+            assert!(
+                control["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("HTTP_REQUEST ")
+            );
+            assert!(control.get("http_response").is_none());
             assert!(
                 !serde_json::to_string(&records)
                     .unwrap()
@@ -9603,8 +9639,7 @@ network_policies:
                 assert!(!response.contains("application-out"));
                 let receipt = response_request_id(response.as_bytes());
                 assert!(uuid::Uuid::parse_str(receipt).is_ok());
-                assert_eq!(primary[0]["metadata"]["correlation_uid"], receipt);
-                assert_eq!(primary[0]["http_response"]["code"], 204);
+                assert_eq!(control["metadata"]["correlation_uid"], receipt);
             } else {
                 assert!(
                     forwarded.contains("X-OpenShell-Request-ID: application-in"),
@@ -9614,7 +9649,7 @@ network_policies:
                     response.contains("X-OpenShell-Request-ID: application-out"),
                     "{response}"
                 );
-                assert!(primary[0]["metadata"].get("correlation_uid").is_none());
+                assert!(control["metadata"].get("correlation_uid").is_none());
             }
         }
     }
@@ -13994,14 +14029,16 @@ network_policies:
                 request_id
             );
             let events = capture.events.json_events();
-            let (primary, companions) = assert_http_request_records(&events, 1);
+            let (controls, companions) = assert_http_control_records(&events, 1, 1);
             assert_eq!(companions[0]["unmapped"]["middleware_phase"], "request");
             assert_eq!(companions[0]["metadata"]["correlation_uid"], request_id);
             assert_eq!(
                 companions[0]["action"],
                 if reject { "Denied" } else { "Allowed" }
             );
-            assert_eq!(primary["metadata"]["correlation_uid"], request_id);
+            assert_eq!(controls[0]["metadata"]["correlation_uid"], request_id);
+            assert_eq!(controls[0]["action"], "Allowed");
+            assert!(controls[0].get("http_response").is_none());
             let spans = capture.spans();
             let stage = |stage_name: &str| {
                 spans
@@ -15007,6 +15044,7 @@ network_policies:
                 &ctx,
                 "/mcp",
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -15039,7 +15077,8 @@ network_policies:
                 &mut response,
                 &ctx,
                 "/mcp",
-                None
+                None,
+                None,
             )
             .await
             .unwrap()
@@ -15490,6 +15529,7 @@ network_policies:
                     &ctx,
                     "/mcp",
                     Some(&observer),
+                    None,
                 )
                 .await;
                 if disconnect_client {
@@ -15602,6 +15642,7 @@ network_policies:
                         &ctx,
                         "/mcp",
                         Some(&observer),
+                        None,
                     )
                     .await
                     .expect("initialize version exemption")
@@ -15626,6 +15667,7 @@ network_policies:
                     &ctx,
                     "/mcp",
                     Some(&observer),
+                    None,
                 )
                 .await;
                 if disconnect_client {
@@ -15734,7 +15776,7 @@ network_policies:
         let correlation =
             RequestCorrelation::with_request_id(&request, &ctx, REQUEST_ID.to_string());
 
-        let allowed = enforce_final_mcp_protocol_version_correlated(
+        let allowed = enforce_final_mcp_protocol_version(
             &config,
             &request,
             &mut relay_client,

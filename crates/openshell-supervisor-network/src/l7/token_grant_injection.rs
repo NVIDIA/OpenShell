@@ -430,6 +430,7 @@ fn report_refused_grant(
                 ctx.host, ctx.port
             ))
             .unmapped("request_id", request_id)
+            .unmapped("http_event_kind", "token_grant")
             .build()],
     );
 }
@@ -494,6 +495,7 @@ async fn inject_selected(
                     ctx.host,
                     ctx.port
                 ))
+                .unmapped("http_event_kind", "token_grant")
                 .build()],
         );
     }

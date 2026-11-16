@@ -21,25 +21,6 @@ pub fn response_request_id(response: &[u8]) -> &str {
         .expect("response carries a request receipt")
 }
 
-pub fn assert_http_request_records(
-    events: &[serde_json::Value],
-    expected_invocations: usize,
-) -> (&serde_json::Value, Vec<&serde_json::Value>) {
-    let (primary, invocations): (Vec<_>, Vec<_>) = events
-        .iter()
-        .filter(|event| event["class_uid"] == 4002)
-        .partition(|event| event["unmapped"]["http_event_kind"] == "request");
-    assert_eq!(primary.len(), 1, "{events:?}");
-    assert_eq!(invocations.len(), expected_invocations, "{events:?}");
-    assert!(
-        invocations
-            .iter()
-            .all(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation"),
-        "unexpected HTTP Activity record: {events:?}"
-    );
-    (primary[0], invocations)
-}
-
 pub fn header_placement_metadata(
     keys: &[&str],
 ) -> std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential> {

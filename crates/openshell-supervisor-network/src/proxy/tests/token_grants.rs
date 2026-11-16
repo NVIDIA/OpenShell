@@ -180,6 +180,7 @@ async fn forward_inspection_retains_installation_through_guarded_write() {
             response_middleware: None,
             endpoint_observer: None,
         },
+        None,
     );
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
         .await

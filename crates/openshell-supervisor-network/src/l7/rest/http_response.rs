@@ -103,15 +103,6 @@ where
         }
 
         if let Some(header_end) = header_end {
-            if options.correlation.is_some()
-                && let Err(error) = validate_http_response_header_block(&buf[..header_end])
-            {
-                if let Some(observer) = options.observer.as_ref() {
-                    observer.observe(EndpointResult::TransportFailed);
-                }
-                record_upstream_response_error(options.correlation, "upstream_response_headers");
-                return Err(error);
-            }
             let header_str = String::from_utf8_lossy(&buf[..header_end]);
             if matches!(
                 parse_observed_http_status_code(&header_str),
@@ -119,7 +110,7 @@ where
             ) {
                 informational_header_bytes += header_end;
                 let sanitized = if options.correlation.is_some() {
-                    strip_platform_request_id_from_head(&buf[..header_end])
+                    strip_platform_request_id_from_response_head(&buf[..header_end])
                 } else {
                     Cow::Borrowed(&buf[..header_end])
                 };
@@ -146,7 +137,8 @@ where
     };
 
     if options.correlation.is_some()
-        && let Cow::Owned(sanitized) = strip_platform_request_id_from_head(&buf[..header_end])
+        && let Cow::Owned(sanitized) =
+            strip_platform_request_id_from_response_head(&buf[..header_end])
     {
         let overflow = buf.split_off(header_end);
         buf = sanitized;
@@ -157,9 +149,6 @@ where
     // Parse response framing
     let header_str = String::from_utf8_lossy(&buf[..header_end]);
     let observed_status = parse_observed_http_status_code(&header_str);
-    if let (Some(correlation), Some(status_code)) = (options.correlation, observed_status) {
-        correlation.record_upstream_status(status_code);
-    }
     if let Some(observer) = options.observer.as_ref() {
         match observed_status {
             Some(status_code) if status_code < 400 => {
@@ -359,64 +348,6 @@ fn record_committed_response_error(
     }
 }
 
-fn validate_http_response_header_block(headers: &[u8]) -> Result<()> {
-    if !headers.ends_with(b"\r\n\r\n") {
-        return Err(miette!("HTTP response header block is incomplete"));
-    }
-
-    for (index, byte) in headers.iter().copied().enumerate() {
-        match byte {
-            b'\r' if headers.get(index + 1) != Some(&b'\n') => {
-                return Err(miette!("HTTP response headers contain a bare CR"));
-            }
-            b'\n' if index == 0 || headers.get(index - 1) != Some(&b'\r') => {
-                return Err(miette!("HTTP response headers contain a bare LF"));
-            }
-            _ => {}
-        }
-    }
-
-    let header_lines = &headers[..headers.len() - 2];
-    let mut lines = header_lines
-        .split(|byte| *byte == b'\n')
-        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-        .skip(1);
-
-    while let Some(line) = lines.next() {
-        if line.is_empty() {
-            if lines.next().is_some() {
-                return Err(miette!(
-                    "HTTP response header block contains an unexpected empty line"
-                ));
-            }
-            break;
-        }
-        if line
-            .first()
-            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
-        {
-            return Err(miette!(
-                "HTTP response header continuation lines are not supported"
-            ));
-        }
-        let colon = line
-            .iter()
-            .position(|byte| *byte == b':')
-            .ok_or_else(|| miette!("HTTP response header field is malformed"))?;
-        let name = &line[..colon];
-        if name.last().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
-            return Err(miette!(
-                "HTTP response header field contains whitespace before the colon"
-            ));
-        }
-        http::HeaderName::from_bytes(name)
-            .map_err(|_| miette!("HTTP response field name is malformed"))?;
-        http::HeaderValue::from_bytes(&line[colon + 1..])
-            .map_err(|_| miette!("HTTP response field value is malformed"))?;
-    }
-    Ok(())
-}
-
 fn final_response_head<'a>(
     headers: &'a [u8],
     correlation: Option<&RequestCorrelation>,
@@ -424,8 +355,10 @@ fn final_response_head<'a>(
     let Some(correlation) = correlation else {
         return Cow::Borrowed(headers);
     };
-    let stripped =
-        strip_platform_request_id_from_connection(strip_platform_request_id_from_head(headers));
+    if let Some(status_code) = parse_status_code(&String::from_utf8_lossy(headers)) {
+        correlation.record_response_status(status_code);
+    }
+    let stripped = strip_platform_request_id_from_response_head(headers);
     let Some(header_end) = stripped.windows(4).position(|window| window == b"\r\n\r\n") else {
         return stripped;
     };
@@ -441,7 +374,11 @@ fn final_response_head<'a>(
     Cow::Owned(output)
 }
 
-fn strip_platform_request_id_from_connection(headers: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
+/// Remove only receipt fields and their hop-by-hop/trailer nominations.
+/// Folded fields are grouped so removing a receipt never leaves its
+/// continuation attached to an unrelated field. Recognize physical LF lines
+/// without normalizing unrelated bytes or tightening response parsing.
+fn strip_platform_request_id_from_response_head(headers: &[u8]) -> Cow<'_, [u8]> {
     let header_end = headers
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -453,62 +390,91 @@ fn strip_platform_request_id_from_connection(headers: Cow<'_, [u8]>) -> Cow<'_, 
 
     while position < header_block.len() {
         let line_end = header_block[position..]
-            .windows(2)
-            .position(|window| window == b"\r\n")
+            .iter()
+            .position(|byte| *byte == b'\n')
             .map_or(header_block.len(), |end| position + end);
-        let line = &header_block[position..line_end];
+        let raw_line = &header_block[position..line_end];
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
         if line.is_empty() {
-            if position + 2 < header_block.len() {
-                output.get_or_insert_with(|| header_block[..position].to_vec());
-            }
             if let Some(output) = &mut output {
-                output.extend_from_slice(b"\r\n");
+                output.extend_from_slice(&header_block[position..]);
             }
             break;
         }
 
-        if let Some(colon) = line.iter().position(|byte| *byte == b':')
-            && trim_ascii_ows(&line[..colon]).eq_ignore_ascii_case(b"connection")
-            && line[colon + 1..]
-                .split(|byte| *byte == b',')
-                .any(|value| trim_ascii_ows(value).eq_ignore_ascii_case(protected))
+        let mut field_end = (line_end + 1).min(header_block.len());
+        while header_block
+            .get(field_end)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
         {
-            let output = output.get_or_insert_with(|| {
-                let mut output = Vec::with_capacity(headers.len());
-                output.extend_from_slice(&header_block[..position]);
-                output
-            });
-            let mut retained = line[colon + 1..]
-                .split(|byte| *byte == b',')
-                .map(trim_ascii_ows)
-                .filter(|token| !token.is_empty() && !token.eq_ignore_ascii_case(protected));
-            if let Some(first) = retained.next() {
-                output.extend_from_slice(&line[..=colon]);
-                output.push(b' ');
-                output.extend_from_slice(first);
-                for token in retained {
-                    output.extend_from_slice(b", ");
-                    output.extend_from_slice(token);
-                }
-                output.extend_from_slice(b"\r\n");
-            }
-            position = line_end.saturating_add(2);
-            continue;
+            field_end = header_block[field_end..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(header_block.len(), |end| field_end + end + 1);
         }
-        if line_end + 2 > header_block.len() {
-            output.get_or_insert_with(|| header_block[..position].to_vec());
+        let field = &header_block[position..field_end];
+        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+            let name = trim_ascii_ows(&line[..colon]);
+            let receipt = name.eq_ignore_ascii_case(protected);
+            let nomination = (name.eq_ignore_ascii_case(b"connection")
+                || name.eq_ignore_ascii_case(b"trailer"))
+                && field
+                    .windows(protected.len())
+                    .any(|window| window.eq_ignore_ascii_case(protected));
+            let unfolded = nomination.then(|| {
+                let mut value = Vec::with_capacity(field.len() - colon);
+                for segment in field[colon + 1..].split(|byte| *byte == b'\n') {
+                    let segment = trim_ascii_ows(segment.strip_suffix(b"\r").unwrap_or(segment));
+                    if !value.is_empty() && !segment.is_empty() {
+                        value.push(b' ');
+                    }
+                    value.extend_from_slice(segment);
+                }
+                value
+            });
+            let protected_nomination = unfolded.as_ref().is_some_and(|value| {
+                value
+                    .split(|byte| *byte == b',')
+                    .any(|value| trim_ascii_ows(value).eq_ignore_ascii_case(protected))
+            });
+            if receipt || protected_nomination {
+                let output = output.get_or_insert_with(|| {
+                    let mut output = Vec::with_capacity(headers.len());
+                    output.extend_from_slice(&header_block[..position]);
+                    output
+                });
+                if let Some(unfolded) = unfolded {
+                    let mut retained = unfolded
+                        .split(|byte| *byte == b',')
+                        .map(trim_ascii_ows)
+                        .filter(|token| {
+                            !token.is_empty() && !token.eq_ignore_ascii_case(protected)
+                        });
+                    if let Some(first) = retained.next() {
+                        output.extend_from_slice(&line[..=colon]);
+                        output.push(b' ');
+                        output.extend_from_slice(first);
+                        for token in retained {
+                            output.extend_from_slice(b", ");
+                            output.extend_from_slice(token);
+                        }
+                        output.extend_from_slice(b"\r\n");
+                    }
+                }
+                position = field_end;
+                continue;
+            }
         }
         if let Some(output) = &mut output {
-            output.extend_from_slice(line);
-            output.extend_from_slice(b"\r\n");
+            output.extend_from_slice(field);
         }
-        position = line_end.saturating_add(2);
+        position = field_end;
     }
 
     if let Some(output) = &mut output {
         output.extend_from_slice(buffered_suffix);
     }
-    output.map_or(headers, Cow::Owned)
+    output.map_or(Cow::Borrowed(headers), Cow::Owned)
 }
 
 /// Body framing determines when delivery finishes, not whether another
@@ -2603,7 +2569,7 @@ pub(super) fn response_is_event_stream(headers: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{final_response_head, strip_platform_request_id_from_connection};
+    use super::{final_response_head, strip_platform_request_id_from_response_head};
     use crate::l7::correlation::HttpOutcome;
     use crate::l7::rest::strip_platform_request_id_from_head;
     use openshell_supervisor_middleware::{
@@ -2763,7 +2729,7 @@ mod tests {
                 .status(openshell_ocsf::StatusId::Success)
                 .build(),
         );
-        correlation.response_selected(200);
+        correlation.record_response_status(200);
         for (outcome, failed) in [(Outcome::FailOpen, true), (Outcome::BlockDelivery, false)] {
             for event in super::http_response_middleware_invocation_events(
                 "response-policy",
@@ -2781,7 +2747,7 @@ mod tests {
             .filter(|event| event["class_uid"] == 4002)
             .collect();
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0]["unmapped"]["http_event_kind"], "request");
+        assert_eq!(events[0]["unmapped"]["http_event_kind"], "decision");
         assert_eq!(events[0]["action"], "Allowed");
         assert_eq!(events[1]["action"], "Other");
         assert_eq!(
@@ -2811,7 +2777,7 @@ mod tests {
     use super::{
         RelayResponseOptions, ResponseFraming, parse_connection_keep_alive,
         parse_response_head_for_middleware, relay_response, response_is_http_10,
-        serialize_response_head, validate_http_response_header_block,
+        serialize_response_head,
     };
     use crate::l7::provider::{BodyLength, L7Request, RelayOutcome};
     use crate::l7::relay::L7EvalContext;
@@ -2875,7 +2841,7 @@ mod tests {
 
         let stripped = strip_platform_request_id_from_head(head);
         assert!(matches!(stripped, Cow::Borrowed(_)));
-        let stripped = strip_platform_request_id_from_connection(stripped);
+        let stripped = strip_platform_request_id_from_response_head(&stripped);
         assert!(matches!(stripped, Cow::Borrowed(_)));
         assert_eq!(stripped.as_ref(), head);
     }
@@ -2936,7 +2902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_failure_receipt_distinguishes_upstream_error_from_local_block() {
+    async fn delivery_failure_receipt_does_not_synthesize_audit_records() {
         for outcome in [HttpOutcome::UpstreamError, HttpOutcome::PlatformError] {
             let capture = openshell_ocsf::test_support::OcsfCapture::default();
             let _subscriber = capture.install();
@@ -2950,36 +2916,27 @@ mod tests {
                 query: String::new(),
             };
             let mut client = Vec::new();
-            {
-                let mut client = correlation.observe_response(&mut client);
-                super::send_response_delivery_failure(
-                    &mut client,
-                    "GET",
-                    "policy",
-                    &target,
-                    None,
-                    outcome,
-                    "response_body",
-                    Some(&correlation),
-                )
-                .await
-                .unwrap();
-            }
+            super::send_response_delivery_failure(
+                &mut client,
+                "GET",
+                "policy",
+                &target,
+                None,
+                outcome,
+                "response_body",
+                Some(&correlation),
+            )
+            .await
+            .unwrap();
             drop(correlation);
             assert_eq!(request_id_header_count(&client), 1);
-            let events = capture.json_events();
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0]["http_response"]["code"], 502);
-            assert_eq!(events[0]["metadata"]["correlation_uid"], "delivery-failure");
-            assert_eq!(
-                events[0]["action"] == "Denied",
-                outcome == HttpOutcome::PlatformError
-            );
+            assert!(client.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+            assert!(capture.json_events().is_empty());
         }
     }
 
     #[tokio::test]
-    async fn correlated_upstream_eof_preserves_transport_close_and_audits_failure() {
+    async fn correlated_upstream_eof_preserves_transport_close_without_synthetic_records() {
         let capture = openshell_ocsf::test_support::OcsfCapture::default();
         let _subscriber = capture.install();
         let correlation = test_correlation("eof-request");
@@ -2993,15 +2950,7 @@ mod tests {
             "EOF must not become a synthetic HTTP response"
         );
         drop(correlation);
-        let records = capture.json_events();
-        let primary: Vec<_> = records
-            .iter()
-            .filter(|event| event["class_uid"] == 4002)
-            .collect();
-        assert_eq!(primary.len(), 1, "{records:?}");
-        assert_eq!(primary[0]["status"], "Failure");
-        assert_eq!(primary[0]["metadata"]["correlation_uid"], "eof-request");
-        assert!(primary[0].get("http_response").is_none());
+        assert!(capture.json_events().is_empty());
     }
 
     #[tokio::test]
@@ -3039,7 +2988,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_middleware_denial_has_one_correlated_primary_without_tracing() {
+    async fn response_middleware_denial_preserves_correlated_control_records_without_tracing() {
         let capture = openshell_ocsf::test_support::OcsfCapture::default();
         let _subscriber = capture.install();
         exercise_response_middleware_block().await;
@@ -3112,20 +3061,23 @@ mod tests {
             companions[0]["metadata"]["correlation_uid"],
             "response-denied"
         );
-        let primary: Vec<_> = records
+        let policy: Vec<_> = records
             .iter()
             .filter(|event| {
-                event["class_uid"] == 4002 && event["unmapped"]["http_event_kind"] == "request"
+                event["class_uid"] == 4002 && event["firewall_rule"]["type"] == "l7-rest"
             })
             .collect();
-        assert_eq!(primary.len(), 1, "{records:?}");
-        assert_eq!(primary[0]["action"], "Denied");
-        assert_eq!(primary[0]["status"], "Failure");
-        assert_eq!(primary[0]["http_response"]["code"], 403);
-        assert_eq!(primary[0]["http_request"]["url"]["path"], "/mutate");
-        assert_eq!(primary[0]["firewall_rule"]["type"], "l7-rest");
-        assert_eq!(primary[0]["metadata"]["correlation_uid"], "response-denied");
-        assert_eq!(primary[0].get("trace").is_some(), traced);
+        assert_eq!(policy.len(), 1, "{records:?}");
+        assert_eq!(policy[0]["action"], "Allowed");
+        assert_eq!(policy[0]["status"], "Success");
+        assert!(policy[0].get("http_response").is_none());
+        assert_eq!(policy[0]["http_request"]["url"]["path"], "/mutate");
+        for record in records {
+            assert_eq!(record["metadata"]["correlation_uid"], "response-denied");
+            if record["class_uid"] == 4002 {
+                assert_eq!(record.get("trace").is_some(), traced);
+            }
+        }
     }
 
     #[tokio::test]
@@ -3204,84 +3156,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_response_rejects_folded_receipt_connection_nomination() {
+    async fn ordinary_response_sanitizes_only_folded_receipt_fields_and_nominations() {
         let correlation = test_correlation("trusted");
-        let response = &b"HTTP/1.1 200 OK\r\nConnection: keep-alive,\r\n X-OpenShell-Request-ID\r\nContent-Length: 0\r\n\r\n"[..];
+        let response = &b"HTTP/1.1 200 OK\r\nX-Unrelated: opaque\r\n continuation\r\nX-OpenShell-Request-ID: forged\r\n more-forgery\r\nConnection: keep-alive,\r\n X-OpenShell-Request-ID\r\nTrailer: X-Checksum,\r\n\tx-openshell-request-id\r\nContent-Length: 0\r\n\r\n"[..];
         let (outcome, client) = relay_bytes(response, Some(&correlation)).await;
-        let error = outcome.expect_err("folded response fields must fail closed");
-
-        assert!(
-            error
-                .to_string()
-                .contains("response header continuation lines are not supported"),
-            "{error}"
+        outcome.expect("protected folded fields are sanitized");
+        assert_eq!(
+            client,
+            b"HTTP/1.1 200 OK\r\nX-Unrelated: opaque\r\n continuation\r\nConnection: keep-alive\r\nTrailer: X-Checksum\r\nContent-Length: 0\r\nx-openshell-request-id: trusted\r\n\r\n"
         );
-        assert!(client.is_empty());
     }
 
     #[tokio::test]
-    async fn ordinary_response_rejects_bare_lf_receipt_smuggling() {
+    async fn ordinary_response_strips_bare_lf_receipt_without_normalizing_unrelated_fields() {
         let correlation = test_correlation("trusted");
-        let response = &b"HTTP/1.1 200 OK\r\nX-Safe: yes\nX-OpenShell-Request-ID: forged\r\nContent-Length: 0\r\n\r\n"[..];
+        let response = b"HTTP/1.1 200 OK\r\nX-Safe: yes\nX-OpenShell-Request-ID: forged\r\nX-Unrelated: opaque\n retained\r\nContent-Length: 0\r\n\r\n";
         let (outcome, client) = relay_bytes(response, Some(&correlation)).await;
-        let error = outcome.expect_err("bare LF response fields must fail closed");
+        outcome.expect("protected physical LF fields are sanitized");
 
-        assert!(error.to_string().contains("bare LF"), "{error}");
-        assert!(client.is_empty());
-    }
-
-    #[test]
-    fn response_head_validation_rejects_ambiguous_header_blocks() {
-        let cases: &[(&str, &[u8])] = &[
-            ("incomplete block", b"HTTP/1.1 200 OK\r\nX-Test: yes\r\n"),
-            ("bare LF", b"HTTP/1.1 200 OK\r\nX-Test: yes\n\r\n"),
-            ("bare CR", b"HTTP/1.1 200 OK\r\nX-Test: yes\rX: no\r\n\r\n"),
-            (
-                "obsolete fold",
-                b"HTTP/1.1 200 OK\r\nX-Test: yes\r\n continued\r\n\r\n",
-            ),
-            ("malformed field", b"HTTP/1.1 200 OK\r\nX-Test\r\n\r\n"),
-            ("empty field name", b"HTTP/1.1 200 OK\r\n: value\r\n\r\n"),
-            (
-                "non-token field name",
-                b"HTTP/1.1 200 OK\r\nBad Name: value\r\n\r\n",
-            ),
-            (
-                "whitespace before colon",
-                b"HTTP/1.1 200 OK\r\nX-Test : value\r\n\r\n",
-            ),
-            (
-                "field control byte",
-                b"HTTP/1.1 200 OK\r\nX-Test: value\x0bmore\r\n\r\n",
-            ),
-            (
-                "field delete byte",
-                b"HTTP/1.1 200 OK\r\nX-Test: value\x7f\r\n\r\n",
-            ),
-            (
-                "early empty line",
-                b"HTTP/1.1 200 OK\r\n\r\nX-Smuggled: yes\r\n\r\n",
-            ),
-        ];
-
-        for (name, input) in cases {
-            assert!(
-                validate_http_response_header_block(input).is_err(),
-                "{name} unexpectedly passed validation"
-            );
-        }
-    }
-
-    #[test]
-    fn response_head_validation_accepts_supported_informational_and_upgrade_responses() {
-        for response in [
-            &b"HTTP/1.0 200 OK\r\nX-Test: yes\r\n\r\n"[..],
-            &b"HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n"[..],
-            &b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"[..],
-            &b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"[..],
-        ] {
-            validate_http_response_header_block(response).expect("valid HTTP/1.x response head");
-        }
+        assert_eq!(
+            client,
+            b"HTTP/1.1 200 OK\r\nX-Safe: yes\nX-Unrelated: opaque\n retained\r\nContent-Length: 0\r\nx-openshell-request-id: trusted\r\n\r\n"
+        );
+        assert_eq!(request_id_header_count(&client), 1);
     }
 
     #[tokio::test]
@@ -3382,19 +3279,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switching_protocols_rejects_folded_receipt_connection_nomination() {
+    async fn switching_protocols_sanitizes_folded_receipt_connection_nomination() {
         let correlation = test_correlation("trusted-upgrade");
         let response = &b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade,\r\n\tX-OpenShell-Request-ID\r\nUpgrade: websocket\r\n\r\n"[..];
         let (outcome, client) = relay_bytes(response, Some(&correlation)).await;
-        let error = outcome.expect_err("folded upgrade fields must fail closed");
-
+        assert!(matches!(
+            outcome.expect("sanitized upgrade"),
+            RelayOutcome::Upgraded { .. }
+        ));
         assert!(
-            error
-                .to_string()
-                .contains("response header continuation lines are not supported"),
-            "{error}"
+            String::from_utf8_lossy(&client).contains("Connection: Upgrade\r\n"),
+            "{client:?}"
         );
-        assert!(client.is_empty());
+        assert_eq!(request_id_header_count(&client), 1);
     }
 
     #[test]

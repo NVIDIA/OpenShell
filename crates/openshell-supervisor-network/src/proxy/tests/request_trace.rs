@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::test_support::request_tracing::RequestTracing;
+use crate::test_support::response_request_id;
 use opentelemetry_sdk::trace::Sampler;
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -18,7 +19,25 @@ enum Outcome {
     UpstreamClosed,
 }
 
-async fn forward_case(ip: Ipv4Addr, outcome: Outcome, sampler: Option<Sampler>, flags: &str) {
+fn assert_request_record_sequence(records: &[serde_json::Value], receipt: &str) {
+    for (index, record) in records.iter().enumerate() {
+        assert_eq!(
+            record["metadata"]["correlation_uid"], receipt,
+            "{records:?}"
+        );
+        assert_eq!(
+            record["unmapped"]["request_sequence"],
+            index + 1,
+            "{records:?}"
+        );
+        assert_eq!(
+            record["unmapped"]["http_event_kind"], "decision",
+            "{records:?}"
+        );
+    }
+}
+
+async fn forward_case(ip: Ipv4Addr, outcome: Outcome, sampler: Option<Sampler>) {
     let listener = TcpListener::bind((ip, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let mode = if matches!(outcome, Outcome::AuditDenied) {
@@ -71,7 +90,7 @@ network_policies:
     let mut proxy: ProxyClient = tokio::io::BufReader::new(Box::new(proxy));
     let target = format!("http://{ip}:{port}{path}?token=SENTINEL-QUERY");
     let request = format!(
-        "GET {target} HTTP/1.1\r\nHost: {ip}:{port}\r\ntraceparent: 00-{WORKLOAD_TRACE_ID}-{WORKLOAD_SPAN_ID}-{flags}\r\ntracestate: vendor=SENTINEL-VENDOR\r\nx-openshell-request-id: forged-receipt\r\nConnection: close\r\n\r\n"
+        "GET {target} HTTP/1.1\r\nHost: {ip}:{port}\r\ntraceparent: 00-{WORKLOAD_TRACE_ID}-{WORKLOAD_SPAN_ID}-01\r\ntracestate: vendor=SENTINEL-VENDOR\r\nx-openshell-request-id: forged-receipt\r\nConnection: close\r\n\r\n"
     );
     let exchange = async {
         tokio::join!(
@@ -153,40 +172,64 @@ network_policies:
         },
     );
     let response = String::from_utf8(response).unwrap();
-    let records = capture
-        .events
-        .json_events()
-        .into_iter()
-        .filter(|event| event["class_uid"] == 4002)
-        .collect::<Vec<_>>();
-    assert_eq!(records.len(), 1, "{records:?}");
-    let receipt = records[0]["metadata"]["correlation_uid"].as_str().unwrap();
+    let records = capture.events.json_events();
+    let expected_records = if matches!(outcome, Outcome::PolicyDenied) {
+        1
+    } else {
+        2
+    };
+    assert_eq!(records.len(), expected_records, "{records:?}");
+    assert!(records.iter().all(|record| record["class_uid"] == 4002));
+    let record = &records[0];
+    let decision = match outcome {
+        Outcome::PolicyDenied => "deny",
+        Outcome::AuditDenied => "audit",
+        Outcome::Allowed | Outcome::UpstreamClosed => "allow",
+    };
+    assert!(
+        record["message"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("FORWARD_L7 {decision} GET "))
+    );
+    assert_eq!(record["firewall_rule"]["type"], "l7");
+    assert!(record.get("status_id").is_none());
+    assert!(record.get("status_detail").is_none());
+    for control in &records {
+        assert_eq!(control["http_request"]["url"]["path"], path);
+        assert!(control.get("http_response").is_none());
+    }
+    if !matches!(outcome, Outcome::PolicyDenied) {
+        let forwarded = &records[1];
+        assert!(
+            forwarded["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("FORWARD allowed GET ")
+        );
+        assert_eq!(forwarded["firewall_rule"]["type"], "opa");
+        assert_eq!(forwarded["action_id"], 1);
+        assert_eq!(forwarded["status_id"], 1);
+    }
+    let receipt = record["metadata"]["correlation_uid"].as_str().unwrap();
     assert!(uuid::Uuid::parse_str(receipt).is_ok());
+    assert_request_record_sequence(&records, receipt);
+    assert!(!format!("{records:?}").contains("SENTINEL"));
+    assert!(!format!("{records:?}").contains("forged-receipt"));
     if let Some(expected) = expected {
         assert!(
             response.starts_with(&format!("HTTP/1.1 {expected} ")),
             "{response}"
         );
-        let wire_receipt = response
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("x-openshell-request-id")
-                    .then(|| value.trim())
-            })
-            .expect("inspected response receipt");
-        assert_eq!(wire_receipt, receipt);
-        assert_eq!(records[0]["http_response"]["code"], expected);
+        assert_eq!(response_request_id(response.as_bytes()), receipt);
     } else {
         assert!(
             response.is_empty(),
             "upstream EOF must not synthesize a response"
         );
-        assert!(records[0].get("http_response").is_none());
-        assert_eq!(records[0]["status_id"], 2);
     }
     assert_eq!(
-        records[0]["action_id"],
+        record["action_id"],
         if matches!(outcome, Outcome::PolicyDenied) {
             2
         } else {
@@ -216,7 +259,7 @@ network_policies:
     );
     if roots.is_empty() {
         assert!(spans.is_empty());
-        assert!(records[0].get("trace").is_none());
+        assert!(records.iter().all(|record| record.get("trace").is_none()));
     } else {
         assert_eq!(roots.len(), 1);
         let root = roots[0];
@@ -238,10 +281,24 @@ network_policies:
                 .header()
                 .is_empty()
         );
-        assert_eq!(
-            records[0]["trace"]["uid"],
-            root.span_context.trace_id().to_string()
-        );
+        for record in &records {
+            assert_eq!(
+                record["trace"]["uid"],
+                root.span_context.trace_id().to_string()
+            );
+        }
+        if let Some(expected) = expected {
+            assert!(root.attributes.iter().any(|attribute| {
+                attribute.key.as_str() == "http.response.status_code"
+                    && attribute.value == opentelemetry::Value::I64(expected)
+            }));
+        } else {
+            assert!(
+                root.attributes
+                    .iter()
+                    .all(|attribute| attribute.key.as_str() != "http.response.status_code")
+            );
+        }
         assert!(root.attributes.iter().any(|attribute| {
             attribute.key.as_str() == "openshell.request.id" && attribute.value.as_str() == receipt
         }));
@@ -292,10 +349,8 @@ async fn inspected_forward_traces_all_outcomes_without_sampling_or_export_depend
         Outcome::AuditDenied,
         Outcome::UpstreamClosed,
     ] {
-        for flags in ["00", "01"] {
-            for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {
-                forward_case(ip, outcome, sampler, flags).await;
-            }
+        for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {
+            forward_case(ip, outcome, sampler).await;
         }
     }
 }
@@ -401,14 +456,17 @@ network_policies:
         ready.await.unwrap();
         let response = read_http_headers(&mut app).await;
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 101 "));
+        let receipt = response_request_id(&response);
         let root = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(root) = capture
+                let mut roots: Vec<_> = capture
                     .spans()
                     .into_iter()
-                    .find(|span| span.name == "openshell.http.request")
-                {
-                    break root;
+                    .filter(|span| span.name == "openshell.http.request")
+                    .collect();
+                if !roots.is_empty() {
+                    assert_eq!(roots.len(), 1);
+                    break roots.pop().unwrap();
                 }
                 tokio::task::yield_now().await;
             }
@@ -438,13 +496,52 @@ network_policies:
         upstream.await.unwrap();
         handler.await.unwrap().unwrap();
         let records = capture.events.json_events();
-        assert_eq!(
-            records
-                .iter()
-                .filter(|event| event["class_uid"] == 4002 && event["http_response"]["code"] == 101)
-                .count(),
-            1
+        assert_eq!(records.len(), 4, "{records:?}");
+        assert_request_record_sequence(&records, receipt);
+        for record in &records[..2] {
+            assert_eq!(record["class_uid"], 4002);
+            assert_eq!(record["action_id"], 1);
+            assert_eq!(record["http_request"]["url"]["path"], "/ws");
+            assert!(record.get("http_response").is_none());
+            assert_eq!(
+                record["trace"]["uid"],
+                root.span_context.trace_id().to_string()
+            );
+        }
+        assert!(
+            records[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("FORWARD_L7 allow GET ")
         );
+        assert_eq!(records[0]["firewall_rule"]["type"], "l7");
+        assert!(records[0].get("status_id").is_none());
+        assert!(
+            records[1]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("FORWARD allowed GET ")
+        );
+        assert_eq!(records[1]["firewall_rule"]["type"], "opa");
+        assert_eq!(records[1]["status_id"], 1);
+        assert_eq!(records[2]["class_uid"], 4001);
+        assert_eq!(records[2]["activity_name"], "Upgrade");
+        assert!(
+            records[2]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("101 Switching Protocols — websocket parsed relay ")
+        );
+        assert!(records[2].get("http_response").is_none());
+        assert_eq!(records[3]["class_uid"], 4001);
+        assert!(
+            records[3]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("WEBSOCKET_L7_REQUEST allow WEBSOCKET_TEXT ")
+        );
+        assert_eq!(records[3]["firewall_rule"]["type"], "l7-websocket");
+        assert!(!format!("{records:?}").contains("after-http-root"));
     };
     tokio::time::timeout(std::time::Duration::from_secs(5), scenario)
         .await

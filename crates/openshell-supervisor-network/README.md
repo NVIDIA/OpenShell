@@ -64,16 +64,16 @@ header. Application correlation must use another header. The receipt is only a
 join key: it does not establish identity, authorization or complete delivery.
 L4 and passthrough traffic do not provide this header guarantee.
 
-The audit state commits one primary HTTP Activity record when the final response
-head is written, with an early-termination fallback. It retains the original
-request and process context. Middleware invocation records remain separate,
-request-correlated observations, including after the primary is committed. They
-retain attribution and transformation details without changing the final
-response status or consuming the late-failure budget. Security findings remain
-separate. A process crash or indefinitely hung request cannot be finalized by
-the fallback.
-
-This includes HTTP-hook preflight and completion invocation records.
+The emission hook adds request correlation to every OCSF class in the current
+request scope, including findings. Policy, middleware, token-grant and finding
+records retain their original content, event IDs, timestamps and classification;
+they are not merged or delayed. `unmapped.http_event_kind` identifies `decision`,
+`middleware_invocation` or `token_grant`, and middleware records retain
+`unmapped.middleware_phase`, including HTTP-hook preflight and completion.
+`unmapped.request_sequence` starts at 1 per request and describes local emission
+order, not downstream delivery order. Count policy outcomes by selecting the
+actual policy/firewall control record within a receipt group, not every
+`decision` record; companion findings also use `decision`.
 
 Request IDs and audit outcomes do not depend on OpenTelemetry, sampling or
 collector availability. Inspected requests have a supervisor-owned request span
@@ -84,5 +84,6 @@ legacy bounded deny-span behavior. End HTTP tracing before an upgraded session.
 The request span ends after its owned stages, not when response headers are logged.
 The `openshell.upstream.send` stage measures request writes and flush; response
 handling is measured separately. Receipt filtering preserves raw HTTP bytes
-and borrows unchanged header blocks. It retains the existing status-line parsing
-but rejects ambiguous header line endings and folded fields.
+and borrows unchanged header blocks. It removes only protected receipt fields
+and their `Connection` or `Trailer` nominations, including folded continuations,
+without adding general response-header validation.
