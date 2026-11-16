@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use super::{DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, SupervisorConfig};
 use crate::ServerState;
+use crate::auth::audit::{DisclosureAudit, DisclosureSource};
 use crate::grpc::policy::{
     build_provider_environment_snapshot_from_inputs, build_sandbox_config_snapshot_from_inputs,
     is_configuration_rejection, load_sandbox_config_inputs, unadmitted_sandbox_config,
@@ -80,6 +81,8 @@ impl ConfigFingerprint {
 pub struct ConfigSessionState {
     /// The session's ordered outbound channel.
     tx: mpsc::Sender<GatewayMessage>,
+    /// Attributes each credential-bearing update to the supervisor stream.
+    disclosure: DisclosureSource,
     in_flight: Option<InFlightConfigUpdate>,
     /// Newest configuration built while an update was in flight.
     pending: Option<SupervisorConfig>,
@@ -142,6 +145,18 @@ struct InFlightConfigUpdate {
     /// The session's bootstrap, whose result completes session setup.
     bootstrap: bool,
     sent_at: Instant,
+    /// Set when the update carries provider credentials. It finishes once the
+    /// supervisor answers the update, and records a cancellation if the
+    /// session ends first.
+    disclosure: Option<DisclosureAudit>,
+}
+
+impl InFlightConfigUpdate {
+    fn fail_disclosure(&mut self, status: Status) {
+        if let Some(audit) = self.disclosure.take() {
+            audit.finish(&Err::<(), _>(status));
+        }
+    }
 }
 
 /// The bootstrap a session is accepted with, in flight from the start.
@@ -155,6 +170,7 @@ struct CompletedConfigUpdate {
     admission: SandboxConfigurationAdmission,
     bootstrap: bool,
     sent_at: Instant,
+    disclosure: Option<DisclosureAudit>,
 }
 
 /// An update to queue on the session stream once the registry lock is
@@ -162,12 +178,14 @@ struct CompletedConfigUpdate {
 struct Outgoing {
     tx: mpsc::Sender<GatewayMessage>,
     message: GatewayMessage,
+    update_id: String,
 }
 
 impl ConfigSessionState {
     pub fn new(tx: mpsc::Sender<GatewayMessage>) -> Self {
         Self {
             tx,
+            disclosure: DisclosureSource::default(),
             in_flight: None,
             pending: None,
             acknowledged: None,
@@ -193,24 +211,28 @@ impl ConfigSessionState {
     }
 
     fn send(&mut self, config: SupervisorConfig) -> Result<Outgoing, DeliveryDisposition> {
-        let (update, in_flight) = build_config_update(config, false, live_message_len);
+        let (update, mut in_flight) =
+            build_config_update(config, false, live_message_len, &self.disclosure);
+        let update_id = update.update_id.clone();
         let message = GatewayMessage {
             payload: Some(gateway_message::Payload::ConfigUpdate(update)),
         };
         if message.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
+            in_flight.fail_disclosure(Status::resource_exhausted("update exceeds message limit"));
             return Err(DeliveryDisposition::PayloadTooLarge);
         }
         self.in_flight = Some(in_flight);
         Ok(Outgoing {
             tx: self.tx.clone(),
             message,
+            update_id,
         })
     }
 
-    fn complete(&self, result: &ConfigUpdateResult) -> Result<CompletedConfigUpdate, Status> {
+    fn complete(&mut self, result: &ConfigUpdateResult) -> Result<CompletedConfigUpdate, Status> {
         let in_flight = self
             .in_flight
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| Status::failed_precondition("no update is in flight"))?;
         if in_flight.update_id != result.update_id {
             return Err(Status::invalid_argument(
@@ -229,7 +251,19 @@ impl ConfigSessionState {
             admission: in_flight.admission.clone(),
             bootstrap: in_flight.bootstrap,
             sent_at: in_flight.sent_at,
+            disclosure: in_flight.disclosure.take(),
         })
+    }
+
+    /// Record that `update_id` could not be queued on the stream.
+    fn fail_delivery(&mut self, update_id: &str) {
+        if let Some(in_flight) = self
+            .in_flight
+            .as_mut()
+            .filter(|update| update.update_id == update_id)
+        {
+            in_flight.fail_disclosure(Status::unavailable("session stream did not take update"));
+        }
     }
 
     /// Finish the update in flight and release configuration held behind
@@ -300,15 +334,21 @@ impl SupervisorSessionRegistry {
     fn send_or_close(&self, sandbox_id: &str, session_id: &str, outgoing: Outgoing) -> bool {
         match outgoing.tx.try_send(outgoing.message) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(
-                    sandbox_id,
-                    session_id, "supervisor session stopped draining configuration; closing it"
-                );
-                self.close_if_current(sandbox_id, session_id);
+            Err(error) => {
+                self.with_config_session(sandbox_id, session_id, |session| {
+                    if let Some(session) = session {
+                        session.fail_delivery(&outgoing.update_id);
+                    }
+                });
+                if matches!(error, mpsc::error::TrySendError::Full(_)) {
+                    warn!(
+                        sandbox_id,
+                        session_id, "supervisor session stopped draining configuration; closing it"
+                    );
+                    self.close_if_current(sandbox_id, session_id);
+                }
                 false
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 
@@ -323,9 +363,11 @@ impl SupervisorSessionRegistry {
         session_id: &str,
         bootstrap: BootstrapInFlight,
         persisted_admission: Option<SandboxConfigurationAdmission>,
+        disclosure: DisclosureSource,
     ) {
         self.with_config_session(sandbox_id, session_id, |session| {
             if let Some(session) = session {
+                session.disclosure = disclosure;
                 session.in_flight = Some(bootstrap.0);
                 session.persisted_admission = persisted_admission;
             }
@@ -338,15 +380,22 @@ impl SupervisorSessionRegistry {
         session_id: &str,
         result: &ConfigUpdateResult,
     ) -> Result<CompletedConfigUpdate, Status> {
-        self.with_config_session(sandbox_id, session_id, |session| {
-            session.map(|session| session.complete(result))
-        })
-        .flatten()
-        .unwrap_or_else(|| {
-            Err(Status::failed_precondition(
-                "obsolete supervisor session result",
-            ))
-        })
+        let mut completed = self
+            .with_config_session(sandbox_id, session_id, |session| {
+                session.map(|session| session.complete(result))
+            })
+            .flatten()
+            .unwrap_or_else(|| {
+                Err(Status::failed_precondition(
+                    "obsolete supervisor session result",
+                ))
+            })?;
+        // The supervisor answered this update, so it received what the update
+        // carried, whether or not it applied it.
+        if let Some(audit) = completed.disclosure.take() {
+            audit.finish(&Ok::<_, Status>(()));
+        }
+        Ok(completed)
     }
 
     /// Finish a validated update after all durable side effects have either
@@ -458,12 +507,17 @@ fn bootstrap_message_len(accepted: &SessionAccepted, update_len: usize) -> usize
     )
 }
 
+fn carries_credentials(environment: &ProviderEnvironmentSnapshot) -> bool {
+    !environment.values.is_empty() || !environment.dynamic_credentials.is_empty()
+}
+
 /// `message_size` maps the encoded length of the update to the length of
 /// the message that carries it.
 fn build_config_update(
     config: SupervisorConfig,
     bootstrap: bool,
     message_size: impl Fn(usize) -> usize,
+    source: &DisclosureSource,
 ) -> (ConfigUpdate, InFlightConfigUpdate) {
     let update_id = Uuid::new_v4().to_string();
     let mut update = ConfigUpdate {
@@ -490,12 +544,27 @@ fn build_config_update(
         .sandbox_config
         .as_ref()
         .expect("sandbox configuration");
+    let disclosure = update
+        .provider_environment
+        .as_ref()
+        .is_some_and(carries_credentials)
+        .then(|| {
+            let mut audit = DisclosureAudit::from_source("ConnectSupervisor", source.clone());
+            audit.resource("update_id", update.update_id.clone());
+            audit.resource("delivery", if bootstrap { "bootstrap" } else { "update" });
+            audit.resource(
+                "provider_env_revision",
+                snapshot.provider_env_revision.to_string(),
+            );
+            audit
+        });
     let in_flight = InFlightConfigUpdate {
         update_id,
         fingerprint: ConfigFingerprint::of(snapshot),
         admission: expected_configuration_admission(snapshot),
         bootstrap,
         sent_at: Instant::now(),
+        disclosure,
     };
     (update, in_flight)
 }
@@ -505,11 +574,22 @@ fn build_config_update(
 pub fn bootstrap_update(
     config: SupervisorConfig,
     accepted: &SessionAccepted,
+    source: &DisclosureSource,
 ) -> (ConfigUpdate, BootstrapInFlight) {
-    let (update, in_flight) = build_config_update(config, true, |update_len| {
-        bootstrap_message_len(accepted, update_len)
-    });
+    let (update, in_flight) = build_config_update(
+        config,
+        true,
+        |update_len| bootstrap_message_len(accepted, update_len),
+        source,
+    );
     (update, BootstrapInFlight(in_flight))
+}
+
+impl BootstrapInFlight {
+    /// Record that the bootstrap never reached the supervisor.
+    pub fn fail_disclosure(mut self, status: Status) {
+        self.0.fail_disclosure(status);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1356,7 +1436,8 @@ mod tests {
             config_push_enabled: true,
             ..Default::default()
         };
-        let (update, in_flight) = bootstrap_update(config, &acceptance);
+        let (update, in_flight) =
+            bootstrap_update(config, &acceptance, &DisclosureSource::default());
         assert_oversized_rejection(&update, &original);
         assert_eq!(
             in_flight.0.admission.state,
@@ -1392,14 +1473,19 @@ mod tests {
         config.provider_environment.values[0]
             .value
             .truncate(MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES - overhead);
-        let (live, _) = build_config_update(config.clone(), false, live_message_len);
+        let (live, _) = build_config_update(
+            config.clone(),
+            false,
+            live_message_len,
+            &DisclosureSource::default(),
+        );
         assert!(live.sandbox_config.unwrap().configuration_admitted);
         let acceptance = SessionAccepted {
             session_id: Uuid::new_v4().to_string(),
             config_push_enabled: true,
             ..Default::default()
         };
-        let (bootstrap, _) = bootstrap_update(config, &acceptance);
+        let (bootstrap, _) = bootstrap_update(config, &acceptance, &DisclosureSource::default());
         assert!(!bootstrap.sandbox_config.unwrap().configuration_admitted);
     }
 
@@ -1494,8 +1580,18 @@ mod tests {
         bootstrap: SupervisorConfig,
     ) -> (mpsc::Receiver<GatewayMessage>, ConfigUpdate) {
         let slots = register_apply_session(registry, sandbox_id, session_id);
-        let (update, in_flight) = bootstrap_update(bootstrap, &SessionAccepted::default());
-        registry.begin_config_bootstrap(sandbox_id, session_id, in_flight, None);
+        let (update, in_flight) = bootstrap_update(
+            bootstrap,
+            &SessionAccepted::default(),
+            &DisclosureSource::default(),
+        );
+        registry.begin_config_bootstrap(
+            sandbox_id,
+            session_id,
+            in_flight,
+            None,
+            DisclosureSource::default(),
+        );
         (slots, update)
     }
 
@@ -2135,13 +2231,17 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         // write could change the sandbox record.
         let (tx, _rx) = mpsc::channel(4);
         register_running_push_session(&state, sandbox_id, &tx);
-        let (bootstrap, in_flight) =
-            bootstrap_update(sandbox_policy_config(), &SessionAccepted::default());
+        let (bootstrap, in_flight) = bootstrap_update(
+            sandbox_policy_config(),
+            &SessionAccepted::default(),
+            &DisclosureSource::default(),
+        );
         state.supervisor_sessions.begin_config_bootstrap(
             sandbox_id,
             "session-1",
             in_flight,
             Some(expected_configuration_admission(&sandbox_policy_snapshot())),
+            DisclosureSource::default(),
         );
         let before = stored_sandbox(&state, sandbox_id).await;
         assert!(
@@ -2307,10 +2407,18 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         sandbox_id: &str,
         config: SupervisorConfig,
     ) -> ConfigUpdate {
-        let (update, in_flight) = bootstrap_update(config, &SessionAccepted::default());
-        state
-            .supervisor_sessions
-            .begin_config_bootstrap(sandbox_id, "session-1", in_flight, None);
+        let (update, in_flight) = bootstrap_update(
+            config,
+            &SessionAccepted::default(),
+            &DisclosureSource::default(),
+        );
+        state.supervisor_sessions.begin_config_bootstrap(
+            sandbox_id,
+            "session-1",
+            in_flight,
+            None,
+            DisclosureSource::default(),
+        );
         update
     }
 
@@ -2366,12 +2474,17 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
 
         // The reconnect starts from the stored admission and reports it again.
         let (tx, _rx) = register_apply_session_in_state(&state, sandbox_id);
-        let (update, in_flight) = bootstrap_update(config, &SessionAccepted::default());
+        let (update, in_flight) = bootstrap_update(
+            config,
+            &SessionAccepted::default(),
+            &DisclosureSource::default(),
+        );
         state.supervisor_sessions.begin_config_bootstrap(
             sandbox_id,
             "session-1",
             in_flight,
             Some(admission),
+            DisclosureSource::default(),
         );
         assert!(
             handle_config_update_result(
@@ -2700,5 +2813,178 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             4,
         )
         .await;
+    }
+
+    const DISCLOSURE_CANARY: &str = "canary-credential-3017";
+
+    fn credential_config(config_revision: u64) -> SupervisorConfig {
+        let mut config = config(config_revision);
+        config.provider_environment.values = vec![ProviderEnvironmentValue {
+            name: "TOKEN".into(),
+            value: DISCLOSURE_CANARY.into(),
+            ..Default::default()
+        }];
+        config
+    }
+
+    fn supervisor_source() -> DisclosureSource {
+        let mut request = tonic::Request::new(());
+        request
+            .extensions_mut()
+            .insert(crate::auth::principal::Principal::Sandbox(
+                crate::auth::principal::SandboxPrincipal {
+                    sandbox_id: "sb-1".into(),
+                    source: crate::auth::principal::SandboxIdentitySource::BootstrapJwt {
+                        issuer: "openshell-gateway:test".into(),
+                        auth_epoch: None,
+                    },
+                    trust_domain: None,
+                },
+            ));
+        request.metadata_mut().insert(
+            "x-request-id",
+            crate::auth::audit::test_support::REQUEST_ID
+                .parse()
+                .unwrap(),
+        );
+        DisclosureSource::from_request(&request).with_sandbox("sb-1", "agent")
+    }
+
+    /// A session whose bootstrap carries no credentials and is already
+    /// answered, so every later update is a live one.
+    fn answered_session(registry: &SupervisorSessionRegistry, tx: mpsc::Sender<GatewayMessage>) {
+        registry.register_with_mode(
+            "sb-1".into(),
+            "session-1".into(),
+            tx,
+            make_shutdown(),
+            SessionMode::Push,
+        );
+        let (bootstrap, in_flight) =
+            bootstrap_update(config(1), &SessionAccepted::default(), &supervisor_source());
+        registry.begin_config_bootstrap("sb-1", "session-1", in_flight, None, supervisor_source());
+        answer(registry, &bootstrap);
+    }
+
+    fn answer(registry: &SupervisorSessionRegistry, update: &ConfigUpdate) {
+        let completed = registry
+            .complete_config_update(
+                "sb-1",
+                "session-1",
+                &update_result(update, ConfigApplyOutcome::Applied),
+            )
+            .unwrap();
+        registry.finalize_config_update("sb-1", "session-1", &completed, true);
+    }
+
+    fn disclosures(capture: &openshell_ocsf::test_support::OcsfCapture) -> Vec<serde_json::Value> {
+        crate::auth::audit::test_support::disclosure_events(capture)
+    }
+
+    #[test]
+    fn live_credential_update_is_disclosed_when_the_supervisor_answers() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut outbound) = mpsc::channel(4);
+        answered_session(&registry, tx);
+
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", credential_config(2)),
+            DeliveryDisposition::Queued
+        );
+        // Queueing the update is not proof the supervisor received it.
+        assert!(disclosures(&capture).is_empty());
+
+        let update = take_update(&mut outbound).unwrap();
+        answer(&registry, &update);
+        let events = disclosures(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event["unmapped"]["operation"], "ConnectSupervisor");
+        assert_eq!(event["unmapped"]["outcome"], "disclosed");
+        assert_eq!(event["unmapped"]["actor"], "sandbox:sb-1");
+        assert_eq!(event["unmapped"]["delivery"], "update");
+        assert_eq!(event["unmapped"]["update_id"], update.update_id);
+        assert_eq!(event["unmapped"]["sandbox_id"], "sb-1");
+        assert_eq!(
+            event["metadata"]["correlation_uid"],
+            crate::auth::audit::test_support::REQUEST_ID
+        );
+        crate::auth::audit::test_support::assert_redacted(event, DISCLOSURE_CANARY);
+    }
+
+    #[test]
+    fn credential_free_updates_are_not_disclosures() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut outbound) = mpsc::channel(4);
+        answered_session(&registry, tx);
+
+        registry.deliver_config("sb-1", "session-1", config(2));
+        answer(&registry, &take_update(&mut outbound).unwrap());
+
+        assert!(disclosures(&capture).is_empty());
+    }
+
+    #[test]
+    fn session_ending_before_an_answer_cancels_only_the_update_sent() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _outbound) = mpsc::channel(4);
+        answered_session(&registry, tx);
+
+        registry.deliver_config("sb-1", "session-1", credential_config(2));
+        // Held behind the unanswered update, so it was never disclosed.
+        registry.deliver_config("sb-1", "session-1", credential_config(3));
+        registry.remove_if_current("sb-1", "session-1");
+
+        let events = disclosures(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["unmapped"]["outcome"], "cancelled");
+        assert_eq!(events[0]["unmapped"]["delivery"], "update");
+        crate::auth::audit::test_support::assert_redacted(&events[0], DISCLOSURE_CANARY);
+    }
+
+    #[test]
+    fn update_the_stream_cannot_take_is_a_failed_disclosure() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _outbound) = mpsc::channel(1);
+        answered_session(&registry, tx.clone());
+        tx.try_send(GatewayMessage::default()).unwrap();
+
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", credential_config(2)),
+            DeliveryDisposition::StreamClosed
+        );
+        registry.remove_if_current("sb-1", "session-1");
+
+        let events = disclosures(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["unmapped"]["outcome"], "failed");
+        assert_eq!(events[0]["unmapped"]["status_code"], "Unavailable");
+        crate::auth::audit::test_support::assert_redacted(&events[0], DISCLOSURE_CANARY);
+    }
+
+    #[test]
+    fn bootstrap_never_sent_is_not_recorded_as_disclosed() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+        let (_, in_flight) = bootstrap_update(
+            credential_config(1),
+            &SessionAccepted::default(),
+            &supervisor_source(),
+        );
+        in_flight.fail_disclosure(Status::resource_exhausted("too large"));
+
+        let events = disclosures(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["unmapped"]["delivery"], "bootstrap");
+        assert_eq!(events[0]["unmapped"]["outcome"], "failed");
+        crate::auth::audit::test_support::assert_redacted(&events[0], DISCLOSURE_CANARY);
     }
 }

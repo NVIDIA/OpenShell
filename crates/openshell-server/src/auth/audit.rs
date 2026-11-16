@@ -789,27 +789,68 @@ const MAX_RESOURCE_CHARS: usize = 256;
 /// cancellation when the RPC future is dropped first. Any new RPC that returns
 /// secret-bearing material must begin one of these before it authorizes the
 /// caller. Record only identifiers, never the disclosed values.
+#[derive(Debug)]
 pub struct DisclosureAudit {
     operation: &'static str,
-    actor: String,
-    request_id: Option<String>,
-    sandbox: Option<(String, String)>,
+    source: DisclosureSource,
     resource: Vec<(&'static str, String)>,
     emitted: bool,
 }
 
-impl DisclosureAudit {
-    /// Start the record for `operation`, naming the caller from the principal
-    /// the gateway authenticated rather than from the request body.
-    pub fn begin<T>(operation: &'static str, request: &Request<T>) -> Self {
+/// Who an audited disclosure is attributed to: the authenticated caller, the
+/// request that opened it, and the sandbox it serves. A long-lived stream
+/// captures this once and starts one [`DisclosureAudit`] per delivery.
+#[derive(Debug, Clone)]
+pub struct DisclosureSource {
+    actor: String,
+    request_id: Option<String>,
+    sandbox: Option<(String, String)>,
+}
+
+impl Default for DisclosureSource {
+    fn default() -> Self {
         Self {
-            operation,
+            actor: "unknown".to_string(),
+            request_id: None,
+            sandbox: None,
+        }
+    }
+}
+
+impl DisclosureSource {
+    /// Name the caller from the principal the gateway authenticated rather
+    /// than from the request body.
+    pub fn from_request<T>(request: &Request<T>) -> Self {
+        Self {
             actor: request
                 .extensions()
                 .get::<Principal>()
                 .map_or_else(|| "unknown".to_string(), Principal::audit_actor),
             request_id: RequestOrigin::from_request(request).request_id,
             sandbox: None,
+        }
+    }
+
+    /// Name the sandbox the disclosed material belongs to.
+    #[must_use]
+    pub fn with_sandbox(mut self, id: &str, name: &str) -> Self {
+        self.sandbox = Some((id.to_string(), name.to_string()));
+        self
+    }
+}
+
+impl DisclosureAudit {
+    /// Start the record for `operation`, naming the caller from the principal
+    /// the gateway authenticated rather than from the request body.
+    pub fn begin<T>(operation: &'static str, request: &Request<T>) -> Self {
+        Self::from_source(operation, DisclosureSource::from_request(request))
+    }
+
+    /// Start the record for `operation` on behalf of `source`.
+    pub fn from_source(operation: &'static str, source: DisclosureSource) -> Self {
+        Self {
+            operation,
+            source,
             resource: Vec::new(),
             emitted: false,
         }
@@ -817,7 +858,7 @@ impl DisclosureAudit {
 
     /// Name the sandbox the disclosed material belongs to.
     pub fn sandbox(&mut self, id: &str, name: &str) {
-        self.sandbox = Some((id.to_string(), name.to_string()));
+        self.source.sandbox = Some((id.to_string(), name.to_string()));
     }
 
     /// Name a disclosed resource by identifier. Never pass a credential value.
@@ -851,6 +892,7 @@ impl DisclosureAudit {
         self.emitted = true;
         let label = outcome.label();
         let (sandbox_id, sandbox_name) = self
+            .source
             .sandbox
             .as_ref()
             .map_or(("", ""), |(id, name)| (id, name));
@@ -864,7 +906,7 @@ impl DisclosureAudit {
             })
             .message(format!("{} {label}", self.operation))
             .unmapped("operation", self.operation)
-            .unmapped("actor", self.actor.clone())
+            .unmapped("actor", self.source.actor.clone())
             .unmapped("outcome", label);
         if let Some(code) = outcome.code() {
             builder = builder.unmapped("status_code", format!("{code:?}"));
@@ -872,7 +914,7 @@ impl DisclosureAudit {
         for (key, value) in &self.resource {
             builder = builder.unmapped(key, value.clone());
         }
-        if let Some(request_id) = &self.request_id {
+        if let Some(request_id) = &self.source.request_id {
             builder = builder.correlation_uid(request_id);
         }
         ocsf_emit!(builder.build());
@@ -1089,7 +1131,7 @@ mod tests {
         assert_eq!(event["unmapped"]["operation"], "GetThing");
         assert_eq!(event["unmapped"]["outcome"], "disclosed");
         assert_eq!(event["unmapped"]["provider"], "work");
-        assert_eq!(event["container"]["uid"], "sb-1");
+        assert_eq!(event["unmapped"]["sandbox_id"], "sb-1");
         assert!(event["unmapped"].get("status_code").is_none());
     }
 

@@ -14928,7 +14928,7 @@ mod tests {
         );
         assert_eq!(disclosed["unmapped"]["actor"], "sandbox:sb-audited");
         assert_eq!(disclosed["unmapped"]["providers"], "work-github");
-        assert_eq!(disclosed["container"]["uid"], "sb-audited");
+        assert_eq!(disclosed["unmapped"]["sandbox_id"], "sb-audited");
         assert_eq!(events[1]["unmapped"]["actor"], "sandbox:sb-other");
         assert_eq!(events[2]["unmapped"]["actor"], "user:test-user");
         assert_eq!(events[2]["unmapped"]["status_code"], "NotFound");

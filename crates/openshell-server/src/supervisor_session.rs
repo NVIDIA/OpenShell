@@ -17,6 +17,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use openshell_core::ObjectName;
 use openshell_core::jwt::CredentialEpoch;
 use openshell_core::proto::{
     GatewayMessage, GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse,
@@ -30,6 +31,7 @@ use openshell_core::proto::{
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
 use crate::ServerState;
+use crate::auth::audit::DisclosureSource;
 use crate::auth::principal::Principal;
 use crate::config_delivery::MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES;
 use crate::config_delivery::session::{self as config_session, ConfigSessionState};
@@ -2222,6 +2224,7 @@ struct SessionSetup {
     bootstrap: Option<config_session::SessionBootstrap>,
     provider_readiness: ProviderReadinessEvidence,
     config_push: Option<ConfigPushSetup>,
+    disclosure: DisclosureSource,
     outbound_tx: mpsc::Sender<GatewayMessage>,
     inbound: tonic::Streaming<SupervisorMessage>,
     session_lifetime: OwnedRwLockReadGuard<()>,
@@ -2240,6 +2243,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         bootstrap,
         provider_readiness,
         config_push,
+        disclosure,
         outbound_tx,
         mut inbound,
         session_lifetime,
@@ -2265,7 +2269,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         ..Default::default()
     };
     let (bootstrap, bootstrap_in_flight) = bootstrap
-        .map(|config| config_session::bootstrap_update(config, &acceptance))
+        .map(|config| config_session::bootstrap_update(config, &acceptance, &disclosure))
         .unzip();
     acceptance.bootstrap = bootstrap;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -2278,6 +2282,11 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         payload: Some(gateway_message::Payload::SessionAccepted(acceptance)),
     };
     if accepted.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
+        if let Some(bootstrap) = bootstrap_in_flight {
+            bootstrap.fail_disclosure(Status::resource_exhausted(
+                "bootstrap exceeds message limit",
+            ));
+        }
         counter!(
             "openshell_supervisor_config_bootstrap_total",
             "outcome" => "payload_too_large"
@@ -2339,6 +2348,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
             config_push
                 .as_ref()
                 .and_then(|setup| setup.persisted_admission.clone()),
+            disclosure,
         );
     }
 
@@ -2524,6 +2534,7 @@ pub async fn handle_connect_supervisor(
     Status,
 > {
     let principal = request.extensions().get::<Principal>().cloned();
+    let disclosure = DisclosureSource::from_request(&request);
     let mut inbound = request.into_inner();
 
     // Step 1: Wait for SupervisorHello.
@@ -2624,6 +2635,7 @@ pub async fn handle_connect_supervisor(
         None
     };
 
+    let disclosure = disclosure.with_sandbox(sandbox.object_id(), sandbox.object_name());
     let session_lifetime = state.supervisor_sessions.track_session()?;
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let stream: Pin<
@@ -2643,6 +2655,7 @@ pub async fn handle_connect_supervisor(
         bootstrap,
         provider_readiness,
         config_push,
+        disclosure,
         outbound_tx: tx,
         inbound,
         session_lifetime,
