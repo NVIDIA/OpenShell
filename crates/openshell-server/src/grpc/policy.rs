@@ -23256,6 +23256,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_config_global_policy_rejects_overbroad_wildcard_host() {
+        let state = test_server_state().await;
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(test_policy_with_rule("open", "**.*.*")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message().contains("'**.*.*' is too broad"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
     async fn update_config_global_policy_rejects_ambiguity_before_persisting() {
         let state = test_server_state().await;
 

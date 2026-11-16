@@ -1721,12 +1721,23 @@ fn host_wildcard_shape_invalid(host: &str) -> bool {
 /// of a newly authored host selector.
 const MIN_FIXED_SUFFIX_LABELS: usize = 2;
 
-/// Whether a wildcard host leaves fewer than [`MIN_FIXED_SUFFIX_LABELS`] fixed
-/// labels after its last wildcard label, so it can match names under
-/// unrelated registrable domains (`**.*.*`, `*.*.com`, `api.github.*`).
-pub(crate) fn host_wildcard_overbroad(host: &str) -> bool {
+/// Whether a wildcard host has fewer than two fixed labels after its last wildcard.
+///
+/// Such hosts match names under unrelated registrable domains (`**.*.*`,
+/// `*.*.com`, `api.github.*`). This is an authoring rule: apply it where a
+/// caller writes a host selector, not where one is loaded.
+pub fn host_wildcard_overbroad(host: &str) -> bool {
     let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
-    let Some(last_wildcard) = labels.iter().rposition(|label| label.contains('*')) else {
+    if !host.contains('*') {
+        // Hosts without `*` match exactly, so other characters are literal.
+        return false;
+    }
+    // Runtime glob matching also treats `?`, `[...]`, `{a,b}`, and `\` as
+    // patterns, so a label containing any of them is not fixed.
+    let Some(last_wildcard) = labels
+        .iter()
+        .rposition(|label| label.contains(['*', '?', '[', ']', '{', '}', '\\']))
+    else {
         return false;
     };
     labels.len() - last_wildcard - 1 < MIN_FIXED_SUFFIX_LABELS
@@ -3942,6 +3953,10 @@ network_policies:
             "a*.com",
             "api.github.*",
             "*.example.*",
+            "*.{?,??,???}.{??,???}",
+            "*.example.{com,io}",
+            "*.example.c?m",
+            "*.example.[a-z]om",
         ] {
             let violations =
                 validate_authored_host_selectors(&policy_with_endpoint_host(host)).expect_err(host);

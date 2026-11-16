@@ -7358,6 +7358,61 @@ mod tests {
         assert!(err.message().contains("reserved '_provider_' prefix"));
     }
 
+    #[tokio::test]
+    async fn create_sandbox_rejects_overbroad_wildcard_host() {
+        let state = test_server_state().await;
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "open".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "open".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "**.*.*".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                request_id: String::new(),
+                name: "overbroad-host".to_string(),
+                spec: Some(SandboxSpec {
+                    policy: Some(policy),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                await_main_process_attachment: false,
+                workload_template: String::new(),
+                service_exposures: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("'**.*.*' is too broad"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "overbroad-host")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     fn mcp_policy_with_options(
         mcp: Option<openshell_core::proto::McpOptions>,
     ) -> openshell_core::proto::SandboxPolicy {

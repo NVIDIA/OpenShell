@@ -2676,7 +2676,7 @@ use openshell_core::spiffe::{
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
     normalize_profile_id, strategy_output_env_key, strategy_output_spec, strategy_primary_env_key,
-    validate_profile_set,
+    validate_authored_profile_hosts, validate_profile_set,
 };
 use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
@@ -3100,6 +3100,7 @@ pub(super) async fn handle_import_provider_profiles(
         profile_conflict_diagnostics(state.store.as_ref(), &catalog, &workspace, &profiles).await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(validate_authored_profile_hosts(&profiles));
     if !has_errors(&diagnostics) {
         diagnostics.extend(
             profile_attached_sandbox_diagnostics(
@@ -3204,6 +3205,7 @@ pub(super) async fn handle_update_provider_profiles(
         .await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(validate_authored_profile_hosts(&profiles));
     let expected_resource_version = if request.expected_resource_version != 0 {
         Some(request.expected_resource_version)
     } else {
@@ -3325,6 +3327,7 @@ pub(super) async fn handle_lint_provider_profiles(
         profile_conflict_diagnostics(state.store.as_ref(), &catalog, &workspace, &profiles).await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(validate_authored_profile_hosts(&profiles));
     let valid = !has_errors(&diagnostics);
 
     Ok(Response::new(LintProviderProfilesResponse {
@@ -6620,6 +6623,43 @@ mod tests {
                 .message
                 .contains("import would create ambiguous dynamic token grants")
         }));
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_rejects_overbroad_wildcard_host() {
+        let state = test_server_state().await;
+        let mut profile = custom_profile("open-egress");
+        profile.endpoints = vec![NetworkEndpoint {
+            host: "**.*.*".to_string(),
+            port: 443,
+            ..Default::default()
+        }];
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "open-egress.yaml".to_string(),
+                }],
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert!(
+            response.diagnostics.iter().any(|diagnostic| {
+                diagnostic.field == "endpoints[0].host"
+                    && diagnostic.message.contains("'**.*.*' is too broad")
+            }),
+            "{:?}",
+            response.diagnostics
+        );
     }
 
     #[tokio::test]
