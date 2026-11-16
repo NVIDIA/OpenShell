@@ -1,0 +1,241 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Stable version (e.g. v0.0.4); omit to detect the highest prerelease version on this branch"
+        required: false
+        type: string
+      notes-only:
+        description: "Generate a release notes artifact without promoting or publishing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ inputs.notes-only && format('release-notes-preview-{0}', github.ref) || 'release-stable' }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  preview-notes:
+    name: Preview Release Notes
+    if: ${{ inputs.notes-only }}
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/release-notes.yml
+    with:
+      release-tag: ${{ inputs.tag }}
+    secrets:
+      LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
+
+  promote:
+    name: Select Qualified Prerelease
+    if: ${{ !inputs.notes-only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      tag: ${{ steps.candidate.outputs.tag }}
+      source-sha: ${{ steps.candidate.outputs.source_sha }}
+      make-latest: ${{ steps.candidate.outputs.make_latest }}
+      candidate-tag: ${{ steps.candidate.outputs.candidate_tag }}
+      qualification-run-id: ${{ steps.candidate.outputs.qualification_run_id }}
+    steps:
+      - name: Require a release branch
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+        run: test "${REF_TYPE}" = branch
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.10.12"
+          python-version: "3.13"
+
+      - name: Select candidate and verify qualification evidence
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          uv run --no-project python tasks/scripts/select-release-candidate.py \
+            "${RELEASE_TAG}" --branch "${RELEASE_BRANCH}" > promotion.json
+          jq -r 'to_entries[] | "\(.key)=\(.value)"' promotion.json >> "${GITHUB_OUTPUT}"
+          {
+            echo "## Stable release promotion"
+            jq -r '"- Prerelease: `\(.candidate_tag)`\n- Stable tag: `\(.tag)`\n- Source commit: `\(.source_sha)`\n- Qualification: \(.qualification_run_url)\n- Update shared latest channels: \(.make_latest)"' promotion.json
+            echo
+            echo "Stable artifacts are rebuilt from this qualified commit with the stable version."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Retain promotion record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stable-promotion-${{ steps.candidate.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: promotion.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Create stable tag at the qualified commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.candidate.outputs.tag }}
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
+            test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" = "${SOURCE_SHA}"
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${RELEASE_TAG}" -f "sha=${SOURCE_SHA}"
+          fi
+
+  build:
+    name: Build
+    needs: promote
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release-build.yml
+    with:
+      release-tag: ${{ needs.promote.outputs.tag }}
+      expected-source-sha: ${{ needs.promote.outputs.source-sha }}
+      is-prerelease: false
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  release-notes:
+    name: Release Notes
+    needs: promote
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/release-notes.yml
+    with:
+      release-tag: ${{ needs.promote.outputs.tag }}
+      preview-run-id: ${{ needs.promote.outputs.qualification-run-id }}
+      preview-tag: ${{ needs.promote.outputs.candidate-tag }}
+    secrets:
+      LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
+
+  publish:
+    name: Publish
+    needs: [promote, build, release-notes]
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    uses: ./.github/workflows/release-publish.yml
+    with:
+      release-tag: ${{ needs.promote.outputs.tag }}
+      source-sha: ${{ needs.build.outputs.source_sha }}
+      semver: ${{ needs.build.outputs.semver }}
+      npm-version: ${{ needs.build.outputs.npm_version }}
+      is-prerelease: false
+      make-latest: ${{ needs.promote.outputs.make-latest == 'true' }}
+    secrets:
+      BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+      SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+
+  publish-fern-docs:
+    name: Sync and Publish Fern Docs
+    needs: [build, publish]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/sync-docs.yml
+    with:
+      operation: sync
+      channel: stable
+      source_ref: ${{ needs.build.outputs.source_sha }}
+      release_version: ${{ needs.build.outputs.semver }}
+      version_slug: v${{ needs.build.outputs.semver }}
+      display_name: Latest (v${{ needs.build.outputs.semver }})
+      publish: true
+    secrets:
+      FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+
+  check-publication:
+    name: Check Stable Publication
+    needs: [promote, build, release-notes, publish, publish-fern-docs]
+    if: ${{ always() && !inputs.notes-only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require every stable publisher to succeed
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -e 'all(.[]; .result == "success")' <<<"${NEEDS}"
+
+  notify-release-failure:
+    name: Notify Release Failure
+    needs: [promote, build, release-notes, publish, publish-fern-docs, check-publication]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Send Slack notification
+        continue-on-error: true
+        env:
+          RELEASE_TAG: ${{ needs.promote.outputs.tag || inputs.tag || github.ref_name }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
+          SLACK_MENTION: ${{ secrets.SLACK_OPENSHELL_TRIAGE_MENTION }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}/attempts/{3}', github.server_url, github.repository, github.run_id, github.run_attempt) }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
+            echo "::notice::SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL is unset; skipping Slack notification."
+            exit 0
+          fi
+
+          message=":x: OpenShell release ${RELEASE_TAG} failed (attempt ${GITHUB_RUN_ATTEMPT})."
+          if [[ -n "${SLACK_MENTION}" ]]; then
+            message+=" ${SLACK_MENTION}"
+          fi
+
+          failed_jobs=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
+            --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | "• <\(.html_url)|\(.name)>"') || {
+            echo "::warning::Could not list failed jobs; sending the notification without them."
+            failed_jobs=""
+          }
+          if [[ -n "${failed_jobs}" ]]; then
+            message+=$'\n\nFailed jobs\n'"${failed_jobs}"
+          fi
+
+          jq -n --arg text "${message}" --arg run_url "${RUN_URL}" \
+            '{text: ($text + "\n<" + $run_url + "|View failed release run>"), unfurl_links: false, unfurl_media: false}' |
+            curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+              --header 'Content-Type: application/json' --data-binary @- "${SLACK_WEBHOOK_URL}"

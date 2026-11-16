@@ -21,9 +21,9 @@ USER sandbox
 const RECIPE: &str = r#"set -eu
 test "$(id -u):$(id -g)" = 10001:10002
 /usr/bin/true
-printf 'all: ; @true\n' > /tmp/Makefile
+printf 'value := $(shell printf expansion-ok)\nall: direct shell\ndirect: ; @true\nshell: ; @test "$(value)" = expansion-ok && true\n' > /tmp/Makefile
 make -f /tmp/Makefile
-python3 -c 'import os; assert os.getresuid() == (10001,)*3; assert os.getresgid() == (10002,)*3'
+python3 -c 'import os; assert os.getresuid() == (10001,)*3; assert os.getresgid() == (10002,)*3; pid = os.posix_spawn("/bin/true", ["true"], os.environ, resetids=True); assert os.waitpid(pid, 0) == (pid, 0)'
 printf 'MAKE_RECIPE_OK\n'
 "#;
 

@@ -60,7 +60,7 @@ where
             if let Some(ocsf_event) = clone_current_event() {
                 let line = ocsf_event.format_shorthand();
                 if let Ok(mut w) = self.writer.lock() {
-                    let _ = writeln!(w, "{ts} OCSF {line}");
+                    let _ = write_record(&mut *w, format!("{ts} OCSF {line}"));
                 }
             }
         } else if self.include_non_ocsf {
@@ -71,10 +71,20 @@ where
             let mut message = String::new();
             event.record(&mut MessageVisitor(&mut message));
             if let Ok(mut w) = self.writer.lock() {
-                let _ = writeln!(w, "{ts} {level} {target}: {message}");
+                let _ = write_record(&mut *w, format!("{ts} {level} {target}: {message}"));
             }
         }
     }
+}
+
+/// Preserve one physical line for the entire rendered record, including its
+/// target and any event fields. JSON serialization handles its own escaping.
+fn write_record(writer: &mut impl Write, mut line: String) -> std::io::Result<()> {
+    if line.contains(['\r', '\n']) {
+        line = line.replace('\r', "\\r").replace('\n', "\\n");
+    }
+    line.push('\n');
+    writer.write_all(line.as_bytes())
 }
 
 /// Simple visitor that extracts the message field from tracing events.

@@ -9,13 +9,9 @@ use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEn
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::ActivitySender;
 use openshell_core::endpoint_status::EndpointObservationSender;
-use openshell_core::proto::ProviderProfileCredential;
 use openshell_core::secrets::SecretResolver;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-
-type DynamicCredentials = Arc<std::sync::RwLock<HashMap<String, ProviderProfileCredential>>>;
 
 enum PreparedHttpPolicy {
     Inspect {
@@ -51,9 +47,8 @@ pub(super) fn http_context(
     decision: &EgressDecision,
     provider_credentials: Option<openshell_core::provider_credentials::ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
-    dynamic_credentials: Option<DynamicCredentials>,
+    policy_local: Option<&crate::policy_local::PolicyLocalContext>,
     agent_proposals: openshell_core::proposals::AgentProposals,
-    workspace: String,
     signals: RelaySignals,
 ) -> L7EvalContext {
     // Provider-backed credentials must be acquired from the live state for
@@ -63,6 +58,14 @@ pub(super) fn http_context(
         .is_none()
         .then_some(secret_resolver)
         .flatten();
+    // Grants use the owning sandbox instance's resolver; without one they fail closed.
+    let token_grant_resolver = provider_credentials
+        .as_ref()
+        .and(policy_local)
+        .and_then(crate::policy_local::PolicyLocalContext::token_grant_resolver);
+    let workspace = policy_local
+        .map(crate::policy_local::PolicyLocalContext::workspace)
+        .unwrap_or_default();
     let policy_name = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone().unwrap_or_default(),
         NetworkAction::Deny { .. } => String::new(),
@@ -91,12 +94,10 @@ pub(super) fn http_context(
         secret_resolver,
         provider_credentials,
         provider_credential_revision: None,
+        provider_credential_installation_id: None,
         body_classifier: None,
         activity_tx: signals.activity,
-        dynamic_credentials: dynamic_credentials.clone(),
-        token_grant_resolver: dynamic_credentials
-            .as_ref()
-            .map(|_| crate::l7::token_grant_injection::default_resolver()),
+        token_grant_resolver,
         agent_proposals,
         workspace,
         endpoint_observation_tx: signals.endpoint_observation,
@@ -294,6 +295,35 @@ where
     }
 }
 
+// Exercise the production single/multiple-route dispatch from L7 fixtures.
+#[cfg(test)]
+pub async fn relay_inspected_http_stream_for_test<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    configs: Vec<crate::l7::L7EndpointConfig>,
+    evaluator: TunnelPolicyEngine,
+    middleware_engine: &OpaEngine,
+    request: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    relay_http_stream(
+        client,
+        upstream,
+        RelayContext {
+            request,
+            policy: PreparedHttpPolicy::Inspect {
+                configs,
+                evaluator: Box::new(evaluator),
+            },
+            middleware_engine,
+        },
+    )
+    .await
+}
+
 /// Relay a policy-authorized raw TCP stream.
 pub(super) async fn relay_tcp<C, U>(
     client: &mut C,
@@ -364,9 +394,9 @@ mod tests {
             secret_resolver: None,
             provider_credentials: None,
             provider_credential_revision: None,
+            provider_credential_installation_id: None,
             body_classifier: None,
             activity_tx: None,
-            dynamic_credentials: None,
             token_grant_resolver: None,
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
             workspace: String::new(),
@@ -441,14 +471,14 @@ mod tests {
     #[tokio::test]
     async fn tls_http_relay_reuses_then_sends_close_notify_after_complete_response() {
         use crate::l7::tls::{CertCache, ProxyTlsState, SandboxCa, tls_terminate_client};
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
         let ca = SandboxCa::generate().unwrap();
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
+        for cert in CertificateDer::pem_reader_iter(&mut ca.cert_pem().as_bytes()) {
             roots.add(cert.unwrap()).unwrap();
         }
         let config = Arc::new(
-            rustls::ClientConfig::builder()
+            openshell_crypto::tls::client_builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth(),
         );

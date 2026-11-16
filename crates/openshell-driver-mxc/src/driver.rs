@@ -455,7 +455,7 @@ impl MxcComputeBackend {
     /// Test-only constructor wiring the in-process mock `wxc-exec` shim.
     #[cfg(test)]
     pub(crate) fn new_mocked(config: MxcComputeConfig) -> Self {
-        let mut backend = Self::new(config);
+        let mut backend = Self::new(openshell_core::config::DEFAULT_GATEWAY_NAME, config);
         backend.invoker = WxcExecInvoker::mocked(&backend.config.wxc_exec_path);
         backend
     }
@@ -870,7 +870,7 @@ async fn run_lifecycle(
                 binary_path: host_proxy_binary_path(&sandbox_config),
                 sandbox_id: Some(sandbox_id.clone()),
                 sandbox_name: Some(sandbox_name.clone()),
-                openshell_endpoint: None,
+                gateway: None,
                 provider_credentials: None,
                 agent_proposals: openshell_core::proposals::AgentProposals::default(),
                 denial_tx: None,

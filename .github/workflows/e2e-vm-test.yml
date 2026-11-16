@@ -14,6 +14,10 @@ on:
         required: false
         type: string
         default: ""
+      prebuilt-conformance:
+        required: false
+        type: boolean
+        default: false
       suite-name:
         required: false
         type: string
@@ -22,7 +26,7 @@ on:
         required: false
         type: string
         default: e2e:vm
-      conformance-artifact-prefix:
+      test-name:
         required: false
         type: string
         default: ""
@@ -48,7 +52,7 @@ jobs:
 
       - uses: ./.github/actions/setup-e2e-cli
         with:
-          conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
+          conformance: ${{ inputs.prebuilt-conformance }}
 
       - uses: ./.github/actions/setup-e2e-gateway
         with:
@@ -61,4 +65,5 @@ jobs:
       - name: Run tests
         env:
           E2E_TASK: ${{ inputs.e2e-task }}
+          OPENSHELL_E2E_VM_TEST: ${{ inputs.test-name }}
         run: mise run --no-deps --skip-deps "$E2E_TASK"

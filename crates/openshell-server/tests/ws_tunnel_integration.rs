@@ -409,7 +409,9 @@ async fn ws_tunnel_grpc_health_through_websocket() {
 
     // Also verify HTTP /healthz works directly (not through tunnel — WS is
     // for gRPC; HTTP healthz goes through the multiplexed service directly).
-    let stream = TcpStream::connect(stack.grpc_addr).await.unwrap();
+    let stream = openshell_core::net::connect_tcp_nodelay_best_effort(stack.grpc_addr)
+        .await
+        .unwrap();
     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(stream))
         .await

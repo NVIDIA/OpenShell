@@ -2,10 +2,10 @@ name: Setup E2E CLI
 description: Download architecture-matched prebuilt OpenShell host CLIs for E2E tests
 
 inputs:
-  conformance-artifact-prefix:
-    description: Optional conformance CLI artifact name prefix; linux-<arch> is appended automatically
+  conformance:
+    description: Also download the prebuilt openshell-conformance program and set OPENSHELL_CONFORMANCE_BIN
     required: false
-    default: ""
+    default: "false"
 
 runs:
   using: composite
@@ -24,26 +24,18 @@ runs:
         "$cli" --version
         echo "OPENSHELL_BIN=$cli" >> "$GITHUB_ENV"
 
-    - name: Download prebuilt conformance CLI
-      if: inputs.conformance-artifact-prefix != ''
+    - name: Download prebuilt openshell-conformance
+      if: inputs.conformance == 'true'
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: ${{ format('{0}-{1}', inputs.conformance-artifact-prefix, runner.arch == 'X64' && 'x86_64-unknown-linux-musl' || 'aarch64-unknown-linux-musl') }}
+        name: ${{ runner.arch == 'X64' && 'openshell-conformance-x86_64-unknown-linux-musl' || 'openshell-conformance-aarch64-unknown-linux-musl' }}
         path: .e2e/prebuilt-conformance
 
-    - name: Configure prebuilt conformance CLI
-      if: inputs.conformance-artifact-prefix != ''
+    - name: Configure prebuilt openshell-conformance
+      if: inputs.conformance == 'true'
       shell: bash
-      run: | # zizmor: ignore[github-env] validated filename under the trusted workspace path
-        set -euo pipefail
-        conformance="$GITHUB_WORKSPACE/.e2e/prebuilt-conformance/openshell-conformance"
-        if [[ ! -f "$conformance" ]]; then
-          echo "downloaded artifact is missing $conformance" >&2
-          exit 1
-        fi
-        # TODO: Remove this temporary mode diagnostic after CI confirms artifact permission handling.
-        echo "conformance binary mode before chmod: $(ls -l "$conformance")"
-        chmod +x "$conformance"
-        echo "conformance binary mode after chmod: $(ls -l "$conformance")"
-        "$conformance" list --output json >/dev/null
-        echo "OPENSHELL_CONFORMANCE_BIN=$conformance" >> "$GITHUB_ENV"
+      run: | # zizmor: ignore[github-env] persists only a fixed path under the trusted workspace
+        program="$GITHUB_WORKSPACE/.e2e/prebuilt-conformance/openshell-conformance"
+        chmod +x "$program"
+        "$program" list
+        echo "OPENSHELL_CONFORMANCE_BIN=$program" >> "$GITHUB_ENV"

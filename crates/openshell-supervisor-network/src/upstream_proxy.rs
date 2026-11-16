@@ -63,7 +63,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine as _;
-use openshell_core::net::set_tcp_nodelay_best_effort;
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -219,12 +218,8 @@ impl NoProxy {
     /// outside that range.
     ///
     /// The automatic loopback bypass is derived from resolved addresses, never
-    /// from the host string: `resolved` may come from the sandbox's own
-    /// `/etc/hosts` (see `resolve_socket_addrs`), which the workload controls,
-    /// so treating the name `localhost` as proof of loopback would let a
-    /// spoofed mapping dial a policy-allowed public address while escaping the
-    /// operator proxy. A spoofed `localhost` falls through to the entries below
-    /// and is proxied unless an explicit `NO_PROXY` entry matches.
+    /// from the host string. This keeps the bypass valid even for callers whose
+    /// independently IP-constrained resolution may honor sandbox `/etc/hosts`.
     fn direct_addrs(
         &self,
         host: &str,
@@ -1020,10 +1015,18 @@ async fn connect_via_inner(
     target: ConnectTarget,
 ) -> std::io::Result<PrefixedStream> {
     let tcp = match endpoint.dial_ip {
-        Some(ip) => TcpStream::connect(SocketAddr::new(ip, endpoint.port)).await?,
-        None => TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?,
+        Some(ip) => {
+            openshell_core::net::connect_tcp_nodelay_best_effort(SocketAddr::new(ip, endpoint.port))
+                .await?
+        }
+        None => {
+            openshell_core::net::connect_tcp_nodelay_best_effort((
+                endpoint.host.as_str(),
+                endpoint.port,
+            ))
+            .await?
+        }
     };
-    set_tcp_nodelay_best_effort(&tcp);
     // For an `https://` proxy, wrap the connection in TLS (verifying the proxy
     // certificate against the configured roots) before the CONNECT handshake.
     let mut stream = match &endpoint.tls {
@@ -1782,11 +1785,10 @@ mod tests {
         assert!(!bypasses(&cfg, "example.com"));
     }
 
-    /// A sandbox controls its own `/etc/hosts`, and `resolve_socket_addrs`
-    /// consults it before DNS, so `localhost` can resolve to any address the
-    /// network policy happens to allow. The name must not authorize a direct
-    /// dial that escapes the operator proxy — only genuinely loopback
-    /// resolved addresses may.
+    /// Only genuinely loopback resolved addresses may authorize the automatic
+    /// direct-dial bypass. Callers with independently IP-constrained resolution
+    /// can still honor sandbox `/etc/hosts`, so this check must remain based on
+    /// the resolved address rather than the hostname.
     #[test]
     fn spoofed_localhost_resolution_does_not_bypass_proxy() {
         let cfg = config_ok(&[(HTTPS_PROXY, "http://proxy:8080")]);
@@ -2067,7 +2069,9 @@ mod tests {
                             .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                             .await
                             .unwrap();
-                        if let Ok(mut upstream) = TcpStream::connect(tls_addr).await {
+                        if let Ok(mut upstream) =
+                            openshell_core::net::connect_tcp_nodelay_best_effort(tls_addr).await
+                        {
                             let _ = copy_bidirectional(&mut client, &mut upstream).await;
                         }
                     });
@@ -2155,7 +2159,11 @@ mod tests {
     async fn prefixed_stream_replays_prefix_before_socket_bytes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let connect = tokio::spawn(async move {
+            openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+                .await
+                .unwrap()
+        });
         let (mut accepted, _) = listener.accept().await.unwrap();
         let dialed = connect.await.unwrap();
 
@@ -2258,19 +2266,20 @@ mod tests {
     async fn fake_tls_proxy(
         tls_identity: &str,
     ) -> (SocketAddr, tokio::task::JoinHandle<String>, String) {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = rcgen::CertificateParams::new(vec![tls_identity.to_string()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
+        openshell_crypto::tls::ensure_default_provider();
+        let key = openshell_crypto::pki::generate_keypair().unwrap();
+        let cert = openshell_crypto::pki::self_signed(
+            rcgen::CertificateParams::new(vec![tls_identity.to_string()]).unwrap(),
+            &key,
+        )
+        .unwrap();
         let cert_pem = cert.pem();
 
-        let server_config = rustls::ServerConfig::builder()
+        let server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(
                 vec![cert.der().clone()],
-                rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+                rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der().unwrap()).unwrap(),
             )
             .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));

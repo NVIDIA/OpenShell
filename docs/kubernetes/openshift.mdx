@@ -19,20 +19,11 @@ process to install a nested seccomp user-notification filter and use Landlock.
 OpenShell fails sandbox startup when either capability-free runtime probe fails.
 </Warning>
 
-## Node kernel and legacy read-only mode
+## Node kernel
 
-OpenShift nodes run RHCOS, which currently ships a RHEL 9.x kernel (5.14). That
-kernel predates `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (Linux 5.19), so the
-sandbox starts in a reduced **legacy read-only** cancellation mode. Isolation is
-unchanged, but the broker fails closed with `EOPNOTSUPP` on the mediated
-operations that write results back into workload memory — `getpeername`,
-`accept`/`accept4` with a non-null peer-address argument, and `sendmmsg`
-per-message length write-backs. Outbound-oriented workloads run unchanged;
-server workloads that read the peer address on accept need a node kernel with
-`WAIT_KILLABLE_RECV` (Linux 5.19+, or a distribution backport). See the
-[support matrix](/about/support-matrix#legacy-read-only-mode-kernels-before-linux-519)
-for the full behavior; the selected mode is reported as `seccomp_listener_mode`
-in the sandbox qualification output.
+OpenShell requires OpenShift 4.19 or later. The RHCOS kernels in OpenShift 4.16
+through 4.18 (RHEL 9.4, 5.14.0-427) are built without Landlock, so sandbox
+startup fails its Landlock probe on those releases.
 
 ## Prerequisites
 
@@ -72,6 +63,19 @@ oc -n openshell rollout status statefulset/openshell
 ```
 
 If you set `workload.kind=deployment`, wait for `deployment/openshell` instead.
+
+## Managed workspace namespaces
+
+In managed workspace mode, the Kubernetes driver creates one namespace per
+workspace. On OpenShift, the driver leaves SCC annotations unset so the cluster's
+namespace allocator can assign each workspace its own MCS, UID range, and
+supplemental-group range. The driver waits for those annotations before it
+provisions the workspace ServiceAccount or sandbox Pods.
+
+Namespaces created by an earlier version may have a UID range but no MCS
+annotation. OpenShift does not allocate a new MCS for a namespace that already
+has a UID range, so preserve any needed workspace data and recreate that
+workspace namespace before retrying sandbox creation.
 
 ## Connect to the Gateway
 

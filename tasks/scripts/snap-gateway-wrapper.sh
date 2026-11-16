@@ -2,67 +2,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Snap wrapper for openshell-gateway. Sets snap-specific defaults:
-#   - OPENSHELL_DB_URL        -> sqlite:$SNAP_COMMON/gateway.db (overridable)
-#   - OPENSHELL_LOCAL_TLS_DIR -> $SNAP_COMMON/tls (overridable)
-# The gateway serves TLS from the generated bundle and requires client
-# certificates. It bootstraps package-managed credentials and validates, but
-# never creates or rewrites, an operator-provided config before starting.
+# Snap wrapper for openshell-gateway. The system service supplies explicit
+# compatibility paths; the user service uses OpenShell's XDG defaults.
 
 set -eu
 
-CANONICAL_CONFIG_FILE="${SNAP_COMMON}/gateway.toml"
-export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"
-export OPENSHELL_LOCAL_TLS_DIR="${OPENSHELL_LOCAL_TLS_DIR:-${SNAP_COMMON}/tls}"
-
-# Mirror clap's CLI-over-environment precedence so preflight always inspects
-# the same file the daemon will load. Reject ambiguous duplicate selectors
-# before either command runs.
-cli_config=""
-config_seen=false
-expect_config_path=false
-options_done=false
-for argument in "$@"; do
-    if [ "$options_done" = true ]; then
-        continue
-    fi
-    if [ "$expect_config_path" = true ]; then
-        case "$argument" in
-            -*)
-                echo "openshell-gateway: --config requires a nonempty path" >&2
-                exit 2
-                ;;
-        esac
-        if [ "$config_seen" = true ]; then
-            echo "openshell-gateway: duplicate --config option" >&2
-            exit 2
-        fi
-        cli_config=$argument
-        config_seen=true
-        expect_config_path=false
-        continue
-    fi
-    case "$argument" in
-        --)
-            options_done=true
-            ;;
-        --config)
-            expect_config_path=true
-            ;;
-        --config=*)
-            if [ "$config_seen" = true ]; then
-                echo "openshell-gateway: duplicate --config option" >&2
-                exit 2
-            fi
-            cli_config=${argument#--config=}
-            config_seen=true
-            ;;
-    esac
-done
-if [ "$expect_config_path" = true ] || { [ "$config_seen" = true ] && [ -z "$cli_config" ]; }; then
-    echo "openshell-gateway: --config requires a nonempty path" >&2
-    exit 2
+if [ -z "${OPENSHELL_GATEWAY_CONFIG:-}" ] \
+    && [ -n "${OPENSHELL_SNAP_CONFIG_FILE:-}" ] \
+    && { [ -e "$OPENSHELL_SNAP_CONFIG_FILE" ] || [ -L "$OPENSHELL_SNAP_CONFIG_FILE" ]; }
+then
+    export OPENSHELL_GATEWAY_CONFIG="$OPENSHELL_SNAP_CONFIG_FILE"
 fi
+
+if [ -z "${OPENSHELL_LOCAL_TLS_DIR:-}" ]; then
+    if [ -z "${XDG_STATE_HOME:-}" ]; then
+        echo "openshell-gateway: OPENSHELL_LOCAL_TLS_DIR or XDG_STATE_HOME is required" >&2
+        exit 1
+    fi
+    export OPENSHELL_LOCAL_TLS_DIR="${XDG_STATE_HOME}/openshell/tls"
+fi
+
+"${SNAP}/bin/openshell-gateway" config preflight -- "$@"
 
 # Generate the local TLS bundle and the JWT bundle used for launch-scoped
 # supervisor credentials; generate-certs is idempotent and preserves an
@@ -71,16 +31,4 @@ fi
     --output-dir "$OPENSHELL_LOCAL_TLS_DIR" \
     --server-san host.openshell.internal
 
-if [ "$config_seen" = true ]; then
-    "${SNAP}/bin/openshell-gateway" config preflight -- "$@"
-    exec "${SNAP}/bin/openshell-gateway" "$@"
-elif [ -n "${OPENSHELL_GATEWAY_CONFIG:-}" ]; then
-    "${SNAP}/bin/openshell-gateway" config preflight -- "$@"
-    exec "${SNAP}/bin/openshell-gateway" "$@"
-elif [ -e "$CANONICAL_CONFIG_FILE" ] || [ -L "$CANONICAL_CONFIG_FILE" ]; then
-    "${SNAP}/bin/openshell-gateway" config preflight -- --config "$CANONICAL_CONFIG_FILE" "$@"
-    exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"
-else
-    "${SNAP}/bin/openshell-gateway" config preflight -- "$@"
-    exec "${SNAP}/bin/openshell-gateway" "$@"
-fi
+exec "${SNAP}/bin/openshell-gateway" "$@"

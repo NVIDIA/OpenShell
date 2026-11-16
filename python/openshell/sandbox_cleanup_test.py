@@ -3,6 +3,7 @@
 
 """Cleanup status handling through the curated client's real gRPC interceptor."""
 
+import time
 from concurrent import futures
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ def cleanup_client():
     state = SimpleNamespace(
         exists=False,
         code=grpc.StatusCode.NOT_FOUND,
+        delete_delay=0.0,
         calls=[],
         closed=[],
     )
@@ -46,6 +48,7 @@ def cleanup_client():
         assert request.name == "cleanup-test"
         assert request.workspace_scope.workspace == "default"
         assert request.allow_missing
+        time.sleep(state.delete_delay)
         if state.code == grpc.StatusCode.NOT_FOUND:
             return openshell_pb2.DeleteSandboxResponse(
                 outcome=openshell_pb2.DELETION_OUTCOME_ALREADY_ABSENT
@@ -156,3 +159,128 @@ def test_context_cleanup_handles_absence_and_intercepted_errors(
     assert state.closed == [True]
     assert managed._client is None
     assert managed._session is None
+
+
+@pytest.mark.parametrize(
+    ("client_timeout", "delete_timeout_seconds", "expect_deadline"),
+    [(0.2, None, True), (0.2, 5, False), (5, 0.2, True)],
+)
+def test_context_cleanup_delete_timeout_is_opt_in(
+    cleanup_client,
+    monkeypatch,
+    client_timeout,
+    delete_timeout_seconds,
+    expect_deadline,
+):
+    client, state = cleanup_client
+    state.exists = True
+    state.delete_delay = 0.5
+    monkeypatch.setattr(
+        SandboxClient,
+        "from_active_cluster",
+        classmethod(lambda _cls, **_kwargs: client),
+    )
+
+    managed = Sandbox(
+        workspace="default",
+        sandbox="cleanup-test",
+        delete_timeout_seconds=delete_timeout_seconds,
+    )
+    expected = pytest.raises(GatewayError) if expect_deadline else nullcontext()
+    with expected as caught, managed:
+        # Only the exit delete runs under the short deadline.
+        client._timeout = client_timeout
+        state.exists = False
+    if caught is not None:
+        assert caught.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+    assert state.calls == ["GetSandbox", "GetSandbox", "DeleteSandbox"]
+    assert state.closed == [True]
+    assert managed._client is None
+    assert managed._session is None
+
+
+class _EntryFailureClient:
+    """Fails the named client call and records close()."""
+
+    def __init__(self, fail_at, close_error=None):
+        self.fail_at = fail_at
+        self.close_error = close_error
+        self.closed = 0
+        self.error = RuntimeError(f"{fail_at} failed")
+
+    def _step(self, name):
+        if name == self.fail_at:
+            raise self.error
+        return SimpleNamespace(sandbox=SimpleNamespace(name="s1"))
+
+    def create_session(self, **_kwargs):
+        return self._step("create_session")
+
+    def create_session_from_template(self, **_kwargs):
+        return self._step("create_session_from_template")
+
+    def get_session(self, *_args, **_kwargs):
+        return self._step("get_session")
+
+    def wait_ready(self, *_args, **_kwargs):
+        self._step("wait_ready")
+        return SimpleNamespace(name="s1", workspace="default")
+
+    def close(self):
+        self.closed += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def _use_client(monkeypatch, client):
+    monkeypatch.setattr(
+        SandboxClient, "from_active_cluster", classmethod(lambda _cls, **_kw: client)
+    )
+
+
+@pytest.mark.parametrize(
+    ("fail_at", "kwargs"),
+    [
+        ("create_session", {}),
+        ("create_session_from_template", {"workload_template": "t"}),
+        ("get_session", {"sandbox": "existing"}),
+        ("wait_ready", {}),
+        ("wait_ready", {"sandbox": "existing"}),
+    ],
+)
+def test_context_entry_failure_closes_client(monkeypatch, fail_at, kwargs):
+    client = _EntryFailureClient(fail_at)
+    _use_client(monkeypatch, client)
+    managed = Sandbox(workspace="default", delete_on_exit=False, **kwargs)
+
+    with pytest.raises(RuntimeError) as observed, managed:
+        pass
+
+    assert observed.value is client.error
+    assert client.closed == 1
+    assert managed._client is None
+    assert managed._session is None
+
+
+def test_context_entry_failure_keeps_original_error_when_close_fails(monkeypatch):
+    client = _EntryFailureClient("wait_ready", close_error=OSError("close failed"))
+    _use_client(monkeypatch, client)
+    managed = Sandbox(workspace="default")
+
+    with pytest.raises(RuntimeError) as observed, managed:
+        pass
+
+    assert observed.value is client.error
+    assert client.closed == 1
+    assert managed._client is None
+    assert managed._session is None
+
+
+def test_context_closes_client_once_on_success(monkeypatch):
+    client = _EntryFailureClient(None)
+    _use_client(monkeypatch, client)
+
+    with Sandbox(workspace="default", delete_on_exit=False):
+        assert client.closed == 0
+
+    assert client.closed == 1

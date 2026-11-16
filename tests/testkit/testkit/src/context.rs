@@ -1,0 +1,817 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Per-test context: the SDK client, the run ID, and the resources to clean up.
+
+use std::time::Duration;
+
+use openshell_sdk::raw::{AuthedGrpcClient, proto};
+use openshell_sdk::{
+    DeleteOptions, ExecOptions, ListOptions, OpenShellClient, SandboxPhase, SandboxRef,
+    SandboxRestartPolicy, SandboxSpec, SdkError, WorkspaceScopedClient,
+};
+use rand::Rng;
+
+use crate::cleanup::{CLEANUP_TIMEOUT, Cleanup, Key};
+use crate::cli::{Cli, CliOutput};
+use crate::cli_sandbox::CliSandboxBuilder;
+use crate::error::{Error, Result, ResultExt};
+use crate::output::Outcome;
+use crate::poll::{Poll, poll_until};
+
+/// Sandbox creation includes image pulls on a cold environment.
+pub const READY_TIMEOUT: Duration = Duration::from_mins(10);
+pub const DELETE_TIMEOUT: Duration = Duration::from_mins(2);
+pub const EXEC_TIMEOUT: Duration = Duration::from_mins(2);
+/// Stopping includes stopping compute, which can take a while on some drivers.
+pub const STOP_TIMEOUT: Duration = Duration::from_mins(5);
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What a test uses to act on the system under test.
+pub struct Context {
+    handles: Handles,
+    run_id: String,
+}
+
+impl Context {
+    pub(crate) fn new(client: &OpenShellClient, workspace: &str, cli: Cli) -> Self {
+        Self {
+            handles: Handles {
+                client: client.workspace(workspace),
+                grpc: Grpc {
+                    client: client.clone(),
+                    workspace: workspace.to_string(),
+                },
+                cli,
+                cleanup: Cleanup::default(),
+            },
+            run_id: generate_run_id(),
+        }
+    }
+
+    /// Run the `openshell` CLI against the test's gateway and workspace.
+    /// A non-zero exit is returned, not raised.
+    pub async fn cli<I, S>(&self, args: I) -> Result<CliOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.handles.cli.run(args).await
+    }
+
+    /// Like [`Context::cli`], with `dir` as the working directory.
+    pub async fn cli_in<I, S>(&self, dir: &std::path::Path, args: I) -> Result<CliOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.handles.cli.run_in(Some(dir), args).await
+    }
+
+    /// Like [`Context::cli`], with extra environment variables for the CLI.
+    /// Pass secrets this way rather than as arguments: values are not
+    /// included in the reported command or in errors.
+    pub async fn cli_with_env<I, S>(&self, env: &[(&str, &str)], args: I) -> Result<CliOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.handles.cli.run_with_env(None, env, args).await
+    }
+
+    /// The CLI that [`Context::cli`] runs, for code that can't borrow the
+    /// context, such as a cleanup hook.
+    pub fn cli_handle(&self) -> Cli {
+        self.handles.cli.clone()
+    }
+
+    /// The ID unique to this test run, used in resource names.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// The SDK client, for operations testkit does not wrap.
+    pub fn client(&self) -> &WorkspaceScopedClient {
+        &self.handles.client
+    }
+
+    /// A resource name unique to this run: `test-<run-id>-<suffix>`.
+    pub fn name(&self, suffix: &str) -> String {
+        format!("test-{}-{suffix}", self.run_id)
+    }
+
+    /// Start describing a sandbox named `cx.name(suffix)`.
+    pub fn sandbox(&self, suffix: &str) -> SandboxBuilder {
+        SandboxBuilder {
+            handles: self.handles.clone(),
+            policy: None,
+            spec: SandboxSpec {
+                name: Some(self.name(suffix)),
+                ..SandboxSpec::default()
+            },
+        }
+    }
+
+    /// Start describing a sandbox named `cx.name(suffix)` that the
+    /// `openshell` CLI creates. Use it for what only `sandbox create`
+    /// offers, such as a `--policy` file or `--no-keep`; prefer
+    /// [`Context::sandbox`] otherwise.
+    pub fn cli_sandbox(&self, suffix: &str) -> CliSandboxBuilder {
+        CliSandboxBuilder::new(self.handles.clone(), self.name(suffix))
+    }
+
+    /// Track a sandbox the test is about to create through the CLI, so cleanup
+    /// deletes it even if the test fails after the gateway accepted the create.
+    /// Call this before the CLI command; use [`Context::adopt`] afterwards.
+    ///
+    /// Cleanup deletes the sandbox and waits until it is gone, at the point
+    /// in the cleanup order where it was first tracked. Tracking a sandbox
+    /// again, for example by adopting it, doesn't move it.
+    pub fn track(&self, name: &str) {
+        self.handles.track(name);
+    }
+
+    /// Run `hook` after the test body, whether the body passes, fails, or
+    /// panics. Use it to remove what testkit doesn't track, such as
+    /// providers, profiles, or images. `name` says what the hook does, for
+    /// reporting a failure.
+    ///
+    /// Hooks run one at a time, last registered first, after the body and
+    /// before the test reports. Sandboxes from [`Context::sandbox`] and
+    /// [`Context::track`] are cleaned up the same way, so a hook registered
+    /// before a sandbox is created runs after the sandbox is deleted. Each
+    /// hook has [`CLEANUP_TIMEOUT`]. A hook that fails, panics, or times out
+    /// is reported and the remaining hooks still run; it fails a test whose
+    /// body passed.
+    ///
+    /// `provider delete` succeeds for a missing provider, so this registers
+    /// the hook before the create. It then also covers a create the gateway
+    /// applied but the CLI reported as failed.
+    ///
+    /// ```ignore
+    /// let cli = cx.cli_handle();
+    /// let provider = cx.name("provider");
+    /// let name = provider.clone();
+    /// cx.on_cleanup(format!("delete provider {provider}"), async move || {
+    ///     cli.run(["provider", "delete", &name]).await?.success()?;
+    ///     Ok(())
+    /// });
+    /// cx.cli(["provider", "create", "--name", &provider /* ... */])
+    ///     .await?
+    ///     .success()?;
+    /// ```
+    pub fn on_cleanup<F, Fut>(&self, name: impl Into<String>, hook: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result> + Send + 'static,
+    {
+        self.handles.cleanup.push(name, hook);
+    }
+
+    /// A handle to a sandbox created outside the builder, e.g. by the CLI.
+    /// It is tracked for cleanup like a built one.
+    pub async fn adopt(&self, name: &str) -> Result<Sandbox> {
+        self.handles.adopt(name).await
+    }
+
+    /// Fail unless the gateway runs exactly one compute driver, `name`, as
+    /// gateway info reports it. Driver suites check this first, so a suite
+    /// pointed at another driver's gateway fails instead of testing it.
+    pub async fn expect_compute_driver(&self, name: &str) -> Result {
+        let info = self
+            .handles
+            .grpc
+            .client()
+            .await?
+            .get_gateway_info(proto::GetGatewayInfoRequest {})
+            .await
+            .context("get gateway info")?
+            .into_inner();
+        let drivers: Vec<(&str, &str)> = info
+            .compute_drivers
+            .iter()
+            .map(|driver| {
+                let reported = driver
+                    .capabilities
+                    .as_ref()
+                    .map_or("", |capabilities| capabilities.driver_name.as_str());
+                (driver.name.as_str(), reported)
+            })
+            .collect();
+        crate::ensure!(
+            matches!(drivers.as_slice(), [(configured, reported)] if *configured == name && *reported == name),
+            "the gateway reports compute drivers (name, driver name) {drivers:?}; expected only {name}"
+        );
+        Ok(())
+    }
+
+    /// Run the cleanup hooks, including deleting the sandboxes the test
+    /// created and has not deleted. Returns the cleanup failures; they are
+    /// reported separately from the test result.
+    pub(crate) async fn cleanup(&self) -> Vec<String> {
+        self.handles.cleanup.run(CLEANUP_TIMEOUT).await
+    }
+}
+
+/// Register the cleanup hook that deletes sandbox `name`, unless it is
+/// already tracked.
+fn track_sandbox(cleanup: &Cleanup, client: &WorkspaceScopedClient, name: &str) {
+    let client = client.clone();
+    let owned = name.to_string();
+    // The timeout wraps the whole hook, not just the wait, so a gateway that
+    // never answers the delete cannot hang cleanup.
+    cleanup.push_keyed(
+        Key::Sandbox(name.to_string()),
+        format!("delete sandbox {name}"),
+        async move || {
+            client
+                .delete_sandbox(
+                    &owned,
+                    DeleteOptions {
+                        allow_missing: true,
+                    },
+                )
+                .await?;
+            client.wait_deleted(&owned, CLEANUP_TIMEOUT, None).await?;
+            Ok(())
+        },
+    );
+}
+
+/// The generated gRPC client, for public API the SDK does not wrap yet.
+#[derive(Clone)]
+struct Grpc {
+    client: OpenShellClient,
+    workspace: String,
+}
+
+impl Grpc {
+    async fn client(&self) -> Result<AuthedGrpcClient> {
+        Ok(self.client.raw_grpc_fresh().await?)
+    }
+
+    fn scope(&self) -> Option<openshell_sdk::raw::proto::datamodel::v1::WorkspaceSelector> {
+        Some(proto::workspace_selector(&self.workspace))
+    }
+}
+
+/// What the context, its builders and its sandboxes share: the gateway
+/// clients, the CLI, and the test's cleanup list.
+#[derive(Clone)]
+pub(crate) struct Handles {
+    client: WorkspaceScopedClient,
+    grpc: Grpc,
+    cli: Cli,
+    cleanup: Cleanup,
+}
+
+impl Handles {
+    pub(crate) fn cli(&self) -> &Cli {
+        &self.cli
+    }
+
+    pub(crate) fn track(&self, name: &str) {
+        track_sandbox(&self.cleanup, &self.client, name);
+    }
+
+    pub(crate) async fn adopt(&self, name: &str) -> Result<Sandbox> {
+        self.track(name);
+        let found = self
+            .client
+            .get_sandbox(name)
+            .await
+            .context(format!("get sandbox {name}"))?;
+        Ok(Sandbox {
+            handles: self.clone(),
+            name: name.to_string(),
+            id: found.id,
+        })
+    }
+}
+
+/// A sandbox to create.
+#[must_use = "a SandboxBuilder does nothing until create() or create_ready()"]
+pub struct SandboxBuilder {
+    handles: Handles,
+    policy: Option<proto::SandboxPolicy>,
+    spec: SandboxSpec,
+}
+
+impl SandboxBuilder {
+    /// The sandbox's main command. Empty selects the gateway's default.
+    pub fn command<I, S>(mut self, command: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.spec.command = command.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Create the sandbox from `image` instead of the gateway's default.
+    pub fn image(mut self, image: impl Into<String>) -> Self {
+        self.spec.image = Some(image.into());
+        self
+    }
+
+    /// Whether the sandbox restarts when its main command exits: never, on
+    /// failure, or always.
+    pub fn restart_policy(mut self, policy: SandboxRestartPolicy) -> Self {
+        self.spec.restart_policy = policy;
+        self
+    }
+
+    /// Create the sandbox with this policy instead of the gateway's default.
+    pub fn policy(mut self, policy: proto::SandboxPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Full access to the spec for fields without a builder method.
+    pub fn spec(mut self, update: impl FnOnce(&mut SandboxSpec)) -> Self {
+        update(&mut self.spec);
+        self
+    }
+
+    /// Create the sandbox and wait until it is Ready.
+    pub async fn create_ready(self) -> Result<Sandbox> {
+        let sandbox = self.create().await?;
+        sandbox.wait_ready().await?;
+        Ok(sandbox)
+    }
+
+    /// Create the sandbox. It is tracked for cleanup before the request is
+    /// sent, so a create that fails after the gateway accepted it is still
+    /// cleaned up.
+    pub async fn create(self) -> Result<Sandbox> {
+        let name = self.spec.name.clone().unwrap_or_default();
+        self.handles.track(&name);
+        let id = match self.policy {
+            None => {
+                self.handles
+                    .client
+                    .create_sandbox(self.spec)
+                    .await
+                    .context(format!("create sandbox {name}"))?
+                    .id
+            }
+            // The SDK's spec has no policy field, so create through gRPC.
+            Some(policy) => {
+                crate::ensure!(
+                    !self.spec.gpu && self.spec.service_exposures.is_empty(),
+                    "testkit doesn't create a sandbox with a policy and a GPU or service exposures"
+                );
+                let request = policy_create_request(self.spec, policy, self.handles.grpc.scope());
+                self.handles
+                    .grpc
+                    .client()
+                    .await?
+                    .create_sandbox(request)
+                    .await
+                    .context(format!("create sandbox {name}"))?;
+                self.handles
+                    .client
+                    .get_sandbox(&name)
+                    .await
+                    .context(format!("get sandbox {name}"))?
+                    .id
+            }
+        };
+        Ok(Sandbox {
+            handles: self.handles,
+            name,
+            id,
+        })
+    }
+}
+
+/// The gRPC request for a sandbox created from `spec` with `policy`, built
+/// as the SDK builds one from `spec` alone. The spec is destructured without
+/// `..`, so a field added to the SDK's spec fails to compile here instead of
+/// being dropped. [`SandboxBuilder::create`] rejects a GPU or service
+/// exposures before calling this. A policy field on the SDK's spec would
+/// replace this (#5410).
+fn policy_create_request(
+    spec: SandboxSpec,
+    policy: proto::SandboxPolicy,
+    workspace_scope: Option<proto::datamodel::v1::WorkspaceSelector>,
+) -> proto::CreateSandboxRequest {
+    let SandboxSpec {
+        name,
+        image,
+        labels,
+        environment,
+        providers,
+        gpu: _,
+        command,
+        tty,
+        service_exposures: _,
+        restart_policy,
+    } = spec;
+    proto::CreateSandboxRequest {
+        name: name.unwrap_or_default(),
+        labels,
+        workspace_scope,
+        spec: Some(proto::SandboxSpec {
+            environment,
+            template: image.map(|image| proto::SandboxTemplate {
+                image,
+                ..proto::SandboxTemplate::default()
+            }),
+            providers,
+            command,
+            tty,
+            policy: Some(policy),
+            restart_policy: proto::SandboxRestartPolicy::from(restart_policy) as i32,
+            ..proto::SandboxSpec::default()
+        }),
+        ..proto::CreateSandboxRequest::default()
+    }
+}
+
+/// A sandbox created by the test.
+pub struct Sandbox {
+    handles: Handles,
+    name: String,
+    id: String,
+}
+
+/// The buffered output of an exec.
+#[derive(Debug)]
+pub struct ExecOutput {
+    /// The command and the sandbox it ran in, for reports.
+    pub description: String,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl ExecOutput {
+    /// Fail unless the command exited 0.
+    pub fn success(self) -> Result<Self> {
+        self.outcome().success()?;
+        Ok(self)
+    }
+
+    /// Fail unless the command exited non-zero, e.g. when a request must be
+    /// rejected.
+    pub fn failure(self) -> Result<Self> {
+        self.outcome().failure()?;
+        Ok(self)
+    }
+
+    /// Fail unless the command exited 0 and printed exactly `expected`.
+    pub fn expect_stdout(self, expected: &str) -> Result<Self> {
+        self.outcome().stdout_is(expected)?;
+        Ok(self)
+    }
+
+    fn outcome(&self) -> Outcome<'_> {
+        Outcome {
+            what: &self.description,
+            exit_code: self.exit_code,
+            stdout: &self.stdout,
+            stderr: &self.stderr,
+        }
+    }
+}
+
+impl Sandbox {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Wait until the sandbox is Ready. A sandbox that completes or fails
+    /// instead is an error.
+    pub async fn wait_ready(&self) -> Result<SandboxRef> {
+        let snapshot = self
+            .handles
+            .client
+            .wait_ready(&self.name, READY_TIMEOUT)
+            .await
+            .context(format!("wait for sandbox {} to be ready", self.name))?;
+        crate::ensure!(
+            snapshot.phase == SandboxPhase::Ready,
+            "sandbox {} reached phase {:?}; expected Ready",
+            self.name,
+            snapshot.phase
+        );
+        Ok(snapshot)
+    }
+
+    /// Wait until the main process has finished: the sandbox is Completed or
+    /// in Error. Returns that snapshot; the test decides which outcome it
+    /// expects. Includes provisioning, so it uses the ready timeout.
+    pub async fn wait_finished(&self) -> Result<SandboxRef> {
+        poll_until(
+            &format!("sandbox {} to finish", self.name),
+            READY_TIMEOUT,
+            STATUS_INTERVAL,
+            async || {
+                let snapshot = self.get().await?;
+                Ok(match snapshot.phase {
+                    SandboxPhase::Completed | SandboxPhase::Error => Poll::Ready(snapshot),
+                    phase => Poll::Pending(format!("phase {phase:?}")),
+                })
+            },
+        )
+        .await
+    }
+
+    /// Stop the sandbox and wait until it is Stopped.
+    pub async fn stop(&self) -> Result<SandboxRef> {
+        self.handles
+            .client
+            .stop_sandbox(&self.name)
+            .await
+            .context(format!("stop sandbox {}", self.name))?;
+        self.wait_phase(SandboxPhase::Stopped, STOP_TIMEOUT).await
+    }
+
+    /// Start the sandbox and wait until it is Ready again.
+    pub async fn start(&self) -> Result<SandboxRef> {
+        self.handles
+            .client
+            .start_sandbox(&self.name)
+            .await
+            .context(format!("start sandbox {}", self.name))?;
+        self.wait_ready().await
+    }
+
+    /// Wait until the sandbox reaches `phase`.
+    pub async fn wait_phase(&self, phase: SandboxPhase, timeout: Duration) -> Result<SandboxRef> {
+        poll_until(
+            &format!("sandbox {} to be {phase:?}", self.name),
+            timeout,
+            STATUS_INTERVAL,
+            async || {
+                let snapshot = self.get().await?;
+                Ok(if snapshot.phase == phase {
+                    Poll::Ready(snapshot)
+                } else {
+                    Poll::Pending(format!("phase {:?}", snapshot.phase))
+                })
+            },
+        )
+        .await
+    }
+
+    /// Set a sandbox-scoped setting.
+    pub async fn set_setting(&self, key: &str, value: proto::setting_value::Value) -> Result {
+        let request = proto::UpdateConfigRequest {
+            sandbox: self.name.clone(),
+            workspace_scope: self.handles.grpc.scope(),
+            setting_key: key.to_string(),
+            setting_value: Some(proto::SettingValue { value: Some(value) }),
+            ..proto::UpdateConfigRequest::default()
+        };
+        self.handles
+            .grpc
+            .client()
+            .await?
+            .update_config(request)
+            .await
+            .context(format!("set {key} on sandbox {}", self.name))?;
+        Ok(())
+    }
+
+    /// The sandbox's effective policy and settings.
+    pub async fn config(&self) -> Result<proto::GetSandboxConfigResponse> {
+        let request = proto::GetSandboxConfigRequest {
+            name: self.name.clone(),
+            workspace_scope: self.handles.grpc.scope(),
+        };
+        Ok(self
+            .handles
+            .grpc
+            .client()
+            .await?
+            .get_sandbox_config(request)
+            .await
+            .context(format!("get config of sandbox {}", self.name))?
+            .into_inner())
+    }
+
+    /// The sandbox's draft policy chunks, all statuses.
+    pub async fn draft_policy(&self) -> Result<proto::GetDraftPolicyResponse> {
+        let request = proto::GetDraftPolicyRequest {
+            sandbox: self.name.clone(),
+            workspace_scope: self.handles.grpc.scope(),
+            status_filter: String::new(),
+        };
+        Ok(self
+            .handles
+            .grpc
+            .client()
+            .await?
+            .get_draft_policy(request)
+            .await
+            .context(format!("get draft policy of sandbox {}", self.name))?
+            .into_inner())
+    }
+
+    /// The sandbox's current state.
+    pub async fn get(&self) -> Result<SandboxRef> {
+        self.handles
+            .client
+            .get_sandbox(&self.name)
+            .await
+            .context(format!("get sandbox {}", self.name))
+    }
+
+    /// Run a command in the sandbox and buffer its output.
+    pub async fn exec<I, S>(&self, command: I) -> Result<ExecOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let command: Vec<String> = command.into_iter().map(Into::into).collect();
+        let description = format!("exec {command:?} in sandbox {}", self.name);
+        let options = ExecOptions {
+            timeout: Some(EXEC_TIMEOUT),
+            ..ExecOptions::default()
+        };
+        let result = self
+            .handles
+            .client
+            .exec(&self.name, &command, options)
+            .await
+            .context(&description)?;
+        Ok(ExecOutput {
+            description,
+            exit_code: result.exit_code,
+            stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+        })
+    }
+
+    /// Run `command` every 250 ms until `ready` accepts its output, and return
+    /// that output. An exec error fails at once; a timeout reports the last
+    /// output.
+    pub async fn poll_exec<I, S>(
+        &self,
+        what: &str,
+        timeout: Duration,
+        command: I,
+        ready: impl Fn(&ExecOutput) -> bool,
+    ) -> Result<ExecOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let command: Vec<String> = command.into_iter().map(Into::into).collect();
+        poll_until(what, timeout, Duration::from_millis(250), async || {
+            let output = self.exec(command.iter().cloned()).await?;
+            Ok(if ready(&output) {
+                Poll::Ready(output)
+            } else {
+                Poll::Pending(format!(
+                    "exited {} with stdout {:?}; stderr: {}",
+                    output.exit_code,
+                    output.stdout,
+                    output.stderr.trim()
+                ))
+            })
+        })
+        .await
+    }
+
+    /// `sandbox get --output json`. It reports fields the SDK does not
+    /// expose, such as `restart_count`, `restart_policy`,
+    /// `main_process_instance_id`, and `conditions`.
+    pub async fn get_json(&self) -> Result<serde_json::Value> {
+        self.handles
+            .cli
+            .run(["sandbox", "get", &self.name, "--output", "json"])
+            .await?
+            .success()?
+            .json()
+    }
+
+    /// Fail unless `list` shows the sandbox in `phase`.
+    pub async fn expect_listed(&self, phase: SandboxPhase) -> Result {
+        let name = &self.name;
+        let listed = self
+            .handles
+            .client
+            .list_all_sandboxes(ListOptions::default())
+            .await
+            .context("list sandboxes")?;
+        let Some(entry) = listed.iter().find(|entry| entry.name == *name) else {
+            return Err(Error::msg(format!("sandbox {name} is not listed")));
+        };
+        crate::ensure!(
+            entry.phase == phase,
+            "sandbox {name} is listed in phase {:?}; expected {phase:?}",
+            entry.phase
+        );
+        Ok(())
+    }
+
+    /// Fail unless the sandbox is gone from both get and list.
+    pub async fn expect_absent(&self) -> Result {
+        let name = &self.name;
+        match self.handles.client.get_sandbox(name).await {
+            Err(SdkError::NotFound { .. }) => {}
+            Err(error) => return Err(Error::from(error).context(format!("get sandbox {name}"))),
+            Ok(found) => {
+                return Err(Error::msg(format!(
+                    "sandbox {name} still exists (id {}, phase {:?})",
+                    found.id, found.phase
+                )));
+            }
+        }
+        let listed = self
+            .handles
+            .client
+            .list_all_sandboxes(ListOptions::default())
+            .await
+            .context("list sandboxes")?;
+        crate::ensure!(
+            !listed.iter().any(|entry| entry.name == *name),
+            "sandbox {name} is absent from get but still listed"
+        );
+        Ok(())
+    }
+
+    /// Wait up to `timeout` for the gateway to remove the sandbox by itself,
+    /// for example after a `--no-keep` main command exits, then check it is
+    /// gone from both get and list.
+    pub async fn wait_absent(&self, timeout: Duration) -> Result {
+        self.handles
+            .client
+            .wait_deleted(&self.name, timeout, Some(&self.id))
+            .await
+            .context(format!("wait for sandbox {} to be removed", self.name))?;
+        self.expect_absent().await
+    }
+
+    /// Delete the sandbox and wait until it is gone.
+    pub async fn delete(&self) -> Result {
+        self.handles
+            .client
+            .delete_sandbox(&self.name, DeleteOptions::default())
+            .await
+            .context(format!("delete sandbox {}", self.name))?;
+        self.handles
+            .client
+            .wait_deleted(&self.name, DELETE_TIMEOUT, Some(&self.id))
+            .await
+            .context(format!("wait for sandbox {} to be deleted", self.name))?;
+        self.handles
+            .cleanup
+            .remove(&Key::Sandbox(self.name.clone()));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Context {
+    /// A context for a gateway that isn't running, so gateway calls fail.
+    pub(crate) fn unconnected() -> Self {
+        const ENDPOINT: &str = "http://127.0.0.1:1";
+        let channel = tonic::transport::Channel::from_static(ENDPOINT).connect_lazy();
+        let interceptor =
+            openshell_sdk::EdgeAuthInterceptor::new(None, None).expect("no-op interceptor");
+        let client = OpenShellClient::from_parts(channel, interceptor);
+        let gateway =
+            crate::gateway::Gateway::from_endpoint(ENDPOINT.to_string(), "default".to_string());
+        Self::new(&client, "default", Cli::from_env(&gateway))
+    }
+}
+
+/// Short, lowercase, and DNS-label safe, so names work on every driver.
+fn generate_run_id() -> String {
+    const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut rng = rand::rng();
+    (0..8)
+        .map(|_| char::from(ALPHABET[rng.random_range(0..ALPHABET.len())]))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_create_request_keeps_the_spec_and_adds_the_policy() {
+        let spec = SandboxSpec {
+            image: Some("python:3".to_string()),
+            providers: vec!["provider".to_string()],
+            ..SandboxSpec::default()
+        };
+        let policy = crate::policy::base();
+
+        let spec = policy_create_request(spec, policy.clone(), None)
+            .spec
+            .expect("spec");
+
+        assert_eq!(spec.template.expect("template").image, "python:3");
+        assert_eq!(spec.providers, ["provider"]);
+        assert_eq!(spec.policy, Some(policy));
+    }
+}

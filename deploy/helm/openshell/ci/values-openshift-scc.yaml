@@ -18,3 +18,11 @@ securityContext:
   capabilities:
     drop:
       - ALL
+
+# The shared supervisor keeps runAsNonRoot and its seccomp profile; the SCC
+# assigns its user, group, and fsGroup IDs.
+supervisor:
+  podSecurityContext:
+    runAsUser: null
+    runAsGroup: null
+    fsGroup: null

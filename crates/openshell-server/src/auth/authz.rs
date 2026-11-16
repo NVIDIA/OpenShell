@@ -12,6 +12,7 @@
 //! authentication is handled by explicit application-layer authenticators,
 //! authorization is a gateway concern.
 
+use super::audit::AuthzDenial;
 use super::identity::Identity;
 use super::{descriptor_authz, method_authz};
 use tonic::Status;
@@ -56,10 +57,19 @@ impl AuthzPolicy {
     }
 }
 
+/// A failed RBAC check: what the caller lacked, and the status returned to
+/// it.
+#[derive(Debug)]
+pub struct RbacDenial {
+    pub denial: AuthzDenial<'static>,
+    pub status: Status,
+}
+
 impl AuthzPolicy {
     /// Check whether the identity is authorized to call the given method.
     ///
-    /// Returns `Ok(())` if authorized, `Err(PERMISSION_DENIED)` if not.
+    /// Returns `Ok(())` if authorized, or the denial with a `PERMISSION_DENIED`
+    /// status if not.
     /// When both role names are empty, all authenticated callers are authorized
     /// (authentication-only mode for providers like GitHub).
     ///
@@ -69,7 +79,7 @@ impl AuthzPolicy {
     /// role via `authorize_workspace()`. A known Bearer method with neither role
     /// annotation requires authentication only.
     #[allow(clippy::result_large_err)]
-    pub fn check(&self, identity: &Identity, method: &str) -> Result<(), Status> {
+    pub fn check(&self, identity: &Identity, method: &str) -> Result<(), RbacDenial> {
         let required = match descriptor_authz::lookup(method) {
             Some(entry) if entry.global_role.is_some() => Some(&self.admin_role),
             Some(entry) if entry.workspace_role.is_some() => Some(&self.user_role),
@@ -96,9 +106,10 @@ impl AuthzPolicy {
                     method = method,
                     "authorization denied: missing role"
                 );
-                return Err(Status::permission_denied(format!(
-                    "role '{required}' required"
-                )));
+                return Err(RbacDenial {
+                    denial: AuthzDenial::MissingRole,
+                    status: Status::permission_denied(format!("role '{required}' required")),
+                });
             }
         }
 
@@ -110,7 +121,7 @@ impl AuthzPolicy {
     }
 
     #[allow(clippy::result_large_err, clippy::unused_self)]
-    fn check_scope(&self, identity: &Identity, method: &str) -> Result<(), Status> {
+    fn check_scope(&self, identity: &Identity, method: &str) -> Result<(), RbacDenial> {
         if identity.scopes.iter().any(|s| s == SCOPE_ALL) {
             return Ok(());
         }
@@ -136,9 +147,10 @@ impl AuthzPolicy {
             method = method,
             "authorization denied: missing scope"
         );
-        Err(Status::permission_denied(format!(
-            "scope '{required_scope}' required"
-        )))
+        Err(RbacDenial {
+            denial: AuthzDenial::MissingScope,
+            status: Status::permission_denied(format!("scope '{required_scope}' required")),
+        })
     }
 }
 
@@ -198,10 +210,12 @@ mod tests {
     fn user_blocked_for_platform_admin_methods() {
         let id = identity_with_roles(&["openshell-user"]);
         let policy = default_policy();
-        assert!(
+        assert_eq!(
             policy
                 .check(&id, "/openshell.v1.OpenShell/CreateWorkspace")
-                .is_err()
+                .expect_err("user role must not satisfy the admin role")
+                .denial,
+            AuthzDenial::MissingRole
         );
         assert!(
             policy
@@ -431,19 +445,22 @@ mod tests {
         );
         let err = policy
             .check(&id, "/openshell.v1.OpenShell/AttachSandboxProvider")
-            .unwrap_err();
+            .unwrap_err()
+            .status;
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("sandbox:write"));
 
         let err = policy
             .check(&id, "/openshell.v1.OpenShell/ExposeService")
-            .unwrap_err();
+            .unwrap_err()
+            .status;
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("sandbox:write"));
 
         let err = policy
             .check(&id, "/openshell.v1.OpenShell/DeleteService")
-            .unwrap_err();
+            .unwrap_err()
+            .status;
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("sandbox:write"));
     }
@@ -485,7 +502,8 @@ mod tests {
                 &admin_without_scope,
                 "/openshell.v1.OpenShell/RotateProviderCredential",
             )
-            .unwrap_err();
+            .unwrap_err()
+            .status;
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("provider:write"));
     }
@@ -503,7 +521,8 @@ mod tests {
         let wrong_scope = identity_with_roles_and_scopes(&["openshell-user"], &["sandbox:read"]);
         let err = policy
             .check(&wrong_scope, "/openshell.v1.OpenShell/GetSandboxConfig")
-            .unwrap_err();
+            .unwrap_err()
+            .status;
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("config:read"));
     }
@@ -515,8 +534,9 @@ mod tests {
         let err = policy
             .check(&id, "/openshell.v1.OpenShell/ListSandboxes")
             .expect_err("identity without required scope must be denied");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert!(err.message().contains("sandbox:read"));
+        assert_eq!(err.denial, AuthzDenial::MissingScope);
+        assert_eq!(err.status.code(), tonic::Code::PermissionDenied);
+        assert!(err.status.message().contains("sandbox:read"));
     }
 
     #[test]
@@ -569,7 +589,8 @@ mod tests {
         let policy = scoped_policy();
         let err = policy
             .check(&id, "/openshell.v1.OpenShell/SomeFutureMethod")
-            .unwrap_err();
+            .unwrap_err()
+            .status;
         assert!(err.message().contains("openshell:all"));
     }
 

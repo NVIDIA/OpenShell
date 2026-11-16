@@ -84,3 +84,48 @@ impl tonic::service::Interceptor for EdgeAuthInterceptor {
         Ok(req)
     }
 }
+
+/// Return the credential from an `authorization` header value that uses the
+/// `Bearer` scheme.
+///
+/// The scheme is matched ASCII case-insensitively and may be followed by more
+/// than one space (RFC 9110 section 11.1). The credential is returned
+/// verbatim, so callers keep their own validation.
+#[must_use]
+pub fn strip_bearer_scheme(value: &str) -> Option<&str> {
+    let (scheme, credential) = value.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("Bearer")
+        .then(|| credential.trim_start_matches(' '))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_bearer_scheme;
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
+            assert_eq!(strip_bearer_scheme(&format!("{scheme} abc")), Some("abc"));
+        }
+    }
+
+    #[test]
+    fn bearer_scheme_allows_repeated_spaces() {
+        assert_eq!(strip_bearer_scheme("Bearer   abc"), Some("abc"));
+    }
+
+    #[test]
+    fn bearer_scheme_returns_credential_verbatim() {
+        assert_eq!(strip_bearer_scheme("Bearer "), Some(""));
+        assert_eq!(strip_bearer_scheme("Bearer a b"), Some("a b"));
+        assert_eq!(strip_bearer_scheme("Bearer abc "), Some("abc "));
+    }
+
+    #[test]
+    fn other_schemes_are_not_bearer() {
+        for value in ["Basic abc", "Bearerabc", "Bearer", "", "Bearer\tabc", "abc"] {
+            assert_eq!(strip_bearer_scheme(value), None, "{value:?}");
+        }
+    }
+}

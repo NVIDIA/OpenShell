@@ -25,7 +25,7 @@ fn allowed_decision(intent: EgressIntent) -> EgressDecision {
 
 async fn tcp_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap())
+    let client = connect_tcp_nodelay_best_effort(listener.local_addr().unwrap())
         .await
         .unwrap();
     let (server, _) = listener.accept().await.unwrap();
@@ -116,6 +116,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
         let (mut app, mut proxy) = tcp_pair().await;
         deny_forward_destination(
             &mut proxy,
+            &tracing::Span::none(),
             &denial,
             peer,
             "POST",
@@ -470,7 +471,7 @@ async fn forward_https_absolute_form_rejection_is_snapshotted() {
 }
 
 async fn exercise_benchmark_request(proxy_addr: SocketAddr, target: SocketAddr, connect: bool) {
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut client = connect_tcp_nodelay_best_effort(proxy_addr).await.unwrap();
     let authority = target.to_string();
     let request = if connect {
         format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n")
@@ -548,7 +549,6 @@ network_policies:
                             None,
                             None,
                             None,
-                            None,
                         ))
                         .await
                         .unwrap();
@@ -576,8 +576,15 @@ network_policies:
                 let elapsed = started.elapsed();
                 let queries = crate::opa::test_opa_query_count();
                 let (allocations, allocated_bytes) = crate::test_alloc::snapshot();
-                let expected_queries = 4;
+                // One endpoint-policy query precedes the loopback-address
+                // rejection; this denied path never reaches upstream stages.
+                let expected_queries = 1;
                 assert_eq!(queries, expected_queries * iterations);
+                assert!(allocations > 0, "allocation instrumentation is inactive");
+                assert!(
+                    allocated_bytes > 0,
+                    "allocated-byte instrumentation is inactive"
+                );
                 results.insert(
                     name.to_string(),
                     serde_json::json!({

@@ -7,7 +7,7 @@
 //! resource limits are actually enforced by cgroups inside the workload, not
 //! just echoed back by the API/template layer.
 //!
-//! `e2e/rust/tests/sandbox_templates.rs` already verifies that
+//! The conformance `templates` suite already verifies that
 //! `sandbox template create --cpu ... --memory ...` is stored and returned
 //! correctly, but it never inspects the resulting container's real resource
 //! state. This test creates a sandbox with those flags directly and reads the

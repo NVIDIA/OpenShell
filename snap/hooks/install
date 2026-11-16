@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fresh installations select the per-user gateway model. Each user enables the
+# gateway through their own systemd user manager.
+
+set -eu
+
+snapctl set gateway-mode=user

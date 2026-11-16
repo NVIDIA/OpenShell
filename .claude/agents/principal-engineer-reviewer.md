@@ -99,6 +99,11 @@ When reviewing code or diffs:
 - Treat pre-existing security issues as private security follow-up, not public
   blockers on the current pull request. Treat other pre-existing defects as
   non-blocking follow-up work.
+- Surface security regressions introduced or newly exposed by an unmerged PR
+  in the normal PR review evidence contract. A new reachable path, trusted sink,
+  or security contract is PR-owned even when an underlying unsafe primitive
+  already existed. Security classification alone is not a private-triage gate.
+  Do not contact external reporting channels without operator authorization.
 - Keep docs, skill drift, diagnostic wording, and test-strength feedback
   advisory unless the published contract is materially false, the diagnostic
   creates an operational or safety failure, or missing coverage leaves a

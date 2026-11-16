@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Render/preflight example for operator-run extensions. Top-level YAML lists
+# emit one TOML [[table]] per entry, preserving the list and explicit order.
+# The CI parser check does not connect to these example endpoints. Deploy the
+# services separately before using this overlay with a running gateway.
+gatewayConfig:
+  openshell.gateway.interceptors:
+    - name: governance
+      grpc_endpoint: http://governance.ns.svc.cluster.local:18081
+      allow_insecure_transport: true
+      order: 0
+      failure_policy: fail_closed
+    - name: audit
+      grpc_endpoint: http://audit.ns.svc.cluster.local:18081
+      allow_insecure_transport: true
+      order: 1
+      failure_policy: fail_open
+  openshell.supervisor.middleware:
+    - name: content-guard
+      grpc_endpoint: http://content-guard.ns.svc.cluster.local:18082
+      allow_insecure_transport: true
+      max_payload_bytes: 262144
+      timeout: 500ms
+    - name: request-audit
+      grpc_endpoint: http://request-audit.ns.svc.cluster.local:18082
+      allow_insecure_transport: true
+      max_payload_bytes: 262144
+      timeout: 1s

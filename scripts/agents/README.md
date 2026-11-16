@@ -28,6 +28,13 @@ prompt templates, provider profiles, policies, and references to skills or
 subagents. They should not contain `harnesses/codex`, `harnesses/opencode`, or
 similar runtime code.
 
+Sandbox names supplied through `--name`, `GATOR_SANDBOX_NAME`, or generated
+from the manifest prefix must be DNS-1123 labels of at most 19 characters.
+The launcher validates them before building images or changing gateway state.
+For example, use `gtr-pr-4633-watch` for a supervised Gator watcher. Generated
+names append a hyphen and a 14-digit timestamp, leaving four characters for
+the manifest's name prefix.
+
 ## Agent Manifest
 
 Each agent has an `agent.yaml` manifest. The launcher currently reads these
@@ -40,7 +47,7 @@ sections:
 - `runtime`: in-sandbox run mode (`once` or `watch`), watch poll interval, and
   transient failure logging threshold.
 - `profile_paths`: ordered directories to scan for provider profile YAML files.
-- `settings`: gateway settings to apply before launch.
+- `settings`: sandbox-scoped settings to apply after the sandbox is created.
 - `providers`: provider instances to create or update, credential sources, and
   optional refresh configuration.
 - `skills`: files to inject into the sandbox payload.
@@ -75,20 +82,22 @@ Manifest paths support these prefixes:
 9. Query the gateway's compute driver, then build a temporary image context
    with its Docker or Podman image store. The image bakes the rendered payload
    into `/etc/openshell/agent-payload`.
-10. Apply manifest-declared gateway settings.
-11. Resolve provider profile IDs by scanning `profile_paths` in order.
-12. Import each provider profile into the gateway. If an active profile already
+10. Resolve provider profile IDs by scanning `profile_paths` in order.
+11. Import each provider profile into the gateway. If an active profile already
      exists, the launcher keeps going and uses it.
-13. Resolve provider credentials from host commands, JSON files, or literal
+12. Resolve provider credentials from host commands, JSON files, or literal
      manifest values.
-14. Create or update each provider instance and attach every selected provider
+13. Create or update each provider instance and attach every selected provider
      to the sandbox.
-15. Configure and rotate refresh-backed provider credentials when declared by
+14. Configure and rotate refresh-backed provider credentials when declared by
      the manifest.
-16. Run `openshell sandbox create` from the resulting image reference, with the
+15. Run `openshell sandbox create` from the resulting image reference, with the
     runtime entrypoint persisted as the detached canonical main process.
-17. Mark the sandbox ephemeral unless `--keep` was supplied, allowing the
+16. Mark the sandbox ephemeral unless `--keep` was supplied, allowing the
     gateway to delete it after the canonical process exits.
+17. Apply manifest-declared settings to the new sandbox. The launcher never
+    changes gateway-global settings. A gateway-global value for the same key
+    takes precedence, and the launcher warns instead of overriding it.
 18. Inside the sandbox, run `/etc/openshell/agent-payload/runtime/entrypoint.sh`.
 19. The runtime entrypoint starts
     `/etc/openshell/agent-payload/runtime/supervisor.sh`.

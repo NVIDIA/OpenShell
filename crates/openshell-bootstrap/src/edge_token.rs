@@ -88,30 +88,21 @@ pub fn remove_edge_token(gateway_name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Helper: hold the shared XDG test lock, set `XDG_CONFIG_HOME` to a
-    /// tempdir, run `f`, then restore the original value.
-    #[allow(unsafe_code)]
-    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp);
-        }
-        f();
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+    /// Run the assertions in a child with an isolated configuration root.
+    fn with_tmp_xdg(tmp: &std::path::Path, f: impl FnOnce(&std::path::Path)) {
+        crate::test_environment::Environment::new()
+            .set("XDG_CONFIG_HOME", tmp)
+            .remove(crate::paths::SYSTEM_GATEWAY_DIR_ENV)
+            .run(|| {
+                let root = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+                f(&root);
+            });
     }
 
     #[test]
     fn store_and_load_edge_token_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             store_edge_token("test-gateway", "eyJhbGciOiJSUzI1NiJ9.test.sig").unwrap();
             assert_eq!(
                 load_edge_token("test-gateway"),
@@ -123,7 +114,7 @@ mod tests {
     #[test]
     fn load_edge_token_returns_none_when_not_set() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             assert_eq!(load_edge_token("no-such-gateway"), None);
         });
     }
@@ -131,7 +122,7 @@ mod tests {
     #[test]
     fn store_edge_token_overwrites_previous() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             store_edge_token("c1", "token-1").unwrap();
             store_edge_token("c1", "token-2").unwrap();
             assert_eq!(load_edge_token("c1"), Some("token-2".to_string()));
@@ -141,7 +132,7 @@ mod tests {
     #[test]
     fn remove_edge_token_deletes_file() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             store_edge_token("c2", "token").unwrap();
             assert!(load_edge_token("c2").is_some());
             remove_edge_token("c2").unwrap();
@@ -152,7 +143,7 @@ mod tests {
     #[test]
     fn remove_edge_token_noop_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             // Should not error when file doesn't exist.
             remove_edge_token("nonexistent").unwrap();
         });
@@ -161,7 +152,7 @@ mod tests {
     #[test]
     fn edge_token_paths_reject_multi_component_gateway_names() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             assert!(store_edge_token("../escape", "token").is_err());
             assert_eq!(load_edge_token("../escape"), None);
             assert!(remove_edge_token("../escape").is_err());
@@ -170,7 +161,7 @@ mod tests {
     #[test]
     fn load_edge_token_trims_whitespace() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             // Write manually with whitespace.
             let path = edge_token_path("ws-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -182,7 +173,7 @@ mod tests {
     #[test]
     fn load_edge_token_returns_none_for_empty_file() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             let path = edge_token_path("empty-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "   \n").unwrap();
@@ -193,7 +184,7 @@ mod tests {
     #[test]
     fn load_edge_token_falls_back_to_legacy_cf_token() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             // Write to the legacy cf_token path.
             let path = legacy_token_path("legacy-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -210,7 +201,7 @@ mod tests {
     fn store_edge_token_sets_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             store_edge_token("perm-test", "secret").unwrap();
             let path = edge_token_path("perm-test").unwrap();
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

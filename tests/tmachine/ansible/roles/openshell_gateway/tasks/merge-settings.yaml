@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# An environment overrides gateway settings by writing the tables to change,
+# such as `[openshell.drivers.podman]`, to
+# /etc/openshell-test/gateway-overrides.toml before the installer runs (for
+# example playbooks/drivers/podman/userns.yaml). Apply them to
+# `openshell_gateway_merge_target` without replacing the file; see
+# files/merge-gateway-toml.py.
+#
+# `openshell_gateway_merge_default` is a default configuration to start from
+# when the target doesn't exist yet, and `openshell_gateway_merge_user` is who
+# owns the target.
+---
+- name: Check for environment gateway overrides
+  ansible.builtin.stat:
+    path: /etc/openshell-test/gateway-overrides.toml
+  register: openshell_gateway_overrides
+
+- name: Apply environment gateway overrides
+  become: true
+  become_user: "{{ openshell_gateway_merge_user | default('root') }}"
+  ansible.builtin.script:
+    cmd: >-
+      merge-gateway-toml.py {{ openshell_gateway_merge_target }}
+      /etc/openshell-test/gateway-overrides.toml
+      {{ '--default ' ~ openshell_gateway_merge_default
+         if openshell_gateway_merge_default | default('') else '' }}
+    executable: /usr/bin/python3
+  when: openshell_gateway_overrides.stat.exists

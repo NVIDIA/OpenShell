@@ -241,9 +241,8 @@ impl GatewayEntry {
 // ---------------------------------------------------------------------------
 
 /// Data extracted from the create sandbox form:
-/// `(name, image, command, selected_provider_names, forward_specs)`.
+/// `(name, image, selected_provider_names, forward_specs)`.
 pub type CreateFormData = (
-    String,
     String,
     String,
     Vec<String>,
@@ -723,8 +722,8 @@ pub struct App {
     pub pending_create_sandbox: bool,
     /// Forward specs to apply after sandbox creation completes.
     pub pending_forward_ports: Vec<openshell_core::forward::ForwardSpec>,
-    /// Command to exec via SSH after sandbox creation completes.
-    pub pending_exec_command: String,
+    /// Parsed arguments to exec via SSH after sandbox creation completes.
+    pub pending_exec_command: Vec<String>,
     /// Animation ticker handle — aborted when animation stops.
     pub anim_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -1078,7 +1077,7 @@ impl App {
             create_form: None,
             pending_create_sandbox: false,
             pending_forward_ports: Vec::new(),
-            pending_exec_command: String::new(),
+            pending_exec_command: Vec::new(),
             anim_handle: None,
             sandbox_log_lines: Vec::new(),
             sandbox_log_scroll: 0,
@@ -1216,11 +1215,16 @@ impl App {
 
     pub fn cycle_workspace(&mut self) {
         if self.all_workspaces {
-            self.all_workspaces = false;
-            self.current_workspace = "default".to_string();
+            // Leaving "all" scope: return to the first known named workspace.
+            // The workspace list is server-provided and membership-scoped, so
+            // it is not guaranteed to contain (or start with) "default"; only
+            // enter named scope when at least one workspace is known.
+            if let Some(first) = self.workspace_names.first() {
+                self.all_workspaces = false;
+                self.current_workspace = first.clone();
+            }
         } else if self.workspace_names.is_empty() {
             self.all_workspaces = true;
-            self.current_workspace = "default".to_string();
         } else {
             let current_idx = self
                 .workspace_names
@@ -1232,7 +1236,6 @@ impl App {
                 }
                 _ => {
                     self.all_workspaces = true;
-                    self.current_workspace = "default".to_string();
                 }
             }
         }
@@ -2396,6 +2399,13 @@ impl App {
                     }
                     CreateFormField::Submit => {
                         if key.code == KeyCode::Enter {
+                            match shell_words::split(&form.command) {
+                                Ok(command) => self.pending_exec_command = command,
+                                Err(error) => {
+                                    form.status = Some(format!("Invalid command: {error}"));
+                                    return;
+                                }
+                            }
                             form.anim_start = Some(Instant::now());
                             form.status = None;
                             form.phase = CreatePhase::Creating;
@@ -2408,7 +2418,7 @@ impl App {
     }
 
     /// Build the form data needed for the gRPC `CreateSandbox` request.
-    /// Returns `(name, image, command, selected_provider_names, forward_ports)`.
+    /// Returns `(name, image, selected_provider_names, forward_ports)`.
     pub fn create_form_data(&self) -> Option<CreateFormData> {
         let form = self.create_form.as_ref()?;
         let providers: Vec<String> = form
@@ -2428,13 +2438,7 @@ impl App {
                 openshell_core::forward::ForwardSpec::parse(s).ok()
             })
             .collect();
-        Some((
-            form.name.clone(),
-            form.image.clone(),
-            form.command.clone(),
-            providers,
-            ports,
-        ))
+        Some((form.name.clone(), form.image.clone(), providers, ports))
     }
 
     // ------------------------------------------------------------------
@@ -3653,6 +3657,71 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn create_command_preserves_quoted_and_escaped_arguments() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                r#"/bin/sh -c "echo GOOD; read x""#,
+                &["/bin/sh", "-c", "echo GOOD; read x"],
+            ),
+            (
+                r#"echo 'hello world' "" a\ b "it's""#,
+                &["echo", "hello world", "", "a b", "it's"],
+            ),
+            (r#"echo pre"fix value"post"#, &["echo", "prefix valuepost"]),
+            (
+                "echo $HOME $(id) ; | > *.txt",
+                &["echo", "$HOME", "$(id)", ";", "|", ">", "*.txt"],
+            ),
+            ("echo hello", &["echo", "hello"]),
+            ("", &[]),
+            ("   \t", &[]),
+        ];
+        for (command, expected) in cases {
+            let mut app = test_app();
+            app.create_form = Some(CreateSandboxForm {
+                command: (*command).into(),
+                focused_field: CreateFormField::Submit,
+                ..Default::default()
+            });
+            app.handle_create_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(app.pending_create_sandbox, "{command}");
+            assert_eq!(app.pending_exec_command, *expected, "{command}");
+            let form = app.create_form.as_ref().unwrap();
+            assert_eq!(form.phase, CreatePhase::Creating);
+            assert!(form.status.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_create_command_stays_in_form_until_corrected() {
+        for command in ["echo \"unfinished", "echo 'unfinished", "echo \"trailing\\"] {
+            let mut app = test_app();
+            app.create_form = Some(CreateSandboxForm {
+                command: command.into(),
+                focused_field: CreateFormField::Submit,
+                ..Default::default()
+            });
+            app.handle_create_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(!app.pending_create_sandbox, "{command}");
+            assert!(app.pending_exec_command.is_empty());
+            let form = app.create_form.as_mut().unwrap();
+            assert_eq!(form.phase, CreatePhase::Form);
+            assert!(form.anim_start.is_none());
+            assert!(
+                form.status
+                    .as_ref()
+                    .unwrap()
+                    .starts_with("Invalid command:")
+            );
+            form.command = "echo corrected".into();
+            app.handle_create_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(app.pending_create_sandbox);
+            assert_eq!(app.pending_exec_command, ["echo", "corrected"]);
+            assert!(app.create_form.as_ref().unwrap().status.is_none());
+        }
+    }
+
     fn provider_profile(
         id: &str,
         credentials: Vec<openshell_core::proto::ProviderProfileCredential>,
@@ -3725,7 +3794,7 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 36))
             .expect("test terminal");
         terminal
-            .draw(|frame| crate::ui::create_provider::draw_detail(frame, app, frame.size()))
+            .draw(|frame| crate::ui::create_provider::draw_detail(frame, app, frame.area()))
             .expect("provider detail renders");
         terminal
             .backend()
@@ -4110,6 +4179,36 @@ mod tests {
         app.handle_key(key(KeyCode::Char('w')));
         assert!(!app.all_workspaces);
         assert_eq!(app.current_workspace, "default");
+    }
+
+    #[tokio::test]
+    async fn cycle_workspace_without_default_stays_on_real_workspaces() {
+        // The workspace list is server-provided and membership-scoped, so a
+        // non-admin principal may have no "default" workspace visible.
+        let mut app = test_app();
+        app.workspace_names = vec!["team-a".to_string(), "team-b".to_string()];
+        app.current_workspace = "team-a".to_string();
+        app.all_workspaces = false;
+
+        // Collect every named-scope selection across several full cycles. Each
+        // named scope must be a workspace that actually exists in the list;
+        // the cursor must never land on a phantom "default".
+        let mut named_scopes = Vec::new();
+        for _ in 0..8 {
+            if !app.all_workspaces {
+                assert!(
+                    app.workspace_names.contains(&app.current_workspace),
+                    "cycled to '{}', which is not a known workspace",
+                    app.current_workspace
+                );
+                named_scopes.push(app.current_workspace.clone());
+            }
+            app.cycle_workspace();
+        }
+
+        // Both real workspaces must be reachable by repeated cycling.
+        assert!(named_scopes.iter().any(|w| w == "team-a"));
+        assert!(named_scopes.iter().any(|w| w == "team-b"));
     }
 
     // -- selected_sandbox_workspace ----------------------------------------

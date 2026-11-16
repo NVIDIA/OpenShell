@@ -3,6 +3,7 @@
 
 //! Workload-side PTY and audited pre-exec setup.
 
+use std::os::fd::AsFd;
 use std::os::fd::RawFd;
 use std::process::Command;
 
@@ -12,13 +13,16 @@ use openshell_core::policy::SandboxPolicy;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 
-#[allow(unsafe_code)]
-pub fn set_winsize(fd: RawFd, winsize: Winsize) -> std::io::Result<()> {
-    // SAFETY: fd is the owned PTY master and winsize is initialized.
-    let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+pub fn set_winsize(fd: impl AsFd, winsize: Winsize) -> std::io::Result<()> {
+    rustix::termios::tcsetwinsize(
+        fd,
+        rustix::termios::Winsize {
+            ws_row: winsize.ws_row,
+            ws_col: winsize.ws_col,
+            ws_xpixel: winsize.ws_xpixel,
+            ws_ypixel: winsize.ws_ypixel,
+        },
+    )?;
     Ok(())
 }
 
@@ -57,8 +61,7 @@ pub fn install_pre_exec(
     _workdir: Option<String>,
     slave_fd: RawFd,
     #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    #[cfg(target_os = "linux")]
-    child_hardening: openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    #[cfg(target_os = "linux")] child_hardening: crate::linux::child_seccomp::ChildHardeningProgram,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let mut prepared = prepared;
@@ -92,8 +95,7 @@ pub fn install_pre_exec_no_pty(
     policy: SandboxPolicy,
     _workdir: Option<String>,
     #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    #[cfg(target_os = "linux")]
-    child_hardening: openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    #[cfg(target_os = "linux")] child_hardening: crate::linux::child_seccomp::ChildHardeningProgram,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let mut prepared = prepared;
@@ -122,7 +124,7 @@ fn enter_sandbox(
     policy: &SandboxPolicy,
     #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     #[cfg(target_os = "linux")]
-    child_hardening: &mut openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    child_hardening: &mut crate::linux::child_seccomp::ChildHardeningProgram,
 ) -> std::io::Result<()> {
     crate::process::harden_child_process()
         .map_err(|error| std::io::Error::other(error.to_string()))?;

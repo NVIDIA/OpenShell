@@ -4,8 +4,8 @@
 //! CLI command implementations.
 
 pub use crate::commands::common::{
-    PolicyGetView, parse_credential_expiry_cli_value, parse_env_pairs, parse_key_value_pairs,
-    parse_secret_material_env_pairs, warn_credential_env_vars,
+    PolicyGetView, parse_credential_expiry_cli_value, parse_env_from_pairs, parse_env_pairs,
+    parse_key_value_pairs, parse_secret_material_env_pairs, warn_credential_env_vars,
 };
 use crate::commands::common::{
     ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
@@ -13,7 +13,7 @@ use crate::commands::common::{
     format_timestamp_ms, handle_platform_progress_event, is_provisioning_progress_event,
     non_empty_or, parse_cli_setting_value, parse_duration_to_ms, phase_name,
     print_policy_merge_warnings, print_sandbox_header, print_sandbox_policy,
-    provisioning_timeout_message, ready_false_condition_message, scrub_git_env, short_hash,
+    provisioning_blocker_message, provisioning_timeout_message, scrub_git_env, short_hash,
     truncate_status_field,
 };
 pub use crate::commands::gateway::{
@@ -37,7 +37,9 @@ pub use crate::commands::provider_readiness::{ProviderWaitOptions, sandbox_provi
 
 use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;
-use crate::tls::{TlsOptions, grpc_client};
+use crate::tls::{
+    TlsOptions, grpc_client, owner_replica, retry_unrouted, routed_to, with_owner_hint,
+};
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
@@ -55,12 +57,13 @@ use openshell_core::proto::{
     GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
     ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
-    SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceEndpointResponse, SettingScope,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
+    ResumeSandboxRequest, RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase,
+    SandboxPolicy, SandboxResources, SandboxRestartPolicy, SandboxServiceExposure,
+    SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig,
+    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+    ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
+    SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -71,6 +74,7 @@ use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use tonic::metadata::AsciiMetadataValue;
 use tonic::{Code, Status};
 
 const PROVISIONAL_CONTAINER_EXIT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -107,7 +111,6 @@ enum SandboxUploadPlan {
         files: Vec<String>,
     },
     Regular,
-    GitFilteredEmpty,
 }
 
 enum ProgressOutput {
@@ -448,12 +451,14 @@ pub struct SandboxCreateConfig<'a> {
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
     pub labels: HashMap<String, String>,
+    pub annotations: HashMap<String, String>,
     pub environment: HashMap<String, String>,
     pub approval_mode: &'a str,
     pub output: &'a str,
     pub detach: bool,
     pub suppress_credential_warnings: bool,
     pub restart_policy: &'a str,
+    pub provision_timeout_secs: Option<u32>,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -478,12 +483,14 @@ impl Default for SandboxCreateConfig<'_> {
             tty_override: None,
             auto_providers_override: None,
             labels: HashMap::new(),
+            annotations: HashMap::new(),
             environment: HashMap::new(),
             approval_mode: "manual",
             output: "table",
             detach: false,
             suppress_credential_warnings: false,
             restart_policy: "never",
+            provision_timeout_secs: None,
         }
     }
 }
@@ -516,12 +523,14 @@ pub async fn sandbox_create(
         tty_override,
         auto_providers_override,
         labels,
+        mut annotations,
         environment,
         approval_mode,
         output,
         detach,
         suppress_credential_warnings,
         restart_policy,
+        provision_timeout_secs,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -542,6 +551,12 @@ pub async fn sandbox_create(
     if expose == Some(0) {
         return Err(miette::miette!("--expose port must be in 1..=65535"));
     }
+
+    // Plan every upload before provisioning so a rejected one leaves no sandbox.
+    let upload_plans = uploads
+        .iter()
+        .map(|(local_path, _, git_ignore)| sandbox_upload_plan(Path::new(local_path), *git_ignore))
+        .collect::<Result<Vec<_>>>()?;
 
     // Check port availability *before* creating the sandbox so we don't
     // leave an orphaned sandbox behind when the forward would fail.
@@ -654,14 +669,12 @@ pub async fn sandbox_create(
             && command.is_empty()
             && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()));
     let await_main_process_attachment = output == "table" && editor.is_none() && !create_detaches;
-    let annotations = if persist {
-        HashMap::new()
-    } else {
-        HashMap::from([(
+    if !persist {
+        annotations.insert(
             "openshell.nvidia.com/retention".to_string(),
             "ephemeral".to_string(),
-        )])
-    };
+        );
+    }
     let request = CreateSandboxRequest {
         request_id: String::new(),
         spec: Some(SandboxSpec {
@@ -801,11 +814,8 @@ pub async fn sandbox_create(
     // Non-interactive mode: track start time for timestamps.
     let provision_start = Instant::now();
 
-    // Don't use stop_on_terminal on the server — the Kubernetes CRD may
-    // briefly report a stale Ready status before the controller reconciles
-    // a newly created sandbox.  Instead we handle termination client-side:
-    // we wait until we have observed at least one non-Ready phase followed
-    // by Ready (a genuine Provisioning → Ready transition).
+    // Handle terminal states here so a provisional container exit can wait
+    // for the supervisor's canonical-process result before cleanup.
     let sandbox_name = sandbox.object_name().to_string();
     let sandbox_workspace = sandbox.object_workspace().to_string();
     let mut stream = client
@@ -832,13 +842,15 @@ pub async fn sandbox_create(
     let mut last_phase = sandbox.phase();
     let mut last_sandbox = sandbox.clone();
     let mut last_error_reason = String::new();
-    let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
-    // Track whether we have seen a non-Ready phase during the watch.
-    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready);
+    let mut last_condition_message = provisioning_blocker_message(sandbox.status.as_ref());
     let provision_timeout = Duration::from_secs(
-        std::env::var("OPENSHELL_PROVISION_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        provision_timeout_secs
+            .map(u64::from)
+            .or_else(|| {
+                std::env::var("OPENSHELL_PROVISION_TIMEOUT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
             .unwrap_or(300),
     );
     let mut provisioning_idle_deadline = Instant::now() + provision_timeout;
@@ -908,12 +920,8 @@ pub async fn sandbox_create(
                 let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
                 last_phase = s.phase();
                 last_sandbox = s.clone();
-                if let Some(message) = ready_false_condition_message(s.status.as_ref()) {
+                if let Some(message) = provisioning_blocker_message(s.status.as_ref()) {
                     last_condition_message = Some(message);
-                }
-
-                if phase != SandboxPhase::Ready {
-                    saw_non_ready = true;
                 }
 
                 let main_process_result = has_main_process_result(&s);
@@ -950,9 +958,10 @@ pub async fn sandbox_create(
                     break;
                 }
 
-                // Only accept Ready as terminal after we've observed a
-                // non-Ready phase, proving the controller has reconciled.
-                if saw_non_ready && phase == SandboxPhase::Ready {
+                // The gateway owns readiness. Its initial watch snapshot may
+                // already be Ready if provisioning finished before CREATE
+                // returned; requiring an earlier phase would miss that state.
+                if phase == SandboxPhase::Ready {
                     if let Some(d) = display.as_interactive_mut() {
                         d.clear();
                     }
@@ -1042,7 +1051,9 @@ pub async fn sandbox_create(
             drop(client);
 
             let upload_count = uploads.len();
-            for (idx, (local_path, sandbox_path, git_ignore)) in uploads.iter().enumerate() {
+            for (idx, ((local_path, sandbox_path, _), upload_plan)) in
+                uploads.iter().zip(upload_plans).enumerate()
+            {
                 let dest = sandbox_path.as_deref();
                 let dest_display = dest.unwrap_or("~");
                 if upload_count > 1 {
@@ -1058,49 +1069,23 @@ pub async fn sandbox_create(
                         "\u{2022}".dimmed(),
                     );
                 }
-                let local = Path::new(local_path);
-                match sandbox_upload_plan(local, *git_ignore)? {
-                    SandboxUploadPlan::GitAware { base_dir, files } => {
-                        sandbox_sync_up_files(
-                            &effective_server,
-                            &sandbox_name,
-                            &base_dir,
-                            &files,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                    SandboxUploadPlan::GitFilteredEmpty => {
-                        eprintln!(
-                            "  {} .gitignore filtering excluded all files in {}; uploading unfiltered",
-                            "⚠".yellow().bold(),
-                            local.display(),
-                        );
-                        sandbox_sync_up(
-                            &effective_server,
-                            &sandbox_name,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                    SandboxUploadPlan::Regular => {
-                        sandbox_sync_up(
-                            &effective_server,
-                            &sandbox_name,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                }
+                // Boxed so the upload state machine lives on the heap instead of
+                // inflating the `sandbox_create` future (clippy::large_futures).
+                Box::pin(sandbox_upload_planned(
+                    upload_plan,
+                    &effective_server,
+                    &sandbox_name,
+                    Path::new(local_path),
+                    dest,
+                    &effective_tls,
+                    workspace,
+                ))
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "Sandbox '{sandbox_name}' was created and still exists.\nRetry the upload with 'openshell sandbox upload', or remove the sandbox with 'openshell sandbox delete'",
+                    )
+                })?;
                 eprintln!("  {} Files uploaded", "\u{2713}".green().bold());
             }
 
@@ -1230,25 +1215,31 @@ pub async fn sandbox_create(
         SandboxPhase::Error => {
             drop(stream);
             drop(client);
-            let provisioning_timed_out = last_sandbox
+            let timed_out_provisioning = last_sandbox
                 .status
                 .as_ref()
                 .and_then(|status| status.provisioning.as_ref())
-                .is_some_and(|record| record.timeout_time.is_some());
-            let create_result = if provisioning_timed_out {
-                Err(miette::miette!(
-                    "{last_error_reason}\nSandbox '{sandbox_name}' was retained. Inspect it with `openshell sandbox get {sandbox_name}`; repair its configuration, then run `openshell sandbox start {sandbox_name}` after cleanup completes."
-                ))
-            } else if last_error_reason.is_empty() {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning"
-                ))
-            } else {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning: {}",
-                    last_error_reason
-                ))
-            };
+                .filter(|record| record.timeout_time.is_some());
+            let create_result = timed_out_provisioning.map_or_else(
+                || {
+                    if last_error_reason.is_empty() {
+                        Err(miette::miette!(
+                            "sandbox entered error phase while provisioning"
+                        ))
+                    } else {
+                        Err(miette::miette!(
+                            "sandbox entered error phase while provisioning: {}",
+                            last_error_reason
+                        ))
+                    }
+                },
+                |record| {
+                    Err(miette::miette!(
+                        "{}",
+                        retained_sandbox_timeout_message(&sandbox_name, &last_error_reason, record)
+                    ))
+                },
+            );
             finalize_sandbox_create_session(
                 &effective_server,
                 &sandbox_name,
@@ -1269,6 +1260,24 @@ pub async fn sandbox_create(
             "sandbox provisioning stream ended before reaching terminal phase"
         )),
     }
+}
+
+/// Use the persisted phase to select recovery guidance. Preparation may expire
+/// before any policy is evaluated, so it must not tell the user to repair policy.
+fn retained_sandbox_timeout_message(
+    sandbox_name: &str,
+    error_reason: &str,
+    record: &openshell_core::proto::SandboxProvisioning,
+) -> String {
+    let recovery = if record.preparation_deadline.is_some() && record.admission_start_time.is_none()
+    {
+        "check image preparation and supervisor startup diagnostics and the gateway's `image_preparation_timeout_seconds` budget"
+    } else {
+        "repair its configuration"
+    };
+    format!(
+        "{error_reason}\nSandbox '{sandbox_name}' was retained. Inspect it with `openshell sandbox get {sandbox_name}`; {recovery}, then run `openshell sandbox start {sandbox_name}` after cleanup completes."
+    )
 }
 
 /// Resolved source for the `--from` flag on `sandbox create`.
@@ -1808,6 +1817,17 @@ where
         );
     }
 
+    if let Some(observation) = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.last_token_grant_failure.as_deref())
+    {
+        println!("  {}", "Last token grant failure:".dimmed());
+        for line in token_grant_failure_display_lines(observation) {
+            println!("    {line}");
+        }
+    }
+
     let policy_from_global = config.policy_source == PolicySource::Global as i32;
     println!(
         "  {} {}",
@@ -1880,7 +1900,7 @@ enum PipedStdin {
 /// never waits on a thread parked in `read(2)`. The thread exits at EOF, on a
 /// read error, or when the receiver is dropped.
 fn spawn_piped_stdin_reader(
-    mut reader: impl Read + Send + 'static,
+    mut reader: impl PipedInput,
 ) -> tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(64);
     std::thread::spawn(move || {
@@ -1889,6 +1909,16 @@ fn spawn_piped_stdin_reader(
             match reader.read(&mut buf) {
                 Ok(0) => return,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                // Processes that inherit the same stdin share its open file
+                // description, so another process may have made it
+                // nonblocking. Wait for input instead of failing.
+                #[cfg(unix)]
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if let Err(error) = wait_until_readable(&reader) {
+                        let _ = tx.blocking_send(Err(error));
+                        return;
+                    }
+                }
                 Err(error) => {
                     let _ = tx.blocking_send(Err(error));
                     return;
@@ -1902,6 +1932,30 @@ fn spawn_piped_stdin_reader(
         }
     });
     rx
+}
+
+/// Input the piped-stdin reader accepts. On Unix it must expose a descriptor
+/// so a nonblocking stream can be waited on.
+#[cfg(unix)]
+trait PipedInput: Read + std::os::fd::AsFd + Send + 'static {}
+#[cfg(unix)]
+impl<T: Read + std::os::fd::AsFd + Send + 'static> PipedInput for T {}
+#[cfg(not(unix))]
+trait PipedInput: Read + Send + 'static {}
+#[cfg(not(unix))]
+impl<T: Read + Send + 'static> PipedInput for T {}
+
+/// Block until `reader` has input or reaches end of file.
+#[cfg(unix)]
+fn wait_until_readable(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let mut fds = [PollFd::new(reader.as_fd(), PollFlags::POLLIN)];
+    loop {
+        match poll(&mut fds, PollTimeout::NONE) {
+            Err(nix::errno::Errno::EINTR) => {}
+            result => return result.map(drop).map_err(std::io::Error::from),
+        }
+    }
 }
 
 /// Collect piped stdin until EOF or until `grace` elapses, whichever comes
@@ -1952,15 +2006,17 @@ pub async fn sandbox_exec_grpc(
     let mut client = grpc_client(server, tls).await?;
 
     // Resolve sandbox name to id.
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
+    let response = client
+        .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
-        })
+        }))
         .await
-        .into_diagnostic()?
+        .into_diagnostic()?;
+    let replica = owner_replica(&response);
+    let sandbox = response
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
@@ -2048,16 +2104,26 @@ pub async fn sandbox_exec_grpc(
             stdin_is_terminal,
             std::mem::take(&mut request.stdin),
             stdin_rest,
+            replica.as_ref(),
         )
         .await;
     }
 
     // Make the streaming gRPC call.
-    let mut stream = client
-        .exec_sandbox(request)
-        .await
-        .into_diagnostic()?
-        .into_inner();
+    let retry = replica.is_some().then(|| request.clone());
+    let mut stream = match (
+        client
+            .exec_sandbox(routed_to(request, replica.as_ref()))
+            .await,
+        retry,
+    ) {
+        (Err(status), Some(request)) if retry_unrouted(replica.as_ref(), &status) => {
+            client.exec_sandbox(request).await
+        }
+        (response, _) => response,
+    }
+    .into_diagnostic()?
+    .into_inner();
 
     // Stream output to terminal in real-time.
     let mut exit_code = 0i32;
@@ -2110,7 +2176,7 @@ pub async fn service_forward_tcp(
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
-    fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+    let mut replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
 
     let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
         .await
@@ -2132,6 +2198,9 @@ pub async fn service_forward_tcp(
     let sandbox_name = name.to_string();
     let sandbox_workspace = workspace.to_string();
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<String>(1);
+    // Set once this forward learns that the gateway predates principal-authorized
+    // TCP forwards and still requires a `CreateSshSession` token per connection.
+    let legacy_session_tokens = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut health_check = tokio::time::interval(Duration::from_secs(2));
     health_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -2141,7 +2210,7 @@ pub async fn service_forward_tcp(
             }
 
             _ = health_check.tick() => {
-                fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+                replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
             }
 
             accepted = listener.accept() => {
@@ -2155,21 +2224,9 @@ pub async fn service_forward_tcp(
                 let target_host = target_host.to_string();
                 let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
                 let fatal_tx = fatal_tx.clone();
+                let legacy_session_tokens = legacy_session_tokens.clone();
+                let replica = replica.clone();
                 tokio::spawn(async move {
-                    let token = match create_forward_session_token(
-                        &mut client,
-                        &sandbox_name,
-                        &sandbox_workspace,
-                    ).await {
-                        Ok(token) => token,
-                        Err(err) => {
-                            tracing::warn!(peer = %peer, error = %err, "service forward session creation failed");
-                            if err.fatal {
-                                let _ = fatal_tx.send(err.message).await;
-                            }
-                            return;
-                        }
-                    };
                     if let Err(err) = forward_one_tcp_connection(
                         &mut client,
                         socket,
@@ -2178,7 +2235,8 @@ pub async fn service_forward_tcp(
                         target_host,
                         target_port,
                         service_id,
-                        token.clone(),
+                        legacy_session_tokens,
+                        replica.as_ref(),
                     )
                     .await
                     {
@@ -2187,9 +2245,6 @@ pub async fn service_forward_tcp(
                             let _ = fatal_tx.send(err.message).await;
                         }
                     }
-                    let _ = client
-                        .revoke_ssh_session(RevokeSshSessionRequest { allow_missing: true, token })
-                        .await;
                 });
             }
         }
@@ -2213,18 +2268,27 @@ async fn create_forward_session_token(
     Ok(response.into_inner().token)
 }
 
+/// Older gateways reject a token-less `ForwardTcp` init with this
+/// `Unauthenticated` status; newer ones authorize TCP targets on the caller's
+/// principal and only demand a token for SSH targets.
+fn forward_requires_session_token(status: &Status) -> bool {
+    status.code() == Code::Unauthenticated
+        && status.message().contains("authorization_token is required")
+}
+
+/// Confirm the sandbox is still ready, returning the replica that owns it.
 async fn fetch_ready_sandbox_for_forward(
     client: &mut crate::tls::GrpcClient,
     name: &str,
     workspace: &str,
-) -> Result<Sandbox> {
+) -> Result<Option<AsciiMetadataValue>> {
     let response = match client
-        .get_sandbox(GetSandboxRequest {
+        .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
-        })
+        }))
         .await
     {
         Ok(response) => response,
@@ -2236,6 +2300,7 @@ async fn fetch_ready_sandbox_for_forward(
         Err(status) => return Err(status).into_diagnostic(),
     };
 
+    let replica = owner_replica(&response);
     let sandbox = response
         .into_inner()
         .sandbox
@@ -2249,7 +2314,7 @@ async fn fetch_ready_sandbox_for_forward(
         ));
     }
 
-    Ok(sandbox)
+    Ok(replica)
 }
 
 #[derive(Debug)]
@@ -2314,39 +2379,134 @@ async fn forward_one_tcp_connection(
     target_host: String,
     target_port: u16,
     service_id: String,
-    authorization_token: String,
+    legacy_session_tokens: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    replica: Option<&AsciiMetadataValue>,
 ) -> std::result::Result<(), ForwardTcpConnectionError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_stream::wrappers::ReceiverStream;
+    let mut init = TcpForwardInit {
+        sandbox: sandbox_name.clone(),
+        workspace: workspace.clone(),
+        service_id,
+        target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+            host: target_host,
+            port: u32::from(target_port),
+        })),
+        // The gateway authorizes TCP forwards on this client's credentials for
+        // every stream, so no per-connection session token is minted unless the
+        // gateway turns out to predate that (`forward_requires_session_token`),
+        // which this forward remembers in `legacy_session_tokens`.
+        authorization_token: String::new(),
+    };
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
-    tx.send(TcpForwardFrame {
-        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
-            TcpForwardInit {
-                sandbox: sandbox_name,
-                workspace: workspace.clone(),
-                service_id,
-                target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
-                    host: target_host,
-                    port: u32::from(target_port),
-                })),
-                authorization_token,
-            },
-        )),
-    })
-    .await
-    .map_err(|_| ForwardTcpConnectionError::transient("failed to initialize forward stream"))?;
+    let mut session_token = None;
+    if legacy_session_tokens.load(std::sync::atomic::Ordering::Relaxed) {
+        match create_forward_session_token(client, &sandbox_name, &workspace).await {
+            Ok(token) => {
+                init.authorization_token.clone_from(&token);
+                session_token = Some(token);
+            }
+            Err(err) => {
+                drain_and_shutdown_local_socket(socket).await;
+                return Err(err);
+            }
+        }
+    }
 
-    let mut response = match client.forward_tcp(ReceiverStream::new(rx)).await {
-        Ok(response) => response.into_inner(),
+    let opened = match open_forward_tcp_stream(client, init.clone(), replica).await {
+        Ok(opened) => opened,
+        Err(status) if session_token.is_none() && forward_requires_session_token(&status) => {
+            tracing::info!(
+                "gateway requires an SSH session token per forwarded connection; \
+                 minting one per connection for the rest of this forward"
+            );
+            legacy_session_tokens.store(true, std::sync::atomic::Ordering::Relaxed);
+            let token = match create_forward_session_token(client, &sandbox_name, &workspace).await
+            {
+                Ok(token) => token,
+                Err(err) => {
+                    drain_and_shutdown_local_socket(socket).await;
+                    return Err(err);
+                }
+            };
+            init.authorization_token.clone_from(&token);
+            session_token = Some(token);
+            match open_forward_tcp_stream(client, init, replica).await {
+                Ok(opened) => opened,
+                Err(status) => {
+                    drain_and_shutdown_local_socket(socket).await;
+                    revoke_forward_session_token(client, session_token).await;
+                    return Err(ForwardTcpConnectionError::from_status(status));
+                }
+            }
+        }
         Err(status) => {
-            let err = ForwardTcpConnectionError::from_status(status);
             drain_and_shutdown_local_socket(socket).await;
-            return Err(err);
+            revoke_forward_session_token(client, session_token).await;
+            return Err(ForwardTcpConnectionError::from_status(status));
         }
     };
 
-    let (mut local_read, mut local_write) = socket.into_split();
+    let result = bridge_local_socket_to_forward_stream(socket, opened).await;
+    revoke_forward_session_token(client, session_token).await;
+    result
+}
+
+/// An open `ForwardTcp` stream: the sender for local-to-gateway frames and the
+/// gateway-to-local response stream.
+type OpenForwardTcpStream = (
+    tokio::sync::mpsc::Sender<TcpForwardFrame>,
+    tonic::Streaming<TcpForwardFrame>,
+);
+
+async fn open_forward_tcp_stream(
+    client: &mut crate::tls::GrpcClient,
+    init: TcpForwardInit,
+    replica: Option<&AsciiMetadataValue>,
+) -> std::result::Result<OpenForwardTcpStream, Status> {
+    let init = TcpForwardFrame {
+        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
+            init,
+        )),
+    };
+    let (tx, response) = crate::ssh::open_forward_tcp(client, init, replica).await;
+    Ok((tx, response?.into_inner()))
+}
+
+async fn revoke_forward_session_token(client: &mut crate::tls::GrpcClient, token: Option<String>) {
+    if let Some(token) = token {
+        let _ = client
+            .revoke_ssh_session(RevokeSshSessionRequest {
+                allow_missing: true,
+                token,
+            })
+            .await;
+    }
+}
+
+async fn bridge_local_socket_to_forward_stream(
+    socket: tokio::net::TcpStream,
+    (tx, response): OpenForwardTcpStream,
+) -> std::result::Result<(), ForwardTcpConnectionError> {
+    let (local_read, local_write) = socket.into_split();
+    relay_local_socket(local_read, local_write, tx, response).await
+}
+
+/// Relay bytes between a local socket and a forward stream.
+///
+/// When the target closes first, half-close the local socket but keep sending
+/// client data until the client closes, so a target that only half-closes
+/// still receives the rest of the request.
+async fn relay_local_socket<R, W, S>(
+    mut local_read: R,
+    mut local_write: W,
+    tx: tokio::sync::mpsc::Sender<TcpForwardFrame>,
+    mut response: S,
+) -> std::result::Result<(), ForwardTcpConnectionError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+    S: tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let to_gateway = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
@@ -2371,8 +2531,9 @@ async fn forward_one_tcp_connection(
     });
 
     while let Some(frame) = response
-        .message()
+        .next()
         .await
+        .transpose()
         .map_err(ForwardTcpConnectionError::from_status)?
     {
         let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
@@ -2389,7 +2550,7 @@ async fn forward_one_tcp_connection(
     }
 
     let _ = local_write.shutdown().await;
-    to_gateway.abort();
+    let _ = to_gateway.await;
     Ok(())
 }
 
@@ -2435,6 +2596,7 @@ async fn sandbox_exec_streaming_grpc(
     stdin_is_terminal: bool,
     stdin_prefix: Vec<u8>,
     stdin_rest: Option<tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    replica: Option<&AsciiMetadataValue>,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
@@ -2447,36 +2609,44 @@ async fn sandbox_exec_streaming_grpc(
         (0, 0)
     };
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+    // The start message carries the exec metadata.
+    let start = ExecSandboxInput {
+        payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+            request_id: String::new(),
+            sandbox: sandbox.object_name().to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                (sandbox.object_workspace()).to_string(),
+            )),
+            command: command.to_vec(),
+            workdir: workdir.unwrap_or_default().to_string(),
+            environment: environment.clone(),
+            no_login_shell,
+            execution_timeout: proto_execution_timeout(timeout_seconds)?,
+            stdin: Vec::new(),
+            tty,
+            cols,
+            rows,
+        })),
+    };
 
-    // Send the start message with exec metadata.
-    input_tx
-        .send(ExecSandboxInput {
-            payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                request_id: String::new(),
-                sandbox: sandbox.object_name().to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    (sandbox.object_workspace()).to_string(),
-                )),
-                command: command.to_vec(),
-                workdir: workdir.unwrap_or_default().to_string(),
-                environment: environment.clone(),
-                no_login_shell,
-                execution_timeout: proto_execution_timeout(timeout_seconds)?,
-                stdin: Vec::new(),
-                tty,
-                cols,
-                rows,
-            })),
-        })
+    let (mut input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+    input_tx.send(start.clone()).await.into_diagnostic()?;
+    let mut stream = match client
+        .exec_sandbox_interactive(routed_to(ReceiverStream::new(input_rx), replica))
         .await
-        .into_diagnostic()?;
-
-    let mut stream = client
-        .exec_sandbox_interactive(ReceiverStream::new(input_rx))
-        .await
-        .into_diagnostic()?
-        .into_inner();
+    {
+        Err(status) if retry_unrouted(replica, &status) => {
+            let (tx, rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+            tx.send(start).await.into_diagnostic()?;
+            input_tx = tx;
+            client
+                .exec_sandbox_interactive(ReceiverStream::new(rx))
+                .await
+        }
+        response => response,
+    }
+    .into_diagnostic()?
+    .into_inner();
 
     // Raw mode is only appropriate for an interactive terminal, not a pipe.
     let raw_guard = if tty && stdin_is_terminal {
@@ -2518,7 +2688,7 @@ async fn sandbox_exec_streaming_grpc(
                     if forwarded > MAX_EXEC_STDIN_BYTES {
                         return Err(std::io::Error::new(
                             ErrorKind::InvalidInput,
-                            piped_stdin_limit_error().to_string(),
+                            "streamed stdin exceeds the 4 MiB limit; the command may have processed partial input; use `sandbox upload` for larger input",
                         ));
                     }
                     if stdin_tx
@@ -2660,7 +2830,9 @@ async fn sandbox_exec_streaming_grpc(
             Some(exec_sandbox_event::Payload::Exit(exit)) => {
                 exit_code = exit.exit_code;
                 exit_seen = true;
-                break;
+                // Process exit does not complete the RPC. Keep draining so a
+                // failing final gRPC status cannot turn partial output into
+                // a successful execution result.
             }
             None => {}
         }
@@ -2806,8 +2978,8 @@ pub async fn sandbox_list(
             {
                 phase.red().to_string()
             }
-            Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
-            Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
+            Ok(SandboxPhase::Provisioning | SandboxPhase::Suspending) => phase.yellow().to_string(),
+            Ok(SandboxPhase::Deleting | SandboxPhase::Suspended) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
         let created = format_epoch_ms(
@@ -2885,10 +3057,22 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
                     "path": endpoint.path,
                     "last_result": endpoint_result_name(endpoint.last_result()),
                     "last_reported_at": endpoint.last_reported_time.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    "last_failure": endpoint.last_failure.as_ref().map(endpoint_failure_to_json),
                 })
             })
             .collect::<Vec<_>>()
     });
+    let last_token_grant_failure = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.last_token_grant_failure.as_deref())
+        .map(|observation| {
+            serde_json::json!({
+                "destination_host": observation.destination_host,
+                "destination_port": observation.destination_port,
+                "failure": observation.failure.as_ref().map(endpoint_failure_to_json),
+            })
+        });
     let admission = sandbox
         .status
         .as_ref()
@@ -2914,16 +3098,28 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
             "configuration_change_id": record.configuration_change_id,
             "configuration_change_time": record.configuration_change_time.as_ref().map(ToString::to_string),
             "first_rejection_time": record.first_rejection_time.as_ref().map(ToString::to_string),
+            "phase": if record.deadline.is_none() && record.timeout_time.is_none() {
+                "ready"
+            } else if record.preparation_deadline.is_some() && record.admission_start_time.is_none() {
+                "preparation"
+            } else {
+                "admission"
+            },
+            "preparation_deadline": record.preparation_deadline.as_ref().map(ToString::to_string),
+            "admission_start_time": record.admission_start_time.as_ref().map(ToString::to_string),
             "deadline": record.deadline.as_ref().map(ToString::to_string),
             "timeout_time": record.timeout_time.as_ref().map(ToString::to_string),
             "cleanup_completed_time": record.cleanup_completed_time.as_ref().map(ToString::to_string),
             "cleanup_error": record.cleanup_error,
             "cleanup_retry_time": record.cleanup_retry_time.as_ref().map(ToString::to_string),
+            "driver_operation_pending": record.driver_operation_pending,
+            "driver_operation_id": record.driver_operation_id,
         }));
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
         "workspace": sandbox.object_workspace(),
+        "host_key_fingerprint": sandbox.host_key_fingerprint,
         "labels": labels,
         "annotations": annotations,
         "resource_version": meta.map_or(0, |m| m.resource_version),
@@ -2933,6 +3129,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
         "conditions": conditions,
         "endpoint_statuses": endpoint_statuses,
+        "last_token_grant_failure": last_token_grant_failure,
         "configuration_admission": admission,
         "provisioning": provisioning,
         "created_from_workload_template": created_from_workload_template,
@@ -2990,6 +3187,83 @@ fn endpoint_result_name(result: EndpointResult) -> &'static str {
     }
 }
 
+fn endpoint_failure_domain_name(domain: i32) -> &'static str {
+    match openshell_core::proto::EndpointFailureDomain::try_from(domain) {
+        Ok(openshell_core::proto::EndpointFailureDomain::TokenGrant) => "token_grant",
+        Ok(openshell_core::proto::EndpointFailureDomain::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+fn endpoint_failure_recovery_name(
+    action: openshell_core::proto::ProviderCredentialRefreshRecoveryAction,
+) -> &'static str {
+    match action {
+        // Structured output names every value; "-" is a table placeholder.
+        openshell_core::proto::ProviderCredentialRefreshRecoveryAction::Unspecified => {
+            "unspecified"
+        }
+        action => crate::commands::provider::provider_refresh_recovery_action_name(action),
+    }
+}
+
+fn endpoint_failure_to_json(failure: &openshell_core::proto::EndpointFailure) -> serde_json::Value {
+    serde_json::json!({
+        "domain": endpoint_failure_domain_name(failure.domain),
+        "code": failure.code,
+        "recovery_action": endpoint_failure_recovery_name(failure.recovery_action()),
+        "provider": failure.provider,
+        "credential_key": failure.credential_key,
+        "stage": failure.stage,
+        "upstream_http_status": failure.upstream_http_status,
+        "request_id": failure.request_id,
+    })
+}
+
+fn endpoint_failure_display_lines(failure: &openshell_core::proto::EndpointFailure) -> Vec<String> {
+    use openshell_core::proto::ProviderCredentialRefreshRecoveryAction as Recovery;
+    let upstream = failure
+        .upstream_http_status
+        .map(|status| format!(", upstream HTTP {status}"))
+        .unwrap_or_default();
+    let recovery = match failure.recovery_action() {
+        Recovery::Retry => "Retry later; the failure can be temporary.",
+        Recovery::Reauthorize => "Reauthorize the provider credential.",
+        Recovery::FixConfiguration => {
+            "An operator must fix the provider or identity configuration."
+        }
+        Recovery::Investigate => "An operator must investigate gateway and supervisor logs.",
+        Recovery::Unspecified => "No recovery action provided.",
+    };
+    let mut lines = vec![format!(
+        "Cause: {} ({}, stage {}{upstream})",
+        failure.code,
+        endpoint_failure_domain_name(failure.domain).replace('_', " "),
+        failure.stage,
+    )];
+    if !failure.provider.is_empty() {
+        lines.push(format!(
+            "Credential: {}/{}",
+            failure.provider, failure.credential_key
+        ));
+    }
+    lines.push(format!("Recovery: {recovery}"));
+    lines.push(format!("Request ID: {}", failure.request_id));
+    lines
+}
+
+fn token_grant_failure_display_lines(
+    observation: &openshell_core::proto::TokenGrantFailureObservation,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Destination: {} (port {})",
+        observation.destination_host, observation.destination_port
+    )];
+    if let Some(failure) = observation.failure.as_ref() {
+        lines.extend(endpoint_failure_display_lines(failure));
+    }
+    lines
+}
+
 fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
     let ports = endpoint
         .ports
@@ -3015,14 +3289,18 @@ fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
         .last_reported_time
         .as_ref()
         .map_or_else(|| "no report yet".to_string(), ToString::to_string);
-    vec![
+    let mut lines = vec![
         format!(
             "{} (ports: {ports}; path: {})",
             endpoint.host, endpoint.path
         ),
         format!("Last result: {result}"),
-        format!("Reported at (gateway acceptance): {reported_at}"),
-    ]
+    ];
+    if let Some(failure) = endpoint.last_failure.as_ref() {
+        lines.extend(endpoint_failure_display_lines(failure));
+    }
+    lines.push(format!("Reported at (gateway acceptance): {reported_at}"));
+    lines
 }
 
 fn restart_policy_name(policy: i32) -> &'static str {
@@ -3845,6 +4123,14 @@ pub async fn sandbox_stop(
         .into_inner()
         .sandbox
         .ok_or_else(|| miette!("gateway returned no sandbox after stop"))?;
+    // A successful stop can preserve a canonical result when the transient
+    // compute resource is already gone. There is no Stopped event to wait for.
+    if sandbox.phase() == SandboxPhase::Completed as i32
+        || (sandbox.phase() == SandboxPhase::Error as i32 && has_main_process_result(&sandbox))
+    {
+        println!("{} Sandbox {name} already finished", "✓".green().bold());
+        return Ok(());
+    }
     wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Stopped).await?;
     println!("{} Stopped sandbox {name}", "✓".green().bold());
     Ok(())
@@ -3876,6 +4162,110 @@ pub async fn sandbox_start(
     Ok(())
 }
 
+/// Suspend a ready sandbox, retaining its memory state, and wait until it is suspended.
+pub async fn sandbox_suspend(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .suspend_sandbox(SuspendSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after suspend"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Suspended).await?;
+    if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
+        for port in stopped {
+            eprintln!(
+                "{} Stopped forward of port {port} for sandbox {name}",
+                "✓".green().bold(),
+            );
+        }
+    }
+
+    println!("{} Suspended sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Resume a suspended sandbox and wait until it is ready.
+pub async fn sandbox_resume(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .resume_sandbox(ResumeSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            restart_if_restore_fails: false,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after resume"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Ready).await?;
+    println!("{} Resumed sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Whether `phase` means a lifecycle wait for `target` can no longer succeed
+/// without another lifecycle request.
+fn lifecycle_phase_blocks_target(target: SandboxPhase, phase: SandboxPhase) -> bool {
+    match target {
+        SandboxPhase::Ready => matches!(
+            phase,
+            SandboxPhase::Suspending | SandboxPhase::Suspended | SandboxPhase::Deleting
+        ),
+        SandboxPhase::Suspended => matches!(
+            phase,
+            SandboxPhase::Ready
+                | SandboxPhase::Starting
+                | SandboxPhase::Stopping
+                | SandboxPhase::Stopped
+                | SandboxPhase::Deleting
+        ),
+        SandboxPhase::Stopped => phase == SandboxPhase::Deleting,
+        _ => false,
+    }
+}
+
+fn lifecycle_phase_error(
+    sandbox: &Sandbox,
+    target: SandboxPhase,
+    phase: SandboxPhase,
+) -> Option<miette::Report> {
+    if phase == SandboxPhase::Error {
+        let detail = provisioning_blocker_message(sandbox.status.as_ref())
+            .unwrap_or_else(|| "sandbox entered Error".to_string());
+        return Some(miette!(
+            "{detail} while waiting for {}",
+            phase_name(target as i32)
+        ));
+    }
+    if lifecycle_phase_blocks_target(target, phase) {
+        return Some(miette!(
+            "sandbox entered {} while waiting for {}",
+            phase_name(phase as i32),
+            phase_name(target as i32)
+        ));
+    }
+    None
+}
+
 async fn wait_for_lifecycle_phase(
     client: &mut crate::tls::GrpcClient,
     sandbox: Sandbox,
@@ -3885,10 +4275,8 @@ async fn wait_for_lifecycle_phase(
     if current == target {
         return Ok(sandbox);
     }
-    if current == SandboxPhase::Error {
-        let detail = ready_false_condition_message(sandbox.status.as_ref())
-            .unwrap_or_else(|| "sandbox entered Error".to_string());
-        return Err(miette!("{detail} while waiting for {target:?}"));
+    if let Some(err) = lifecycle_phase_error(&sandbox, target, current) {
+        return Err(err);
     }
 
     let timeout = Duration::from_secs(
@@ -3944,10 +4332,8 @@ async fn wait_for_lifecycle_phase(
             if phase == target {
                 return Ok(sandbox);
             }
-            if phase == SandboxPhase::Error {
-                let detail = ready_false_condition_message(sandbox.status.as_ref())
-                    .unwrap_or_else(|| "sandbox entered Error".to_string());
-                return Err(miette!(detail));
+            if let Some(err) = lifecycle_phase_error(&sandbox, target, phase) {
+                return Err(err);
             }
         }
     }
@@ -4019,12 +4405,8 @@ async fn expose_service_endpoint(
             )),
         })
         .await
-        .map_err(service_expose_status_error)
+        .map_err(|status| service_status_error("expose service", "sandbox:write", sandbox, status))
         .map(tonic::Response::into_inner)
-}
-
-fn service_expose_status_error(status: Status) -> miette::Report {
-    service_status_error("expose service", "sandbox:write", status)
 }
 
 #[allow(clippy::too_many_arguments)] // user-facing CLI command
@@ -4051,7 +4433,14 @@ pub async fn service_list(
             }),
         })
         .await
-        .map_err(|status| service_status_error("list services", "sandbox:read", status))?
+        .map_err(|status| {
+            service_status_error(
+                "list services",
+                "sandbox:read",
+                sandbox.unwrap_or_default(),
+                status,
+            )
+        })?
         .into_inner();
 
     let next_page_token = response.next_page_token.clone();
@@ -4101,7 +4490,7 @@ pub async fn service_get(
             name: service.to_string(),
         })
         .await
-        .map_err(|status| service_status_error("get service", "sandbox:read", status))?
+        .map_err(|status| service_status_error("get service", "sandbox:read", sandbox, status))?
         .into_inner();
 
     print_service_endpoint_table(&[response], server, false);
@@ -4127,7 +4516,7 @@ pub async fn service_delete(
             )),
         })
         .await
-        .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
+        .map_err(|status| service_status_error("delete service", "sandbox:write", sandbox, status))?
         .into_inner();
 
     if !deletion_completed(response.outcome)? {
@@ -4151,13 +4540,23 @@ pub async fn service_delete(
     Ok(())
 }
 
-fn service_status_error(action: &str, required_scope: &str, status: Status) -> miette::Report {
+fn service_status_error(
+    action: &str,
+    required_scope: &str,
+    sandbox: &str,
+    status: Status,
+) -> miette::Report {
     let message = status.message();
     match status.code() {
         Code::PermissionDenied => {
             miette!("{action} failed: permission denied (requires {required_scope})")
         }
         Code::Unauthenticated => miette!("{action} failed: authentication required"),
+        Code::NotFound if message == "sandbox not found" && !sandbox.is_empty() => {
+            miette!(
+                "{action} failed: sandbox \"{sandbox}\" not found (the first argument is the sandbox name, not the service name)"
+            )
+        }
         Code::NotFound if message == "sandbox not found" => {
             miette!("{action} failed: sandbox not found")
         }
@@ -4338,6 +4737,7 @@ pub async fn workspace_create(
     server: &str,
     name: &str,
     label_args: &[String],
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     use openshell_core::proto::CreateWorkspaceRequest;
@@ -4365,6 +4765,10 @@ pub async fn workspace_create(
         .workspace
         .ok_or_else(|| miette!("workspace missing from response"))?;
 
+    if crate::output::print_output_single(output, &workspace, workspace_to_json)? {
+        return Ok(());
+    }
+
     println!(
         "{} Created workspace {}",
         "✓".green().bold(),
@@ -4374,7 +4778,7 @@ pub async fn workspace_create(
     Ok(())
 }
 
-pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn workspace_get(server: &str, name: &str, output: &str, tls: &TlsOptions) -> Result<()> {
     use openshell_core::proto::GetWorkspaceRequest;
 
     let mut client = grpc_client(server, tls).await?;
@@ -4389,6 +4793,10 @@ pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result
         .into_inner()
         .workspace
         .ok_or_else(|| miette!("workspace missing from response"))?;
+
+    if crate::output::print_output_single(output, &workspace, workspace_to_json)? {
+        return Ok(());
+    }
 
     println!("{}", "Workspace:".cyan().bold());
     println!();
@@ -4738,6 +5146,13 @@ fn workspace_to_json(workspace: &openshell_core::proto::Workspace) -> serde_json
 }
 
 pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
+    discover_git_repo_root(local_path)?
+        .ok_or_else(|| miette::miette!("path is outside a Git work tree: {}", local_path.display()))
+}
+
+/// Only return `None` when Git reports no repository and no ancestor has a
+/// `.git` entry. A corrupt repository can produce the same Git diagnostic.
+fn discover_git_repo_root(local_path: &Path) -> Result<Option<PathBuf>> {
     let git_dir = if local_path.is_dir() {
         local_path
     } else {
@@ -4748,6 +5163,9 @@ pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
     let mut command = Command::new("git");
     scrub_git_env(&mut command);
     let output = command
+        .env("LC_ALL", "C")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(git_dir)
         .output()
@@ -4755,6 +5173,32 @@ pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
         .wrap_err("failed to run git rev-parse")?;
 
     if !output.status.success() {
+        if output.status.code() == Some(128)
+            && String::from_utf8_lossy(&output.stderr).trim_end()
+                == "fatal: not a git repository (or any of the parent directories): .git"
+        {
+            for ancestor in git_dir.ancestors() {
+                let marker = ancestor.join(".git");
+                match std::fs::symlink_metadata(&marker) {
+                    Ok(_) => {
+                        return Err(miette::miette!(
+                            "Git repository discovery failed despite an existing .git entry: {}",
+                            marker.display()
+                        ));
+                    }
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err).into_diagnostic().wrap_err_with(|| {
+                            format!(
+                                "failed to inspect Git repository marker: {}",
+                                marker.display()
+                            )
+                        });
+                    }
+                }
+            }
+            return Ok(None);
+        }
         return Err(miette::miette!(
             "git rev-parse --show-toplevel failed with status {}",
             output.status
@@ -4768,24 +5212,21 @@ pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
         ));
     }
 
-    Ok(PathBuf::from(root))
+    Ok(Some(PathBuf::from(root)))
 }
 
 pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
-    let repo_root = std::fs::canonicalize(git_repo_root(local_path)?)
-        .into_diagnostic()
-        .wrap_err("failed to canonicalize git repository root")?;
-    let local_path = if local_path.is_absolute() {
-        local_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .into_diagnostic()
-            .wrap_err("failed to resolve current directory")?
-            .join(local_path)
-    };
     let local_path = std::fs::canonicalize(local_path)
         .into_diagnostic()
         .wrap_err("failed to canonicalize local upload path")?;
+    let repo_root = git_repo_root(&local_path)?;
+    git_sync_files_in_repo(&local_path, &repo_root)
+}
+
+fn git_sync_files_in_repo(local_path: &Path, repo_root: &Path) -> Result<(PathBuf, Vec<String>)> {
+    let repo_root = std::fs::canonicalize(repo_root)
+        .into_diagnostic()
+        .wrap_err("failed to canonicalize git repository root")?;
     let relative_path = local_path
         .strip_prefix(&repo_root)
         .into_diagnostic()
@@ -4804,7 +5245,7 @@ pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
             .map(Path::to_path_buf)
             .ok_or_else(|| miette::miette!("path has no parent: {}", local_path.display()))?
     } else {
-        local_path.clone()
+        local_path.to_path_buf()
     };
     let pathspec = if relative_path.as_os_str().is_empty() {
         None
@@ -4871,17 +5312,72 @@ fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUpl
         }
     })?;
 
-    if git_ignore
-        && !metadata.file_type().is_symlink()
-        && let Ok((base_dir, files)) = git_sync_files(local_path)
-    {
-        if files.is_empty() {
-            return Ok(SandboxUploadPlan::GitFilteredEmpty);
-        }
-        return Ok(SandboxUploadPlan::GitAware { base_dir, files });
+    if !git_ignore || metadata.file_type().is_symlink() {
+        return Ok(SandboxUploadPlan::Regular);
     }
 
-    Ok(SandboxUploadPlan::Regular)
+    let plan = git_filtered_upload_plan(local_path).wrap_err_with(|| {
+        format!(
+            "Git filtering failed for {}; upload stopped.\nUse --no-git-ignore to upload intentionally without filtering",
+            local_path.display(),
+        )
+    })?;
+    if let SandboxUploadPlan::GitAware { files, .. } = &plan
+        && files.is_empty()
+    {
+        return Err(miette::miette!(
+            "Git filtering selected no files for {}; upload stopped.\nGit returned 0 uploadable paths: the source may be empty or all files may be ignored.\nUse --no-git-ignore to upload intentionally without filtering",
+            local_path.display(),
+        ));
+    }
+    Ok(plan)
+}
+
+fn git_filtered_upload_plan(local_path: &Path) -> Result<SandboxUploadPlan> {
+    let canonical_path = std::fs::canonicalize(local_path)
+        .into_diagnostic()
+        .wrap_err("failed to canonicalize local upload path")?;
+    let Some(repo_root) = discover_git_repo_root(&canonical_path)? else {
+        eprintln!(
+            "Warning: {} is outside a Git work tree; uploading without Git filtering (.gitignore rules are not applied).",
+            local_path.display()
+        );
+        return Ok(SandboxUploadPlan::Regular);
+    };
+    let (base_dir, files) = git_sync_files_in_repo(&canonical_path, &repo_root)?;
+    Ok(SandboxUploadPlan::GitAware { base_dir, files })
+}
+
+async fn sandbox_upload_planned(
+    plan: SandboxUploadPlan,
+    server: &str,
+    name: &str,
+    local_path: &Path,
+    sandbox_path: Option<&str>,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<Option<String>> {
+    match plan {
+        SandboxUploadPlan::GitAware { base_dir, files } => {
+            sandbox_sync_up_files(
+                server,
+                name,
+                &base_dir,
+                &files,
+                local_path,
+                sandbox_path,
+                tls,
+                workspace,
+            )
+            .await?;
+            Ok(None)
+        }
+        SandboxUploadPlan::Regular => {
+            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace)
+                .await
+                .map(Some)
+        }
+    }
 }
 
 /// Upload a local path to a sandbox.
@@ -4905,34 +5401,22 @@ pub async fn sandbox_upload(
         dest_display
     );
 
-    match upload_plan {
-        SandboxUploadPlan::GitAware { base_dir, files } => {
-            sandbox_sync_up_files(
-                server,
-                name,
-                &base_dir,
-                &files,
-                local_path,
-                sandbox_path,
-                tls,
-                workspace,
-            )
-            .await?;
-        }
-        SandboxUploadPlan::GitFilteredEmpty => {
-            eprintln!(
-                "{} .gitignore filtering excluded all files in {}; uploading unfiltered",
-                "⚠".yellow().bold(),
-                local_path.display(),
-            );
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?;
-        }
-        SandboxUploadPlan::Regular => {
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?;
-        }
-    }
+    let uploaded_path = sandbox_upload_planned(
+        upload_plan,
+        server,
+        name,
+        local_path,
+        sandbox_path,
+        tls,
+        workspace,
+    )
+    .await?;
 
-    eprintln!("{} Upload complete", "✓".green().bold());
+    if let Some(path) = uploaded_path {
+        eprintln!("{} Upload complete: {path}", "✓".green().bold());
+    } else {
+        eprintln!("{} Upload complete", "✓".green().bold());
+    }
     Ok(())
 }
 
@@ -6407,7 +6891,7 @@ pub async fn sandbox_draft_approve(
             review_token,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|status| draft_approval_error(status, name))?;
 
     let inner = response.into_inner();
     println!(
@@ -6418,6 +6902,23 @@ pub async fn sandbox_draft_approve(
     );
 
     Ok(())
+}
+
+/// Explain an approval the gateway refused because the proposal's evaluation
+/// changed after it was fetched. The gateway has already stored the refreshed
+/// evaluation, so the reviewer needs to look at it before approving again.
+fn draft_approval_error(status: Status, name: &str) -> miette::Report {
+    if status.code() == Code::FailedPrecondition
+        && status.message().contains("refetch and review again")
+    {
+        return miette::miette!(
+            help = format!(
+                "review it with `openshell rule get {name} --status pending`, then approve again"
+            ),
+            "the sandbox policy or its inputs changed after this rule was fetched, so the gateway re-evaluated it"
+        );
+    }
+    miette::Report::from_err(status)
 }
 
 /// Reject a network rule.
@@ -6488,7 +6989,7 @@ pub async fn sandbox_draft_approve_all(
             approvals,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|status| draft_approval_error(status, name))?;
 
     let inner = response.into_inner();
     println!(
@@ -6638,15 +7139,72 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, format_endpoint,
-        format_log_line, git_sync_files, has_main_process_result, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_driver_config_json,
-        parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
-        proto_execution_timeout, provisioning_timeout_message, ready_false_condition_message,
+        ForwardTcpConnectionError, PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
+        format_endpoint, format_log_line, forward_requires_session_token, git_sync_files,
+        has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_driver_config_json, parse_env_from_pairs, parse_secret_material_env_pairs,
+        policy_revision_list_json, policy_revision_to_json, proto_execution_timeout,
+        provisioning_blocker_message, provisioning_timeout_message, relay_local_socket,
         resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
-        sandbox_upload_plan, service_endpoint_to_json, service_expose_status_error,
+        sandbox_upload_plan, service_endpoint_to_json, service_status_error,
         service_url_for_gateway, workspace_member_to_json,
     };
+    use openshell_core::proto::TcpForwardFrame;
+
+    #[test]
+    fn lifecycle_wait_fails_fast_on_phases_that_block_the_target() {
+        use super::lifecycle_phase_blocks_target;
+        use openshell_core::proto::SandboxPhase;
+
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Suspended
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Suspending
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Starting
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Stopped
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Ready
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Suspending
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Stopped,
+            SandboxPhase::Suspended
+        ));
+    }
+
+    #[test]
+    fn draft_approval_error_explains_refreshed_evaluation() {
+        use super::draft_approval_error;
+        use tonic::Status;
+
+        let refreshed = draft_approval_error(
+            Status::failed_precondition(
+                "proposal inputs changed; evaluation refreshed, refetch and review again",
+            ),
+            "my-agent",
+        );
+        assert!(refreshed.to_string().contains("re-evaluated"));
+        let help = refreshed.help().expect("help text").to_string();
+        assert!(help.contains("openshell rule get my-agent --status pending"));
+
+        let other = draft_approval_error(Status::not_found("chunk not found"), "my-agent");
+        assert!(other.to_string().contains("chunk not found"));
+        assert!(other.help().is_none());
+    }
 
     #[test]
     fn zero_exec_timeout_is_omitted() {
@@ -6663,7 +7221,7 @@ mod tests {
     use crate::commands::common::{
         parse_credential_expiry_pairs, parse_credential_pairs, progress_step_from_metadata,
     };
-    use crate::test_utils::EnvVarGuard;
+    use crate::test_utils::Environment;
     use openshell_bootstrap::GatewayMetadata;
     use std::fs;
     use std::path::Path;
@@ -6851,81 +7409,148 @@ mod tests {
 
     #[test]
     fn parse_credential_pairs_reads_value_from_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_TEST_KEY", "from-env");
-
-        let parsed =
-            parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_TEST_KEY".to_string()]).expect("parse");
-        assert_eq!(
-            parsed.get("NAV_PARSE_CREDENTIAL_TEST_KEY"),
-            Some(&"from-env".to_string())
-        );
+        Environment::new()
+            .set("NAV_PARSE_CREDENTIAL_TEST_KEY", "from-env")
+            .run(|| {
+                let parsed = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_TEST_KEY".to_string()])
+                    .expect("parse");
+                assert_eq!(
+                    parsed.get("NAV_PARSE_CREDENTIAL_TEST_KEY"),
+                    Some(&"from-env".to_string())
+                );
+            });
     }
 
     #[test]
     fn parse_credential_pairs_rejects_missing_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::unset("NAV_PARSE_CREDENTIAL_MISSING");
-
-        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_MISSING".to_string()])
-            .expect_err("missing env should error");
-        assert!(err.to_string().contains(
+        Environment::new()
+            .remove("NAV_PARSE_CREDENTIAL_MISSING")
+            .run(|| {
+                let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_MISSING".to_string()])
+                    .expect_err("missing env should error");
+                assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_MISSING' to be set to a non-empty value"
         ));
+            });
     }
 
     #[test]
     fn parse_credential_pairs_rejects_empty_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_EMPTY", "");
-
-        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_EMPTY".to_string()])
-            .expect_err("empty env should error");
-        assert!(err.to_string().contains(
+        Environment::new()
+            .set("NAV_PARSE_CREDENTIAL_EMPTY", "")
+            .run(|| {
+                let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_EMPTY".to_string()])
+                    .expect_err("empty env should error");
+                assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+            });
+    }
+
+    #[test]
+    fn parse_env_from_pairs_reads_named_and_same_name_environment_variables() {
+        Environment::new()
+            .set("NAV_PARSE_ENV_FROM_NAMED", "named-value")
+            .set("NAV_PARSE_ENV_FROM_SAME", "same-name-value")
+            .run(|| {
+                let parsed = parse_env_from_pairs(&[
+                    "SANDBOX_NAMED=NAV_PARSE_ENV_FROM_NAMED".to_string(),
+                    "NAV_PARSE_ENV_FROM_SAME".to_string(),
+                ])
+                .expect("parse");
+                assert_eq!(
+                    parsed.get("SANDBOX_NAMED"),
+                    Some(&"named-value".to_string())
+                );
+                assert_eq!(
+                    parsed.get("NAV_PARSE_ENV_FROM_SAME"),
+                    Some(&"same-name-value".to_string())
+                );
+            });
+    }
+
+    #[test]
+    fn parse_env_from_pairs_rejects_missing_invalid_reserved_and_duplicate_keys() {
+        Environment::new()
+            .remove("NAV_PARSE_ENV_FROM_MISSING")
+            .set("NAV_PARSE_ENV_FROM_PRESENT", "value")
+            .run(|| {
+                for (input, expected) in [
+                    ("TARGET=NAV_PARSE_ENV_FROM_MISSING", "is not set"),
+                    ("1BAD=NAV_PARSE_ENV_FROM_PRESENT", "key must match"),
+                    ("TARGET=BAD-NAME", "source must match"),
+                    ("OPENSHELL_RESERVED=NAV_PARSE_ENV_FROM_PRESENT", "reserved"),
+                ] {
+                    let error =
+                        parse_env_from_pairs(&[input.to_string()]).expect_err("must reject");
+                    assert!(
+                        error.to_string().contains(expected),
+                        "unexpected error: {error}"
+                    );
+                }
+
+                let error = parse_env_from_pairs(&[
+                    "TARGET=NAV_PARSE_ENV_FROM_PRESENT".to_string(),
+                    "TARGET=NAV_PARSE_ENV_FROM_PRESENT".to_string(),
+                ])
+                .expect_err("duplicate must reject");
+                assert!(error.to_string().contains("duplicate --env-from"));
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_reads_value_from_named_environment_variable() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_NAMED", "pem-material");
-
-        let parsed =
-            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_NAMED".to_string()])
+        Environment::new()
+            .set("NAV_PARSE_SME_NAMED", "pem-material")
+            .run(|| {
+                let parsed = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_NAMED".to_string()
+                ])
                 .expect("parse");
-        assert_eq!(parsed.get("private_key"), Some(&"pem-material".to_string()));
+                assert_eq!(parsed.get("private_key"), Some(&"pem-material".to_string()));
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_defaults_env_name_to_key() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_KEY_ONLY", "key-only-material");
-
-        let parsed = parse_secret_material_env_pairs(&["NAV_PARSE_SME_KEY_ONLY".to_string()])
-            .expect("parse");
-        assert_eq!(
-            parsed.get("NAV_PARSE_SME_KEY_ONLY"),
-            Some(&"key-only-material".to_string())
-        );
+        Environment::new()
+            .set("NAV_PARSE_SME_KEY_ONLY", "key-only-material")
+            .run(|| {
+                let parsed =
+                    parse_secret_material_env_pairs(&["NAV_PARSE_SME_KEY_ONLY".to_string()])
+                        .expect("parse");
+                assert_eq!(
+                    parsed.get("NAV_PARSE_SME_KEY_ONLY"),
+                    Some(&"key-only-material".to_string())
+                );
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_missing_environment() {
-        let _guard = EnvVarGuard::unset("NAV_PARSE_SME_MISSING");
-
-        let err =
-            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_MISSING".to_string()])
-                .expect_err("missing env should error");
-        assert!(err.to_string().contains(
-            "requires local env var 'NAV_PARSE_SME_MISSING' to be set to a non-empty value"
-        ));
+        Environment::new().remove("NAV_PARSE_SME_MISSING").run(|| {
+            let err =
+                parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_MISSING".to_string()])
+                    .expect_err("missing env should error");
+            assert!(err.to_string().contains(
+                "requires local env var 'NAV_PARSE_SME_MISSING' to be set to a non-empty value"
+            ));
+        });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_empty_environment_value() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_EMPTY", "   ");
-
-        let err = parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_EMPTY".to_string()])
-            .expect_err("blank env should error");
-        assert!(err.to_string().contains(
-            "requires local env var 'NAV_PARSE_SME_EMPTY' to be set to a non-empty value"
-        ));
+        Environment::new()
+            .set("NAV_PARSE_SME_EMPTY", "   ")
+            .run(|| {
+                let err = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_EMPTY".to_string()
+                ])
+                .expect_err("blank env should error");
+                assert!(err.to_string().contains(
+                    "requires local env var 'NAV_PARSE_SME_EMPTY' to be set to a non-empty value"
+                ));
+            });
     }
 
     #[test]
@@ -6937,17 +7562,19 @@ mod tests {
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_duplicate_keys() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_DUP", "value");
-
-        let err = parse_secret_material_env_pairs(&[
-            "private_key=NAV_PARSE_SME_DUP".to_string(),
-            "private_key=NAV_PARSE_SME_DUP".to_string(),
-        ])
-        .expect_err("duplicate key should error");
-        assert!(
-            err.to_string()
-                .contains("key 'private_key' supplied more than once")
-        );
+        Environment::new()
+            .set("NAV_PARSE_SME_DUP", "value")
+            .run(|| {
+                let err = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_DUP".to_string(),
+                    "private_key=NAV_PARSE_SME_DUP".to_string(),
+                ])
+                .expect_err("duplicate key should error");
+                assert!(
+                    err.to_string()
+                        .contains("key 'private_key' supplied more than once")
+                );
+            });
     }
 
     #[test]
@@ -7550,10 +8177,13 @@ mod tests {
     }
 
     #[test]
-    fn service_expose_status_error_mentions_required_scope() {
-        let report = service_expose_status_error(Status::permission_denied(
-            "scope 'sandbox:write' required",
-        ));
+    fn service_status_error_mentions_required_scope() {
+        let report = service_status_error(
+            "expose service",
+            "sandbox:write",
+            "demo",
+            Status::permission_denied("scope 'sandbox:write' required"),
+        );
 
         assert_eq!(
             report.to_string(),
@@ -7562,7 +8192,53 @@ mod tests {
     }
 
     #[test]
-    fn ready_false_condition_message_prefers_reason_and_message() {
+    fn service_status_error_names_missing_sandbox() {
+        let report = service_status_error(
+            "delete service",
+            "sandbox:write",
+            "web-http",
+            Status::not_found("sandbox not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "delete service failed: sandbox \"web-http\" not found \
+             (the first argument is the sandbox name, not the service name)"
+        );
+    }
+
+    #[test]
+    fn service_status_error_omits_empty_sandbox_name() {
+        let report = service_status_error(
+            "list services",
+            "sandbox:read",
+            "",
+            Status::not_found("sandbox not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "list services failed: sandbox not found"
+        );
+    }
+
+    #[test]
+    fn service_status_error_keeps_missing_service_message() {
+        let report = service_status_error(
+            "get service",
+            "sandbox:read",
+            "demo",
+            Status::not_found("service endpoint not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "get service failed: service endpoint not found"
+        );
+    }
+
+    #[test]
+    fn provisioning_blocker_message_prefers_reason_and_message() {
         let status = SandboxStatus {
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
@@ -7576,13 +8252,13 @@ mod tests {
         };
 
         assert_eq!(
-            ready_false_condition_message(Some(&status)).as_deref(),
+            provisioning_blocker_message(Some(&status)).as_deref(),
             Some("Unschedulable: Another GPU sandbox may already be using the available GPU.")
         );
     }
 
     #[test]
-    fn ready_false_condition_message_ignores_non_ready_conditions() {
+    fn provisioning_blocker_message_ignores_non_ready_conditions() {
         let status = SandboxStatus {
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
@@ -7595,7 +8271,121 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(ready_false_condition_message(Some(&status)).is_none());
+        assert!(provisioning_blocker_message(Some(&status)).is_none());
+    }
+
+    #[test]
+    fn provisioning_blocker_message_prefers_unschedulable_pod_scheduled_condition() {
+        let status = SandboxStatus {
+            agent_pod: "pending-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: "Waiting for effective configuration validation".to_string(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: "Unschedulable".to_string(),
+                    message: "0/11 nodes are available: 11 Insufficient cpu.".to_string(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            provisioning_blocker_message(Some(&status)).as_deref(),
+            Some("Unschedulable: 0/11 nodes are available: 11 Insufficient cpu.")
+        );
+    }
+
+    #[test]
+    fn provisioning_blocker_message_ignores_scheduled_pod_condition() {
+        let status = SandboxStatus {
+            agent_pod: "scheduled-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "True".to_string(),
+                    reason: String::new(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: "Waiting for effective configuration validation".to_string(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            provisioning_blocker_message(Some(&status)).as_deref(),
+            Some("ConfigurationPending: Waiting for effective configuration validation")
+        );
+    }
+
+    #[test]
+    fn provisioning_blocker_message_falls_back_when_pod_scheduled_has_no_detail() {
+        let status = SandboxStatus {
+            agent_pod: "pending-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: String::new(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            provisioning_blocker_message(Some(&status)).as_deref(),
+            Some("ConfigurationPending")
+        );
+    }
+
+    #[test]
+    fn lifecycle_phase_error_reports_scheduling_failure() {
+        use super::lifecycle_phase_error;
+        use openshell_core::proto::SandboxPhase;
+
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                phase: SandboxPhase::Error as i32,
+                conditions: vec![SandboxCondition {
+                    r#type: "PodScheduled".into(),
+                    status: "False".into(),
+                    reason: "Unschedulable".into(),
+                    message: "0/5 nodes are available: 1 Too many pods".into(),
+                    transition_time: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = lifecycle_phase_error(&sandbox, SandboxPhase::Ready, SandboxPhase::Error)
+            .expect("Error phase should fail the wait");
+        assert_eq!(
+            err.to_string(),
+            "Unschedulable: 0/5 nodes are available: 1 Too many pods while waiting for Ready"
+        );
     }
 
     #[test]
@@ -7740,7 +8530,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_upload_plan_falls_back_when_all_files_gitignored() {
+    fn sandbox_upload_plan_rejects_empty_filtered_selections() {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         let repo = tmpdir.path().join("repo");
         fs::create_dir_all(repo.join("runs")).expect("create repo");
@@ -7748,14 +8538,126 @@ mod tests {
         fs::write(repo.join(".gitignore"), "runs/\n").expect("write .gitignore");
         fs::write(repo.join("runs/test.json"), r#"{"key":"value"}"#).expect("write test.json");
 
-        let plan =
-            sandbox_upload_plan(&repo.join("runs"), true).expect("upload plan should succeed");
+        fs::create_dir(repo.join("empty")).expect("create empty directory");
+
+        for path in [
+            repo.join("runs"),
+            repo.join("runs/test.json"),
+            repo.join("empty"),
+        ] {
+            let err =
+                sandbox_upload_plan(&path, true).expect_err("empty selection must stop upload");
+            let message = err.to_string();
+            assert!(message.contains("filtering selected no files"), "{message}");
+            assert!(
+                message.contains("Git returned 0 uploadable paths"),
+                "{message}"
+            );
+            assert!(message.contains("--no-git-ignore"), "{message}");
+            assert_eq!(
+                sandbox_upload_plan(&path, false).expect("explicit unfiltered upload"),
+                super::SandboxUploadPlan::Regular,
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_upload_plan_allows_paths_outside_git_repository() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        fs::write(tmpdir.path().join("file.txt"), "hello").expect("write file");
+
+        for path in [tmpdir.path().to_path_buf(), tmpdir.path().join("file.txt")] {
+            assert_eq!(
+                sandbox_upload_plan(&path, true).expect("upload outside a repository"),
+                super::SandboxUploadPlan::Regular,
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_upload_plan_selects_only_unignored_files() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path();
+        init_git_repo(repo);
+        fs::write(repo.join(".gitignore"), "*.log\n").expect("write .gitignore");
+        fs::create_dir(repo.join("files")).expect("create files directory");
+        fs::write(repo.join("files/keep.txt"), "keep").expect("write included file");
+        fs::write(repo.join("files/skip.log"), "skip").expect("write ignored file");
 
         assert_eq!(
-            plan,
-            super::SandboxUploadPlan::GitFilteredEmpty,
-            "gitignored directory should fall back with GitFilteredEmpty"
+            sandbox_upload_plan(&repo.join("files"), true).expect("filtered upload"),
+            super::SandboxUploadPlan::GitAware {
+                base_dir: fs::canonicalize(repo.join("files")).expect("canonical path"),
+                files: vec!["keep.txt".to_string()],
+            },
         );
+    }
+
+    #[test]
+    fn sandbox_upload_plan_filters_linked_worktrees_and_separate_git_dirs() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path().join("repo");
+        fs::create_dir(&repo).expect("create repo");
+        init_git_repo(&repo);
+        let mut commit = Command::new("git");
+        super::scrub_git_env(&mut commit);
+        assert!(
+            commit
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ])
+                .current_dir(&repo)
+                .status()
+                .expect("initial commit")
+                .success()
+        );
+
+        let worktree = tmpdir.path().join("worktree");
+        let mut add = Command::new("git");
+        super::scrub_git_env(&mut add);
+        assert!(
+            add.args(["worktree", "add", "--detach"])
+                .arg(&worktree)
+                .current_dir(&repo)
+                .status()
+                .expect("add worktree")
+                .success()
+        );
+
+        let separate = tmpdir.path().join("separate");
+        let mut init = Command::new("git");
+        super::scrub_git_env(&mut init);
+        assert!(
+            init.args(["init", "--separate-git-dir"])
+                .arg(tmpdir.path().join("metadata"))
+                .arg(&separate)
+                .status()
+                .expect("initialize separate git directory")
+                .success()
+        );
+
+        for source in [worktree, separate] {
+            assert!(source.join(".git").is_file());
+            fs::write(source.join(".gitignore"), ".env\n").expect("write ignore rule");
+            fs::write(source.join(".env"), "dummy").expect("write ignored file");
+            fs::write(source.join("keep.txt"), "keep").expect("write included file");
+            let super::SandboxUploadPlan::GitAware { mut files, .. } =
+                sandbox_upload_plan(&source, true).expect("filter gitfile worktree")
+            else {
+                panic!("a gitfile worktree must be filtered");
+            };
+            files.sort();
+            assert_eq!(files, vec![".gitignore", "keep.txt"]);
+        }
     }
 
     #[test]
@@ -7771,17 +8673,19 @@ mod tests {
         fs::write(repo.join("nested/file.txt"), "file").expect("write file.txt");
         fs::write(repo.join("top.txt"), "top").expect("write top.txt");
 
-        let _git_dir = EnvVarGuard::set("GIT_DIR", "/tmp/not-the-test-repo/.git");
-        let _git_work_tree = EnvVarGuard::set("GIT_WORK_TREE", "/tmp/not-the-test-repo");
+        Environment::new()
+            .set("GIT_DIR", "/tmp/not-the-test-repo/.git")
+            .set("GIT_WORK_TREE", "/tmp/not-the-test-repo")
+            .run(|| {
+                let result = git_sync_files(&repo.join("nested"));
+                let (base_dir, files) = result.expect("git_sync_files should succeed");
 
-        let result = git_sync_files(&repo.join("nested"));
-        let (base_dir, files) = result.expect("git_sync_files should succeed");
-
-        assert_eq!(
-            base_dir,
-            fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
-        );
-        assert_eq!(files, vec!["file.txt"]);
+                assert_eq!(
+                    base_dir,
+                    fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
+                );
+                assert_eq!(files, vec!["file.txt"]);
+            });
     }
 
     #[test]
@@ -7924,6 +8828,101 @@ mod tests {
     }
 
     #[test]
+    fn retained_sandbox_timeout_message_matches_expired_phase() {
+        let mut record = openshell_core::proto::SandboxProvisioning {
+            preparation_deadline: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+            timeout_time: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+            ..Default::default()
+        };
+        let message = super::retained_sandbox_timeout_message(
+            "cold-image",
+            "ImagePreparationTimedOut: preparation expired",
+            &record,
+        );
+        assert!(message.starts_with("ImagePreparationTimedOut: preparation expired\n"));
+        assert!(message.contains("Sandbox 'cold-image' was retained"));
+        assert!(message.contains("image preparation and supervisor startup diagnostics"));
+        assert!(message.contains("image_preparation_timeout_seconds"));
+        assert!(!message.contains("repair its configuration"));
+        assert!(message.contains("openshell sandbox get cold-image"));
+        assert!(message.contains("openshell sandbox start cold-image` after cleanup completes"));
+
+        // An admission timeout retains preparation timestamps. Its completed
+        // transition must select configuration repair rather than a larger budget.
+        record.admission_start_time = openshell_core::time::timestamp_from_millis(600_000).ok();
+        let admission_without_preparation = openshell_core::proto::SandboxProvisioning {
+            timeout_time: record.timeout_time,
+            ..Default::default()
+        };
+        for admission_record in [&record, &admission_without_preparation] {
+            let message = super::retained_sandbox_timeout_message(
+                "invalid-policy",
+                "ProvisioningTimedOut: repair window expired",
+                admission_record,
+            );
+            assert!(message.contains("repair its configuration"));
+            assert!(!message.contains("image_preparation_timeout_seconds"));
+            assert!(
+                message.contains("openshell sandbox start invalid-policy` after cleanup completes")
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_json_exposes_pending_driver_operation() {
+        for pending in [true, false] {
+            let mut sandbox = Sandbox::default();
+            sandbox.set_phase(SandboxPhase::Provisioning.into());
+            sandbox.status.as_mut().unwrap().provisioning =
+                Some(openshell_core::proto::SandboxProvisioning {
+                    driver_operation_pending: pending,
+                    driver_operation_id: "operation-1".into(),
+                    ..Default::default()
+                });
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_pending"],
+                pending
+            );
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_id"],
+                "operation-1"
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_json_distinguishes_preparation_and_admission() {
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        let ceiling = openshell_core::time::timestamp_from_millis(1_800_000).ok();
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(openshell_core::proto::SandboxProvisioning {
+                preparation_deadline: ceiling,
+                deadline: ceiling,
+                ..Default::default()
+            });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["provisioning"]["phase"], "preparation");
+        assert_eq!(
+            json["provisioning"]["preparation_deadline"],
+            "1970-01-01T00:30:00Z"
+        );
+        assert!(json["provisioning"]["admission_start_time"].is_null());
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .provisioning
+            .as_mut()
+            .unwrap()
+            .admission_start_time = openshell_core::time::timestamp_from_millis(600_000).ok();
+        assert_eq!(
+            super::sandbox_to_json(&sandbox)["provisioning"]["phase"],
+            "admission"
+        );
+    }
+
+    #[test]
     fn sandbox_json_exposes_repair_diagnostic_and_accepted_generation() {
         use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
 
@@ -8059,6 +9058,7 @@ mod tests {
                     path: "/mcp".to_string(),
                     last_result: EndpointResult::TransportFailed as i32,
                     last_reported_time: Some("2026-09-05T10:01:00Z".parse().unwrap()),
+                    last_failure: None,
                 }],
                 conditions: vec![SandboxCondition {
                     r#type: "Ready".to_string(),
@@ -8106,6 +9106,7 @@ mod tests {
                     "path": "/mcp",
                     "last_result": "TransportFailed",
                     "last_reported_at": "2026-09-05T10:01:00Z",
+                    "last_failure": null,
                 }])
             );
         }
@@ -8120,6 +9121,7 @@ mod tests {
             path: "/mcp".to_string(),
             last_result: EndpointResult::TransportFailed as i32,
             last_reported_time: Some("2026-09-05T11:01:00Z".parse().unwrap()),
+            last_failure: None,
         };
 
         assert_eq!(
@@ -8141,6 +9143,7 @@ mod tests {
             path: "/**".to_string(),
             last_result: EndpointResult::NoObservedExchange as i32,
             last_reported_time: None,
+            last_failure: None,
         };
 
         assert_eq!(
@@ -8168,9 +9171,89 @@ mod tests {
                 "path": "/**",
                 "last_result": "NoObservedExchange",
                 "last_reported_at": "",
+                "last_failure": null,
             }])
         );
         assert_eq!(output["conditions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn token_grant_failure_renders_in_text_and_structured_output() {
+        use openshell_core::proto::{
+            EndpointFailure, EndpointFailureDomain, ProviderCredentialRefreshRecoveryAction,
+            TokenGrantFailureObservation,
+        };
+        let failure = EndpointFailure {
+            domain: EndpointFailureDomain::TokenGrant.into(),
+            code: "provider_authorization_required".to_string(),
+            recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize.into(),
+            provider: "github".to_string(),
+            credential_key: "access_token".to_string(),
+            stage: "token_endpoint".to_string(),
+            upstream_http_status: Some(409),
+            request_id: "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908".to_string(),
+        };
+        let endpoint = EndpointStatus {
+            host: "tools.example.test".to_string(),
+            last_failure: Some(failure.clone()),
+            ..Default::default()
+        };
+        let observation = TokenGrantFailureObservation {
+            destination_host: "api.example.test".to_string(),
+            destination_port: 8443,
+            failure: Some(failure),
+        };
+        let cause = [
+            "Cause: provider_authorization_required (token grant, stage token_endpoint, upstream HTTP 409)",
+            "Credential: github/access_token",
+            "Recovery: Reauthorize the provider credential.",
+            "Request ID: 7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908",
+        ];
+        // MCP endpoint status places the cause between the result and report time.
+        let endpoint_lines = super::endpoint_status_display_lines(&endpoint);
+        assert_eq!(endpoint_lines[2..6], cause);
+        assert!(endpoint_lines[6].starts_with("Reported at"));
+        assert_eq!(
+            super::token_grant_failure_display_lines(&observation),
+            [&["Destination: api.example.test (port 8443)"][..], &cause].concat()
+        );
+
+        let output = super::sandbox_to_json(&Sandbox {
+            status: Some(SandboxStatus {
+                endpoint_statuses: vec![endpoint],
+                last_token_grant_failure: Some(Box::new(observation)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let failure_json = serde_json::json!({
+            "domain": "token_grant",
+            "code": "provider_authorization_required",
+            "recovery_action": "reauthorize",
+            "provider": "github",
+            "credential_key": "access_token",
+            "stage": "token_endpoint",
+            "upstream_http_status": 409,
+            "request_id": "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908",
+        });
+        assert_eq!(output["endpoint_statuses"][0]["last_failure"], failure_json);
+        assert_eq!(
+            output["last_token_grant_failure"],
+            serde_json::json!({
+                "destination_host": "api.example.test",
+                "destination_port": 8443,
+                "failure": failure_json,
+            })
+        );
+        assert!(super::sandbox_to_json(&Sandbox::default())["last_token_grant_failure"].is_null());
+
+        let unknown = super::endpoint_failure_to_json(&EndpointFailure {
+            domain: 99,
+            recovery_action: 99,
+            ..Default::default()
+        });
+        assert_eq!(unknown["domain"], "unknown");
+        assert_eq!(unknown["recovery_action"], "unspecified");
     }
 
     #[test]
@@ -8338,6 +9421,87 @@ mod tests {
         assert!(format_log_line(&log).ends_with(message));
     }
 
+    fn forward_data(bytes: &[u8]) -> TcpForwardFrame {
+        TcpForwardFrame {
+            payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                bytes.to_vec(),
+            )),
+        }
+    }
+
+    struct Relay {
+        client: tokio::io::DuplexStream,
+        to_gateway: tokio::sync::mpsc::Receiver<TcpForwardFrame>,
+        response: tokio::sync::mpsc::Sender<Result<TcpForwardFrame, Status>>,
+        task: tokio::task::JoinHandle<Result<(), ForwardTcpConnectionError>>,
+    }
+
+    fn start_relay() -> Relay {
+        let (client, local) = tokio::io::duplex(4096);
+        let (local_read, local_write) = tokio::io::split(local);
+        let (tx, to_gateway) = tokio::sync::mpsc::channel(16);
+        let (response, resp_rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(relay_local_socket(
+            local_read,
+            local_write,
+            tx,
+            tokio_stream::wrappers::ReceiverStream::new(resp_rx),
+        ));
+        Relay {
+            client,
+            to_gateway,
+            response,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_keeps_client_upload_after_target_half_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut relay = start_relay();
+        relay
+            .response
+            .send(Ok(forward_data(b"ready")))
+            .await
+            .unwrap();
+        drop(relay.response);
+
+        let mut greeting = [0u8; 5];
+        relay.client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(&greeting, b"ready");
+
+        relay.client.write_all(b"upload").await.unwrap();
+        relay.client.shutdown().await.unwrap();
+
+        let mut uploaded = Vec::new();
+        while let Some(frame) = relay.to_gateway.recv().await {
+            if let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) =
+                frame.payload
+            {
+                uploaded.extend(data);
+            }
+        }
+        assert_eq!(uploaded, b"upload");
+        relay.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_half_closes_local_socket_when_target_closes() {
+        use tokio::io::AsyncReadExt;
+
+        let mut relay = start_relay();
+        relay.response.send(Ok(forward_data(b"bye"))).await.unwrap();
+        drop(relay.response);
+
+        let mut received = Vec::new();
+        relay.client.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"bye");
+
+        drop(relay.client);
+        relay.task.await.unwrap().unwrap();
+    }
+
     use std::io::Write as _;
     use std::time::{Duration, Instant};
 
@@ -8400,6 +9564,42 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn piped_stdin_left_nonblocking_by_another_process_still_streams() {
+        // Processes that inherit the same stdin share one open file
+        // description, so any of them can make it nonblocking for all. A
+        // read with no input yet then fails with EAGAIN instead of waiting.
+        use std::os::fd::AsRawFd as _;
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        nix::fcntl::fcntl(
+            reader.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("make the shared pipe nonblocking");
+        let runtime = exec_stdin_runtime();
+        let collected = runtime.block_on(super::collect_piped_stdin(
+            super::spawn_piped_stdin_reader(reader),
+            Duration::from_millis(100),
+            super::MAX_EXEC_STDIN_BYTES,
+        ));
+        let super::PipedStdin::Open { prefix, mut rest } = collected.expect("collect") else {
+            panic!("an open pipe must start the command before EOF");
+        };
+        assert!(prefix.is_empty());
+        writer.write_all(b"late").unwrap();
+        drop(writer);
+        let next = runtime
+            .block_on(rest.recv())
+            .expect("late chunk")
+            .expect("read");
+        assert_eq!(next, b"late");
+        assert!(
+            runtime.block_on(rest.recv()).is_none(),
+            "EOF closes the channel"
+        );
+    }
+
     #[test]
     fn piped_stdin_over_the_limit_is_rejected_with_the_upload_hint() {
         let (reader, mut writer) = std::io::pipe().expect("pipe");
@@ -8414,5 +9614,18 @@ mod tests {
             .err()
             .expect("over the limit must fail");
         assert!(error.to_string().contains("sandbox upload"), "{error}");
+    }
+
+    #[test]
+    fn forward_requires_session_token_matches_only_the_legacy_gateway_error() {
+        assert!(forward_requires_session_token(&Status::unauthenticated(
+            "authorization_token is required for ForwardTcp"
+        )));
+        assert!(!forward_requires_session_token(&Status::unauthenticated(
+            "SSH session token not found"
+        )));
+        assert!(!forward_requires_session_token(&Status::permission_denied(
+            "authorization_token is required for ForwardTcp"
+        )));
     }
 }

@@ -94,6 +94,17 @@ openshell rule reject my-agent \
   --reason "Not needed for this task."
 ```
 
+Approving a proposal rechecks the other pending proposals against the updated
+policy, so you can list them again and approve them one after another. To
+approve every pending proposal in one step, run:
+
+```shell
+openshell rule approve-all my-agent
+```
+
+`rule approve-all` skips proposals with a security flag unless you add
+`--include-security-flagged`, and it reports how many it skipped.
+
 Approved rules hot-reload into the running sandbox without a restart, so the
 agent can retry the request. To let the agent propose its own narrower rules,
 or to approve proposals automatically when the prover finds no new risk, refer

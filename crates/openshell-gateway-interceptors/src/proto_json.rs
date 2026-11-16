@@ -337,6 +337,28 @@ mod tests {
     }
 
     #[test]
+    fn operator_credential_response_omits_values_inside_maps() {
+        let codec = ProtoJsonCodec::openshell().unwrap();
+        let response = openshell_core::proto::GetProviderCredentialsResponse {
+            credentials: HashMap::from([(
+                "ACCESS_TOKEN".to_string(),
+                openshell_core::proto::ProviderCredentialValue {
+                    value: "must-not-observe".to_string(),
+                    expiration_time: None,
+                },
+            )]),
+        };
+        let view = codec
+            .decode_bytes_to_interceptor_json(
+                "openshell.v1.GetProviderCredentialsResponse",
+                &response.encode_to_vec(),
+            )
+            .unwrap();
+        assert!(view["credentials"]["ACCESS_TOKEN"].get("value").is_none());
+        assert!(!view.to_string().contains("must-not-observe"));
+    }
+
+    #[test]
     fn interceptor_view_omits_nested_secrets_but_keeps_non_secret_fields() {
         let codec = ProtoJsonCodec::openshell().unwrap();
         let request = CreateProviderRequest {

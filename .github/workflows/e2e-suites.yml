@@ -1,0 +1,255 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Runs testkit suites in tmachine environments on CI. Each row of `ROWS` below
+# names a tmachine environment and installer, the family (the path of a
+# workspace under tests/suites/, such as conformance or drivers/podman) and,
+# optionally, the package in it, the gateway name the installer registers, and
+# the runner label for the environment's architecture. `openshell-test-runner`
+# builds the tests, boots the environment, runs them inside it and checks the
+# results. With `prebuilt`, the rows run what the caller built once for the
+# run instead: conformance rows the static `openshell-conformance`, the other
+# rows their family's test bundle. The `family` input selects the rows of one
+# family, including the workspaces under it (drivers selects drivers/podman);
+# leave it empty to run every row.
+
+name: E2E Suites
+
+on:
+  workflow_call:
+    inputs:
+      family:
+        description: Run only the rows of this family and the workspaces under it (for example conformance or drivers); empty runs every row
+        required: false
+        type: string
+        default: ""
+      source-sha:
+        description: Source revision of the prepared candidate artifacts
+        required: true
+        type: string
+      integration-inputs-artifact-id:
+        description: Immutable ID of the prepared integration inputs artifact
+        required: true
+        type: string
+      prebuilt:
+        description: Run the rows with this run's prebuilt tests instead of building them in every job; conformance rows take the openshell-conformance-x86_64-unknown-linux-musl artifact, other rows their family's openshell-e2e-bundle-<family>-x86_64-unknown-linux-musl artifact
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        description: Token used to push Nix builds, such as the test runner, to Cachix
+        required: false
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+# github.workflow is the caller's name here, so scope the group to this
+# workflow to avoid colliding with (and cancelling) the caller's other jobs.
+concurrency:
+  group: ${{ github.workflow }}-e2e-suites-${{ inputs.family }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The rows live here, in one place. Add an environment or a suite by adding a
+  # row; the runner needs no list of its own.
+  select:
+    name: Select E2E suites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.rows.outputs.matrix }}
+    steps:
+      - name: Select the rows to run
+        id: rows
+        env:
+          FAMILY: ${{ inputs.family }}
+        run: |
+          set -euo pipefail
+          # Only amd64 for now: CI has no arm64 runner with KVM for tmachine,
+          # and the caller only builds amd64 inputs. The gateway is the name the
+          # installer registers with the CLI: `openshell` for the packages,
+          # `tmachine` for the k3s and binaries installers. A row without a
+          # package runs every package in the workspace; each driver suite is a
+          # workspace of its own.
+          rows='[
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-k3s","installer":"k3s","family":"conformance","package":"conformance","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"conformance","package":"conformance","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful-cdi","installer":"deb","family":"features","package":"cdi","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-cdi","installer":"rpm","family":"features","package":"cdi","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-cdi","installer":"rpm","family":"features","package":"cdi","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful-keycloak","installer":"deb","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful","installer":"rpm","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless","installer":"rpm","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"host-gateway","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful","installer":"rpm","family":"features","package":"host-gateway","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless","installer":"rpm","family":"features","package":"host-gateway","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-k3s","installer":"k3s","family":"features","package":"host-gateway","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"features","package":"host-gateway","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-default","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-auto","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-default","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-auto","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"}
+          ]'
+          # `suite` names the row's tests in the job and artifact names.
+          matrix=$(jq -c --arg family "${FAMILY}" '{include: map(
+              select($family == "" or .family == $family or (.family | startswith($family + "/")))
+              | .package //= ""
+              | .suite = (if .package == "" then .family else "\(.family)/\(.package)" end)
+              | .artifact = ([.suite, .environment, .installer] | join("-") | gsub("/"; "-"))
+              | .bundle = "openshell-e2e-bundle-\(.family | gsub("/"; "-"))-x86_64-unknown-linux-musl"
+            )}' <<< "$rows")
+          if [ "$(jq '.include | length' <<< "$matrix")" -eq 0 ]; then
+            echo "::error::No E2E suites match family '${FAMILY}'"
+            exit 1
+          fi
+          echo "$matrix"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  suites:
+    name: E2E suites (${{ matrix.suite }}, ${{ matrix.environment }}, ${{ matrix.installer }})
+    needs: select
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['source-sha'] }}
+          persist-credentials: false
+
+      - name: Enable KVM access
+        run: |
+          set -euo pipefail
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::The runner did not expose /dev/kvm"
+            exit 1
+          fi
+          sudo chmod 0666 /dev/kvm
+          exec 3<>/dev/kvm
+          exec 3>&-
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      # integration-runner.yml skips the disk cache for ubuntu-k3s and doesn't say
+      # why, so the k3s environment skips it here too until that is understood.
+      - name: Cache tmachine disks
+        if: matrix.environment != 'ubuntu-k3s'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/tmachine
+          # tmachine keys its disk layers on a hash of the Ansible tree, the
+          # environments' playbook lists and setup inputs (config.nix, and
+          # files such as the Keycloak realm file) and the cache versions in
+          # setup.rs and install.rs. actions/cache doesn't save after an
+          # exact key hit, so a key that misses one of those would rebuild the
+          # changed layers on every run. Environments share no layers, and
+          # only the first job to save a key gets its disks in, so each
+          # environment and installer needs its own key. No restore-keys
+          # fallback: restoring an older entry would carry its stale disks
+          # into the new one, which then only grows.
+          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-${{ matrix.installer }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/config.nix', 'tests/tmachine/images.nix', 'tests/tmachine/src/qemu/setup.rs', 'tests/tmachine/src/qemu/install.rs', 'scripts/keycloak-realm.json') }}
+
+      - name: Download integration inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ inputs['integration-inputs-artifact-id'] }}
+          path: artifacts
+
+      # The program and the bundles are built once per run (see
+      # build-conformance and build-e2e-bundles in branch-e2e.yml), so the rows
+      # need not each build the suites.
+      - name: Download prebuilt openshell-conformance
+        if: inputs.prebuilt && matrix.family == 'conformance'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-conformance-x86_64-unknown-linux-musl
+          path: artifacts/prebuilt-conformance
+
+      - name: Download prebuilt test bundle
+        if: inputs.prebuilt && matrix.family != 'conformance'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.bundle }}
+          path: artifacts/prebuilt-bundle
+
+      - name: Run the suites in this environment
+        env:
+          PREBUILT: ${{ inputs.prebuilt }}
+          ENVIRONMENT: ${{ matrix.environment }}
+          INSTALLER: ${{ matrix.installer }}
+          FAMILY: ${{ matrix.family }}
+          PACKAGE: ${{ matrix.package }}
+          GATEWAY: ${{ matrix.gateway }}
+        run: |
+          # Retry dependency preparation, then run the suites once. Without
+          # prebuilt tests, the runner builds the suites for the guest, so it
+          # needs no prepared archives.
+          nix build --no-link .#openshell-test-runner || nix build --no-link .#openshell-test-runner
+          # A prebuilt program replaces the build, and so the package choice.
+          # A prebuilt bundle holds the whole family; the package selects the
+          # tests to run from it.
+          selection=()
+          if [ "${PREBUILT}" = "true" ] && [ "${FAMILY}" = "conformance" ]; then
+            program="artifacts/prebuilt-conformance/openshell-conformance"
+            chmod +x "${program}"
+            "${program}" list > /dev/null
+            selection=(--program "${program}")
+          else
+            if [ "${PREBUILT}" = "true" ]; then
+              selection=(--bundle artifacts/prebuilt-bundle)
+            fi
+            if [ -n "${PACKAGE}" ]; then
+              selection+=(--package "${PACKAGE}")
+            fi
+          fi
+          nix run .#openshell-test-runner -- run \
+            --environment "${ENVIRONMENT}" \
+            --installer "${INSTALLER}" \
+            --family "${FAMILY}" \
+            "${selection[@]}" \
+            --gateway "${GATEWAY}" \
+            --results artifacts/test-results
+
+      # The results directory holds the JUnit report (junit.xml), the nextest
+      # log, and the guest's diagnostics when the run failed. The log and the
+      # report are collected even when the run timed out.
+      # The runner exits with 1 when a test failed and 2 when the run could
+      # not complete.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-results-${{ matrix.artifact }}
+          path: artifacts/test-results
+          if-no-files-found: ignore
+          retention-days: 7
+
+  result:
+    name: E2E suites result
+    needs: [select, suites]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ toJSON(needs) }}

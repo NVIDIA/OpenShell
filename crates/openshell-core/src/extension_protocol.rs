@@ -12,6 +12,31 @@ use crate::proto::extension::v1::{PeerMetadata, ProtocolVersion};
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR: u32 = 0;
 
+/// Capability for compute drivers that require gateway-minted launch credentials.
+///
+/// Drivers require this capability when every launch needs a
+/// [`crate::jwt::SandboxLaunchAuthentication`] bundle. The gateway checks its
+/// configured signer before accepting sandbox creation.
+pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
+
+/// Driver stages operator-selected external isolation routes for the supervisor.
+pub const COMPUTE_ISOLATION_BACKEND: &str = "openshell.compute.isolation-backend";
+
+/// Driver implements `SuspendSandbox` and resuming through `StartSandbox`.
+pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
+
+/// Optional stopped-state workload configuration updates retaining the resource and storage.
+pub const COMPUTE_UPDATE_SANDBOX_CONFIGURATION: &str =
+    "openshell.compute.update-sandbox-configuration";
+
+/// Capability for supervisor middleware that implements HTTP hooks.
+///
+/// A service selects HTTP hooks for all of its HTTP bindings by
+/// listing this capability in `required_capabilities`. Peers that predate
+/// HTTP hooks do not support it, so they reject the service at
+/// `Describe` instead of calling the deprecated legacy HTTP hooks.
+pub const SUPERVISOR_MIDDLEWARE_HTTP_HOOKS: &str = "openshell.supervisor-middleware.http-hooks";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
@@ -57,15 +82,23 @@ pub struct NegotiatedExtension {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NegotiationError {
     #[error(
-        "{family} extension '{name}' did not provide protocol metadata; upgrade the extension to a version that supports OpenShell extension negotiation"
+        "{family} extension '{name}' did not provide protocol metadata; upgrade the extension to a version that supports OpenShell extension negotiation (expected {expected})"
     )]
-    MissingMetadata { family: &'static str, name: String },
+    MissingMetadata {
+        family: &'static str,
+        name: String,
+        expected: String,
+    },
     #[error(
         "gateway did not provide protocol metadata to {family} extension '{name}'; upgrade the gateway and extension together"
     )]
     MissingGatewayMetadata { family: &'static str, name: String },
-    #[error("{family} extension '{name}' did not provide a protocol version")]
-    MissingProtocolVersion { family: &'static str, name: String },
+    #[error("{family} extension '{name}' did not provide a protocol version (expected {expected})")]
+    MissingProtocolVersion {
+        family: &'static str,
+        name: String,
+        expected: String,
+    },
     #[error(
         "{family} extension '{name}' uses unsupported protocol {remote_major}.{remote_minor}; gateway supports {local_major}.{local_minor}"
     )]
@@ -103,6 +136,18 @@ pub enum NegotiationError {
 #[must_use]
 pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     let contract = family.contract_capability();
+    let mut supported_capabilities = vec![contract.clone()];
+    match family {
+        ExtensionFamily::Compute => {
+            supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+            supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
+            supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_CONFIGURATION.to_string());
+        }
+        ExtensionFamily::SupervisorMiddleware => {
+            supported_capabilities.push(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string());
+        }
+        ExtensionFamily::Credentials | ExtensionFamily::GatewayInterceptor => {}
+    }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {
             major: PROTOCOL_MAJOR,
@@ -110,7 +155,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
         }),
         implementation_name: "openshell/gateway".to_string(),
         implementation_version: crate::VERSION.to_string(),
-        supported_capabilities: vec![contract.clone()],
+        supported_capabilities,
         required_capabilities: vec![contract],
     }
 }
@@ -137,6 +182,35 @@ pub fn extension_metadata(
     }
 }
 
+/// Protocol version and base capability an extension of `family` must declare.
+fn expected_contract(gateway: &PeerMetadata) -> String {
+    format!(
+        "protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR} and capability {}",
+        gateway.required_capabilities.join(", ")
+    )
+}
+
+/// Extension metadata for supervisor middleware that implements HTTP hooks.
+///
+/// It supports and requires [`SUPERVISOR_MIDDLEWARE_HTTP_HOOKS`], so peers
+/// without HTTP hooks reject the service at `Describe`.
+#[must_use]
+pub fn http_hooks_middleware_metadata(
+    implementation_name: impl Into<String>,
+    implementation_version: impl Into<String>,
+) -> PeerMetadata {
+    let mut metadata = extension_metadata(
+        ExtensionFamily::SupervisorMiddleware,
+        implementation_name,
+        implementation_version,
+        [SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string()],
+    );
+    metadata
+        .required_capabilities
+        .push(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string());
+    metadata
+}
+
 pub fn negotiate(
     family: ExtensionFamily,
     configured_name: impl Into<String>,
@@ -144,21 +218,49 @@ pub fn negotiate(
     extension: Option<PeerMetadata>,
 ) -> Result<NegotiatedExtension, NegotiationError> {
     let configured_name = configured_name.into();
-    let family_name = family.as_str();
+    let metadata = negotiate_metadata(family.as_str(), &configured_name, gateway, extension)?;
+    let version = metadata
+        .protocol_version
+        .expect("validated protocol version");
+    Ok(NegotiatedExtension {
+        family,
+        configured_name,
+        implementation_name: metadata.implementation_name,
+        implementation_version: metadata.implementation_version,
+        protocol_major: version.major,
+        protocol_minor: version.minor,
+        supported_capabilities: metadata.supported_capabilities,
+        required_capabilities: metadata.required_capabilities,
+    })
+}
+
+/// Validate a versioned peer contract, including families owned by the supervisor.
+/// Both peers must advertise every capability required by the other peer.
+pub fn negotiate_metadata(
+    family_name: &'static str,
+    configured_name: impl Into<String>,
+    gateway: &PeerMetadata,
+    extension: Option<PeerMetadata>,
+) -> Result<PeerMetadata, NegotiationError> {
+    let configured_name = configured_name.into();
+    let expected = expected_contract(gateway);
     let extension = extension.ok_or_else(|| NegotiationError::MissingMetadata {
         family: family_name,
         name: configured_name.clone(),
+        expected: expected.clone(),
     })?;
     let version = extension.protocol_version.as_ref().ok_or_else(|| {
         NegotiationError::MissingProtocolVersion {
             family: family_name,
             name: configured_name.clone(),
+            expected: expected.clone(),
         }
     })?;
     let gateway_version = gateway.protocol_version.as_ref().ok_or_else(|| {
         NegotiationError::MissingProtocolVersion {
             family: family_name,
             name: "gateway".to_string(),
+            expected,
         }
     })?;
     if version.major != gateway_version.major {
@@ -234,13 +336,10 @@ pub fn negotiate(
         });
     }
 
-    Ok(NegotiatedExtension {
-        family,
-        configured_name,
+    Ok(PeerMetadata {
+        protocol_version: Some(*version),
         implementation_name: extension.implementation_name,
         implementation_version: extension.implementation_version,
-        protocol_major: version.major,
-        protocol_minor: version.minor,
         supported_capabilities: extension_supported.into_iter().collect(),
         required_capabilities: extension_required.into_iter().collect(),
     })
@@ -340,6 +439,23 @@ fn valid_capability(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn compute_gateway_advertises_both_optional_extensions() {
+        let gateway = gateway_metadata(ExtensionFamily::Compute);
+        assert!(
+            gateway
+                .supported_capabilities
+                .iter()
+                .any(|c| c == COMPUTE_ISOLATION_BACKEND)
+        );
+        assert!(
+            gateway
+                .supported_capabilities
+                .iter()
+                .any(|c| c == COMPUTE_UPDATE_SANDBOX_CONFIGURATION)
+        );
+    }
+
     fn compatible() -> (PeerMetadata, PeerMetadata) {
         let gateway = gateway_metadata(ExtensionFamily::Compute);
         let extension = extension_metadata(
@@ -390,10 +506,13 @@ mod tests {
     #[test]
     fn missing_metadata_and_major_skew_are_actionable() {
         let (gateway, mut extension) = compatible();
-        assert!(matches!(
-            negotiate(ExtensionFamily::Compute, "example", &gateway, None),
-            Err(NegotiationError::MissingMetadata { .. })
-        ));
+        let missing = negotiate(ExtensionFamily::Compute, "example", &gateway, None).unwrap_err();
+        assert!(matches!(missing, NegotiationError::MissingMetadata { .. }));
+        assert!(
+            missing
+                .to_string()
+                .contains("protocol 1.0 and capability openshell.compute.contract")
+        );
         extension.protocol_version.as_mut().unwrap().major = 2;
         assert!(matches!(
             negotiate(
@@ -404,6 +523,69 @@ mod tests {
             ),
             Err(NegotiationError::IncompatibleProtocol { .. })
         ));
+    }
+
+    #[test]
+    fn missing_protocol_version_names_the_expected_contract() {
+        let (gateway, mut extension) = compatible();
+        extension.protocol_version = None;
+        let error = negotiate(
+            ExtensionFamily::Compute,
+            "example",
+            &gateway,
+            Some(extension),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NegotiationError::MissingProtocolVersion { .. }
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("protocol 1.0 and capability openshell.compute.contract")
+        );
+    }
+
+    #[test]
+    fn http_hooks_middleware_requires_a_peer_with_http_hooks() {
+        let middleware = http_hooks_middleware_metadata("example/guard", "test");
+        let gateway = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
+        let negotiated = negotiate(
+            ExtensionFamily::SupervisorMiddleware,
+            "example/guard",
+            &gateway,
+            Some(middleware.clone()),
+        )
+        .expect("a peer with HTTP hooks accepts the service");
+        assert!(
+            negotiated
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_HOOKS)
+        );
+
+        // A peer that predates HTTP hooks advertises only the
+        // contract capability.
+        let mut older = gateway;
+        older
+            .supported_capabilities
+            .retain(|capability| capability != SUPERVISOR_MIDDLEWARE_HTTP_HOOKS);
+        let error = negotiate(
+            ExtensionFamily::SupervisorMiddleware,
+            "example/guard",
+            &older,
+            Some(middleware),
+        )
+        .expect_err("a peer without HTTP hooks rejects the service");
+        assert!(matches!(
+            error,
+            NegotiationError::MissingGatewayCapabilities { .. }
+        ));
+        assert!(
+            error.to_string().contains(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS),
+            "{error}"
+        );
     }
 
     #[test]

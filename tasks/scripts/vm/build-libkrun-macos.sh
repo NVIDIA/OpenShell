@@ -33,7 +33,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 # Source pinned dependency versions.
-source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
+source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env"
 
 BUILD_DIR="${ROOT}/target/libkrun-build"
 OUTPUT_DIR="${BUILD_DIR}"
@@ -152,9 +152,6 @@ cp "${OUTPUT_DIR}/libkrunfw.${ABI_VERSION}.dylib" "${OUTPUT_DIR}/libkrunfw.dylib
 echo "    Built: libkrunfw.${ABI_VERSION}.dylib ($(du -sh "${OUTPUT_DIR}/libkrunfw.${ABI_VERSION}.dylib" | cut -f1))"
 
 # ── Clone libkrun ───────────────────────────────────────────────────────
-
-# LIBKRUN_REF is sourced from pins.env; env-var override still works.
-LIBKRUN_REF="${LIBKRUN_REF:-728df8125077d0db44265f6e997c72b81b65c015}"
 
 if [ ! -d libkrun ]; then
     echo "==> Cloning libkrun..."

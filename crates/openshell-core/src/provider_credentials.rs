@@ -3,7 +3,7 @@
 
 //! Runtime provider credential snapshots.
 
-use crate::secrets::SecretResolver;
+use crate::secrets::{CredentialPlacement, SecretResolver};
 use crate::{
     endpoint_path::EndpointPathPattern,
     host_pattern::HostPattern,
@@ -54,6 +54,9 @@ struct ProviderCredentialStateInner {
     body_inventory_available: bool,
     known_body_keys: HashSet<String>,
     static_credential_identity_epochs: HashMap<String, StaticCredentialIdentityEpoch>,
+    // Revocation must retain this requirement so retrying against a downgraded
+    // gateway cannot silently publish revision-scoped replacements.
+    requires_stable_placeholders: bool,
 }
 
 #[derive(Debug)]
@@ -64,6 +67,7 @@ struct StaticCredentialIdentityEpoch {
 
 #[derive(Debug, Clone)]
 struct CompiledStaticCredentialBinding {
+    placement: CredentialPlacement,
     endpoints: Vec<CompiledStaticCredentialEndpointBinding>,
     credential_identity: String,
     workload_credential_handle: String,
@@ -94,6 +98,29 @@ impl fmt::Display for StaticCredentialBindingError {
 
 impl std::error::Error for StaticCredentialBindingError {}
 
+/// Reserved entries in the existing credential map carry static placement only.
+pub const STATIC_CREDENTIAL_METADATA_PREFIX: &str = "static-env:";
+
+const CREDENTIAL_PATH_SLOT: &str = "{credential}";
+
+fn split_static_credential_metadata(
+    credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+) -> (
+    HashMap<String, crate::proto::ProviderProfileCredential>,
+    HashMap<String, crate::proto::ProviderProfileCredential>,
+) {
+    let mut metadata = HashMap::new();
+    let mut grants = HashMap::new();
+    for (key, credential) in credentials {
+        if let Some(env_key) = key.strip_prefix(STATIC_CREDENTIAL_METADATA_PREFIX) {
+            metadata.insert(env_key.to_string(), credential);
+        } else {
+            grants.insert(key, credential);
+        }
+    }
+    (metadata, grants)
+}
+
 impl ProviderCredentialState {
     pub fn from_environment(
         revision: u64,
@@ -101,6 +128,7 @@ impl ProviderCredentialState {
         credential_expires_at_ms: HashMap<String, i64>,
         dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     ) -> Self {
+        let (_, dynamic_credentials) = split_static_credential_metadata(dynamic_credentials);
         let (child_env, generation_resolver, current_resolver) =
             SecretResolver::from_provider_env_for_current_revision(
                 env,
@@ -131,6 +159,7 @@ impl ProviderCredentialState {
                 known_body_keys: snapshot.child_env.keys().cloned().collect(),
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
+                requires_stable_placeholders: false,
             })),
         }
     }
@@ -143,10 +172,40 @@ impl ProviderCredentialState {
         static_credential_bindings: HashMap<String, StaticCredentialBinding>,
         non_secret_environment_keys: Vec<String>,
     ) -> Result<Self, StaticCredentialBindingError> {
+        Self::from_bound_environment_with_stable_placeholders(
+            revision,
+            env,
+            credential_expires_at_ms,
+            dynamic_credentials,
+            static_credential_bindings,
+            non_secret_environment_keys,
+            Vec::new(),
+        )
+    }
+
+    /// Build provider state with explicitly declared stable placeholders.
+    ///
+    /// Stable placeholders are accepted only for environment keys that have a
+    /// complete static endpoint binding and an opaque identity-bound handle.
+    /// The endpoint-scoped resolver still applies the binding before resolving
+    /// that handle.
+    pub fn from_bound_environment_with_stable_placeholders(
+        revision: u64,
+        env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
+        dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+        static_credential_bindings: HashMap<String, StaticCredentialBinding>,
+        non_secret_environment_keys: Vec<String>,
+        stable_placeholder_environment_keys: Vec<String>,
+    ) -> Result<Self, StaticCredentialBindingError> {
+        let (placement_metadata, dynamic_credentials) =
+            split_static_credential_metadata(dynamic_credentials);
         let static_credential_bindings = compile_static_credential_bindings(
             &env,
             static_credential_bindings,
             &non_secret_environment_keys,
+            &stable_placeholder_environment_keys,
+            &placement_metadata,
         )?;
         let stable_handles = static_credential_stable_handles(&static_credential_bindings);
         let (child_env, generation_resolver, current_resolver) =
@@ -187,6 +246,7 @@ impl ProviderCredentialState {
                 known_body_keys: snapshot.child_env.keys().cloned().collect(),
                 known_static_credential_keys,
                 static_credential_identity_epochs,
+                requires_stable_placeholders: !stable_placeholder_environment_keys.is_empty(),
             })),
         })
     }
@@ -221,6 +281,7 @@ impl ProviderCredentialState {
                 known_body_keys: snapshot.child_env.keys().cloned().collect(),
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
+                requires_stable_placeholders: false,
             })),
         }
     }
@@ -271,11 +332,21 @@ impl ProviderCredentialState {
     }
 
     pub fn resolver(&self) -> Option<Arc<SecretResolver>> {
-        self.inner
+        let inner = self
+            .inner
             .read()
-            .expect("provider credential state poisoned")
-            .combined_resolver
-            .clone()
+            .expect("provider credential state poisoned");
+        inner.combined_resolver.as_ref().map(|resolver| {
+            Arc::new(
+                resolver.as_ref().clone().with_placements(
+                    inner
+                        .static_credential_bindings
+                        .iter()
+                        .map(|(key, binding)| (key.clone(), binding.placement.clone()))
+                        .collect(),
+                ),
+            )
+        })
     }
 
     /// Resolve provider placeholders only for credentials bound to this
@@ -381,11 +452,23 @@ impl ProviderCredentialState {
                 })
                 .map(|(key, epoch)| (key.clone(), epoch.revisions.clone()))
                 .collect();
-            Arc::new(resolver.scoped_to_env_keys(
-                &inner.known_static_credential_keys,
-                &allowed,
-                revision_fallback_allowed_revisions,
-            ))
+            Arc::new(
+                resolver
+                    .as_ref()
+                    .clone()
+                    .with_placements(
+                        inner
+                            .static_credential_bindings
+                            .iter()
+                            .map(|(key, binding)| (key.clone(), binding.placement.clone()))
+                            .collect(),
+                    )
+                    .scoped_to_env_keys(
+                        &inner.known_static_credential_keys,
+                        &allowed,
+                        revision_fallback_allowed_revisions,
+                    ),
+            )
         });
         (resolver, classifier, revision)
     }
@@ -397,6 +480,28 @@ impl ProviderCredentialState {
             .expect("provider credential state poisoned")
             .current
             .revision
+    }
+
+    /// Whether the last installed snapshot requires external stable delivery.
+    /// Failed refreshes preserve this requirement until a successful bound install.
+    #[must_use]
+    pub fn requires_stable_placeholders(&self) -> bool {
+        self.inner
+            .read()
+            .expect("provider credential state poisoned")
+            .requires_stable_placeholders
+    }
+
+    /// Whether this snapshot contains endpoint-bound material that must be
+    /// resolved by a network proxy rather than exposed to the child process.
+    #[must_use]
+    pub fn requires_proxy_resolution(&self) -> bool {
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        !inner.static_credential_bindings.is_empty()
+            || !inner.current.dynamic_credentials.is_empty()
     }
 
     /// Remove a key from the credential snapshot's child env.
@@ -573,6 +678,26 @@ impl ProviderCredentialState {
         Ok(revision)
     }
 
+    /// Read current provider configuration only when explicitly classified non-secret.
+    ///
+    /// Local metadata adapters must not unwrap credential values just because their
+    /// environment names match a conventional configuration key.
+    pub fn current_non_secret_environment_value(&self, key: &str) -> Option<String> {
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        if !inner.non_secret_environment_keys.contains(key) {
+            return None;
+        }
+        let placeholder = inner.current.child_env.get(key)?;
+        inner
+            .current_resolver
+            .as_ref()?
+            .resolve_placeholder(placeholder)
+            .map(str::to_string)
+    }
+
     /// Return the GCP token placeholder and its remaining lifetime in seconds.
     ///
     /// Searches `google_cloud::TOKEN_ENV_KEYS` in priority order (SA before
@@ -619,6 +744,7 @@ impl ProviderCredentialState {
         credential_expires_at_ms: HashMap<String, i64>,
         dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     ) -> usize {
+        let (_, dynamic_credentials) = split_static_credential_metadata(dynamic_credentials);
         let (mut child_env, generation_resolver, current_resolver) =
             SecretResolver::from_provider_env_for_current_revision(
                 env,
@@ -672,10 +798,41 @@ impl ProviderCredentialState {
         static_credential_bindings: HashMap<String, StaticCredentialBinding>,
         non_secret_environment_keys: Vec<String>,
     ) -> Result<usize, StaticCredentialBindingError> {
+        self.install_bound_environment_with_stable_placeholders(
+            revision,
+            env,
+            credential_expires_at_ms,
+            dynamic_credentials,
+            static_credential_bindings,
+            non_secret_environment_keys,
+            Vec::new(),
+        )
+    }
+
+    /// Install one provider snapshot and its opt-in stable handles.
+    ///
+    /// Metadata validation happens before the live resolver is replaced. Any
+    /// invalid metadata revokes static material and leaves dynamic grants
+    /// available through the existing fail-closed refresh path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_bound_environment_with_stable_placeholders(
+        &self,
+        revision: u64,
+        env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
+        dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+        static_credential_bindings: HashMap<String, StaticCredentialBinding>,
+        non_secret_environment_keys: Vec<String>,
+        stable_placeholder_environment_keys: Vec<String>,
+    ) -> Result<usize, StaticCredentialBindingError> {
+        let (placement_metadata, dynamic_credentials) =
+            split_static_credential_metadata(dynamic_credentials);
         let static_credential_bindings = match compile_static_credential_bindings(
             &env,
             static_credential_bindings,
             &non_secret_environment_keys,
+            &stable_placeholder_environment_keys,
+            &placement_metadata,
         ) {
             Ok(bindings) => bindings,
             Err(error) => {
@@ -733,6 +890,7 @@ impl ProviderCredentialState {
         );
         inner.non_secret_environment_keys = non_secret_environment_keys.into_iter().collect();
         inner.static_credential_bindings = static_credential_bindings;
+        inner.requires_stable_placeholders = !stable_placeholder_environment_keys.is_empty();
         Ok(inner.current.child_env.len())
     }
 
@@ -745,7 +903,15 @@ impl ProviderCredentialState {
     pub fn install_prepared(&self, prepared: &Self) -> usize {
         // Release the candidate lock before taking the live lock, including
         // when a caller passes another handle to the same state.
-        let (snapshot, generations, current_resolver, bindings, non_secret_keys, files) = {
+        let (
+            snapshot,
+            generations,
+            current_resolver,
+            bindings,
+            non_secret_keys,
+            files,
+            requires_stable_placeholders,
+        ) = {
             let candidate = prepared
                 .inner
                 .read()
@@ -757,6 +923,7 @@ impl ProviderCredentialState {
                 candidate.static_credential_bindings.clone(),
                 candidate.non_secret_environment_keys.clone(),
                 candidate.files.clone(),
+                candidate.requires_stable_placeholders,
             )
         };
         let mut inner = self
@@ -790,6 +957,10 @@ impl ProviderCredentialState {
         inner.static_credential_bindings = bindings;
         inner.non_secret_environment_keys = non_secret_keys;
         inner.files = files;
+        // Prepared installation is the refresh commit point. Carry its
+        // acknowledged delivery requirement into later fetches, including
+        // failures that revoke credentials without removing the requirement.
+        inner.requires_stable_placeholders = requires_stable_placeholders;
         inner.body_inventory_available = true;
         inner
             .known_body_keys
@@ -822,6 +993,7 @@ impl ProviderCredentialState {
             .expect("provider credential state poisoned");
         let dynamic_credentials =
             dynamic_credentials.unwrap_or_else(|| inner.current.dynamic_credentials.clone());
+        let (_, dynamic_credentials) = split_static_credential_metadata(dynamic_credentials);
         inner.current = Arc::new(ProviderCredentialSnapshot {
             installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
@@ -841,7 +1013,23 @@ fn compile_static_credential_bindings(
     env: &HashMap<String, String>,
     bindings: HashMap<String, StaticCredentialBinding>,
     non_secret_environment_keys: &[String],
+    stable_placeholder_environment_keys: &[String],
+    placement_metadata: &HashMap<String, crate::proto::ProviderProfileCredential>,
 ) -> Result<HashMap<String, CompiledStaticCredentialBinding>, StaticCredentialBindingError> {
+    for (key, metadata) in placement_metadata {
+        if !env.contains_key(key)
+            || !bindings.contains_key(key)
+            || metadata.env_vars.len() != 1
+            || metadata.env_vars[0] != *key
+            || metadata.token_grant.is_some()
+            || metadata.refresh.is_some()
+            || !metadata.token_grant_owners.is_empty()
+        {
+            return Err(binding_error(
+                "static credential placement metadata does not match delivered credentials",
+            ));
+        }
+    }
     let non_secret_keys = non_secret_environment_keys
         .iter()
         .cloned()
@@ -849,6 +1037,40 @@ fn compile_static_credential_bindings(
     if non_secret_keys.len() != non_secret_environment_keys.len() {
         return Err(binding_error(
             "provider environment repeats a non-secret environment key",
+        ));
+    }
+    let stable_placeholder_keys = stable_placeholder_environment_keys
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    if stable_placeholder_keys.len() != stable_placeholder_environment_keys.len() {
+        return Err(binding_error(
+            "provider environment repeats a stable placeholder environment key",
+        ));
+    }
+    if stable_placeholder_keys
+        .iter()
+        .any(|key| non_secret_keys.contains(key))
+    {
+        return Err(binding_error(
+            "provider environment classifies a stable placeholder key as non-secret configuration",
+        ));
+    }
+    if stable_placeholder_keys
+        .iter()
+        .any(|key| !bindings.contains_key(key))
+    {
+        return Err(binding_error(
+            "stable placeholder environment key has no static credential binding",
+        ));
+    }
+    if stable_placeholder_keys.iter().any(|key| {
+        bindings
+            .get(key)
+            .is_some_and(|binding| binding.workload_credential_handle.is_empty())
+    }) {
+        return Err(binding_error(
+            "stable placeholder environment key has no identity-bound handle",
         ));
     }
     if bindings.keys().any(|key| non_secret_keys.contains(key)) {
@@ -866,6 +1088,9 @@ fn compile_static_credential_bindings(
     }
     if bindings.keys().any(|key| !env.contains_key(key))
         || non_secret_keys.iter().any(|key| !env.contains_key(key))
+        || stable_placeholder_keys
+            .iter()
+            .any(|key| !env.contains_key(key))
     {
         return Err(binding_error(
             "provider environment metadata references a missing environment key",
@@ -901,6 +1126,10 @@ fn compile_static_credential_bindings(
     bindings
         .into_iter()
         .map(|(key, binding)| {
+            let placement = placement_metadata.get(&key).map_or_else(
+                || Ok(CredentialPlacement::Header("authorization".into())),
+                compile_credential_placement,
+            )?;
             let endpoints = binding
                 .endpoints
                 .into_iter()
@@ -910,12 +1139,59 @@ fn compile_static_credential_bindings(
                 key,
                 CompiledStaticCredentialBinding {
                     endpoints,
+                    placement,
                     credential_identity: binding.credential_identity,
                     workload_credential_handle: binding.workload_credential_handle,
                 },
             ))
         })
         .collect()
+}
+
+fn compile_credential_placement(
+    metadata: &crate::proto::ProviderProfileCredential,
+) -> Result<CredentialPlacement, StaticCredentialBindingError> {
+    let style = metadata.auth_style.trim().to_ascii_lowercase();
+    // Authored profiles may retain fields for other auth styles. Only the
+    // selected style grants a location; unused fields grant no authority.
+    let placement = match style.as_str() {
+        "basic" => CredentialPlacement::Header("authorization".into()),
+        "header" | "bearer"
+            if !metadata.header_name.trim().is_empty()
+                && metadata
+                    .header_name
+                    .trim()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)) =>
+        {
+            CredentialPlacement::Header(metadata.header_name.trim().to_ascii_lowercase())
+        }
+        "query"
+            if !metadata.query_param.trim().is_empty()
+                && !metadata
+                    .query_param
+                    .chars()
+                    .any(|c| c.is_control() || "&=#?".contains(c)) =>
+        {
+            CredentialPlacement::QueryParam(metadata.query_param.trim().to_string())
+        }
+        "path"
+            if metadata.path_template.starts_with('/')
+                && metadata.path_template.matches(CREDENTIAL_PATH_SLOT).count() == 1
+                && !metadata
+                    .path_template
+                    .chars()
+                    .any(|c| c.is_control() || "?#".contains(c)) =>
+        {
+            CredentialPlacement::PathTemplate(metadata.path_template.clone())
+        }
+        _ => {
+            return Err(binding_error(
+                "static credential placement metadata has an invalid request location",
+            ));
+        }
+    };
+    Ok(placement)
 }
 
 fn compile_static_credential_endpoint(
@@ -1026,6 +1302,15 @@ fn merge_resolvers(
 mod tests {
     use super::*;
     use crate::google_cloud;
+
+    fn jwt_alias(placeholder: &str) -> String {
+        // Claims are irrelevant to injection authority: retain the exact issued
+        // identity in the signature while giving clients a parseable JWT envelope.
+        let suffix = placeholder
+            .strip_prefix("openshell:resolve:env:")
+            .expect("issued placeholder");
+        format!("e30.e30.OPENSHELL-RESOLVE-ENV-{suffix}")
+    }
 
     #[test]
     fn body_classification_distinguishes_literal_foreign_bound_and_revoked() {
@@ -1182,6 +1467,10 @@ mod tests {
         );
     }
 
+    fn authorization_location() -> crate::secrets::RequestCredentialLocation {
+        crate::secrets::RequestCredentialLocation::Header("Authorization".into())
+    }
+
     fn binding(host: &str, port: u32, path: &str) -> StaticCredentialBinding {
         StaticCredentialBinding {
             endpoints: vec![StaticCredentialEndpointBinding {
@@ -1201,15 +1490,336 @@ mod tests {
         binding
     }
 
+    fn placement_metadata(style: &str) -> HashMap<String, crate::proto::ProviderProfileCredential> {
+        HashMap::from([(
+            format!("{STATIC_CREDENTIAL_METADATA_PREFIX}API_KEY"),
+            crate::proto::ProviderProfileCredential {
+                name: "api_key".into(),
+                env_vars: vec!["API_KEY".into()],
+                auth_style: style.into(),
+                header_name: if matches!(style, "header" | "bearer" | "basic") {
+                    "Authorization".into()
+                } else {
+                    String::new()
+                },
+                query_param: if style == "query" {
+                    "api_key".into()
+                } else {
+                    String::new()
+                },
+                path_template: if style == "path" {
+                    "/v1/{credential}/events".into()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            },
+        )])
+    }
+
+    #[test]
+    fn metadata_free_static_binding_defaults_to_authorization_across_rotation() {
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([("API_KEY".into(), "initial".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+            vec![],
+        )
+        .unwrap();
+        let reference = state.snapshot().child_env["API_KEY"].clone();
+        for revision in [7, 8] {
+            if revision == 8 {
+                state
+                    .install_bound_environment(
+                        revision,
+                        HashMap::from([("API_KEY".into(), "rotated".into())]),
+                        HashMap::new(),
+                        HashMap::new(),
+                        HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+                        vec![],
+                    )
+                    .unwrap();
+            }
+            let resolver = state
+                .resolver_for_endpoint("api.example.com", 443, "/search")
+                .unwrap();
+            assert!(resolver.resolve_placeholder(&reference).is_none());
+            for token in [
+                reference.clone(),
+                format!("vendor-OPENSHELL-RESOLVE-ENV-v{revision}_API_KEY"),
+                jwt_alias(&reference),
+            ] {
+                assert!(
+                    resolver
+                        .rewrite_header_value_for_name("Authorization", &format!("Bearer {token}"))
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    resolver
+                        .rewrite_header_value_for_name("X-Reflect", &token)
+                        .unwrap_err()
+                        .is_placement_mismatch()
+                );
+                for target in [format!("/search?token={token}"), format!("/api/{token}")] {
+                    assert!(crate::secrets::rewrite_target_for_eval(&target, &resolver).is_err());
+                }
+            }
+            let current = &state.snapshot().child_env["API_KEY"];
+            assert_eq!(
+                resolver
+                    .rewrite_header_value_for_name("Authorization", current)
+                    .unwrap(),
+                Some(if revision == 7 { "initial" } else { "rotated" }.into())
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_custom_header_overrides_authorization_default() {
+        let mut metadata = placement_metadata("header");
+        metadata.values_mut().next().unwrap().header_name = "x-api-key".into();
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([("API_KEY".into(), "synthetic".into())]),
+            HashMap::new(),
+            metadata,
+            HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+            vec![],
+        )
+        .unwrap();
+        let reference = state.snapshot().child_env["API_KEY"].clone();
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 443, "/search")
+            .unwrap();
+        assert_eq!(
+            resolver
+                .rewrite_header_value_for_name("X-Api-Key", &reference)
+                .unwrap(),
+            Some("synthetic".into())
+        );
+        assert!(
+            resolver
+                .rewrite_header_value_for_name("Authorization", &reference)
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
+    }
+
+    #[test]
+    fn static_metadata_selects_one_location_and_preserves_other_providers() {
+        for style in ["bearer", "header", "basic", "query", "path"] {
+            let env = HashMap::from([
+                ("API_KEY".into(), "synthetic".into()),
+                ("OTHER_KEY".into(), "other-secret".into()),
+            ]);
+            let mut other_binding = binding("other.example.com", 443, "/**");
+            other_binding.credential_identity = "provider-b:OTHER_KEY".into();
+            let bindings = HashMap::from([
+                ("API_KEY".into(), binding("api.example.com", 443, "/**")),
+                ("OTHER_KEY".into(), other_binding),
+            ]);
+            let state = ProviderCredentialState::from_bound_environment(
+                7,
+                env.clone(),
+                HashMap::new(),
+                HashMap::new(),
+                bindings.clone(),
+                vec![],
+            )
+            .unwrap();
+            // Older documented profiles populated all three placement fields.
+            // Only auth_style's selected field may grant request authority.
+            let mut metadata = placement_metadata(style);
+            let declaration = metadata.values_mut().next().unwrap();
+            declaration.header_name = if style == "basic" {
+                "x-unused-for-basic"
+            } else {
+                "Authorization"
+            }
+            .into();
+            declaration.query_param = "api_key".into();
+            declaration.path_template = "/v1/{credential}/events".into();
+            assert_eq!(
+                state
+                    .install_bound_environment(8, env, HashMap::new(), metadata, bindings, vec![])
+                    .unwrap(),
+                2
+            );
+            assert!(state.snapshot().dynamic_credentials.is_empty());
+            assert_eq!(
+                state
+                    .resolver_for_endpoint("other.example.com", 443, "/")
+                    .unwrap()
+                    .rewrite_header_value_for_name(
+                        "Authorization",
+                        &state.snapshot().child_env["OTHER_KEY"],
+                    )
+                    .unwrap(),
+                Some("other-secret".into())
+            );
+            let reference = state.snapshot().child_env["API_KEY"].clone();
+            let resolver = state
+                .resolver_for_endpoint("api.example.com", 443, "/v1/chat")
+                .unwrap();
+            assert!(
+                resolver
+                    .rewrite_header_value_for_name("X-Reflect", &reference)
+                    .is_err()
+            );
+            let header = resolver.rewrite_header_value_for_name("Authorization", &reference);
+            let query = crate::secrets::rewrite_target_for_eval(
+                &format!("/v1/chat?api_key={reference}"),
+                &resolver,
+            );
+            let path = crate::secrets::rewrite_target_for_eval(
+                &format!("/v1/{reference}/events"),
+                &resolver,
+            );
+            assert_eq!(
+                header.is_ok(),
+                matches!(style, "bearer" | "header" | "basic")
+            );
+            assert_eq!(query.is_ok(), style == "query");
+            assert_eq!(path.is_ok(), style == "path");
+        }
+    }
+
+    #[test]
+    fn malformed_static_metadata_revokes_static_material_and_preserves_real_grants() {
+        for malformed in 0..11 {
+            let state = ProviderCredentialState::from_bound_environment(
+                7,
+                HashMap::from([("API_KEY".into(), "synthetic".into())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+                vec![],
+            )
+            .unwrap();
+            let mut metadata = placement_metadata("header");
+            let key = format!("{STATIC_CREDENTIAL_METADATA_PREFIX}API_KEY");
+            let value = metadata.get_mut(&key).unwrap();
+            match malformed {
+                0 => value.env_vars = vec!["OTHER".into()],
+                1 => {
+                    value.token_grant = Some(crate::proto::ProviderCredentialTokenGrant::default());
+                }
+                2 => value.refresh = Some(crate::proto::ProviderCredentialRefresh::default()),
+                3 => value.token_grant_owners = vec!["owner".into()],
+                4 => value.auth_style = "unsupported".into(),
+                5 => {
+                    let value = metadata.remove(&key).unwrap();
+                    metadata.insert(format!("{STATIC_CREDENTIAL_METADATA_PREFIX}OTHER"), value);
+                }
+                6 => value.header_name.clear(),
+                7 => value.header_name = "Bad Header".into(),
+                8 => {
+                    value.auth_style = "path".into();
+                    value.header_name.clear();
+                    value.path_template = "/no-slot".into();
+                }
+                9 => {
+                    value.auth_style = "query".into();
+                    value.query_param = "api?key".into();
+                }
+                10 => value.auth_style.clear(),
+                _ => unreachable!(),
+            }
+            metadata.insert(
+                "real-grant".into(),
+                crate::proto::ProviderProfileCredential {
+                    token_grant: Some(crate::proto::ProviderCredentialTokenGrant::default()),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                state
+                    .install_bound_environment(
+                        8,
+                        HashMap::from([("API_KEY".into(), "replacement".into())]),
+                        HashMap::new(),
+                        metadata,
+                        HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+                        vec![],
+                    )
+                    .is_err()
+            );
+            assert!(state.snapshot().child_env.is_empty());
+            assert_eq!(state.snapshot().dynamic_credentials.len(), 1);
+            assert!(
+                state
+                    .snapshot()
+                    .dynamic_credentials
+                    .contains_key("real-grant")
+            );
+        }
+    }
+
+    #[test]
+    fn stable_references_survive_metadata_arrival_and_use_the_current_location() {
+        let handle = "a".repeat(64);
+        let bindings = HashMap::from([(
+            "API_KEY".into(),
+            stable_binding("api.example.com", 443, "/**", &handle),
+        )]);
+        let state = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+            7,
+            HashMap::from([("API_KEY".into(), "synthetic".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            bindings.clone(),
+            vec![],
+            vec!["API_KEY".into()],
+        )
+        .unwrap();
+        let reference = state.snapshot().child_env["API_KEY"].clone();
+        for style in [None, Some("header"), Some("query"), None] {
+            state
+                .install_bound_environment_with_stable_placeholders(
+                    8,
+                    HashMap::from([("API_KEY".into(), "synthetic".into())]),
+                    HashMap::new(),
+                    style.map_or_else(HashMap::new, placement_metadata),
+                    bindings.clone(),
+                    vec![],
+                    vec!["API_KEY".into()],
+                )
+                .unwrap();
+            assert_eq!(state.snapshot().child_env["API_KEY"], reference);
+            let resolver = state
+                .resolver_for_endpoint("api.example.com", 443, "/v1/chat")
+                .unwrap();
+            let query = crate::secrets::rewrite_target_for_eval(
+                &format!("/v1/chat?api_key={reference}"),
+                &resolver,
+            );
+            assert_eq!(query.is_ok(), style == Some("query"));
+            assert_eq!(
+                resolver
+                    .rewrite_header_value_for_name("Authorization", &reference)
+                    .is_ok(),
+                style != Some("query")
+            );
+        }
+    }
+
     fn assert_binding_validation_error(
         env: HashMap<String, String>,
         bindings: HashMap<String, StaticCredentialBinding>,
         non_secret_environment_keys: Vec<String>,
         expected: &str,
     ) {
-        let error =
-            compile_static_credential_bindings(&env, bindings, &non_secret_environment_keys)
-                .expect_err("malformed provider metadata must fail validation");
+        let error = compile_static_credential_bindings(
+            &env,
+            bindings,
+            &non_secret_environment_keys,
+            &[],
+            &HashMap::new(),
+        )
+        .expect_err("malformed provider metadata must fail validation");
         assert_eq!(error.to_string(), expected);
     }
 
@@ -1308,7 +1918,12 @@ mod tests {
         let allowed = state
             .resolver_for_endpoint("api.example.com", 443, "/v1/messages?stream=true")
             .expect("resolver");
-        assert_eq!(allowed.resolve_placeholder(placeholder), Some("secret"));
+        assert_eq!(
+            allowed
+                .with_request_location(authorization_location())
+                .resolve_placeholder(placeholder),
+            Some("secret")
+        );
 
         for (host, port, path) in [
             ("example.com", 443, "/v1/messages"),
@@ -1319,10 +1934,384 @@ mod tests {
                 .resolver_for_endpoint(host, port, path)
                 .expect("resolver");
             let error = denied
-                .rewrite_header_value(placeholder)
+                .rewrite_header_value_for_name("Authorization", placeholder)
                 .expect_err("endpoint mismatch must fail closed");
             assert!(error.is_endpoint_mismatch(), "{host}:{port}{path}");
         }
+    }
+
+    #[test]
+    fn stable_placeholder_uses_identity_bound_handle_and_tracks_value_updates() {
+        let handle = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stable_assertion_binding = stable_binding("tools.example.com", 443, "/mcp/**", handle);
+        let state = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+            1,
+            HashMap::from([
+                ("EXTERNAL_ASSERTION".to_string(), "old".to_string()),
+                ("ORDINARY_TOKEN".to_string(), "ordinary".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (
+                    "EXTERNAL_ASSERTION".to_string(),
+                    stable_assertion_binding.clone(),
+                ),
+                (
+                    "ORDINARY_TOKEN".to_string(),
+                    binding("tools.example.com", 443, "/mcp/**"),
+                ),
+            ]),
+            Vec::new(),
+            vec!["EXTERNAL_ASSERTION".to_string()],
+        )
+        .expect("stable placeholder binding");
+
+        let stable_placeholder = state.snapshot().child_env["EXTERNAL_ASSERTION"].clone();
+        assert!(stable_placeholder.contains(handle));
+        let resolver = state
+            .resolver_for_endpoint("tools.example.com", 443, "/mcp/local")
+            .expect("endpoint resolver");
+        assert_eq!(
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&stable_placeholder),
+            Some("old")
+        );
+        assert_eq!(
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:ORDINARY_TOKEN"),
+            None,
+            "ordinary endpoint-bound credentials remain revision scoped"
+        );
+        assert_eq!(
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_ORDINARY_TOKEN"),
+            Some("ordinary")
+        );
+
+        state
+            .install_bound_environment_with_stable_placeholders(
+                2,
+                HashMap::from([
+                    ("EXTERNAL_ASSERTION".to_string(), "new".to_string()),
+                    ("ORDINARY_TOKEN".to_string(), "ordinary-new".to_string()),
+                ]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([
+                    ("EXTERNAL_ASSERTION".to_string(), stable_assertion_binding),
+                    (
+                        "ORDINARY_TOKEN".to_string(),
+                        binding("tools.example.com", 443, "/mcp/**"),
+                    ),
+                ]),
+                Vec::new(),
+                vec!["EXTERNAL_ASSERTION".to_string()],
+            )
+            .expect("stable placeholder refresh");
+        let refreshed = state
+            .resolver_for_endpoint("tools.example.com", 443, "/mcp/local")
+            .expect("refreshed endpoint resolver");
+        assert_eq!(
+            refreshed
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&stable_placeholder),
+            Some("new")
+        );
+        assert_eq!(
+            refreshed
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:EXTERNAL_ASSERTION"),
+            None,
+            "an identityless current-name alias must remain unavailable"
+        );
+        assert_eq!(
+            refreshed
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:ORDINARY_TOKEN"),
+            None
+        );
+
+        let replacement_handle = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        state
+            .install_bound_environment_with_stable_placeholders(
+                3,
+                HashMap::from([("EXTERNAL_ASSERTION".to_string(), "replacement".to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "EXTERNAL_ASSERTION".to_string(),
+                    stable_binding("tools.example.com", 443, "/mcp/**", replacement_handle),
+                )]),
+                Vec::new(),
+                vec!["EXTERNAL_ASSERTION".to_string()],
+            )
+            .expect("replacement provider binding");
+        let replacement = state
+            .resolver_for_endpoint("tools.example.com", 443, "/mcp/local")
+            .expect("replacement endpoint resolver");
+        assert_eq!(
+            replacement
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&stable_placeholder),
+            None,
+            "a placeholder issued for an earlier provider identity must be revoked"
+        );
+        assert_eq!(
+            replacement
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&state.snapshot().child_env["EXTERNAL_ASSERTION"]),
+            Some("replacement")
+        );
+    }
+
+    #[test]
+    fn external_stable_placeholder_rotations_reconstruction_expiry_and_detach() {
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_millis(),
+        )
+        .expect("current time fits i64");
+        let handle = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let bindings = HashMap::from([(
+            "API_KEY".to_string(),
+            stable_binding("api.example.com", 443, "/v1/**", handle),
+        )]);
+        let stable_keys = vec!["API_KEY".to_string()];
+        let environment =
+            |revision| HashMap::from([("API_KEY".to_string(), format!("synthetic-{revision}"))]);
+        let expires = |expiry| HashMap::from([("API_KEY".to_string(), expiry)]);
+        let state = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+            1,
+            environment(1),
+            expires(now_ms + 60_000),
+            HashMap::new(),
+            bindings.clone(),
+            Vec::new(),
+            stable_keys.clone(),
+        )
+        .expect("external stable binding");
+        let original = state.snapshot().child_env["API_KEY"].clone();
+
+        // Exceed the retained revision queue while keeping the original workload
+        // reference. External metadata must reach every installation unchanged.
+        for revision in 2..=13 {
+            state
+                .install_bound_environment_with_stable_placeholders(
+                    revision,
+                    environment(revision),
+                    expires(now_ms + 60_000),
+                    HashMap::new(),
+                    bindings.clone(),
+                    Vec::new(),
+                    stable_keys.clone(),
+                )
+                .expect("external value update");
+            assert!(state.snapshot().child_env["API_KEY"] == original);
+            let resolver = state
+                .resolver_for_endpoint("api.example.com", 443, "/v1/chat/completions")
+                .expect("authorized endpoint resolver");
+            assert!(
+                resolver
+                    .with_request_location(authorization_location())
+                    .resolve_placeholder(&original)
+                    == Some(format!("synthetic-{revision}").as_str())
+            );
+            assert!(
+                resolver
+                    .with_request_location(authorization_location())
+                    .resolve_placeholder("openshell:resolve:env:API_KEY")
+                    .is_none()
+            );
+            assert!(
+                resolver
+                    .with_request_location(authorization_location())
+                    .resolve_placeholder("openshell:resolve:env:v1_API_KEY")
+                    .is_none()
+            );
+        }
+
+        let reconstructed =
+            ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+                13,
+                environment(13),
+                expires(now_ms + 60_000),
+                HashMap::new(),
+                bindings.clone(),
+                Vec::new(),
+                stable_keys.clone(),
+            )
+            .expect("reconstructed external supervisor state");
+        assert!(reconstructed.snapshot().child_env["API_KEY"] == original);
+        assert!(
+            reconstructed
+                .resolver_for_endpoint("api.example.com", 443, "/v1/chat/completions")
+                .expect("reconstructed resolver")
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&original)
+                == Some("synthetic-13")
+        );
+        for (host, port, path) in [
+            ("other.example.com", 443, "/v1/chat/completions"),
+            ("api.example.com", 8443, "/v1/chat/completions"),
+            ("api.example.com", 443, "/other/chat/completions"),
+        ] {
+            let resolver = reconstructed
+                .resolver_for_endpoint(host, port, path)
+                .expect("endpoint-scoped resolver");
+            assert!(
+                resolver
+                    .rewrite_header_value_for_name("Authorization", &original)
+                    .is_err()
+            );
+        }
+
+        // Current-value expiry must not fall back to a previously valid value.
+        reconstructed
+            .install_bound_environment_with_stable_placeholders(
+                14,
+                environment(14),
+                expires(now_ms - 1),
+                HashMap::new(),
+                bindings,
+                Vec::new(),
+                stable_keys,
+            )
+            .expect("expired external value installation");
+        let resolver = reconstructed
+            .resolver_for_endpoint("api.example.com", 443, "/v1/chat/completions")
+            .expect("expired resolver");
+        assert!(
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&original)
+                .is_none()
+        );
+
+        // An activated detach removes the current binding and all authority for
+        // a still-running process, even when it retains its original reference.
+        state
+            .install_bound_environment_with_stable_placeholders(
+                15,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("detached provider snapshot");
+        assert!(state.snapshot().child_env.is_empty());
+        assert!(
+            state
+                .resolver_for_endpoint("api.example.com", 443, "/v1/chat/completions")
+                .is_none_or(|resolver| resolver
+                    .with_request_location(authorization_location())
+                    .resolve_placeholder(&original)
+                    .is_none())
+        );
+    }
+
+    #[test]
+    fn stable_placeholder_requirement_survives_failed_refresh() {
+        let state = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+            1,
+            HashMap::from([("TOKEN".to_string(), "synthetic".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "TOKEN".to_string(),
+                stable_binding(
+                    "api.example.com",
+                    443,
+                    "/v1/**",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+            )]),
+            Vec::new(),
+            vec!["TOKEN".to_string()],
+        )
+        .expect("stable credential snapshot");
+        assert!(state.requires_stable_placeholders());
+
+        // A transport failure and a later malformed response must both retain
+        // the requirement, even though neither leaves static material active.
+        state.revoke_static_provider_environment(2);
+        assert!(state.requires_stable_placeholders());
+        assert!(state.snapshot().child_env.is_empty());
+        assert!(
+            state
+                .install_bound_environment_with_stable_placeholders(
+                    3,
+                    HashMap::from([("TOKEN".to_string(), "synthetic".to_string())]),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .is_err()
+        );
+        assert!(state.requires_stable_placeholders());
+
+        // The response adapter requires acknowledgment before this successful
+        // empty install can represent removal of the external stable profile.
+        state
+            .install_bound_environment_with_stable_placeholders(
+                4,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("activated detach");
+        assert!(!state.requires_stable_placeholders());
+    }
+
+    #[test]
+    fn stable_placeholder_without_endpoint_binding_is_rejected() {
+        let error = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+            1,
+            HashMap::from([("EXTERNAL_ASSERTION".to_string(), "secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+            vec!["EXTERNAL_ASSERTION".to_string()],
+        )
+        .expect_err("an unbound stable alias must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "stable placeholder environment key has no static credential binding"
+        );
+    }
+
+    #[test]
+    fn stable_placeholder_without_identity_bound_handle_is_rejected() {
+        let error = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+            1,
+            HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".to_string(),
+                binding("api.example.com", 443, "/**"),
+            )]),
+            Vec::new(),
+            vec!["API_KEY".to_string()],
+        )
+        .expect_err("a stable placeholder must carry an identity-bound handle");
+        assert_eq!(
+            error.to_string(),
+            "stable placeholder environment key has no identity-bound handle"
+        );
     }
 
     #[test]
@@ -1351,11 +2340,15 @@ mod tests {
             .resolver_for_endpoint("a.example.com", 443, "/a/check")
             .expect("endpoint A resolver");
         assert_eq!(
-            resolver_a.resolve_placeholder("openshell:resolve:env:v7_KEY_A"),
+            resolver_a
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v7_KEY_A"),
             Some("secret-a")
         );
         assert_eq!(
-            resolver_a.resolve_placeholder("openshell:resolve:env:v7_KEY_B"),
+            resolver_a
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v7_KEY_B"),
             None,
             "credential B must not resolve at endpoint A"
         );
@@ -1364,11 +2357,15 @@ mod tests {
             .resolver_for_endpoint("b.example.com", 443, "/b/check")
             .expect("endpoint B resolver");
         assert_eq!(
-            resolver_b.resolve_placeholder("openshell:resolve:env:v7_KEY_B"),
+            resolver_b
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v7_KEY_B"),
             Some("secret-b")
         );
         assert_eq!(
-            resolver_b.resolve_placeholder("openshell:resolve:env:v7_KEY_A"),
+            resolver_b
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v7_KEY_A"),
             None,
             "credential A must not resolve at endpoint B"
         );
@@ -1407,7 +2404,9 @@ mod tests {
             .resolver_for_endpoint("new.example.com", 443, "/v2/messages")
             .expect("replacement endpoint resolver");
         assert_eq!(
-            replacement.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
+            replacement
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
             Some("new")
         );
 
@@ -1415,7 +2414,7 @@ mod tests {
             .resolver_for_endpoint("old.example.com", 443, "/v1/messages")
             .expect("restricted resolver");
         let error = removed
-            .rewrite_header_value("openshell:resolve:env:v2_API_KEY")
+            .rewrite_header_value_for_name("Authorization", "openshell:resolve:env:v2_API_KEY")
             .expect_err("replaced endpoint binding must no longer authorize the credential");
         assert!(error.is_endpoint_mismatch());
     }
@@ -1443,7 +2442,12 @@ mod tests {
                 &format!("/bot{placeholder}/sendMessage?stream=true"),
             )
             .expect("syntax-redacted path should select the binding");
-        assert_eq!(resolver.resolve_placeholder(placeholder), Some("secret"));
+        assert_eq!(
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(placeholder),
+            Some("secret")
+        );
     }
 
     #[test]
@@ -1469,7 +2473,9 @@ mod tests {
             )
             .expect("syntax-redacted alias path should select the binding");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v7_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v7_API_KEY"),
             Some("secret")
         );
     }
@@ -1516,7 +2522,9 @@ mod tests {
             .resolver_for_endpoint("unrelated.example", 1234, "/")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v3_GCP_PROJECT_ID"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v3_GCP_PROJECT_ID"),
             Some("project")
         );
     }
@@ -1571,7 +2579,9 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
             Some("recovered"),
             "a metadata failure must not permanently strand placeholders from the same provider identity"
         );
@@ -1623,7 +2633,9 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
             Some("new"),
             "the running process placeholder should recover against the current same-identity secret"
         );
@@ -1662,11 +2674,15 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
             Some("old")
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
             Some("new")
         );
     }
@@ -1697,9 +2713,21 @@ mod tests {
             state
                 .resolver_for_endpoint("api.example.com", 443, "/v1")
                 .expect("resolver")
+                .with_request_location(authorization_location())
                 .resolve_placeholder(&workload_placeholder),
             None,
             "the expired access token must fail closed"
+        );
+        assert!(
+            state
+                .resolver_for_endpoint("api.example.com", 443, "/v1")
+                .expect("resolver")
+                .rewrite_header_value_for_name(
+                    "Authorization",
+                    &format!("Bearer {}", jwt_alias(&workload_placeholder))
+                )
+                .is_err(),
+            "wrapping a placeholder must not bypass access-token expiry"
         );
 
         state
@@ -1718,11 +2746,24 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder(&workload_placeholder),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&workload_placeholder),
             Some("current")
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
+            resolver
+                .rewrite_header_value_for_name(
+                    "Authorization",
+                    &format!("Bearer {}", jwt_alias(&workload_placeholder))
+                )
+                .expect("refresh updates the JWT alias"),
+            Some("Bearer current".to_string())
+        );
+        assert_eq!(
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
             None,
             "refresh-managed credentials must not expose revision aliases"
         );
@@ -1742,6 +2783,10 @@ mod tests {
         )
         .expect("initial stable binding");
         let workload_placeholder = state.snapshot().child_env["API_KEY"].clone();
+        let request = format!(
+            "GET /v1 HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n",
+            jwt_alias(&workload_placeholder)
+        );
 
         for revision in 2..=13 {
             let token = format!("token-{revision}");
@@ -1760,8 +2805,19 @@ mod tests {
                 state
                     .resolver_for_endpoint("api.example.com", 443, "/v1")
                     .expect("resolver")
+                    .with_request_location(authorization_location())
                     .resolve_placeholder(&workload_placeholder),
                 Some(token.as_str())
+            );
+            let resolver = state
+                .resolver_for_endpoint("api.example.com", 443, "/v1")
+                .expect("resolver");
+            let rewritten =
+                crate::secrets::rewrite_http_header_block(request.as_bytes(), Some(&resolver))
+                    .expect("the unchanged JWT alias uses the current token");
+            assert_eq!(
+                String::from_utf8(rewritten.rewritten).expect("HTTP header"),
+                format!("GET /v1 HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n")
             );
         }
 
@@ -1782,8 +2838,20 @@ mod tests {
             reconstructed
                 .resolver_for_endpoint("api.example.com", 443, "/v1")
                 .expect("resolver")
+                .with_request_location(authorization_location())
                 .resolve_placeholder(&workload_placeholder),
             Some("token-14")
+        );
+        assert_eq!(
+            reconstructed
+                .resolver_for_endpoint("api.example.com", 443, "/v1")
+                .expect("resolver")
+                .rewrite_header_value_for_name(
+                    "Authorization",
+                    &format!("Bearer {}", jwt_alias(&workload_placeholder))
+                )
+                .expect("the JWT alias survives supervisor reconstruction"),
+            Some("Bearer token-14".to_string())
         );
     }
 
@@ -1822,17 +2890,55 @@ mod tests {
         let current = state
             .resolver_for_endpoint("new.example.com", 443, "/v2/messages")
             .expect("current resolver");
-        assert_eq!(current.resolve_placeholder(&old_placeholder), None);
         assert_eq!(
-            current.resolve_placeholder(&state.snapshot().child_env["API_KEY"]),
+            current
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&old_placeholder),
+            None
+        );
+        assert!(
+            current
+                .rewrite_header_value_for_name(
+                    "Authorization",
+                    &format!("Bearer {}", jwt_alias(&old_placeholder))
+                )
+                .is_err(),
+            "a JWT alias must not carry a revoked identity into the new epoch"
+        );
+        for alias in [
+            "e30.e30.OPENSHELL-RESOLVE-ENV-API_KEY",
+            "e30.e30.OPENSHELL-RESOLVE-ENV-sshort_API_KEY",
+            "e30.e30.OPENSHELL-RESOLVE-ENV-v18446744073709551616_API_KEY",
+        ] {
+            assert!(
+                current
+                    .rewrite_header_value_for_name("Authorization", &format!("Bearer {alias}"))
+                    .is_err(),
+                "identityless and malformed JWT aliases must fail closed"
+            );
+        }
+        assert_eq!(
+            current
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&state.snapshot().child_env["API_KEY"]),
             Some("new")
         );
         let wrong_endpoint = state
             .resolver_for_endpoint("old.example.com", 443, "/v1/messages")
             .expect("endpoint-scoped resolver");
         let error = wrong_endpoint
-            .rewrite_header_value(&state.snapshot().child_env["API_KEY"])
+            .rewrite_header_value_for_name("Authorization", &state.snapshot().child_env["API_KEY"])
             .expect_err("new handle must not resolve at the old endpoint");
+        assert!(error.is_endpoint_mismatch());
+        let error = wrong_endpoint
+            .rewrite_header_value_for_name(
+                "Authorization",
+                &format!(
+                    "Bearer {}",
+                    jwt_alias(&state.snapshot().child_env["API_KEY"])
+                ),
+            )
+            .expect_err("JWT wrapping preserves endpoint authorization");
         assert!(error.is_endpoint_mismatch());
     }
 
@@ -1850,6 +2956,11 @@ mod tests {
             Vec::new(),
         )
         .expect("initial bindings");
+        let workload_placeholder = state.snapshot().child_env["API_KEY"].clone();
+        let request = format!(
+            "POST /v2/inference HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer {}\r\nContent-Length: 2\r\n\r\n{{}}",
+            jwt_alias(&workload_placeholder)
+        );
 
         for revision in [10, 100, 9, 101, 8, 102, 7, 103, 6] {
             state
@@ -1868,12 +2979,21 @@ mod tests {
         }
 
         let resolver = state
-            .resolver_for_endpoint("api.example.com", 443, "/v1")
+            .resolver_for_endpoint("api.example.com", 443, "/v2/inference")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v50_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v50_API_KEY"),
             Some("secret-6"),
             "an aged-out placeholder may use the current secret across revisions in both numeric directions while its provider identity is unchanged"
+        );
+        let rewritten =
+            crate::secrets::rewrite_http_header_block(request.as_bytes(), Some(&resolver))
+                .expect("an aged-out JWT alias retains the issued provider identity");
+        assert_eq!(
+            String::from_utf8(rewritten.rewritten).expect("HTTP request"),
+            "POST /v2/inference HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer secret-6\r\nContent-Length: 2\r\n\r\n{}"
         );
     }
 
@@ -1906,17 +3026,35 @@ mod tests {
             .resolver_for_endpoint("b.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder(&format!("openshell:resolve:env:v{}_API_KEY", u64::MAX)),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&format!("openshell:resolve:env:v{}_API_KEY", u64::MAX)),
             None,
             "an opaque revision from another provider identity must fail closed even when it is numerically greater"
         );
+        assert!(
+            resolver
+                .rewrite_header_value_for_name(
+                    "Authorization",
+                    &format!(
+                        "Bearer {}",
+                        jwt_alias(&format!("openshell:resolve:env:v{}_API_KEY", u64::MAX))
+                    )
+                )
+                .is_err(),
+            "a JWT alias must not resolve a replacement provider's credential"
+        );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:API_KEY"),
             None,
             "an identityless canonical placeholder must not resolve a replacement provider"
         );
         assert_eq!(
-            resolver.resolve_placeholder("vendor-OPENSHELL-RESOLVE-ENV-API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("vendor-OPENSHELL-RESOLVE-ENV-API_KEY"),
             None,
             "an identityless provider alias must not resolve a replacement provider"
         );
@@ -1959,17 +3097,23 @@ mod tests {
             .resolver_for_endpoint("b.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
             None,
             "a placeholder issued before detach must not resolve to a replacement provider"
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:API_KEY"),
             None,
             "an identityless canonical placeholder must not cross a failed refresh into a replacement identity"
         );
         assert_eq!(
-            resolver.resolve_placeholder("vendor-OPENSHELL-RESOLVE-ENV-API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("vendor-OPENSHELL-RESOLVE-ENV-API_KEY"),
             None,
             "an identityless provider alias must not cross a failed refresh into a replacement identity"
         );
@@ -2013,12 +3157,16 @@ mod tests {
             .resolver_for_endpoint("a.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
             None,
             "a successful empty environment represents detach and must invalidate old membership"
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v4_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v4_API_KEY"),
             Some("reattached")
         );
     }
@@ -2051,19 +3199,27 @@ mod tests {
 
         let resolver = state.resolver().expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             Some("old")
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v11_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v11_GITHUB_TOKEN"),
             Some("new")
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:GITHUB_TOKEN"),
             Some("new")
         );
         assert_eq!(
-            resolver.resolve_placeholder("provider-OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("provider-OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
             Some("new")
         );
     }
@@ -2082,15 +3238,21 @@ mod tests {
         assert!(state.snapshot().child_env.is_empty());
         let resolver = state.resolver().expect("old resolver retained");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             Some("old")
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:GITHUB_TOKEN"),
             None
         );
         assert_eq!(
-            resolver.resolve_placeholder("provider-OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("provider-OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
             None
         );
     }
@@ -2120,11 +3282,15 @@ mod tests {
 
         let resolver = state.resolver().expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             None
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v11_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v11_GITHUB_TOKEN"),
             Some("new")
         );
     }
@@ -2488,11 +3654,15 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/")
             .unwrap();
         assert_eq!(
-            resolver.resolve_placeholder(&old_placeholder),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&old_placeholder),
             Some("first-secret")
         );
         assert_eq!(
-            resolver.resolve_placeholder(&live.snapshot().child_env["API_KEY"]),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&live.snapshot().child_env["API_KEY"]),
             Some("second-secret"),
         );
     }
@@ -2551,7 +3721,12 @@ mod tests {
         let resolver = observer
             .resolver_for_endpoint("api.example.com", 443, "/")
             .unwrap();
-        assert!(resolver.resolve_placeholder(&old_placeholder).is_none());
+        assert!(
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&old_placeholder)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2716,7 +3891,9 @@ mod tests {
 
         let resolver = state.resolver().expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             Some("new-19")
         );
     }
@@ -2741,7 +3918,9 @@ mod tests {
 
         let resolver = state.resolver().expect("retained resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             None
         );
     }

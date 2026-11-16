@@ -21,6 +21,7 @@ pub struct ManagedGateway {
     args_file: PathBuf,
     log: PathBuf,
     pid_file: PathBuf,
+    supervisor_image: Option<String>,
 }
 
 impl ManagedGateway {
@@ -36,6 +37,7 @@ impl ManagedGateway {
             args_file: args_file.into(),
             log: log.into(),
             pid_file: pid_file.into(),
+            supervisor_image: None,
         }
     }
 
@@ -53,7 +55,13 @@ impl ManagedGateway {
             args_file: env_path("OPENSHELL_E2E_GATEWAY_ARGS_FILE")?,
             log: env_path("OPENSHELL_E2E_GATEWAY_LOG")?,
             pid_file: env_path("OPENSHELL_E2E_GATEWAY_PID_FILE")?,
+            supervisor_image: None,
         }))
+    }
+
+    /// Override the supervisor image for gateways started by this handle.
+    pub fn set_supervisor_image(&mut self, image: &str) {
+        self.supervisor_image = Some(image.to_owned());
     }
 
     /// Start the gateway if it is not already running.
@@ -80,10 +88,15 @@ impl ManagedGateway {
             .try_clone()
             .map_err(|err| format!("clone gateway log handle: {err}"))?;
 
-        let child = Command::new(&self.bin)
+        let mut command = Command::new(&self.bin);
+        command
             .args(args)
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(stderr))
+            .stderr(Stdio::from(stderr));
+        if let Some(image) = &self.supervisor_image {
+            command.env("OPENSHELL_SUPERVISOR_IMAGE", image);
+        }
+        let child = command
             .spawn()
             .map_err(|err| format!("start openshell-gateway '{}': {err}", self.bin.display()))?;
         let pid = child.id();

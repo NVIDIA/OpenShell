@@ -12,6 +12,28 @@ release:
   namespace: app-a
 
 tests:
+  - it: grants supervisor lifecycle and complete stopped-update pod inspection
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["create", "delete", "get", "list", "patch", "watch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create", "get"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["create", "get"]
+
   - it: creates the workspace role in the release namespace
     template: templates/role.yaml
     asserts:

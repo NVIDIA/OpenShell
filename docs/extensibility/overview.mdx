@@ -102,6 +102,29 @@ are satisfied. It rejects different major versions, missing metadata, or an
 unmet required capability during startup. Built-in and external service
 extensions follow the same compatibility checks.
 
+Every extension returns protocol `1.0` and lists its family's base capability in
+`supported_capabilities`:
+
+| Family | Base capability | Returned in |
+|---|---|---|
+| Compute driver | `openshell.compute.contract` | `GetCapabilitiesResponse.extension` |
+| Credential driver | `openshell.credentials.contract` | `GetCredentialDriverCapabilitiesResponse.extension` |
+| Gateway interceptor | `openshell.gateway-interceptor.contract` | `InterceptorManifest.extension` |
+| Supervisor middleware | `openshell.supervisor-middleware.contract` | `MiddlewareManifest.extension` |
+
+For example, a supervisor middleware `Describe` response includes:
+
+```json
+{
+  "extension": {
+    "protocol_version": { "major": 1, "minor": 0 },
+    "implementation_name": "example/content-guard",
+    "implementation_version": "0.1.0",
+    "supported_capabilities": ["openshell.supervisor-middleware.contract"]
+  }
+}
+```
+
 Use `openshell gateway info` to inspect the negotiated extension families,
 implementation versions, protocol versions, and capabilities active on a
 gateway.

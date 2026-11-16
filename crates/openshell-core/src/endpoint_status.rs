@@ -8,7 +8,8 @@
 //!
 //! The types in this module deliberately cannot carry request URLs, headers,
 //! bodies, tool arguments, credentials, or upstream error text. Network
-//! enforcement reports only the configured endpoint identifier and a typed result.
+//! enforcement reports configured endpoint results and the latest refused token
+//! grant with a bounded host, port, and [`EndpointFailure`].
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -16,6 +17,8 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
+
+use crate::endpoint_failure::EndpointFailure;
 
 /// Maximum number of pending endpoint observations between network enforcement
 /// and the sandbox orchestrator.
@@ -85,6 +88,7 @@ pub fn initial_endpoint_status(
         path: path.to_string(),
         last_result: crate::proto::EndpointResult::NoObservedExchange.into(),
         last_reported_time: None,
+        last_failure: None,
     }
 }
 
@@ -186,6 +190,22 @@ pub struct EndpointObservationContext {
     authority_generation: EndpointObservationGeneration,
 }
 
+impl EndpointObservationContext {
+    /// Check that selected request state belongs to the captured configuration.
+    #[must_use]
+    pub fn matches_config(&self, policy_hash: &str, provider_env_revision: Option<u64>) -> bool {
+        self.inventory.config_version.policy_hash == policy_hash
+            && self.matches_provider_revision(provider_env_revision)
+    }
+
+    /// Check a provider snapshot when forwarding has no L7 endpoint selection.
+    #[must_use]
+    pub fn matches_provider_revision(&self, revision: Option<u64>) -> bool {
+        revision
+            .is_none_or(|revision| revision == self.inventory.config_version.provider_env_revision)
+    }
+}
+
 /// Commands consumed in FIFO order by the sandbox endpoint-status tracker.
 #[derive(Debug)]
 pub enum EndpointStatusCommand {
@@ -206,10 +226,23 @@ pub enum EndpointStatusCommand {
         endpoint_id: String,
         /// Typed, non-sensitive terminal result.
         result: EndpointResult,
+        /// Bounded cause of the result, when the enforcement point classified it.
+        failure: Option<EndpointFailure>,
         /// Inventory installation captured when the request started.
         inventory_generation: EndpointObservationGeneration,
         /// Supervisor observation authority captured when the request started.
         authority_generation: EndpointObservationGeneration,
+    },
+    /// Report a refused grant, or a successful grant for a named credential.
+    ObserveTokenGrant {
+        /// Authority captured before request selection and asynchronous work.
+        context: EndpointObservationContext,
+        /// Canonical destination, without paths, query strings, or headers.
+        destination_host: String,
+        /// Destination port.
+        destination_port: u16,
+        /// Success identifies the credential; failure carries its bounded cause.
+        result: Result<(String, String), EndpointFailure>,
     },
 }
 
@@ -232,6 +265,7 @@ impl EndpointStatusReceiver {
             inventory_generation: None,
             current: self.current.clone(),
             endpoints: BTreeMap::new(),
+            last_token_grant_failure: None,
         }
     }
 
@@ -262,6 +296,29 @@ pub struct EndpointObservationSender {
 }
 
 impl EndpointObservationSender {
+    /// Report a grant outcome without delaying traffic. Success clears only a
+    /// failure for the same destination and credential (or an unselected grant).
+    /// Invalid destinations and saturated queues lose telemetry, never traffic.
+    #[must_use]
+    pub fn try_observe_token_grant(
+        &self,
+        context: EndpointObservationContext,
+        destination_host: &str,
+        destination_port: u16,
+        result: Result<(String, String), EndpointFailure>,
+    ) -> bool {
+        if !valid_token_grant_destination(destination_host, u32::from(destination_port)) {
+            return false;
+        }
+        self.commands
+            .try_send(EndpointStatusCommand::ObserveTokenGrant {
+                context,
+                destination_host: destination_host.to_ascii_lowercase(),
+                destination_port,
+                result,
+            })
+            .is_ok()
+    }
     /// Capture the installed observation authority before selecting request state.
     ///
     /// Returns `None` until the first complete endpoint inventory is installed.
@@ -288,11 +345,7 @@ impl EndpointObservationSender {
         policy_hash: &str,
         provider_env_revision: Option<u64>,
     ) -> Option<EndpointObservationHandle> {
-        let config = &context.inventory.config_version;
-        if config.policy_hash != policy_hash
-            || provider_env_revision
-                .is_some_and(|revision| revision != config.provider_env_revision)
-        {
+        if !context.matches_config(policy_hash, provider_env_revision) {
             // Runtime activation and inventory publication are separate. Reject
             // observations during that gap instead of assigning another policy's result.
             return None;
@@ -307,7 +360,7 @@ impl EndpointObservationSender {
             return None;
         }
         Some(EndpointObservationHandle {
-            config_version: config.clone(),
+            config_version: context.inventory.config_version.clone(),
             endpoint_id,
             inventory_generation: context.inventory.generation.clone(),
             authority_generation: context.authority_generation.clone(),
@@ -376,6 +429,20 @@ impl EndpointObservationSender {
         observation: EndpointObservationHandle,
         result: EndpointResult,
     ) -> bool {
+        self.try_observe_with_failure(observation, result, None)
+    }
+
+    /// Try to enqueue a terminal observation and its bounded cause.
+    ///
+    /// The cause replaces any earlier cause for the endpoint; `None` clears it.
+    /// Capacity and rejection behave as in [`Self::try_observe`].
+    #[must_use]
+    pub fn try_observe_with_failure(
+        &self,
+        observation: EndpointObservationHandle,
+        result: EndpointResult,
+        failure: Option<EndpointFailure>,
+    ) -> bool {
         if result == EndpointResult::NoObservedExchange {
             return false;
         }
@@ -384,11 +451,31 @@ impl EndpointObservationSender {
                 config_version: observation.config_version,
                 endpoint_id: observation.endpoint_id,
                 result,
+                failure,
                 inventory_generation: observation.inventory_generation,
                 authority_generation: observation.authority_generation,
             })
             .is_ok()
     }
+}
+
+/// Accept only a bounded DNS host or IP address, never a URL or arbitrary text.
+#[must_use]
+pub fn valid_token_grant_destination(host: &str, port: u32) -> bool {
+    if host.is_empty() || host.len() > 253 || !(1..=65535).contains(&port) {
+        return false;
+    }
+    host.parse::<std::net::IpAddr>().is_ok()
+        || host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .is_some_and(|host| host.parse::<std::net::Ipv6Addr>().is_ok())
+        || host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            && host
+                .split('.')
+                .all(|label| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-'))
 }
 
 /// Create the bounded channel used for tool server endpoint inventory and observations.
@@ -418,6 +505,18 @@ pub struct EndpointObservation {
     pub endpoint_id: String,
     /// Latest result observed for the endpoint in the current configuration version.
     pub result: EndpointResult,
+    /// Bounded cause of `result`, when the enforcement point classified it.
+    pub failure: Option<EndpointFailure>,
+}
+
+/// The latest result for one endpoint and the cause reported with it.
+///
+/// Both fields change together, so a later result can never inherit an
+/// earlier result's cause.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LatestObservation {
+    result: EndpointResult,
+    failure: Option<EndpointFailure>,
 }
 
 /// Complete tool server endpoint status for one installed policy and provider revision.
@@ -427,6 +526,8 @@ pub struct EndpointStatusSnapshot {
     pub config_version: EndpointConfigVersion,
     /// Complete, identifier-sorted set of configured endpoint statuses.
     pub endpoints: Vec<EndpointObservation>,
+    /// Latest refused grant across all HTTP protocols, independent of MCP inventory.
+    pub last_token_grant_failure: Option<crate::proto::TokenGrantFailureObservation>,
     /// Endpoints that carried at least one new result in this report batch.
     ///
     /// The gateway uses this set to advance observation timestamps only for
@@ -452,7 +553,8 @@ pub struct EndpointStatusTracker {
     config_version: Option<EndpointConfigVersion>,
     inventory_generation: Option<EndpointObservationGeneration>,
     current: watch::Sender<ObservationState>,
-    endpoints: BTreeMap<String, EndpointResult>,
+    endpoints: BTreeMap<String, LatestObservation>,
+    last_token_grant_failure: Option<crate::proto::TokenGrantFailureObservation>,
 }
 
 impl EndpointStatusTracker {
@@ -480,20 +582,15 @@ impl EndpointStatusTracker {
                 config_version,
                 endpoint_id,
                 result,
+                failure,
                 inventory_generation,
                 authority_generation,
             } => {
-                if self.config_version.as_ref() != Some(&config_version)
-                    || !self
-                        .inventory_generation
-                        .as_ref()
-                        .is_some_and(|current| current.matches(&inventory_generation))
-                    || !self
-                        .current
-                        .borrow()
-                        .authority_generation
-                        .matches(&authority_generation)
-                {
+                if !self.is_current(
+                    &config_version,
+                    &inventory_generation,
+                    &authority_generation,
+                ) {
                     // Stale evidence must not change results or freshness.
                     return false;
                 }
@@ -503,8 +600,52 @@ impl EndpointStatusTracker {
                 // Repeated results are material observations: the gateway
                 // advances endpoint freshness even when the classification is
                 // unchanged.
-                *endpoint = result;
+                *endpoint = LatestObservation { result, failure };
                 true
+            }
+            EndpointStatusCommand::ObserveTokenGrant {
+                context,
+                destination_host,
+                destination_port,
+                result,
+            } => {
+                if !self.is_current(
+                    &context.inventory.config_version,
+                    &context.inventory.generation,
+                    &context.authority_generation,
+                ) {
+                    return false;
+                }
+                match result {
+                    Err(failure) => {
+                        self.last_token_grant_failure =
+                            Some(crate::proto::TokenGrantFailureObservation {
+                                destination_host,
+                                destination_port: destination_port.into(),
+                                failure: Some(failure.to_proto()),
+                            });
+                        true
+                    }
+                    Ok((provider, credential_key)) => {
+                        let matches =
+                            self.last_token_grant_failure
+                                .as_ref()
+                                .is_some_and(|observation| {
+                                    observation.destination_host == destination_host
+                                        && observation.destination_port
+                                            == u32::from(destination_port)
+                                        && observation.failure.as_ref().is_some_and(|failure| {
+                                            failure.provider.is_empty()
+                                                || (failure.provider == provider
+                                                    && failure.credential_key == credential_key)
+                                        })
+                                });
+                        if matches {
+                            self.last_token_grant_failure = None;
+                        }
+                        matches
+                    }
+                }
             }
         }
     }
@@ -518,12 +659,14 @@ impl EndpointStatusTracker {
             .iter()
             .map(|(endpoint_id, endpoint)| EndpointObservation {
                 endpoint_id: endpoint_id.clone(),
-                result: *endpoint,
+                result: endpoint.result,
+                failure: endpoint.failure.clone(),
             })
             .collect();
         Some(EndpointStatusSnapshot {
             config_version,
             endpoints,
+            last_token_grant_failure: self.last_token_grant_failure.clone(),
             observed_endpoint_ids: Vec::new(),
             supervisor_session_id: String::new(),
             report_sequence: 0,
@@ -546,8 +689,9 @@ impl EndpointStatusTracker {
             return false;
         };
         for endpoint in self.endpoints.values_mut() {
-            *endpoint = EndpointResult::NoObservedExchange;
+            *endpoint = LatestObservation::default();
         }
+        self.last_token_grant_failure = None;
         true
     }
 
@@ -563,6 +707,9 @@ impl EndpointStatusTracker {
         let provider_changed = self.config_version.as_ref().is_some_and(|current| {
             current.provider_env_revision != config_version.provider_env_revision
         });
+        if policy_changed || provider_changed {
+            self.last_token_grant_failure = None;
+        }
         let previous = std::mem::take(&mut self.endpoints);
 
         self.endpoints = inventory
@@ -573,18 +720,36 @@ impl EndpointStatusTracker {
                 // depend on provider-managed credentials.
                 let preserve =
                     !policy_changed && (!provider_changed || !endpoint.uses_provider_credentials);
-                let result = if preserve {
+                let latest = if preserve {
                     previous
                         .get(&endpoint.endpoint_id)
-                        .copied()
-                        .unwrap_or(EndpointResult::NoObservedExchange)
+                        .cloned()
+                        .unwrap_or_default()
                 } else {
-                    EndpointResult::NoObservedExchange
+                    LatestObservation::default()
                 };
-                (endpoint.endpoint_id, result)
+                (endpoint.endpoint_id, latest)
             })
             .collect();
         self.config_version = Some(config_version);
+    }
+
+    fn is_current(
+        &self,
+        config_version: &EndpointConfigVersion,
+        inventory_generation: &EndpointObservationGeneration,
+        authority_generation: &EndpointObservationGeneration,
+    ) -> bool {
+        self.config_version.as_ref() == Some(config_version)
+            && self
+                .inventory_generation
+                .as_ref()
+                .is_some_and(|current| current.matches(inventory_generation))
+            && self
+                .current
+                .borrow()
+                .authority_generation
+                .matches(authority_generation)
     }
 }
 
@@ -706,6 +871,16 @@ mod tests {
         endpoint_id: &str,
         result: EndpointResult,
     ) -> EndpointStatusCommand {
+        observe_with_failure(tracker, config_version, endpoint_id, result, None)
+    }
+
+    fn observe_with_failure(
+        tracker: &EndpointStatusTracker,
+        config_version: EndpointConfigVersion,
+        endpoint_id: &str,
+        result: EndpointResult,
+        failure: Option<EndpointFailure>,
+    ) -> EndpointStatusCommand {
         EndpointStatusCommand::Observe {
             inventory_generation: tracker
                 .inventory_generation
@@ -715,7 +890,48 @@ mod tests {
             config_version,
             endpoint_id: endpoint_id.to_string(),
             result,
+            failure,
         }
+    }
+
+    #[test]
+    fn failure_travels_with_its_result_and_clears_with_it() {
+        let failure = grant_refusal("github", "access_token");
+        let latest = |tracker: &EndpointStatusTracker| {
+            tracker.snapshot().expect("inventory installed").endpoints[0].clone()
+        };
+        let observe_result = |tracker: &EndpointStatusTracker, result, failure| {
+            observe_with_failure(
+                tracker,
+                config_version("policy-a", 1),
+                "endpoint:credentialed",
+                result,
+                failure,
+            )
+        };
+        let mut tracker = endpoint_status_channel().1.tracker();
+        tracker.apply(EndpointStatusCommand::Reset {
+            inventory_generation: EndpointObservationGeneration::new(),
+            config_version: config_version("policy-a", 1),
+            endpoints: inventory(),
+        });
+        let unavailable = EndpointResult::CredentialUnavailable;
+
+        assert!(tracker.apply(observe_result(&tracker, unavailable, Some(failure.clone()))));
+        assert_eq!(latest(&tracker).failure, Some(failure.clone()));
+
+        // A later success replaces the result and its cause together.
+        tracker.apply(observe_result(
+            &tracker,
+            EndpointResult::HttpResponseReceived,
+            None,
+        ));
+        assert_eq!(latest(&tracker).failure, None);
+
+        // A replacement supervisor session forgets the cause.
+        tracker.apply(observe_result(&tracker, unavailable, Some(failure)));
+        assert!(tracker.clear_observations());
+        assert_eq!(latest(&tracker).failure, None);
     }
 
     #[test]
@@ -793,10 +1009,12 @@ mod tests {
                 EndpointObservation {
                     endpoint_id: "endpoint:new".to_string(),
                     result: EndpointResult::NoObservedExchange,
+                    failure: None,
                 },
                 EndpointObservation {
                     endpoint_id: "endpoint:public".to_string(),
                     result: EndpointResult::HttpResponseReceived,
+                    failure: None,
                 },
             ]
         );
@@ -832,10 +1050,12 @@ mod tests {
                 EndpointObservation {
                     endpoint_id: "endpoint:credentialed".to_string(),
                     result: EndpointResult::NoObservedExchange,
+                    failure: None,
                 },
                 EndpointObservation {
                     endpoint_id: "endpoint:public".to_string(),
                     result: EndpointResult::HttpResponseReceived,
+                    failure: None,
                 },
             ]
         );
@@ -1180,5 +1400,163 @@ mod tests {
                 ..
             }) if endpoint_id == "endpoint:public"
         ));
+    }
+
+    fn grant_refusal(provider: &str, credential: &str) -> EndpointFailure {
+        use crate::token_grant_failure::{
+            TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
+        };
+        EndpointFailure::token_grant(
+            TokenGrantFailure::new(
+                TokenGrantFailureKind::ProviderAuthorizationRequired,
+                TokenGrantStage::TokenEndpoint,
+            ),
+            provider,
+            credential,
+            "3e2d1c0b-9a8f-4e7d-b6c5-a4f3e2d1c0b9",
+        )
+    }
+
+    struct GrantStatus {
+        sender: EndpointObservationSender,
+        receiver: EndpointStatusReceiver,
+        tracker: EndpointStatusTracker,
+    }
+
+    impl GrantStatus {
+        async fn new() -> Self {
+            let (sender, receiver) = endpoint_status_channel();
+            let tracker = receiver.tracker();
+            let mut status = Self {
+                sender,
+                receiver,
+                tracker,
+            };
+            status.reset(config_version("policy-a", 1)).await;
+            status
+        }
+
+        async fn reset(&mut self, version: EndpointConfigVersion) {
+            self.sender.reset(version, Vec::new()).await.unwrap();
+            assert!(self.tracker.apply(self.receiver.recv().await.unwrap()));
+        }
+
+        /// Enqueue a grant outcome and return whether the tracker applied it.
+        async fn observe(
+            &mut self,
+            context: &EndpointObservationContext,
+            host: &str,
+            port: u16,
+            result: Result<(&str, &str), EndpointFailure>,
+        ) -> bool {
+            let result = result.map(|(provider, key)| (provider.into(), key.into()));
+            assert!(
+                self.sender
+                    .try_observe_token_grant(context.clone(), host, port, result)
+            );
+            self.tracker.apply(self.receiver.recv().await.unwrap())
+        }
+
+        fn last_failure(&self) -> Option<crate::proto::TokenGrantFailureObservation> {
+            self.tracker.snapshot().unwrap().last_token_grant_failure
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_failure_without_mcp_inventory_clears_only_on_matching_success() {
+        let mut status = GrantStatus::new().await;
+        let context = status.sender.capture().unwrap();
+        let failure = grant_refusal("github", "token");
+        assert!(
+            status
+                .observe(&context, "API.EXAMPLE.TEST", 8443, Err(failure.clone()))
+                .await
+        );
+        let expected = crate::proto::TokenGrantFailureObservation {
+            destination_host: "api.example.test".into(),
+            destination_port: 8443,
+            failure: Some(failure.to_proto()),
+        };
+        assert!(status.tracker.snapshot().unwrap().endpoints.is_empty());
+        assert_eq!(status.last_failure(), Some(expected.clone()));
+        // An invalid destination drops only the telemetry.
+        assert!(!status.sender.try_observe_token_grant(
+            context.clone(),
+            "https://api.example.test/",
+            443,
+            Err(failure.clone()),
+        ));
+        assert!(status.receiver.try_recv().is_err());
+        // A success for another destination or credential leaves the failure.
+        for (host, port, credential) in [
+            ("other.example.test", 8443, ("github", "token")),
+            ("api.example.test", 443, ("github", "token")),
+            ("api.example.test", 8443, ("github", "other")),
+        ] {
+            assert!(!status.observe(&context, host, port, Ok(credential)).await);
+            assert_eq!(status.last_failure(), Some(expected.clone()));
+        }
+        let matching = Ok(("github", "token"));
+        assert!(
+            status
+                .observe(&context, "api.example.test", 8443, matching)
+                .await
+        );
+        assert_eq!(status.last_failure(), None);
+
+        // A failure before credential selection clears on any success there.
+        let unselected = Err(grant_refusal("", ""));
+        assert!(
+            status
+                .observe(&context, "api.example.test", 8443, unselected)
+                .await
+        );
+        assert!(
+            status
+                .observe(&context, "api.example.test", 8443, Ok(("other", "key")))
+                .await
+        );
+        assert_eq!(status.last_failure(), None);
+    }
+
+    #[tokio::test]
+    async fn configuration_change_clears_grant_failure_and_retires_its_context() {
+        let mut status = GrantStatus::new().await;
+        let retired = status.sender.capture().unwrap();
+        let refusal = || Err(grant_refusal("github", "token"));
+        assert!(
+            status
+                .observe(&retired, "api.example.test", 443, refusal())
+                .await
+        );
+        // Returning to the same configuration must not revive the old context.
+        status.reset(config_version("policy-b", 1)).await;
+        status.reset(config_version("policy-a", 1)).await;
+        assert_eq!(status.last_failure(), None);
+        assert!(
+            !status
+                .observe(&retired, "api.example.test", 443, refusal())
+                .await
+        );
+        assert_eq!(status.last_failure(), None);
+    }
+
+    #[test]
+    fn grant_destination_accepts_only_bounded_hosts_and_ports() {
+        let oversized = "a".repeat(254);
+        for (host, port) in [
+            ("", 443),
+            ("api.example.test", 0),
+            ("api.example.test", 65536),
+            ("api example.test", 443),
+            ("https://api.example.test/path?token=secret", 443),
+            ("api\u{202e}.example.test", 443),
+            (oversized.as_str(), 443),
+        ] {
+            assert!(!valid_token_grant_destination(host, port), "{host}:{port}");
+        }
+        for host in ["api.example.test", "::1", "[::1]"] {
+            assert!(valid_token_grant_destination(host, 443), "{host}");
+        }
     }
 }

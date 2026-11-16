@@ -8,8 +8,9 @@
 # with OpenShell's custom kernel configuration for sandbox enforcement.
 #
 # In addition to the platform's native .so artifacts, this script exports
-# kernel.c and ABI_VERSION metadata so that other platforms (e.g. macOS) can
-# compile their own libkrunfw wrapper without rebuilding the kernel.
+# kernel.c, ABI_VERSION, and provenance.json (libkrunfw commit, kernel version,
+# final kernel config hash) so that other platforms (e.g. macOS) can compile
+# their own libkrunfw wrapper without rebuilding the kernel.
 #
 # Prerequisites:
 #   - Linux (aarch64 or x86_64)
@@ -29,7 +30,7 @@ source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
 # Source pinned dependency versions.
-source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
+source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env"
 
 BUILD_DIR="${ROOT}/target/libkrun-build"
 OUTPUT_DIR="${BUILD_DIR}"
@@ -133,18 +134,16 @@ echo "==> Building libkrunfw with custom kernel config..."
 ensure_python3_with_pyelftools_for_libkrunfw
 
 if [ ! -d libkrunfw ]; then
-  echo "    Cloning libkrunfw (pinned: ${LIBKRUNFW_REF:-HEAD})..."
+  echo "    Cloning libkrunfw (pinned: ${LIBKRUNFW_REF})..."
   git clone https://github.com/libkrun/libkrunfw.git
 fi
 
 cd libkrunfw
 
 # Ensure we're on the pinned commit for reproducible builds
-if [ -n "${LIBKRUNFW_REF:-}" ]; then
-  echo "    Checking out pinned ref: ${LIBKRUNFW_REF}"
-  git fetch origin
-  git checkout "${LIBKRUNFW_REF}"
-fi
+echo "    Checking out pinned ref: ${LIBKRUNFW_REF}"
+git fetch origin
+git checkout "${LIBKRUNFW_REF}"
 
 # Copy custom kernel config fragment
 if [ -f "$KERNEL_CONFIG" ]; then
@@ -274,6 +273,14 @@ for artifact in kernel.c ABI_VERSION; do
   cp "$artifact" "$OUTPUT_DIR/"
 done
 echo "    Built: $(ls "$OUTPUT_DIR"/libkrunfw.so* | xargs -n1 basename | tr '\n' ' ')"
+
+# Record the kernel inputs for package-vm-runtime.sh. The macOS job reuses
+# kernel.c without a libkrunfw checkout, so it reads this file instead.
+kernel_config_sha256="$(sha256sum "${KERNEL_SOURCES}/.config" | awk '{print $1}')"
+printf '{"libkrunfw_commit":"%s","kernel_version":"%s","kernel_config_sha256":"%s"}\n' \
+  "$(git rev-parse HEAD)" "$KERNEL_VERSION" "$kernel_config_sha256" \
+  > "$OUTPUT_DIR/provenance.json"
+echo "    Kernel config sha256: ${kernel_config_sha256}"
 
 cd "$BUILD_DIR"
 
@@ -415,9 +422,6 @@ echo "==> Building libkrun..."
 ensure_cargo_for_libkrun
 ensure_libclang_for_libkrun
 
-# LIBKRUN_REF is sourced from pins.env (line 32); env-var override still works.
-LIBKRUN_REF="${LIBKRUN_REF:-728df8125077d0db44265f6e997c72b81b65c015}"
-
 if [ ! -d libkrun ]; then
   echo "    Cloning libkrun..."
   git clone https://github.com/libkrun/libkrun.git
@@ -425,11 +429,12 @@ fi
 
 cd libkrun
 
-if [ -n "${LIBKRUN_REF:-}" ]; then
-  echo "    Checking out pinned ref: ${LIBKRUN_REF}"
-  git fetch origin "${LIBKRUN_REF}" 2>/dev/null || git fetch origin
-  git checkout "${LIBKRUN_REF}" 2>/dev/null || git checkout "origin/${LIBKRUN_REF}" 2>/dev/null || true
-fi
+echo "    Checking out pinned ref: ${LIBKRUN_REF}"
+git fetch origin "${LIBKRUN_REF}" 2>/dev/null || git fetch origin
+git checkout "${LIBKRUN_REF}" 2>/dev/null || git checkout "origin/${LIBKRUN_REF}" 2>/dev/null || {
+  echo "Error: could not check out LIBKRUN_REF=${LIBKRUN_REF} in $(pwd) (dirty tree or unknown ref?)" >&2
+  exit 1
+}
 
 echo "    Building libkrun with NET=1 BLK=1..."
 cargo build --release --features blk --features net --target-dir="$(pwd)/target"

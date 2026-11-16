@@ -13,13 +13,13 @@ struct RenewingGrpcBoundary {
 }
 
 #[tonic::async_trait]
-impl IsolationBoundary for RenewingGrpcBoundary {
+impl SandboxProtocol for RenewingGrpcBoundary {
     type ExchangeStream = TestGrpcStream;
-    type MediateStream = TestGrpcStream;
+    type MediateStream = TestGrpcStream<MediateFrame>;
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<ExchangeFrame>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         if self
             .failures
@@ -40,9 +40,11 @@ impl IsolationBoundary for RenewingGrpcBoundary {
 
     async fn mediate(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<MediateFrame>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
-        self.exchange(request).await
+        let mut inner = self.inner.clone();
+        inner.expected_token = self.expected_token.read().unwrap().clone();
+        inner.mediate(request).await
     }
 }
 
@@ -67,6 +69,8 @@ async fn renewing_boundary_client(
             mediation_ready: false,
             provider_environment_generation: 0,
             confirmation: test_confirmation(),
+            attach_snapshots: Arc::default(),
+            received: Arc::default(),
         },
         expected_token: Arc::new(std::sync::RwLock::new("a".repeat(32))),
         failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -87,7 +91,8 @@ async fn renewing_boundary_client(
             let service = server_service.clone();
             connections.spawn(async move {
                 tonic::transport::Server::builder()
-                    .add_service(IsolationBoundaryServer::new(service))
+                    .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                    .add_service(SandboxProtocolServer::new(service))
                     .serve_with_incoming(
                         tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(Box::new(stream)))])
                             .chain(tokio_stream::pending()),
@@ -105,7 +110,8 @@ async fn renewing_boundary_client(
         .call_idempotent(Request::Attach {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
-            resource_claims: std::collections::BTreeMap::new(),
+            supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: None,
         })
         .await
         .unwrap();

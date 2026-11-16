@@ -18,6 +18,29 @@ rules:
       - pods
     verbs:
       - get
+  {{- if include "openshell.supervisorEnabled" . }}
+  # The Kubernetes driver reads the shared supervisor Service to scope each
+  # sandbox's control egress to the supervisor Pods it selects.
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    resourceNames:
+      - {{ include "openshell.supervisorName" . }}
+    verbs:
+      - get
+  # The gateway delivers the supervisor token it mints by replacing the token
+  # in the chart-created Secret; it creates no Secrets here.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    resourceNames:
+      - {{ include "openshell.supervisorName" . }}-token
+    verbs:
+      - get
+      - patch
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -98,233 +98,137 @@ pub fn last_sandbox_path(gateway: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_environment::Environment;
 
     #[test]
-    #[allow(unsafe_code)]
     fn system_config_dir_defaults_to_etc_openshell() {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig_sys = std::env::var(SYSTEM_GATEWAY_DIR_ENV).ok();
-        unsafe {
-            std::env::remove_var(SYSTEM_GATEWAY_DIR_ENV);
-        }
-        assert_eq!(system_config_dir(), PathBuf::from("/etc/openshell"));
-        assert_eq!(
-            system_gateways_dir(),
-            PathBuf::from("/etc/openshell/gateways")
-        );
-        assert_eq!(
-            system_active_gateway_path(),
-            PathBuf::from("/etc/openshell/active_gateway")
-        );
-        unsafe {
-            match orig_sys {
-                Some(v) => std::env::set_var(SYSTEM_GATEWAY_DIR_ENV, v),
-                None => std::env::remove_var(SYSTEM_GATEWAY_DIR_ENV),
-            }
-        }
+        Environment::new().remove(SYSTEM_GATEWAY_DIR_ENV).run(|| {
+            assert_eq!(system_config_dir(), PathBuf::from("/etc/openshell"));
+            assert_eq!(
+                system_gateways_dir(),
+                PathBuf::from("/etc/openshell/gateways")
+            );
+            assert_eq!(
+                system_active_gateway_path(),
+                PathBuf::from("/etc/openshell/active_gateway")
+            );
+        });
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn system_config_dir_prefers_env_override() {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         let override_dir = tmp.path().join("openshell-system");
-        let orig_sys = std::env::var(SYSTEM_GATEWAY_DIR_ENV).ok();
-        unsafe {
-            std::env::set_var(SYSTEM_GATEWAY_DIR_ENV, &override_dir);
-        }
-        assert_eq!(system_config_dir(), override_dir);
-        assert_eq!(
-            system_gateways_dir(),
-            tmp.path().join("openshell-system/gateways")
-        );
-        assert_eq!(
-            system_active_gateway_path(),
-            tmp.path().join("openshell-system/active_gateway")
-        );
-        unsafe {
-            match orig_sys {
-                Some(v) => std::env::set_var(SYSTEM_GATEWAY_DIR_ENV, v),
-                None => std::env::remove_var(SYSTEM_GATEWAY_DIR_ENV),
-            }
-        }
+
+        Environment::new()
+            .set(SYSTEM_GATEWAY_DIR_ENV, &override_dir)
+            .run(|| {
+                let override_dir = PathBuf::from(std::env::var_os(SYSTEM_GATEWAY_DIR_ENV).unwrap());
+                assert_eq!(system_config_dir(), override_dir);
+                assert_eq!(system_gateways_dir(), override_dir.join("gateways"));
+                assert_eq!(
+                    system_active_gateway_path(),
+                    override_dir.join("active_gateway")
+                );
+            });
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn system_config_dir_ignores_empty_env_override() {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig_sys = std::env::var(SYSTEM_GATEWAY_DIR_ENV).ok();
-        unsafe {
-            std::env::set_var(SYSTEM_GATEWAY_DIR_ENV, "");
-        }
-        assert_eq!(system_config_dir(), PathBuf::from("/etc/openshell"));
-        unsafe {
-            match orig_sys {
-                Some(v) => std::env::set_var(SYSTEM_GATEWAY_DIR_ENV, v),
-                None => std::env::remove_var(SYSTEM_GATEWAY_DIR_ENV),
-            }
-        }
+        Environment::new().set(SYSTEM_GATEWAY_DIR_ENV, "").run(|| {
+            assert_eq!(system_config_dir(), PathBuf::from("/etc/openshell"));
+        });
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn system_config_dir_ignores_relative_env_override() {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig_sys = std::env::var(SYSTEM_GATEWAY_DIR_ENV).ok();
-        unsafe {
-            std::env::set_var(SYSTEM_GATEWAY_DIR_ENV, "relative/openshell-system");
-        }
-        assert_eq!(system_config_dir(), PathBuf::from("/etc/openshell"));
-        unsafe {
-            match orig_sys {
-                Some(v) => std::env::set_var(SYSTEM_GATEWAY_DIR_ENV, v),
-                None => std::env::remove_var(SYSTEM_GATEWAY_DIR_ENV),
-            }
-        }
+        Environment::new()
+            .set(SYSTEM_GATEWAY_DIR_ENV, "relative/openshell-system")
+            .run(|| {
+                assert_eq!(system_config_dir(), PathBuf::from("/etc/openshell"));
+            });
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn user_gateway_dir_layout() {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        }
-        assert_eq!(
-            user_gateway_dir("my-gateway").unwrap(),
-            tmp.path().join("openshell/gateways/my-gateway")
-        );
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+
+        Environment::new()
+            .set("XDG_CONFIG_HOME", tmp.path())
+            .run(|| {
+                let tmp = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+                assert_eq!(
+                    user_gateway_dir("my-gateway").unwrap(),
+                    tmp.join("openshell/gateways/my-gateway")
+                );
+            });
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn user_gateway_dir_rejects_multi_component_gateway_names() {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        }
-        let err = user_gateway_dir("../escape").unwrap_err();
-        assert!(err.to_string().contains("single path component"));
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+
+        Environment::new()
+            .set("XDG_CONFIG_HOME", tmp.path())
+            .run(|| {
+                let err = user_gateway_dir("../escape").unwrap_err();
+                assert!(err.to_string().contains("single path component"));
+            });
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn system_gateway_dir_layout() {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         let override_dir = tmp.path().join("openshell-system");
-        let orig_sys = std::env::var(SYSTEM_GATEWAY_DIR_ENV).ok();
-        unsafe {
-            std::env::set_var(SYSTEM_GATEWAY_DIR_ENV, &override_dir);
-        }
-        assert_eq!(
-            system_gateway_dir("my-gateway").unwrap(),
-            override_dir.join("gateways/my-gateway")
-        );
-        unsafe {
-            match orig_sys {
-                Some(v) => std::env::set_var(SYSTEM_GATEWAY_DIR_ENV, v),
-                None => std::env::remove_var(SYSTEM_GATEWAY_DIR_ENV),
-            }
-        }
+
+        Environment::new()
+            .set(SYSTEM_GATEWAY_DIR_ENV, &override_dir)
+            .run(|| {
+                let override_dir = PathBuf::from(std::env::var_os(SYSTEM_GATEWAY_DIR_ENV).unwrap());
+                assert_eq!(
+                    system_gateway_dir("my-gateway").unwrap(),
+                    override_dir.join("gateways/my-gateway")
+                );
+            });
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn system_gateway_dir_rejects_multi_component_gateway_names() {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         let override_dir = tmp.path().join("openshell-system");
-        let orig_sys = std::env::var(SYSTEM_GATEWAY_DIR_ENV).ok();
-        unsafe {
-            std::env::set_var(SYSTEM_GATEWAY_DIR_ENV, &override_dir);
-        }
-        let err = system_gateway_dir("../escape").unwrap_err();
-        assert!(err.to_string().contains("single path component"));
-        unsafe {
-            match orig_sys {
-                Some(v) => std::env::set_var(SYSTEM_GATEWAY_DIR_ENV, v),
-                None => std::env::remove_var(SYSTEM_GATEWAY_DIR_ENV),
-            }
-        }
+
+        Environment::new()
+            .set(SYSTEM_GATEWAY_DIR_ENV, &override_dir)
+            .run(|| {
+                let err = system_gateway_dir("../escape").unwrap_err();
+                assert!(err.to_string().contains("single path component"));
+            });
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn last_sandbox_path_layout() {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        }
-        let path = last_sandbox_path("my-gateway").unwrap();
-        assert!(
-            path.ends_with("openshell/gateways/my-gateway/last_sandbox"),
-            "unexpected path: {path:?}"
-        );
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+
+        Environment::new()
+            .set("XDG_CONFIG_HOME", tmp.path())
+            .run(|| {
+                let path = last_sandbox_path("my-gateway").unwrap();
+                assert!(
+                    path.ends_with("openshell/gateways/my-gateway/last_sandbox"),
+                    "unexpected path: {path:?}"
+                );
+            });
     }
 
-    #[allow(unsafe_code)]
     #[test]
     fn last_sandbox_path_rejects_multi_component_gateway_names() {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        }
-        let err = last_sandbox_path("../escape").unwrap_err();
-        assert!(err.to_string().contains("single path component"));
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+
+        Environment::new()
+            .set("XDG_CONFIG_HOME", tmp.path())
+            .run(|| {
+                let err = last_sandbox_path("../escape").unwrap_err();
+                assert!(err.to_string().contains("single path component"));
+            });
     }
 }

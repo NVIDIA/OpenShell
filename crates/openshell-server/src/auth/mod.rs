@@ -8,6 +8,7 @@
 //! - `identity`: Provider-agnostic identity representation
 //! - `http`: HTTP endpoints for auth discovery and token exchange
 
+pub mod audit;
 pub mod authenticator;
 pub mod authz;
 pub mod compute_driver;
@@ -16,6 +17,7 @@ pub mod extension_mint_limit;
 pub mod guard;
 mod http;
 pub mod identity;
+pub mod launch_signing;
 pub mod method_authz;
 pub mod oidc;
 pub mod peer;
@@ -23,6 +25,7 @@ pub mod principal;
 pub mod sandbox_jwt;
 pub mod sandbox_methods;
 pub mod sandbox_session;
+pub mod supervisor_token;
 pub mod workspace_authz;
 
 pub use http::router;

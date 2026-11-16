@@ -3,7 +3,7 @@
 
 //! Builder for Detection Finding [2004] events.
 
-use crate::builders::EventContext;
+use crate::builders::{ContextRef, EventOrigin};
 use crate::enums::{ActionId, ActivityId, ConfidenceId, DispositionId, RiskLevelId, SeverityId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{DetectionFindingEvent, OcsfEvent};
@@ -11,7 +11,7 @@ use crate::objects::{Attack, Evidence, FindingInfo, Remediation};
 
 /// Builder for Detection Finding [2004] events.
 pub struct DetectionFindingBuilder<'a> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
     activity: ActivityId,
     severity: SeverityId,
     action: Option<ActionId>,
@@ -25,14 +25,15 @@ pub struct DetectionFindingBuilder<'a> {
     risk_level: Option<RiskLevelId>,
     message: Option<String>,
     log_source: Option<String>,
+    correlation_uid: Option<String>,
     unmapped: serde_json::Map<String, serde_json::Value>,
 }
 
 impl<'a> DetectionFindingBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a EventContext) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
             activity: ActivityId::Open,
             severity: SeverityId::Medium,
             action: None,
@@ -46,6 +47,7 @@ impl<'a> DetectionFindingBuilder<'a> {
             risk_level: None,
             message: None,
             log_source: None,
+            correlation_uid: None,
             unmapped: serde_json::Map::new(),
         }
     }
@@ -73,6 +75,13 @@ impl<'a> DetectionFindingBuilder<'a> {
     #[must_use]
     pub fn log_source(mut self, source: impl Into<String>) -> Self {
         self.log_source = Some(source.into());
+        self
+    }
+
+    /// Set the identifier shared by events about the same incident.
+    #[must_use]
+    pub fn correlation_uid(mut self, uid: impl Into<String>) -> Self {
+        self.correlation_uid = Some(uid.into());
         self
     }
 
@@ -114,12 +123,16 @@ impl<'a> DetectionFindingBuilder<'a> {
     #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity.finding_label().to_string();
-        let mut metadata = self
-            .ctx
-            .metadata(&["security_control", "container", "host"]);
+        // Only supervisors describe a container on the producing device.
+        let profiles: &[&str] = match self.ctx.origin {
+            EventOrigin::Gateway { .. } => &["security_control", "host"],
+            EventOrigin::Supervisor => &["security_control", "container", "host"],
+        };
+        let mut metadata = self.ctx.metadata(profiles);
         if let Some(source) = self.log_source {
             metadata.log_source = Some(source);
         }
+        metadata.correlation_uid = self.correlation_uid;
 
         let mut base = BaseEventData::new(
             2004,
@@ -168,7 +181,41 @@ impl_builder_setters!(DetectionFindingBuilder, no_status);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builders::test_sandbox_context;
+    use crate::builders::{test_gateway_context, test_sandbox_context};
+
+    #[test]
+    fn gateway_finding_identifies_context_sandbox_in_unmapped() {
+        // Gateway-wide findings name no sandbox; MXC findings name the
+        // sandbox they concern.
+        for (sandbox_id, profiles) in [
+            ("", serde_json::json!(["security_control", "host"])),
+            ("sb-1", serde_json::json!(["security_control", "host"])),
+        ] {
+            let mut ctx = test_gateway_context();
+            ctx.sandbox_id = sandbox_id.to_string();
+            let json = DetectionFindingBuilder::new(&ctx)
+                .finding_info(FindingInfo::new(
+                    "cross-sandbox-access",
+                    "Cross-Sandbox Access",
+                ))
+                .correlation_uid("6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f")
+                .build()
+                .to_json()
+                .unwrap();
+
+            assert_eq!(
+                json["metadata"]["correlation_uid"],
+                "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f"
+            );
+            assert_eq!(json["metadata"]["profiles"], profiles, "{sandbox_id:?}");
+            assert!(json["device"].get("container").is_none());
+            assert!(json.get("resources").is_none());
+            assert_eq!(
+                json["unmapped"]["sandbox_id"].as_str(),
+                (!sandbox_id.is_empty()).then_some(sandbox_id)
+            );
+        }
+    }
 
     #[test]
     fn test_detection_finding_builder() {

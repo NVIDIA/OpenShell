@@ -111,4 +111,25 @@ assert_helm_image_translation "sandbox" \
   "registry.example/sandbox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
   "registry.example" "sandbox" "" "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
+# The certgen hook uses the chart's shared registry fallback. The Kubernetes
+# harness must propagate the gateway registry there too, including an empty
+# registry for k3d-imported local images.
+if grep -Fq 'helm_values_args+=(--set-string "global.image.registry=$(e2e_image_reference_registry "${GATEWAY_IMAGE}")")' "${ROOT}/e2e/with-kube-gateway.sh"; then
+  :
+else
+  echo "FAIL: Kubernetes Helm installs must propagate the gateway registry to certgen" >&2
+  exit 1
+fi
+
+# The Vault credential-driver overlay must use the fixture alias created in
+# the gateway namespace. The alias is covered by OpenBao's development TLS
+# certificate; the chart's namespace service is not.
+if grep -Fq 'address: https://openbao-0:8200' \
+  "${ROOT}/deploy/helm/openshell/ci/values-credential-driver-vault.yaml"; then
+  :
+else
+  echo "FAIL: Vault credential-driver overlay must use the OpenBao TLS alias" >&2
+  exit 1
+fi
+
 echo "E2E image override tests passed."

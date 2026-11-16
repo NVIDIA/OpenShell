@@ -966,12 +966,35 @@ fn endpoint_matches_connection(endpoint: &Endpoint, action: &SymbolicAction) -> 
 }
 
 fn endpoint_path_matches(endpoint: &Endpoint, action: &SymbolicAction) -> Bool {
-    let path = if endpoint.path.is_empty() {
-        "**"
+    let pattern = endpoint.path.as_str();
+    // Mirror openshell_core::endpoint_path, not the REST rule glob matcher.
+    if matches!(pattern, "" | "**" | "/**") {
+        return Bool::from_bool(true);
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        // The entire prefix is literal, including any wildcard characters.
+        return Bool::or(&[
+            action.path.eq(prefix),
+            Z3String::from_str(&format!("{prefix}/"))
+                .unwrap()
+                .prefix(&action.path),
+        ]);
+    }
+    if glob::Pattern::new(pattern).is_err() {
+        return action.path.eq(pattern);
+    }
+    // Rust glob consumes the slash after ** while parsing. A terminal **/
+    // therefore matches the rest of the path, even without a trailing slash.
+    let pattern = if pattern.ends_with("/**/") {
+        &pattern[..pattern.len() - 1]
     } else {
-        &endpoint.path
+        pattern
     };
-    action.path.regex_matches(&glob_regex(path, "/"))
+    // Validation excludes ?, brackets, braces and escapes. For the remaining
+    // Rust glob language, a single star also crosses path separators.
+    action
+        .path
+        .regex_matches(&path_glob_regex(pattern, &Regexp::full()))
 }
 
 fn method_and_path_match(method: &str, path: &str, action: &SymbolicAction) -> Bool {
@@ -2136,7 +2159,7 @@ fn glob_regex(pattern: &str, separator: &str) -> Regexp {
         return Regexp::full();
     }
     if separator == "/" {
-        return path_glob_regex(pattern);
+        return path_glob_regex(pattern, &non_separator_regex("/").star());
     }
     let mut parts = Vec::new();
     let mut chars = pattern.chars().peekable();
@@ -2159,7 +2182,7 @@ fn glob_regex(pattern: &str, separator: &str) -> Regexp {
     }
 }
 
-fn path_glob_regex(pattern: &str) -> Regexp {
+fn path_glob_regex(pattern: &str, single_star: &Regexp) -> Regexp {
     let mut parts = Vec::new();
     let mut segments = pattern.split('/').peekable();
     while let Some(segment) = segments.next() {
@@ -2180,9 +2203,10 @@ fn path_glob_regex(pattern: &str) -> Regexp {
             });
         } else {
             for character in segment.chars() {
-                // Embedded stars, including **, cannot cross a separator.
+                // REST rule stars stay within a segment; endpoint selector
+                // stars use the unrestricted Rust glob match language.
                 parts.push(if character == '*' {
-                    non_separator_regex("/").star()
+                    single_star.clone()
                 } else {
                     Regexp::literal(&character.to_string())
                 });
@@ -2223,6 +2247,16 @@ mod tests {
 
     fn parse(value: &str) -> ContainmentPolicy {
         parse_policy_str(value).expect("valid policy")
+    }
+
+    #[test]
+    fn unknown_policy_controls_are_not_silently_omitted_from_containment_checks() {
+        for control in ["ui", "unsupported_control"] {
+            let source = format!("version: 1\n{control}: {{}}\n");
+            let error =
+                parse_policy_str(&source).expect_err("unknown policy authority must fail closed");
+            assert!(error.to_string().contains(control));
+        }
     }
 
     fn options() -> CheckOptions {
@@ -3313,6 +3347,71 @@ network_policies:
                 check_within_boundary(&root, &boundary, options()),
                 CheckResult::Within(_)
             ));
+        }
+    }
+
+    #[test]
+    fn endpoint_paths_match_the_canonical_runtime_matcher() {
+        for pattern in [
+            "",
+            "**",
+            "/**",
+            "/a",
+            "/a/*",
+            "/a/*/b",
+            "/a/**",
+            "/a/**/b",
+            "/a/**/**/b",
+            "/a/**/",
+            "/**/",
+            "/a/**/**/",
+            "/a/**/b/**/",
+            "/a/*/**/",
+            "/a*/**",
+            "/a/**/**",
+            "/a/x**/b",
+            "/a/**x/b",
+            "/a/***/b",
+        ] {
+            let endpoint: Endpoint = serde_json::from_value(serde_json::json!({
+                "host": "api.example.com", "port": 443, "path": pattern,
+            }))
+            .unwrap();
+            let mut action = symbolic_action("endpoint_path_parity");
+            for path in [
+                pattern,
+                "/",
+                "/a",
+                "/a/",
+                "/a/b",
+                "/a/x/b",
+                "/a/x/y/b",
+                "/a/x/y/",
+                "/a/xb/b",
+                "/a/xx/b",
+                "/ab/c",
+                "/a*",
+                "/a*/b",
+                "/a/**",
+                "/a/**/b",
+                "/a/é/b",
+                "/a/汉/b",
+                "/a/e\u{301}/b",
+                "/a/😀/b",
+            ] {
+                action.path = Z3String::from_str(path).unwrap();
+                let solver = Solver::new();
+                solver.assert(endpoint_path_matches(&endpoint, &action));
+                assert_eq!(
+                    solver.check(),
+                    if openshell_core::endpoint_path::matches(pattern, path) {
+                        SatResult::Sat
+                    } else {
+                        SatResult::Unsat
+                    },
+                    "pattern={pattern:?} path={path:?}"
+                );
+            }
         }
     }
 

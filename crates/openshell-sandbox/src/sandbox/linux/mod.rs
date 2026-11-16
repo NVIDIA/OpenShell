@@ -11,6 +11,8 @@ use openshell_core::policy::SandboxPolicy;
 use std::path::PathBuf;
 use std::sync::Once;
 
+pub use landlock::require_abi as require_landlock_abi;
+
 /// Opaque handle to a prepared-but-not-yet-enforced sandbox.
 /// Holds the Landlock ruleset with `PathFds` opened before child exec.
 pub struct PreparedSandbox {
@@ -86,7 +88,7 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
 /// installation, so this order is mandatory for capability-free children.
 pub fn enforce_capability_free(
     prepared: PreparedSandbox,
-    child_hardening: &mut openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    child_hardening: &mut crate::linux::child_seccomp::ChildHardeningProgram,
 ) -> Result<()> {
     for ruleset in prepared.landlock {
         landlock::enforce(ruleset)?;

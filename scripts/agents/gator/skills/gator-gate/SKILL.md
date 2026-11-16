@@ -40,7 +40,14 @@ If the `principal-engineer-reviewer` sub-agent fails before producing usable rev
 - You may push changes only when explicitly instructed by a GitHub comment from a maintainer or by a direct operator prompt.
 - Do not post `/ok to test <full-head-sha>` unless the current GitHub user has maintainer authority.
 - Code review is code-only. Do not run pre-commit, unit tests, or E2E locally as part of the initial PR review unless explicitly instructed.
-- Security vulnerabilities must not be triaged through public GitHub issues. Follow `SECURITY.md`.
+- Surface security-related findings introduced or newly exposed by an unmerged
+  PR in that PR's normal review, using the same evidence, severity, and blocker
+  rules as other findings. A security classification alone does not require
+  private triage or suspend operator-authorized test dispatch.
+- For pre-existing vulnerabilities independent of the PR, follow `SECURITY.md`:
+  retain detailed evidence privately and notify the operator without publishing
+  exploit details. Do not initiate external disclosure, contact PSIRT, or submit
+  a security report without explicit operator authorization.
 
 Maintainer authority means one of:
 
@@ -132,6 +139,13 @@ Treat the ledger as required reviewer input, not optional background:
 - Use `current_patch_id`, `previous_reviewed_patch_id`, base SHA, and merge-base
   SHA to preserve review identity across rebases and merge-main commits. If
   `rebase_equivalent` is true, do not review the same effective patch again.
+- A null `current_patch_id` disables patch-equivalence shortcuts; it does not
+  invalidate the feedback ledger. Preserve exact-SHA history and review the
+  author-only delta conservatively when the head changed.
+- For large PRs, fetch the exact commits and inspect local `git diff` output
+  file-by-file. Do not depend on `gh pr diff` or GitHub's full-diff endpoint:
+  those reject oversized diffs. Review schema/generated changes separately
+  from handwritten behavior, without silently excluding them from scope.
 - For a non-equivalent rebase, compare author patch IDs or use `git range-diff`
   to isolate the author-only delta. Upstream changes are context, not new PR
   findings.
@@ -527,7 +541,7 @@ Validate small and concentrated work when it has clear motivation and one of the
 - TUI, CLI, or API quality-of-life improvement with a clear user path
 - Driver improvement that makes sandbox lifecycle management easier or more efficient
 - Documentation clarification, typo fix, errata, or missing documentation
-- CI/CD/build/release improvement, including Snap, package, release, or test harness work
+- CI/CD/build/release improvement, including snap, package, release, or test harness work
 
 Documentation changes from non-maintainers must not reorder ToC items, change fundamental hierarchy, or restructure docs without a clear maintainer-approved reason.
 
@@ -644,6 +658,14 @@ Keep reviews proportional, scope-bound, and convergent:
 - Route pre-existing security defects through the private security process.
   Do not publish exploit details or make them blockers on the current PR.
   Route other pre-existing defects to a non-blocking follow-up.
+- A pre-existing unsafe primitive does not make a new PR-owned exposure
+  pre-existing. Compare base and head: if the PR creates a new reachable path,
+  trusted sink, or security contract that makes the defect exploitable, surface
+  the regression in the PR review with its invariant, impact, fix, and verification.
+  Do not substitute a generic private-security notice for actionable feedback
+  or invent a `private_security_review_required` gate solely because the finding
+  is security-related. Existing review blockers still follow normal state rules;
+  this distinction does not waive findings or authorize tests otherwise forbidden.
 - Treat docs, skill drift, diagnostic wording, and test-strength feedback as
   non-blocking unless the published contract is materially false, the
   diagnostic causes an operational or safety failure, or missing coverage

@@ -24,12 +24,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
-source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
+source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env"
 
 RELEASE_TAG="${VM_RUNTIME_RELEASE_TAG:-vm-runtime}"
 REPO="${GITHUB_REPOSITORY:-NVIDIA/OpenShell}"
 OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
-UMOCI_VERSION="${UMOCI_VERSION:-v0.6.0}"
 
 # ── Auto-detect platform (detect_platform from _lib.sh) ─────────────────
 

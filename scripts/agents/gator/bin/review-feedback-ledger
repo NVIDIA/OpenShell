@@ -119,13 +119,28 @@ query(
     merge_base_sha="$(gh api \
         "repos/$owner/$repo/compare/$base_sha...$head_sha" \
         --jq '.merge_base_commit.sha')"
-    patch_id="$(
-        gh api \
-            -H 'Accept: application/vnd.github.v3.diff' \
-            "repos/$owner/$repo/pulls/$pr_number" |
-            git patch-id --stable |
-            awk 'NR == 1 { print $1 }'
-    )"
+    # GitHub's full-diff endpoint rejects large PRs. Fetch only the two
+    # immutable trees needed for patch identity; never check out PR code.
+    # Patch identity is optional: failure disables equivalence shortcuts,
+    # not the mandatory feedback ledger or its exact-SHA review history.
+    patch_id=""
+    if [[ "$merge_base_sha" =~ ^[0-9a-f]{40}$ && "$head_sha" =~ ^[0-9a-f]{40}$ ]] &&
+        git init --bare --quiet "$tmp/trees.git" &&
+        GIT_TERMINAL_PROMPT=0 git -C "$tmp/trees.git" \
+            -c credential.helper='!gh auth git-credential' \
+            fetch --quiet --no-tags --no-recurse-submodules --depth=1 \
+            "https://github.com/$owner/$repo.git" "$merge_base_sha" "$head_sha" &&
+        patch_id="$(
+            git -C "$tmp/trees.git" diff --no-ext-diff --no-textconv \
+                --no-renames "$merge_base_sha" "$head_sha" -- |
+                git patch-id --stable |
+                awk 'NR == 1 { print $1 }'
+        )"; then
+        :
+    else
+        patch_id=""
+        echo "patch identity unavailable; rebase equivalence disabled" >&2
+    fi
 
     jq -n \
         --arg head_sha "$head_sha" \

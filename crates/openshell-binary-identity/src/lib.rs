@@ -13,12 +13,19 @@ use openshell_isolation_interface::contract::{BinaryIdentity, ResolveError};
 #[cfg(target_os = "linux")]
 use openshell_isolation_interface::contract::{ExecutableIdentity, Sha256Digest};
 #[cfg(target_os = "linux")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
 const EXECUTABLE_DIGEST_CACHE_CAPACITY: usize = 1_024;
+
+/// Bounds the total cmdline bytes read from `/proc/<pid>/cmdline`. This is a
+/// diagnostic-read cap on the whole command line, not a per-argument limit:
+/// the kernel allows a single argument larger than this cap, so one
+/// maximum-size argument plus argv[0] already exceeds it and is truncated.
+#[cfg(target_os = "linux")]
+const CMDLINE_READ_LIMIT: usize = 128 * 1024;
 
 /// Resolves executable identity from a Linux procfs process identifier.
 ///
@@ -106,29 +113,31 @@ fn resolve_linux_process(
         .map(|(snapshot, _)| snapshot.binary_path.clone())
         .collect::<Vec<_>>();
     excluded_paths.push(snapshot.binary_path.clone());
-    let cmdline_paths = cmdline_absolute_paths(&snapshot.cmdline)
-        .into_iter()
-        .chain(
-            ancestor_processes
-                .iter()
-                .flat_map(|(snapshot, _)| cmdline_absolute_paths(&snapshot.cmdline)),
-        )
-        .filter(|path| !excluded_paths.contains(path))
-        .fold(Vec::new(), |mut paths, path| {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-            paths
-        });
+    let cmdline_paths = collect_cmdline_paths(
+        &snapshot.cmdline,
+        ancestor_processes
+            .iter()
+            .map(|(snapshot, _)| snapshot.cmdline.as_slice()),
+        &excluded_paths,
+    );
 
-    let (executable_identity, pending_cache_entry) =
-        resolve_open_executable(&snapshot, &mut executable, cache)?;
-    let mut pending_cache_entries = pending_cache_entry.into_iter().collect::<Vec<_>>();
+    // Digests computed during this call. They reach the shared cache only after
+    // every snapshot validates, but later processes in the chain reuse them.
+    let mut pending_cache_entries = HashMap::new();
+    let executable_identity = resolve_open_executable(
+        &snapshot,
+        &mut executable,
+        cache,
+        &mut pending_cache_entries,
+    )?;
     let mut ancestors = Vec::with_capacity(ancestor_processes.len());
     for (ancestor, executable) in &mut ancestor_processes {
-        let (identity, pending_cache_entry) = resolve_open_executable(ancestor, executable, cache)?;
-        ancestors.push(identity);
-        pending_cache_entries.extend(pending_cache_entry);
+        ancestors.push(resolve_open_executable(
+            ancestor,
+            executable,
+            cache,
+            &mut pending_cache_entries,
+        )?);
     }
 
     validate_process_snapshot(pid, &snapshot)?;
@@ -151,23 +160,21 @@ fn resolve_open_executable(
     snapshot: &ProcessSnapshot,
     executable: &mut std::fs::File,
     cache: &Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>,
-) -> Result<
-    (
-        ExecutableIdentity,
-        Option<(ExecutableCacheKey, Sha256Digest)>,
-    ),
-    ResolveError,
-> {
+    pending: &mut HashMap<ExecutableCacheKey, Sha256Digest>,
+) -> Result<ExecutableIdentity, ResolveError> {
     let key = snapshot.executable_cache_key();
-    let cached_digest = cached_executable_digest(cache, key);
-    let digest = cached_digest.map_or_else(|| hash_executable(snapshot.pid, executable), Ok)?;
-    Ok((
-        ExecutableIdentity {
-            path: snapshot.binary_path.clone(),
-            digest: Some(digest),
-        },
-        cached_digest.is_none().then_some((key, digest)),
-    ))
+    let known = pending
+        .get(&key)
+        .copied()
+        .or_else(|| cached_executable_digest(cache, key));
+    let digest = known.map_or_else(|| hash_executable(snapshot.pid, executable), Ok)?;
+    if known.is_none() {
+        pending.insert(key, digest);
+    }
+    Ok(ExecutableIdentity {
+        path: snapshot.binary_path.clone(),
+        digest: Some(digest),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -236,7 +243,11 @@ fn cache_executable_digest(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if cache.len() >= EXECUTABLE_DIGEST_CACHE_CAPACITY {
-        cache.clear();
+        // Evict a single arbitrary entry: clearing the whole cache would
+        // force a rehash of every live executable after one capacity crossing.
+        if let Some(evict) = cache.keys().next().copied() {
+            cache.remove(&evict);
+        }
     }
     cache.insert(key, digest);
 }
@@ -328,8 +339,39 @@ fn process_stat(pid: u32) -> Result<(u32, u64), ResolveError> {
 
 #[cfg(target_os = "linux")]
 fn read_process_cmdline(pid: u32) -> Result<Vec<u8>, ResolveError> {
+    use std::io::Read as _;
+
     let path = format!("/proc/{pid}/cmdline");
-    std::fs::read(&path).map_err(|error| ResolveError::Failed(format!("read {path}: {error}")))
+    let file = std::fs::File::open(&path)
+        // Keep the message prefix std::fs::read produced, so denial-path
+        // strings downstream stay byte-identical.
+        .map_err(|error| ResolveError::Failed(format!("read {path}: {error}")))?;
+    // Reading one byte past the limit makes the truncation predicate exact:
+    // a cmdline of exactly CMDLINE_READ_LIMIT bytes is kept whole.
+    let mut buffer = Vec::new();
+    file.take(CMDLINE_READ_LIMIT as u64 + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|error| ResolveError::Failed(format!("read {path}: {error}")))?;
+    Ok(cap_cmdline(buffer))
+}
+
+#[cfg(target_os = "linux")]
+fn cap_cmdline(mut buffer: Vec<u8>) -> Vec<u8> {
+    if buffer.len() <= CMDLINE_READ_LIMIT {
+        return buffer;
+    }
+    buffer.truncate(CMDLINE_READ_LIMIT);
+    // Drop the last argument whether it is partial or happens to end exactly
+    // at the cap: a truncated fragment must not reach cmdline_absolute_paths,
+    // and diagnostic-only data does not justify boundary-case recovery.
+    if buffer.last().is_some_and(|byte| *byte == 0) {
+        buffer.pop();
+    }
+    match buffer.iter().rposition(|byte| *byte == 0) {
+        Some(index) => buffer.truncate(index + 1),
+        None => buffer.clear(),
+    }
+    buffer
 }
 
 #[cfg(target_os = "linux")]
@@ -356,13 +398,19 @@ fn executable_path(pid: u32) -> Result<std::path::PathBuf, ResolveError> {
 }
 
 #[cfg(target_os = "linux")]
+// Stack buffer by design: no heap allocation per cache miss. The array is
+// zeroed on each call, a negligible cost next to hashing the executable.
+// The 64 KiB size exceeds clippy's 16 KiB large_stack_arrays default, which
+// is far below every thread stack in this call path.
+#[allow(clippy::large_stack_arrays)]
 fn hash_executable(pid: u32, executable: &mut std::fs::File) -> Result<Sha256Digest, ResolveError> {
-    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
     use std::io::Read as _;
 
     let path = format!("/proc/{pid}/exe");
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 8 * 1024];
+    let crypto_error = |error| ResolveError::Failed(format!("hash executable: {error}"));
+    let mut digest = openshell_crypto::sha256_digest().map_err(crypto_error)?;
+    let mut buffer = [0_u8; 64 * 1024];
     loop {
         let length = executable
             .read(&mut buffer)
@@ -370,9 +418,14 @@ fn hash_executable(pid: u32, executable: &mut std::fs::File) -> Result<Sha256Dig
         if length == 0 {
             break;
         }
-        digest.update(&buffer[..length]);
+        digest.update(&buffer[..length]).map_err(crypto_error)?;
     }
-    format!("{:x}", digest.finalize()).parse()
+    let bytes = digest.finish().map_err(crypto_error)?;
+    let mut hex = String::with_capacity(64);
+    for byte in bytes {
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex.parse()
 }
 
 #[cfg(target_os = "linux")]
@@ -411,14 +464,34 @@ fn collect_ancestor_processes(
 }
 
 #[cfg(target_os = "linux")]
-fn parent_pid(pid: u32) -> Option<u32> {
-    std::fs::read_to_string(format!("/proc/{pid}/status"))
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("PPid:"))?
-        .trim()
-        .parse()
-        .ok()
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProcessStatus {
+    ppid: Option<u32>,
+    innermost_nspid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_status(pid: u32) -> Option<ProcessStatus> {
+    let path = format!("/proc/{pid}/status");
+    Some(parse_process_status(&std::fs::read_to_string(path).ok()?))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_process_status(status: &str) -> ProcessStatus {
+    let mut parsed = ProcessStatus::default();
+    for line in status.lines() {
+        match line.split_once(':') {
+            Some(("PPid", value)) => parsed.ppid = value.trim().parse().ok(),
+            Some(("NSpid", value)) => {
+                parsed.innermost_nspid = value
+                    .split_whitespace()
+                    .next_back()
+                    .and_then(|nspid| nspid.parse().ok());
+            }
+            _ => {}
+        }
+    }
+    parsed
 }
 
 #[cfg(target_os = "linux")]
@@ -427,26 +500,19 @@ fn nested_pid_namespace_init(pid: u32) -> Option<u32> {
 
     let mut current = pid;
     for _ in 0..MAX_DEPTH {
-        if namespace_pid(current) == Some(1) {
+        // One status read per hop carries both the namespace PID check and
+        // the parent PID for the next hop.
+        let status = read_process_status(current)?;
+        if status.innermost_nspid == Some(1) {
             // Host PID 1 is outside every workload. A nested namespace init
             // has a distinct host PID and is a valid workload ancestry root.
             return (current != 1).then_some(current);
         }
-        current = parent_pid(current).filter(|parent| *parent > 0 && *parent != current)?;
+        current = status
+            .ppid
+            .filter(|parent| *parent > 0 && *parent != current)?;
     }
     None
-}
-
-#[cfg(target_os = "linux")]
-fn namespace_pid(pid: u32) -> Option<u32> {
-    std::fs::read_to_string(format!("/proc/{pid}/status"))
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("NSpid:"))?
-        .split_whitespace()
-        .next_back()?
-        .parse()
-        .ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -456,6 +522,32 @@ fn cmdline_absolute_paths(cmdline: &[u8]) -> Vec<std::path::PathBuf> {
         .filter(|argument| argument.first() == Some(&b'/'))
         .map(|argument| std::path::PathBuf::from(String::from_utf8_lossy(argument).into_owned()))
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn collect_cmdline_paths<'a>(
+    own_cmdline: &'a [u8],
+    ancestor_cmdlines: impl Iterator<Item = &'a [u8]>,
+    excluded_paths: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    // Insertion order is load-bearing: consumers compare the collected
+    // vectors wholesale, so the own cmdline comes first and ancestors follow
+    // nearest-first. The excluded-paths scan stays a bounded linear check
+    // over binary paths only. Candidates stream one cmdline at a time, and a
+    // PathBuf is cloned only for unique survivors, never for duplicates or
+    // excluded paths.
+    let mut paths = Vec::new();
+    let mut seen_paths: HashSet<std::path::PathBuf> = HashSet::new();
+    for cmdline in std::iter::once(own_cmdline).chain(ancestor_cmdlines) {
+        for path in cmdline_absolute_paths(cmdline) {
+            if excluded_paths.contains(&path) || seen_paths.contains(&path) {
+                continue;
+            }
+            seen_paths.insert(path.clone());
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -510,15 +602,16 @@ mod tests {
         let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0_u8]);
     }
 
-    #[test]
-    fn resolves_child_and_hashes_ancestor_chain() {
-        let parent_pid = std::process::id();
+    /// Spawns `identity_helper_process` with optional extra argv entries and
+    /// waits for its readiness signal. Only the spawn itself reports errors:
+    /// callers decide how to react (the long-cmdline test skips on E2BIG).
+    fn spawn_identity_helper(extra_args: &[String]) -> std::io::Result<ChildGuard> {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "tests::identity_helper_process"])
+            .args(extra_args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn child");
+            .spawn()?;
         let mut child_stdout = std::io::BufReader::new(child.stdout.take().expect("child stdout"));
         let mut line = String::new();
         // Wait until the helper has entered the test before taking the
@@ -532,7 +625,13 @@ mod tests {
                 break;
             }
         }
-        let child = ChildGuard(child);
+        Ok(ChildGuard(child))
+    }
+
+    #[test]
+    fn resolves_child_and_hashes_ancestor_chain() {
+        let parent_pid = std::process::id();
+        let child = spawn_identity_helper(&[]).expect("spawn child");
 
         let identity = ProcfsIdentityResolver::for_process_tree(parent_pid)
             .resolve(child.0.id())
@@ -546,6 +645,62 @@ mod tests {
     }
 
     #[test]
+    fn executable_is_hashed_once_per_resolution() {
+        let pid = std::process::id();
+        let (snapshot, mut executable) = open_process_snapshot(pid).unwrap();
+        let cache = Mutex::new(HashMap::new());
+        let mut pending = HashMap::new();
+
+        let hashed =
+            resolve_open_executable(&snapshot, &mut executable, &cache, &mut pending).unwrap();
+        assert_eq!(pending.len(), 1);
+
+        // A sentinel proves a pending digest is reused instead of rehashed.
+        let sentinel: Sha256Digest = "ab".repeat(32).parse().unwrap();
+        assert_ne!(hashed.digest, Some(sentinel));
+        pending.insert(snapshot.executable_cache_key(), sentinel);
+        let reused =
+            resolve_open_executable(&snapshot, &mut executable, &cache, &mut pending).unwrap();
+        assert_eq!(reused.digest, Some(sentinel));
+        assert!(cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hash_executable_matches_one_shot_sha256_over_the_same_file() {
+        let current_exe = std::env::current_exe().unwrap();
+        let mut executable = std::fs::File::open(&current_exe).unwrap();
+
+        let streamed = hash_executable(std::process::id(), &mut executable).unwrap();
+        let one_shot = openshell_crypto::sha256(&std::fs::read(&current_exe).unwrap()).unwrap();
+
+        assert_eq!(streamed.as_bytes(), &one_shot);
+    }
+
+    #[test]
+    fn cache_executable_digest_evicts_one_entry_at_capacity() {
+        let sentinel: Sha256Digest = "ab".repeat(32).parse().unwrap();
+        let cache = Mutex::new(HashMap::new());
+        for index in 0..EXECUTABLE_DIGEST_CACHE_CAPACITY as u64 {
+            cache_executable_digest(&cache, synthetic_cache_key(index), sentinel);
+        }
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            EXECUTABLE_DIGEST_CACHE_CAPACITY
+        );
+
+        let newest_key = synthetic_cache_key(EXECUTABLE_DIGEST_CACHE_CAPACITY as u64);
+        let newest_sentinel: Sha256Digest = "cd".repeat(32).parse().unwrap();
+        cache_executable_digest(&cache, newest_key, newest_sentinel);
+
+        // Crossing the capacity evicts exactly one entry, not the whole cache.
+        // Which entry drops is arbitrary, so only the size and the newest
+        // mapping are asserted.
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.len(), EXECUTABLE_DIGEST_CACHE_CAPACITY);
+        assert_eq!(cache.get(&newest_key), Some(&newest_sentinel));
+    }
+
+    #[test]
     fn process_tree_root_does_not_escape_into_host_ancestry() {
         let pid = std::process::id();
         let identity = ProcfsIdentityResolver::for_process_tree(pid)
@@ -553,5 +708,199 @@ mod tests {
             .expect("resolve process-tree root");
 
         assert!(identity.ancestors.is_empty());
+    }
+
+    fn synthetic_cache_key(index: u64) -> ExecutableCacheKey {
+        ExecutableCacheKey {
+            device: 1,
+            inode: index,
+            size: 1,
+            mtime: 0,
+            mtime_nsec: 0,
+            ctime: 0,
+            ctime_nsec: 0,
+        }
+    }
+
+    #[test]
+    fn resolves_child_with_cmdline_beyond_the_read_limit() {
+        // The kernel caps a single argument at a size that already reaches
+        // the whole-cmdline cap, so one oversized argument fails spawn with
+        // E2BIG before the child ever runs. The cmdline is instead pushed
+        // past CMDLINE_READ_LIMIT with several arguments that each stay under
+        // the per-argument limit. Separately, the whole argv+env list is
+        // capped at RLIMIT_STACK/4, so a host with a small stack limit can
+        // still reject the filler list with E2BIG; that skips the test
+        // instead of failing it.
+        let filler = "x".repeat(64 * 1024);
+        let fillers = [filler.clone(), filler.clone(), filler];
+        let parent_pid = std::process::id();
+        let child = match spawn_identity_helper(&fillers) {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::ArgumentListTooLong => {
+                eprintln!(
+                    "skipping: host argv+env limit (RLIMIT_STACK/4) too small for the filler arguments"
+                );
+                return;
+            }
+            Err(error) => panic!("spawn child: {error}"),
+        };
+
+        let identity = ProcfsIdentityResolver::for_process_tree(parent_pid)
+            .resolve(child.0.id())
+            .expect("resolve child identity");
+        assert!(identity.executable.digest.is_some());
+
+        let cmdline = read_process_cmdline(child.0.id()).expect("read capped cmdline");
+        assert!(cmdline.len() <= CMDLINE_READ_LIMIT);
+        // The capped cmdline ends on an argument boundary, not mid-argument.
+        assert_eq!(cmdline.last(), Some(&0));
+        // Every surviving filler argument is complete: the argv prefix
+        // (executable path plus harness flags) is far below one filler, so
+        // the cut lands inside the second filler and only the first one,
+        // which ends before the cap, survives whole.
+        let complete_fillers = cmdline
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty() && argument.iter().all(|byte| *byte == b'x'))
+            .count();
+        assert_eq!(complete_fillers, 1);
+    }
+
+    #[test]
+    fn cap_cmdline_keeps_cmdline_at_the_limit_whole() {
+        let mut buffer = b"/bin/one\0".to_vec();
+        buffer.extend(vec![b'a'; CMDLINE_READ_LIMIT - buffer.len() - 1]);
+        buffer.push(0);
+        assert_eq!(buffer.len(), CMDLINE_READ_LIMIT);
+
+        assert_eq!(cap_cmdline(buffer.clone()), buffer);
+    }
+
+    #[test]
+    fn cap_cmdline_truncates_over_limit_cmdline_and_drops_last_argument() {
+        let mut buffer = b"/bin/one\0".to_vec();
+        buffer.extend(vec![b'a'; CMDLINE_READ_LIMIT - buffer.len() - 1]);
+        buffer.push(0);
+        buffer.push(b'x');
+        assert_eq!(buffer.len(), CMDLINE_READ_LIMIT + 1);
+
+        assert_eq!(cap_cmdline(buffer), b"/bin/one\0");
+    }
+
+    #[test]
+    fn cap_cmdline_drops_argument_terminated_at_the_cut_point() {
+        // The NUL terminating the second argument is the last byte of the
+        // cut region: the argument is complete, but the cap deliberately
+        // drops it rather than recover boundary-case arguments.
+        let mut buffer = b"/bin/one\0".to_vec();
+        buffer.extend(vec![b'a'; CMDLINE_READ_LIMIT - buffer.len() - 1]);
+        buffer.push(0);
+        buffer.extend(b"/bin/two\0");
+        assert!(buffer.len() > CMDLINE_READ_LIMIT);
+
+        assert_eq!(cap_cmdline(buffer), b"/bin/one\0");
+    }
+
+    #[test]
+    fn cap_cmdline_drops_sole_argument_over_the_limit_entirely() {
+        let buffer = vec![b'a'; CMDLINE_READ_LIMIT + 1];
+
+        assert_eq!(cap_cmdline(buffer), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn cap_cmdline_passes_short_cmdlines_through() {
+        let without_trailing_nul = b"/bin/one\0/bin/two".to_vec();
+        assert_eq!(
+            cap_cmdline(without_trailing_nul.clone()),
+            without_trailing_nul
+        );
+
+        assert_eq!(cap_cmdline(Vec::new()), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn read_process_cmdline_maps_a_missing_process_to_a_read_error() {
+        // u32::MAX - 1 is beyond the kernel PID ceiling, so reading
+        // /proc/<pid>/cmdline fails. The message prefix must match what
+        // std::fs::read produced, since the string reaches identity-source
+        // denial paths downstream.
+        let pid = u32::MAX - 1;
+        match read_process_cmdline(pid) {
+            Err(ResolveError::Failed(message)) => {
+                let expected = format!("read /proc/{pid}/cmdline: ");
+                assert!(
+                    message.starts_with(&expected),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected a failed cmdline read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_process_status_reads_ppid_and_innermost_nspid() {
+        let status = "Name:\tbash\nUmask:\t0022\nState:\tS\nPPid:\t1234\n\
+                      NSpid:\t5678\t9\n";
+        let parsed = parse_process_status(status);
+        assert_eq!(parsed.ppid, Some(1234));
+        // The last NSpid field is the innermost namespace PID.
+        assert_eq!(parsed.innermost_nspid, Some(9));
+    }
+
+    #[test]
+    fn parse_process_status_keeps_a_zero_ppid_distinct_from_a_missing_one() {
+        // Some(0) vs None is load-bearing: the ancestry walk's `parent > 0`
+        // termination filter relies on a present-but-zero PPid being Some.
+        let parsed = parse_process_status("Name:\tkthreadd\nPPid:\t0\nNSpid:\t2\n");
+        assert_eq!(parsed.ppid, Some(0));
+        assert_eq!(parsed.innermost_nspid, Some(2));
+    }
+
+    #[test]
+    fn parse_process_status_reports_missing_fields_as_none() {
+        let parsed = parse_process_status("Name:\tbash\nState:\tS\n");
+        assert_eq!(parsed.ppid, None);
+        assert_eq!(parsed.innermost_nspid, None);
+    }
+
+    #[test]
+    fn parse_process_status_reports_garbage_as_none() {
+        let parsed = parse_process_status("");
+        assert_eq!(parsed.ppid, None);
+        assert_eq!(parsed.innermost_nspid, None);
+
+        let parsed = parse_process_status("PPid:\tnot-a-pid\nNSpid:\talso not pids\n");
+        assert_eq!(parsed.ppid, None);
+        assert_eq!(parsed.innermost_nspid, None);
+    }
+
+    #[test]
+    fn read_process_status_returns_none_for_a_missing_process() {
+        // u32::MAX - 1 is beyond the kernel PID ceiling, so the status file
+        // cannot be read and the namespace walk terminates on this hop.
+        // parse_process_status alone never yields None: only the failed read
+        // does, which keeps a garbage status distinct from an absent one.
+        assert_eq!(read_process_status(u32::MAX - 1), None);
+    }
+
+    #[test]
+    fn collect_cmdline_paths_preserves_order_and_deduplicates() {
+        let own = b"/own/exe\0/usr/bin/dupe\0relative\0".to_vec();
+        let ancestors = [
+            b"/anc/one\0/usr/bin/dupe\0".to_vec(),
+            b"/anc/one\0/anc/two\0".to_vec(),
+        ];
+        let excluded_paths = vec![std::path::PathBuf::from("/own/exe")];
+
+        let paths =
+            collect_cmdline_paths(&own, ancestors.iter().map(Vec::as_slice), &excluded_paths);
+
+        let expected = [
+            std::path::PathBuf::from("/usr/bin/dupe"),
+            std::path::PathBuf::from("/anc/one"),
+            std::path::PathBuf::from("/anc/two"),
+        ];
+        assert_eq!(paths, expected);
     }
 }

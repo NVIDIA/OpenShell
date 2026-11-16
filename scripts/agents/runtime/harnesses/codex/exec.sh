@@ -16,7 +16,8 @@ require_env() {
 }
 
 require_env CODEX_AUTH_ACCESS_TOKEN
-require_env CODEX_AUTH_ACCOUNT_ID
+require_env CODEX_ACCOUNT_ID
+[[ "$CODEX_ACCOUNT_ID" != openshell:resolve:* ]] || { echo "Codex account ID must be a literal identifier" >&2; exit 1; }
 require_env GITHUB_TOKEN
 
 PROMPT_FILE="$1"
@@ -58,7 +59,8 @@ fs.writeFileSync(path, JSON.stringify({
     id_token: providerValue("CODEX_AUTH_ID_TOKEN") || fallbackIdToken,
     access_token: providerValue("CODEX_AUTH_ACCESS_TOKEN"),
     refresh_token: providerValue("CODEX_AUTH_REFRESH_TOKEN") || "gateway-managed-refresh-token",
-    account_id: providerValue("CODEX_AUTH_ACCOUNT_ID"),
+    // Workspace discovery compares this non-secret identifier locally.
+    account_id: process.env.CODEX_ACCOUNT_ID,
   },
   last_refresh: new Date().toISOString(),
 }, null, 2));

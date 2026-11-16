@@ -54,6 +54,7 @@ jobs:
       - name: Set up Nix
         uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
 
       - name: Run Actionlint
@@ -107,7 +108,7 @@ jobs:
 
       - name: Upload Actionlint SARIF to Code Scanning
         if: success()
-        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           sarif_file: reports/actionlint.sarif
           ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
@@ -141,6 +142,7 @@ jobs:
       - name: Set up Nix
         uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
 
       - name: Run Zizmor
@@ -193,7 +195,7 @@ jobs:
 
       - name: Upload Zizmor SARIF to Code Scanning
         if: success()
-        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           sarif_file: reports/zizmor-high.sarif
           ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}

@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::Service;
+
 /// The API object describes the API request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Api {
@@ -13,6 +15,9 @@ pub struct Api {
     /// The API version (e.g., "v1").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// The service that exposes the operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<Service>,
 }
 
 impl Api {
@@ -21,6 +26,7 @@ impl Api {
         Self {
             operation: operation.into(),
             version: None,
+            service: None,
         }
     }
 }

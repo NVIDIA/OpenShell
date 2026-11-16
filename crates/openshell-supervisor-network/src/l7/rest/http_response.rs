@@ -3,6 +3,8 @@
 
 //! HTTP response relay and pre-return middleware integration.
 
+mod http_hooks;
+
 use super::*;
 
 /// Default wall-clock bound shared by whole-body stages in one response.
@@ -18,6 +20,31 @@ pub struct HttpResponseMiddlewareRelay<'a> {
     pub(crate) policy_name: &'a str,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) whole_body_timeout: std::time::Duration,
+    /// The client request used HTTP/1.1, so an HTTP hook response may
+    /// be re-framed chunked. An HTTP/1.0 client cannot decode chunked framing.
+    pub(crate) client_accepts_chunked: bool,
+    /// The request head as request middleware forwarded it, before
+    /// credentials. HTTP hook response stages receive its headers, and
+    /// fail closed without it.
+    pub(crate) request_head: Option<crate::l7::middleware::ForwardedRequestHead>,
+}
+
+impl HttpResponseMiddlewareRelay<'_> {
+    /// Whether an HTTP hook stage of this response chain may inspect bodies.
+    ///
+    /// A chain that cannot be described fails when the response arrives, so
+    /// the request is left unchanged.
+    pub(super) async fn inspects_bodies(&self) -> bool {
+        if self.chain.is_empty() {
+            return false;
+        }
+        self.runner
+            .describe_http_response_chain(self.chain)
+            .await
+            .is_ok_and(|described| {
+                openshell_supervisor_middleware::chain_inspects_http_response_bodies(&described)
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -236,20 +263,27 @@ where
         return Ok(RelayOutcome::Reusable);
     }
 
-    // Forward response headers + any overflow body bytes
-    client.write_all(&buf).await.into_diagnostic()?;
+    // Hold buffered chunk framing until relay_chunked validates it.
+    client
+        .write_all(&buf[..header_end])
+        .await
+        .into_diagnostic()?;
+    let overflow = &buf[header_end..];
     let overflow_len = (buf.len() - header_end) as u64;
 
     // Forward remaining response body
     match body_length {
         BodyLength::ContentLength(len) => {
+            if !overflow.is_empty() {
+                client.write_all(overflow).await.into_diagnostic()?;
+            }
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
                 relay_fixed(upstream, client, remaining, None).await?;
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(upstream, client, &buf[header_end..], None).await?;
+            relay_chunked(upstream, client, overflow, None).await?;
         }
         BodyLength::None => unreachable!(),
     }
@@ -267,7 +301,7 @@ where
 /// request is permitted. Signal EOF (including TLS `close_notify`) before the
 /// caller tears down a closing CONNECT tunnel; waiting for another request
 /// deadlocks clients that are themselves waiting for EOF.
-async fn finish_response<C>(client: &mut C, close: bool) -> Result<RelayOutcome>
+pub(super) async fn finish_response<C>(client: &mut C, close: bool) -> Result<RelayOutcome>
 where
     C: AsyncWrite + Unpin,
 {
@@ -335,11 +369,53 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
             )
             .await?;
             return Ok(Some(RelayOutcome::Consumed));
         }
     };
+    match openshell_supervisor_middleware::chain_http_hook_version(&described) {
+        openshell_supervisor_middleware::ChainHttpHookVersion::Legacy => {}
+        openshell_supervisor_middleware::ChainHttpHookVersion::Current => {
+            return Box::pin(http_hooks::relay_response_through_pipeline(
+                request_method,
+                upstream,
+                client,
+                middleware,
+                described,
+                parsed,
+                buffered,
+                header_end,
+                status_code,
+                body_length,
+                server_wants_close,
+                event_stream,
+            ))
+            .await;
+        }
+        openshell_supervisor_middleware::ChainHttpHookVersion::Mixed => {
+            debug!(
+                reason = openshell_supervisor_middleware::MIDDLEWARE_HOOK_VERSIONS_MIXED,
+                "HTTP response middleware chain mixes HTTP hook versions"
+            );
+            emit_http_response_middleware_failure(
+                middleware.policy_name,
+                &middleware.target,
+                status_code,
+                false,
+            );
+            send_response_delivery_failure(
+                client,
+                request_method,
+                middleware.policy_name,
+                &middleware.target,
+                None,
+            )
+            .await?;
+            return Ok(Some(RelayOutcome::Consumed));
+        }
+    }
     let original_headers = parsed.headers.clone();
     let preserved_credential_headers = parsed.preserved_credential_headers;
     let upstream_declared_trailers = parsed.declared_trailers.clone();
@@ -354,6 +430,8 @@ where
         },
         headers: parsed.headers,
         connection_nominated_headers: parsed.connection_nominated,
+        // Legacy response hooks do not receive request headers.
+        request_headers: Vec::new(),
     };
     let preflight_result = if parsed.representable {
         middleware
@@ -380,6 +458,7 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
             )
             .await?;
             return Ok(Some(RelayOutcome::Consumed));
@@ -401,16 +480,27 @@ where
         allowed = preflight.allowed,
         "HTTP response middleware preflight completed"
     );
-    for event in crate::l7::middleware::middleware_finding_events(&preflight.findings) {
-        openshell_ocsf::ocsf_emit!(event);
-    }
+    let mut preflight_events =
+        crate::l7::middleware::middleware_finding_events(&preflight.findings);
     if !preflight.allowed {
-        emit_http_response_middleware_invocations(
+        preflight_events.extend(http_response_decision_events(
             middleware.policy_name,
             &middleware.target,
             status_code,
             &preflight.invocations,
-        );
+        ));
+        if preflight.denial.is_none() {
+            preflight_events.push(http_response_middleware_failure_event(
+                middleware.policy_name,
+                &middleware.target,
+                status_code,
+                false,
+                true,
+            ));
+        }
+    }
+    crate::telemetry::emit_decision(preflight_events, None);
+    if !preflight.allowed {
         if let Some(denial) = preflight.denial.as_ref() {
             send_response_middleware_denial(
                 client,
@@ -421,27 +511,25 @@ where
             )
             .await?;
         } else {
-            emit_http_response_middleware_failure(
-                middleware.policy_name,
-                &middleware.target,
-                status_code,
-                false,
-            );
             send_response_delivery_failure(
                 client,
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
             )
             .await?;
         }
         return Ok(Some(RelayOutcome::Consumed));
     }
-    emit_http_response_middleware_invocations(
-        middleware.policy_name,
-        &middleware.target,
-        status_code,
-        &preflight.invocations,
+    crate::telemetry::emit_decision(
+        http_response_decision_events(
+            middleware.policy_name,
+            &middleware.target,
+            status_code,
+            &preflight.invocations,
+        ),
+        None,
     );
 
     let Some(mut session) = preflight.session else {
@@ -475,17 +563,27 @@ where
             Ok(finish) => finish,
             Err(error) => {
                 debug!(error = %error, "HTTP response middleware finalization failed");
-                emit_http_response_diagnostics(
+                let mut events = http_response_diagnostic_events(
                     middleware.policy_name,
                     &middleware.target,
                     status_code,
-                    &error.diagnostics,
+                    &error.diagnostics.invocations,
+                    &error.diagnostics.findings,
                 );
+                events.push(http_response_middleware_failure_event(
+                    middleware.policy_name,
+                    &middleware.target,
+                    status_code,
+                    false,
+                    true,
+                ));
+                crate::telemetry::emit_decision(events, None);
                 send_response_delivery_failure(
                     client,
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
                 )
                 .await?;
                 return Ok(Some(RelayOutcome::Consumed));
@@ -495,15 +593,16 @@ where
             guard.ensure_current()?;
         }
         let mut headers = preflight.headers;
-        emit_http_response_middleware_invocations(
-            middleware.policy_name,
-            &middleware.target,
-            status_code,
-            &finish.invocations,
+        crate::telemetry::emit_decision(
+            http_response_diagnostic_events(
+                middleware.policy_name,
+                &middleware.target,
+                status_code,
+                &finish.invocations,
+                &finish.findings,
+            ),
+            None,
         );
-        for event in crate::l7::middleware::middleware_finding_events(&finish.findings) {
-            openshell_ocsf::ocsf_emit!(event);
-        }
         if finish.strip_stale_integrity_headers {
             strip_response_integrity_headers(&mut headers);
         }
@@ -603,13 +702,30 @@ where
                 openshell_core::proto::MiddlewareSessionEndReason::UpstreamDisconnect
             };
             session.end(end_reason).await;
-            if committed {
-                emit_http_response_middleware_failure(
+            // Diagnostics from a middleware stop and its terminal finding are
+            // one decision. Transport/framing errors still record delivery
+            // failure, but do not imply an enforced middleware refusal.
+            let mut events = middleware_stop.map_or_else(Vec::new, |stop| {
+                http_response_diagnostic_events(
                     middleware.policy_name,
                     &middleware.target,
                     status_code,
-                    true,
-                );
+                    &stop.diagnostics.invocations,
+                    &stop.diagnostics.findings,
+                )
+            });
+            // A denial sent before commitment is reported by its invocation.
+            if committed || middleware_stop.is_none_or(|stop| stop.failure.denial.is_none()) {
+                events.push(http_response_middleware_failure_event(
+                    middleware.policy_name,
+                    &middleware.target,
+                    status_code,
+                    committed,
+                    middleware_stop.is_some(),
+                ));
+            }
+            crate::telemetry::emit_decision(events, None);
+            if committed {
                 return Err(error);
             }
             debug!(error = %error, "HTTP response processing failed before commitment");
@@ -623,17 +739,12 @@ where
                 )
                 .await?;
             } else {
-                emit_http_response_middleware_failure(
-                    middleware.policy_name,
-                    &middleware.target,
-                    status_code,
-                    false,
-                );
                 send_response_delivery_failure(
                     client,
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
                 )
                 .await?;
             }
@@ -653,19 +764,24 @@ where
     let finish = match session.finish(trailers).await {
         Ok(finish) => finish,
         Err(error) => {
-            emit_http_response_diagnostics(
+            let mut events = http_response_diagnostic_events(
                 middleware.policy_name,
                 &middleware.target,
                 status_code,
-                &error.diagnostics,
+                &error.diagnostics.invocations,
+                &error.diagnostics.findings,
             );
-            if committed {
-                emit_http_response_middleware_failure(
+            if committed || error.denial.is_none() {
+                events.push(http_response_middleware_failure_event(
                     middleware.policy_name,
                     &middleware.target,
                     status_code,
+                    committed,
                     true,
-                );
+                ));
+            }
+            crate::telemetry::emit_decision(events, None);
+            if committed {
                 return Err(miette!(
                     "HTTP response middleware failed after commitment: {error}"
                 ));
@@ -681,17 +797,12 @@ where
                 )
                 .await?;
             } else {
-                emit_http_response_middleware_failure(
-                    middleware.policy_name,
-                    &middleware.target,
-                    status_code,
-                    false,
-                );
                 send_response_delivery_failure(
                     client,
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
                 )
                 .await?;
             }
@@ -701,15 +812,16 @@ where
     if let Some(guard) = middleware.generation_guard {
         guard.ensure_current()?;
     }
-    emit_http_response_middleware_invocations(
-        middleware.policy_name,
-        &middleware.target,
-        status_code,
-        &finish.invocations,
+    crate::telemetry::emit_decision(
+        http_response_diagnostic_events(
+            middleware.policy_name,
+            &middleware.target,
+            status_code,
+            &finish.invocations,
+            &finish.findings,
+        ),
+        None,
     );
-    for event in crate::l7::middleware::middleware_finding_events(&finish.findings) {
-        openshell_ocsf::ocsf_emit!(event);
-    }
 
     if whole_body && !committed {
         let mut headers = preflight.headers;
@@ -817,9 +929,11 @@ where
         });
     }
 
-    client.write_all(overflow).await.into_diagnostic()?;
     match body_length {
         BodyLength::ContentLength(length) => {
+            if !overflow.is_empty() {
+                client.write_all(overflow).await.into_diagnostic()?;
+            }
             let remaining = length.saturating_sub(overflow.len() as u64);
             if remaining > 0 {
                 relay_fixed(upstream, client, remaining, None).await?;
@@ -827,6 +941,9 @@ where
         }
         BodyLength::Chunked => relay_chunked(upstream, client, overflow, None).await?,
         BodyLength::None if server_wants_close || event_stream => {
+            if !overflow.is_empty() {
+                client.write_all(overflow).await.into_diagnostic()?;
+            }
             if event_stream {
                 relay_until_eof_without_idle_timeout(upstream, client).await?;
             } else {
@@ -835,7 +952,11 @@ where
             client.flush().await.into_diagnostic()?;
             return Ok(RelayOutcome::Consumed);
         }
-        BodyLength::None => {}
+        BodyLength::None => {
+            if !overflow.is_empty() {
+                client.write_all(overflow).await.into_diagnostic()?;
+            }
+        }
     }
     client.flush().await.into_diagnostic()?;
     Ok(if server_wants_close {
@@ -845,29 +966,39 @@ where
     })
 }
 
-fn emit_http_response_middleware_invocations(
+fn http_response_decision_events(
     policy_name: &str,
     target: &HttpRequestTarget,
     status_code: u16,
     invocations: &[openshell_supervisor_middleware::HttpResponseInvocation],
-) {
-    for event in
-        http_response_middleware_invocation_events(policy_name, target, status_code, invocations)
-    {
-        openshell_ocsf::ocsf_emit!(event);
-    }
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    let mut events =
+        http_response_middleware_invocation_events(policy_name, target, status_code, invocations);
     for invocation in invocations {
-        if let Some(event) =
-            http_response_middleware_fail_open_finding_event(policy_name, target, invocation)
-        {
-            openshell_ocsf::ocsf_emit!(event);
-        }
-        if let Some(event) =
-            http_response_middleware_block_finding_event(policy_name, target, invocation)
-        {
-            openshell_ocsf::ocsf_emit!(event);
-        }
+        events.extend(http_response_middleware_fail_open_finding_event(
+            policy_name,
+            target,
+            invocation,
+        ));
+        events.extend(http_response_middleware_block_finding_event(
+            policy_name,
+            target,
+            invocation,
+        ));
     }
+    events
+}
+
+fn http_response_diagnostic_events(
+    policy_name: &str,
+    target: &HttpRequestTarget,
+    status_code: u16,
+    invocations: &[openshell_supervisor_middleware::HttpResponseInvocation],
+    findings: &[openshell_supervisor_middleware::NamespacedFinding],
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    let mut events = http_response_decision_events(policy_name, target, status_code, invocations);
+    events.extend(crate::l7::middleware::middleware_finding_events(findings));
+    events
 }
 
 fn emit_http_response_diagnostics(
@@ -876,15 +1007,16 @@ fn emit_http_response_diagnostics(
     status_code: u16,
     diagnostics: &openshell_supervisor_middleware::HttpResponseDiagnostics,
 ) {
-    emit_http_response_middleware_invocations(
-        policy_name,
-        target,
-        status_code,
-        &diagnostics.invocations,
+    crate::telemetry::emit_decision(
+        http_response_diagnostic_events(
+            policy_name,
+            target,
+            status_code,
+            &diagnostics.invocations,
+            &diagnostics.findings,
+        ),
+        None,
     );
-    for event in crate::l7::middleware::middleware_finding_events(&diagnostics.findings) {
-        openshell_ocsf::ocsf_emit!(event);
-    }
 }
 
 pub(super) fn http_response_middleware_invocation_events(
@@ -898,8 +1030,11 @@ pub(super) fn http_response_middleware_invocation_events(
         .map(|invocation| {
             let outcome = format!("{:?}", invocation.outcome).to_ascii_lowercase();
             let failed = invocation.failed;
-            let blocked = invocation.outcome
-                == openshell_supervisor_middleware::HttpResponseInvocationOutcome::BlockDelivery;
+            let blocked = matches!(
+                invocation.outcome,
+                openshell_supervisor_middleware::HttpResponseInvocationOutcome::BlockDelivery
+                    | openshell_supervisor_middleware::HttpResponseInvocationOutcome::FailClosed
+            );
             openshell_ocsf::HttpActivityBuilder::new(ocsf_ctx())
             .activity(openshell_ocsf::ActivityId::Other)
             .action(if blocked {
@@ -975,6 +1110,7 @@ fn http_response_middleware_block_finding_event(
     }
     Some(
         openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
+            .action(openshell_ocsf::ActionId::Denied)
             .severity(openshell_ocsf::SeverityId::Medium)
             .finding_info(openshell_ocsf::FindingInfo::new(
                 "openshell.middleware.http_response_blocked",
@@ -1052,8 +1188,28 @@ fn emit_http_response_middleware_failure(
     status_code: u16,
     committed: bool,
 ) {
+    crate::telemetry::egress_emit!(http_response_middleware_failure_event(
+        policy_name,
+        target,
+        status_code,
+        committed,
+        true,
+    ));
+}
+
+fn http_response_middleware_failure_event(
+    policy_name: &str,
+    target: &HttpRequestTarget,
+    status_code: u16,
+    committed: bool,
+    denied: bool,
+) -> openshell_ocsf::OcsfEvent {
     let status_code = status_code.to_string();
-    let event = openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
+    let mut builder = openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx());
+    if denied {
+        builder = builder.action(openshell_ocsf::ActionId::Denied);
+    }
+    builder
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
             "openshell.middleware.http_response_failure",
@@ -1077,8 +1233,7 @@ fn emit_http_response_middleware_failure(
         } else {
             "HTTP response middleware failed before response commitment"
         })
-        .build();
-    openshell_ocsf::ocsf_emit!(event);
+        .build()
 }
 
 #[derive(Debug)]
@@ -1450,15 +1605,7 @@ where
             let mut size_line =
                 read_response_line_with_deadline(reader, session, client, &mut framing).await?;
             loop {
-                let size_line_text = std::str::from_utf8(&size_line)
-                    .map_err(|_| miette!("Invalid UTF-8 in response chunk-size line"))?;
-                let size_token = size_line_text
-                    .split(';')
-                    .next()
-                    .map(str::trim)
-                    .unwrap_or_default();
-                let chunk_size = usize::from_str_radix(size_token, 16)
-                    .map_err(|_| miette!("Invalid HTTP response chunk size"))?;
+                let chunk_size = parse_chunk_size_line(&size_line)?;
                 if chunk_size == 0 {
                     flush_normalized_response_bytes(session, client, pending, &mut framing).await?;
                     return read_response_trailers(
@@ -1619,11 +1766,18 @@ struct ResponseOutputState<'a> {
 #[derive(Debug)]
 struct ResponseMiddlewareStop {
     failure: openshell_supervisor_middleware::HttpResponseMiddlewareFailure,
+    diagnostics: openshell_supervisor_middleware::HttpResponseDiagnostics,
 }
 
 impl ResponseMiddlewareStop {
-    fn new(failure: openshell_supervisor_middleware::HttpResponseMiddlewareFailure) -> Self {
-        Self { failure }
+    fn new(
+        failure: openshell_supervisor_middleware::HttpResponseMiddlewareFailure,
+        diagnostics: openshell_supervisor_middleware::HttpResponseDiagnostics,
+    ) -> Self {
+        Self {
+            failure,
+            diagnostics,
+        }
     }
 }
 
@@ -1668,13 +1822,15 @@ async fn expire_whole_body_deadline<C: AsyncWrite + Unpin>(
         guard.ensure_current()?;
     }
     let diagnostics = session.take_diagnostics();
-    emit_http_response_diagnostics(
-        framing.policy_name,
-        framing.target,
-        framing.status_code,
-        &diagnostics,
-    );
-    let output = output.map_err(ResponseMiddlewareStop::new)?;
+    if output.is_ok() {
+        emit_http_response_diagnostics(
+            framing.policy_name,
+            framing.target,
+            framing.status_code,
+            &diagnostics,
+        );
+    }
+    let output = output.map_err(|failure| ResponseMiddlewareStop::new(failure, diagnostics))?;
     deliver_response_units(client, output, framing, session.requires_whole_body()).await
 }
 
@@ -1810,13 +1966,15 @@ async fn process_response_unit<C: AsyncWrite + Unpin>(
         guard.ensure_current()?;
     }
     let diagnostics = session.take_diagnostics();
-    emit_http_response_diagnostics(
-        framing.policy_name,
-        framing.target,
-        framing.status_code,
-        &diagnostics,
-    );
-    let output = output.map_err(ResponseMiddlewareStop::new)?;
+    if output.is_ok() {
+        emit_http_response_diagnostics(
+            framing.policy_name,
+            framing.target,
+            framing.status_code,
+            &diagnostics,
+        );
+    }
+    let output = output.map_err(|failure| ResponseMiddlewareStop::new(failure, diagnostics))?;
     deliver_response_units(client, output, framing, session.requires_whole_body()).await
 }
 
@@ -1894,6 +2052,7 @@ where
     let mut trailers = Vec::new();
     loop {
         let line = read_response_line_with_deadline(reader, session, client, framing).await?;
+        validate_chunk_trailer_line(&line)?;
         if line.is_empty() {
             return Ok(trailers);
         }
@@ -1972,13 +2131,16 @@ async fn send_response_middleware_denial<C: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Answer a response that middleware failed before its head was committed.
+/// An HTTP hook failure carries its platform-owned code and stage.
 async fn send_response_delivery_failure<C: AsyncWrite + Unpin>(
     client: &mut C,
     request_method: &str,
     policy_name: &str,
     target: &HttpRequestTarget,
+    failure: Option<&openshell_supervisor_middleware::MiddlewareFailureDetail>,
 ) -> Result<()> {
-    let body = serde_json::to_vec(&serde_json::json!({
+    let mut body = serde_json::json!({
         "error": "response_delivery_failed",
         "detail": "The upstream request may have completed, but OpenShell could not deliver its response. Retrying may repeat upstream side effects.",
         "policy": policy_name,
@@ -1987,8 +2149,11 @@ async fn send_response_delivery_failure<C: AsyncWrite + Unpin>(
         "path": target.path,
         "host": target.host,
         "port": target.port,
-    }))
-    .into_diagnostic()?;
+    });
+    if let Some(failure) = failure {
+        insert_middleware_failure(&mut body, failure);
+    }
+    let body = serde_json::to_vec(&body).into_diagnostic()?;
     let head = format!(
         "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-OpenShell-Policy: {policy_name}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -2072,6 +2237,137 @@ pub(super) fn response_is_event_stream(headers: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use openshell_supervisor_middleware::{
+        HttpResponseInvocation, HttpResponseInvocationOutcome as Outcome, NamespacedFinding,
+    };
+
+    fn invocation(outcome: Outcome, failed: bool) -> HttpResponseInvocation {
+        HttpResponseInvocation {
+            config_name: "guard".to_string(),
+            implementation: "test/guard".to_string(),
+            outcome,
+            sequence: None,
+            input_size: 0,
+            output_size: None,
+            failed,
+            stage_disabled: false,
+            reason_code: None,
+            failure_category: None,
+        }
+    }
+
+    fn finding() -> NamespacedFinding {
+        NamespacedFinding {
+            middleware: "guard".to_string(),
+            finding: openshell_core::proto::Finding {
+                r#type: "test.finding".to_string(),
+                label: "Test finding".to_string(),
+                count: 1,
+                severity: "high".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_terminal_failure_without_diagnostics_has_no_deny_trace() {
+        use crate::telemetry::tests::{assert_no_deny, exported};
+
+        // Platform refusals can lack invocation diagnostics, but must retain
+        // their terminal failure record. Without an HTTP record, no deny span.
+        for committed in [false, true] {
+            let (events, received) = exported("warn", || {
+                super::emit_http_response_middleware_failure(
+                    "response-policy",
+                    &super::HttpRequestTarget::default(),
+                    200,
+                    committed,
+                );
+            })
+            .await;
+
+            assert_eq!(events.len(), 1, "only the terminal failure is emitted");
+            assert_eq!(
+                events[0]["finding_info"]["uid"],
+                "openshell.middleware.http_response_failure"
+            );
+            assert_no_deny(&events, &received);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_diagnostic_findings_share_a_deny_span_only_when_delivery_is_denied() {
+        use crate::telemetry::tests::{assert_deny_resolves, assert_no_deny, exported};
+
+        for denied in [false, true] {
+            let (events, received) = exported("warn", || {
+                let outcome = if denied {
+                    Outcome::BlockDelivery
+                } else {
+                    Outcome::PassThrough
+                };
+                let diagnostics = openshell_supervisor_middleware::HttpResponseDiagnostics {
+                    invocations: vec![invocation(outcome, false)],
+                    findings: vec![finding()],
+                    ..Default::default()
+                };
+                super::emit_http_response_diagnostics(
+                    "response-policy",
+                    &super::HttpRequestTarget::default(),
+                    200,
+                    &diagnostics,
+                );
+            })
+            .await;
+            // A blocking invocation adds its own block finding.
+            assert_eq!(events.len(), if denied { 3 } else { 2 });
+            if denied {
+                let blocked = events
+                    .iter()
+                    .find(|event| {
+                        event["finding_info"]["uid"] == "openshell.middleware.http_response_blocked"
+                    })
+                    .expect("blocked delivery emits its refusal finding");
+                assert_eq!(blocked["action_id"], 2);
+                assert_eq!(blocked["action"], "Denied");
+                assert_eq!(received.spans.len(), 1);
+                assert_deny_resolves(&events, &received, true);
+            } else {
+                assert_no_deny(&events, &received);
+            }
+        }
+    }
+
+    #[test]
+    fn fail_closed_invocations_and_enforced_failures_record_the_denial() {
+        let target = super::HttpRequestTarget::default();
+        for (outcome, failed, action_id) in [
+            (Outcome::BlockDelivery, false, 2),
+            (Outcome::FailClosed, true, 2),
+            (Outcome::FailOpen, true, 99),
+            (Outcome::PassThrough, false, 1),
+        ] {
+            let events = super::http_response_middleware_invocation_events(
+                "p",
+                &target,
+                200,
+                &[invocation(outcome, failed)],
+            );
+            assert_eq!(
+                events[0].to_json().unwrap()["action_id"],
+                action_id,
+                "{outcome:?}"
+            );
+        }
+        for denied in [false, true] {
+            let failure =
+                super::http_response_middleware_failure_event("p", &target, 200, false, denied)
+                    .to_json()
+                    .unwrap();
+            assert_eq!(failure["action_id"] == 2, denied);
+        }
+    }
+
     use super::{
         ResponseFraming, parse_connection_keep_alive, parse_response_head_for_middleware,
         response_is_http_10, serialize_response_head,

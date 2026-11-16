@@ -80,6 +80,16 @@ pub(super) enum EgressTransport {
     TransparentTcp,
 }
 
+impl EgressTransport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::ForwardHttp => "forward_http",
+            Self::TransparentTcp => "transparent_tcp",
+        }
+    }
+}
+
 /// Destination requested by an explicit proxy adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RequestedDestination {
@@ -160,6 +170,58 @@ pub(super) struct EgressDecision {
     pub(super) cmdline_paths: Vec<PathBuf>,
 }
 
+pub(super) fn connect_span(intent: &EgressIntent) -> tracing::Span {
+    tracing::debug_span!(
+        "supervisor.egress.connect",
+        server.address = intent.destination.host.as_str(),
+        server.port = intent.destination.port,
+        openshell.egress.transport = intent.transport.as_str(),
+    )
+}
+
+pub(super) fn resolve_span(parent: &tracing::Span) -> tracing::Span {
+    tracing::debug_span!(parent: parent, "supervisor.egress.resolve")
+}
+
+pub(super) fn dial_span(parent: &tracing::Span) -> tracing::Span {
+    tracing::debug_span!(
+        parent: parent,
+        "supervisor.egress.dial",
+        otel.status_code = tracing::field::Empty,
+    )
+}
+
+pub(super) fn mark_error(span: &tracing::Span) {
+    span.record("otel.status_code", "ERROR");
+}
+
+/// Run one egress authorization inside a `supervisor.egress.authorize` span
+/// that records the policy outcome.
+pub(super) fn traced_authorization<T>(
+    intent: EgressIntent,
+    authorize: impl FnOnce(EgressIntent) -> T,
+    decision: impl FnOnce(&T) -> &EgressDecision,
+) -> T {
+    let span = tracing::debug_span!(
+        "supervisor.egress.authorize",
+        openshell.policy.decision = tracing::field::Empty,
+        openshell.policy.name = tracing::field::Empty,
+    );
+    let result = span.in_scope(|| authorize(intent));
+    match &decision(&result).action {
+        NetworkAction::Allow { matched_policy } => {
+            span.record("openshell.policy.decision", "allow");
+            if let Some(name) = matched_policy {
+                span.record("openshell.policy.name", name.as_str());
+            }
+        }
+        NetworkAction::Deny { .. } => {
+            span.record("openshell.policy.decision", "deny");
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +241,123 @@ mod tests {
         assert_eq!(transparent.transport, EgressTransport::TransparentTcp);
         assert_eq!(transparent.destination.host, "db.example.com");
         assert_eq!(transparent.destination.port, 5432);
+    }
+
+    fn decision(intent: EgressIntent, action: NetworkAction) -> EgressDecision {
+        EgressDecision {
+            intent,
+            action,
+            policy_generation: 1,
+            identity: ProcessIdentityEvidence::Available,
+            endpoint: EndpointDecision::default(),
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        }
+    }
+
+    #[test]
+    fn egress_spans_are_debug_level() {
+        let subscriber = tracing_subscriber::registry();
+        tracing::subscriber::with_default(subscriber, || {
+            let intent = EgressIntent::connect("api.example.com".to_string(), 443);
+            let connect = connect_span(&intent);
+            let level = |span: &tracing::Span| *span.metadata().expect("span enabled").level();
+            assert_eq!(level(&connect), tracing::Level::DEBUG);
+            assert_eq!(level(&resolve_span(&connect)), tracing::Level::DEBUG);
+            assert_eq!(level(&dial_span(&connect)), tracing::Level::DEBUG);
+            let authorize = traced_authorization(
+                intent,
+                |intent| {
+                    let level = level(&tracing::Span::current());
+                    let deny = NetworkAction::Deny {
+                        reason: String::new(),
+                    };
+                    (decision(intent, deny), level)
+                },
+                |(d, _)| d,
+            );
+            assert_eq!(authorize.1, tracing::Level::DEBUG);
+        });
+    }
+
+    #[test]
+    fn authorization_is_a_child_of_the_connect_span() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(openshell_otel::layer(&provider, "egress-test"));
+
+        let authorize = |intent: EgressIntent, action: NetworkAction| {
+            let connect = connect_span(&intent);
+            connect.in_scope(|| {
+                traced_authorization(intent, |intent| decision(intent, action), |d| d);
+            });
+            resolve_span(&connect).in_scope(|| {});
+            dial_span(&connect).in_scope(|| {});
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            authorize(
+                EgressIntent::connect("api.example.com".to_string(), 443),
+                NetworkAction::Allow {
+                    matched_policy: Some("github".to_string()),
+                },
+            );
+            authorize(
+                EgressIntent::forward_http("blocked.example.com".to_string(), 80),
+                NetworkAction::Deny {
+                    reason: "not allowed".to_string(),
+                },
+            );
+        });
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let attributes = |span: &opentelemetry_sdk::trace::SpanData| {
+            span.attributes
+                .iter()
+                .map(|kv| (kv.key.as_str().to_string(), kv.value.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let child = |parent: &opentelemetry_sdk::trace::SpanData, name: &str| {
+            spans
+                .iter()
+                .find(|span| {
+                    span.name == name && span.parent_span_id == parent.span_context.span_id()
+                })
+                .unwrap_or_else(|| panic!("{name} is a child of the connect span"))
+                .clone()
+        };
+        let connect = |host: &str| {
+            spans
+                .iter()
+                .find(|span| {
+                    span.name == "supervisor.egress.connect"
+                        && attributes(span)["server.address"] == host
+                })
+                .unwrap()
+                .clone()
+        };
+
+        let allowed = connect("api.example.com");
+        assert_eq!(attributes(&allowed)["server.port"], "443");
+        assert_eq!(
+            attributes(&allowed)["openshell.egress.transport"],
+            "connect"
+        );
+        let authorized = attributes(&child(&allowed, "supervisor.egress.authorize"));
+        assert_eq!(authorized["openshell.policy.decision"], "allow");
+        assert_eq!(authorized["openshell.policy.name"], "github");
+        child(&allowed, "supervisor.egress.resolve");
+        child(&allowed, "supervisor.egress.dial");
+
+        let denied = connect("blocked.example.com");
+        let authorized = attributes(&child(&denied, "supervisor.egress.authorize"));
+        assert_eq!(authorized["openshell.policy.decision"], "deny");
+        assert!(!authorized.contains_key("openshell.policy.name"));
     }
 }
