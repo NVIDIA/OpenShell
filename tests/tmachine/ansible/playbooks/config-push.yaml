@@ -32,6 +32,11 @@
     # openshell_external_driver role in the deb-external-docker-driver
     # installer, which always runs after it, so don't pair that installer with
     # this environment.
+    #
+    # TODO: https://github.com/NVIDIA/OpenShell/pull/5489 installs this file
+    # as a gateway.d drop-in config, which must declare `[openshell]
+    # version = 2`. When it lands, add that table here unless an earlier
+    # writer already does; TOML rejects a table defined twice.
     - name: Write the configuration delivery mode
       become: true
       ansible.builtin.blockinfile:
