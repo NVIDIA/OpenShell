@@ -5111,6 +5111,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "async-stream",
  "async-trait",
  "axum",
  "base64 0.22.1",

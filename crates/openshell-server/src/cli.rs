@@ -154,6 +154,10 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_DB_URL")]
     db_url: Option<String>,
 
+    /// Database identity source: default or azure-workload-identity.
+    #[arg(long, env = "OPENSHELL_DB_AUTH")]
+    db_auth: Option<openshell_core::config::DatabaseAuthMode>,
+
     /// Connection ceiling for the database pool, shared by every
     /// database-backed request.
     ///
@@ -629,6 +633,7 @@ fn prepare_server_config_with_drivers(
 
     config = config
         .with_database_url(db_url)
+        .with_database_auth(args.db_auth.unwrap_or_default())
         .with_database_max_connections(args.db_max_connections)
         .with_database_lock_max_connections(args.db_lock_max_connections);
     if let Some(driver) = &args.compute_driver {
@@ -1698,6 +1703,12 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.grpc_rate_limit_window_seconds = Some(window);
     }
+    if let Some(mode) = file.database_auth
+        && args.db_auth.is_none()
+        && arg_defaulted(matches, "db_auth")
+    {
+        args.db_auth = Some(mode);
+    }
     if let Some(max_connections) = file.database_max_connections
         && args.db_max_connections.is_none()
         && arg_defaulted(matches, "db_max_connections")
@@ -1801,7 +1812,7 @@ mod tests {
     use super::{Cli, command};
     use crate::test_environment::Environment;
     use clap::Parser;
-    use openshell_core::config::ServiceHostnameFormat;
+    use openshell_core::config::{DatabaseAuthMode, ServiceHostnameFormat};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4466,6 +4477,33 @@ grpc_rate_limit_window_seconds = 30
 
         assert_eq!(args.grpc_rate_limit_requests, Some(20));
         assert_eq!(args.grpc_rate_limit_window_seconds, Some(30));
+    }
+
+    #[test]
+    fn database_auth_file_and_explicit_overrides() {
+        Environment::new().remove("OPENSHELL_DB_AUTH").run(|| {
+            let file = config_file_from_toml(
+                "[openshell.gateway]\ndatabase_auth = \"azure-workload-identity\"\n",
+            );
+            let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+            assert_eq!(args.db_auth, None);
+            merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+            assert_eq!(args.db_auth, Some(DatabaseAuthMode::AzureWorkloadIdentity));
+            let (mut args, matches) =
+                parse_with_args(&["openshell-gateway", "--db-auth", "default"]);
+            merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+            assert_eq!(args.db_auth, Some(DatabaseAuthMode::Default));
+        });
+        Environment::new()
+            .set("OPENSHELL_DB_AUTH", "default")
+            .run(|| {
+                let file = config_file_from_toml(
+                    "[openshell.gateway]\ndatabase_auth = \"azure-workload-identity\"\n",
+                );
+                let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert_eq!(args.db_auth, Some(DatabaseAuthMode::Default));
+            });
     }
 
     #[test]

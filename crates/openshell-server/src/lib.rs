@@ -1631,10 +1631,11 @@ async fn connect_store(
     let mut delay = DATABASE_CONNECT_RETRY_INITIAL_DELAY;
     let mut waiting = false;
     loop {
-        let attempt = Store::try_connect_with_pool_sizes(
+        let attempt = Store::try_connect_with_database_auth(
             database_url,
             config.database_max_connections,
             config.database_lock_max_connections,
+            config.database_auth,
         );
         let result = if waiting {
             tokio::select! {

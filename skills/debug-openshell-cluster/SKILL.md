@@ -1759,3 +1759,21 @@ admits 16 unary requests (four per principal, eight per workspace), and 32 watch
 record/route/byte limits; `UNAVAILABLE` means storage or collection timeout.
 Watches recheck bearer credentials and membership every second. Allow one refresh
 interval for withdrawals; route lease expiry remains independently enforced.
+
+## Azure PostgreSQL workload identity
+
+When `database_auth = "azure-workload-identity"` is configured, verify the gateway
+ServiceAccount client-ID annotation and gateway Pod label
+`azure.workload.identity/use: "true"`. AKS must enable OIDC and workload identity;
+the federated subject must match the gateway namespace and ServiceAccount with
+audience `api://AzureADTokenExchange`. Check that the webhook injected
+`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`, without
+printing the token file or environment secrets. The database URL must omit the
+password, name the mapped PostgreSQL role, and use `sslmode=verify-full`.
+
+Both database pools refresh credentials before opening connections and retain
+healthy sessions. A refresh outage can therefore affect new connections while
+existing connections continue working. Check Entra egress, the federated
+credential, and PostgreSQL role mapping; do not suggest CLI login, node identity,
+or a password fallback. Sandbox ServiceAccounts must not carry gateway database
+federation. See the published gateway configuration documentation for setup.
