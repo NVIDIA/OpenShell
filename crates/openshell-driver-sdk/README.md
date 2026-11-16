@@ -22,10 +22,22 @@ only by the Docker, Podman, and VM drivers belongs in
   extension negotiation, destination-trust bundles, and the sandbox workload
   identity limits.
 - `error`, `paths`, `net`, `settings`, `telemetry`, `time`, `progress`,
-  `image`, `sandbox_session`, `sandbox_generation`, `proto_struct`,
+  `image`, `sandbox_generation`, `proto_struct`,
   `external_driver_socket`, `e2fsprogs`: small helpers.
+- `driver_contract`: re-export of `openshell-driver-contract`.
 
 ## Dependencies
 
 The crate depends only on workspace crates and crates.io, and never on
 `openshell-core`.
+
+## Driver contract
+
+The documents a driver hands to the supervisor and the sandbox boundary (the
+runtime descriptor and the boundary configuration) are in
+`openshell-driver-contract`, which this crate re-exports as `driver_contract`.
+`sandbox_session`, `jwt::{CredentialEpoch, SessionRotation}` and
+`paths::is_posix_absolute` keep resolving here as re-exports.
+`jwt::SandboxLaunchAuthentication` and `jwt::SupervisorAuthBundle`, the gateway's
+launch credentials, stay here with the JWT code. Their golden JSON examples are
+in `tests/legacy_contract/examples/`, checked by `tests/legacy_jwt_documents.rs`.

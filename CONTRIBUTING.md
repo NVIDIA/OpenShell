@@ -426,6 +426,7 @@ These are the primary `mise` tasks for day-to-day development:
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
+| `crates/openshell-driver-contract/` | The documents a compute driver hands to the supervisor and sandbox boundary; `openshell-driver-sdk` re-exports it |
 | `crates/openshell-driver-sdk/` | Narrow contract shared by core and the compute drivers; `openshell-core` re-exports it |
 | `crates/openshell-container-runtime/` | Code shared only by the desktop compute drivers (Docker, Podman, VM) |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |

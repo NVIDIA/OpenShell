@@ -94,7 +94,7 @@ pub struct SandboxSessionIdError;
 
 #[cfg(test)]
 mod tests {
-    use crate::sandbox_session::SandboxSessionId;
+    use super::SandboxSessionId;
 
     #[test]
     fn round_trips_canonical_id() {

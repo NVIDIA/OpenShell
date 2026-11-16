@@ -4526,6 +4526,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-contract"
+version = "0.0.0"
+dependencies = [
+ "openshell-crypto",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "openshell-driver-db-credstore"
 version = "0.0.0"
 dependencies = [
@@ -4554,11 +4568,10 @@ dependencies = [
  "libc",
  "miette",
  "openshell-container-runtime",
+ "openshell-driver-contract",
  "openshell-driver-sdk",
- "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
- "openshell-sandbox-backend",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost-types",
@@ -4685,11 +4698,10 @@ dependencies = [
  "nix 0.29.0",
  "openshell-container-runtime",
  "openshell-crypto",
+ "openshell-driver-contract",
  "openshell-driver-sdk",
- "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
- "openshell-sandbox-backend",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost-types",
@@ -4724,6 +4736,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-crypto",
+ "openshell-driver-contract",
  "openshell-otel",
  "prost",
  "prost-types",
@@ -4733,7 +4746,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -4790,13 +4802,11 @@ dependencies = [
  "oci-client",
  "openshell-container-runtime",
  "openshell-crypto",
+ "openshell-driver-contract",
  "openshell-driver-podman",
  "openshell-driver-sdk",
- "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
- "openshell-policy",
- "openshell-sandbox-backend",
  "openshell-vfio",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -4894,6 +4904,7 @@ name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
  "openshell-core",
+ "openshell-driver-contract",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5105,6 +5116,7 @@ dependencies = [
  "libc",
  "openshell-core",
  "openshell-crypto",
+ "openshell-driver-contract",
  "openshell-isolation-interface",
  "prost",
  "prost-types",

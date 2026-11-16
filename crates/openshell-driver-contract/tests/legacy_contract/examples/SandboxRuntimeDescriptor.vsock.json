@@ -1,0 +1,27 @@
+{
+  "boundary_id": "sbx-0004",
+  "generation": "g0000000000000001",
+  "session_id": "7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14",
+  "workload_identity": {
+    "uid": 1000,
+    "gid": 1000,
+    "supplementary_gids": [],
+    "source": "image",
+    "resource_digest": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+  },
+  "transport": {
+    "kind": "vsock",
+    "guest_cid": 3,
+    "port": 1024
+  },
+  "tls": {
+    "server_name": "sandbox.7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14.openshell.internal",
+    "trust_anchor_pem": "-----BEGIN CERTIFICATE-----\nMIIBexample\n-----END CERTIFICATE-----\n"
+  },
+  "provisioning_evidence": {
+    "generation": "g0000000000000001",
+    "evidence_digest": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+  },
+  "host_gateway_ip": null,
+  "resource_claims": {}
+}

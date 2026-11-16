@@ -43,7 +43,7 @@ impl DelegatedLaunch {
             generation: self.generation,
             session_id: self.session_id,
             workload_identity: self.workload_identity,
-            transport: transport.into(),
+            transport: crate::boundary_protocol::transport_from_registration(transport),
             tls: self.tls,
             host_gateway_ip: self.host_gateway_ip,
             resource_claims: self.resource_claims,

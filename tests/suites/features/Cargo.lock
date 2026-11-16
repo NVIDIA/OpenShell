@@ -2238,6 +2238,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-contract"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "openshell-driver-sdk"
 version = "0.0.0"
 dependencies = [
@@ -2245,6 +2256,7 @@ dependencies = [
  "libc",
  "miette",
  "nix",
+ "openshell-driver-contract",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
@@ -2252,7 +2264,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",

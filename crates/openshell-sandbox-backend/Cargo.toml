@@ -11,11 +11,14 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-test-support = []
+test-support = ["write"]
+## Re-export `generate_sandbox_tls_material` from `boundary_protocol`.
+write = ["openshell-driver-contract/write"]
 
 [dependencies]
 openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false, features = ["jwt"] }
+openshell-driver-contract = { path = "../openshell-driver-contract" }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 async-trait = "0.1"
 bytes = { workspace = true }
@@ -43,6 +46,7 @@ libc = "0.2"
 rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
+openshell-driver-contract = { path = "../openshell-driver-contract", features = ["write"] }
 tokio = { workspace = true, features = ["test-util"] }
 jsonwebtoken = { workspace = true }
 

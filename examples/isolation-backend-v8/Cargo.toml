@@ -16,7 +16,7 @@ anyhow = "1"
 async-stream = "0.3"
 openshell-core = { path = "../../crates/openshell-core", default-features = false, features = ["jwt"] }
 openshell-isolation-interface = { path = "../../crates/openshell-isolation-interface" }
-openshell-sandbox-backend = { path = "../../crates/openshell-sandbox-backend" }
+openshell-sandbox-backend = { path = "../../crates/openshell-sandbox-backend", features = ["write"] }
 rustix = { version = "1", features = ["process"] }
 tokio-rustls = "0.26"
 rustls = "0.23"

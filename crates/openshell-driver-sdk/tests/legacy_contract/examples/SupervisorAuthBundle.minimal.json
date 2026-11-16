@@ -1,0 +1,10 @@
+{
+  "session_id": "7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14",
+  "runtime_generation": "g0000000000000001",
+  "session_rotation": 1,
+  "auth_epoch": 1,
+  "gateway_token": "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJnYXRld2F5In0.c2ln",
+  "gateway_expires_at": 1893456000,
+  "sandbox_token": "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJzYW5kYm94In0.c2ln",
+  "sandbox_expires_at": 1893456000
+}

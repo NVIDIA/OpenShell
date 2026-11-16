@@ -1,0 +1,41 @@
+{
+  "boundary_id": "sbx-0001",
+  "generation": "g0000000000000001",
+  "session_id": "7d3f0a52-9c1e-4b6a-8f21-3a5e6c9d0b14",
+  "session_rotation": 1,
+  "auth_epoch": 1,
+  "gateway_id": "gw-test",
+  "verification_keys": [
+    {
+      "key_id": "k1",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAexampleexampleexampleexampleexampleexample=\n-----END PUBLIC KEY-----\n"
+    }
+  ],
+  "listener": {
+    "kind": "runtime-initiated-unix",
+    "socket_path": "/.openshell/channel/control/supervisor/control.sock",
+    "tls": {
+      "certificate_chain_path": "/.openshell/tls/server.crt",
+      "private_key_path": "/.openshell/tls/server.key"
+    }
+  },
+  "resource_claims": {
+    "docker.container_id": "c0ffee0123",
+    "openshell.gpu": "true"
+  },
+  "workload_identity": {
+    "uid": 1000,
+    "gid": 1000,
+    "supplementary_gids": [],
+    "source": "image",
+    "resource_digest": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+  },
+  "provisioning_evidence": {
+    "generation": "g0000000000000001",
+    "evidence_digest": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+  },
+  "child_env": {
+    "HOME": "/home/sandbox"
+  },
+  "resource_claim_files": {}
+}

@@ -127,7 +127,7 @@ impl PersistedSandboxIdentity {
             .ok_or(SessionJwtError::MissingRuntimeIdentity)?
             .parse::<u64>()
             .map_err(|_| SessionJwtError::InvalidCredentialEpoch)
-            .and_then(CredentialEpoch::new)?;
+            .and_then(|value| CredentialEpoch::new(value).map_err(SessionJwtError::from))?;
         let gateway_token_id = annotations
             .get(GATEWAY_TOKEN_ID_ANNOTATION)
             .ok_or(SessionJwtError::MissingRuntimeIdentity)

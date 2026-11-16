@@ -12,6 +12,7 @@ repository.workspace = true
 
 [dependencies]
 openshell-crypto = { workspace = true, optional = true }
+openshell-driver-contract = { path = "../openshell-driver-contract" }
 openshell-otel = { path = "../openshell-otel", optional = true }
 base64 = { workspace = true }
 clap = { workspace = true, optional = true }
@@ -28,7 +29,6 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
-sha2 = { workspace = true }
 rustls = { workspace = true }
 miette = { workspace = true }
 url = { workspace = true }

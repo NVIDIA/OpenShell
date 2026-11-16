@@ -2172,6 +2172,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-contract"
+version = "0.0.0"
+dependencies = [
+ "openshell-crypto",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "openshell-driver-sdk"
 version = "0.0.0"
 dependencies = [
@@ -2181,6 +2194,7 @@ dependencies = [
  "miette",
  "nix",
  "openshell-crypto",
+ "openshell-driver-contract",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
@@ -2188,7 +2202,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -2218,6 +2231,7 @@ name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
  "openshell-core",
+ "openshell-driver-contract",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2246,6 +2260,7 @@ dependencies = [
  "libc",
  "openshell-core",
  "openshell-crypto",
+ "openshell-driver-contract",
  "openshell-isolation-interface",
  "prost",
  "prost-types",

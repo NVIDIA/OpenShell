@@ -86,10 +86,7 @@ pub fn set_file_owner_only(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether `path` is absolute under POSIX rules, whatever the host platform.
-pub fn is_posix_absolute(path: &Path) -> bool {
-    path.to_str().is_some_and(|path| path.starts_with('/'))
-}
+pub use openshell_driver_contract::model::paths::is_posix_absolute;
 
 #[cfg(test)]
 mod tests {

@@ -7,6 +7,9 @@
 //! Kubernetes driver) and the desktop drivers depend on. `openshell-core`
 //! re-exports every item defined here, so each item has exactly one definition.
 //! It depends only on workspace crates and crates.io.
+//!
+//! The driver contract documents are in `openshell-driver-contract`, which this
+//! crate re-exports as [`driver_contract`].
 
 pub mod compute;
 pub mod config;
@@ -33,7 +36,6 @@ pub mod proto_struct;
 pub mod resource_admission;
 pub mod sandbox_env;
 pub mod sandbox_generation;
-pub mod sandbox_session;
 pub mod settings;
 pub mod telemetry;
 pub mod time;
@@ -41,7 +43,12 @@ pub mod time;
 pub use config::{AppArmorProfile, ImagePullPolicy, UpstreamProxyConfig};
 pub use error::{ComputeDriverError, Error, Result};
 pub use network_trust::NetworkSupervisorTrustBundle;
-pub use sandbox_session::{SandboxSessionId, SandboxSessionIdError};
+pub use openshell_driver_contract::model::sandbox_session;
+pub use openshell_driver_contract::{SandboxSessionId, SandboxSessionIdError};
+
+/// The documents a driver hands to the supervisor and the sandbox boundary,
+/// re-exported so a driver depends on one crate.
+pub use openshell_driver_contract as driver_contract;
 
 /// Build version string derived from git metadata.
 ///
