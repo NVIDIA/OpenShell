@@ -143,16 +143,6 @@ later label, such as `api.*.example.com`. `**` is allowed only as the whole
 first label. The rule counts labels and does not know public suffixes, so a
 pattern such as `*.co.uk` passes but still matches unrelated domains.
 
-The fixed-suffix rule applies when you write a policy or provider profile:
-creating a sandbox, `openshell policy set`, including a rollback to an earlier
-revision, new endpoints from `openshell policy update` or approved proposals,
-and provider profile imports and updates. A policy stored before OpenShell
-enforced the rule, or shipped in a sandbox image, keeps loading and enforcing
-unchanged, and the sandbox logs a `Deprecated network endpoint host` warning
-for each such selector when it loads the policy. To correct it, replace each
-rejected pattern with exact hosts or anchored wildcards and submit the complete
-policy with `openshell policy set`, adding `--global` for a global policy.
-
 An endpoint can omit `host` only when it sets `allowed_ips`. Exact hostnames can
 reach the private addresses they resolve to, unless the endpoint comes from an
 approved policy advisor proposal. Wildcard and hostless endpoints can reach
