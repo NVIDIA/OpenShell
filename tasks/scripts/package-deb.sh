@@ -22,10 +22,11 @@ Required environment:
   OPENSHELL_CLI_BINARY        Path to openshell
   OPENSHELL_GATEWAY_BINARY    Path to openshell-gateway
   OPENSHELL_PROVER_BINARY     Path to openshell-prover
-  OPENSHELL_DRIVER_VM_BINARY  Path to openshell-driver-vm
+  OPENSHELL_DRIVER_VM_BINARY  Path to openshell-driver-vm (unless OPENSHELL_DEB_OMIT_VM_DRIVER=1)
   OPENSHELL_DEB_VERSION       Debian package version
 
 Optional environment:
+  OPENSHELL_DEB_OMIT_VM_DRIVER  Set to 1 to build without openshell-driver-vm (CI test packages only)
   OPENSHELL_DEB_ARCH          Debian architecture (amd64 or arm64; defaults to host arch)
   OPENSHELL_OUTPUT_DIR        Output directory (default: artifacts)
 EOF
@@ -71,8 +72,21 @@ infer_deb_arch() {
 require_env OPENSHELL_CLI_BINARY
 require_env OPENSHELL_GATEWAY_BINARY
 require_env OPENSHELL_PROVER_BINARY
-require_env OPENSHELL_DRIVER_VM_BINARY
 require_env OPENSHELL_DEB_VERSION
+
+case "${OPENSHELL_DEB_OMIT_VM_DRIVER:-0}" in
+0) require_env OPENSHELL_DRIVER_VM_BINARY ;;
+1)
+	if [ -n "${OPENSHELL_DRIVER_VM_BINARY:-}" ]; then
+		echo "error: OPENSHELL_DRIVER_VM_BINARY and OPENSHELL_DEB_OMIT_VM_DRIVER=1 are mutually exclusive" >&2
+		exit 2
+	fi
+	;;
+*)
+	echo "error: OPENSHELL_DEB_OMIT_VM_DRIVER must be 0 or 1, got ${OPENSHELL_DEB_OMIT_VM_DRIVER}" >&2
+	exit 2
+	;;
+esac
 
 OPENSHELL_DEB_ARCH="${OPENSHELL_DEB_ARCH:-$(infer_deb_arch)}"
 
@@ -113,7 +127,9 @@ mkdir -p "$pkgroot/DEBIAN"
 stage_binary "$OPENSHELL_CLI_BINARY"       "$pkgroot/usr/bin/openshell"
 stage_binary "$OPENSHELL_GATEWAY_BINARY"   "$pkgroot/usr/bin/openshell-gateway"
 stage_binary "$OPENSHELL_PROVER_BINARY"    "$pkgroot/usr/bin/openshell-prover"
-stage_binary "$OPENSHELL_DRIVER_VM_BINARY" "$pkgroot/usr/libexec/openshell/openshell-driver-vm"
+if [ -n "${OPENSHELL_DRIVER_VM_BINARY:-}" ]; then
+	stage_binary "$OPENSHELL_DRIVER_VM_BINARY" "$pkgroot/usr/libexec/openshell/openshell-driver-vm"
+fi
 
 # Per-user systemd unit. Each user enables it via `systemctl --user`.
 install -D -m 0644 "$src_dir/openshell-gateway.service" \
