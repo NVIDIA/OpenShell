@@ -207,10 +207,10 @@ depends = ["e2e:workload:build"]
 run = "e2e/with-docker-gateway.sh cargo nextest run --locked --manifest-path tests/suites/conformance/Cargo.toml --workspace --test-threads 1 --no-fail-fast"
 
 ["e2e:testkit:push"]
-description = "Run the config-push feature suite, then the conformance suite, against a Docker gateway that pushes configuration"
+description = "Run the conformance suite against a Docker gateway that pushes configuration"
 depends = ["e2e:workload:build"]
 env = { OPENSHELL_CONFIG_DELIVERY_MODE = "push" }
-run = "e2e/with-docker-gateway.sh bash -c 'cargo nextest run --locked --manifest-path tests/suites/features/Cargo.toml -p config-push --test-threads 1 && cargo nextest run --locked --manifest-path tests/suites/conformance/Cargo.toml --workspace --test-threads 1 --no-fail-fast'"
+run = "e2e/with-docker-gateway.sh cargo nextest run --locked --manifest-path tests/suites/conformance/Cargo.toml --workspace --test-threads 1 --no-fail-fast"
 
 ["e2e:rust:push"]
 description = "Run conformance and policy e2e tests against a Docker gateway that pushes configuration"

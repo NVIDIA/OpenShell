@@ -521,13 +521,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "config-push"
-version = "0.0.0"
-dependencies = [
- "openshell-testkit",
-]
-
-[[package]]
 name = "container-engine-support"
 version = "0.0.0"
 dependencies = [

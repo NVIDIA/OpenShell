@@ -276,8 +276,7 @@ result. Release Dev and Release Qualification run the conformance and feature
 families. To run a suite in another environment on CI, add a row.
 
 CI also runs the conformance family in `ubuntu-docker-rootful-config-push`,
-whose gateway pushes configuration to supervisors. The `config-push` feature
-suite runs there too and fails if push is not in use.
+whose gateway pushes configuration to supervisors.
 
 ### Adding a feature suite
 

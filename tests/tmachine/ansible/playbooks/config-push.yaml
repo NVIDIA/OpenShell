@@ -6,8 +6,7 @@
 # Writes `[openshell.gateway] config_delivery_mode = "push"` to
 # /etc/openshell-test/gateway-overrides.toml, which the `binaries`, `deb` and
 # `rpm` installers apply to the gateway's configuration (k3s installers ignore
-# it). The config-push feature suite (tests/suites/features/config-push) fails
-# unless a supervisor reports a pushed-configuration session.
+# it).
 ---
 - name: Gateway configuration push for tests
   hosts: all

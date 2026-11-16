@@ -113,8 +113,7 @@ let
       setup.playbooks = [ "ansible/playbooks/cdi.yaml" ];
     };
     # A gateway that pushes configuration to supervisors
-    # (`config_delivery_mode = "push"`), for the conformance family and the
-    # config-push suite.
+    # (`config_delivery_mode = "push"`), for the conformance family.
     config-push = {
       bases = dockerBases;
       setup.playbooks = [ "ansible/playbooks/config-push.yaml" ];
