@@ -636,7 +636,10 @@ mod tests {
     #[test]
     fn correlation_uid_is_a_stable_otlp_attribute() {
         let mut event = event("sandbox-1", SeverityId::Informational);
-        event.set_correlation_uid("request-123");
+        let OcsfEvent::DeviceConfigStateChange(config) = &mut event else {
+            unreachable!("event fixture returns a configuration event");
+        };
+        config.base.metadata.correlation_uid = Some("request-123".into());
         assert_eq!(
             attribute(&record(&event), CORRELATION_UID_ATTRIBUTE),
             Some(AnyValue::String("request-123".into()))
@@ -803,7 +806,11 @@ mod tests {
             let span_context = tracing::subscriber::with_default(subscriber, || {
                 let span = tracing::info_span!("decision");
                 let mut event = event("sandbox-1", SeverityId::Medium);
-                event.set_correlation_uid("request-with-or-without-sampling");
+                let OcsfEvent::DeviceConfigStateChange(config) = &mut event else {
+                    unreachable!("event fixture returns a configuration event");
+                };
+                config.base.metadata.correlation_uid =
+                    Some("request-with-or-without-sampling".into());
                 span.in_scope(|| ocsf_emit!(event));
                 span.context().span().span_context().clone()
             });

@@ -334,13 +334,14 @@ This header is reserved for OpenShell: workload and upstream values are removed,
 and middleware cannot set or remove it. Use a different header for
 application-owned correlation. The receipt is a join key, not proof of identity,
 authorization or downstream execution. L4 and uninspected traffic do not provide
-this receipt guarantee.
+this receipt guarantee. OpenShell does not add the receipt to JSON error bodies.
 
 All OCSF event classes emitted in the inspected request scope carry the request
 ID, including Detection Findings. Policy, middleware, token-grant and finding
 records remain separate, with their original event IDs, timestamps,
 classification and decision fields. The additive `unmapped.http_event_kind`
-field identifies `decision`, `middleware_invocation` or `token_grant` records.
+field distinguishes decisions, findings, connection events and middleware
+invocations. Explicit control kinds such as `token_grant` remain unchanged.
 Middleware records retain `unmapped.middleware_phase` and their existing
 attribution and transformation details.
 
@@ -348,8 +349,11 @@ attribution and transformation details.
 emission order. It does not guarantee downstream delivery order or complete
 collection. To count policy outcomes, group by `metadata.correlation_uid` and
 select the actual policy or firewall control record. Do not count every HTTP
-Activity or `decision` record as another request; companion findings also use
-`decision`.
+Activity or `decision` record as another request.
+
+Errors that end an inspected request retain that request's ID. A policy reload
+records the active request before closing it; an idle connection has no request
+ID. After a WebSocket upgrade, frame events do not reuse the HTTP handshake ID.
 
 The request ID join and enforcement work without tracing, when spans are not
 sampled, and when the collector is unavailable. Sampled OCSF trace fields identify

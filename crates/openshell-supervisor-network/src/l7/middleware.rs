@@ -426,7 +426,12 @@ pub fn emit_websocket_preflight_events_correlated(
     outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
     correlation: Option<&super::correlation::RequestCorrelation>,
 ) {
-    emit_websocket_invocations_correlated(ctx, &outcome.invocations, correlation);
+    emit_websocket_invocations_correlated(
+        ctx,
+        &outcome.invocations,
+        WebSocketMiddlewarePhase::Preflight,
+        correlation,
+    );
     emit_request_events(
         correlation,
         websocket_coverage_events(ctx, &outcome.coverage),
@@ -508,14 +513,18 @@ pub(super) fn emit_websocket_session_start_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketSessionStartOutcome,
 ) {
-    emit_websocket_invocations(ctx, &outcome.invocations);
+    emit_websocket_invocations(
+        ctx,
+        &outcome.invocations,
+        WebSocketMiddlewarePhase::SessionStart,
+    );
 }
 
 pub(super) fn emit_websocket_message_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketMessageOutcome,
 ) {
-    emit_websocket_invocations(ctx, &outcome.invocations);
+    emit_websocket_invocations(ctx, &outcome.invocations, WebSocketMiddlewarePhase::Message);
     if outcome.saturated {
         emit_websocket_saturation(ctx);
     }
@@ -568,16 +577,35 @@ pub(super) fn middleware_finding_events(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum WebSocketMiddlewarePhase {
+    Preflight,
+    SessionStart,
+    Message,
+}
+
+impl WebSocketMiddlewarePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preflight => "websocket_preflight",
+            Self::SessionStart => "websocket_session_start",
+            Self::Message => "websocket_message",
+        }
+    }
+}
+
 fn emit_websocket_invocations(
     ctx: &L7EvalContext,
     invocations: &[openshell_supervisor_middleware::WebSocketInvocation],
+    phase: WebSocketMiddlewarePhase,
 ) {
-    emit_websocket_invocations_correlated(ctx, invocations, None);
+    emit_websocket_invocations_correlated(ctx, invocations, phase, None);
 }
 
 fn emit_websocket_invocations_correlated(
     ctx: &L7EvalContext,
     invocations: &[openshell_supervisor_middleware::WebSocketInvocation],
+    phase: WebSocketMiddlewarePhase,
     correlation: Option<&super::correlation::RequestCorrelation>,
 ) {
     for invocation in invocations {
@@ -642,6 +670,8 @@ fn emit_websocket_invocations_correlated(
             .status(status)
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
             .firewall_rule(&ctx.policy_name, "supervisor-middleware")
+            .unmapped("http_event_kind", "middleware_invocation")
+            .unmapped("middleware_phase", phase.as_str())
             .message(format!(
                 "WEBSOCKET_MIDDLEWARE {outcome_name} config={} implementation={} sequence={sequence} input_bytes={} replacement_bytes={replacement_size} transformed={} reason_code={reason_code}",
                 invocation.config_name,
@@ -1023,68 +1053,80 @@ async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery_correlat
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
     let chain = runner.describe_chain(&chain).await?;
-    let span = if chain.is_empty() {
-        tracing::Span::none()
-    } else {
-        correlation.map_or_else(tracing::Span::none, |correlation| {
-            correlation.stage(RequestStage::RequestMiddleware)
-        })
+    let has_stages = !chain.is_empty();
+    let apply = async {
+        let span = if has_stages && correlation.is_some() {
+            tracing::Span::current()
+        } else {
+            tracing::Span::none()
+        };
+        match openshell_supervisor_middleware::chain_http_hook_version(&chain) {
+            ChainHttpHookVersion::Legacy => {
+                Box::pin(apply_protocol1_middleware_chain(
+                    req,
+                    client,
+                    ctx,
+                    scheme,
+                    chain,
+                    runner,
+                    generation_guard,
+                    transformed_body_policy,
+                    request_id,
+                    correlation,
+                ))
+                .await
+            }
+            ChainHttpHookVersion::Mixed => {
+                emit_mixed_protocol_denial(ctx, &req, &chain, correlation);
+                Ok(MiddlewareApplyResult::Denied {
+                    denial: None,
+                    failure: Some(MiddlewareFailureDetail {
+                        config_name: None,
+                        code: HttpFailureCode::HookVersionsMixed,
+                    }),
+                })
+            }
+            ChainHttpHookVersion::Current => {
+                // A body-aware policy re-checks every replaced body, so the
+                // upstream must not see any of it before the last stage's output
+                // is checked.
+                let delivery = match transformed_body_policy {
+                    openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant => {
+                        delivery
+                    }
+                    openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(_) => {
+                        delivery.or_withhold()
+                    }
+                };
+                Box::pin(apply_pipeline_middleware_chain(
+                    req,
+                    client,
+                    ctx,
+                    scheme,
+                    chain,
+                    runner,
+                    generation_guard,
+                    transformed_body_policy,
+                    request_id,
+                    delivery,
+                    correlation,
+                    span.clone(),
+                ))
+                .await
+            }
+        }
     };
-    match openshell_supervisor_middleware::chain_http_hook_version(&chain) {
-        ChainHttpHookVersion::Legacy => {
-            Box::pin(apply_protocol1_middleware_chain(
-                req,
-                client,
-                ctx,
-                scheme,
-                chain,
-                runner,
-                generation_guard,
-                transformed_body_policy,
-                request_id,
-                correlation,
-                span.clone(),
-            ))
+    if has_stages && let Some(correlation) = correlation {
+        correlation
+            .run_stage(
+                RequestStage::RequestMiddleware,
+                super::correlation::HttpOutcome::PlatformError,
+                "request_middleware_failed",
+                apply,
+            )
             .await
-        }
-        ChainHttpHookVersion::Mixed => {
-            emit_mixed_protocol_denial(ctx, &req, &chain, correlation);
-            Ok(MiddlewareApplyResult::Denied {
-                denial: None,
-                failure: Some(MiddlewareFailureDetail {
-                    config_name: None,
-                    code: HttpFailureCode::HookVersionsMixed,
-                }),
-            })
-        }
-        ChainHttpHookVersion::Current => {
-            // A body-aware policy re-checks every replaced body, so the
-            // upstream must not see any of it before the last stage's output
-            // is checked.
-            let delivery = match transformed_body_policy {
-                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant => {
-                    delivery
-                }
-                openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(_) => {
-                    delivery.or_withhold()
-                }
-            };
-            Box::pin(apply_pipeline_middleware_chain(
-                req,
-                client,
-                ctx,
-                scheme,
-                chain,
-                runner,
-                generation_guard,
-                transformed_body_policy,
-                request_id,
-                delivery,
-                correlation,
-                span.clone(),
-            ))
-            .await
-        }
+    } else {
+        apply.await
     }
 }
 
@@ -1101,15 +1143,11 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
     request_id: &str,
     correlation: Option<&super::correlation::RequestCorrelation>,
-    span: tracing::Span,
 ) -> Result<MiddlewareApplyResult> {
     let admission = if chain.is_empty() {
         None
     } else {
-        let outcome = runner
-            .reserve_middleware_work()
-            .instrument(span.clone())
-            .await?;
+        let outcome = runner.reserve_middleware_work().await?;
         match outcome {
             openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::Admitted(
                 admission,
@@ -1143,7 +1181,6 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
                 openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
                 admission,
             )
-            .instrument(span.clone())
             .await?;
         emit_request_events(correlation, middleware_events(ctx, &req, &outcome));
         return Ok(if outcome.allowed {
@@ -1165,7 +1202,6 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
         Some(generation_guard),
         max_body_bytes,
     )
-    .instrument(span.clone())
     .await?;
     let buffered = match buffer_result {
         crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
@@ -1202,7 +1238,6 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
             transformed_body_policy,
             Some(admission),
         )
-        .instrument(span)
         .await?;
     emit_request_events(correlation, middleware_events(ctx, &req, &outcome));
     if !outcome.allowed {
@@ -2419,6 +2454,7 @@ mod trace_tests {
                         stage_disabled: false,
                         reason_code: None,
                     }],
+                    WebSocketMiddlewarePhase::Message,
                 );
             })
             .await;
@@ -2429,6 +2465,58 @@ mod trace_tests {
                 })
                 .unwrap();
             assert_eq!(finding["action_id"].as_u64(), action_id, "{outcome:?}");
+            assert_ne!(
+                finding["unmapped"]["http_event_kind"],
+                "middleware_invocation"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_invocation_records_are_explicitly_tagged_by_phase() {
+        use openshell_supervisor_middleware::{WebSocketInvocation, WebSocketInvocationOutcome};
+
+        let (events, _) = exported("warn", || {
+            let invocation = WebSocketInvocation {
+                config_name: "guard".into(),
+                implementation: "test/guard".into(),
+                outcome: WebSocketInvocationOutcome::Allow,
+                sequence: None,
+                original_size: 0,
+                replacement_size: None,
+                transformed: false,
+                failed: false,
+                stage_disabled: false,
+                reason_code: None,
+            };
+            for phase in [
+                WebSocketMiddlewarePhase::Preflight,
+                WebSocketMiddlewarePhase::SessionStart,
+                WebSocketMiddlewarePhase::Message,
+            ] {
+                emit_websocket_invocations(
+                    &L7EvalContext::default(),
+                    std::slice::from_ref(&invocation),
+                    phase,
+                );
+            }
+        })
+        .await;
+
+        assert_eq!(events.len(), 3);
+        for (event, phase) in events.iter().zip([
+            "websocket_preflight",
+            "websocket_session_start",
+            "websocket_message",
+        ]) {
+            assert_eq!(event["class_uid"], 4001);
+            assert_eq!(
+                event["unmapped"]["http_event_kind"],
+                "middleware_invocation"
+            );
+            assert_eq!(event["unmapped"]["middleware_phase"], phase);
+            assert_eq!(event["action"], "Allowed");
+            assert_eq!(event["status"], "Success");
         }
     }
 
@@ -2932,7 +3020,7 @@ mod tests {
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
         assert_eq!(body["error"], "middleware_denied");
-        assert_eq!(body["request_id"], "00000000-0000-4000-8000-000000000010");
+        assert!(body.get("request_id").is_none());
         assert_eq!(body["middleware"], "prototype-content-guard");
         assert_eq!(body["reason_code"], "content_match");
         assert!(body.get("rule_missing").is_none());
@@ -3045,7 +3133,7 @@ mod tests {
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
         assert_eq!(body["error"], "middleware_failed");
-        assert_eq!(body["request_id"], "00000000-0000-4000-8000-000000000011");
+        assert!(body.get("request_id").is_none());
         assert_eq!(
             body["detail"],
             "Request could not be processed by configured middleware"

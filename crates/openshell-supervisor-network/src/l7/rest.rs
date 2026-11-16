@@ -27,7 +27,7 @@ pub(crate) use request_body::{
 };
 
 use crate::l7::EndpointObserver;
-use crate::l7::correlation::{RequestCorrelation, RequestStage};
+use crate::l7::correlation::{HttpOutcome, RequestCorrelation, RequestStage};
 use crate::l7::http::{parse_chunk_size_line, validate_chunk_trailer_line};
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
@@ -49,7 +49,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::{Instrument as _, debug};
+use tracing::debug;
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
 pub(crate) const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
@@ -1087,10 +1087,24 @@ where
         } else {
             tracing::Span::none()
         };
-    let rewrite_result = rewrite_span
-        .in_scope(|| rewrite_http_header_block(&header_bytes, options.resolver))
-        .map_err(miette::Report::new)?;
+    let rewrite_result =
+        rewrite_span.in_scope(|| rewrite_http_header_block(&header_bytes, options.resolver));
+    rewrite_span.record(
+        "otel.status_code",
+        if rewrite_result.is_ok() {
+            "OK"
+        } else {
+            "ERROR"
+        },
+    );
+    if rewrite_result.is_err() {
+        rewrite_span.record(
+            "openshell.request.failure_reason",
+            "credential_resolution_refused",
+        );
+    }
     drop(rewrite_span);
+    let rewrite_result = rewrite_result.map_err(miette::Report::new)?;
 
     if let Some(validation) = options.mcp_request_validation {
         // Header credential resolution and hop-by-hop cleanup must finish
@@ -1434,10 +1448,7 @@ where
     upstream.flush().await.into_diagnostic()?;
     upstream.request_span.take();
 
-    let response_span = correlation.map_or_else(tracing::Span::none, |correlation| {
-        correlation.stage(RequestStage::Response)
-    });
-    let outcome = relay_response(
+    let response = relay_response(
         &req.action,
         upstream,
         client,
@@ -1449,9 +1460,18 @@ where
             correlation,
         },
         response_middleware,
-    )
-    .instrument(response_span)
-    .await?;
+    );
+    let outcome = if let Some(correlation) = correlation {
+        Box::pin(correlation.run_stage(
+            RequestStage::Response,
+            HttpOutcome::UpstreamError,
+            "response_failed",
+            response,
+        ))
+        .await?
+    } else {
+        response.await?
+    };
 
     Ok(outcome)
 }
@@ -1478,6 +1498,18 @@ struct ObservedUpstream<'a, U> {
     correlation: Option<&'a RequestCorrelation>,
     request_span: Option<tracing::Span>,
     track_request_span: bool,
+}
+
+impl<U> ObservedUpstream<'_, U> {
+    fn record_write_failure(&self) {
+        if let Some(span) = &self.request_span {
+            span.record("otel.status_code", "ERROR");
+            span.record("openshell.request.failure_reason", "upstream_send_failed");
+        }
+        if let Some(correlation) = self.correlation {
+            correlation.record_failure(HttpOutcome::UpstreamError, "upstream_send_failed");
+        }
+    }
 }
 
 impl<U: AsyncRead + Unpin> AsyncRead for ObservedUpstream<'_, U> {
@@ -1515,10 +1547,11 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
         } else {
             std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf)
         };
-        if matches!(result, std::task::Poll::Ready(Err(_)))
-            && let Some(observer) = this.observer
-        {
-            observer.observe(EndpointResult::TransportFailed);
+        if matches!(result, std::task::Poll::Ready(Err(_))) {
+            this.record_write_failure();
+            if let Some(observer) = this.observer {
+                observer.observe(EndpointResult::TransportFailed);
+            }
         }
         result
     }
@@ -1533,10 +1566,15 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
         } else {
             std::pin::Pin::new(&mut *this.upstream).poll_flush(cx)
         };
-        if matches!(result, std::task::Poll::Ready(Err(_)))
-            && let Some(observer) = this.observer
+        if matches!(result, std::task::Poll::Ready(Err(_))) {
+            this.record_write_failure();
+            if let Some(observer) = this.observer {
+                observer.observe(EndpointResult::TransportFailed);
+            }
+        } else if matches!(result, std::task::Poll::Ready(Ok(())))
+            && let Some(span) = &this.request_span
         {
-            observer.observe(EndpointResult::TransportFailed);
+            span.record("otel.status_code", "OK");
         }
         result
     }
@@ -3161,7 +3199,7 @@ pub(crate) async fn send_middleware_deny_response<C: AsyncWrite + Unpin>(
     let body = middleware_deny_response_body(req, policy_name, denial, redacted_target, context);
     send_json_response_internal(
         policy_name,
-        body_with_request_id(body, context.and_then(|context| context.request_id)),
+        body,
         client,
         "403 Forbidden",
         None,
@@ -3190,7 +3228,7 @@ pub(crate) async fn send_middleware_failure_response<C: AsyncWrite + Unpin>(
     }
     send_json_response_internal(
         policy_name,
-        body_with_request_id(body, context.and_then(|context| context.request_id)),
+        body,
         client,
         "403 Forbidden",
         None,
@@ -3236,23 +3274,13 @@ pub(crate) async fn send_middleware_unavailable_response<C: AsyncWrite + Unpin>(
     );
     send_json_response_internal(
         policy_name,
-        body_with_request_id(body, context.and_then(|context| context.request_id)),
+        body,
         client,
         "503 Service Unavailable",
         None,
         context.and_then(|context| context.request_id),
     )
     .await
-}
-
-fn body_with_request_id(
-    mut body: serde_json::Value,
-    request_id: Option<&str>,
-) -> serde_json::Value {
-    if let (Some(request_id), serde_json::Value::Object(fields)) = (request_id, &mut body) {
-        fields.insert("request_id".to_string(), serde_json::json!(request_id));
-    }
-    body
 }
 
 /// Send a platform-owned 408 when the sandbox stops sending a request body
@@ -3274,7 +3302,7 @@ pub(crate) async fn send_request_timeout_response<C: AsyncWrite + Unpin>(
     }
     send_json_response_internal(
         policy_name,
-        body_with_request_id(body, context.and_then(|context| context.request_id)),
+        body,
         client,
         "408 Request Timeout",
         None,
@@ -3315,7 +3343,7 @@ pub(crate) async fn send_json_response_with_allow_and_request_id<C: AsyncWrite +
 ) -> Result<()> {
     send_json_response_internal(
         policy_name,
-        body_with_request_id(body, Some(request_id)),
+        body,
         client,
         status,
         allowed_methods,
@@ -3497,9 +3525,6 @@ fn deny_response_body(
     }
     if let Some(binary) = binary {
         body.insert("binary".to_string(), serde_json::json!(binary));
-    }
-    if let Some(request_id) = context.request_id {
-        body.insert("request_id".to_string(), serde_json::json!(request_id));
     }
     body.insert(
         "rule_missing".to_string(),
@@ -5353,7 +5378,7 @@ mod tests {
         assert_eq!(body["error"], "policy_denied");
         assert_eq!(body["method"], "POST");
         assert_eq!(body["path"], "/user/repos");
-        assert_eq!(body["request_id"], "request-123");
+        assert!(body.get("request_id").is_none());
         assert_eq!(body["rule_missing"]["host"], "api.github.com");
         assert_eq!(body["next_steps"][2]["action"], "inspect_recent_denials");
         assert!(body["agent_guidance"].as_str().unwrap().contains("retry"));

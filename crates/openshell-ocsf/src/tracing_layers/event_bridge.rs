@@ -318,7 +318,8 @@ mod tests {
                             .base_mut()
                             .add_unmapped("http_event_kind", "original_kind");
                         let mut enriched = event.clone();
-                        enriched.set_correlation_uid("emit-time-request");
+                        enriched.base_mut().metadata.correlation_uid =
+                            Some("emit-time-request".into());
                         enriched
                             .base_mut()
                             .add_unmapped("request_sequence", sequence);

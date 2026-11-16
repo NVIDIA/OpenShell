@@ -96,6 +96,38 @@ fn explicit_request_root_does_not_adopt_ambient_otel_context() {
 }
 
 #[test]
+fn failures_cannot_be_overwritten_by_later_success_or_decisions() {
+    for failure in [HttpOutcome::PlatformError, HttpOutcome::UpstreamError] {
+        let spans = capture(Sampler::AlwaysOn, || {
+            let mut trace = RequestTrace::new("local", "GET", "example.test", 443, &request("01"));
+            trace.record_outcome(failure);
+            trace.record_failure_reason("upstream_connect_failed");
+            trace.record_outcome(HttpOutcome::Allowed);
+            trace.record_outcome(HttpOutcome::Denied);
+            trace.record_outcome(HttpOutcome::Upgraded);
+            trace.record_failure_reason("request_failed");
+        });
+        let root = root(&spans);
+        assert!(matches!(
+            root.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+        assert_eq!(
+            span_attribute(root, "openshell.request.outcome")
+                .unwrap()
+                .as_str(),
+            "failed"
+        );
+        assert_eq!(
+            span_attribute(root, "openshell.request.failure_reason")
+                .unwrap()
+                .as_str(),
+            "upstream_connect_failed"
+        );
+    }
+}
+
+#[test]
 fn request_completion_encloses_stages_after_an_early_root_exit() {
     let spans = capture(Sampler::AlwaysOn, || {
         let mut trace = RequestTrace::new("local", "GET", "example.test", 443, &request("01"));

@@ -631,8 +631,15 @@ async fn read_trailer_fields<R: AsyncRead + Unpin>(
     connection_nominated: &[String],
 ) -> Result<Vec<HttpHeader>> {
     let mut trailers = Vec::new();
+    let mut field_count = 0;
     loop {
         let line = reader.read_line().await?;
+        if !line.is_empty() {
+            field_count += 1;
+            if field_count > openshell_supervisor_middleware::MAX_MIDDLEWARE_HEADERS {
+                return Err(miette!("HTTP response trailer count exceeds limit"));
+            }
+        }
         if !push_trailer(&line, connection_nominated, &mut trailers)? {
             return Ok(trailers);
         }
@@ -950,6 +957,11 @@ fn push_trailer(
     validate_http_field_name(name)?;
     validate_http_field_value(value.trim())?;
     let name = name.to_ascii_lowercase();
+    // Only the platform owns receipt fields. Do not abort a valid upstream
+    // stream or expose its forged receipt to a response middleware stage.
+    if name.eq_ignore_ascii_case(openshell_core::token_grant_failure::REQUEST_ID_HEADER) {
+        return Ok(true);
+    }
     if is_protected_response_field(&name) || connection_nominated.contains(&name) {
         return Err(miette!("HTTP response trailer uses a protected field name"));
     }
@@ -1004,6 +1016,31 @@ mod tests {
     use opentelemetry_sdk::trace::Sampler;
     use tokio::io::AsyncReadExt as _;
     use tracing::instrument::WithSubscriber as _;
+
+    #[test]
+    fn upstream_receipt_trailers_are_hidden_from_http_hooks() {
+        let mut trailers = Vec::new();
+        let nominated = vec!["x-openshell-request-id".into(), "x-private".into()];
+        assert!(
+            push_trailer(b"x-OPENshell-request-ID: forged", &nominated, &mut trailers).unwrap()
+        );
+        assert!(trailers.is_empty());
+        assert!(push_trailer(b"X-Checksum: ok", &nominated, &mut trailers).unwrap());
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(trailers[0].name, "x-checksum");
+        assert_eq!(trailers[0].value, "ok");
+        assert!(!push_trailer(b"", &nominated, &mut trailers).unwrap());
+
+        for line in [
+            b"Content-Length: 7".as_slice(),
+            b"Set-Cookie: secret",
+            b"X-Private: opaque",
+            b"X-OpenShell-Request-ID: bad\0value",
+        ] {
+            push_trailer(line, &nominated, &mut Vec::new())
+                .expect_err("other protected or malformed trailers still fail closed");
+        }
+    }
 
     #[test]
     fn response_hook_invocations_keep_individual_correlated_records_without_tracing() {

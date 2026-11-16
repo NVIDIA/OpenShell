@@ -6,7 +6,7 @@
 use super::L7EvalContext;
 use crate::l7::L7EndpointConfig;
 use crate::opa::{NetworkInput, OpaEngine, TunnelPolicyEngine};
-use crate::test_support::request_tracing::RequestTracing;
+use crate::test_support::request_tracing::{RequestTracing, span_attribute};
 use crate::test_support::response_request_id as request_id;
 use opentelemetry_sdk::trace::{Sampler, SpanData};
 use std::future::Future;
@@ -674,6 +674,257 @@ async fn inspected_keep_alive_requests_have_distinct_receipts_without_tracing() 
                 .contains("4bf92f3577b34da6a3ce929d0e0e4736")
         );
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReloadAt {
+    BeforeRequest,
+    DuringResponse,
+    BetweenRequests,
+}
+
+async fn reload_inspected_relay(at: ReloadAt) -> Option<String> {
+    let Fixture {
+        config,
+        tunnel_engine,
+        middleware_engine,
+        ctx,
+    } = rest_fixture("GET", false);
+    let (mut app, mut relay_client) = tokio::io::duplex(8192);
+    let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+    let mut relay = Box::pin(crate::proxy::relay_inspected_http_stream_for_test(
+        &mut relay_client,
+        &mut relay_upstream,
+        vec![config],
+        tunnel_engine,
+        &middleware_engine,
+        &ctx,
+    ));
+    let mut receipt = None;
+    if !matches!(at, ReloadAt::BeforeRequest) {
+        app.write_all(b"GET /item HTTP/1.1\r\nHost: rest.example.test:8000\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::select! {
+            result = relay.as_mut() => panic!("relay stopped before forwarding: {result:?}"),
+            forwarded = read_http_message(&mut upstream) => {
+                assert!(forwarded.starts_with(b"GET /item HTTP/1.1\r\n"));
+            }
+        }
+        if matches!(at, ReloadAt::BetweenRequests) {
+            upstream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let response = tokio::select! {
+                result = relay.as_mut() => panic!("persistent relay stopped: {result:?}"),
+                response = read_http_message(&mut app) => response,
+            };
+            receipt = Some(request_id(&response).to_string());
+        }
+    }
+    // Drive the real relay into the pending response read or next request
+    // read before reloading, without a scheduling delay or a test-only hook.
+    assert!(futures::poll!(relay.as_mut()).is_pending(), "{at:?}");
+    middleware_engine
+        .reload(POLICY, "network_policies: {}\n")
+        .expect("reload closes the generation-pinned relay");
+    relay.await.expect("stale relay closes without a new error");
+    receipt
+}
+
+fn assert_request_outcome<T>(
+    evidence: &TracedOperation<T>,
+    receipt: &str,
+    outcome: &str,
+    reason: Option<&str>,
+) {
+    evidence.assert_no_deny_span(true);
+    let root = evidence
+        .spans
+        .iter()
+        .find(|span| span.name == "openshell.http.request")
+        .unwrap();
+    assert_eq!(
+        span_attribute(root, "openshell.request.id")
+            .unwrap()
+            .as_str(),
+        receipt
+    );
+    assert_eq!(
+        span_attribute(root, "openshell.request.outcome")
+            .unwrap()
+            .as_str(),
+        outcome,
+    );
+    assert_eq!(
+        span_attribute(root, "openshell.request.failure_reason").map(|value| value.as_str()),
+        reason.map(std::borrow::Cow::Borrowed),
+    );
+    assert_eq!(
+        matches!(root.status, opentelemetry::trace::Status::Error { .. }),
+        outcome == "failed",
+    );
+}
+
+#[tokio::test]
+async fn production_policy_reload_correlates_only_the_active_request() {
+    for at in [
+        ReloadAt::BeforeRequest,
+        ReloadAt::DuringResponse,
+        ReloadAt::BetweenRequests,
+    ] {
+        let evidence = capture_request_spans(
+            true,
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                Box::pin(reload_inspected_relay(at)),
+            ),
+        )
+        .await;
+        let completed_receipt = evidence.output.as_ref().expect("policy reload completes");
+        let started = !matches!(at, ReloadAt::BeforeRequest);
+        let events: Vec<_> = evidence
+            .events
+            .iter()
+            .filter(|event| matches!(event["class_uid"].as_u64(), Some(4001 | 4002)))
+            .collect();
+        assert_eq!(events.len(), 1 + usize::from(started), "{at:?}");
+        let close = events.last().unwrap();
+        assert_eq!(close["class_uid"], 4001);
+        assert_eq!(close["action"], "Denied");
+        assert_eq!(close["status"], "Failure");
+        assert!(
+            close["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("L7 tunnel closed before inspection because policy changed:")
+        );
+        if matches!(at, ReloadAt::DuringResponse) {
+            let policy = events[0];
+            let receipt = policy["metadata"]["correlation_uid"].as_str().unwrap();
+            assert!(uuid::Uuid::parse_str(receipt).is_ok());
+            assert_eq!(policy["action"], "Allowed");
+            assert_eq!(close["metadata"]["correlation_uid"], receipt);
+            assert_eq!(close["unmapped"]["request_sequence"], 2);
+            assert_eq!(close["unmapped"]["http_event_kind"], "connection");
+            assert_request_outcome(&evidence, receipt, "failed", Some("policy_reloaded"));
+        } else {
+            assert!(
+                close["metadata"].get("correlation_uid").is_none(),
+                "{at:?}: {close}"
+            );
+            assert!(
+                close["unmapped"].get("request_sequence").is_none(),
+                "{at:?}: {close}"
+            );
+            if let Some(receipt) = completed_receipt {
+                assert_eq!(events[0]["metadata"]["correlation_uid"], *receipt);
+                assert_request_outcome(&evidence, receipt, "allowed", None);
+            } else {
+                assert!(evidence.spans.is_empty());
+                assert!(!evidence.created.contains(&"openshell.http.request"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn oversized_response_header_keeps_request_attribution_after_dispatch_returns_error() {
+    let operation = async {
+        let Fixture {
+            config,
+            tunnel_engine,
+            middleware_engine,
+            ctx,
+        } = rest_fixture("GET", false);
+        let (mut app, mut relay_client) = tokio::io::duplex(32 * 1024);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(32 * 1024);
+        let mut relay = Box::pin(crate::proxy::relay_inspected_http_stream_for_test(
+            &mut relay_client,
+            &mut relay_upstream,
+            vec![config],
+            tunnel_engine,
+            &middleware_engine,
+            &ctx,
+        ));
+        app.write_all(b"GET /item HTTP/1.1\r\nHost: rest.example.test:8000\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::select! {
+            result = relay.as_mut() => panic!("relay stopped before forwarding: {result:?}"),
+            forwarded = read_http_message(&mut upstream) => {
+                assert!(forwarded.starts_with(b"GET /item HTTP/1.1\r\n"));
+            }
+        }
+        let oversized = format!(
+            "HTTP/1.1 200 OK\r\nX-Fill: {}\r\n\r\n",
+            "x".repeat(16 * 1024)
+        );
+        upstream.write_all(oversized.as_bytes()).await.unwrap();
+        let error = relay
+            .await
+            .expect_err("oversized upstream response headers fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP response headers exceed limit")
+        );
+
+        // This is the existing outer plaintext relay-error record, emitted
+        // only after the production dispatch has dropped its request guard.
+        let message = format!("L7 relay error: {error}");
+        let terminal = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(openshell_ocsf::ActivityId::Fail)
+            .severity(openshell_ocsf::SeverityId::Low)
+            .status(openshell_ocsf::StatusId::Failure)
+            .dst_endpoint(openshell_ocsf::Endpoint::from_domain(&ctx.host, ctx.port))
+            .message(&message)
+            .build();
+        let event_uid = terminal.to_json().unwrap()["metadata"]["uid"].clone();
+        crate::l7::correlation::emit_error_event(terminal, &error);
+        (message, event_uid)
+    };
+    let evidence = capture_request_spans(
+        true,
+        tokio::time::timeout(std::time::Duration::from_secs(5), Box::pin(operation)),
+    )
+    .await;
+    let (message, event_uid) = evidence
+        .output
+        .as_ref()
+        .expect("oversized response header fails without waiting for EOF");
+    let events: Vec<_> = evidence
+        .events
+        .iter()
+        .filter(|event| matches!(event["class_uid"].as_u64(), Some(4001 | 4002)))
+        .collect();
+    assert_eq!(events.len(), 2, "{:?}", evidence.events);
+    let policy = events[0];
+    let terminal = events[1];
+    let receipt = policy["metadata"]["correlation_uid"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(receipt).is_ok());
+    assert_eq!(policy["class_uid"], 4002);
+    assert_eq!(policy["action"], "Allowed");
+    assert_eq!(terminal["class_uid"], 4001);
+    assert_eq!(terminal["metadata"]["correlation_uid"], receipt);
+    assert_eq!(terminal["metadata"]["uid"], *event_uid);
+    assert_eq!(terminal["unmapped"]["request_sequence"], 2);
+    assert_eq!(terminal["unmapped"]["http_event_kind"], "connection");
+    assert_eq!(terminal["message"], *message);
+    assert_eq!(terminal["status"], "Failure");
+    assert!(terminal.get("action").is_none());
+    assert!(terminal.get("disposition").is_none());
+    assert_request_outcome(&evidence, receipt, "failed", Some("response_failed"));
+    let response = evidence
+        .spans
+        .iter()
+        .find(|span| span.name == "openshell.http.response")
+        .unwrap();
+    assert!(matches!(
+        response.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
 }
 
 #[tokio::test]

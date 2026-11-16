@@ -15,6 +15,7 @@ const WORKLOAD_SPAN_ID: &str = "00f067aa0ba902b7";
 enum Outcome {
     Allowed,
     PolicyDenied,
+    MalformedQueryPolicyDenied,
     AuditDenied,
     UpstreamClosed,
 }
@@ -40,12 +41,16 @@ fn assert_request_record_sequence(records: &[serde_json::Value], receipt: &str) 
 async fn forward_case(ip: Ipv4Addr, outcome: Outcome, sampler: Option<Sampler>) {
     let listener = TcpListener::bind((ip, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let policy_denied = matches!(
+        outcome,
+        Outcome::PolicyDenied | Outcome::MalformedQueryPolicyDenied
+    );
     let mode = if matches!(outcome, Outcome::AuditDenied) {
         "audit"
     } else {
         "enforce"
     };
-    let path = if matches!(outcome, Outcome::PolicyDenied | Outcome::AuditDenied) {
+    let path = if policy_denied || matches!(outcome, Outcome::AuditDenied) {
         "/blocked"
     } else {
         "/allowed"
@@ -88,7 +93,12 @@ network_policies:
         .with(openshell_otel::supervisor_span_filter("info"));
     let (mut app, proxy) = tokio::io::duplex(8192);
     let mut proxy: ProxyClient = tokio::io::BufReader::new(Box::new(proxy));
-    let target = format!("http://{ip}:{port}{path}?token=SENTINEL-QUERY");
+    let query = if matches!(outcome, Outcome::MalformedQueryPolicyDenied) {
+        "token=%ff"
+    } else {
+        "token=SENTINEL-QUERY"
+    };
+    let target = format!("http://{ip}:{port}{path}?{query}");
     let request = format!(
         "GET {target} HTTP/1.1\r\nHost: {ip}:{port}\r\ntraceparent: 00-{WORKLOAD_TRACE_ID}-{WORKLOAD_SPAN_ID}-01\r\ntracestate: vendor=SENTINEL-VENDOR\r\nx-openshell-request-id: forged-receipt\r\nConnection: close\r\n\r\n"
     );
@@ -124,7 +134,7 @@ network_policies:
                 result
             },
             async {
-                if matches!(outcome, Outcome::PolicyDenied) {
+                if policy_denied {
                     assert!(
                         tokio::time::timeout(
                             std::time::Duration::from_millis(50),
@@ -164,25 +174,19 @@ network_policies:
             .unwrap();
     result.unwrap();
     let spans = capture.spans();
-    let expected = (!matches!(outcome, Outcome::UpstreamClosed)).then_some(
-        if matches!(outcome, Outcome::PolicyDenied) {
-            403
-        } else {
-            200
-        },
-    );
+    let expected = (!matches!(outcome, Outcome::UpstreamClosed)).then_some(if policy_denied {
+        403
+    } else {
+        200
+    });
     let response = String::from_utf8(response).unwrap();
     let records = capture.events.json_events();
-    let expected_records = if matches!(outcome, Outcome::PolicyDenied) {
-        1
-    } else {
-        2
-    };
+    let expected_records = if policy_denied { 1 } else { 2 };
     assert_eq!(records.len(), expected_records, "{records:?}");
     assert!(records.iter().all(|record| record["class_uid"] == 4002));
     let record = &records[0];
     let decision = match outcome {
-        Outcome::PolicyDenied => "deny",
+        Outcome::PolicyDenied | Outcome::MalformedQueryPolicyDenied => "deny",
         Outcome::AuditDenied => "audit",
         Outcome::Allowed | Outcome::UpstreamClosed => "allow",
     };
@@ -199,7 +203,7 @@ network_policies:
         assert_eq!(control["http_request"]["url"]["path"], path);
         assert!(control.get("http_response").is_none());
     }
-    if !matches!(outcome, Outcome::PolicyDenied) {
+    if !policy_denied {
         let forwarded = &records[1];
         assert!(
             forwarded["message"]
@@ -216,26 +220,32 @@ network_policies:
     assert_request_record_sequence(&records, receipt);
     assert!(!format!("{records:?}").contains("SENTINEL"));
     assert!(!format!("{records:?}").contains("forged-receipt"));
+    assert!(!format!("{records:?}").contains("%ff"));
     if let Some(expected) = expected {
         assert!(
             response.starts_with(&format!("HTTP/1.1 {expected} ")),
             "{response}"
         );
         assert_eq!(response_request_id(response.as_bytes()), receipt);
+        if policy_denied {
+            let (_, body) = response.split_once("\r\n\r\n").unwrap();
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(body["error"], "policy_denied");
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("GET {ip}:{port}{path} denied by L7 policy: "))
+            );
+            assert_eq!(body.as_object().unwrap().len(), 2);
+        }
     } else {
         assert!(
             response.is_empty(),
             "upstream EOF must not synthesize a response"
         );
     }
-    assert_eq!(
-        record["action_id"],
-        if matches!(outcome, Outcome::PolicyDenied) {
-            2
-        } else {
-            1
-        }
-    );
+    assert_eq!(record["action_id"], if policy_denied { 2 } else { 1 });
     let created = capture.created_span_names();
     assert!(
         !created.contains(&"supervisor.egress.deny"),
@@ -315,13 +325,13 @@ network_policies:
             stages
                 .iter()
                 .any(|span| span.name == "openshell.upstream.connect"),
-            !matches!(outcome, Outcome::PolicyDenied)
+            !policy_denied
         );
         assert_eq!(
             stages
                 .iter()
                 .any(|span| span.name == "openshell.upstream.resolve"),
-            !matches!(outcome, Outcome::PolicyDenied)
+            !policy_denied
         );
         assert_eq!(
             matches!(root.status, opentelemetry::trace::Status::Error { .. }),
@@ -352,6 +362,68 @@ async fn inspected_forward_traces_all_outcomes_without_sampling_or_export_depend
         for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {
             forward_case(ip, outcome, sampler).await;
         }
+    }
+}
+
+#[tokio::test]
+async fn inspected_forward_malformed_query_preserves_correlated_l7_denial() {
+    let _lock = openshell_otel_test_support::tracing_test_lock().await;
+    let ip = non_loopback_test_ipv4()
+        .expect("FORWARD trace qualification requires a non-loopback IPv4 address");
+    // This malformed query already reaches the L7 deny path. Creating a
+    // receipt must not add a stricter parse that aborts before the 403 and its
+    // existing policy decision record.
+    for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {
+        forward_case(ip, Outcome::MalformedQueryPolicyDenied, sampler).await;
+    }
+}
+
+#[test]
+fn inspected_forward_error_receipts_preserve_json_bodies() {
+    let request_id = "server-owned-receipt";
+    let denial = openshell_supervisor_middleware::MiddlewareDenial {
+        config_name: "content-guard".into(),
+        reason_code: Some("content_match".into()),
+    };
+    for (original, correlated) in [
+        (
+            build_json_error_response_with_request_id(
+                403,
+                "Forbidden",
+                "policy_denied",
+                "denied by L7 policy",
+                None,
+            ),
+            build_json_error_response_with_request_id(
+                403,
+                "Forbidden",
+                "policy_denied",
+                "denied by L7 policy",
+                Some(request_id),
+            ),
+        ),
+        (
+            build_middleware_deny_response("api-policy", &denial, None),
+            build_middleware_deny_response("api-policy", &denial, Some(request_id)),
+        ),
+        (
+            build_middleware_failure_response("api-policy", None, None),
+            build_middleware_failure_response("api-policy", None, Some(request_id)),
+        ),
+        (
+            build_middleware_unavailable_response("api-policy", None),
+            build_middleware_unavailable_response("api-policy", Some(request_id)),
+        ),
+    ] {
+        let original = String::from_utf8(original).unwrap();
+        let correlated = String::from_utf8(correlated).unwrap();
+        let (_, original_body) = original.split_once("\r\n\r\n").unwrap();
+        let (headers, correlated_body) = correlated.split_once("\r\n\r\n").unwrap();
+        assert_eq!(response_request_id(correlated.as_bytes()), request_id);
+        assert!(headers.contains(&format!("Content-Length: {}\r\n", correlated_body.len())));
+        assert_eq!(correlated_body, original_body);
+        let body: serde_json::Value = serde_json::from_str(correlated_body).unwrap();
+        assert!(body.get("request_id").is_none());
     }
 }
 
@@ -497,7 +569,7 @@ network_policies:
         handler.await.unwrap().unwrap();
         let records = capture.events.json_events();
         assert_eq!(records.len(), 4, "{records:?}");
-        assert_request_record_sequence(&records, receipt);
+        assert_request_record_sequence(&records[..2], receipt);
         for record in &records[..2] {
             assert_eq!(record["class_uid"], 4002);
             assert_eq!(record["action_id"], 1);
@@ -533,6 +605,7 @@ network_policies:
                 .starts_with("101 Switching Protocols — websocket parsed relay ")
         );
         assert!(records[2].get("http_response").is_none());
+        assert!(records[2].get("http_request").is_none());
         assert_eq!(records[3]["class_uid"], 4001);
         assert!(
             records[3]["message"]
@@ -541,6 +614,12 @@ network_policies:
                 .starts_with("WEBSOCKET_L7_REQUEST allow WEBSOCKET_TEXT ")
         );
         assert_eq!(records[3]["firewall_rule"]["type"], "l7-websocket");
+        for record in &records[2..] {
+            assert!(record["metadata"].get("correlation_uid").is_none());
+            assert!(record["unmapped"].get("request_sequence").is_none());
+            assert!(record["unmapped"].get("http_event_kind").is_none());
+            assert!(record.get("trace").is_none());
+        }
         assert!(!format!("{records:?}").contains("after-http-root"));
     };
     tokio::time::timeout(std::time::Duration::from_secs(5), scenario)

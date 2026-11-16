@@ -693,18 +693,24 @@ where
         correlation,
     ));
     let mut response = Box::pin(async {
-        let span = correlation.map_or_else(tracing::Span::none, |correlation| {
-            correlation.stage(RequestStage::Response)
-        });
-        relay_response(
+        let response = relay_response(
             &req.action,
             &mut upstream_reader,
             &mut client_writer,
             response_options,
             response_middleware,
-        )
-        .instrument(span)
-        .await
+        );
+        if let Some(correlation) = correlation {
+            Box::pin(correlation.run_stage(
+                RequestStage::Response,
+                HttpOutcome::UpstreamError,
+                "response_failed",
+                response,
+            ))
+            .await
+        } else {
+            response.await
+        }
     });
 
     tokio::select! {

@@ -625,7 +625,10 @@ async fn inspected_audit_records_do_not_depend_on_sampling_or_create_deny_spans(
         let events = capture("warn", &provider, || {
             let request = tracing::info_span!(parent: None, "openshell.http.request");
             let mut denied = http_deny("blocked.example", "middleware_blocked");
-            denied.set_correlation_uid(request_id.clone());
+            let openshell_ocsf::OcsfEvent::HttpActivity(event) = &mut denied else {
+                unreachable!("http_deny returns an HTTP activity");
+            };
+            event.base.metadata.correlation_uid = Some(request_id.clone());
             super::emit_inspected_decision([denied], Some(&request));
         });
         provider.force_flush().unwrap();

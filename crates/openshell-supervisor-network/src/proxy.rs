@@ -3356,7 +3356,7 @@ async fn handle_mediated_connection(
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .message(format!("TLS relay error: {e}"))
                         .build();
-                    egress_emit!(event);
+                    crate::l7::correlation::emit_error_event(event, &e);
                 }
             }
         } else {
@@ -3431,7 +3431,7 @@ async fn handle_mediated_connection(
                     .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                     .message(message)
                     .build();
-                egress_emit!(event);
+                crate::l7::correlation::emit_error_event(event, &e);
             }
         }
     } else {
@@ -5975,21 +5975,18 @@ async fn handle_forward_proxy_inner(
         || middleware_chain
             .as_ref()
             .is_ok_and(|(chain, _)| !chain.is_empty());
-    let correlation_request = crate::l7::rest::request_from_buffered_http_unprotected(
-        method,
-        path.clone(),
-        &upstream_target,
-        forward_request_bytes,
-    )?;
     let correlation = if inspected {
-        crate::l7::correlation::RequestCorrelation::new(&correlation_request, &l7_ctx)
+        crate::l7::correlation::RequestCorrelation::new_http(
+            method,
+            &forward_request_bytes,
+            &l7_ctx,
+        )
     } else {
         crate::l7::correlation::RequestCorrelation::uninspected()
     };
     let request_correlation = inspected.then_some(&correlation);
     let receipt_id =
         request_correlation.map(crate::l7::correlation::RequestCorrelation::request_id);
-    forward_request_bytes = correlation_request.raw_header;
     if let Some(route) = decision
         .endpoint
         .l7_route
@@ -6347,13 +6344,18 @@ async fn handle_forward_proxy_inner(
         let mut evaluation_error = None;
         let (allowed, reason) = hard_deny_reason.map_or_else(
             || {
-                let stage = correlation.stage(RequestStage::PolicyEvaluate);
-                let evaluation = stage.in_scope(|| {
-                    crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
-                });
-                if evaluation.is_err() {
-                    egress::mark_error(&stage);
-                }
+                let evaluation = correlation.run_stage_sync(
+                    RequestStage::PolicyEvaluate,
+                    HttpOutcome::PlatformError,
+                    "policy_evaluation_failed",
+                    || {
+                        crate::l7::relay::evaluate_l7_request(
+                            &tunnel_engine,
+                            &l7_ctx,
+                            &request_info,
+                        )
+                    },
+                );
                 evaluation.unwrap_or_else(|e| {
                     evaluation_error = Some(build_forward_l7_evaluation_error(
                         &host_lc,
@@ -6528,8 +6530,14 @@ async fn handle_forward_proxy_inner(
     })
     .instrument(resolve_span.clone())
     .await;
-    if inspected && resolved.is_err() {
-        egress::mark_error(&resolve_span);
+    if inspected {
+        if resolved.is_err() {
+            egress::mark_error(&resolve_span);
+            resolve_span.record("openshell.request.failure_reason", "destination_denied");
+            correlation.record_failure(HttpOutcome::Denied, "destination_denied");
+        } else {
+            resolve_span.record("otel.status_code", "OK");
+        }
     }
     drop(resolve_span);
     let connector = match resolved {
@@ -6682,7 +6690,7 @@ async fn handle_forward_proxy_inner(
                     } else {
                         HttpOutcome::PlatformError
                     },
-                    None,
+                    Some("request_middleware_denied"),
                 );
                 let response = denial.as_ref().map_or_else(
                     || {
@@ -6702,7 +6710,11 @@ async fn handle_forward_proxy_inner(
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
                 emit_activity_simple(activity_tx, true, "middleware");
-                correlation.record_rejection(503, HttpOutcome::PlatformError, None);
+                correlation.record_rejection(
+                    503,
+                    HttpOutcome::PlatformError,
+                    Some("middleware_admission_exhausted"),
+                );
                 let response =
                     build_middleware_unavailable_response(&l7_ctx.policy_name, receipt_id);
                 respond(client, &response).await?;
@@ -6720,29 +6732,34 @@ async fn handle_forward_proxy_inner(
             forward_request_bytes.clone(),
         )?;
         let middleware_runner = opa_engine.middleware_runner()?;
-        let stage = if chain.is_empty() {
-            tracing::Span::none()
-        } else {
-            correlation.stage(RequestStage::WebsocketPreflight)
-        };
         let preflight = crate::l7::relay::websocket_middleware_preflight(
             &request,
             chain,
             &middleware_runner,
             &l7_ctx,
             "ws",
-        )
-        .instrument(stage.clone())
-        .await;
-        if preflight.is_err() {
-            egress::mark_error(&stage);
-        }
-        drop(stage);
+        );
+        let preflight = if chain.is_empty() {
+            preflight.await
+        } else {
+            correlation
+                .run_stage(
+                    RequestStage::WebsocketPreflight,
+                    HttpOutcome::PlatformError,
+                    "websocket_preflight_failed",
+                    preflight,
+                )
+                .await
+        };
         let preflight = match preflight {
             Ok(preflight) => preflight,
             Err(error) => {
                 warn!(error = %error, "Plaintext WebSocket middleware preflight failed");
-                correlation.record_rejection(502, HttpOutcome::PlatformError, None);
+                correlation.record_rejection(
+                    502,
+                    HttpOutcome::PlatformError,
+                    Some("websocket_preflight_failed"),
+                );
                 respond(
                     client,
                     &build_json_error_response_with_request_id(
@@ -6809,7 +6826,11 @@ async fn handle_forward_proxy_inner(
         Err(e) => {
             let refusal =
                 e.downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>();
-            correlation.record_rejection(502, HttpOutcome::PlatformError, None);
+            correlation.record_rejection(
+                502,
+                HttpOutcome::PlatformError,
+                Some("token_grant_failed"),
+            );
             if refusal.is_none() {
                 warn!(
                     dst_host = %host_lc,
@@ -6884,7 +6905,7 @@ async fn handle_forward_proxy_inner(
     };
     if let Some(guard) = credential_generation {
         guard.ensure_current().inspect_err(|_| {
-            correlation.record_outcome(HttpOutcome::PlatformError);
+            correlation.record_failure(HttpOutcome::PlatformError, "credential_generation_stale");
         })?;
     }
 
@@ -7055,9 +7076,21 @@ async fn handle_forward_proxy_inner(
     };
     let dial_result = connector.connect().instrument(dial_span.clone()).await;
     let mut upstream = match dial_result {
-        Ok(s) => s,
+        Ok(s) => {
+            if inspected {
+                dial_span.record("otel.status_code", "OK");
+            }
+            s
+        }
         Err(e) => {
             egress::mark_error(&dial_span);
+            if inspected {
+                dial_span.record(
+                    "openshell.request.failure_reason",
+                    "upstream_connect_failed",
+                );
+                correlation.record_failure(HttpOutcome::UpstreamError, "upstream_connect_failed");
+            }
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Fail)
                 .severity(SeverityId::Low)
@@ -7219,7 +7252,8 @@ async fn handle_forward_proxy_inner(
         policy_str,
         outcome_result,
     )
-    .await?;
+    .await
+    .map_err(|error| correlation.capture_error(error))?;
 
     // The request has now survived middleware, token grant, credential
     // rewriting, generation checks, and the HTTP relay. Only now record the
@@ -7252,7 +7286,7 @@ async fn handle_forward_proxy_inner(
             websocket_permessage_deflate,
             websocket_subprotocol,
         } => {
-            correlation.finish_http_trace();
+            correlation.finish_http_request();
             // Protocols whose rules apply to individual HTTP requests never
             // upgrade (see `upgrade_refusal_for_protocol`). No current path
             // forwards upgrade headers for them: the request-side refusal
@@ -7398,7 +7432,6 @@ fn build_correlated_json_error_response(
     let body = serde_json::json!({
         "error": error,
         "detail": detail,
-        "request_id": request_id,
     })
     .to_string();
     format!(
@@ -7486,9 +7519,6 @@ fn build_middleware_deny_response(
     if let Some(reason_code) = &denial.reason_code {
         body.insert("reason_code".to_string(), serde_json::json!(reason_code));
     }
-    if let Some(request_id) = request_id {
-        body.insert("request_id".to_string(), serde_json::json!(request_id));
-    }
     let body_str = serde_json::Value::Object(body).to_string();
     let request_id_header = request_id.map_or_else(String::new, |request_id| {
         format!(
@@ -7541,9 +7571,6 @@ fn build_middleware_platform_response(
         "detail": "Request could not be processed by configured middleware",
         "policy": policy_name,
     });
-    if let (Some(request_id), serde_json::Value::Object(fields)) = (request_id, &mut body) {
-        fields.insert("request_id".to_string(), serde_json::json!(request_id));
-    }
     if let Some(failure) = failure {
         crate::l7::rest::insert_middleware_failure(&mut body, failure);
     }

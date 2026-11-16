@@ -169,11 +169,6 @@ impl OcsfEvent {
         }
     }
 
-    /// Associate this event with other events produced for the same operation.
-    pub fn set_correlation_uid(&mut self, uid: impl Into<String>) {
-        self.base_mut().metadata.correlation_uid = Some(uid.into());
-    }
-
     /// Returns mutable base data common to all event classes.
     pub(crate) fn base_mut(&mut self) -> &mut BaseEventData {
         match self {
@@ -297,7 +292,7 @@ mod tests {
         .status(StatusId::Success)
         .build();
 
-        event.set_correlation_uid("request-123");
+        event.base_mut().metadata.correlation_uid = Some("request-123".into());
 
         assert_eq!(
             event.base().metadata.correlation_uid.as_deref(),

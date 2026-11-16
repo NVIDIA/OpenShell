@@ -67,20 +67,25 @@ L4 and passthrough traffic do not provide this header guarantee.
 The emission hook adds request correlation to every OCSF class in the current
 request scope, including findings. Policy, middleware, token-grant and finding
 records retain their original content, event IDs, timestamps and classification;
-they are not merged or delayed. `unmapped.http_event_kind` identifies `decision`,
-`middleware_invocation` or `token_grant`, and middleware records retain
+they are not merged or delayed. `unmapped.http_event_kind` distinguishes decisions,
+findings, connection events and middleware invocations. Explicit control kinds,
+such as `token_grant`, remain unchanged. Middleware records retain
 `unmapped.middleware_phase`, including HTTP-hook preflight and completion.
 `unmapped.request_sequence` starts at 1 per request and describes local emission
 order, not downstream delivery order. Count policy outcomes by selecting the
 actual policy/firewall control record within a receipt group, not every
-`decision` record; companion findings also use `decision`.
+`decision` record.
 
 Request IDs and audit outcomes do not depend on OpenTelemetry, sampling or
 collector availability. Inspected requests have a supervisor-owned request span
 and children around stages that actually run, with valid workload W3C context
 only as an untrusted link. Their records never create an extra denial-only span,
 even if the request span is disabled or unsampled. Other egress paths retain the
-legacy bounded deny-span behavior. End HTTP tracing before an upgraded session.
+legacy bounded deny-span behavior. Both HTTP tracing and the request's ambient
+audit scope end before an upgraded session; later WebSocket frames do not reuse
+the handshake receipt. Terminal errors retain their request context explicitly,
+and policy-reload cancellation records the active request before dropping it.
+Idle connection closures have no HTTP receipt.
 The request span ends after its owned stages, not when response headers are logged.
 The `openshell.upstream.send` stage measures request writes and flush; response
 handling is measured separately. Receipt filtering preserves raw HTTP bytes

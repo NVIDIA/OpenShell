@@ -19,6 +19,7 @@ const MAX_TRACEPARENT_BYTES: usize = 256;
 pub(super) struct RequestTrace {
     span: Span,
     outcome: &'static str,
+    failure_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +84,7 @@ impl RequestTrace {
         Self {
             span,
             outcome: "incomplete",
+            failure_reason: None,
         }
     }
 
@@ -99,6 +101,7 @@ impl RequestTrace {
             "openshell.http.stage",
             otel.name = stage.name(),
             otel.status_code = tracing::field::Empty,
+            openshell.request.failure_reason = tracing::field::Empty,
         )
     }
 
@@ -109,6 +112,7 @@ impl RequestTrace {
 
     pub(super) fn record_outcome(&mut self, outcome: HttpOutcome) {
         let outcome = match outcome {
+            _ if self.outcome == "failed" => "failed",
             HttpOutcome::Allowed if self.outcome == "denied" => "denied",
             HttpOutcome::Allowed => "allowed",
             HttpOutcome::Denied => "denied",
@@ -119,8 +123,16 @@ impl RequestTrace {
         self.span.record("openshell.request.outcome", outcome);
     }
 
-    pub(super) fn record_failure_reason(&self, reason: &'static str) {
-        self.span.record("openshell.request.failure_reason", reason);
+    pub(super) fn record_failure_reason(&mut self, reason: &'static str) {
+        if self.failure_reason.is_none() {
+            self.failure_reason = Some(reason);
+            self.span.record("openshell.request.failure_reason", reason);
+        }
+    }
+
+    pub(super) fn record_unclassified_failure(&mut self) {
+        self.record_outcome(HttpOutcome::PlatformError);
+        self.record_failure_reason("request_failed");
     }
 
     pub(super) fn observe_http(&mut self, event: &HttpActivityEvent) {

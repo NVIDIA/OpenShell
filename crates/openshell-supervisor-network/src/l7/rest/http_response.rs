@@ -532,10 +532,7 @@ where
         }
         Err(error) => Err(error),
     };
-    let span = response_correlation.map_or_else(tracing::Span::none, |correlation| {
-        correlation.stage(RequestStage::ResponseMiddleware)
-    });
-    relay_described_response_through_middleware(
+    let response = relay_described_response_through_middleware(
         request_method,
         upstream,
         client,
@@ -548,9 +545,18 @@ where
         event_stream,
         response_correlation,
         parsed,
-    )
-    .instrument(span)
-    .await
+    );
+    if let Some(correlation) = response_correlation {
+        Box::pin(correlation.run_stage(
+            RequestStage::ResponseMiddleware,
+            HttpOutcome::PlatformError,
+            "response_middleware_failed",
+            response,
+        ))
+        .await
+    } else {
+        response.await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2364,11 +2370,16 @@ where
     C: AsyncWrite + Unpin,
 {
     let mut trailers = Vec::new();
+    let mut field_count = 0;
     loop {
         let line = read_response_line_with_deadline(reader, session, client, framing).await?;
         validate_chunk_trailer_line(&line)?;
         if line.is_empty() {
             return Ok(trailers);
+        }
+        field_count += 1;
+        if field_count > openshell_supervisor_middleware::MAX_MIDDLEWARE_HEADERS {
+            return Err(miette!("HTTP response trailer count exceeds limit"));
         }
         let line = std::str::from_utf8(&line)
             .map_err(|_| miette!("HTTP response trailer contains invalid UTF-8"))?;
@@ -2378,6 +2389,11 @@ where
         validate_http_field_name(name)?;
         validate_http_field_value(value.trim())?;
         let name = name.to_ascii_lowercase();
+        // The upstream cannot supply the platform receipt. Strip it just as
+        // the ordinary response relay does, before exposing trailers to stages.
+        if name.eq_ignore_ascii_case(openshell_core::token_grant_failure::REQUEST_ID_HEADER) {
+            continue;
+        }
         if is_protected_response_field(&name) || connection_nominated_headers.contains(&name) {
             return Err(miette!("HTTP response trailer uses a protected field name"));
         }
@@ -2385,9 +2401,6 @@ where
             name,
             value: value.trim().to_string(),
         });
-        if trailers.len() > openshell_supervisor_middleware::MAX_MIDDLEWARE_HEADERS {
-            return Err(miette!("HTTP response trailer count exceeds limit"));
-        }
     }
 }
 
@@ -2483,7 +2496,6 @@ async fn send_response_delivery_failure<C: AsyncWrite + Unpin>(
     if let Some(failure) = failure {
         insert_middleware_failure(&mut body, failure);
     }
-    let body = body_with_request_id(body, correlation.map(RequestCorrelation::request_id));
     let body = serde_json::to_vec(&body).into_diagnostic()?;
     let head = format!(
         "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-OpenShell-Policy: {policy_name}\r\nConnection: close\r\n\r\n",
@@ -3182,16 +3194,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_middleware_rejects_forged_request_id_trailer() {
+    async fn response_middleware_strips_upstream_receipt_trailers_without_aborting_streams() {
         let correlation = test_correlation("trusted");
         let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
         let mut middleware = response_middleware_context(&runner, &chain, "GET");
         middleware.request_context.request_id = "middleware-request".into();
         middleware.request_head = None;
-        let mut upstream = &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\nX-OpenShell-Request-ID: forged\r\n\r\n"[..];
+        let response = b"HTTP/1.1 200 OK\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Trailer: X-OpenShell-Request-ID, X-Checksum\r\n\r\n\
+            4\r\nbody\r\n0\r\n\
+            x-OPENshell-request-ID: forged\r\n\
+            X-Checksum: ok\r\n\r\n";
+        let (ordinary_outcome, ordinary) = relay_bytes(response, Some(&correlation)).await;
+        assert!(matches!(ordinary_outcome.unwrap(), RelayOutcome::Reusable));
+        let mut upstream = response.as_slice();
         let mut client = Vec::new();
 
-        let error = relay_response(
+        let outcome = relay_response(
             "GET",
             &mut upstream,
             &mut client,
@@ -3202,19 +3222,22 @@ mod tests {
             Some(middleware),
         )
         .await
-        .expect_err("platform correlation trailers must fail closed");
+        .expect("upstream receipt trailers are stripped without aborting delivery");
 
-        assert!(
-            error.to_string().contains("protected field name"),
-            "{error}"
-        );
+        assert!(matches!(outcome, RelayOutcome::Reusable));
         let delivered = String::from_utf8_lossy(&client);
         assert!(!delivered.contains("forged"), "{delivered}");
+        assert!(delivered.contains("4\r\nBODY\r\n"), "{delivered}");
+        assert!(
+            delivered.ends_with("0\r\nx-checksum: ok\r\n\r\n"),
+            "{delivered}"
+        );
         assert!(
             delivered.contains("x-openshell-request-id: trusted\r\n"),
             "{delivered}"
         );
         assert_eq!(request_id_header_count(&client), 1);
+        assert_eq!(request_id_header_count(&ordinary), 1);
     }
 
     #[test]

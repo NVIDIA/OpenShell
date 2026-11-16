@@ -52,13 +52,10 @@ fn assert_json_response(
     if let Some(request_id) = expected_request_id {
         assert!(headers.contains(&format!("x-openshell-request-id: {request_id}\r\n")));
     }
-    let mut expected = serde_json::json!({
+    let expected = serde_json::json!({
         "error": expected_error,
         "detail": expected_detail,
     });
-    if let Some(request_id) = expected_request_id {
-        expected["request_id"] = serde_json::json!(request_id);
-    }
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(body).unwrap(),
         expected
