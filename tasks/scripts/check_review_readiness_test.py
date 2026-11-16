@@ -417,11 +417,74 @@ class ReconciliationTests(unittest.TestCase):
 
 
 class AcceptedWorkIntegrationTests(unittest.TestCase):
+    def test_accepted_label_event_carries_structured_rationale(self):
+        with (
+            mock.patch.object(
+                routing,
+                "_api",
+                side_effect=[
+                    {**pr(draft=True), "node_id": "PR_node"},
+                    {"node_id": "label_node"},
+                    {
+                        "data": {
+                            "addLabelsToLabelable": {
+                                "labelable": {"__typename": "PullRequest"}
+                            }
+                        }
+                    },
+                ],
+            ) as api,
+            mock.patch.object(
+                routing,
+                "evaluate_pr_accepted_work",
+                return_value={"basis": "repository_permission", "permission": "admin"},
+            ),
+        ):
+            routing.check_review_readiness(
+                CATEGORIES,
+                REPO,
+                42,
+                apply=True,
+                label_accepted_work=True,
+                maintainers={"maintainer"},
+            )
+        request = api.call_args.kwargs["data"]
+        label = request["variables"]["input"]["labels"][0]
+        self.assertEqual(request["variables"]["input"]["labelableId"], "PR_node")
+        self.assertEqual(label["labelId"], "label_node")
+        self.assertEqual(
+            json.loads(label["rationale"]),
+            {
+                "schema": "openshell-acceptance-v1",
+                "basis": "repository_permission",
+                "permission": "admin",
+            },
+        )
+
+    def test_label_mutation_graphql_error_is_not_silent(self):
+        with (
+            mock.patch.object(
+                routing,
+                "_api",
+                side_effect=[
+                    {"node_id": "label_node"},
+                    {"errors": [{"message": "denied"}]},
+                ],
+            ),
+            self.assertRaisesRegex(ValueError, "Could not apply"),
+        ):
+            routing._add_accepted_label(
+                REPO, {"node_id": "PR_node"}, {"basis": "maintainer"}
+            )
+
     def run_check(self, value, *, accepted=True, apply=True, opened=True):
         with (
-            mock.patch.object(routing, "_api", side_effect=[value, None]) as api,
+            mock.patch.object(routing, "_api", side_effect=[value]) as api,
+            mock.patch.object(routing, "_add_accepted_label") as add_label,
             mock.patch.object(
-                routing, "check_pr_accepted_work", return_value=accepted
+                routing,
+                "evaluate_pr_accepted_work",
+                return_value={"basis": "maintainer"} if accepted else None,
             ) as check,
             mock.patch.object(
                 routing, "_load_reviewers", return_value=reviewers()
@@ -435,29 +498,29 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
                 label_accepted_work=opened,
                 maintainers={"maintainer"},
             )
+        if (
+            value["state"] == "open"
+            and opened
+            and accepted
+            and apply
+            and not any(label["name"] == "state:accepted" for label in value["labels"])
+        ):
+            add_label.assert_called_once_with(REPO, value, {"basis": "maintainer"})
+        else:
+            add_label.assert_not_called()
         return plan, api, check, load
 
     def test_new_draft_is_labeled_without_requesting_reviewers(self):
         plan, api, check, load = self.run_check(pr(draft=True))
         self.assertEqual(plan, routing.ReviewPlan((), (), True, ("state:accepted",)))
         check.assert_called_once_with(REPO, pr(draft=True), {"maintainer"}, api=api)
-        api.assert_has_calls(
-            [
-                mock.call(PULL),
-                mock.call(
-                    "repos/owner/repo/issues/42/labels",
-                    method="POST",
-                    data={"labels": ["state:accepted"]},
-                ),
-            ]
-        )
-        self.assertEqual(api.call_count, 2)
+        api.assert_called_once_with(PULL)
         load.assert_not_called()
 
     def test_new_ready_pr_can_be_labeled_before_area_classification(self):
         plan, api, _, load = self.run_check(pr())
         self.assertEqual(plan.add_labels, ("state:accepted",))
-        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_count, 1)
         load.assert_not_called()
 
     def test_nonqualifying_pr_is_not_labeled(self):
@@ -496,9 +559,14 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
     def test_labels_and_requests_reviewers_for_a_classified_ready_pr(self):
         with (
             mock.patch.object(
-                routing, "_api", side_effect=[pr("area:build"), None, None]
+                routing, "_api", side_effect=[pr("area:build"), None]
             ) as api,
-            mock.patch.object(routing, "check_pr_accepted_work", return_value=True),
+            mock.patch.object(routing, "_add_accepted_label"),
+            mock.patch.object(
+                routing,
+                "evaluate_pr_accepted_work",
+                return_value={"basis": "maintainer"},
+            ),
             mock.patch.object(routing, "_load_reviewers", return_value=reviewers()),
         ):
             plan = routing.check_review_readiness(
@@ -522,7 +590,7 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
             mock.patch.object(routing, "_api", return_value=pr("area:build")) as api,
             mock.patch.object(
                 routing,
-                "check_pr_accepted_work",
+                "evaluate_pr_accepted_work",
                 side_effect=ValueError("lookup failed"),
             ),
             self.assertRaisesRegex(ValueError, "lookup failed"),
@@ -538,9 +606,12 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
         api.assert_called_once_with(PULL)
 
     def test_real_library_qualifies_a_maintainer_without_permission_reads(self):
-        with mock.patch.object(
-            routing, "_api", side_effect=[pr(author="MAINTAINER", draft=True), None]
-        ) as api:
+        with (
+            mock.patch.object(
+                routing, "_api", side_effect=[pr(author="MAINTAINER", draft=True)]
+            ) as api,
+            mock.patch.object(routing, "_add_accepted_label"),
+        ):
             plan = routing.check_review_readiness(
                 CATEGORIES,
                 REPO,
@@ -551,16 +622,21 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
             )
         assert plan is not None
         self.assertTrue(plan.accepted_work)
-        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_count, 1)
 
     def test_label_result_survives_the_refresh_before_reviewer_removal(self):
         before = pr("area:build", requested=("alice", "dave"))
         after = pr("area:build", "state:accepted", requested=("alice", "dave"))
         with (
             mock.patch.object(
-                routing, "_api", side_effect=[before, None, after, None]
+                routing, "_api", side_effect=[before, after, None]
             ) as api,
-            mock.patch.object(routing, "check_pr_accepted_work", return_value=True),
+            mock.patch.object(routing, "_add_accepted_label"),
+            mock.patch.object(
+                routing,
+                "evaluate_pr_accepted_work",
+                return_value={"basis": "maintainer"},
+            ),
             mock.patch.object(
                 routing,
                 "_load_reviewers",
@@ -586,8 +662,13 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
     def test_label_write_failure_does_not_request_reviewers(self):
         error = subprocess.CalledProcessError(1, "gh", stderr="(HTTP 403)")
         with (
-            mock.patch.object(routing, "_api", side_effect=[pr("area:build"), error]),
-            mock.patch.object(routing, "check_pr_accepted_work", return_value=True),
+            mock.patch.object(routing, "_api", side_effect=[pr("area:build")]),
+            mock.patch.object(routing, "_add_accepted_label", side_effect=error),
+            mock.patch.object(
+                routing,
+                "evaluate_pr_accepted_work",
+                return_value={"basis": "maintainer"},
+            ),
             mock.patch.object(routing, "_load_reviewers") as load,
             self.assertRaises(subprocess.CalledProcessError),
         ):
