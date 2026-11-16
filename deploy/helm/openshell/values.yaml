@@ -416,6 +416,10 @@ server:
   name: ""
   # -- Gateway log level.
   logLevel: info
+  # -- Gateway console log format: text, or json for one JSON object per line
+  # with timestamp, severity, and message keys that log collectors such as
+  # Google Cloud Logging parse into structured entries.
+  logFormat: text
   # OpenTelemetry trace export over OTLP. Leave endpoint empty to disable.
   otlp:
     # -- OTLP/gRPC collector endpoint, conventionally port 4317. For an

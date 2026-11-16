@@ -143,6 +143,34 @@ tests:
           path: data["gateway.toml"]
           pattern: legacy-gateway
 
+  - it: maps server.logFormat to the gateway log_format key
+    set:
+      server.logFormat: json
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^log_format = "json"$'
+
+  - it: defaults the console log format to text
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^log_format = "text"$'
+
+  - it: gives an explicit gatewayConfig log format precedence over server.logFormat
+    set:
+      server.logFormat: text
+      gatewayConfig:
+        openshell.gateway:
+          log_format: json
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^log_format = "json"$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^log_format = "text"$'
+
   - it: translates legacy OIDC roles and scopes into schema-v2 field names
     set:
       server.oidc.issuer: https://issuer.example/realms/openshell

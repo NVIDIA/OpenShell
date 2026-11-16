@@ -7,8 +7,8 @@ use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::config::{
-    ConfigDeliveryMode, DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT, ServiceHostnameFormat,
-    ServiceRoutingConfig,
+    ConfigDeliveryMode, DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT, LogFormat,
+    ServiceHostnameFormat, ServiceRoutingConfig,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -133,6 +133,10 @@ struct RunArgs {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info", env = "OPENSHELL_LOG_LEVEL")]
     log_level: String,
+
+    /// Console log format: text (default) or json (one JSON object per line).
+    #[arg(long, default_value = "text", env = "OPENSHELL_LOG_FORMAT")]
+    log_format: LogFormat,
 
     /// Path to TLS certificate file (required unless --disable-tls).
     #[arg(long, env = "OPENSHELL_TLS_CERT")]
@@ -561,7 +565,8 @@ fn prepare_server_config_with_drivers(
     let mut config = openshell_core::Config::new(tls)
         .with_name(name)
         .with_bind_address(bind)
-        .with_log_level(&args.log_level);
+        .with_log_level(&args.log_level)
+        .with_log_format(args.log_format);
     if let Some(auth) = file.as_ref().and_then(|f| f.openshell.gateway.auth.clone()) {
         config.auth = auth;
     }
@@ -920,6 +925,7 @@ async fn run_from_args(
         &EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level))
             .to_string(),
+        prepared.config.log_format,
         &tracing_log_bus,
         ocsf_log.as_ref(),
         otlp_export.as_ref(),
@@ -1575,6 +1581,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "log_level")
     {
         args.log_level.clone_from(level);
+    }
+    if let Some(format) = file.log_format
+        && arg_defaulted(matches, "log_format")
+    {
+        args.log_format = format;
     }
     if let Some(driver) = &file.compute_driver
         && arg_defaulted(matches, "compute_driver")
@@ -4327,6 +4338,67 @@ log_level = "debug"
 
                 assert_eq!(args.log_level, "trace", "env var must win over file");
                 assert_eq!(args.name, "env-gateway");
+            });
+    }
+
+    #[test]
+    fn log_format_resolves_file_then_env_then_flag() {
+        let file = config_file_from_toml(
+            r#"
+[openshell.gateway]
+log_format = "json"
+"#,
+        );
+        Environment::new().remove("OPENSHELL_LOG_FORMAT").run(|| {
+            let (mut args, matches) =
+                parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+            assert_eq!(
+                args.log_format,
+                openshell_core::LogFormat::Text,
+                "text is the default"
+            );
+            merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+            assert_eq!(
+                args.log_format,
+                openshell_core::LogFormat::Json,
+                "file applies over default"
+            );
+
+            let (mut args, matches) = parse_with_args(&[
+                "openshell-gateway",
+                "--db-url",
+                "sqlite::memory:",
+                "--log-format",
+                "text",
+            ]);
+            merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+            assert_eq!(
+                args.log_format,
+                openshell_core::LogFormat::Text,
+                "CLI flag must win over file"
+            );
+        });
+        Environment::new()
+            .set("OPENSHELL_LOG_FORMAT", "text")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert_eq!(
+                    args.log_format,
+                    openshell_core::LogFormat::Text,
+                    "env var must win over file"
+                );
+            });
+        Environment::new()
+            .set("OPENSHELL_LOG_FORMAT", "yaml")
+            .run(|| {
+                assert!(
+                    command()
+                        .try_get_matches_from(["openshell-gateway", "--db-url", "sqlite::memory:"])
+                        .is_err(),
+                    "unknown formats are rejected"
+                );
             });
     }
 

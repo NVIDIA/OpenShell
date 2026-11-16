@@ -89,6 +89,33 @@ impl FromStr for ConfigDeliveryMode {
     }
 }
 
+/// Console log line format for the gateway.
+///
+/// `Text` writes human-readable lines. `Json` writes one JSON object per line
+/// with `timestamp`, `severity`, and `message` keys that log collectors such as
+/// Google Cloud Logging map to structured entries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl FromStr for LogFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            _ => Err(format!(
+                "invalid log format '{value}'; expected text or json"
+            )),
+        }
+    }
+}
+
 /// Gateway posture when a sandbox rejects a candidate policy generation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -255,6 +282,9 @@ pub struct Config {
 
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
+
+    /// Console log line format.
+    pub log_format: LogFormat,
 
     /// Security posture for rejected sandbox policy generations.
     pub policy_validation_failure_mode: PolicyValidationFailureMode,
@@ -1072,6 +1102,7 @@ impl Config {
             metrics_bind_address: None,
             metrics_tls: None,
             log_level: default_log_level(),
+            log_format: LogFormat::default(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
             config_delivery_mode: ConfigDeliveryMode::default(),
             tls,
@@ -1141,6 +1172,13 @@ impl Config {
     #[must_use]
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
         self.log_level = level.into();
+        self
+    }
+
+    /// Create a new configuration with the given console log format.
+    #[must_use]
+    pub const fn with_log_format(mut self, format: LogFormat) -> Self {
+        self.log_format = format;
         self
     }
 

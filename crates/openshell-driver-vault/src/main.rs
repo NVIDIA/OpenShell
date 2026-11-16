@@ -62,6 +62,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt()
+        .with_ansi(openshell_core::color::stdout_ansi())
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
         )

@@ -21,6 +21,7 @@ mod compute;
 mod config_delivery;
 pub mod config_file;
 mod config_update_operation;
+mod console_json;
 mod credential_store;
 mod credentials;
 mod defaults;
