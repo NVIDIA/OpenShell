@@ -1157,24 +1157,12 @@ fn validate_and_canonicalize_operation(
         return Ok(operation.clone());
     };
 
-    let rule = validate_rule_fragment(rule_name, rule.clone())
-        .and_then(|rule| {
-            // An `AddRule` authors new host selectors, so apply the
-            // authoring-only rules to the fragment. Existing endpoints in the
-            // current policy are not rechecked, so a stored selector that
-            // predates these rules does not block unrelated additions.
-            let mut violations = Vec::new();
-            crate::collect_authored_rule_host_violations(rule_name, &rule, &mut violations);
-            if violations.is_empty() {
-                Ok(rule)
-            } else {
-                Err(violations)
-            }
-        })
-        .map_err(|violations| PolicyMergeError::InvalidOperationPolicy {
+    let rule = validate_rule_fragment(rule_name, rule.clone()).map_err(|violations| {
+        PolicyMergeError::InvalidOperationPolicy {
             operation_index,
             violations,
-        })?;
+        }
+    })?;
     Ok(PolicyMergeOp::AddRule {
         rule_name: rule_name.clone(),
         rule,
@@ -3065,25 +3053,6 @@ mod tests {
                 [crate::PolicyViolation::OverbroadHostWildcard { host, .. }] if host == "**.*.*"
             )
         ));
-    }
-
-    #[test]
-    fn stored_overbroad_wildcard_does_not_block_unrelated_add_rule() {
-        let policy = policy_with_rule("open", rule_with_endpoint("open", "**.*.*", 443));
-        let result = merge_policy(
-            policy,
-            &[PolicyMergeOp::AddRule {
-                rule_name: "api".to_string(),
-                rule: rule_with_endpoint("api", "api.example.com", 443),
-            }],
-        )
-        .expect("unrelated additions must not recheck stored selectors");
-
-        assert_eq!(
-            result.policy.network_policies["open"].endpoints[0].host,
-            "**.*.*"
-        );
-        assert!(result.policy.network_policies.contains_key("api"));
     }
 
     #[test]

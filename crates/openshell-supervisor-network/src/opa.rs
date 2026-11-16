@@ -512,20 +512,6 @@ impl OpaEngine {
         }
         // Rejected candidates must not leak authored values through warnings.
         emit_l7_config_warnings(&warnings, "L7 policy validation warning");
-        // Selectors that the gateway now rejects on write still load here so
-        // stored and image policies keep working; surface them so operators
-        // can find and replace them.
-        if let Err(violations) = openshell_policy::validate_authored_host_selectors(&proto) {
-            let deprecated: Vec<String> = violations
-                .iter()
-                .map(|violation| {
-                    format!(
-                        "{violation}; the policy still loads, but the gateway rejects this selector when the policy is next written"
-                    )
-                })
-                .collect();
-            emit_l7_config_warnings(&deprecated, "Deprecated network endpoint host");
-        }
 
         normalize_l7_policy_rule_aliases(&mut data);
 
@@ -10548,10 +10534,10 @@ network_policies:
         );
     }
 
-    /// The gateway rejects `**.*.*` on write, but a policy stored before that
-    /// rule must keep loading and enforcing after a supervisor upgrade.
+    /// A policy stored before the gateway rejected `**.*.*` must not reach
+    /// enforcement: the supervisor refuses to load it.
     #[test]
-    fn stored_overbroad_wildcard_host_still_loads_from_proto() {
+    fn overbroad_wildcard_host_fails_to_load_from_proto() {
         let mut proto = test_proto();
         proto.network_policies.insert(
             "open".to_string(),
@@ -10567,18 +10553,7 @@ network_policies:
                 }],
             },
         );
-        let engine = OpaEngine::from_proto(&proto).expect("stored policy must load");
-        let decision = engine
-            .evaluate_network(&NetworkInput {
-                host: "api.github.com".into(),
-                port: 443,
-                binary_path: PathBuf::from("/usr/bin/curl"),
-                binary_sha256: "unused".into(),
-                ancestors: vec![],
-                cmdline_paths: vec![],
-            })
-            .unwrap();
-        assert!(decision.allowed, "{}", decision.reason);
+        assert!(OpaEngine::from_proto(&proto).is_err());
     }
 
     #[test]

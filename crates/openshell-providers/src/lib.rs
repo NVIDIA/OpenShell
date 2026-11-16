@@ -22,8 +22,7 @@ pub use profiles::{
     CredentialRefreshProfile, ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile,
     is_gateway_mintable_strategy, normalize_profile_id, parse_profile_json, parse_profile_yaml,
     profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml, strategy_output_env_key,
-    strategy_output_spec, strategy_primary_env_key, validate_authored_profile_hosts,
-    validate_profile_set,
+    strategy_output_spec, strategy_primary_env_key, validate_profile_set,
 };
 
 pub const VERTEX_AI_PROJECT_ID_KEY: &str = "VERTEX_AI_PROJECT_ID";

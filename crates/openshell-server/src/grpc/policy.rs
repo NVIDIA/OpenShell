@@ -113,8 +113,7 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, source_matches, validate_and_canonicalize_policy,
-    validate_authored_policy_hosts, validate_caller_annotations,
+    level_matches, source_matches, validate_and_canonicalize_policy, validate_caller_annotations,
     validate_no_reserved_provider_policy_keys, validate_policy_safety,
     validate_static_fields_unchanged,
 };
@@ -4319,7 +4318,6 @@ async fn handle_update_config_inner(
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             new_policy = validate_and_canonicalize_policy(new_policy)?;
             validate_policy_safety(&new_policy)?;
-            validate_authored_policy_hosts(&new_policy)?;
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
                 .await?;
             validate_candidate_effective_policy(&new_policy, &[])?;
@@ -4745,12 +4743,6 @@ async fn handle_update_config_inner(
     new_policy = validate_and_canonicalize_policy(new_policy)?;
     let backfill_policy = should_backfill_policy.then(|| new_policy.clone());
     validate_policy_safety(&new_policy)?;
-    // A supervisor sync writes back the stored or image policy it loaded, with
-    // baseline paths added. It does not author host selectors, so a policy
-    // stored before an authoring rule existed must not block sandbox startup.
-    if !sandbox_caller {
-        validate_authored_policy_hosts(&new_policy)?;
-    }
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
     let provider_layers =
         provider_policy_layers_for_sandbox(state, &workspace, &sandbox, &spec.providers).await?;
@@ -25691,66 +25683,6 @@ mod tests {
             "{}",
             err.message()
         );
-    }
-
-    /// A supervisor writes back the policy it loaded, after adding baseline
-    /// paths. A stored selector that predates the authoring rule must not
-    /// block that sync, or the sandbox could never start after an upgrade.
-    #[tokio::test]
-    async fn update_config_sandbox_sync_keeps_stored_overbroad_wildcard_host() {
-        use openshell_core::proto::{SandboxPhase, SandboxSpec};
-
-        let state = test_server_state().await;
-        let mut sandbox = Sandbox {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: "sb-sync-overbroad".to_string(),
-                name: "sync-overbroad".to_string(),
-                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
-                labels: HashMap::new(),
-                resource_version: 0,
-                annotations: HashMap::new(),
-                workspace: "default".to_string(),
-                deletion_time: None,
-            }),
-            spec: Some(SandboxSpec {
-                policy: None,
-                providers: Vec::new(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        sandbox.set_phase(SandboxPhase::Provisioning as i32);
-        state.store.put_message(&sandbox).await.unwrap();
-        let current_version = state
-            .store
-            .get_message_by_name::<Sandbox>("default", "sync-overbroad")
-            .await
-            .unwrap()
-            .unwrap()
-            .metadata
-            .unwrap()
-            .resource_version;
-
-        let response = handle_update_config(
-            &state,
-            with_sandbox(
-                Request::new(UpdateConfigRequest {
-                    sandbox: "sync-overbroad".to_string(),
-                    workspace_scope: Some(openshell_core::proto::workspace_selector(
-                        "default".to_string(),
-                    )),
-                    policy: Some(test_policy_with_rule("open", "**.*.*")),
-                    expected_resource_version: current_version,
-                    ..Default::default()
-                }),
-                "sb-sync-overbroad",
-            ),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-
-        assert_eq!(response.version, 1);
     }
 
     #[tokio::test]

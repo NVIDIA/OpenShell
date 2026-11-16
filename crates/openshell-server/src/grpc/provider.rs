@@ -2676,7 +2676,7 @@ use openshell_core::spiffe::{
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
     normalize_profile_id, strategy_output_env_key, strategy_output_spec, strategy_primary_env_key,
-    validate_authored_profile_hosts, validate_profile_set,
+    validate_profile_set,
 };
 use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
@@ -3100,7 +3100,6 @@ pub(super) async fn handle_import_provider_profiles(
         profile_conflict_diagnostics(state.store.as_ref(), &catalog, &workspace, &profiles).await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
-    diagnostics.extend(validate_authored_profile_hosts(&profiles));
     if !has_errors(&diagnostics) {
         diagnostics.extend(
             profile_attached_sandbox_diagnostics(
@@ -3205,7 +3204,6 @@ pub(super) async fn handle_update_provider_profiles(
         .await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
-    diagnostics.extend(validate_authored_profile_hosts(&profiles));
     let expected_resource_version = if request.expected_resource_version != 0 {
         Some(request.expected_resource_version)
     } else {
@@ -3327,7 +3325,6 @@ pub(super) async fn handle_lint_provider_profiles(
         profile_conflict_diagnostics(state.store.as_ref(), &catalog, &workspace, &profiles).await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
-    diagnostics.extend(validate_authored_profile_hosts(&profiles));
     let valid = !has_errors(&diagnostics);
 
     Ok(Response::new(LintProviderProfilesResponse {

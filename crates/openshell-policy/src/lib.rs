@@ -1058,9 +1058,8 @@ pub enum PolicyViolation {
     },
     /// A network endpoint uses a wildcard shape that does not match runtime semantics.
     InvalidHostWildcard { policy_name: String, host: String },
-    /// A newly authored wildcard host lacks a fixed suffix of at least two DNS
-    /// labels after its last wildcard (e.g. `**.*.*` or `*.*.com`). Reported
-    /// only by [`validate_authored_host_selectors`].
+    /// A wildcard host lacks a fixed suffix of at least two DNS labels after
+    /// its last wildcard (e.g. `**.*.*` or `*.*.com`).
     OverbroadHostWildcard { policy_name: String, host: String },
     /// `credential_signing` is set but `signing_service` is missing.
     MissingSigningService { policy_name: String, host: String },
@@ -1537,6 +1536,12 @@ fn validate_sandbox_policy_with_mcp_presence(
                     host: ep.host.clone(),
                 });
             }
+            if host_wildcard_overbroad(&ep.host) {
+                violations.push(PolicyViolation::OverbroadHostWildcard {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
             if !ep.credential_signing.is_empty()
                 && !matches!(
                     ep.credential_signing.as_str(),
@@ -1718,14 +1723,13 @@ fn host_wildcard_shape_invalid(host: &str) -> bool {
 }
 
 /// Minimum number of fixed DNS labels that must follow the last wildcard label
-/// of a newly authored host selector.
+/// of a host selector.
 const MIN_FIXED_SUFFIX_LABELS: usize = 2;
 
 /// Whether a wildcard host has fewer than two fixed labels after its last wildcard.
 ///
 /// Such hosts match names under unrelated registrable domains (`**.*.*`,
-/// `*.*.com`, `api.github.*`). This is an authoring rule: apply it where a
-/// caller writes a host selector, not where one is loaded.
+/// `*.*.com`, `api.github.*`).
 pub fn host_wildcard_overbroad(host: &str) -> bool {
     let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
     if !host.contains('*') {
@@ -1741,51 +1745,6 @@ pub fn host_wildcard_overbroad(host: &str) -> bool {
         return false;
     };
     labels.len() - last_wildcard - 1 < MIN_FIXED_SUFFIX_LABELS
-}
-
-/// Check host selectors that are being authored now, as opposed to loaded
-/// from durable state or delivered to a supervisor.
-///
-/// These rules are intentionally not part of [`validate_sandbox_policy`]:
-/// that function also gates stored-policy reads and supervisor activation,
-/// and policies stored before a rule existed must keep loading. Call this on
-/// create and full-replacement write paths; merge operations apply it to each
-/// `AddRule` fragment.
-pub fn validate_authored_host_selectors(
-    policy: &SandboxPolicy,
-) -> std::result::Result<(), Vec<PolicyViolation>> {
-    let mut network_policies: Vec<_> = policy.network_policies.iter().collect();
-    network_policies.sort_by_key(|(name, _)| *name);
-    let mut violations = Vec::new();
-    for (key, rule) in network_policies {
-        collect_authored_rule_host_violations(key, rule, &mut violations);
-    }
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(violations)
-    }
-}
-
-/// Append authoring-only host selector violations for one network rule.
-pub(crate) fn collect_authored_rule_host_violations(
-    key: &str,
-    rule: &NetworkPolicyRule,
-    violations: &mut Vec<PolicyViolation>,
-) {
-    let name = if rule.name.is_empty() {
-        key
-    } else {
-        rule.name.as_str()
-    };
-    for endpoint in &rule.endpoints {
-        if host_wildcard_overbroad(&endpoint.host) {
-            violations.push(PolicyViolation::OverbroadHostWildcard {
-                policy_name: name.to_string(),
-                host: endpoint.host.clone(),
-            });
-        }
-    }
 }
 
 /// Validate that an explicit-TCP host selector can produce names accepted by
@@ -3941,7 +3900,7 @@ network_policies:
     }
 
     #[test]
-    fn authored_host_selectors_reject_wildcards_without_fixed_suffix() {
+    fn validate_rejects_wildcard_host_without_fixed_suffix() {
         for host in [
             "**.*.*",
             "*.*.*",
@@ -3959,7 +3918,7 @@ network_policies:
             "*.example.[a-z]om",
         ] {
             let violations =
-                validate_authored_host_selectors(&policy_with_endpoint_host(host)).expect_err(host);
+                validate_sandbox_policy(&policy_with_endpoint_host(host)).expect_err(host);
             assert_eq!(
                 violations,
                 vec![PolicyViolation::OverbroadHostWildcard {
@@ -3977,7 +3936,7 @@ network_policies:
     }
 
     #[test]
-    fn authored_host_selectors_accept_anchored_wildcards() {
+    fn validate_accepts_wildcard_host_with_fixed_suffix() {
         for host in [
             "example.com",
             "*.example.com",
@@ -3991,7 +3950,6 @@ network_policies:
         ] {
             let policy = policy_with_endpoint_host(host);
             validate_sandbox_policy(&policy).unwrap_or_else(|v| panic!("{host}: {v:?}"));
-            validate_authored_host_selectors(&policy).unwrap_or_else(|v| panic!("{host}: {v:?}"));
         }
 
         let mut hostless = restrictive_default_policy();
@@ -4006,20 +3964,7 @@ network_policies:
                 ..Default::default()
             },
         );
-        validate_authored_host_selectors(&hostless).expect("hostless endpoint");
-    }
-
-    /// Policies stored before the authoring rule existed must keep loading:
-    /// `validate_sandbox_policy` gates stored-policy reads and supervisor
-    /// activation, so it must not reject these selectors.
-    #[test]
-    fn stored_overbroad_wildcard_still_passes_load_validation() {
-        for host in ["**.*.*", "*.*.com"] {
-            let policy = policy_with_endpoint_host(host);
-            validate_and_canonicalize_sandbox_policy(policy.clone())
-                .unwrap_or_else(|error| panic!("{host}: {error}"));
-            assert!(validate_authored_host_selectors(&policy).is_err(), "{host}");
-        }
+        validate_sandbox_policy(&hostless).expect("hostless endpoint");
     }
 
     #[test]

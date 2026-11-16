@@ -1039,23 +1039,6 @@ pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), 
     Ok(())
 }
 
-/// Validate host selectors that a caller is authoring in a full policy.
-///
-/// Apply this only where the request supplies a complete policy (sandbox
-/// create, full sandbox or global replacement). It is separate from
-/// [`validate_policy_safety`] because that check also runs on stored and
-/// composed policies, which must keep loading after these rules tighten.
-pub(super) fn validate_authored_policy_hosts(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
-    if let Err(violations) = openshell_policy::validate_authored_host_selectors(policy) {
-        let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
-        return Err(Status::invalid_argument(format!(
-            "policy contains unsafe content: {}",
-            messages.join("; ")
-        )));
-    }
-    Ok(())
-}
-
 /// Validate a policy and return the canonical value safe to hash and persist.
 ///
 /// Validation runs before canonicalization so sorting cannot hide duplicate or
@@ -2237,7 +2220,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_authored_policy_hosts_rejects_overbroad_wildcard() {
+    fn validate_policy_safety_rejects_overbroad_wildcard() {
         use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
 
         let mut policy = openshell_policy::restrictive_default_policy();
@@ -2253,9 +2236,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        // Stored-policy and supervisor validation keep accepting the selector.
-        assert!(validate_policy_safety(&policy).is_ok());
-        let err = validate_authored_policy_hosts(&policy).unwrap_err();
+        let err = validate_policy_safety(&policy).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(
             err.message().contains("'**.*.*' is too broad"),

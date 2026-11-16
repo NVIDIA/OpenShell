@@ -2134,35 +2134,6 @@ fn is_valid_profile_id(id: &str) -> bool {
         })
 }
 
-/// Report endpoint hosts that a caller may not author in a profile import or
-/// update, such as `**.*.*`.
-///
-/// Kept out of [`validate_profile_set`] because that function also gates
-/// loading the stored profile catalog, which must keep accepting profiles
-/// stored before this rule existed.
-#[must_use]
-pub fn validate_authored_profile_hosts(
-    profiles: &[(String, ProviderTypeProfile)],
-) -> Vec<ProfileValidationDiagnostic> {
-    let mut diagnostics = Vec::new();
-    for (source, profile) in profiles {
-        for (index, endpoint) in profile.endpoints.iter().enumerate() {
-            if openshell_policy::host_wildcard_overbroad(&endpoint.host) {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    &profile.id,
-                    format!("endpoints[{index}].host"),
-                    format!(
-                        "host wildcard '{}' is too broad; a wildcard host must end in at least two fixed DNS labels after its last wildcard, such as '*.example.com' or 's3.*.amazonaws.com'",
-                        endpoint.host
-                    ),
-                ));
-            }
-        }
-    }
-    diagnostics
-}
-
 #[must_use]
 pub fn validate_profile_set(
     profiles: &[(String, ProviderTypeProfile)],
@@ -2765,6 +2736,17 @@ pub fn validate_profile_set(
                     profile_id,
                     format!("endpoints[{index}]"),
                     format!("invalid endpoint '{}:{}'", endpoint.host, endpoint.port),
+                ));
+            }
+            if openshell_policy::host_wildcard_overbroad(&endpoint.host) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}].host"),
+                    format!(
+                        "host wildcard '{}' is too broad; a wildcard host must end in at least two fixed DNS labels after its last wildcard, such as '*.example.com' or 's3.*.amazonaws.com'",
+                        endpoint.host
+                    ),
                 ));
             }
             collect_mcp_profile_diagnostics(source, profile_id, index, endpoint, &mut diagnostics);

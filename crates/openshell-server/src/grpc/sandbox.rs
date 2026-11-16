@@ -69,10 +69,9 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique_with_catalog,
 };
 use super::validation::{
-    level_matches, source_matches, validate_and_canonicalize_policy,
-    validate_authored_policy_hosts, validate_dns1123_label, validate_exec_request_fields,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety,
-    validate_sandbox_governance_spec, validate_sandbox_spec,
+    level_matches, source_matches, validate_and_canonicalize_policy, validate_dns1123_label,
+    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
+    validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
 };
 use super::{MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN};
 use crate::persistence::current_time_ms;
@@ -693,7 +692,6 @@ async fn handle_create_sandbox_inner(
 
     if let Some(ref policy) = spec.policy {
         validate_policy_safety(policy)?;
-        validate_authored_policy_hosts(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
     super::policy::validate_candidate_sandbox_credential_policy(
