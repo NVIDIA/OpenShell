@@ -326,6 +326,9 @@ pub(crate) struct ServerStartupConfig {
 /// Server state shared across handlers.
 #[derive(Debug)]
 pub struct ServerState {
+    pub(crate) discovery: grpc::service_discovery::DiscoveryState,
+    /// Process-local bound on active discovery streams.
+    pub(crate) discovery_watches: Arc<tokio::sync::Semaphore>,
     /// Server configuration.
     pub config: Config,
 
@@ -695,6 +698,8 @@ impl ServerState {
             service_route_index,
             gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
             gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            discovery: grpc::service_discovery::DiscoveryState::default(),
+            discovery_watches: Arc::new(tokio::sync::Semaphore::new(32)),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -3193,7 +3198,11 @@ mod tests {
                 .iter()
                 .map(|service| service.name.as_str())
                 .collect::<Vec<_>>(),
-            ["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
+            [
+                "openshell.v1.OpenShell",
+                "openshell.v1.SandboxUpdates",
+                "openshell.v1.ServiceDiscovery"
+            ]
         );
 
         stop_listener(shutdown, handle).await;

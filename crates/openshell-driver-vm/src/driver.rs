@@ -5201,6 +5201,7 @@ pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), Str
     preparation::watch_parent(request.parent_pid)?;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(openshell_core::color::stderr_ansi())
         .with_env_filter(request.config.log_level.clone())
         .try_init()
         .map_err(|error| format!("initialize image preparation logging: {error}"))?;

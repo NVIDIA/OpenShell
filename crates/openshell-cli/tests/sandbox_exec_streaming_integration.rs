@@ -163,13 +163,6 @@ macro_rules! mock_gateway {
     ) => {
         #[tonic::async_trait]
         impl OpenShell for MockGateway {
-    async fn get_sandbox_provider_access_token(
-        &self,
-        _request: Request<proto::GetSandboxProviderAccessTokenRequest>,
-    ) -> Result<Response<proto::GetSandboxProviderAccessTokenResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
             $(async fn $method(&self, _: Request<$request>) -> Result<Response<$response>, Status> {
                 Err(Status::unimplemented("unused test RPC"))
             })*
@@ -278,6 +271,7 @@ mock_gateway! {
         report_sandbox_configuration(proto::ReportSandboxConfigurationRequest) -> proto::ReportSandboxConfigurationResponse;
         get_sandbox_provider_environment(proto::GetSandboxProviderEnvironmentRequest) -> proto::GetSandboxProviderEnvironmentResponse;
         exchange_provider_subject_token(proto::ExchangeProviderSubjectTokenRequest) -> proto::ExchangeProviderSubjectTokenResponse;
+        get_sandbox_provider_access_token(proto::GetSandboxProviderAccessTokenRequest) -> proto::GetSandboxProviderAccessTokenResponse;
         get_sandbox_logs(proto::GetSandboxLogsRequest) -> proto::GetSandboxLogsResponse;
         report_main_process_exit(proto::ReportMainProcessExitRequest) -> proto::ReportMainProcessExitResponse;
         finalize_main_process_exit(proto::FinalizeMainProcessExitRequest) -> proto::FinalizeMainProcessExitResponse;

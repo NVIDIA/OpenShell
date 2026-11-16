@@ -109,6 +109,7 @@ pub fn install(
         .with(
             tracing_subscriber::fmt::layer()
                 .event_format(GatewayEventFormat)
+                .with_ansi(openshell_core::color::stdout_ansi())
                 .with_filter(filter_from(filter_directives)),
         )
         .with(
