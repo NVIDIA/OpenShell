@@ -12,7 +12,10 @@ use super::layer::hash_file;
 
 pub(super) fn hash_sources(hasher: &mut Hasher) -> Result<()> {
     let requirements = crate::ansible::requirements_path();
-    let root = requirements.parent().unwrap();
+    hash_sources_in(hasher, requirements.parent().unwrap())
+}
+
+pub(super) fn hash_sources_in(hasher: &mut Hasher, root: &Path) -> Result<()> {
     hash_tree(hasher, root, root)
 }
 

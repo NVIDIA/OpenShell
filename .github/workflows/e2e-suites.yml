@@ -161,24 +161,32 @@ jobs:
         with:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
+      # The hash tmachine names the environment's setup layer after, or `none`
+      # when the environment has no setup layer. It reads the base image, which
+      # the run step needs anyway, so this mostly moves that download earlier.
+      - name: Compute the tmachine setup layer key
+        id: layer-key
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+          nix build --no-link .#tmachine || nix build --no-link .#tmachine
+          key=$(nix run .#tmachine -- layer-key "${ENVIRONMENT}")
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+
       - name: Cache tmachine disks
+        if: steps.layer-key.outputs.key != 'none'
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           # Only the setup layers, which depend on the environment alone. The
           # install layers under disks/install hold this commit's build (and
           # on k3s, the gateway's credentials), so no later run could use them.
           path: ~/.cache/tmachine/disks/setup/*.qcow2
-          # tmachine keys its setup layers on a hash of the Ansible tree, the
-          # environments' playbook lists and setup inputs (config.nix, and
-          # files such as the Keycloak realm file) and the cache version in
-          # setup.rs. actions/cache doesn't save after an exact key hit, so a
-          # key that misses one of those would rebuild the changed layers on
-          # every run. Environments share no layers, and
-          # only the first job to save a key gets its disks in, so each
-          # environment needs its own key; its installers share it. No
-          # restore-keys fallback: restoring an older entry would carry its
-          # stale disks into the new one, which then only grows.
-          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/config.nix', 'tests/tmachine/images.nix', 'tests/tmachine/src/qemu/setup.rs', 'tests/tmachine/src/qemu/layer.rs', 'tests/tmachine/src/qemu/ansible_hash.rs', 'scripts/keycloak-realm.json') }}
+          # Keyed on the layer's own hash, so the cache misses exactly when
+          # tmachine would rebuild the layer. The environment's installers
+          # share the key. No restore-keys fallback: restoring an older entry
+          # would carry its stale disks into the new one, which then only grows.
+          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ steps.layer-key.outputs.key }}
 
       - name: Download integration inputs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

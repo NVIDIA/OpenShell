@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tmachine::config::{Config, Environment, Installer, Machine};
-use tmachine::{install, setup, test};
+use tmachine::{install, setup, setup_layer_key, test};
 
 #[derive(Parser)]
 #[command(name = "tmachine")]
@@ -21,6 +21,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Setup {
+        environment: String,
+    },
+    /// Print the key of the environment's setup layer, or `none` when it has
+    /// no setup playbooks, without starting a VM.
+    LayerKey {
         environment: String,
     },
     Install {
@@ -50,6 +55,11 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Setup { environment } => {
             let (machine, environment) = find_environment(&config, &environment)?;
             setup(&machine, &environment).await?;
+        }
+        Command::LayerKey { environment } => {
+            let (machine, environment) = find_environment(&config, &environment)?;
+            let key = setup_layer_key(&machine, &environment)?;
+            println!("{}", key.as_deref().unwrap_or("none"));
         }
         Command::Install {
             environment,
