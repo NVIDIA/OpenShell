@@ -10,23 +10,23 @@ use crate::watcher::{
     self, LifecycleEventFences, WatchStream, driver_sandbox_from_inspect,
     driver_sandbox_from_list_entry,
 };
-use openshell_core::config::CDI_GPU_DEVICE_ALL;
-use openshell_core::driver_utils::{
+use openshell_container_runtime::config::CDI_GPU_DEVICE_ALL;
+use openshell_container_runtime::driver_utils::{
     SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
     temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
 };
-use openshell_core::gpu::{
-    CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
-    effective_driver_gpu_count, validate_cdi_gpu_device_request,
+use openshell_container_runtime::gpu::{
+    CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, validate_cdi_gpu_device_request,
 };
-use openshell_core::network_trust::{
+use openshell_container_runtime::network_trust::{
     NETWORK_SUPERVISOR_TRUST_GENERATION_KEY, NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
 };
-use openshell_core::proto::compute::v1::{
+use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
+use openshell_driver_sdk::proto::compute::v1::{
     CpuResourceCapabilities, DriverSandbox, GetCapabilitiesResponse, GpuResourceCapabilities,
     GpuResourceRequirements, MemoryResourceCapabilities, ResourceCapabilities,
 };
-use openshell_core::{ComputeDriverError, NetworkSupervisorTrustBundle};
+use openshell_driver_sdk::{ComputeDriverError, NetworkSupervisorTrustBundle};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -83,9 +83,9 @@ fn select_grpc_endpoint(
 }
 
 fn select_supervisor_otlp(
-    otlp: openshell_core::sandbox_env::SupervisorOtlp,
+    otlp: openshell_driver_sdk::sandbox_env::SupervisorOtlp,
     environment: PodmanEndpointEnvironment,
-) -> openshell_core::sandbox_env::SupervisorOtlp {
+) -> openshell_driver_sdk::sandbox_env::SupervisorOtlp {
     otlp.map_endpoints(|endpoint| supervisor_collector_endpoint(&endpoint, environment))
 }
 
@@ -117,14 +117,14 @@ fn supervisor_collector_endpoint(endpoint: &str, environment: PodmanEndpointEnvi
 
 fn decode_launch_authentication(
     encoded: &[u8],
-) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, ComputeDriverError> {
+) -> Result<openshell_driver_sdk::jwt::SandboxLaunchAuthentication, ComputeDriverError> {
     let authentication =
-        serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(encoded)
+        serde_json::from_slice::<openshell_driver_sdk::jwt::SandboxLaunchAuthentication>(encoded)
             .map_err(|error| {
-                ComputeDriverError::Precondition(format!(
-                    "decode Podman sandbox launch authentication: {error}"
-                ))
-            })?;
+            ComputeDriverError::Precondition(format!(
+                "decode Podman sandbox launch authentication: {error}"
+            ))
+        })?;
     authentication.validate().map_err(|error| {
         ComputeDriverError::Precondition(format!(
             "validate Podman sandbox launch authentication: {error}"
@@ -270,7 +270,7 @@ async fn cleanup_sandbox_resolver_secret(client: &PodmanClient, secret_name: &st
 /// Fails closed: when `proxy_auth_file` is configured but cannot be read or
 /// does not hold a valid `user:pass` credential, the sandbox is not created.
 /// Credential validation is shared with the in-container supervisor through
-/// [`openshell_core::driver_utils::parse_upstream_proxy_credential`], so a
+/// [`openshell_driver_sdk::driver_utils::parse_upstream_proxy_credential`], so a
 /// credential staged here can never be rejected at supervisor startup.
 async fn create_sandbox_proxy_auth_secret(
     client: &PodmanClient,
@@ -286,13 +286,13 @@ async fn create_sandbox_proxy_auth_secret(
     // exhaust gateway memory.
     let path_owned = path.to_string();
     let raw = tokio::task::spawn_blocking(move || {
-        openshell_core::driver_utils::read_upstream_proxy_credential_file(&path_owned)
+        openshell_driver_sdk::driver_utils::read_upstream_proxy_credential_file(&path_owned)
     })
     .await
     .map_err(|e| ComputeDriverError::Message(format!("proxy_auth_file read task failed: {e}")))?
     .map_err(ComputeDriverError::Message)?;
-    let credential =
-        openshell_core::driver_utils::parse_upstream_proxy_credential(&raw).map_err(|err| {
+    let credential = openshell_driver_sdk::driver_utils::parse_upstream_proxy_credential(&raw)
+        .map_err(|err| {
             ComputeDriverError::InvalidArgument(format!("proxy_auth_file '{path}': {err}"))
         })?;
 
@@ -477,7 +477,7 @@ fn resolve_socket_path(
 fn operator_network_trust(
     path: &str,
 ) -> Result<(NetworkSupervisorTrustBundle, tempfile::TempDir), PodmanApiError> {
-    let pem = openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+    let pem = openshell_driver_sdk::driver_utils::read_upstream_proxy_ca_bundle_file(
         path,
         "additional_ca_bundle",
     )
@@ -715,13 +715,14 @@ impl PodmanComputeDriver {
     /// Report driver capabilities.
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
         Ok(GetCapabilitiesResponse {
-            resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
-                allow_driver_config: self.config.allow_driver_config,
-                resource_admission: self.config.resource_admission.clone(),
-            }
-            .acknowledgement(),
+            resource_admission_policy:
+                openshell_driver_sdk::resource_admission::DriverAdmissionConfig {
+                    allow_driver_config: self.config.allow_driver_config,
+                    resource_admission: self.config.resource_admission.clone(),
+                }
+                .acknowledgement(),
             driver_name: "podman".to_string(),
-            driver_version: openshell_core::VERSION.to_string(),
+            driver_version: openshell_driver_sdk::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
@@ -740,12 +741,14 @@ impl PodmanComputeDriver {
             }),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
-            extension: Some(openshell_core::extension_protocol::extension_metadata(
-                openshell_core::extension_protocol::ExtensionFamily::Compute,
-                "openshell/podman",
-                openshell_core::VERSION,
-                [],
-            )),
+            extension: Some(
+                openshell_driver_sdk::extension_protocol::extension_metadata(
+                    openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
+                    "openshell/podman",
+                    openshell_driver_sdk::VERSION,
+                    [],
+                ),
+            ),
         })
     }
 
@@ -767,7 +770,7 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &'a DriverSandbox,
     ) -> Result<ValidatedPodmanSandbox<'a>, ComputeDriverError> {
-        openshell_core::resource_admission::check_sandbox_driver_config(
+        openshell_driver_sdk::resource_admission::check_sandbox_driver_config(
             self.config.allow_driver_config,
             sandbox,
         )
@@ -901,10 +904,10 @@ impl PodmanComputeDriver {
         let labels = &inspect.config.labels;
         let precondition =
             |error: tonic::Status| ComputeDriverError::Precondition(error.message().into());
-        openshell_core::resource_admission::check_config_provenance(
+        openshell_container_runtime::resource_admission::check_config_provenance(
             self.config.allow_driver_config,
             labels
-                .get(openshell_core::resource_admission::CONFIG_USED_LABEL)
+                .get(openshell_container_runtime::resource_admission::CONFIG_USED_LABEL)
                 .map(String::as_str),
         )
         .map_err(precondition)?;
@@ -919,7 +922,7 @@ impl PodmanComputeDriver {
         let sandbox_id = labels.get(LABEL_SANDBOX_ID).ok_or_else(missing)?;
         let mounts = inspect.mounts.as_ref().ok_or_else(missing)?;
         let expected: std::collections::BTreeMap<String, serde_json::Value> = labels
-            .get(openshell_core::resource_admission::IDENTITIES_LABEL)
+            .get(openshell_container_runtime::resource_admission::IDENTITIES_LABEL)
             .and_then(|value| serde_json::from_str(value).ok())
             .ok_or_else(missing)?;
         let mut actual = std::collections::BTreeMap::new();
@@ -989,7 +992,9 @@ impl PodmanComputeDriver {
                 Some("tmpfs") => {}
                 Some("bind")
                     if mount["Destination"].as_str()
-                        == Some(openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY)
+                        == Some(
+                            openshell_driver_sdk::driver_utils::SUPERVISOR_CONTAINER_BINARY,
+                        )
                         && mount["RW"].as_bool() == Some(false)
                         && labels
                             .get("openshell.ai/runtime-binary-source")
@@ -1872,7 +1877,7 @@ impl PodmanComputeDriver {
         &self,
         old_workload: &ContainerListEntry,
         durable_sandbox: &DriverSandbox,
-        generation: &openshell_core::sandbox_generation::SandboxGenerationId,
+        generation: &openshell_driver_sdk::sandbox_generation::SandboxGenerationId,
         encoded_authentication: &[u8],
     ) -> Result<(), ComputeDriverError> {
         if durable_sandbox.id
@@ -2028,7 +2033,7 @@ impl PodmanComputeDriver {
         // The durable snapshot is used only if a stopped generation must be
         // reconciled; it never comes from Podman's mutable inspect response.
         self.verify_network_trust()?;
-        let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+        let generation = openshell_driver_sdk::sandbox_generation::SandboxGenerationId::parse(
             generation_id.to_string(),
         )
         .map_err(|error| ComputeDriverError::InvalidArgument(error.to_string()))?;
@@ -2455,14 +2460,14 @@ impl PodmanComputeDriver {
 }
 
 fn validate_apparmor_support(
-    profile: Option<&openshell_core::AppArmorProfile>,
+    profile: Option<&openshell_driver_sdk::AppArmorProfile>,
     apparmor_enabled: bool,
 ) -> Result<(), PodmanApiError> {
     let requires_apparmor = matches!(
         profile,
         Some(
-            openshell_core::AppArmorProfile::RuntimeDefault
-                | openshell_core::AppArmorProfile::Localhost(_)
+            openshell_driver_sdk::AppArmorProfile::RuntimeDefault
+                | openshell_driver_sdk::AppArmorProfile::Localhost(_)
         )
     );
     if requires_apparmor && !apparmor_enabled {
@@ -2567,8 +2572,9 @@ async fn extract_sandbox_bin(
         &inspect.id
     };
 
-    let cache_path = openshell_core::driver_utils::supervisor_cache_path("podman-sandbox", digest)
-        .map_err(ComputeDriverError::Precondition)?;
+    let cache_path =
+        openshell_container_runtime::driver_utils::supervisor_cache_path("podman-sandbox", digest)
+            .map_err(ComputeDriverError::Precondition)?;
     // Unit tests use ordered Podman API stubs and intentionally exercise the
     // extraction path on every create. Production reuses the immutable cache.
     #[cfg(not(test))]
@@ -2672,11 +2678,11 @@ mod tests {
     use super::*;
     use crate::test_utils::{StubResponse, spawn_podman_stub};
     use hyper::StatusCode;
-    use openshell_core::jwt::{
+    use openshell_driver_sdk::jwt::{
         CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
         SupervisorAuthBundle,
     };
-    use openshell_core::proto::compute::v1::{
+    use openshell_driver_sdk::proto::compute::v1::{
         DriverSandboxSpec, DriverSandboxTemplate, ResourceRequirements,
     };
     use std::collections::HashMap;
@@ -2686,12 +2692,13 @@ mod tests {
     fn launch_authentication() -> SandboxLaunchAuthentication {
         SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
-                session_id: openshell_core::SandboxSessionId::new(),
-                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
-                    "generation-1",
-                )
-                .unwrap(),
-                session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
+                session_id: openshell_driver_sdk::SandboxSessionId::new(),
+                runtime_generation:
+                    openshell_driver_sdk::sandbox_generation::SandboxGenerationId::parse(
+                        "generation-1",
+                    )
+                    .unwrap(),
+                session_rotation: openshell_driver_sdk::jwt::SessionRotation::new(1).unwrap(),
                 auth_epoch: CredentialEpoch::new(1).unwrap(),
                 gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
                 gateway_expires_at: i64::MAX,
@@ -2830,9 +2837,9 @@ mod tests {
     ) -> (
         ContainerListEntry,
         DriverSandbox,
-        openshell_core::sandbox_generation::SandboxGenerationId,
+        openshell_driver_sdk::sandbox_generation::SandboxGenerationId,
     ) {
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_driver_sdk::proto::compute::v1::DriverSandboxSpec;
         let old_workload = ContainerListEntry {
             id: format!("workload-{sandbox_id}"),
             names: vec![format!("openshell-default--{sandbox_id}")],
@@ -2851,7 +2858,7 @@ mod tests {
             workspace: String::new(),
         };
         let generation =
-            openshell_core::sandbox_generation::SandboxGenerationId::parse("generation-1")
+            openshell_driver_sdk::sandbox_generation::SandboxGenerationId::parse("generation-1")
                 .expect("valid generation");
         (old_workload, durable, generation)
     }
@@ -3537,8 +3544,8 @@ mod tests {
         );
     }
 
-    fn supervisor_otlp(endpoint: &str) -> openshell_core::sandbox_env::SupervisorOtlp {
-        use openshell_core::sandbox_env::{OtlpExport, OtlpProtocol, SupervisorOtlp};
+    fn supervisor_otlp(endpoint: &str) -> openshell_driver_sdk::sandbox_env::SupervisorOtlp {
+        use openshell_driver_sdk::sandbox_env::{OtlpExport, OtlpProtocol, SupervisorOtlp};
         let export = |protocol| {
             Some(OtlpExport {
                 endpoint: endpoint.to_string(),
@@ -3556,7 +3563,7 @@ mod tests {
     fn supervisor_otlp_stays_empty_without_gateway_export() {
         assert!(
             select_supervisor_otlp(
-                openshell_core::sandbox_env::SupervisorOtlp::default(),
+                openshell_driver_sdk::sandbox_env::SupervisorOtlp::default(),
                 PodmanEndpointEnvironment::PodmanMachine
             )
             .is_empty()
@@ -3629,7 +3636,7 @@ mod tests {
 
     #[test]
     fn confined_apparmor_profiles_follow_podman_capability() {
-        use openshell_core::AppArmorProfile;
+        use openshell_driver_sdk::AppArmorProfile;
 
         for profile in [
             AppArmorProfile::RuntimeDefault,
@@ -3698,7 +3705,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_sandbox_create_accepts_default_gpu_with_inventory() {
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_driver_sdk::proto::compute::v1::DriverSandboxSpec;
 
         let driver = PodmanComputeDriver::for_tests_with_gpu_inventory(
             PodmanComputeConfig::default(),
@@ -3717,7 +3724,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_sandbox_create_accepts_all_only_inventory_when_dxg_fallback_allowed() {
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_driver_sdk::proto::compute::v1::DriverSandboxSpec;
 
         let driver = PodmanComputeDriver::for_tests_with_gpu_inventory_and_all_fallback(
             PodmanComputeConfig::default(),
@@ -3737,7 +3744,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_sandbox_create_rejects_all_only_inventory_without_dxg_fallback() {
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_driver_sdk::proto::compute::v1::DriverSandboxSpec;
 
         let driver = PodmanComputeDriver::for_tests_with_gpu_inventory(
             PodmanComputeConfig::default(),
@@ -3758,7 +3765,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_sandbox_create_rejects_host_device_paths() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
             allow_driver_config: true,
@@ -3784,7 +3791,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_sandbox_create_passes_explicit_cdi_device_id_without_inventory() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        use openshell_driver_sdk::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
             allow_driver_config: true,
@@ -3807,7 +3814,7 @@ mod tests {
 
     #[test]
     fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_driver_sdk::proto::compute::v1::DriverSandboxSpec;
 
         let driver = PodmanComputeDriver::for_tests_with_gpu_inventory(
             PodmanComputeConfig::default(),
@@ -3897,7 +3904,7 @@ mod tests {
     fn test_driver(socket_path: PathBuf) -> PodmanComputeDriver {
         let config = PodmanComputeConfig {
             allow_driver_config: true,
-            resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
+            resource_admission: openshell_driver_sdk::resource_admission::ResourceAdmissionConfig {
                 enabled: false,
                 ..Default::default()
             },
@@ -3918,7 +3925,7 @@ mod tests {
         let serde_json::Value::Object(object) = value else {
             panic!("expected JSON object");
         };
-        openshell_core::proto_struct::json_object_to_struct(object)
+        openshell_driver_sdk::proto_struct::json_object_to_struct(object)
             .expect("test JSON must convert to a protobuf Struct")
     }
 
@@ -4052,8 +4059,8 @@ mod tests {
                     "Labels": {
                         LABEL_SANDBOX_ID: sandbox_id,
                         container::LABEL_SANDBOX_WORKSPACE: "team-a",
-                        openshell_core::resource_admission::CONFIG_USED_LABEL: "false",
-                        openshell_core::resource_admission::IDENTITIES_LABEL: "{}",
+                        openshell_container_runtime::resource_admission::CONFIG_USED_LABEL: "false",
+                        openshell_container_runtime::resource_admission::IDENTITIES_LABEL: "{}",
                     }
                 },
                 "Mounts": [
@@ -4071,10 +4078,11 @@ mod tests {
             );
             let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
                 socket_path: Some(socket.clone()),
-                resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
-                    enabled: true,
-                    ..Default::default()
-                },
+                resource_admission:
+                    openshell_driver_sdk::resource_admission::ResourceAdmissionConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
                 ..Default::default()
             });
             let result = driver.admit_container_resources("workload").await;
@@ -4096,10 +4104,11 @@ mod tests {
     async fn admission_driver_config_denial_does_not_contact_podman() {
         for enabled in [true, false] {
             let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
-                resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
-                    enabled,
-                    ..Default::default()
-                },
+                resource_admission:
+                    openshell_driver_sdk::resource_admission::ResourceAdmissionConfig {
+                        enabled,
+                        ..Default::default()
+                    },
                 ..Default::default()
             });
             let error = driver

@@ -15,6 +15,7 @@ openshell-crypto = { workspace = true, features = ["tls-tonic"] }
 async-trait = "0.1"
 openshell-extension-core = { path = "../openshell-extension-core" }
 openshell-policy-schema = { path = "../openshell-policy-schema" }
+openshell-driver-sdk = { path = "../openshell-driver-sdk" }
 glob = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
@@ -34,12 +35,8 @@ uuid = { workspace = true }
 ipnet = "2"
 rustls = { workspace = true }
 base64 = { workspace = true }
-jsonwebtoken = { workspace = true, optional = true }
-zeroize = { workspace = true, optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots-no-provider"], optional = true }
-tar = { version = "0.4", optional = true }
-tempfile = { version = "3", optional = true }
 openshell-otel = { path = "../openshell-otel", optional = true }
 clap = { workspace = true, optional = true }
 
@@ -53,16 +50,15 @@ default = ["telemetry"]
 ## Compile in anonymous telemetry emission support. On by default; disable with
 ## `--no-default-features` (plus any other features you need) for a build that
 ## contains no telemetry endpoint, no HTTP client, and no emission code at all.
-driver-extraction = ["dep:tar", "dep:tempfile"]
-telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking"]
+telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking", "openshell-driver-sdk/telemetry"]
 ## OAuth2 token request helpers used by supervisor and gateway.
 oauth = ["dep:reqwest"]
 ## Strict Ed25519 JWT issuance and verification for authenticated sandbox sessions.
-jwt = ["dep:jsonwebtoken", "dep:zeroize"]
+jwt = ["openshell-driver-sdk/jwt"]
 ## Conversions to `openshell-otel` types.
-otel = ["dep:openshell-otel"]
+otel = ["dep:openshell-otel", "openshell-driver-sdk/otel"]
 ## Command-line flags shared by compute drivers.
-clap = ["dep:clap"]
+clap = ["dep:clap", "openshell-driver-sdk/clap"]
 ## Propagate the active W3C trace context on supervisor gateway calls.
 trace-context = ["otel"]
 

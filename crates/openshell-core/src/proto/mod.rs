@@ -29,25 +29,25 @@ pub mod v1 {
 }
 
 pub mod datamodel {
-    pub use super::generated::openshell::datamodel::v1;
+    pub use openshell_driver_sdk::proto::datamodel::v1;
 }
 
 pub mod sandbox {
     pub mod backend {
         pub use super::super::generated::openshell::sandbox::backend::v1;
     }
-    pub use super::generated::openshell::sandbox::v1;
+    pub use openshell_driver_sdk::proto::sandbox::v1;
     pub mod protocol {
         pub use super::super::generated::openshell::sandbox::protocol::v1;
     }
 }
 
 pub mod compute {
-    pub use super::generated::openshell::compute::v1;
+    pub use openshell_driver_sdk::proto::compute::v1;
 }
 
 pub mod extension {
-    pub use super::generated::openshell::extension::v1;
+    pub use openshell_driver_sdk::proto::extension::v1;
 }
 
 #[allow(

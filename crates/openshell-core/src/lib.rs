@@ -12,61 +12,60 @@
 pub mod activity;
 pub mod app_listener;
 pub mod auth;
-pub mod compute;
+pub use openshell_driver_sdk::compute;
 pub mod config;
-pub mod container_paths;
+pub use openshell_driver_sdk::container_paths;
 pub mod denial;
-pub mod driver_mounts;
-pub mod driver_utils;
+pub use openshell_driver_sdk::driver_mounts;
+pub use openshell_driver_sdk::driver_utils;
 pub mod dynamic_credential_key;
 pub mod dynamic_string_allowlist;
 #[cfg(unix)]
-pub mod e2fsprogs;
+pub use openshell_driver_sdk::e2fsprogs;
 pub mod endpoint_failure;
 pub mod endpoint_path;
 pub mod endpoint_status;
-pub mod error;
-pub mod extension_protocol;
+pub use openshell_driver_sdk::error;
+pub use openshell_driver_sdk::extension_protocol;
 #[cfg(unix)]
-pub mod external_driver_socket;
+pub use openshell_driver_sdk::external_driver_socket;
 pub mod forward;
 pub mod google_cloud;
 pub mod gpu;
 pub mod grpc_client;
 pub mod host_pattern;
-pub mod image;
+pub use openshell_driver_sdk::image;
 pub mod isolation_registration;
 pub mod jwt;
-pub mod local_api_socket;
 pub mod mcp;
 pub mod metadata;
 pub mod middleware;
 pub mod net;
-pub mod network_trust;
+pub use openshell_driver_sdk::network_trust;
 #[cfg(feature = "oauth")]
 pub mod oauth;
 pub mod paths;
 pub mod policy;
 pub use openshell_policy_schema::yaml;
 pub mod policy_identity;
-pub mod progress;
+pub use openshell_driver_sdk::progress;
 pub mod proposals;
 pub mod proto;
-pub mod proto_struct;
+pub use openshell_driver_sdk::proto_struct;
 pub mod provider_credentials;
 pub mod replica_routing;
-pub mod resource_admission;
+pub use openshell_driver_sdk::resource_admission;
 pub mod rpc_error;
-pub mod sandbox_env;
-pub mod sandbox_generation;
-pub mod sandbox_session;
+pub use openshell_driver_sdk::sandbox_env;
+pub use openshell_driver_sdk::sandbox_generation;
+pub use openshell_driver_sdk::sandbox_session;
 pub mod sandbox_update;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
 pub mod spiffe;
 pub mod telemetry;
-pub mod time;
+pub use openshell_driver_sdk::time;
 pub mod token_grant_failure;
 pub mod transport_errors;
 pub mod upload;
@@ -86,20 +85,7 @@ pub use metadata::{
 pub use network_trust::NetworkSupervisorTrustBundle;
 pub use sandbox_session::{SandboxSessionId, SandboxSessionIdError};
 
-/// Build version string derived from git metadata.
-///
-/// For local builds this is computed by `build.rs` from the exact release tag
-/// or the latest merged stable tag using the guess-next-dev scheme (e.g.
-/// `0.0.4-dev.6+g2bf9969ab`). In Docker/CI builds where `.git` is absent, it
-/// falls back to `CARGO_PKG_VERSION`, which the build pipeline already stamps.
-pub const VERSION: &str = match option_env!("OPENSHELL_GIT_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
-
-#[cfg(test)]
-#[path = "../build_version.rs"]
-mod build_version;
+pub use openshell_driver_sdk::VERSION;
 
 /// Encoded protobuf `FileDescriptorSet` for every proto in `proto/`.
 ///

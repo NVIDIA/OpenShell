@@ -23,25 +23,30 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
-use openshell_core::driver_mounts;
-use openshell_core::driver_utils::{
-    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_WORKSPACE_VALIDATION_FAILED,
-    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SANDBOX_RUNTIME_IMAGE_BINARY_PATH,
-    SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, WORKSPACE_VALIDATION_FAILED_MESSAGE,
+use openshell_container_runtime::driver_utils::{
+    CONDITION_WORKSPACE_VALIDATION_FAILED, LABEL_SANDBOX_NAMESPACE,
+    SANDBOX_RUNTIME_IMAGE_BINARY_PATH, WORKSPACE_VALIDATION_FAILED_MESSAGE,
     extract_first_tar_entry, supervisor_image_should_refresh, temp_extract_container_name,
     validate_linux_elf_binary,
 };
-use openshell_core::gpu::{
-    CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
-    effective_driver_gpu_count, validate_cdi_device_names, validate_cdi_gpu_device_request,
+use openshell_container_runtime::gpu::{
+    CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, validate_cdi_device_names,
+    validate_cdi_gpu_device_request,
 };
-use openshell_core::progress::{
+use openshell_container_runtime::proto_struct::deserialize_optional_non_empty_string_list;
+use openshell_driver_sdk::config::DEFAULT_STOP_TIMEOUT_SECS;
+use openshell_driver_sdk::driver_mounts;
+use openshell_driver_sdk::driver_utils::{
+    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
+    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_WORKSPACE,
+    SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED,
+};
+use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
+use openshell_driver_sdk::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
-use openshell_core::proto::compute::v1::{
+use openshell_driver_sdk::proto::compute::v1::{
     CpuResourceCapabilities, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
     DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition,
     DriverPlatformEvent, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
@@ -54,10 +59,8 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
     WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
-use openshell_core::proto_struct::{
-    deserialize_optional_non_empty_string_list, struct_to_json_value,
-};
-use openshell_core::{
+use openshell_driver_sdk::proto_struct::struct_to_json_value;
+use openshell_driver_sdk::{
     AppArmorProfile, Error, ImagePullPolicy, NetworkSupervisorTrustBundle, Result as CoreResult,
     UpstreamProxyConfig,
 };
@@ -123,7 +126,7 @@ const SUPERVISOR_PROXY_AUTH_MOUNT_PATH: &str = "/.openshell/supervisor/upstream-
 const SUPERVISOR_PROXY_CA_BUNDLE_MOUNT_PATH: &str =
     "/.openshell/supervisor/upstream-proxy-ca-bundle.pem";
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
-    openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
+    openshell_container_runtime::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 const DRIVER_ADMITTED_BACKEND: &str = openshell_sandbox_backend::BACKEND_NAME;
 const LABEL_ISOLATION_BACKEND: &str = "openshell.ai/isolation-backend";
 const LABEL_ISOLATION_BACKEND_OPEN_SHELL: &str = openshell_sandbox_backend::BACKEND_NAME;
@@ -144,7 +147,7 @@ const HOST_OPEN_SHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 /// Fixed in-container path for the gateway-owned additional destination trust.
 /// It is mounted only into the separate trusted supervisor container.
-const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
+const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_driver_sdk::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
 
 fn provisioning_span(
     parent: &opentelemetry::Context,
@@ -186,7 +189,7 @@ pub struct DockerComputeConfig {
     /// Permit caller-supplied driver JSON. Does not waive resource admission.
     pub allow_driver_config: bool,
     /// Operator-owned external attachment approval policy.
-    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
+    pub resource_admission: openshell_driver_sdk::resource_admission::ResourceAdmissionConfig,
     /// Docker API Unix socket. When unset, use the socket selected by gateway
     /// auto-detection, falling back to `/var/run/docker.sock` for an explicitly
     /// configured Docker driver.
@@ -213,7 +216,7 @@ pub struct DockerComputeConfig {
     /// OTLP exports passed to supervisors. The gateway supplies them from
     /// `[otlp]`; driver TOML cannot set them.
     #[serde(skip)]
-    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
+    pub supervisor_otlp: openshell_driver_sdk::sandbox_env::SupervisorOtlp,
 
     /// Gateway name passed to supervisors for their telemetry. The gateway
     /// supplies its own name; driver TOML cannot set it.
@@ -251,7 +254,7 @@ pub struct DockerComputeConfig {
     /// Omit the field to use `OpenShell`'s default sandbox process limit.
     /// Explicit zero is invalid.
     #[serde(
-        default = "openshell_core::config::default_sandbox_pids_limit",
+        default = "openshell_container_runtime::config::default_sandbox_pids_limit",
         skip_serializing_if = "Option::is_none"
     )]
     pub sandbox_pids_limit: Option<std::num::NonZeroI64>,
@@ -295,7 +298,7 @@ impl DockerComputeConfig {
         validate_docker_proxy_auth_file(&self.upstream_proxy)?;
         validate_docker_proxy_ca_bundle(self)?;
         if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
-            openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
+            openshell_container_runtime::driver_utils::validate_provider_spiffe_unix_socket(socket)
                 .map_err(Error::config)?;
         }
         if gateway_bind_address.port() == 0 {
@@ -313,14 +316,14 @@ impl Default for DockerComputeConfig {
             socket_path: None,
             allow_driver_config: false,
             resource_admission:
-                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
-            default_image: openshell_core::image::default_sandbox_image(),
+                openshell_driver_sdk::resource_admission::ResourceAdmissionConfig::default(),
+            default_image: openshell_driver_sdk::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             sandbox_label: "default".to_string(),
             grpc_endpoint: String::new(),
             supervisor_network_mode: DockerSupervisorNetworkMode::Host,
             host_gateway_ip: None,
-            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
+            supervisor_otlp: openshell_driver_sdk::sandbox_env::SupervisorOtlp::default(),
             supervisor_gateway_name: None,
             sandbox_runtime_image: None,
             supervisor_bin: None,
@@ -328,8 +331,8 @@ impl Default for DockerComputeConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
-            ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
-            sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
+            ssh_socket_path: openshell_driver_sdk::container_paths::SSH_SOCKET_PATH.to_string(),
+            sandbox_pids_limit: openshell_container_runtime::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
             upstream_proxy: UpstreamProxyConfig::default(),
             proxy_ca_bundle: None,
@@ -347,7 +350,7 @@ pub(crate) struct DockerGuestTlsPaths {
 #[derive(Debug, Clone)]
 struct DockerDriverRuntimeConfig {
     allow_driver_config: bool,
-    resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
+    resource_admission: openshell_driver_sdk::resource_admission::ResourceAdmissionConfig,
     default_image: String,
     image_pull_policy: ImagePullPolicy,
     sandbox_namespace: String,
@@ -360,7 +363,7 @@ struct DockerDriverRuntimeConfig {
     supervisor_endpoint_explicit: bool,
     bridge_default_endpoint: Option<String>,
     host_gateway_ip: Option<IpAddr>,
-    supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
+    supervisor_otlp: openshell_driver_sdk::sandbox_env::SupervisorOtlp,
     supervisor_gateway_name: Option<String>,
     ssh_socket_path: String,
     guest_tls: Option<DockerGuestTlsPaths>,
@@ -709,8 +712,8 @@ fn resolve_docker_identity_from_accounts(
         // rejecting, matching the Podman driver's USER-less default and the
         // numeric-identity behavior of the Kubernetes and VM drivers.
         return ResolvedWorkloadIdentity::new(
-            openshell_core::sandbox_env::DEFAULT_SANDBOX_UID,
-            openshell_core::sandbox_env::DEFAULT_SANDBOX_GID,
+            openshell_driver_sdk::sandbox_env::DEFAULT_SANDBOX_UID,
+            openshell_driver_sdk::sandbox_env::DEFAULT_SANDBOX_GID,
             Vec::new(),
             "default".to_string(),
             image.id.clone(),
@@ -791,7 +794,7 @@ impl DockerSandboxDriverConfig {
     }
 }
 
-use openshell_core::driver_mounts::SelinuxLabel;
+use openshell_driver_sdk::driver_mounts::SelinuxLabel;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -884,11 +887,20 @@ pub fn detect_socket() -> Option<PathBuf> {
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         candidates.push(PathBuf::from(runtime_dir).join("docker.sock"));
     }
-    openshell_core::local_api_socket::first_responsive_socket(&candidates, |response| {
-        openshell_core::local_api_socket::http_response_is_success(response)
-            && openshell_core::local_api_socket::contains_ascii(response, b"Api-Version:")
-            && !openshell_core::local_api_socket::contains_ascii(response, b"Libpod-Api-Version:")
-    })
+    openshell_container_runtime::local_api_socket::first_responsive_socket(
+        &candidates,
+        |response| {
+            openshell_container_runtime::local_api_socket::http_response_is_success(response)
+                && openshell_container_runtime::local_api_socket::contains_ascii(
+                    response,
+                    b"Api-Version:",
+                )
+                && !openshell_container_runtime::local_api_socket::contains_ascii(
+                    response,
+                    b"Libpod-Api-Version:",
+                )
+        },
+    )
 }
 
 #[must_use]
@@ -966,7 +978,7 @@ impl DockerComputeDriver {
         let supervisor_image = docker_config
             .supervisor_image
             .clone()
-            .unwrap_or_else(openshell_core::config::default_supervisor_image);
+            .unwrap_or_else(openshell_driver_sdk::config::default_supervisor_image);
         let supervisor_image_id =
             ensure_runtime_image(&docker, &supervisor_image, "supervisor").await?;
         let host_gateway_ip = if let Some(ip) = docker_config.host_gateway_ip {
@@ -995,7 +1007,7 @@ impl DockerComputeDriver {
             let sandbox_runtime_image = docker_config
                 .sandbox_runtime_image
                 .clone()
-                .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image);
+                .unwrap_or_else(openshell_driver_sdk::config::default_sandbox_runtime_image);
             let sandbox_runtime_image_id =
                 ensure_runtime_image(&docker, &sandbox_runtime_image, "sandbox runtime").await?;
             Arc::new(
@@ -1071,13 +1083,14 @@ impl DockerComputeDriver {
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
-            resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
-                allow_driver_config: self.config.allow_driver_config,
-                resource_admission: self.config.resource_admission.clone(),
-            }
-            .acknowledgement(),
+            resource_admission_policy:
+                openshell_driver_sdk::resource_admission::DriverAdmissionConfig {
+                    allow_driver_config: self.config.allow_driver_config,
+                    resource_admission: self.config.resource_admission.clone(),
+                }
+                .acknowledgement(),
             driver_name: "docker".to_string(),
-            driver_version: openshell_core::VERSION.to_string(),
+            driver_version: openshell_driver_sdk::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
@@ -1096,12 +1109,14 @@ impl DockerComputeDriver {
             }),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
-            extension: Some(openshell_core::extension_protocol::extension_metadata(
-                openshell_core::extension_protocol::ExtensionFamily::Compute,
-                "openshell/docker",
-                openshell_core::VERSION,
-                [],
-            )),
+            extension: Some(
+                openshell_driver_sdk::extension_protocol::extension_metadata(
+                    openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
+                    "openshell/docker",
+                    openshell_driver_sdk::VERSION,
+                    [],
+                ),
+            ),
         }
     }
 
@@ -1118,7 +1133,7 @@ impl DockerComputeDriver {
         sandbox: &'a DriverSandbox,
         config: &DockerDriverRuntimeConfig,
     ) -> Result<ValidatedDockerSandbox<'a>, Status> {
-        openshell_core::resource_admission::check_sandbox_driver_config(
+        openshell_driver_sdk::resource_admission::check_sandbox_driver_config(
             config.allow_driver_config,
             sandbox,
         )?;
@@ -1283,10 +1298,10 @@ impl DockerComputeDriver {
             .as_ref()
             .and_then(|config| config.labels.as_ref())
             .ok_or_else(|| Status::failed_precondition("sandbox lacks admission metadata"))?;
-        openshell_core::resource_admission::check_config_provenance(
+        openshell_container_runtime::resource_admission::check_config_provenance(
             self.config.allow_driver_config,
             labels
-                .get(openshell_core::resource_admission::CONFIG_USED_LABEL)
+                .get(openshell_container_runtime::resource_admission::CONFIG_USED_LABEL)
                 .map(String::as_str),
         )?;
         if !self.config.resource_admission.enabled {
@@ -1299,7 +1314,7 @@ impl DockerComputeDriver {
             .get(LABEL_SANDBOX_ID)
             .ok_or_else(|| Status::failed_precondition("sandbox lacks identity"))?;
         let expected: std::collections::BTreeMap<String, serde_json::Value> = labels
-            .get(openshell_core::resource_admission::IDENTITIES_LABEL)
+            .get(openshell_container_runtime::resource_admission::IDENTITIES_LABEL)
             .and_then(|value| serde_json::from_str(value).ok())
             .ok_or_else(|| Status::failed_precondition("sandbox lacks resource identity record"))?;
         let mut actual = std::collections::BTreeMap::new();
@@ -1761,7 +1776,7 @@ impl DockerComputeDriver {
             .labels
             .get_or_insert_with(Default::default)
             .insert(
-                openshell_core::resource_admission::IDENTITIES_LABEL.into(),
+                openshell_container_runtime::resource_admission::IDENTITIES_LABEL.into(),
                 serde_json::to_string(&identities).map_err(|error| {
                     DockerProvisioningFailure::new("ResourceAdmissionDenied", error.to_string())
                 })?,
@@ -2474,7 +2489,7 @@ impl DockerComputeDriver {
     ) -> Result<bool, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         require_sandbox_identifier(sandbox_id, sandbox_name)?;
-        let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+        let generation = openshell_driver_sdk::sandbox_generation::SandboxGenerationId::parse(
             generation_id.to_string(),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -2497,7 +2512,7 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
-        generation: &openshell_core::sandbox_generation::SandboxGenerationId,
+        generation: &openshell_driver_sdk::sandbox_generation::SandboxGenerationId,
         launch_authentication: &[u8],
         _durable_sandbox: Option<&DriverSandbox>,
     ) -> Result<bool, Status> {
@@ -2811,8 +2826,8 @@ impl DockerComputeDriver {
         self.publish_platform_event(
             sandbox_id.to_string(),
             DriverPlatformEvent {
-                event_time: openshell_core::time::timestamp_from_millis(
-                    openshell_core::time::now_ms(),
+                event_time: openshell_driver_sdk::time::timestamp_from_millis(
+                    openshell_driver_sdk::time::now_ms(),
                 )
                 .ok(),
                 source: "docker".to_string(),
@@ -3146,7 +3161,7 @@ fn validate_docker_outer_fence(
     Ok(())
 }
 #[tonic::async_trait]
-impl openshell_core::compute::ComputeDriver for ComputeDriverService {}
+impl openshell_driver_sdk::compute::ComputeDriver for ComputeDriverService {}
 
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
@@ -3154,9 +3169,11 @@ impl ComputeDriver for ComputeDriverService {
 
     async fn authenticate_sandbox(
         &self,
-        request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
-    {
+        request: Request<openshell_driver_sdk::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<
+        Response<openshell_driver_sdk::proto::compute::v1::AuthenticateSandboxResponse>,
+        Status,
+    > {
         self.rpc_tracer
             .trace(
                 openshell_otel::rpc::AUTHENTICATE_SANDBOX,
@@ -3311,15 +3328,17 @@ impl ComputeDriver for ComputeDriverService {
 }
 
 #[tonic::async_trait]
-impl openshell_core::compute::ComputeDriver for DockerComputeDriver {}
+impl openshell_driver_sdk::compute::ComputeDriver for DockerComputeDriver {}
 
 #[tonic::async_trait]
 impl ComputeDriver for DockerComputeDriver {
     async fn authenticate_sandbox(
         &self,
-        _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
-    {
+        _request: Request<openshell_driver_sdk::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<
+        Response<openshell_driver_sdk::proto::compute::v1::AuthenticateSandboxResponse>,
+        Status,
+    > {
         Err(Status::unimplemented(
             "docker does not authenticate sandbox credentials",
         ))
@@ -3332,8 +3351,8 @@ impl ComputeDriver for DockerComputeDriver {
         request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         let capabilities = self.capabilities();
-        openshell_core::extension_protocol::validate_gateway_metadata(
-            openshell_core::extension_protocol::ExtensionFamily::Compute,
+        openshell_driver_sdk::extension_protocol::validate_gateway_metadata(
+            openshell_driver_sdk::extension_protocol::ExtensionFamily::Compute,
             "docker",
             capabilities.extension.as_ref(),
             request.into_inner().gateway,
@@ -3706,8 +3725,10 @@ fn platform_event(
     message: String,
 ) -> DriverPlatformEvent {
     DriverPlatformEvent {
-        event_time: openshell_core::time::timestamp_from_millis(openshell_core::time::now_ms())
-            .ok(),
+        event_time: openshell_driver_sdk::time::timestamp_from_millis(
+            openshell_driver_sdk::time::now_ms(),
+        )
+        .ok(),
         source: source.to_string(),
         r#type: event_type.to_string(),
         reason: reason.to_string(),
@@ -3735,8 +3756,10 @@ fn docker_pull_progress_event(image: &str, info: &CreateImageInfo) -> Option<Dri
     attach_docker_progress_metadata(&mut metadata, "PullingLayer", status);
 
     Some(DriverPlatformEvent {
-        event_time: openshell_core::time::timestamp_from_millis(openshell_core::time::now_ms())
-            .ok(),
+        event_time: openshell_driver_sdk::time::timestamp_from_millis(
+            openshell_driver_sdk::time::now_ms(),
+        )
+        .ok(),
         source: "docker".to_string(),
         r#type: "Normal".to_string(),
         reason: "PullingLayer".to_string(),
@@ -4319,7 +4342,7 @@ fn sandbox_token_host_path_by_id(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
 ) -> Result<PathBuf, Status> {
-    openshell_core::driver_utils::sandbox_token_path(
+    openshell_container_runtime::driver_utils::sandbox_token_path(
         "docker-sandbox-tokens",
         Some(&config.sandbox_namespace),
         sandbox_id,
@@ -4347,7 +4370,7 @@ async fn write_sandbox_token_file(
         return Ok(path.is_file());
     }
     if let Some(parent) = path.parent() {
-        openshell_core::paths::create_dir_restricted(parent).map_err(|err| {
+        openshell_driver_sdk::paths::create_dir_restricted(parent).map_err(|err| {
             Status::internal(format!(
                 "create sandbox token directory {} failed: {err}",
                 parent.display()
@@ -4362,7 +4385,7 @@ async fn write_sandbox_token_file(
                 path.display()
             ))
         })?;
-    openshell_core::paths::set_file_owner_only(&path).map_err(|err| {
+    openshell_driver_sdk::paths::set_file_owner_only(&path).map_err(|err| {
         Status::internal(format!(
             "restrict sandbox token file {} failed: {err}",
             path.display()
@@ -4376,7 +4399,7 @@ fn prepare_docker_boundary_state_dir(
     config: &DockerDriverRuntimeConfig,
 ) -> Result<PathBuf, Status> {
     let directory = docker_boundary_state_dir(sandbox, config)?;
-    openshell_core::paths::create_dir_restricted(&directory).map_err(|error| {
+    openshell_driver_sdk::paths::create_dir_restricted(&directory).map_err(|error| {
         Status::internal(format!(
             "create Docker boundary state directory {}: {error}",
             directory.display()
@@ -4392,7 +4415,7 @@ async fn write_docker_boundary_file(path: &Path, contents: &[u8]) -> Result<(), 
             path.display()
         ))
     })?;
-    openshell_core::paths::set_file_owner_only(path).map_err(|error| {
+    openshell_driver_sdk::paths::set_file_owner_only(path).map_err(|error| {
         Status::internal(format!(
             "restrict Docker boundary file {}: {error}",
             path.display()
@@ -4403,7 +4426,7 @@ async fn write_docker_boundary_file(path: &Path, contents: &[u8]) -> Result<(), 
 async fn adopt_or_verify_docker_start_generation(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
-    requested: &openshell_core::sandbox_generation::SandboxGenerationId,
+    requested: &openshell_driver_sdk::sandbox_generation::SandboxGenerationId,
 ) -> Result<(), Status> {
     let path = docker_boundary_state_dir_by_id(sandbox_id, config)?.join(START_GENERATION_FILE);
     adopt_or_verify_docker_start_generation_path(&path, requested).await
@@ -4411,7 +4434,7 @@ async fn adopt_or_verify_docker_start_generation(
 
 async fn adopt_or_verify_docker_start_generation_path(
     path: &Path,
-    requested: &openshell_core::sandbox_generation::SandboxGenerationId,
+    requested: &openshell_driver_sdk::sandbox_generation::SandboxGenerationId,
 ) -> Result<(), Status> {
     let active = match tokio::fs::read_to_string(&path).await {
         Ok(active) => active,
@@ -4454,7 +4477,7 @@ async fn adopt_or_verify_docker_start_generation_path(
                     path.display()
                 ))
             })?;
-            openshell_core::paths::set_file_owner_only(path).map_err(|error| {
+            openshell_driver_sdk::paths::set_file_owner_only(path).map_err(|error| {
                 Status::internal(format!(
                     "restrict adopted Docker sandbox generation {}: {error}",
                     path.display()
@@ -4474,7 +4497,7 @@ async fn adopt_or_verify_docker_start_generation_path(
 
 fn verify_docker_start_generation_value(
     active: &str,
-    requested: &openshell_core::sandbox_generation::SandboxGenerationId,
+    requested: &openshell_driver_sdk::sandbox_generation::SandboxGenerationId,
 ) -> Result<(), Status> {
     if active.trim() == requested.as_str() {
         return Ok(());
@@ -4649,14 +4672,14 @@ async fn stage_docker_sandbox_bundle(
 /// types before uploading the same filtered archive to the replacement.
 fn decode_docker_launch_authentication(
     encoded: &[u8],
-) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
+) -> Result<openshell_driver_sdk::jwt::SandboxLaunchAuthentication, Status> {
     let authentication =
-        serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(encoded)
+        serde_json::from_slice::<openshell_driver_sdk::jwt::SandboxLaunchAuthentication>(encoded)
             .map_err(|error| {
-                Status::failed_precondition(format!(
-                    "decode Docker sandbox launch authentication: {error}"
-                ))
-            })?;
+            Status::failed_precondition(format!(
+                "decode Docker sandbox launch authentication: {error}"
+            ))
+        })?;
     authentication.validate().map_err(|error| {
         Status::failed_precondition(format!(
             "validate Docker sandbox launch authentication: {error}"
@@ -4666,7 +4689,7 @@ fn decode_docker_launch_authentication(
 }
 
 fn gateway_verification_keys(
-    keys: &[openshell_core::jwt::SessionVerificationKey],
+    keys: &[openshell_driver_sdk::jwt::SessionVerificationKey],
 ) -> Result<Vec<GatewayVerificationKey>, Status> {
     keys.iter()
         .map(|key| {
@@ -4782,10 +4805,11 @@ async fn prepare_docker_boundary_files(
         &supervisor_auth,
     )
     .await?;
-    let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
-        sandbox.spec.as_ref(),
-    )
-    .map_err(|error| Status::internal(format!("encode Docker main process spec: {error}")))?;
+    let main_process_spec =
+        openshell_driver_sdk::sandbox_env::MainProcessConfig::encode_driver_spec(
+            sandbox.spec.as_ref(),
+        )
+        .map_err(|error| Status::internal(format!("encode Docker main process spec: {error}")))?;
     write_docker_boundary_file(
         &directory.join(MAIN_PROCESS_SPEC_FILE),
         main_process_spec.as_bytes(),
@@ -4891,9 +4915,11 @@ fn append_docker_proxy_ca_bundle(
     let path = path
         .to_str()
         .ok_or_else(|| Status::failed_precondition("proxy_ca_bundle must be valid UTF-8"))?;
-    let contents =
-        openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(path, "proxy_ca_bundle")
-            .map_err(Status::failed_precondition)?;
+    let contents = openshell_driver_sdk::driver_utils::read_upstream_proxy_ca_bundle_file(
+        path,
+        "proxy_ca_bundle",
+    )
+    .map_err(Status::failed_precondition)?;
     append_docker_archive_file(
         archive,
         "upstream-proxy-ca-bundle.pem",
@@ -5349,7 +5375,7 @@ async fn docker_workload_image_environment(
     if let Some(image) = sandbox_image(sandbox) {
         environment.push(format!(
             "{}={image}",
-            openshell_core::sandbox_env::CONTAINER_IMAGE
+            openshell_driver_sdk::sandbox_env::CONTAINER_IMAGE
         ));
     }
     if let Some(uid) = bootstrap
@@ -5359,7 +5385,7 @@ async fn docker_workload_image_environment(
     {
         environment.push(format!(
             "{}={uid}",
-            openshell_core::sandbox_env::CONTAINER_IMAGE_UID
+            openshell_driver_sdk::sandbox_env::CONTAINER_IMAGE_UID
         ));
     }
     Ok(environment)
@@ -5404,42 +5430,50 @@ async fn spawn_docker_control_process(
     let mut environment = vec![
         format!(
             "{}={DRIVER_ADMITTED_BACKEND}",
-            openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND
+            openshell_driver_sdk::sandbox_env::ADMITTED_ISOLATION_BACKEND
         ),
         format!(
             "{}={main_process_spec}",
-            openshell_core::sandbox_env::MAIN_PROCESS_SPEC
+            openshell_driver_sdk::sandbox_env::MAIN_PROCESS_SPEC
         ),
         format!(
             "{}={}",
-            openshell_core::sandbox_env::ENDPOINT,
+            openshell_driver_sdk::sandbox_env::ENDPOINT,
             supervisor_endpoint
         ),
-        format!("{}={}", openshell_core::sandbox_env::SANDBOX_ID, sandbox.id),
-        format!("{}={}", openshell_core::sandbox_env::SANDBOX, sandbox.name),
         format!(
             "{}={}",
-            openshell_core::sandbox_env::SSH_SOCKET_PATH,
+            openshell_driver_sdk::sandbox_env::SANDBOX_ID,
+            sandbox.id
+        ),
+        format!(
+            "{}={}",
+            openshell_driver_sdk::sandbox_env::SANDBOX,
+            sandbox.name
+        ),
+        format!(
+            "{}={}",
+            openshell_driver_sdk::sandbox_env::SSH_SOCKET_PATH,
             config.ssh_socket_path
         ),
         format!(
             "{}=/run/openshell/proxy-tls",
-            openshell_core::sandbox_env::PROXY_TLS_DIR
+            openshell_driver_sdk::sandbox_env::PROXY_TLS_DIR
         ),
         format!(
             "{}={}",
-            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
-            openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+            openshell_driver_sdk::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+            openshell_driver_sdk::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
         ),
         format!(
             "{}={}",
-            openshell_core::sandbox_env::LOG_LEVEL,
-            openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level)
+            openshell_driver_sdk::sandbox_env::LOG_LEVEL,
+            openshell_driver_sdk::driver_utils::sandbox_log_level(sandbox, &config.log_level)
         ),
         format!(
             "{}={}",
-            openshell_core::sandbox_env::TELEMETRY_ENABLED,
-            openshell_core::telemetry::enabled_env_value()
+            openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED,
+            openshell_driver_sdk::telemetry::enabled_env_value()
         ),
     ];
     environment.extend(image_environment);
@@ -5447,15 +5481,18 @@ async fn spawn_docker_control_process(
     if config.guest_tls.is_some() {
         environment.push(format!(
             "{}={SUPERVISOR_STATE_MOUNT_PATH}/tls/ca.pem",
-            openshell_core::sandbox_env::TLS_CA
+            openshell_driver_sdk::sandbox_env::TLS_CA
         ));
     }
     if let Some(socket) = config.provider_spiffe_workload_api_socket.as_ref() {
-        let projected = openshell_core::driver_utils::projected_provider_spiffe_socket_path(socket)
+        let projected =
+            openshell_container_runtime::driver_utils::projected_provider_spiffe_socket_path(
+                socket,
+            )
             .map_err(Status::failed_precondition)?;
         environment.push(format!(
             "{}={projected}",
-            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
+            openshell_driver_sdk::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
         ));
     }
     let supervisor_archive = docker_supervisor_bundle_archive(sandbox, config).await?;
@@ -5966,22 +6003,22 @@ fn docker_child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> 
         environment.extend(spec.environment.clone());
     }
     for protected in [
-        openshell_core::sandbox_env::ENDPOINT,
-        openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
-        openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
-        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
-        openshell_core::sandbox_env::OCI_IMAGE_USER,
-        openshell_core::sandbox_env::SANDBOX,
-        openshell_core::sandbox_env::SANDBOX_GID,
-        openshell_core::sandbox_env::SANDBOX_ID,
-        openshell_core::sandbox_env::SANDBOX_TOKEN,
-        openshell_core::sandbox_env::SANDBOX_TOKEN_FILE,
-        openshell_core::sandbox_env::SANDBOX_UID,
-        openshell_core::sandbox_env::SSH_SOCKET_PATH,
-        openshell_core::sandbox_env::TLS_CA,
-        openshell_core::sandbox_env::TLS_CERT,
-        openshell_core::sandbox_env::TLS_KEY,
-        openshell_core::sandbox_env::USER_ENVIRONMENT,
+        openshell_driver_sdk::sandbox_env::ENDPOINT,
+        openshell_driver_sdk::sandbox_env::GATEWAY_TLS_SERVER_NAME,
+        openshell_driver_sdk::sandbox_env::MAIN_PROCESS_SPEC,
+        openshell_driver_sdk::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        openshell_driver_sdk::sandbox_env::OCI_IMAGE_USER,
+        openshell_driver_sdk::sandbox_env::SANDBOX,
+        openshell_driver_sdk::sandbox_env::SANDBOX_GID,
+        openshell_driver_sdk::sandbox_env::SANDBOX_ID,
+        openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN,
+        openshell_driver_sdk::sandbox_env::SANDBOX_TOKEN_FILE,
+        openshell_driver_sdk::sandbox_env::SANDBOX_UID,
+        openshell_driver_sdk::sandbox_env::SSH_SOCKET_PATH,
+        openshell_driver_sdk::sandbox_env::TLS_CA,
+        openshell_driver_sdk::sandbox_env::TLS_CERT,
+        openshell_driver_sdk::sandbox_env::TLS_KEY,
+        openshell_driver_sdk::sandbox_env::USER_ENVIRONMENT,
     ] {
         environment.remove(protected);
     }
@@ -5998,10 +6035,12 @@ fn supervisor_otlp_environment(config: &DockerDriverRuntimeConfig) -> Vec<String
         .traces
         .iter()
         .flat_map(|_| openshell_otel::current_trace_context_environment());
-    let gateway_name = config
-        .supervisor_gateway_name
-        .iter()
-        .map(|name| (openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
+    let gateway_name = config.supervisor_gateway_name.iter().map(|name| {
+        (
+            openshell_driver_sdk::sandbox_env::GATEWAY_NAME,
+            name.clone(),
+        )
+    });
     exports
         .into_iter()
         .chain(trace_context)
@@ -6017,13 +6056,13 @@ fn build_boundary_environment(
     vec![
         format!(
             "{}={}",
-            openshell_core::sandbox_env::LOG_LEVEL,
-            openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level)
+            openshell_driver_sdk::sandbox_env::LOG_LEVEL,
+            openshell_driver_sdk::driver_utils::sandbox_log_level(sandbox, &config.log_level)
         ),
         format!(
             "{}={}",
-            openshell_core::sandbox_env::TELEMETRY_ENABLED,
-            openshell_core::telemetry::enabled_env_value()
+            openshell_driver_sdk::sandbox_env::TELEMETRY_ENABLED,
+            openshell_driver_sdk::telemetry::enabled_env_value()
         ),
     ]
 }
@@ -6237,7 +6276,7 @@ fn build_container_create_body_for_image(
             .map_err(|error| Status::internal(error.to_string()))?,
     );
     labels.insert(
-        openshell_core::resource_admission::CONFIG_USED_LABEL.into(),
+        openshell_container_runtime::resource_admission::CONFIG_USED_LABEL.into(),
         template
             .driver_config
             .as_ref()
@@ -6389,12 +6428,12 @@ fn validate_docker_proxy_auth_file(config: &UpstreamProxyConfig) -> CoreResult<(
     let Some(path) = config.proxy_auth_file.as_ref() else {
         return Ok(());
     };
-    let raw = openshell_core::driver_utils::read_upstream_proxy_credential_file(
+    let raw = openshell_driver_sdk::driver_utils::read_upstream_proxy_credential_file(
         path.to_str()
             .ok_or_else(|| Error::config("proxy_auth_file must be valid UTF-8"))?,
     )
     .map_err(Error::config)?;
-    openshell_core::driver_utils::parse_upstream_proxy_credential(&raw)
+    openshell_driver_sdk::driver_utils::parse_upstream_proxy_credential(&raw)
         .map_err(|error| Error::config(format!("proxy_auth_file is invalid: {error}")))?;
     Ok(())
 }
@@ -6414,7 +6453,7 @@ fn validate_docker_proxy_ca_bundle(config: &DockerComputeConfig) -> CoreResult<(
     let path = path
         .to_str()
         .ok_or_else(|| Error::config("proxy_ca_bundle must be valid UTF-8"))?;
-    openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(path, "proxy_ca_bundle")
+    openshell_driver_sdk::driver_utils::read_upstream_proxy_ca_bundle_file(path, "proxy_ca_bundle")
         .map_err(Error::config)?;
     Ok(())
 }
@@ -6824,7 +6863,7 @@ fn container_name_for_sandbox(sandbox: &DriverSandbox) -> String {
 /// `--from` reference such as `nicolaka/netshoot` must be resolved to a single
 /// tag the way `docker pull` (and the Podman driver) do.
 ///
-/// Parsing mirrors [`openshell_core::driver_utils::supervisor_image_tag`]: only
+/// Parsing mirrors [`openshell_container_runtime::driver_utils::supervisor_image_tag`]: only
 /// the final path component may carry a tag, so a registry port such as the
 /// `:5000` in `registry:5000/team/app` is not mistaken for one, and a
 /// digest-pinned reference (`...@sha256:...`) already names an exact image and

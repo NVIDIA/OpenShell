@@ -5,6 +5,7 @@
 
 #[cfg(feature = "telemetry")]
 use chrono::{SecondsFormat, Utc};
+pub use openshell_driver_sdk::telemetry::enabled_env_value;
 #[cfg(feature = "telemetry")]
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -17,22 +18,30 @@ use std::thread;
 use std::time::Duration;
 
 const MAX_TELEMETRY_INTEGER: u64 = 9_223_372_036_854_775_807;
+
 const SOURCE: TelemetrySource = TelemetrySource::OpenShell;
 
 #[cfg(feature = "telemetry")]
 const TELEMETRY_EVENT_QUEUE_CAPACITY: usize = 1024;
+
 #[cfg(feature = "telemetry")]
 const CLIENT_ID: &str = "415437562476676";
+
 #[cfg(feature = "telemetry")]
 const DEFAULT_ENDPOINT: &str = "https://events.telemetry.data.nvidia.com/v1.1/events/json";
+
 #[cfg(feature = "telemetry")]
 const EVENT_SCHEMA_VERSION: &str = "4.0";
+
 #[cfg(feature = "telemetry")]
 const EVENT_PROTOCOL_VERSION: &str = "1.6";
+
 #[cfg(feature = "telemetry")]
 const EVENT_SYSTEM_VERSION: &str = "openshell-telemetry/1.0";
+
 #[cfg(feature = "telemetry")]
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[cfg(feature = "telemetry")]
 static TELEMETRY_SENDER: OnceLock<Option<mpsc::SyncSender<TelemetryEvent>>> = OnceLock::new();
 
@@ -295,43 +304,13 @@ impl DenyGroup {
 
 #[cfg(feature = "telemetry")]
 pub fn enabled() -> bool {
-    telemetry_enabled_from(std::env::var("OPENSHELL_TELEMETRY_ENABLED").ok().as_deref())
+    enabled_env_value() == "true"
 }
 
 /// Telemetry support is compiled out: always disabled.
 #[cfg(not(feature = "telemetry"))]
 pub fn enabled() -> bool {
     false
-}
-
-#[cfg(feature = "telemetry")]
-pub fn enabled_env_value() -> &'static str {
-    enabled_env_value_from(std::env::var("OPENSHELL_TELEMETRY_ENABLED").ok().as_deref())
-}
-
-/// Telemetry support is compiled out: report disabled so sandbox supervisors
-/// inherit the disabled state and skip activity collection.
-#[cfg(not(feature = "telemetry"))]
-pub fn enabled_env_value() -> &'static str {
-    "false"
-}
-
-#[cfg(feature = "telemetry")]
-fn enabled_env_value_from(value: Option<&str>) -> &'static str {
-    if telemetry_enabled_from(value) {
-        "true"
-    } else {
-        "false"
-    }
-}
-
-#[cfg(feature = "telemetry")]
-fn telemetry_enabled_from(value: Option<&str>) -> bool {
-    let value = value.unwrap_or("true");
-    !matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    )
 }
 
 #[cfg(feature = "telemetry")]
@@ -611,29 +590,50 @@ where
     Some(sanitized)
 }
 
-#[cfg(all(test, feature = "telemetry"))]
-mod tests {
+#[cfg(all(test, not(feature = "telemetry")))]
+mod disabled_tests {
     use super::*;
 
     #[test]
-    fn telemetry_enabled_defaults_true() {
-        assert!(telemetry_enabled_from(None));
+    fn telemetry_reports_disabled_when_compiled_out() {
+        assert!(!enabled());
+        assert_eq!(enabled_env_value(), "false");
     }
 
     #[test]
-    fn telemetry_enabled_honors_false_values() {
-        assert!(!telemetry_enabled_from(Some("off")));
-        assert!(!telemetry_enabled_from(Some("false")));
-        assert!(telemetry_enabled_from(Some("yes")));
+    fn emit_functions_are_no_ops_when_compiled_out() {
+        // These must remain callable so dependent crates compile unchanged;
+        // with telemetry compiled out they do nothing and never panic.
+        emit_lifecycle(
+            LifecycleResource::Sandbox,
+            LifecycleOperation::Create,
+            TelemetryOutcome::Success,
+        );
+        emit_provider_lifecycle(
+            LifecycleOperation::Create,
+            TelemetryOutcome::Success,
+            ProviderProfile::Custom,
+        );
+        emit_sandbox_create(
+            TelemetryOutcome::Success,
+            false,
+            1,
+            false,
+            SandboxTemplateSource::Default,
+            TelemetryComputeDriver::custom(),
+        );
+        emit_policy_decision(
+            PolicyDecisionOperation::Approve,
+            TelemetryOutcome::Success,
+            1,
+        );
+        emit_sandbox_activity_summary(0, 0, 0.0, [(DenyGroup::ConnectPolicy, 0)]);
     }
+}
 
-    #[test]
-    fn telemetry_enabled_env_value_is_normalized() {
-        assert_eq!(enabled_env_value_from(Some("false")), "false");
-        assert_eq!(enabled_env_value_from(Some("0")), "false");
-        assert_eq!(enabled_env_value_from(None), "true");
-        assert_eq!(enabled_env_value_from(Some("yes")), "true");
-    }
+#[cfg(all(test, feature = "telemetry"))]
+mod tests {
+    use super::*;
 
     #[test]
     fn telemetry_endpoint_empty_disables_publish() {
@@ -739,46 +739,5 @@ mod tests {
 
         assert_eq!(rows.get(&DenyGroup::ConnectPolicy), Some(&3));
         assert_eq!(rows.get(&DenyGroup::Unknown), Some(&3));
-    }
-}
-
-#[cfg(all(test, not(feature = "telemetry")))]
-mod disabled_tests {
-    use super::*;
-
-    #[test]
-    fn telemetry_reports_disabled_when_compiled_out() {
-        assert!(!enabled());
-        assert_eq!(enabled_env_value(), "false");
-    }
-
-    #[test]
-    fn emit_functions_are_no_ops_when_compiled_out() {
-        // These must remain callable so dependent crates compile unchanged;
-        // with telemetry compiled out they do nothing and never panic.
-        emit_lifecycle(
-            LifecycleResource::Sandbox,
-            LifecycleOperation::Create,
-            TelemetryOutcome::Success,
-        );
-        emit_provider_lifecycle(
-            LifecycleOperation::Create,
-            TelemetryOutcome::Success,
-            ProviderProfile::Custom,
-        );
-        emit_sandbox_create(
-            TelemetryOutcome::Success,
-            false,
-            1,
-            false,
-            SandboxTemplateSource::Default,
-            TelemetryComputeDriver::custom(),
-        );
-        emit_policy_decision(
-            PolicyDecisionOperation::Approve,
-            TelemetryOutcome::Success,
-            1,
-        );
-        emit_sandbox_activity_summary(0, 0, 0.0, [(DenyGroup::ConnectPolicy, 0)]);
     }
 }

@@ -13,10 +13,16 @@ const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Return the first responsive well-known socket, then ask the Podman CLI for
 /// the active native or machine-backed connection.
 pub fn detect_socket() -> Option<PathBuf> {
-    openshell_core::local_api_socket::first_responsive_socket(&socket_candidates(), |response| {
-        openshell_core::local_api_socket::http_response_is_success(response)
-            && openshell_core::local_api_socket::contains_ascii(response, b"Libpod-Api-Version:")
-    })
+    openshell_container_runtime::local_api_socket::first_responsive_socket(
+        &socket_candidates(),
+        |response| {
+            openshell_container_runtime::local_api_socket::http_response_is_success(response)
+                && openshell_container_runtime::local_api_socket::contains_ascii(
+                    response,
+                    b"Libpod-Api-Version:",
+                )
+        },
+    )
     .or_else(discover_socket)
 }
 

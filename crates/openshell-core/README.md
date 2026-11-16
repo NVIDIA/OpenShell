@@ -3,6 +3,13 @@
 Shared types, constants, configuration, and helpers used across OpenShell
 crates.
 
+## Driver SDK
+
+Items shared with the compute drivers live in `openshell-driver-sdk`, and
+`openshell-core` re-exports them, so each has one definition. Code used only by
+the desktop drivers lives in `openshell-container-runtime`. Add new items to the
+SDK only when something that stays in core also uses them.
+
 ## Isolation registrations
 
 `isolation_registration` owns the operator registry's backend names, byte-stream

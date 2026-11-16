@@ -2127,11 +2127,11 @@ dependencies = [
  "base64 0.22.1",
  "glob",
  "ipnet",
- "jsonwebtoken",
  "libc",
  "miette",
  "nix",
  "openshell-crypto",
+ "openshell-driver-sdk",
  "openshell-extension-core",
  "openshell-policy-schema",
  "prost",
@@ -2152,7 +2152,6 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
@@ -2170,6 +2169,36 @@ dependencies = [
  "thiserror",
  "tonic",
  "x509-parser",
+]
+
+[[package]]
+name = "openshell-driver-sdk"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "jsonwebtoken",
+ "libc",
+ "miette",
+ "nix",
+ "openshell-crypto",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "rustix 1.1.6",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+ "url",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

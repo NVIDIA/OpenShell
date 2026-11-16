@@ -4415,6 +4415,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-container-runtime"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "openshell-driver-sdk",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tonic",
+]
+
+[[package]]
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
@@ -4425,11 +4439,11 @@ dependencies = [
  "glob",
  "h2",
  "ipnet",
- "jsonwebtoken",
  "libc",
  "miette",
  "nix 0.29.0",
  "openshell-crypto",
+ "openshell-driver-sdk",
  "openshell-extension-core",
  "openshell-otel",
  "openshell-policy-schema",
@@ -4443,7 +4457,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -4457,7 +4470,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
@@ -4541,7 +4553,8 @@ dependencies = [
  "http 1.4.0",
  "libc",
  "miette",
- "openshell-core",
+ "openshell-container-runtime",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -4670,8 +4683,9 @@ dependencies = [
  "hyper-util",
  "miette",
  "nix 0.29.0",
- "openshell-core",
+ "openshell-container-runtime",
  "openshell-crypto",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -4697,6 +4711,40 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "openshell-driver-sdk"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "jsonwebtoken",
+ "libc",
+ "miette",
+ "nix 0.29.0",
+ "openshell-crypto",
+ "openshell-otel",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "rcgen",
+ "rustix 1.1.6",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+ "url",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -4740,9 +4788,10 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "oci-client",
- "openshell-core",
+ "openshell-container-runtime",
  "openshell-crypto",
  "openshell-driver-podman",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",

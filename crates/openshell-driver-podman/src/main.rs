@@ -9,11 +9,11 @@ use std::num::{NonZeroI64, NonZeroU64};
 use std::path::PathBuf;
 use tracing::info;
 
-use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_core::sandbox_env::SupervisorOtlpArgs;
-use openshell_core::{AppArmorProfile, ImagePullPolicy, VERSION};
 use openshell_driver_podman::config::{DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS};
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
+use openshell_driver_sdk::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_driver_sdk::sandbox_env::SupervisorOtlpArgs;
+use openshell_driver_sdk::{AppArmorProfile, ImagePullPolicy, VERSION};
 
 #[derive(Parser)]
 #[command(name = "openshell-driver-podman")]
@@ -25,7 +25,7 @@ struct Args {
         env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON",
         default_value = "{}"
     )]
-    admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
+    admission_config_json: openshell_driver_sdk::resource_admission::DriverAdmissionConfig,
     /// Public compute-driver Unix socket used by an external gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
@@ -70,7 +70,7 @@ struct Args {
     #[arg(
         long,
         env = "OPENSHELL_GATEWAY_PORT",
-        default_value_t = openshell_core::config::DEFAULT_SERVER_PORT
+        default_value_t = openshell_driver_sdk::config::DEFAULT_SERVER_PORT
     )]
     gateway_port: u16,
 
@@ -84,7 +84,7 @@ struct Args {
     #[arg(
         long,
         env = "OPENSHELL_SANDBOX_SSH_SOCKET_PATH",
-        default_value = openshell_core::container_paths::SSH_SOCKET_PATH
+        default_value = openshell_driver_sdk::container_paths::SSH_SOCKET_PATH
     )]
     sandbox_ssh_socket_path: String,
 
@@ -111,11 +111,11 @@ struct Args {
     health_check_interval_secs: Option<NonZeroU64>,
 
     /// OCI image containing the `openshell-sandbox` runtime binary.
-    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
+    #[arg(long, env = openshell_driver_sdk::config::SANDBOX_RUNTIME_IMAGE_ENV)]
     sandbox_runtime_image: Option<String>,
 
     /// OCI image containing the `openshell-supervisor` control binary.
-    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
+    #[arg(long, env = openshell_driver_sdk::config::SUPERVISOR_IMAGE_ENV)]
     supervisor_image: Option<String>,
 
     /// Host path to the CA certificate for supervisor-to-gateway TLS.
@@ -243,10 +243,10 @@ async fn main() -> Result<()> {
             stop_timeout_secs: args.stop_timeout,
             sandbox_runtime_image: args
                 .sandbox_runtime_image
-                .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
+                .unwrap_or_else(openshell_driver_sdk::config::default_sandbox_runtime_image),
             supervisor_image: args
                 .supervisor_image
-                .unwrap_or_else(openshell_core::config::default_supervisor_image),
+                .unwrap_or_else(openshell_driver_sdk::config::default_supervisor_image),
             guest_tls_ca: args.podman_tls_ca,
             guest_tls_cert: args.podman_tls_cert,
             guest_tls_key: args.podman_tls_key,
@@ -273,16 +273,16 @@ async fn main() -> Result<()> {
 
     let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
     if let Some(socket_path) = args.bind_socket {
-        let listener = openshell_core::external_driver_socket::bind_private(&socket_path)
+        let listener = openshell_driver_sdk::external_driver_socket::bind_private(&socket_path)
             .map_err(|err| miette::miette!("{err}"))?;
         let _cleanup =
-            openshell_core::external_driver_socket::SocketCleanup::new(socket_path.clone());
+            openshell_driver_sdk::external_driver_socket::SocketCleanup::new(socket_path.clone());
         info!(socket = %socket_path.display(), "Starting Podman compute driver");
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .serve_with_incoming_shutdown(
-                openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
+                openshell_driver_sdk::external_driver_socket::SameUidUnixIncoming::new(listener),
                 shutdown_signal(),
             )
             .await
@@ -373,7 +373,7 @@ mod tests {
         );
         assert_eq!(
             defaults.sandbox_pids_limit.map(NonZeroI64::get),
-            Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+            Some(openshell_container_runtime::config::DEFAULT_SANDBOX_PIDS_LIMIT)
         );
 
         for flag in ["--sandbox-pids-limit", "--health-check-interval-secs"] {
