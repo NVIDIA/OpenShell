@@ -1287,8 +1287,8 @@ async fn sync_policy_with_client(
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
     workspace: &str,
-) -> Result<()> {
-    client
+) -> Result<crate::proto::UpdateConfigResponse> {
+    let response = client
         .update_config(UpdateConfigRequest {
             sandbox: sandbox.to_string(),
             workspace_scope: Some(crate::proto::workspace_selector(workspace)),
@@ -1299,7 +1299,7 @@ async fn sync_policy_with_client(
         .map_err(grpc_status_error)
         .wrap_err("failed to sync policy to server")?;
 
-    Ok(())
+    Ok(response.into_inner())
 }
 
 /// Discover and sync policy using a single gRPC connection.
@@ -1344,7 +1344,17 @@ pub async fn sync_policy(
 ) -> Result<()> {
     debug!(endpoint = %gateway.url(), sandbox = %sandbox, "Syncing enriched policy to gateway");
     let mut client = connect(gateway).await?;
-    sync_policy_with_client(&mut client, sandbox, policy, workspace).await
+    sync_policy_with_client(&mut client, sandbox, policy, workspace)
+        .await
+        .map(|_| ())
+}
+
+/// The authoritative snapshot and the acknowledged revision this write created.
+/// A deduplicated or unknown write outcome never establishes startup ownership.
+#[derive(Debug)]
+pub struct PolicySyncResult {
+    pub snapshot: SettingsPollResult,
+    pub created_policy_version: Option<u32>,
 }
 
 /// Sync an enriched policy and return the authoritative revision snapshot.
@@ -1358,20 +1368,23 @@ pub async fn sync_policy_and_fetch_snapshot(
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
     workspace: &str,
-) -> Result<SettingsPollResult> {
+) -> Result<PolicySyncResult> {
     let status = ClientSpanStatus::current();
     let mut client = connect(gateway).await?;
-    sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;
-    status.finish(fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace)).await)
+    let write = sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;
+    let snapshot = status
+        .finish(fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace)).await)?;
+    Ok(PolicySyncResult {
+        snapshot,
+        created_policy_version: write
+            .created_policy_revision
+            .then_some(write.version)
+            .filter(|version| *version > 0),
+    })
 }
 
 /// Report an exact runtime configuration generation. Pending registration uses
 /// the snapshot's instance fence; retain that snapshot across registration retries.
-#[tracing::instrument(
-    name = "supervisor.gateway.report_sandbox_configuration",
-    skip_all,
-    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
-)]
 pub async fn report_sandbox_configuration(
     gateway: &GatewayEndpoint,
     sandbox_id: &str,
@@ -1380,10 +1393,9 @@ pub async fn report_sandbox_configuration(
     state: crate::proto::ConfigurationAdmissionState,
     error: &str,
 ) -> Result<()> {
-    let status = ClientSpanStatus::current();
-    let mut client = connect(gateway).await?;
-    client
-        .report_sandbox_configuration(crate::proto::ReportSandboxConfigurationRequest {
+    report_sandbox_configuration_request(
+        gateway,
+        crate::proto::ReportSandboxConfigurationRequest {
             sandbox_id: sandbox_id.to_string(),
             expected_instance_id: snapshot.map_or_else(String::new, |snapshot| {
                 snapshot.configuration_instance_id.clone()
@@ -1399,7 +1411,27 @@ pub async fn report_sandbox_configuration(
                     .map_or(0, |snapshot| snapshot.provider_env_revision),
                 error: error.to_string(),
             }),
-        })
+            refused_before_start: false,
+        },
+    )
+    .await
+}
+
+/// Send a configuration report the caller built itself, such as a refusal of
+/// the generation this instance already accepted.
+#[tracing::instrument(
+    name = "supervisor.gateway.report_sandbox_configuration",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
+pub async fn report_sandbox_configuration_request(
+    gateway: &GatewayEndpoint,
+    request: crate::proto::ReportSandboxConfigurationRequest,
+) -> Result<()> {
+    let status = ClientSpanStatus::current();
+    let mut client = connect(gateway).await?;
+    client
+        .report_sandbox_configuration(request)
         .await
         .map_err(grpc_status_error)?;
     status.finish(Ok(()))
