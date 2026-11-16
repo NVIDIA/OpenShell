@@ -517,7 +517,7 @@ async fn postgres_ssh_identity_lock_excludes_legacy_holders() {
 }
 
 /// When the sandbox key's wait times out after the shared legacy key was
-/// granted, closing the data connection releases the legacy key and the
+/// granted, releasing the data connection releases the legacy key and the
 /// data-pool lock slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
@@ -588,6 +588,58 @@ async fn postgres_ssh_identity_lock_timeout_releases_the_legacy_key_and_slot() {
 
     raw_unlock(&mut holder, sandbox_key).await;
     holder.close().await.expect("close the raw session");
+    fixture.finish(vec![store]).await;
+}
+
+/// A released SSH identity guard unlocks its keys, resets `lock_timeout`, and
+/// returns its session to the data pool instead of closing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_ssh_identity_released_connection_is_reused_without_residual_locks() {
+    let fixture = LockFixture::new().await;
+    // One data connection, so every acquisition reuses the same session.
+    let postgres = PostgresStore::connect_with_lock_pool_size(fixture.schema.url(), Some(1), 1)
+        .await
+        .expect("connect a store with one data connection");
+    let (pid, default_lock_timeout) = postgres.data_session().await;
+    let store = Store::Postgres(postgres);
+    let Store::Postgres(postgres) = &store else {
+        unreachable!();
+    };
+
+    for _ in 0..2 {
+        let guard = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .acquire_ssh_identity_mutation_guard(&random_id("sb"))
+                    .await
+            }
+        })
+        .await
+        .expect("guard task")
+        .expect("the SSH identity guard");
+        assert_eq!(
+            fixture.session_lock_count(pid).await,
+            2,
+            "the guard holds the legacy and sandbox keys on the pooled session"
+        );
+        drop(guard);
+
+        let until = Instant::now() + PROCEEDS_WITHIN;
+        while fixture.session_lock_count(pid).await != 0 {
+            assert!(
+                Instant::now() < until,
+                "the released session still holds advisory locks"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        let session = tokio::time::timeout(PROCEEDS_WITHIN, postgres.data_session())
+            .await
+            .expect("the released session returns to the data pool");
+        assert_eq!(session, (pid, default_lock_timeout.clone()));
+    }
+
     fixture.finish(vec![store]).await;
 }
 

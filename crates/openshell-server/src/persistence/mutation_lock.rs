@@ -26,15 +26,12 @@
 //! 5. The SSH identity keys, S([`SSH_IDENTITY_LOCK_KEY`]) and then
 //!    X([`sandbox_ssh_identity_lock_key`]) on one data-pool connection and one
 //!    data-pool lock slot, together form a leaf: their holders take no
-//!    mutation guard, local key, or lifecycle gate, so sandbox creation may
-//!    wait for them while holding its guard. Their data-pool lock slot is
-//!    shared with provider-refresh holders, which are not leaves: a
+//!    mutation guard, local key, or lifecycle gate. Their data-pool lock slot
+//!    is shared with provider-refresh holders, which are not leaves: a
 //!    refresh executor takes S(global) X(workspace) while it holds a slot.
-//!    With no more slots than the 4 refresh executors
-//!    (`database_max_connections` up to 9), creation waiting for a slot while
-//!    executors wait for its keys can form a cycle, which only
-//!    [`MUTATION_LOCK_TIMEOUT`] on the slot and lock waits breaks.
-//!    Reserving slots for SSH identity would remove it.
+//!    Sandbox creation therefore takes the SSH identity keys only after it
+//!    releases its mutation guard, so it never waits for a slot while
+//!    executors wait for its keys.
 //! 6. A data-pool lock holder never waits for another data-pool lock. At the
 //!    floor there is one slot, so nesting would wait on itself until the slot
 //!    deadline. Debug builds don't check this rule, because both holders
@@ -75,8 +72,8 @@ pub const GLOBAL_MUTATION_LOCK_KEY: i64 = 0x4f50_454e_5348_4c4c;
 /// excluding each other during a rolling upgrade. The shared lock exists only
 /// to exclude earlier releases and can be dropped once no supported release
 /// takes the key exclusively. It is held on a data-pool connection, not the
-/// lock pool, because sandbox creation takes it while holding its mutation
-/// guard. The bytes spell "OSSHHOST".
+/// lock pool, so SSH identity steps never compete with mutation guards for
+/// lock connections. The bytes spell "OSSHHOST".
 pub const SSH_IDENTITY_LOCK_KEY: i64 = 0x4f53_5348_484f_5354;
 
 /// Upper bound on acquiring one mutation lock set.
@@ -169,8 +166,7 @@ impl MutationLockKey<'_> {
 /// after a shared [`SSH_IDENTITY_LOCK_KEY`].
 ///
 /// Derived like [`MutationLockKey::advisory_key`] but with its own kind, so it
-/// never equals the sandbox's mutation lock key, which sandbox creation holds
-/// while it takes this one.
+/// never equals the sandbox's mutation lock key.
 pub fn sandbox_ssh_identity_lock_key(sandbox_id: &str) -> i64 {
     derived_key(b"ssh-identity", sandbox_id)
 }

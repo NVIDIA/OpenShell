@@ -132,12 +132,16 @@ pub(super) struct PostgresAdvisoryLockGuard {
 }
 
 /// Holds session-level advisory locks on a data-pool connection and one
-/// data-pool lock slot. Dropping it closes the connection, which releases the
-/// locks, and frees the slot only once the close ends, so a closing connection
-/// still counts against the slots.
+/// data-pool lock slot. Dropping a guard whose lock statements all completed
+/// unlocks every key, resets `lock_timeout`, and returns the connection to the
+/// pool; any other drop, or a failed or stalled scrub, closes the connection,
+/// which releases the locks. The slot frees only once the connection is
+/// returned or closed, so it still counts against the slots until then.
 pub(super) struct PostgresDataPoolLockGuard {
     connection: Option<PoolConnection<Postgres>>,
     slot: Option<OwnedSemaphorePermit>,
+    /// No lock statement is in flight, so the session can be scrubbed.
+    idle: bool,
 }
 
 impl PostgresDataPoolLockGuard {
@@ -150,17 +154,62 @@ impl PostgresDataPoolLockGuard {
 
 impl Drop for PostgresDataPoolLockGuard {
     fn drop(&mut self) {
-        if let Some(mut connection) = self.connection.take() {
-            // Still closes the session if the task below never runs.
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        let slot = self.slot.take();
+        let mut release = DataPoolLockRelease {
+            connection: Some(connection),
+            scrubbed: false,
+        };
+        let idle = self.idle;
+        tokio::spawn(async move {
+            let _slot = slot;
+            if idle {
+                let scrub = sqlx::raw_sql("SELECT pg_advisory_unlock_all(); RESET lock_timeout")
+                    .execute(&mut **release.connection());
+                release.scrubbed = matches!(
+                    tokio::time::timeout(LOCK_CONNECTION_RELEASE_TIMEOUT, scrub).await,
+                    Ok(Ok(_))
+                );
+            }
+            release.finish().await;
+        });
+    }
+}
+
+/// A data-pool lock connection on its way back. It returns to the pool only
+/// once scrubbed; a release that is dropped before then, including when its
+/// task never runs, closes the session instead.
+struct DataPoolLockRelease {
+    connection: Option<PoolConnection<Postgres>>,
+    scrubbed: bool,
+}
+
+impl DataPoolLockRelease {
+    fn connection(&mut self) -> &mut PoolConnection<Postgres> {
+        self.connection
+            .as_mut()
+            .expect("data-pool lock connection is present until released")
+    }
+
+    async fn finish(mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        if self.scrubbed {
+            drop(connection);
+        } else {
+            // `close` keeps the pool permit until the session is closed.
+            let _ = tokio::time::timeout(LOCK_CONNECTION_RELEASE_TIMEOUT, connection.close()).await;
+        }
+    }
+}
+
+impl Drop for DataPoolLockRelease {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.as_mut() {
             connection.close_on_drop();
-            let slot = self.slot.take();
-            // `close` keeps the pool permit until the session is closed, and
-            // the slot stays taken until then.
-            tokio::spawn(async move {
-                let _slot = slot;
-                let _ =
-                    tokio::time::timeout(LOCK_CONNECTION_RELEASE_TIMEOUT, connection.close()).await;
-            });
         }
     }
 }
@@ -577,12 +626,13 @@ impl PostgresStore {
     }
 
     /// Acquire `locks` as session-level advisory locks, in slice order, on one
-    /// data-pool connection instead of the mutation lock pool. Sandbox
-    /// creation takes the SSH identity locks while it holds its mutation
-    /// guard, so a second lock-pool connection there could exhaust that pool.
+    /// data-pool connection instead of the mutation lock pool, so these
+    /// holders never compete with mutation guards for lock connections.
     /// The locks use the single-`bigint` advisory functions, so a shared lock
     /// conflicts with an earlier release's `pg_advisory_lock` of the same key.
-    /// Closing the connection on drop releases the locks.
+    /// Dropping the guard unlocks them and returns the connection, or closes
+    /// it when the session may still be waiting (see
+    /// [`PostgresDataPoolLockGuard`]).
     ///
     /// Each holder first takes one of the store's data-pool lock slots
     /// ([`data_lock_slot_count`]), so holders keep at most half the data
@@ -620,11 +670,14 @@ impl PostgresStore {
             Ok(Err(error)) => return Err(map_db_error(&error)),
             Ok(Ok(connection)) => connection,
         };
-        // From here on, every exit closes the connection before the slot frees,
-        // which releases the keys already taken.
+        // From here on, every exit unlocks or closes the connection before the
+        // slot frees, which releases the keys already taken. A statement still
+        // in flight (cancelled, or timed out client-side) leaves the session
+        // waiting, so only a guard with none in flight is scrubbed for reuse.
         let mut guard = PostgresDataPoolLockGuard {
             connection: Some(connection),
             slot: Some(slot),
+            idle: true,
         };
         for &(key, mode) in locks {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -647,8 +700,9 @@ impl PostgresStore {
             };
             let statement = sqlx::query(sql)
                 .bind(format!("{}ms", remaining.as_millis()))
-                .bind(key)
-                .execute(&mut **guard.connection());
+                .bind(key);
+            guard.idle = false;
+            let statement = statement.execute(&mut **guard.connection());
             match tokio::time::timeout_at(deadline + LOCK_STATEMENT_CLIENT_GRACE, statement).await {
                 Err(_) => {
                     return Err(PersistenceError::LockTimeout(
@@ -657,15 +711,16 @@ impl PostgresStore {
                 }
                 Ok(Err(error)) => {
                     // 55P03 lock_not_available: the statement's own
-                    // `lock_timeout` ended the wait.
+                    // `lock_timeout` ended the wait, and the session is healthy.
                     if let Some(db) = error.as_database_error()
                         && db.code().as_deref() == Some("55P03")
                     {
+                        guard.idle = true;
                         return Err(PersistenceError::LockTimeout(db.message().to_string()));
                     }
                     return Err(map_db_error(&error));
                 }
-                Ok(Ok(_)) => {}
+                Ok(Ok(_)) => guard.idle = true,
             }
         }
         Ok(guard)
@@ -706,6 +761,15 @@ impl PostgresStore {
     #[cfg(test)]
     pub(super) fn lock_pool_idle(&self) -> usize {
         self.lock_pool.num_idle()
+    }
+
+    /// Backend process id and `lock_timeout` of a data-pool session.
+    #[cfg(test)]
+    pub(super) async fn data_session(&self) -> (i32, String) {
+        sqlx::query_as("SELECT pg_backend_pid(), current_setting('lock_timeout')")
+            .fetch_one(&self.pool)
+            .await
+            .expect("read a data-pool session")
     }
 
     /// Test support only: close the underlying connection pools.
