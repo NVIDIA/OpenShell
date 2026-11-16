@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::enums::{DeviceTypeId, OsTypeId};
+use crate::objects::Container;
 
 /// OCSF Device object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,10 @@ pub struct Device {
     /// Sibling label for `type_id`.
     #[serde(rename = "type")]
     pub type_label: String,
+
+    /// Sandbox identity (Container profile).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<Container>,
 
     /// Operating system info.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,6 +92,7 @@ impl Device {
             uid: None,
             type_id: DeviceTypeId::Other,
             type_label: "Sandbox".to_string(),
+            container: None,
             os: Some(OsInfo::for_target("linux")),
         }
     }
@@ -100,6 +106,7 @@ impl Device {
             uid: None,
             type_id: DeviceTypeId::Other,
             type_label: "Sandbox".to_string(),
+            container: None,
             os: Some(OsInfo::for_target("windows")),
         }
     }
@@ -131,6 +138,7 @@ impl Device {
             name: Some(name.to_string()),
             // Operators assign a unique name per installation; replicas share this UID.
             uid: Some(name.to_string()),
+            container: None,
             os: Some(OsInfo::for_target(std::env::consts::OS)),
         }
     }

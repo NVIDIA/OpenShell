@@ -4,7 +4,7 @@
 title: "Observability Overview"
 sidebar-title: "Overview"
 description: "The traces, metrics, and OCSF events that OpenShell produces, where each one goes, and how to enable it."
-keywords: "Generative AI, Cybersecurity, Observability, OpenTelemetry, OTLP, Traces, Metrics, Prometheus, OCSF, SIEM"
+keywords: "Generative AI, Cybersecurity, Observability, OpenTelemetry, OTLP, Traces, Agent Traces, MLflow, Metrics, Prometheus, OCSF, SIEM"
 position: 1
 ---
 
@@ -13,6 +13,7 @@ OpenShell produces three kinds of observability signals: traces, metrics, and OC
 | Signal | Produced by | Destination |
 |---|---|---|
 | Traces | Gateway, compute drivers, sandbox supervisors | OTLP collector |
+| Agent traces | Agents, relayed by sandbox supervisors | OTLP collector |
 | Metrics | Gateway | Prometheus scrape |
 | OCSF events, shorthand | Gateway, sandbox supervisors | Gateway console, `openshell logs`, supervisor log file |
 | OCSF events, JSONL | Gateway, sandbox supervisors | Local file |
@@ -20,7 +21,21 @@ OpenShell produces three kinds of observability signals: traces, metrics, and OC
 
 The examples on this page are `gateway.toml` tables. In the Helm chart, set each table under `gatewayConfig`, as described in [Configure Chart Values](/kubernetes/setup#configure-chart-values).
 
-OTLP export uses gRPC by default, or HTTP/protobuf for collectors that set it. Configure it in `gateway.toml`, and the gateway passes the settings to the sandbox supervisors it starts. Supervisors connect to the collector directly, so the collector must be reachable from sandboxes as well as from the gateway. The gateway ignores the `OTEL_*` variables that would choose which signals are exported or where they go, and honors those that tune export, such as sampling. Refer to [Tuning](/how-it-works/gateways/configuration#tuning) for the full list.
+## OTLP Collectors
+
+Configure OTLP export in `gateway.toml`. The gateway exports its own signals and passes each collector's settings to the compute drivers and sandbox supervisors it starts. Supervisors export their own signals and relay the agent's traces directly, so each collector must be reachable from sandboxes as well as from the gateway.
+
+![OpenShell OTLP collectors. The gateway and its compute drivers export spans to the trace collector, and the gateway exports its OCSF events to the OCSF collector. The gateway gives each sandbox supervisor its collector settings with the launch credentials. The supervisor exports its own spans and OCSF events to the same collectors. The network-isolated agent sends OTLP/HTTP to the supervisor's agent trace relay, which tags the spans with the sandbox ID and forwards them to the agent trace collector.](../images/openshell-otlp-collectors.svg)
+
+`[openshell.gateway.otlp]` sets one collector for every signal. `[openshell.gateway.otlp.traces]`, `[openshell.gateway.otlp.ocsf]`, and `[openshell.gateway.otlp.agent]` can each send their signal to a different collector instead, such as a SIEM for OCSF events or an MLflow tracking server for agent traces. Each collector has its own transport settings:
+
+- OTLP over gRPC, the default, or HTTP/protobuf.
+- Request headers, such as an authorization token, set inline or read from a file.
+- TLS, verified against the system trust roots or a CA file, with an optional client certificate.
+
+Supervisors receive collector headers and TLS material with their launch credentials, never through the sandbox environment. The agent reaches the relay through the sandbox's mediated channel, so it needs no egress rule and never sees the agent trace collector's address or credentials.
+
+The gateway ignores the `OTEL_*` variables that would choose which signals are exported or where they go, and honors those that tune export, such as sampling. For every setting, refer to [OTLP Export](/how-it-works/gateways/configuration#otlp-export) and [Tuning](/how-it-works/gateways/configuration#tuning).
 
 ## Traces
 
@@ -34,6 +49,20 @@ endpoint = "https://backend:4317"
 ```
 
 For span names, resource attributes, and gateway names, refer to [Traces](/observability/traces).
+
+## Agent Traces
+
+Agent traces are the spans that the agent itself produces, such as its model calls and tool use when it is instrumented with OpenTelemetry. Each sandbox supervisor relays them to the collector you choose. The relay is off by default. To send agent traces to MLflow, which needs OTLP/HTTP and an experiment header:
+
+```toml
+[openshell.gateway.otlp.agent]
+enabled  = true
+endpoint = "http://mlflow.mlops.svc:5000"
+protocol = "http/protobuf"
+headers  = { x-mlflow-experiment-id = "0" }
+```
+
+While the relay is on, every workload process gets `OTEL_EXPORTER_OTLP_ENDPOINT` pointing at it, so an agent that uses a standard OpenTelemetry SDK exports without further configuration. Each relayed trace carries `openshell.telemetry.source=agent` and the sandbox's `openshell.sandbox.id`, so you can separate agent traces from OpenShell's own and join them with the sandbox's supervisor spans. For the workload environment, request limits, and delivery guarantees, refer to [Agent Trace Relay](/how-it-works/gateways/configuration#agent-trace-relay).
 
 ## Metrics
 

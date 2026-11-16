@@ -18,6 +18,10 @@
     keycloak_runtime_state_directory: >-
       {{ '/home/tmachine/.local/share/openshell-keycloak'
          if tmachine_container_runtime_is_rootless else keycloak_state_directory }}
+    # Docker restarts the container itself. Podman has no daemon: its
+    # podman-restart.service starts `--restart always` containers at boot.
+    keycloak_restart_policy: >-
+      {{ 'unless-stopped' if tmachine_container_runtime_name == 'docker' else 'always' }}
 
 - name: Require Keycloak container runtime
   become: true
@@ -75,7 +79,7 @@
       # Environment setup bakes the container into a cached disk; it must
       # come back when a session boots from that disk.
       - --restart
-      - unless-stopped
+      - "{{ keycloak_restart_policy }}"
       - --publish
       - "127.0.0.1:{{ keycloak_port }}:8080"
       - --env
@@ -90,6 +94,32 @@
   environment:
     HOME: "{{ keycloak_runtime_home }}"
   changed_when: true
+
+- name: Restart Keycloak with rootful Podman at boot
+  become: true
+  ansible.builtin.systemd_service:
+    name: podman-restart.service
+    enabled: true
+  when:
+    - tmachine_container_runtime_name == 'podman'
+    - not tmachine_container_runtime_is_rootless
+
+# tmachine lingers (see podman-rootless.yaml), so its user manager, and this
+# unit, start at boot.
+- name: Restart Keycloak with rootless Podman at boot
+  become: true
+  become_user: tmachine
+  ansible.builtin.systemd_service:
+    name: podman-restart.service
+    scope: user
+    enabled: true
+  environment:
+    HOME: /home/tmachine
+    XDG_RUNTIME_DIR: "/run/user/{{ tmachine_container_runtime_tmachine_uid.stdout }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ tmachine_container_runtime_tmachine_uid.stdout }}/bus"
+  when:
+    - tmachine_container_runtime_name == 'podman'
+    - tmachine_container_runtime_is_rootless
 
 - name: Wait for Keycloak discovery endpoint
   ansible.builtin.uri:

@@ -23,8 +23,12 @@ pub struct Container {
 /// OCSF Image object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Image {
+    /// Resolved image unique identifier. Required by the OCSF schema.
+    pub uid: String,
+
     /// Image name (e.g., "ghcr.io/openshell/sandbox:latest").
-    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[cfg(test)]
@@ -37,7 +41,8 @@ mod tests {
             name: "my-sandbox".to_string(),
             uid: Some("sandbox-abc123".to_string()),
             image: Some(Image {
-                name: "ghcr.io/openshell/sandbox:latest".to_string(),
+                uid: "sha256:0123456789abcdef".to_string(),
+                name: Some("ghcr.io/openshell/sandbox:latest".to_string()),
             }),
         };
 
@@ -45,6 +50,7 @@ mod tests {
         assert_eq!(json["name"], "my-sandbox");
         assert_eq!(json["uid"], "sandbox-abc123");
         assert_eq!(json["image"]["name"], "ghcr.io/openshell/sandbox:latest");
+        assert_eq!(json["image"]["uid"], "sha256:0123456789abcdef");
     }
 
     #[test]

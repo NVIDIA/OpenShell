@@ -111,6 +111,11 @@ pub mod rpc {
         "GetSandbox",
         "openshell.compute.v1.ComputeDriver/GetSandbox",
     );
+    pub const RESOLVE_SUPERVISOR_APP_ENDPOINT: ComputeDriverRpc = ComputeDriverRpc {
+        service: "openshell.compute.v1.ComputeDriverAppEndpoints",
+        method: "ResolveSupervisorAppEndpoint",
+        operation: "openshell.compute.v1.ComputeDriverAppEndpoints/ResolveSupervisorAppEndpoint",
+    };
     pub const LIST_SANDBOXES: ComputeDriverRpc = ComputeDriverRpc::new(
         "ListSandboxes",
         "openshell.compute.v1.ComputeDriver/ListSandboxes",
@@ -201,6 +206,7 @@ pub fn compute_driver_rpc_operation(path: &str) -> Option<ComputeDriverRpc> {
         Some("CreateSandbox") => Some(rpc::CREATE_SANDBOX),
         Some("UpdateSandboxConfiguration") => Some(rpc::UPDATE_SANDBOX_CONFIGURATION),
         Some("GetSandbox") => Some(rpc::GET_SANDBOX),
+        Some("ResolveSupervisorAppEndpoint") => Some(rpc::RESOLVE_SUPERVISOR_APP_ENDPOINT),
         Some("ListSandboxes") => Some(rpc::LIST_SANDBOXES),
         Some("StopSandbox") => Some(rpc::STOP_SANDBOX),
         Some("StartSandbox") => Some(rpc::START_SANDBOX),
@@ -325,6 +331,7 @@ mod tests {
             rpc::CREATE_SANDBOX,
             rpc::UPDATE_SANDBOX_CONFIGURATION,
             rpc::GET_SANDBOX,
+            rpc::RESOLVE_SUPERVISOR_APP_ENDPOINT,
             rpc::LIST_SANDBOXES,
             rpc::STOP_SANDBOX,
             rpc::START_SANDBOX,

@@ -4,7 +4,7 @@ Validates OCSF events against JSON Schemas exported by the OCSF schema server.
 
 OCSF validity depends on the profiles an event declares in `metadata.profiles`, and an exported JSON Schema covers one fixed set of profiles. `schemas/v<version>/` therefore holds one schema per event class and profile combination, named `<class>@<profile>+<profile>.json` with profiles sorted. `validate_event` picks the schema from the event's `metadata.version`, `class_uid`, and declared profiles, and fails when none is vendored.
 
-The schemas check required attributes, `at_least_one` constraints, undefined attributes, types, and enum values, including the class and category identifiers. The schemas type `type_uid` only as an integer, so `validate_event` also checks that it equals `class_uid * 100 + activity_id`. The top-level `container` object is accepted although OCSF does not define it at the event level (NVIDIA/OpenShell#4915).
+The schemas check required attributes, `at_least_one` constraints, undefined attributes, types, and enum values, including the class and category identifiers. The schemas type `type_uid` only as an integer, so `validate_event` also checks that it equals `class_uid * 100 + activity_id`. Supervisor sandbox identity is validated under `device.container` with the `container` profile; undefined top-level `container` objects are rejected.
 
 ## Updating
 

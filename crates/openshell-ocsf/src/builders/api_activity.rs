@@ -4,7 +4,7 @@
 //! Builder for API Activity [6003] events.
 
 use crate::builders::{ContextRef, EventOrigin};
-use crate::enums::{ActionId, DispositionId, SeverityId, StatusId};
+use crate::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{ApiActivityEvent, OcsfEvent};
 use crate::objects::{
@@ -29,6 +29,7 @@ fn sanitize_model_name(name: &str) -> String {
 /// Builder for API Activity [6003] events.
 pub struct ApiActivityBuilder<'a> {
     ctx: ContextRef<'a>,
+    activity: ActivityId,
     severity: SeverityId,
     status: Option<StatusId>,
     message: Option<String>,
@@ -52,6 +53,7 @@ impl<'a> ApiActivityBuilder<'a> {
     pub fn new(ctx: impl Into<ContextRef<'a>>, operation: impl Into<String>) -> Self {
         Self {
             ctx: ctx.into(),
+            activity: ActivityId::Other,
             severity: SeverityId::Informational,
             status: None,
             message: None,
@@ -166,10 +168,10 @@ impl<'a> ApiActivityBuilder<'a> {
 
     #[must_use]
     pub fn build(self) -> OcsfEvent {
-        // Gateway events carry a container only when they concern a sandbox.
+        // Only supervisors describe a container on the producing device.
         let mut profiles: Vec<&str> = match self.ctx.origin {
-            EventOrigin::Gateway { .. } if self.ctx.container().is_none() => vec!["host"],
-            _ => vec!["container", "host"],
+            EventOrigin::Gateway { .. } => vec!["host"],
+            EventOrigin::Supervisor => vec!["container", "host"],
         };
         if self.action.is_some() {
             profiles.push("security_control");
@@ -184,8 +186,8 @@ impl<'a> ApiActivityBuilder<'a> {
             "API Activity",
             6,
             "Application Activity",
-            99,
-            "Other",
+            self.activity.as_u8(),
+            self.activity.api_label(),
             self.severity,
             metadata,
         );
@@ -223,13 +225,14 @@ impl<'a> ApiActivityBuilder<'a> {
     }
 }
 
+impl_activity_setter!(ApiActivityBuilder);
 impl_action_disposition_setters!(ApiActivityBuilder);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::builders::{test_gateway_context, test_sandbox_context};
-    use crate::enums::{HttpMethod, UserTypeId};
+    use crate::enums::{ActivityId, HttpMethod, UserTypeId};
     use crate::objects::Url;
 
     fn gateway_denial() -> serde_json::Value {
@@ -296,6 +299,29 @@ mod tests {
             serde_json::json!(["host", "security_control"])
         );
         assert!(json.get("container").is_none());
+    }
+
+    #[test]
+    fn activity_names_the_api_operation_kind() {
+        let ctx = test_gateway_context();
+        for (activity, id, name) in [
+            (ActivityId::Open, 1, "Create"),
+            (ActivityId::Close, 2, "Read"),
+            (ActivityId::Reset, 3, "Update"),
+            (ActivityId::Fail, 4, "Delete"),
+            (ActivityId::Other, 99, "Other"),
+        ] {
+            let json = ApiActivityBuilder::new(&ctx, "DeleteSandbox")
+                .activity(activity)
+                .build()
+                .to_json()
+                .unwrap();
+
+            assert_eq!(json["activity_id"], id, "{name}");
+            assert_eq!(json["activity_name"], name);
+            assert_eq!(json["type_uid"], 600_300 + id, "{name}");
+            openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
+        }
     }
 
     #[test]

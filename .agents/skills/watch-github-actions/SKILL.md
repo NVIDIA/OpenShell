@@ -135,25 +135,32 @@ For tmachine Kubernetes conformance failures, inspect the `e2e-results-conforman
 
 For the `e2e-suites` lane (`.github/workflows/e2e-suites.yml`), the last lines of the job log give the runner's result: PASS, FAIL (exit 1) after the end of the nextest log (which names the failed tests), or ERROR (exit 2) with the step that broke. FAIL and ERROR also appear as annotations on the run's summary page. Then inspect the `e2e-results-<family>-<package>-<environment>-<installer>` artifact, which holds `junit.xml`, `nextest.log` and, after a failure, the guest's `diagnostics/`.
 
-`Pre-release` temporarily omits Codex Security from its `Security Scan` job.
-`Release` uses the passing prerelease qualification result. Other scanners and
-qualification gates still run. Use the standalone
-`Codex Security Release Qualification` workflow for manual investigation.
+`Pre-release` runs Codex Security as a separate advisory qualification job.
+It scans the exact prerelease tag against the previous stable release. Findings
+and scanner execution failures do not affect qualification or publication;
+failed steps and warnings remain visible. `Release` uses the passing prerelease
+qualification result. Codex Security has no schedule or manual trigger.
 
-For `Codex Security`, an exit code of 2 with partial coverage is an incomplete
-scan, not a HIGH/CRITICAL threshold failure. Check the execution diagnostics in
-the job summary and the `codex-security-diagnostics-<run>-<attempt>` artifact on
+For Codex Security `0.8.3`, exit code 2 means an execution or required-output
+failure. Deferred investigations no longer cause that exit code. Check the
+execution diagnostics in the job summary and the
+`codex-security-diagnostics-<run>-<attempt>` artifact on
 scan failure. It contains fixed status values, aggregate coverage counts, and
 disk space before, after, and the minimum sampled every five seconds. Missing
 coverage or manifest documents indicate no readable final report was available;
-deferred items or surfaces needing follow-up can explain partial coverage.
+deferred items or surfaces needing follow-up describe coverage limitations.
+Current reports omit the legacy completeness field, so the diagnostic's
+`coverage` value is `unknown`; use `scan_status` and the exit code for execution.
 Sampling cannot rule out a disk spike between samples.
 
 Artifacts and logs in this public repository are public. Never upload the raw
 scan directory, `report.md`, `coverage.json`, findings, agent state, or scanner
 logs. Coverage reasons and notes are free text and may disclose vulnerabilities.
 The public diagnostic intentionally omits them; detailed review needs an
-approved private destination. Helpers must come from the workflow revision,
+approved private destination. Setting the repository variable
+`CODEX_SECURITY_DIAGNOSTICS_PUBLIC_KEY` enables bounded scanner logging and
+encrypted report retention. Only ciphertext is uploaded; the private key stays
+local. See `CI.md` for decryption. Helpers must come from the workflow revision,
 not from the candidate under scan.
 
 `setup-nix` retries development-shell preparation once when `prepare-shell`

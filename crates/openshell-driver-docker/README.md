@@ -159,8 +159,9 @@ retain its data and runtime resources; explicit Delete removes its owned storage
 Retry through the gateway to finish the accepted update before starting it.
 The operation never starts the workload or rolls back workspace data implicitly.
 
-Stop terminates the supervisor companion and stops the workload container
-without removing it. Docker retains the workload writable layer and attached
+Stop terminates the supervisor companion, allowing it 10 seconds to stop the
+workload, and stops the workload container without removing it. Docker retains
+the workload writable layer and attached
 volumes. Start stages a fresh sandbox bootstrap bundle, restarts that workload,
 and creates a new supervisor companion. A durably stopped sandbox stays stopped
 across gateway restarts.

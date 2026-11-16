@@ -66,6 +66,37 @@ pub(crate) fn build_credential_endpoint_mismatch_finding(
         .build()
 }
 
+pub(crate) fn build_credential_placement_mismatch_finding(
+    policy_name: &str,
+    host: &str,
+    protocol: Option<&str>,
+) -> openshell_ocsf::OcsfEvent {
+    use openshell_ocsf::{
+        ActionId, ActivityId, DetectionFindingBuilder, DispositionId, FindingInfo, SeverityId,
+    };
+    let mut evidence = vec![
+        ("policy", policy_name),
+        ("host", host),
+        ("disposition", "denied"),
+    ];
+    if let Some(protocol) = protocol {
+        evidence.push(("protocol", protocol));
+    }
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(FindingInfo::new(
+            "openshell.provider_credential.placement_mismatch",
+            "Provider credential used at an unauthorized request location",
+        ))
+        .evidence_pairs(&evidence)
+        .message("Provider credential placement mismatch; request denied")
+        .build()
+}
+
 /// TLS handling mode for proxy connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsMode {
@@ -348,6 +379,9 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
     let websocket_credential_rewrite =
         get_object_bool(val, "websocket_credential_rewrite").unwrap_or(false);
+    if protocol == L7Protocol::Rest && websocket_credential_rewrite {
+        return None;
+    }
     let request_body_credential_rewrite =
         get_object_bool(val, "request_body_credential_rewrite").unwrap_or(false);
     let allow_uninspected_credentials =
@@ -386,7 +420,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
                     "rejecting endpoint: unrecognized credential_signing value {other:?}"
                 ))
                 .build();
-            openshell_ocsf::ocsf_emit!(event);
+            crate::telemetry::egress_emit!(event);
             return None;
         }
         _ => CredentialSigning::None,
@@ -402,7 +436,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
             .state(openshell_ocsf::StateId::Disabled, "invalid")
             .message("rejecting endpoint: credential_signing requires signing_service".to_string())
             .build();
-        openshell_ocsf::ocsf_emit!(event);
+        crate::telemetry::egress_emit!(event);
         return None;
     }
 
@@ -431,6 +465,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 
 pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str, surface: &str) {
     let event = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .action(openshell_ocsf::ActionId::Denied)
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
             "openshell.credentials.traffic_uninspectable",
@@ -444,7 +479,7 @@ pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str,
         ])
         .message("Uninspected credential-bearing traffic denied")
         .build();
-    openshell_ocsf::ocsf_emit!(event);
+    crate::telemetry::egress_emit!(event);
 }
 
 impl L7EndpointConfig {
@@ -1361,6 +1396,10 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             let l7_fields = L7EndpointFields {
+                websocket_credential_rewrite: ep
+                    .get("websocket_credential_rewrite")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
                 protocol,
                 access,
                 has_rules,
@@ -1472,7 +1511,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 && protocol != "websocket"
             {
                 warnings.push(format!(
-                    "{loc}: websocket_credential_rewrite is ignored unless protocol is rest or websocket"
+                    "{loc}: websocket_credential_rewrite is ignored unless protocol is websocket"
                 ));
             }
 
@@ -2439,9 +2478,23 @@ mod tests {
     }
 
     #[test]
+    fn rest_websocket_credential_rewrite_fails_validation_and_materialization() {
+        let endpoint = serde_json::json!({
+            "protocol": "rest", "host": "gateway.example.com", "port": 443,
+            "access": "read-only", "websocket_credential_rewrite": true
+        });
+        let val = regorus::Value::from_json_str(&endpoint.to_string()).unwrap();
+        assert!(parse_l7_config(&val).is_none());
+        let (errors, _) = validate_l7_policies(&serde_json::json!({
+            "network_policies": {"test": {"endpoints": [endpoint], "binaries": []}}
+        }));
+        assert!(errors.iter().any(|e| e.contains("use protocol: websocket")));
+    }
+
+    #[test]
     fn parse_l7_config_websocket_credential_rewrite_opt_in() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "rest", "host": "gateway.example.com", "port": 443, "websocket_credential_rewrite": true}"#,
+            r#"{"protocol": "websocket", "host": "gateway.example.com", "port": 443, "websocket_credential_rewrite": true}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
@@ -2489,7 +2542,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_websocket_credential_rewrite_warns_unless_rest_or_websocket() {
+    fn validate_websocket_credential_rewrite_warns_without_inspected_protocol() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {

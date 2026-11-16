@@ -126,6 +126,9 @@ fn build_supervisor_prelude_rules() -> BTreeMap<i64, Vec<SeccompRule>> {
 fn set_no_new_privs() -> Result<()> {
     // libc/syscall FFI requires unsafe
     #[allow(unsafe_code)]
+    // SAFETY: prctl receives only scalar arguments; PR_SET_NO_NEW_PRIVS is
+    // required before an unprivileged seccomp filter load and is
+    // irreversible.
     let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if rc != 0 {
         return Err(miette::miette!(

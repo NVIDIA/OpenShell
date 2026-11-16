@@ -191,6 +191,10 @@ stays `Ready` through a graceful handoff. Supervisors reconnect with
 exponential backoff that restarts after each accepted session, so repeated
 gateway restarts do not lengthen later reconnects.
 
+A sandbox on a shared supervisor keeps its session on the gateway replica that
+serves its supervisor, and reconnects there when the supervisor moves to
+another replica.
+
 Established streams do not move between gateway replicas. An interrupted exec,
 forwarding, or service stream must reconnect. File sync retries with a new SSH
 session instead of resuming the interrupted byte stream. Rolling updates can

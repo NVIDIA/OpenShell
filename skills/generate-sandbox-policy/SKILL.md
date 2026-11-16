@@ -228,7 +228,8 @@ Add `network_middlewares` only when the user asks to inspect, transform, redact,
 - To require request inspection, ask the operator to include `http_request_pre_credentials` in `bindings` with `binding_policy = "allowlist"` or `"exact"`. The default `dynamic` policy follows what the service advertises; sandbox policy alone cannot require a missing binding. Confirm the gateway and all supervisors support binding policies before relying on them.
 - WebSocket middleware inspects client text messages only, over both `ws://` and `wss://`. Binary and upstream-to-client messages pass without inspection, even with `fail_closed`.
 - `on_error` controls selected-stage failures. Explicit denials always block traffic. A failed WebSocket stage with `fail_open` can remain bypassed for the rest of the connection.
-- Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement.
+- Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement. Never use `fail_open` for a service that implements HTTP hooks; the gateway rejects it.
+- Entries whose endpoint selectors may overlap must use the same HTTP hook version for the operations both handle. The built-in `openshell/regex` uses legacy HTTP hooks, so do not let its selector overlap an HTTP hook service that inspects requests.
 - Assign unique `order` values across the complete policy. Lower values run first, and at most 10 configs may be selected.
 - Match the narrowest destination hosts possible with `endpoints.include`; use `exclude` when a broad selector has trusted exceptions.
 - Do not select fail-closed middleware for `tls: skip` endpoints because the supervisor cannot inspect that traffic.
@@ -246,6 +247,7 @@ Only needed for the **Moderate** and **Full** tiers. Translate API path paramete
 | All sub-paths under `/api/v1/` | `/api/v1/**` |
 
 In REST rule paths, `*` stops at `/`, while a whole-segment `**` crosses `/`.
+REST endpoints refuse HTTP upgrades in both enforce and audit modes. For WebSocket traffic, use a separate `protocol: websocket` endpoint with explicit upgrade and message rules; `websocket_credential_rewrite` requires that protocol.
 For example, `/api/v1/**` covers descendants but not `/api/v1` itself; add an
 explicit rule for that path when needed. `?` matches one character except `/`,
 and bracket classes such as `[0-9]` are supported.
@@ -404,6 +406,8 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
 - [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
+- [ ] No HTTP hook middleware entry uses `on_error: fail_open`
+- [ ] Middleware entries with overlapping selectors use the same HTTP hook version for each HTTP operation they share
 - [ ] If inspection by an operator-run service is mandatory, the registration requires the binding (`http_request_pre_credentials`, `http_response_pre_return`, or `websocket_message_pre_credentials`), the service advertises it, and the attachment uses `on_error: fail_closed`
 - [ ] The user understands that V1 WebSocket middleware inspects client text messages only
 - [ ] Endpoints contributed by a credentialed provider are not L4-only or `tls: skip` unless `allow_uninspected_credentials: true` explicitly records the exception
@@ -519,12 +523,19 @@ network_policies:
 ```
 
 The `filesystem_policy` and `landlock` sections above are sensible defaults.
+Use actual target paths for symlinks inside writable workspaces. Policy paths
+that traverse symlinks beneath workload-owned or writable directories fail
+launch even in `best_effort` mode; system aliases through protected directories
+remain supported. A policy with no usable filesystem paths also fails launch.
 Process identity is omitted so the selected compute driver can choose it. For
 Docker and Podman, each omitted identity field falls back to the image's OCI
 `USER`. Tell the user these are defaults and may need adjustment for their
-environment. Gateway inference is configured separately through `openshell
-inference set/get`. The generated `network_policies` block is the primary
-output.
+environment. Inference access uses provider profiles and sandbox attachments;
+the workload calls the provider's native endpoint and selects its model and
+timeout. Inspect the effective policy with `openshell policy get <sandbox>
+--full`, including provider-derived rules, and follow the published
+[inference guide](https://docs.nvidia.com/openshell/latest/how-it-works/inference).
+The generated `network_policies` block is the primary output.
 
 When the user explicitly requests `process.run_as_user` or
 `process.run_as_group`, accept `sandbox` or a numeric UID/GID from `1` through

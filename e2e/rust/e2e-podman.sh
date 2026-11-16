@@ -24,16 +24,12 @@ source "${ROOT}/e2e/support/conformance.sh"
 PODMAN_CI_TESTS=(
   bypass_detection
   ephemeral_cleanup
-  core_dump_hardening
-  credential_gating
-  default_image
   driver_config_volume
   edge_tunnel_e2e
   forward_proxy_graphql_l7
   forward_proxy_jsonrpc_l7
   forward_proxy_l7_bypass
   host_gateway_alias
-  landlock
   live_policy_update
   local_driver_token_restart
   no_proxy
@@ -42,9 +38,7 @@ PODMAN_CI_TESTS=(
   podman_corporate_proxy
   podman_gateway_start
   podman_host_gateway
-  podman_oci_identity
   provider_token_exchange
-  upload_backpressure
 )
 
 if [ -n "${E2E_TEST}" ] && [ -n "${E2E_TEST_SET}" ]; then
@@ -117,9 +111,9 @@ if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ] && [ -z "${OPENSHELL_BIN:-}" ]; then
   export OPENSHELL_BIN="${ROOT}/target/debug/openshell"
 fi
 
-if [ "${E2E_FEATURES}" != "e2e-conformance-only" ]; then
-  CONTAINER_ENGINE=podman bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
-fi
+# The conformance suite runs on every lane, including e2e-conformance-only,
+# and creates sandboxes from this image (testkit::python_image()).
+CONTAINER_ENGINE=podman bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
 
 exec "${ROOT}/e2e/with-podman-gateway.sh" \
   bash "${BASH_SOURCE[0]}" "${RUN_WITH_GATEWAY_COMMAND}"

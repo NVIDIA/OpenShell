@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The in-process driver reads server.hostGatewayIP from the rendered gateway
+# TOML. The external driver reads it from its own environment, so copy the
+# chart's rendered value into that container.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - path: driver-env-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: openshell
+replacements:
+  - source:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: openshell
+      fieldPath: spec.template.spec.hostAliases.0.ip
+    targets:
+      - select:
+          group: apps
+          version: v1
+          kind: StatefulSet
+          name: openshell
+        fieldPaths:
+          - spec.template.spec.containers.[name=kubernetes-compute-driver].env.[name=OPENSHELL_HOST_GATEWAY_IP].value

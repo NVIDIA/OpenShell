@@ -200,6 +200,7 @@ impl TestSetup {
                 HashMap::from([("TEST_CONFIG".into(), "initial".into())]),
             ),
             sandbox_bearer: self.auth.sandbox_bearer_slot().unwrap(),
+            attach_request_timeout: std::time::Duration::from_mins(5),
             takeover: None,
             supervisor_recovery_timeout_secs: None,
         }
@@ -277,6 +278,7 @@ impl PreparedBackend for TestLaunch {
     async fn discover_policy(
         &self,
         bearer: SessionBearerTokenSlot,
+        _attach_request_timeout: std::time::Duration,
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
         self.observed.record("discover");
         bearer.authorization_metadata().unwrap();
@@ -840,7 +842,9 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             sandbox_id: Some(setup.sandbox_id.clone()),
             sandbox: None,
             container_image: String::new(),
+            container_image_uid: None,
             openshell_endpoint: None,
+            gateway_home: None,
             policy_rules: Some(rules.to_string_lossy().into_owned()),
             policy_data: Some(data.to_string_lossy().into_owned()),
             ssh_socket_path: None,
@@ -851,6 +855,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             auth_bundle: setup.auth.clone(),
             admitted_isolation_backend: Some(TEST_BACKEND.into()),
             main_exit_marker: Some(marker.clone()),
+            attach_request_timeout: Duration::from_mins(5),
             trace_context: None,
             provider_workload_api_socket: None,
             // The binary loads the proxy trust directory from its environment.
@@ -895,9 +900,12 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
     assert!(!readiness.exists());
     assert!(!marker.exists());
     assert!(
-        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, health_port))
-            .await
-            .is_err()
+        openshell_core::net::connect_tcp_nodelay_best_effort((
+            std::net::Ipv4Addr::LOCALHOST,
+            health_port
+        ))
+        .await
+        .is_err()
     );
     setup
         .observed
@@ -923,9 +931,12 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
     assert!(!readiness.exists());
     assert!(!marker.exists());
     assert!(
-        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, health_port))
-            .await
-            .is_err()
+        openshell_core::net::connect_tcp_nodelay_best_effort((
+            std::net::Ipv4Addr::LOCALHOST,
+            health_port
+        ))
+        .await
+        .is_err()
     );
 
     setup
@@ -937,7 +948,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             loop {
                 if marker.exists()
                     && tokio::net::UnixStream::connect(&readiness).await.is_ok()
-                    && tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, health_port))
+                    && openshell_core::net::connect_tcp_nodelay_best_effort((std::net::Ipv4Addr::LOCALHOST, health_port))
                         .await
                         .is_ok()
                 {
@@ -974,9 +985,12 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
     // Listener tasks are aborted on drop; let the runtime reap their sockets.
     tokio::task::yield_now().await;
     assert!(
-        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, health_port))
-            .await
-            .is_err()
+        openshell_core::net::connect_tcp_nodelay_best_effort((
+            std::net::Ipv4Addr::LOCALHOST,
+            health_port
+        ))
+        .await
+        .is_err()
     );
 }
 
@@ -1046,7 +1060,9 @@ async fn suspend_signal_exits_without_terminating_boundary() {
             sandbox_id: Some(setup.sandbox_id.clone()),
             sandbox: None,
             container_image: String::new(),
+            container_image_uid: None,
             openshell_endpoint: None,
+            gateway_home: None,
             policy_rules: Some(rules.to_string_lossy().into_owned()),
             policy_data: Some(data.to_string_lossy().into_owned()),
             ssh_socket_path: None,
@@ -1057,6 +1073,7 @@ async fn suspend_signal_exits_without_terminating_boundary() {
             auth_bundle: setup.auth.clone(),
             admitted_isolation_backend: Some(TEST_BACKEND.into()),
             main_exit_marker: Some(marker.clone()),
+            attach_request_timeout: Duration::from_mins(5),
             trace_context: None,
             provider_workload_api_socket: None,
             // The binary loads the proxy trust directory from its environment.

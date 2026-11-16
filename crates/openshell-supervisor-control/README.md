@@ -46,7 +46,9 @@ re-implementing the control contracts.
   stream attaches, ends, or announces leaving, so the gateway refreshes
   membership records at once. The gateway closes a member's stream after
   `pool_timing::GATEWAY_SILENCE_TIMEOUT` of silence, and drops a member that
-  stops reading as soon.
+  stops reading as soon. `HostAccepted` carries this replica's peer endpoint
+  (`set_peer_endpoint`); the host dials its instances' sandbox sessions
+  there, so each session runs on the replica serving its supervisor.
 - `pool_timing`: the timing contract between pool hosts and the gateway: the
   15 s membership TTL, the 2 s record refresh, 1 s heartbeats, host silence
   detection and bounded reconnect attempts, and `reconnect_budget`, the worst

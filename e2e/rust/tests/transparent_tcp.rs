@@ -486,6 +486,12 @@ assert any(ip.startswith('198.18.') or ip.startswith('198.19.') for ip in synthe
 with socket.create_connection(({host:?}, {port}), timeout=10) as conn:
     conn.sendall(b'probe')
     assert conn.recv(1024) == b'native-tcp-ok:probe'
+mapped = next('::ffff:' + ip for ip in synthetic if ip.startswith(('198.18.', '198.19.')))
+with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as conn:
+    conn.settimeout(10)
+    conn.connect((mapped, {port}))
+    conn.sendall(b'mapped-probe')
+    assert conn.recv(1024) == b'native-tcp-ok:mapped-probe'
 with socket.create_connection(({host:?}, {tcp_dns_port}), timeout=10) as conn:
     conn.sendall(b'tcp-53-probe')
     assert conn.recv(1024) == b'native-tcp-ok:tcp-53-probe'

@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+openshell_external_driver_binary_name: openshell-driver-docker
+openshell_external_driver_socket: /run/openshell-driver-docker/compute.sock
+openshell_external_driver_supplementary_groups: docker
+openshell_external_driver_requires: docker.service

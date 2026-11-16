@@ -28,8 +28,9 @@ revision. State who verified what and any failed attempts or limitations.}}
 ## Additional details
 
 {{Optional: include supported details that help review, such as the root cause,
-severity rationale and CVSS/CWE, a proposed fix or verified workaround, known
-unaffected deployments, or a related private PR. Omit this section if none are available.}}
+severity rationale and CVSS/CWE, existing CVE identifiers, disclosure deadlines,
+a proposed fix or verified workaround, known unaffected deployments, or a related
+private PR. Omit this section if none are available.}}
 
 ## Open questions
 

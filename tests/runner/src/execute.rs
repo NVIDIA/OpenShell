@@ -20,11 +20,12 @@ use anyhow::{Context, Result, ensure};
 use tmachine::Session;
 use tmachine::config::Config;
 
-use crate::bundle::{Bundle, PROFILE, READY_BINARY};
+use crate::bundle::{Bundle, Kind, PROFILE, PROGRAM_BINARY, READY_BINARY};
 use crate::test_env;
 
 const GUEST_DIR: &str = "/var/tmp/openshell-tests";
-/// The nextest log's name, in the guest directory and in the results.
+/// The test log's name, in the guest directory and in the results. A program
+/// bundle's log keeps the name, so consumers of the results see one layout.
 const NEXTEST_LOG: &str = "nextest.log";
 /// How long the gateway has to become healthy after the environment is up.
 // Matches the installers' own wait: an HA k3s gateway booted from a cached
@@ -41,6 +42,9 @@ const READY_SLACK: Duration = Duration::from_mins(1);
 const NEXTEST_TEST_FAILED: i32 = 100;
 /// nextest's exit code when `--no-tests fail` found no tests to run.
 const NEXTEST_NO_TESTS_RUN: i32 = 4;
+/// A testkit program's exit code when a test failed. It exits 2 when tests
+/// could not run.
+const PROGRAM_TEST_FAILED: i32 = 1;
 /// How much of the end of the nextest log to print after a failure. nextest
 /// ends its output with a summary that names the failed tests.
 const LOG_TAIL_LINES: usize = 40;
@@ -91,6 +95,18 @@ impl Status {
             )),
         }
     }
+
+    /// The status of a testkit program's `run` that exited with `status`.
+    fn of_program(status: ExitStatus, log: &Path) -> Self {
+        match status.code() {
+            Some(0) => Self::Passed,
+            Some(PROGRAM_TEST_FAILED) => Self::Failed,
+            _ => Self::Error(format!(
+                "the test program exited with {status}; see {}",
+                log.display()
+            )),
+        }
+    }
 }
 
 impl fmt::Display for Status {
@@ -112,8 +128,9 @@ pub struct Run<'a> {
     /// The gateway name the installer registers with the CLI.
     pub gateway: &'a str,
     pub bundle: &'a Bundle,
-    /// A nextest filterset (`-E`) narrowing the tests in the bundle.
-    pub filter: Option<&'a str>,
+    /// Narrowing the tests in the bundle: nextest filtersets (`-E`) for a
+    /// nextest bundle, parts of test names for a program bundle.
+    pub filters: &'a [String],
     /// Where `junit.xml`, `nextest.log` and, after a failure, the guest's
     /// `diagnostics/` go.
     pub results: &'a Path,
@@ -244,15 +261,20 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
             .exec(&["mkdir", "-p", &format!("{guest}/extract")])
             .await?,
     )?;
+    let kind = run.bundle.kind();
 
     // A booted guest restarts its gateway, so wait for it once here rather
     // than in every test. Failing here is an environment error, not a test
     // failure.
+    let program = format!("{guest}/{PROGRAM_BINARY}");
     let ready_binary = format!("{guest}/{READY_BINARY}");
     let ready_timeout = READY_TIMEOUT_SECS.to_string();
     let mut ready = vec!["env"];
     ready.extend(env.iter().map(String::as_str));
-    ready.extend([ready_binary.as_str(), ready_timeout.as_str()]);
+    match kind {
+        Kind::Nextest => ready.extend([ready_binary.as_str(), ready_timeout.as_str()]),
+        Kind::Program => ready.extend([program.as_str(), "ready", "--timeout", &ready_timeout]),
+    }
     checked(
         "wait for the gateway",
         session
@@ -282,36 +304,52 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         )?;
     }
 
+    let junit = format!("{guest}/junit.xml");
     let archive = format!("{guest}/tests.tar.zst");
     let extract = format!("{guest}/extract");
     let config = format!("{guest}/nextest.toml");
-    let mut nextest = vec!["env"];
-    nextest.extend(env.iter().map(String::as_str));
-    nextest.extend([
-        "cargo-nextest",
-        "nextest",
-        "run",
-        "--archive-file",
-        &archive,
-        "--workspace-remap",
-        guest,
-        "--extract-to",
-        &extract,
-        "--extract-overwrite",
-        "--config-file",
-        &config,
-        "--profile",
-        PROFILE,
-        "--no-capture",
-        // Tests share one gateway and the guest has 4 GiB; run them serially
-        // whatever --no-capture implies.
-        "--test-threads",
-        "1",
-        "--no-tests",
-        "fail",
-    ]);
-    if let Some(filter) = run.filter {
-        nextest.extend(["-E", filter]);
+    let mut tests = vec!["env"];
+    tests.extend(env.iter().map(String::as_str));
+    match kind {
+        Kind::Nextest => {
+            tests.extend([
+                "cargo-nextest",
+                "nextest",
+                "run",
+                "--archive-file",
+                &archive,
+                "--workspace-remap",
+                guest,
+                "--extract-to",
+                &extract,
+                "--extract-overwrite",
+                "--config-file",
+                &config,
+                "--profile",
+                PROFILE,
+                "--no-capture",
+                // Tests share one gateway and the guest has 4 GiB; run them
+                // serially whatever --no-capture implies.
+                "--test-threads",
+                "1",
+                "--no-tests",
+                "fail",
+            ]);
+            for filter in run.filters {
+                tests.extend(["-E", filter]);
+            }
+        }
+        // The program runs its tests one at a time, and writes the report
+        // where `collect_results` looks for it.
+        Kind::Program => {
+            tests.extend([program.as_str(), "run", "--junit", &junit]);
+            // `run` takes name filters as arguments, after `--` so that one
+            // starting with a dash isn't read as an option.
+            if !run.filters.is_empty() {
+                tests.push("--");
+                tests.extend(run.filters.iter().map(String::as_str));
+            }
+        }
     }
     // nextest writes its output to a file in the guest, so a run that times
     // out or loses SSH still leaves a log for `collect_results`. The guest
@@ -323,12 +361,13 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         test_env::export_script(test_env::ENV_DIR)
     );
     let mut command = vec!["sh", "-c", &script, &log];
-    command.extend(nextest);
+    command.extend(tests);
     let output = session.exec_timeout(&command, RUN_TIMEOUT).await?;
-    Ok(Status::of_nextest(
-        output.status,
-        &run.results.join(NEXTEST_LOG),
-    ))
+    let log = run.results.join(NEXTEST_LOG);
+    Ok(match kind {
+        Kind::Nextest => Status::of_nextest(output.status, &log),
+        Kind::Program => Status::of_program(output.status, &log),
+    })
 }
 
 /// Copy the nextest log and the JUnit report out of the guest, whether or not
@@ -486,6 +525,15 @@ mod tests {
             Status::Error("no test ran; see log".to_string())
         );
         assert!(matches!(status(1), Status::Error(_)));
+    }
+
+    #[test]
+    fn status_follows_the_program_exit_code() {
+        let status = |code| Status::of_program(ExitStatus::from_raw(code << 8), Path::new("log"));
+        assert_eq!(status(0), Status::Passed);
+        assert_eq!(status(PROGRAM_TEST_FAILED), Status::Failed);
+        // Exit 2: tests could not run.
+        assert!(matches!(status(2), Status::Error(_)));
     }
 
     #[test]

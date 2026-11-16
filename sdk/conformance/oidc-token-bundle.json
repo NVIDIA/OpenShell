@@ -1,0 +1,7 @@
+{
+  "access_token": "conformance-access-token",
+  "refresh_token": "conformance-refresh-token",
+  "expires_at": 4102444800,
+  "issuer": "https://issuer.example.com",
+  "client_id": "openshell-cli"
+}

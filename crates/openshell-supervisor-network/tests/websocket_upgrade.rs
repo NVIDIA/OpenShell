@@ -31,7 +31,7 @@ use openshell_supervisor_network::l7::rest::RestProvider;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -100,7 +100,9 @@ async fn websocket_upgrade_through_l7_relay_exchanges_message() {
     let ws_addr = start_ws_echo_server().await;
 
     // Open a real TCP connection to the WebSocket server (simulates upstream)
-    let mut upstream = TcpStream::connect(ws_addr).await.unwrap();
+    let mut upstream = openshell_core::net::connect_tcp_nodelay_best_effort(ws_addr)
+        .await
+        .unwrap();
 
     // In-memory duplex for the client side of the relay
     let (mut client_app, mut client_proxy) = tokio::io::duplex(8192);
@@ -227,7 +229,9 @@ async fn normal_http_request_still_works_after_relay_changes() {
         stream.flush().await.unwrap();
     });
 
-    let mut upstream = TcpStream::connect(addr).await.unwrap();
+    let mut upstream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+        .await
+        .unwrap();
     let (mut client_read, mut client_proxy) = tokio::io::duplex(8192);
 
     let raw_header = format!(

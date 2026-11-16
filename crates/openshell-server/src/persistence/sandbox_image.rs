@@ -854,7 +854,8 @@ mod tests {
     #[test]
     fn image_completion_preserves_concurrent_attachment_clock_edits() {
         let mut original = sandbox();
-        let mut previous = crate::compute::provisioning_deadline::new_preparation_record(0, 1800);
+        let mut previous =
+            crate::compute::provisioning_deadline::new_preparation_record(0, 1800, 300_000);
         previous.driver_operation_id = "prior-operation".into();
         previous.attachment_change_id = "before-attachment".into();
         original.status.as_mut().unwrap().provisioning = Some(previous);

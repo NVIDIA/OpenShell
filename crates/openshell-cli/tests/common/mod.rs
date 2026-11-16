@@ -12,6 +12,15 @@ pub struct CliOutput {
 }
 
 pub fn run(config_dir: &Path, system_dir: &Path, args: &[&str]) -> CliOutput {
+    run_with_env(config_dir, system_dir, args, &[])
+}
+
+pub fn run_with_env(
+    config_dir: &Path,
+    system_dir: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> CliOutput {
     let output = Command::new(env!("CARGO_BIN_EXE_openshell"))
         .args(args)
         .env("XDG_CONFIG_HOME", config_dir)
@@ -20,6 +29,7 @@ pub fn run(config_dir: &Path, system_dir: &Path, args: &[&str]) -> CliOutput {
         .env("OPENSHELL_NO_BROWSER", "1")
         .env_remove("OPENSHELL_GATEWAY")
         .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .output()
         .expect("run openshell");

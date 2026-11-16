@@ -28,6 +28,13 @@ pub async fn install_roles() -> Result<()> {
 
 pub async fn run(playbook: &Path, inputs: &BTreeMap<String, PathBuf>) -> Result<()> {
     let mut command = Command::new("ansible-playbook");
+    // Newer systemd guests (Fedora) print OSC 3008 shell-integration markers
+    // on every terminal session: from a profile script for login shells and
+    // from pam_systemd for `become`, which Ansible runs over `ssh -tt`.
+    // Ansible reports them as "Module invocation had junk after the JSON
+    // data". Both emitters skip a dumb terminal, so don't forward the caller's
+    // TERM.
+    command.env("TERM", "dumb");
     // The VM's SSH forward may not be the inventory's default port.
     command
         .arg("--extra-vars")
