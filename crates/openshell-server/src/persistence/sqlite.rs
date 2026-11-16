@@ -36,7 +36,10 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
 }
 static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+use super::{
+    DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, EXISTING_IDS_BATCH_SIZE, POLICY_OBJECT_TYPE,
+};
+use std::collections::HashSet;
 
 /// Pool ceiling for an on-disk database when the operator has not configured
 /// one.
@@ -875,6 +878,32 @@ WHERE "object_type" = ?1 AND "id" = ?2
                 .rows_affected();
         }
         Ok(deleted)
+    }
+
+    pub async fn existing_ids(
+        &self,
+        object_type: &str,
+        ids: &[String],
+    ) -> PersistenceResult<HashSet<String>> {
+        let mut existing = HashSet::with_capacity(ids.len());
+        for ids in ids.chunks(EXISTING_IDS_BATCH_SIZE) {
+            let mut query =
+                QueryBuilder::<Sqlite>::new("SELECT id FROM objects WHERE object_type = ");
+            query.push_bind(object_type).push(" AND id IN (");
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+
+            let rows = query
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            existing.extend(rows.iter().map(|row| row.get::<String, _>("id")));
+        }
+        Ok(existing)
     }
 
     pub async fn count_in_workspace(

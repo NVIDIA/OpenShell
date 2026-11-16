@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+disallowed-methods = [
+  { path = "tokio::net::TcpStream::connect", reason = "use openshell_core::net::connect_tcp_nodelay_best_effort so Nagle is disabled on the dialed stream" },
+  { path = "std::net::TcpStream::connect", reason = "use openshell_core::net::connect_std_tcp_nodelay_best_effort so Nagle is disabled on the dialed stream" },
+]

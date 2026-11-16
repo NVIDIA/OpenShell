@@ -245,7 +245,6 @@ mod tests {
         MiddlewareEndpointSelector, NetworkMiddlewareConfig, SandboxPolicy as ProtoSandboxPolicy,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
     use super::*;
 
@@ -345,7 +344,9 @@ mod tests {
                 .contains("BEGIN CERTIFICATE")
         );
 
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         client
             .write_all(
                 b"GET http://policy.local/v1/policy/current HTTP/1.1\r\n\

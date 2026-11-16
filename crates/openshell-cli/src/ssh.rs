@@ -34,7 +34,6 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Code;
@@ -920,7 +919,7 @@ where
 async fn probe_forward_listener(spec: &ForwardSpec) -> std::result::Result<(), String> {
     match tokio::time::timeout(
         FORWARD_LISTENER_CONNECT_TIMEOUT,
-        TcpStream::connect((forward_probe_host(spec), spec.port)),
+        openshell_core::net::connect_tcp_nodelay_best_effort((forward_probe_host(spec), spec.port)),
     )
     .await
     {

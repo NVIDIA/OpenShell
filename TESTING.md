@@ -124,8 +124,7 @@ plugin through its Windows `.cmd` launcher, and installs the matching locked
 ARM64 Rolldown binding when Node itself is ARM64. The helper preserves lockfile
 resolution; it must not upgrade unrelated test dependencies.
 
-`mise run --skip-tools go:ci` retains race detection except on Windows ARM64,
-where Go does not support it. Windows token-file tests explicitly skip POSIX
+Windows token-file tests explicitly skip POSIX
 mode-bit assertions; those skips do not establish Windows ACL protection.
 Use a checkout with LF text files when running Unix-shell fixture checks.
 
@@ -330,6 +329,21 @@ nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful-keycloak --installer deb \
   --family features --package keycloak-provider-refresh
 ```
+
+A suite that needs setup beyond a container engine runs in a feature
+environment, named `<base>-<feature>`, such as `ubuntu-docker-rootful-keycloak`
+or `ubuntu-docker-rootful-cdi`. `features` in `tests/tmachine/config.nix` lists
+each feature's setup playbooks, the inputs they read, and the bases it supports.
+To add one, add an entry there and use the generated environment name in the
+suite's row in `.github/workflows/e2e-suites.yml`. The CDI suite
+(`tests/suites/features/cdi`) runs in `ubuntu-docker-rootful-cdi`, which creates
+hardware-free CDI devices and the host files they reference. The environment
+tells the suite where its scenarios are with `OPENSHELL_TEST_CDI_SCENARIOS`, the
+path of a document that names the device kind, each scenario and the checks it
+expects. Any environment that creates matching devices and sets the variable
+can run the suite. The expectations characterize the sandbox's behavior today,
+not a specification, and the `echo-socket` check needs `perl` in the workload
+image, which the default image has.
 
 ### Python E2E (`e2e/python/`)
 

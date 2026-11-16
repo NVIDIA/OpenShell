@@ -4118,7 +4118,7 @@ async fn echo_through_local_forward<T>(
             !forward.is_finished(),
             "service forward exited before the local listener opened"
         );
-        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+        match openshell_core::net::connect_tcp_nodelay_best_effort(("127.0.0.1", port)).await {
             Ok(stream) => break stream,
             Err(err) => {
                 assert!(

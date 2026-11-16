@@ -95,6 +95,9 @@ const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 // request a bounded opportunity to mark the control exit intentional before
 // publishing a fail-closed runtime error.
 const SUPERVISOR_INTENTIONAL_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+// Longer than the supervisor's own bound on stopping its workload, so it
+// finishes stopping before Docker kills it.
+const SUPERVISOR_STOP_TIMEOUT_SECS: i32 = 10;
 const SUPERVISOR_HEALTH_INTERVAL_NS: i64 = 30_000_000_000;
 // Docker probes at this interval only before the first healthy result and
 // within the start period.
@@ -5610,7 +5613,7 @@ async fn spawn_docker_control_process(
             _ = &mut shutdown_requested => {
                 let _ = monitored_docker.stop_container(
                     &monitored_supervisor_id,
-                    Some(StopContainerOptionsBuilder::default().t(5).build()),
+                    Some(StopContainerOptionsBuilder::default().t(SUPERVISOR_STOP_TIMEOUT_SECS).build()),
                 ).await;
                 let _ = remove_supervisor().await;
             }

@@ -258,6 +258,11 @@ automatically on issue-label events.
 Created PR [#123](https://github.com/OWNER/REPO/pull/123)
 ```
 
+Follow the shared [accepted-work definition](../../../CONTRIBUTING.md#accepted-work)
+and [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications)
+when applying classification labels. Review-readiness applies the acceptance label
+to qualifying PRs when they open; this does not replace existing PR requirements.
+
 ### Monitor Workflow Run (Optional)
 
 If the user asks to wait for a green CI before posting the RFR, use this snippet to monitor the workflow run:

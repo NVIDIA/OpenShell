@@ -225,6 +225,11 @@ path = "tests/workspace_lifecycle.rs"
 required-features = ["e2e"]
 
 [[test]]
+name = "supervisor_middleware_http_hooks"
+path = "tests/supervisor_middleware_http_hooks.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "proxy_egress_pipeline"
 path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]
@@ -280,6 +285,7 @@ tower = "0.5"
 url = "2"
 
 [dev-dependencies]
+flate2 = "1"
 openshell-ocsf-validate = { path = "../../crates/openshell-ocsf-validate" }
 serial_test = "3"
 

@@ -543,17 +543,6 @@ jobs:
       npm-version: ${{ inputs.npm-version }}
       make-latest: ${{ inputs.make-latest }}
 
-  tag-sdk-go:
-    name: Tag Go SDK
-    needs: release
-    if: ${{ !inputs.is-prerelease }}
-    permissions:
-      contents: write
-    uses: ./.github/workflows/sdk-go-tag.yml
-    with:
-      version: ${{ inputs.semver }}
-      source-sha: ${{ inputs.source-sha }}
-
   # GitHub treats skipped jobs as passing, so a publisher that never ran would
   # leave the run green. Fail when any publisher expected for this release kind
   # did not succeed, so callers' failure notifications fire.
@@ -567,7 +556,6 @@ jobs:
       - publish-snap
       - publish-prerelease-snap
       - publish-sdk-typescript
-      - tag-sdk-go
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -583,7 +571,7 @@ jobs:
           if [[ "${IS_PRERELEASE}" == "true" ]]; then
             expected+=(publish-prerelease-snap)
           else
-            expected+=(publish-sdk-typescript tag-sdk-go)
+            expected+=(publish-sdk-typescript)
             if [[ "${MAKE_LATEST}" == "true" ]]; then
               expected+=(publish-snap)
             fi
