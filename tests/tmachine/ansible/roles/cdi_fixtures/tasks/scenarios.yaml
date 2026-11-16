@@ -6,6 +6,28 @@
   ansible.builtin.include_vars:
     file: scenarios.yaml
 
+# A case may name the drivers it runs under with `drivers`. A case that omits it
+# runs under every driver.
+- name: Select the scenarios for this environment's driver
+  ansible.builtin.set_fact:
+    cdi_scenarios: >-
+      {{ cdi_scenarios
+         | selectattr('drivers', 'undefined')
+         | list
+         + cdi_scenarios
+           | selectattr('drivers', 'defined')
+           | selectattr('drivers', 'contains', environment_driver)
+           | list }}
+
+# A CDI device can add this group to the workload. The group is created under
+# every driver so scenario definitions can name its gid unconditionally.
+- name: Allocate a supplementary group for the CDI device fixture
+  become: true
+  ansible.builtin.group:
+    name: openshell-cdi-fixture
+    system: true
+  register: cdi_fixture_group
+
 - name: Collect scenario fixtures
   ansible.builtin.set_fact:
     cdi_scenario_fixtures: >-
@@ -54,14 +76,23 @@
   loop_control:
     label: "{{ item.path }}"
 
-- name: Set scenario fixture pipe ownership
+- name: Create scenario fixture character devices
+  become: true
+  ansible.builtin.command:
+    argv: [mknod, "--mode={{ item.mode }}", "{{ cdi_scenario_dir }}/{{ item.path }}", c, "{{ item.major }}", "{{ item.minor }}"]
+    creates: "{{ cdi_scenario_dir }}/{{ item.path }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'chardev') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Set scenario fixture device and pipe ownership
   become: true
   ansible.builtin.file:
     path: "{{ cdi_scenario_dir }}/{{ item.path }}"
     owner: "{{ item.owner | default('root') }}"
     group: "{{ item.group | default('root') }}"
     mode: "{{ item.mode }}"
-  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'fifo') | list }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'in', ['chardev', 'fifo']) | list }}"
   loop_control:
     label: "{{ item.path }}"
 

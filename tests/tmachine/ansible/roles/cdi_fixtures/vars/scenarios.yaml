@@ -11,7 +11,11 @@
 #   dir     directory (parents must be declared first)
 #   file    regular file with `content`
 #   fifo    named pipe
+#   chardev character device with `major` and `minor`
 # All accept `mode`, `owner` and `group`.
+#
+# A case may set `drivers`, a list of the compute drivers it runs under; without
+# it the case runs under every driver.
 #
 # `expect` records the behavior the CDI feature tests assert for the scenario,
 # and is rendered to {{ cdi_fixture_root }}/scenarios.json for them. It states
@@ -184,6 +188,28 @@ cdi_scenarios:
         - {type: filetype, path: /dev/tmachine-cdi-null, expect: character-device}
         - {type: non-root}
         - {type: write, path: /dev/tmachine-cdi-null, expect: denied}
+
+  # The device is mode 0660 with a group that only `additionalGids` grants.
+  # Docker only: the Podman driver rejects a supplementary group added by a CDI
+  # device at startup under its default user namespace mode (NVIDIA/OpenShell#5305).
+  - name: device-node-with-gid
+    drivers: [docker]
+    fixtures:
+      - {path: group-device, type: chardev, major: 1, minor: 3, mode: "0660", group: openshell-cdi-fixture}
+    edits:
+      additionalGids: ["{{ cdi_fixture_group.gid | int }}"]
+      deviceNodes:
+        - path: /dev/tmachine-cdi-group-null
+          hostPath: "{{ cdi_scenario_dir }}/group-device"
+          permissions: rw
+          uid: 0
+          gid: "{{ cdi_fixture_group.gid | int }}"
+          fileMode: 432
+    expect:
+      checks:
+        - {type: non-root}
+        - {type: in-group-of, path: /dev/tmachine-cdi-group-null}
+        - {type: write, path: /dev/tmachine-cdi-group-null, expect: denied}
 
   # The echo socket is served by the systemd service installed in scenarios.yaml.
   # Its sibling file checks that only the socket path is exposed.
