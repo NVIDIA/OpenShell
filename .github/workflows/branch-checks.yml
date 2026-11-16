@@ -133,6 +133,66 @@ jobs:
                 || github.event.merge_group.base_sha
                 || needs.pr_metadata.outputs.base_sha }}
 
+  monitoring-changes:
+    name: Detect monitoring mixin changes
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.changes.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check mixin paths
+        id: changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha || needs.pr_metadata.outputs.base_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$BASE_SHA" ]; then
+            echo "::error::Missing base SHA for monitoring mixin change detection." >&2
+            exit 1
+          fi
+          changed=$(git diff --name-only "${BASE_SHA}...HEAD" -- deploy/openshell-mixin/)
+          if [ -n "$changed" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  monitoring:
+    name: Monitoring Mixin
+    needs: [pr_metadata, monitoring-changes]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.monitoring-changes.outputs.changed == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install monitoring prerequisites
+        run: mise install --locked go@1.26.7 python uv
+
+      - name: Check monitoring mixin
+        env:
+          # Activate Go while mise 2026.9.9 installs the go: task tools.
+          MISE_GO_VERSION: "1.26.7"
+        run: mise run monitoring:check
+
   mise-lockfile:
     name: mise Lockfile
     needs: pr_metadata

@@ -418,6 +418,8 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run ci`        | Full local CI checks (lint, compile/type checks, tests) |
 | `mise run docs`      | Validate Fern docs locally                              |
 | `mise run helm:docs` | Regenerate the Helm chart README                        |
+| `mise run monitoring:generate` | Render OpenShell Grafana dashboards           |
+| `mise run monitoring:check` | Check and render the monitoring mixin            |
 | `mise run clean`     | Clean build artifacts                                   |
 
 ## Project Structure
