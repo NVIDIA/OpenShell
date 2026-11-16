@@ -46,6 +46,22 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
+/// Default per-sandbox cap for each relay budget (SSH and service forwards).
+pub const DEFAULT_MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
+
+/// Default durable mutation admissions one caller identity can hold.
+pub const DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER: u32 = 1000;
+
+/// Accepted per-caller admission limits. The ceiling bounds the rows one caller
+/// can retain.
+pub const MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE: std::ops::RangeInclusive<u32> = 1..=1_000_000;
+
+/// Default replay window for successful durable mutation admissions.
+pub const DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS: u32 = 24 * 60 * 60;
+
+/// Accepted replay windows, from one minute to seven days.
+pub const MUTATION_REPLAY_WINDOW_SECONDS_RANGE: std::ops::RangeInclusive<u32> = 60..=604_800;
+
 /// Gateway delivery path for supervisor configuration.
 ///
 /// `Push` sends configuration over the supervisor session to supervisors that
@@ -324,9 +340,31 @@ pub struct Config {
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
 
+    /// Maximum concurrent SSH relays per sandbox. Must be at least 1.
+    pub max_ssh_connections_per_sandbox: u32,
+
+    /// Maximum concurrent service forward relays per sandbox. Must be at
+    /// least 1. Kept apart from the SSH budget so open forwards cannot block
+    /// SSH access.
+    pub max_service_connections_per_sandbox: u32,
+
     /// Absolute image preparation and initial supervisor startup budget for new
     /// sandbox attempts, in seconds. Must be between 1 and 86400, inclusive.
     pub image_preparation_timeout_seconds: u32,
+
+    /// Provisioning repair window, in seconds. The first authenticated
+    /// supervisor configuration report starts admission repair, which stays
+    /// armed until Ready. Must be between 1 and 86400, inclusive.
+    pub provisioning_repair_window_seconds: i64,
+
+    /// Durable mutation admissions one caller can hold across every replica
+    /// sharing the database. Replicas must use the same value. Must be within
+    /// [`MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE`].
+    pub mutation_admission_limit_per_caller: u32,
+
+    /// Seconds a successful mutation admission stays replayable. Must be within
+    /// [`MUTATION_REPLAY_WINDOW_SECONDS_RANGE`].
+    pub mutation_replay_window_seconds: u32,
 
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
@@ -509,6 +547,12 @@ pub struct MetricsTlsConfig {
 pub struct OidcConfig {
     /// OIDC issuer URL (e.g., `https://idp.example.com/realms/openshell`).
     pub issuer: String,
+
+    /// Optional PEM CA bundle for an issuer signed by a private CA. It must be
+    /// a regular file no larger than 1 MiB. These certificates augment the
+    /// platform trust roots for OIDC discovery and JWKS requests only.
+    #[serde(default)]
+    pub ca_bundle: Option<PathBuf>,
 
     /// Permit cleartext OIDC metadata and JWKS requests to numeric loopback
     /// addresses. This is a development-only escape hatch and never permits
@@ -1047,7 +1091,12 @@ impl Config {
             credential_drivers: Vec::new(),
             default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            max_ssh_connections_per_sandbox: DEFAULT_MAX_CONNECTIONS_PER_SANDBOX,
+            max_service_connections_per_sandbox: DEFAULT_MAX_CONNECTIONS_PER_SANDBOX,
             image_preparation_timeout_seconds: 1800,
+            provisioning_repair_window_seconds: 300,
+            mutation_admission_limit_per_caller: DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER,
+            mutation_replay_window_seconds: DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),

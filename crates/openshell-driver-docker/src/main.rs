@@ -66,6 +66,7 @@ async fn main() -> Result<()> {
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
+            ansi: openshell_core::color::stdout_ansi(),
         },
     );
     args.otlp.warn_deprecated();

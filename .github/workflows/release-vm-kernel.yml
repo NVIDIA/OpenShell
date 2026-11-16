@@ -79,6 +79,7 @@ jobs:
           path: |
             target/libkrun-build/kernel.c
             target/libkrun-build/ABI_VERSION
+            target/libkrun-build/provenance.json
           retention-days: 1
 
   # ---------------------------------------------------------------------------
@@ -149,6 +150,8 @@ jobs:
         run: tasks/scripts/vm/build-libkrun-macos.sh --kernel-dir target/kernel-artifact
 
       - name: Package runtime tarball
+        env:
+          CUSTOM_PROVENANCE_DIR: target/kernel-artifact
         run: |
           tasks/scripts/vm/package-vm-runtime.sh \
             --platform darwin-aarch64 \

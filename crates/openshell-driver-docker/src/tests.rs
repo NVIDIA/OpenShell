@@ -3274,6 +3274,38 @@ fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
     );
 }
 
+fn engine_version(name: &str, version: &str) -> SystemVersion {
+    SystemVersion {
+        components: Some(vec![bollard::models::SystemVersionComponents {
+            name: name.to_string(),
+            version: version.to_string(),
+            details: None,
+        }]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn warns_on_docker_engine_older_than_minimum() {
+    let warning = unsupported_docker_engine_warning(&engine_version("Engine", "26.1.5+dfsg1"))
+        .expect("old engine warns");
+    assert!(warning.contains("26.1.5+dfsg1"), "{warning}");
+    assert!(warning.contains("28.0"), "{warning}");
+}
+
+#[test]
+fn no_warning_for_supported_unknown_or_other_engines() {
+    for version in [
+        engine_version("Engine", "28.0.0"),
+        engine_version("Engine", "29.9.3"),
+        engine_version("Engine", "garbage"),
+        engine_version("Other Engine", "5.8.2"),
+        SystemVersion::default(),
+    ] {
+        assert!(unsupported_docker_engine_warning(&version).is_none());
+    }
+}
+
 #[test]
 fn docker_info_reports_wsl2_from_kernel_version() {
     let info = SystemInfo {

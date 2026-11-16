@@ -112,6 +112,10 @@ async fn port_forward_echo() {
 }
 
 /// Attempt to send `hello-nav\n` to the echo server and read the response.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the e2e workspace does not depend on openshell-core"
+)]
 async fn try_echo(port: u16) -> Result<String, String> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await

@@ -9,15 +9,20 @@
 //! which waits for the gateway before the tests run. The guest needs only the
 //! `cargo-nextest` binary to run it.
 //!
+//! `build` writes a bundle to a directory, so CI can build it once and every
+//! row can run it (`run --bundle`). A `bundle.json` in it names the family
+//! and the packages it was built with.
+//!
 //! A family that ships a prebuilt test program, such as `openshell-conformance`,
 //! can run it instead: the bundle then holds that program alone, built once
 //! elsewhere for the guest target, and the runner builds nothing.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 /// The nextest profile the runner uses in the guest.
@@ -40,6 +45,21 @@ path = "junit.xml"
 
 /// The prebuilt program's name in a program bundle.
 pub const PROGRAM_BINARY: &str = "test-program";
+
+/// The nextest archive in a nextest bundle.
+const ARCHIVE: &str = "tests.tar.zst";
+/// The nextest config in a nextest bundle.
+const CONFIG: &str = "nextest.toml";
+/// What a nextest bundle was built from.
+const MANIFEST: &str = "bundle.json";
+
+/// The family and packages a nextest bundle holds.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Manifest {
+    family: String,
+    /// Empty when the bundle holds every package in the family.
+    packages: Vec<String>,
+}
 
 /// What a bundle runs the tests with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,7 +100,7 @@ pub fn program(program: &Path) -> Result<Bundle> {
 
 /// The Rust target for guests. tmachine only boots guests of the host's
 /// architecture, and static musl binaries don't depend on the guest's libc.
-pub fn guest_target() -> Result<&'static str> {
+fn guest_target() -> Result<&'static str> {
     if cfg!(target_arch = "x86_64") {
         Ok("x86_64-unknown-linux-musl")
     } else if cfg!(target_arch = "aarch64") {
@@ -91,7 +111,7 @@ pub fn guest_target() -> Result<&'static str> {
 }
 
 /// Build `testkit-ready` for the guest and return its path.
-pub fn build_ready(root: &Path, target: &str) -> Result<PathBuf> {
+fn build_ready(root: &Path, target: &str) -> Result<PathBuf> {
     let output = Command::new("cargo")
         .args(["build", "--locked", "--manifest-path"])
         .arg(root.join("tests/testkit/Cargo.toml"))
@@ -140,26 +160,41 @@ fn built_executable(messages: &[u8], name: &str) -> Option<PathBuf> {
         .find_map(|message| message.executable)
 }
 
-/// Build the bundle for a family workspace (`tests/suites/<family>`). With no
-/// `packages`, the archive holds every package in the workspace. `ready` is
-/// the guest's `testkit-ready`.
-pub fn build(workspace: &Path, packages: &[String], target: &str, ready: &Path) -> Result<Bundle> {
+/// Build the bundle for `family` into a new temporary directory.
+pub fn build_temp(root: &Path, family: &str, packages: &[String]) -> Result<Bundle> {
     let dir = tempfile::tempdir().context("create bundle directory")?;
-    let stage = dir.path();
+    build(root, family, packages, dir.path())?;
+    Ok(Bundle(dir, Kind::Nextest))
+}
+
+/// Build the bundle for `family`, the path of a workspace under
+/// `tests/suites/`, into `out`, an empty or missing directory. With no
+/// `packages`, the archive holds every package in the workspace.
+pub fn build(root: &Path, family: &str, packages: &[String], out: &Path) -> Result<()> {
+    let workspace = crate::family_workspace(root, family)?;
     let manifest = workspace.join("Cargo.toml");
     ensure!(
         manifest.is_file(),
         "{} is not a test family workspace",
         workspace.display()
     );
-    let archive = stage.join("tests.tar.zst");
+    std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
+    ensure!(
+        std::fs::read_dir(out)?.next().is_none(),
+        "{} is not empty",
+        out.display()
+    );
+    let target = guest_target()?;
+    eprintln!("==> building {READY_BINARY} for {target}");
+    let ready = build_ready(root, target)?;
 
+    eprintln!("==> building the {family} tests for {target}");
     let mut command = Command::new("cargo");
     command
         .args(["nextest", "archive", "--locked", "--manifest-path"])
         .arg(&manifest)
         .args(["--target", target, "--archive-file"])
-        .arg(&archive);
+        .arg(out.join(ARCHIVE));
     if packages.is_empty() {
         command.arg("--workspace");
     }
@@ -168,11 +203,108 @@ pub fn build(workspace: &Path, packages: &[String], target: &str, ready: &Path) 
     }
     run(&mut command).with_context(|| format!("build the {} test archive", workspace.display()))?;
 
-    copy_manifests(workspace, stage)?;
-    std::fs::write(stage.join("nextest.toml"), NEXTEST_CONFIG)?;
-    std::fs::copy(ready, stage.join(READY_BINARY))
+    copy_manifests(&workspace, out)?;
+    std::fs::write(out.join(CONFIG), NEXTEST_CONFIG)?;
+    std::fs::copy(&ready, out.join(READY_BINARY))
         .with_context(|| format!("copy {}", ready.display()))?;
-    Ok(Bundle(dir, Kind::Nextest))
+    let manifest = Manifest {
+        family: family.to_string(),
+        packages: packages.to_vec(),
+    };
+    std::fs::write(out.join(MANIFEST), serde_json::to_vec_pretty(&manifest)?)?;
+    Ok(())
+}
+
+/// A bundle that `build` wrote to `dir`, for running `packages` of `family`
+/// (every package in it when empty). The bundle is copied, so `dir` may have
+/// lost the executable bits, as a downloaded CI artifact does.
+pub fn prebuilt(dir: &Path, family: &str, packages: &[String]) -> Result<Bundle> {
+    let read = std::fs::read(dir.join(MANIFEST))
+        .with_context(|| format!("{} is not a test bundle: read {MANIFEST}", dir.display()))?;
+    let manifest: Manifest = serde_json::from_slice(&read)
+        .with_context(|| format!("parse {}", dir.join(MANIFEST).display()))?;
+    check_selection(&manifest, family, packages)
+        .with_context(|| format!("--bundle {}", dir.display()))?;
+    for name in [ARCHIVE, CONFIG, READY_BINARY] {
+        ensure!(
+            dir.join(name).is_file(),
+            "{} is not a test bundle: it has no {name}",
+            dir.display()
+        );
+    }
+
+    let copy = tempfile::tempdir().context("create bundle directory")?;
+    copy_tree(dir, copy.path())?;
+    let ready = copy.path().join(READY_BINARY);
+    std::fs::set_permissions(&ready, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("make {} executable", ready.display()))?;
+    Ok(Bundle(copy, Kind::Nextest))
+}
+
+/// Check that a bundle built from `manifest` holds `packages` of `family`.
+fn check_selection(manifest: &Manifest, family: &str, packages: &[String]) -> Result<()> {
+    ensure!(
+        manifest.family == family,
+        "the bundle holds the {} tests, not {family}",
+        manifest.family
+    );
+    if manifest.packages.is_empty() {
+        return Ok(());
+    }
+    let missing: Vec<_> = if packages.is_empty() {
+        vec!["every package"]
+    } else {
+        packages
+            .iter()
+            .filter(|package| !manifest.packages.contains(package))
+            .map(String::as_str)
+            .collect()
+    };
+    ensure!(
+        missing.is_empty(),
+        "the bundle holds only {}, not {}",
+        manifest.packages.join(", "),
+        missing.join(", ")
+    );
+    Ok(())
+}
+
+/// The nextest filtersets that run the tests of `packages` that match any of
+/// `filters`. nextest runs the tests that match any `-E`, so the packages and
+/// the filters go in one expression.
+pub fn narrow(packages: &[String], filters: &[String]) -> Vec<String> {
+    if packages.is_empty() {
+        return filters.to_vec();
+    }
+    let packages = packages
+        .iter()
+        .map(|package| format!("package(={package})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if filters.is_empty() {
+        return vec![packages];
+    }
+    let filters = filters
+        .iter()
+        .map(|filter| format!("({filter})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    vec![format!("({packages}) & ({filters})")]
+}
+
+/// Copy the files under `src` into `dst`, keeping relative paths.
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let path = entry?.path();
+        let dest = dst.join(path.file_name().unwrap_or_default());
+        if path.is_dir() {
+            std::fs::create_dir_all(&dest)?;
+            copy_tree(&path, &dest)?;
+        } else {
+            std::fs::copy(&path, &dest).with_context(|| format!("copy {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Copy every `Cargo.toml` under `workspace` into `stage`, keeping relative
@@ -224,6 +356,76 @@ mod tests {
             .collect();
         assert_eq!(names, [PROGRAM_BINARY]);
         assert!(program(&dir.path().join("missing")).is_err());
+    }
+
+    fn write_bundle(dir: &Path, family: &str, packages: &[&str]) {
+        std::fs::create_dir_all(dir.join("host-gateway")).unwrap();
+        for name in [ARCHIVE, CONFIG, READY_BINARY, "Cargo.toml"] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        std::fs::write(dir.join("host-gateway/Cargo.toml"), "member").unwrap();
+        let manifest = Manifest {
+            family: family.to_string(),
+            packages: packages.iter().map(ToString::to_string).collect(),
+        };
+        std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn prebuilt_bundle_is_copied_with_an_executable_ready_check() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bundle(dir.path(), "features", &[]);
+        let bundle = prebuilt(dir.path(), "features", &["host-gateway".to_string()]).unwrap();
+        assert_eq!(bundle.kind(), Kind::Nextest);
+        assert_ne!(bundle.path(), dir.path());
+        assert_eq!(
+            std::fs::read(bundle.path().join("host-gateway/Cargo.toml")).unwrap(),
+            b"member"
+        );
+        let mode = std::fs::metadata(bundle.path().join(READY_BINARY))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111);
+    }
+
+    #[test]
+    fn prebuilt_bundle_must_be_complete_and_of_the_family() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(prebuilt(dir.path(), "features", &[]).is_err());
+        write_bundle(dir.path(), "features", &[]);
+        assert!(prebuilt(dir.path(), "drivers/podman", &[]).is_err());
+        std::fs::remove_file(dir.path().join(ARCHIVE)).unwrap();
+        assert!(prebuilt(dir.path(), "features", &[]).is_err());
+    }
+
+    #[test]
+    fn selection_must_be_in_the_bundle() {
+        let some = Manifest {
+            family: "features".to_string(),
+            packages: vec!["oci-image".to_string()],
+        };
+        let check = |packages: &[&str]| {
+            let packages: Vec<_> = packages.iter().map(ToString::to_string).collect();
+            check_selection(&some, "features", &packages)
+        };
+        assert!(check(&["oci-image"]).is_ok());
+        assert!(check(&["host-gateway"]).is_err());
+        assert!(check(&[]).is_err());
+    }
+
+    #[test]
+    fn narrow_combines_packages_and_filters() {
+        let strings = |items: &[&str]| items.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(narrow(&[], &strings(&["test(a)"])), strings(&["test(a)"]));
+        assert_eq!(
+            narrow(&strings(&["oci-image", "host-gateway"]), &[]),
+            strings(&["package(=oci-image) | package(=host-gateway)"])
+        );
+        assert_eq!(
+            narrow(&strings(&["oci-image"]), &strings(&["test(a)", "test(b)"])),
+            strings(&["(package(=oci-image)) & ((test(a)) | (test(b)))"])
+        );
     }
 
     #[test]

@@ -37,9 +37,8 @@ use crate::persistence::{
     ObjectType, PersistenceError, SetResourceVersion, Store, WriteCondition, current_time_ms,
 };
 
-const OBJECT_TYPE: &str = "mutation_admission_v1";
-const SUCCESS_TTL_MS: i64 = 24 * 60 * 60 * 1000;
-const MAX_ADMISSIONS_PER_CALLER: u32 = 1000;
+const OBJECT_TYPE: &str = crate::persistence::MUTATION_ADMISSION_OBJECT_TYPE;
+const SWEEP_BATCH: u32 = 1000;
 // Bound work detached from request cancellation across all service instances.
 static EXECUTORS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(64)));
 static DESCRIPTORS: LazyLock<DescriptorPool> = LazyLock::new(|| {
@@ -258,6 +257,12 @@ async fn execute_owned<M: Mutation>(
     protection: Option<Protection>,
     scope: Scope,
 ) -> Result<Response<M::Output>, Status> {
+    let range = openshell_core::config::MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE;
+    let limit = state
+        .config
+        .mutation_admission_limit_per_caller
+        .clamp(*range.start(), *range.end());
+    let window_ms = replay_window_ms(&state.config);
     let admission = Admission {
         format_version: 1,
         payload_hash,
@@ -282,17 +287,15 @@ async fn execute_owned<M: Mutation>(
             }
             if previous.success.is_some()
                 && previous.completed_at_ms.is_some_and(|completed| {
-                    current_time_ms() >= completed.saturating_add(SUCCESS_TTL_MS)
+                    current_time_ms() >= completed.saturating_add(window_ms)
                 })
             {
-                match state
+                state
                     .store
-                    .delete_if(OBJECT_TYPE, &row.id, row.resource_version)
+                    .delete_mutation_admissions(std::slice::from_ref(&row.id))
                     .await
-                {
-                    Ok(_) | Err(PersistenceError::Conflict { .. }) => continue,
-                    Err(error) => return Err(storage_error(error)),
-                }
+                    .map_err(storage_error)?;
+                continue;
             }
             // A rotated/unavailable protection key must never turn the old ID
             // into a new admission, or report a misleading payload mismatch.
@@ -328,20 +331,17 @@ async fn execute_owned<M: Mutation>(
         let claim_id = uuid::Uuid::new_v4().to_string();
         let write = state
             .store
-            .create_if_workspace_count_below(
-                OBJECT_TYPE,
-                &claim_id,
-                key,
-                bucket,
-                &payload,
-                None,
-                u64::from(MAX_ADMISSIONS_PER_CALLER),
-            )
+            .create_mutation_admission(&claim_id, key, bucket, &payload, limit)
             .await;
         let version = match write {
             Ok(Some(write)) => write.resource_version,
             Ok(None) => {
-                if prune_expired(&state.store, bucket).await? {
+                // A failed reclaim, such as a Postgres deadlock with a concurrent
+                // sweep, is logged and leaves the caller at the limit.
+                if sweep_expired(&state.store, Some(bucket), window_ms)
+                    .await
+                    .unwrap_or(false)
+                {
                     continue;
                 }
                 return Err(Status::resource_exhausted(
@@ -436,34 +436,81 @@ impl Completion {
     }
 }
 
-async fn prune_expired(store: &Store, bucket: &str) -> Result<bool, Status> {
-    // The bucket is atomically bounded, so this scan cannot grow without limit.
-    let rows = store
-        .list(OBJECT_TYPE, bucket, MAX_ADMISSIONS_PER_CALLER, 0)
-        .await
-        .map_err(storage_error)?;
+fn replay_window_ms(config: &openshell_core::Config) -> i64 {
+    let range = openshell_core::config::MUTATION_REPLAY_WINDOW_SECONDS_RANGE;
+    i64::from(
+        config
+            .mutation_replay_window_seconds
+            .clamp(*range.start(), *range.end()),
+    ) * 1000
+}
+
+/// Delete expired successful admissions for one bucket, or all buckets, in
+/// bounded batches. Returns whether any admission was removed.
+async fn sweep_expired(
+    store: &Store,
+    bucket: Option<&str>,
+    window_ms: i64,
+) -> Result<bool, Status> {
+    let now = current_time_ms();
     let mut removed = false;
-    for row in rows {
-        let Ok(admission) = serde_json::from_slice::<Admission>(&row.payload) else {
-            continue;
-        };
-        if admission.format_version == 1
-            && admission.success.is_some()
-            && admission.completed_at_ms.is_some_and(|completed| {
-                current_time_ms() >= completed.saturating_add(SUCCESS_TTL_MS)
+    loop {
+        let rows = store
+            .list_completed_mutation_admissions(bucket, now.saturating_sub(window_ms), SWEEP_BATCH)
+            .await
+            .map_err(storage_error)?;
+        let full_page = rows.len() == SWEEP_BATCH as usize;
+        // Completed admissions never change again, so deleting by ID is safe.
+        let expired: Vec<String> = rows
+            .into_iter()
+            .filter(|row| {
+                serde_json::from_slice::<Admission>(&row.payload).is_ok_and(|admission| {
+                    admission.format_version == 1
+                        && admission.success.is_some()
+                        && admission
+                            .completed_at_ms
+                            .is_some_and(|completed| now >= completed.saturating_add(window_ms))
+                })
             })
-        {
-            match store
-                .delete_if(OBJECT_TYPE, &row.id, row.resource_version)
-                .await
-            {
-                Ok(deleted) => removed |= deleted,
-                Err(PersistenceError::Conflict { .. }) => {}
-                Err(error) => return Err(storage_error(error)),
-            }
+            .map(|row| row.id)
+            .collect();
+        if expired.is_empty() {
+            return Ok(removed);
+        }
+        removed |= store
+            .delete_mutation_admissions(&expired)
+            .await
+            .map_err(storage_error)?
+            > 0;
+        if !full_page {
+            return Ok(removed);
         }
     }
-    Ok(removed)
+}
+
+/// Periodically delete expired successful admissions.
+pub fn spawn_expiry_sweeper(
+    state: Arc<ServerState>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_mins(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                _ = interval.tick() => {}
+            }
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                result = sweep_expired(&state.store, None, replay_window_ms(&state.config)) => {
+                    if let Err(status) = result {
+                        tracing::warn!(%status, "mutation admission expiry sweep failed");
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn validate_request_id(value: &str) -> Result<String, Status> {

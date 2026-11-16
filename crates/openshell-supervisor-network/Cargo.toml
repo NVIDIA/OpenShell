@@ -40,7 +40,7 @@ ipnet = "2"
 miette = { workspace = true }
 prost-types = { workspace = true }
 rcgen = { workspace = true }
-regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
+regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }

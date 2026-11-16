@@ -33,7 +33,9 @@ pub(crate) use store::{
 };
 
 use crate::opa::OpaEngine;
-use crate::proxy::destination::{build_validation_plan, filter_resolved_addresses};
+use crate::proxy::destination::{
+    DestinationDenialKind, build_validation_plan, filter_resolved_addresses,
+};
 use crate::proxy::is_host_gateway_alias;
 use crate::telemetry::egress_emit;
 use openshell_core::host_pattern::HostSelector;
@@ -378,15 +380,18 @@ fn eligible_endpoints(
             && pattern == name.as_str()
             && value_field(&endpoint.endpoint, "advisor_proposed")
                 != Some(&regorus::Value::Bool(true));
-        let destination_plan = build_validation_plan(
+        let destination_plan = match build_validation_plan(
             name.as_str(),
             name.as_str(),
             trusted_host_gateway,
             None,
             &raw_allowed_ips,
             exact_declared_host,
-        )
-        .map_err(|error| PolicyDnsError::Policy(error.reason))?;
+        ) {
+            Ok(plan) => plan,
+            Err(error) if error.kind == DestinationDenialKind::InternalAddress => continue,
+            Err(error) => return Err(PolicyDnsError::Policy(error.reason)),
+        };
         eligible.push(EligibleEndpoint {
             endpoint_id: PolicyEndpointId {
                 policy_name: endpoint.policy_name.clone(),
@@ -1129,6 +1134,101 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .answer_query("db.example.com", AddressFamily::Ipv4, Instant::now())
             .await;
         assert!(matches!(result, Err(PolicyDnsError::NoValidAddress)));
+    }
+
+    #[tokio::test]
+    async fn numeric_private_name_keeps_only_the_exact_endpoint_contract() {
+        let wildcard = "      - { host: '**.*.*', port: 443, protocol: tcp }";
+        let exact = "      - { host: 10.2.3.4, port: 8443, protocol: tcp }";
+        for endpoints in [
+            format!("{wildcard}\n{exact}"),
+            format!("{exact}\n{wildcard}"),
+        ] {
+            let yaml = BASE_POLICY.replace(
+                "      - { host: db.example, port: 5432, protocol: tcp }",
+                &endpoints,
+            );
+            let ip = "10.2.3.4".parse::<IpAddr>().unwrap();
+            let service = service(&yaml, vec![ip]);
+            let now = Instant::now();
+            let answer = service
+                .answer_query("10.2.3.4.", AddressFamily::Ipv4, now)
+                .await
+                .expect("the exact endpoint must retain its private address grant");
+            let mapping = service
+                .store
+                .lookup(answer.address, 8443, answer.policy_generation, now)
+                .unwrap();
+            assert_eq!(mapping.record.contracts.len(), 1);
+            assert_eq!(mapping.record.contracts[0].pinned_addresses, [ip]);
+            assert!(matches!(
+                service
+                    .store
+                    .lookup(answer.address, 443, answer.policy_generation, now),
+                Err(MappingLookupError::PortMismatch)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn wildcard_numeric_private_name_has_no_egress_contract() {
+        let yaml = BASE_POLICY.replace("db.example", "'**.*.*'");
+        for address in ["10.2.3.4", "8.8.8.8"] {
+            let service = service(&yaml, vec![address.parse().unwrap()]);
+            let now = Instant::now();
+            let answer = service
+                .answer_query("10.2.3.4.", AddressFamily::Ipv4, now)
+                .await
+                .expect("an ineligible numeric name can only stage an observation");
+            assert!(matches!(
+                service
+                    .store
+                    .lookup(answer.address, 5432, answer.policy_generation, now),
+                Err(MappingLookupError::PortMismatch)
+            ));
+            let intent = service
+                .store
+                .lookup_intent(answer.address, 5432, answer.policy_generation, now)
+                .unwrap();
+            assert!(intent.record.is_observation());
+            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn numeric_public_name_keeps_literal_address_and_control_plane_port_checks() {
+        for (port, address) in [(5432, "1.1.1.1"), (6443, "8.8.8.8")] {
+            let yaml = BASE_POLICY
+                .replace("db.example", "'**.*.*'")
+                .replace("port: 5432", &format!("port: {port}"));
+            let service = service(&yaml, vec![address.parse().unwrap()]);
+            assert!(matches!(
+                service
+                    .answer_query("8.8.8.8.", AddressFamily::Ipv4, Instant::now())
+                    .await,
+                Err(PolicyDnsError::NoValidAddress)
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_allowed_ips_remains_a_policy_error() {
+        let endpoints = [crate::opa::MatchedEndpoint {
+            policy_name: "database".to_string(),
+            endpoint_index: 0,
+            endpoint: regorus::Value::from_json_str(
+                r#"{"host":"db.example","ports":[5432],"allowed_ips":["not-an-ip"]}"#,
+            )
+            .unwrap(),
+        }];
+        assert!(matches!(
+            eligible_endpoints(
+                &endpoints,
+                &NormalizedName::parse("db.example").unwrap(),
+                None
+            ),
+            Err(PolicyDnsError::Policy(_))
+        ));
     }
 
     #[tokio::test]
