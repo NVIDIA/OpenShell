@@ -89,7 +89,7 @@ mod lifecycle_reconciliation {
         let annotations = &mut object["metadata"]["annotations"];
         annotations[ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION] = serde_json::json!("restart");
         annotations[ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT] =
-            serde_json::json!(openshell_core::time::now_ms().to_string());
+            serde_json::json!(openshell_driver_sdk::time::now_ms().to_string());
         annotations[ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID] =
             serde_json::json!("new-supervisor-uid");
         annotations[ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID] =

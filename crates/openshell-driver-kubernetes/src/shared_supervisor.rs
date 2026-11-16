@@ -60,9 +60,7 @@ pub fn supervisor_placement(
         None => Ok(SupervisorPlacement::Dedicated),
         Some(GATEWAY_TOPOLOGY) => {
             let route = annotation(ANNOTATION_SUPERVISOR_SESSION)
-                .filter(|route| {
-                    openshell_sandbox_backend::runtime_routed::validate_route_handle(route).is_ok()
-                })
+                .filter(|route| openshell_driver_contract::validate_route_handle(route).is_ok())
                 .ok_or_else(|| {
                     KubernetesDriverError::Precondition(
                         "shared supervisor generation has no valid sandbox instance route"
@@ -198,7 +196,7 @@ mod tests {
             supervisor_placement(&object(&[])).unwrap(),
             SupervisorPlacement::Dedicated
         );
-        let route = openshell_sandbox_backend::runtime_routed::new_route_handle();
+        let route = openshell_driver_contract::new_route_handle();
         assert_eq!(
             supervisor_placement(&object(&[
                 (ANNOTATION_SUPERVISOR_TOPOLOGY, GATEWAY_TOPOLOGY),
