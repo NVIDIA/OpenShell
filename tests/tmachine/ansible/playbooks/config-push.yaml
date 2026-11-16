@@ -26,9 +26,12 @@
         group: root
         mode: "0755"
 
-    # A managed block keeps tables that earlier playbooks wrote. A playbook
-    # that replaces the whole file, such as drivers/podman/userns.yaml, must
-    # run before this one.
+    # A managed block keeps tables that earlier playbooks wrote. Some writers
+    # replace the whole file: drivers/podman/userns.yaml and the cdi_fixtures
+    # role in environment setup, which must run before this playbook, and the
+    # openshell_external_driver role in the deb-external-docker-driver
+    # installer, which always runs after it, so don't pair that installer with
+    # this environment.
     - name: Write the configuration delivery mode
       become: true
       ansible.builtin.blockinfile:
