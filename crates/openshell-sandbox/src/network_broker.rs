@@ -5,14 +5,14 @@
 
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::accept_errors::{
@@ -43,6 +43,12 @@ const DNS_RELAY_ADDRESS: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new
 ));
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a blocking-connect worker stays parked for reuse before exiting.
+const CONNECT_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Parked blocking-connect workers kept for reuse. A worker that finishes
+/// while this many are already parked exits instead, so a burst of blocking
+/// connects does not leave a thread per connect behind.
+const CONNECT_WORKER_IDLE_LIMIT: usize = 4;
 
 fn retry_notification_receive(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::ENOENT)
@@ -215,6 +221,7 @@ struct NotificationQueues {
     pending: mpsc::Sender<PendingTcpOpen>,
     dns_relay: DnsRelay,
     active_opens: Arc<AtomicUsize>,
+    connect_workers: Arc<ConnectWorkers>,
     descriptor_soft_limit: usize,
     decision_timeout: Duration,
 }
@@ -230,14 +237,44 @@ pub struct NetworkBroker {
     descriptor_soft_limit: usize,
     dns_address: SocketAddr,
     healthy: Arc<AtomicBool>,
+    #[cfg(test)]
+    active_opens: Arc<AtomicUsize>,
+    #[cfg(test)]
+    connect_workers: Arc<ConnectWorkers>,
 }
 
 impl NetworkBroker {
+    /// Start the broker for `listener`.
+    ///
+    /// `provider_files` must be the delivery whose
+    /// [`open_mediation`](crate::provider_files::ProviderFiles::open_mediation)
+    /// the listener was installed with.
     pub(crate) fn start(
         listener: NotificationListener,
         protected_control_port: Option<u16>,
+        provider_files: crate::provider_files::ProviderFiles,
     ) -> io::Result<Self> {
-        Self::start_with_dns_address(listener, DNS_RELAY_ADDRESS, protected_control_port)
+        Self::start_configured(
+            listener,
+            DNS_RELAY_ADDRESS,
+            protected_control_port,
+            NETWORK_DECISION_TIMEOUT,
+            provider_files,
+        )
+    }
+
+    #[cfg(any(test, feature = "perf-harness"))]
+    pub(crate) fn start_for_test_with_provider_files(
+        listener: NotificationListener,
+        provider_files: crate::provider_files::ProviderFiles,
+    ) -> io::Result<Self> {
+        Self::start_configured(
+            listener,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
+            NETWORK_DECISION_TIMEOUT,
+            provider_files,
+        )
     }
 
     #[cfg(any(test, feature = "perf-harness"))]
@@ -249,6 +286,7 @@ impl NetworkBroker {
         )
     }
 
+    #[cfg(any(test, feature = "perf-harness"))]
     fn start_with_dns_address(
         listener: NotificationListener,
         dns_address: SocketAddr,
@@ -262,11 +300,28 @@ impl NetworkBroker {
         )
     }
 
+    #[cfg(any(test, feature = "perf-harness"))]
     fn start_with_decision_timeout(
         listener: NotificationListener,
         dns_address: SocketAddr,
         protected_control_port: Option<u16>,
         decision_timeout: Duration,
+    ) -> io::Result<Self> {
+        Self::start_configured(
+            listener,
+            dns_address,
+            protected_control_port,
+            decision_timeout,
+            crate::provider_files::ProviderFiles::default(),
+        )
+    }
+
+    fn start_configured(
+        listener: NotificationListener,
+        dns_address: SocketAddr,
+        protected_control_port: Option<u16>,
+        decision_timeout: Duration,
+        provider_files: crate::provider_files::ProviderFiles,
     ) -> io::Result<Self> {
         let listener = Arc::new(listener);
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
@@ -276,7 +331,6 @@ impl NetworkBroker {
         let dns_address = dns_relay.address;
         let descriptor_soft_limit = descriptor_soft_limit()?;
         let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
-        let provider_files = crate::provider_files::ProviderFiles::default();
         let workload_frozen = Arc::new(AtomicBool::new(false));
         let queues = NotificationQueues {
             provider_files: provider_files.clone(),
@@ -286,9 +340,19 @@ impl NetworkBroker {
             pending: pending_tx,
             dns_relay,
             active_opens,
+            connect_workers: ConnectWorkers::new(ConnectWorkerLimits {
+                max_workers: OPEN_QUEUE_CAPACITY,
+                max_idle: CONNECT_WORKER_IDLE_LIMIT,
+                idle_timeout: CONNECT_WORKER_IDLE_TIMEOUT,
+            }),
             descriptor_soft_limit,
             decision_timeout,
         };
+        #[cfg(test)]
+        let (test_active_opens, test_connect_workers) = (
+            Arc::clone(&queues.active_opens),
+            Arc::clone(&queues.connect_workers),
+        );
         let healthy = Arc::new(AtomicBool::new(true));
         let broker_healthy = healthy.clone();
         let broker_registry = Arc::clone(&registry);
@@ -316,10 +380,10 @@ impl NetworkBroker {
                     // broker keeps mediating the rest.
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         dispatch_notification(
-                            Arc::clone(&broker_registry),
-                            Arc::clone(&listener),
+                            &broker_registry,
+                            &listener,
                             notification,
-                            queues.clone(),
+                            &queues,
                         )
                     }));
                     match outcome {
@@ -362,6 +426,10 @@ impl NetworkBroker {
             descriptor_soft_limit,
             dns_address,
             healthy,
+            #[cfg(test)]
+            active_opens: test_active_opens,
+            #[cfg(test)]
+            connect_workers: test_connect_workers,
         })
     }
 
@@ -687,22 +755,22 @@ fn serve_dns_tcp(mut stream: TcpStream, pending: mpsc::Sender<PendingDnsQuery>) 
 }
 
 fn dispatch_notification(
-    registry: Arc<Mutex<SocketRegistry>>,
-    listener: Arc<NotificationListener>,
+    registry: &Arc<Mutex<SocketRegistry>>,
+    listener: &Arc<NotificationListener>,
     notification: Notification,
-    queues: NotificationQueues,
+    queues: &NotificationQueues,
 ) -> io::Result<()> {
     let syscall = i64::from(notification.syscall);
     if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
-        return queues.provider_files.handle_open(&listener, notification);
+        return queues.provider_files.handle_open(listener, notification);
     }
     #[cfg(target_arch = "x86_64")]
     if syscall == libc::SYS_open {
-        return queues.provider_files.handle_open(&listener, notification);
+        return queues.provider_files.handle_open(listener, notification);
     }
     if matches!(syscall, libc::SYS_kill | libc::SYS_rt_sigqueueinfo) {
         return crate::linux::process_signal::mediate_process_signal(
-            &listener,
+            listener,
             notification,
             std::process::id(),
             &queues.workload_frozen,
@@ -713,7 +781,7 @@ fn dispatch_notification(
         libc::SYS_tkill | libc::SYS_tgkill | libc::SYS_rt_tgsigqueueinfo
     ) {
         return crate::linux::process_signal::mediate_thread_signal(
-            &listener,
+            listener,
             notification,
             std::process::id(),
             &queues.workload_frozen,
@@ -721,8 +789,8 @@ fn dispatch_notification(
     }
     if syscall == libc::SYS_socket {
         return create_socket(
-            &registry,
-            &listener,
+            registry,
+            listener,
             notification,
             queues.descriptor_soft_limit,
         );
@@ -731,16 +799,16 @@ fn dispatch_notification(
         return connect_socket(registry, listener, notification, queues);
     }
     if syscall == libc::SYS_bind {
-        return bind_socket(&registry, &listener, notification);
+        return bind_socket(registry, listener, notification);
     }
     if syscall == libc::SYS_listen {
-        return listen_socket(&registry, &listener, notification);
+        return listen_socket(registry, listener, notification);
     }
     if matches!(
         syscall,
         libc::SYS_sendto | libc::SYS_sendmsg | libc::SYS_sendmmsg
     ) {
-        return classify_send(&registry, &listener, notification, &queues.dns_relay);
+        return classify_send(registry, listener, notification, &queues.dns_relay);
     }
     if syscall == libc::SYS_setsockopt {
         let level = i32::try_from(notification.args[1])
@@ -868,7 +936,7 @@ fn descriptor_soft_limit() -> io::Result<usize> {
 }
 
 fn open_descriptor_count() -> io::Result<usize> {
-    std::fs::read_dir("/proc/self/fd").map(Iterator::count)
+    crate::linux::proc_fd::open_descriptor_count()
 }
 
 fn descriptor_headroom_exhausted(
@@ -896,11 +964,16 @@ fn prepare_registry_for_socket_with_count(
 ) -> io::Result<()> {
     let required = SOCKET_FD_HEADROOM.saturating_add(1);
     let mut registry = lock(registry);
-    if registry.is_full()
-        || descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required)
+    // One count decides the ordinary path. Descriptor use is recounted only
+    // after a collection, which is the one step here that changes it; a
+    // second count without one would merely resample concurrent ambient use
+    // a few microseconds later, which the next socket request does anyway.
+    if !registry.is_full()
+        && !descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required)
     {
-        collect_closed_socket_entries_locked(&mut registry)?;
+        return Ok(());
     }
+    collect_closed_socket_entries_locked(&mut registry)?;
     if registry.is_full()
         || descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required)
     {
@@ -929,9 +1002,11 @@ fn ensure_descriptor_headroom_with_count(
     mut open_descriptors: impl FnMut() -> io::Result<usize>,
 ) -> io::Result<()> {
     let mut registry = lock(registry);
-    if descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required) {
-        collect_closed_socket_entries_locked(&mut registry)?;
+    if !descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required) {
+        return Ok(());
     }
+    // Recount only after the collection that may have released descriptors.
+    collect_closed_socket_entries_locked(&mut registry)?;
     if descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required) {
         return Err(io::Error::from_raw_os_error(libc::EMFILE));
     }
@@ -952,27 +1027,29 @@ fn reject_protected_control_destination(
 }
 
 fn connect_socket(
-    registry: Arc<Mutex<SocketRegistry>>,
-    listener: Arc<NotificationListener>,
+    registry: &Arc<Mutex<SocketRegistry>>,
+    listener: &Arc<NotificationListener>,
     notification: Notification,
-    queues: NotificationQueues,
+    queues: &NotificationQueues,
 ) -> io::Result<()> {
     let NotificationQueues {
         pending,
         dns_relay,
         active_opens,
+        connect_workers,
         identity_resolver,
         decision_timeout,
         protected_control_port,
         ..
     } = queues;
+    let decision_timeout = *decision_timeout;
     let notification_started = Instant::now();
     let fd = raw_fd(notification.args[0])?;
-    let address_family =
-        read_socket_family(notification.tid, notification.args[1], notification.args[2])?;
+    let (address_family, copied_destination) =
+        read_socket_family_and_addr(notification.tid, notification.args[1], notification.args[2])?;
     if !matches!(address_family, libc::AF_INET | libc::AF_INET6) {
         if address_family == libc::AF_UNSPEC {
-            let mut registry = lock(&registry);
+            let mut registry = lock(registry);
             if let Ok(entry) = registry.resolve_mut(notification.tid, fd)
                 && entry.metadata().kind == InetKind::DnsUdp
                 && matches!(
@@ -987,7 +1064,7 @@ fn connect_socket(
                 return listener.respond_value(notification.id, 0);
             }
         }
-        if lock(&registry)
+        if lock(registry)
             .resolve_for_native_fallback(notification.tid, fd)?
             .is_some()
         {
@@ -998,17 +1075,35 @@ fn connect_socket(
         // Native non-INET descriptors remain kernel-driven.
         return listener.respond_continue(notification.id);
     }
-    let destination =
-        read_socket_addr(notification.tid, notification.args[1], notification.args[2])?;
-    reject_protected_control_destination(destination, protected_control_port)?;
-    let (kind, socket_identity, nonblocking, repeated) = {
-        let registry = lock(&registry);
+    let destination = copied_destination?;
+    reject_protected_control_destination(destination, *protected_control_port)?;
+    // The metadata service lives in the supervisor, even though SDKs address
+    // it through loopback, and the DNS relay has its own admission path.
+    let ordinary_loopback = destination.ip().is_loopback()
+        && !openshell_core::google_cloud::is_metadata_destination(destination)
+        && destination != dns_relay.address;
+    let (kind, socket_identity, nonblocking, repeated, local_connector) = {
+        let registry = lock(registry);
         let entry = registry.resolve(notification.tid, fd)?;
+        let kind = entry.metadata().kind;
+        let repeated = repeated_connect_outcome(entry.state(), kind, destination);
+        // A loopback TCP connect waits on a duplicate of the retained socket.
+        // Take it in the scope that captured the socket identity, so the two
+        // name the same socket and the descriptor is resolved once.
+        let local_connector = if ordinary_loopback && kind == InetKind::Tcp && repeated.is_none() {
+            Some(rustix::io::fcntl_dupfd_cloexec(
+                entry.retained_preconnect()?,
+                3,
+            )?)
+        } else {
+            None
+        };
         (
-            entry.metadata().kind,
+            kind,
             entry.identity(),
             entry.metadata().nonblocking,
-            repeated_connect_outcome(entry.state(), entry.metadata().kind, destination),
+            repeated,
+            local_connector,
         )
     };
     match repeated {
@@ -1017,7 +1112,7 @@ fn connect_socket(
         None => {}
     }
     if kind == InetKind::DnsUdp && destination.port() == 0 {
-        let mut registry = lock(&registry);
+        let mut registry = lock(registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
         if !matches!(
             entry.state(),
@@ -1046,7 +1141,7 @@ fn connect_socket(
         return listener.respond_value(notification.id, 0);
     }
     if destination == dns_relay.address {
-        let mut registry = lock(&registry);
+        let mut registry = lock(registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
         if !matches!(
             entry.state(),
@@ -1079,18 +1174,25 @@ fn connect_socket(
         && !openshell_core::google_cloud::is_metadata_destination(destination)
     {
         if kind == InetKind::Tcp {
+            let connector = local_connector.ok_or_else(|| {
+                io::Error::other("loopback TCP connect has no retained socket duplicate")
+            })?;
             return connect_local_tcp(
-                &registry,
-                &listener,
+                registry,
+                listener,
                 notification,
-                fd,
-                socket_identity,
-                destination,
-                &active_opens,
+                LocalConnectTarget {
+                    fd,
+                    socket_identity,
+                    destination,
+                },
+                connector,
+                active_opens,
+                connect_workers,
             );
         }
         // A UDP connect completes immediately.
-        let mut registry = lock(&registry);
+        let mut registry = lock(registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
         listener.validate_id(notification.id)?;
         connect_exact(entry.retained_preconnect()?.as_raw_fd(), destination)?;
@@ -1105,7 +1207,7 @@ fn connect_socket(
     let identity = identity_resolver.resolve(notification.tid);
     let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel(1);
     let (relay_tx, relay_rx) = oneshot::channel();
-    let slot = acquire_pending_open_slot(&active_opens)?;
+    let slot = acquire_pending_open_slot(active_opens)?;
     pending
         .try_send(PendingTcpOpen {
             destination,
@@ -1126,7 +1228,8 @@ fn connect_socket(
                 io::Error::new(io::ErrorKind::BrokenPipe, "network-open queue closed")
             }
         })?;
-    let worker_listener = Arc::clone(&listener);
+    let worker_listener = Arc::clone(listener);
+    let registry = Arc::clone(registry);
     std::thread::Builder::new()
         .name("openshell-network-open".to_string())
         .spawn(move || {
@@ -1192,16 +1295,16 @@ fn connect_local_tcp(
     registry: &Arc<Mutex<SocketRegistry>>,
     listener: &Arc<NotificationListener>,
     notification: Notification,
-    fd: RawFd,
-    socket_identity: SocketIdentity,
-    destination: SocketAddr,
+    target: LocalConnectTarget,
+    connector: OwnedFd,
     active_opens: &Arc<AtomicUsize>,
+    connect_workers: &Arc<ConnectWorkers>,
 ) -> io::Result<()> {
-    let connector = {
-        let registry = lock(registry);
-        let entry = registry.resolve(notification.tid, fd)?;
-        rustix::io::fcntl_dupfd_cloexec(entry.retained_preconnect()?, 3)?
-    };
+    let LocalConnectTarget {
+        fd,
+        socket_identity,
+        destination,
+    } = target;
     listener.validate_id(notification.id)?;
     // SAFETY: F_GETFL reads the flags of the live shared open file.
     let flags = unsafe { libc::fcntl(connector.as_raw_fd(), libc::F_GETFL) };
@@ -1229,42 +1332,288 @@ fn connect_local_tcp(
             Err(error) => Err(error),
         };
     }
+    // The admission bound precedes the handoff: at most OPEN_QUEUE_CAPACITY
+    // blocking connects and external opens wait at once. The pool holds the
+    // slot until its worker has parked or retired, and separately caps its
+    // live and parked threads.
     let slot = acquire_pending_open_slot(active_opens)?;
-    let registry = Arc::clone(registry);
-    let worker_listener = Arc::clone(listener);
-    std::thread::Builder::new()
-        .name("openshell-local-connect".to_string())
-        .spawn(move || {
-            let _slot = slot;
-            // The duplicate shares the workload's blocking open file; wait
-            // natively without changing its flags.
-            let result = with_sockaddr(destination, |pointer, length| {
-                // SAFETY: pointer/length describe a live sockaddr and the
-                // connector is a live duplicate of the workload's socket.
-                if unsafe { libc::connect(connector.as_raw_fd(), pointer, length) } == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            });
-            if result.is_ok() {
-                commit_local_connect(
-                    &registry,
-                    notification.tid,
-                    fd,
-                    socket_identity,
-                    destination,
-                );
+    connect_workers.submit(
+        LocalConnectJob {
+            connector,
+            registry: Arc::clone(registry),
+            listener: Arc::clone(listener),
+            notification,
+            target,
+        },
+        slot,
+    )
+}
+
+/// The workload socket a loopback connect acts on.
+#[derive(Clone, Copy)]
+struct LocalConnectTarget {
+    fd: RawFd,
+    socket_identity: SocketIdentity,
+    destination: SocketAddr,
+}
+
+/// One admitted blocking loopback connect, owned by the worker that waits.
+struct LocalConnectJob {
+    connector: OwnedFd,
+    registry: Arc<Mutex<SocketRegistry>>,
+    listener: Arc<NotificationListener>,
+    notification: Notification,
+    target: LocalConnectTarget,
+}
+
+impl PoolJob for LocalConnectJob {
+    /// Run the job, answering the blocked syscall even if the job panics, so
+    /// a faulty connect cannot take a reusable worker down with it.
+    fn run_contained(self) {
+        let listener = Arc::clone(&self.listener);
+        let id = self.notification.id;
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || self.run())).is_err() {
+            tracing::error!("sandbox local-connect worker job panicked");
+            let _ = listener.respond_errno(id, libc::EIO);
+        }
+    }
+}
+
+impl LocalConnectJob {
+    fn run(self) {
+        let LocalConnectTarget {
+            fd,
+            socket_identity,
+            destination,
+        } = self.target;
+        // The duplicate shares the workload's blocking open file; wait
+        // natively without changing its flags.
+        let result = with_sockaddr(destination, |pointer, length| {
+            // SAFETY: pointer/length describe a live sockaddr and the
+            // connector is a live duplicate of the workload's socket.
+            if unsafe { libc::connect(self.connector.as_raw_fd(), pointer, length) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
             }
-            let _ = match result {
-                Ok(()) => worker_listener.respond_value(notification.id, 0),
-                Err(error) => {
-                    worker_listener.respond_errno(notification.id, error_to_errno(&error))
-                }
-            };
+        });
+        if result.is_ok() {
+            commit_local_connect(
+                &self.registry,
+                self.notification.tid,
+                fd,
+                socket_identity,
+                destination,
+            );
+        }
+        let _ = match result {
+            Ok(()) => self.listener.respond_value(self.notification.id, 0),
+            Err(error) => self
+                .listener
+                .respond_errno(self.notification.id, error_to_errno(&error)),
+        };
+    }
+}
+
+/// Work a [`ConnectWorkers`] thread runs to completion.
+trait PoolJob: Send + 'static {
+    /// Run the job. Implementations contain their own panics and always
+    /// answer whatever waits on the job.
+    fn run_contained(self);
+}
+
+/// Thread bounds of a [`ConnectWorkers`] pool.
+#[derive(Clone, Copy, Debug)]
+struct ConnectWorkerLimits {
+    /// Live worker threads, busy or parked. A submission that would exceed
+    /// it is refused.
+    max_workers: usize,
+    /// Parked workers kept for reuse; a worker finishing beyond it exits.
+    max_idle: usize,
+    /// How long a parked worker waits for a job before exiting.
+    idle_timeout: Duration,
+}
+
+/// Reusable threads that wait in blocking loopback connects.
+///
+/// A blocking connect must wait off the dispatcher, and a slow or full
+/// listener can hold its waiter indefinitely, so a job is never queued behind
+/// a busy worker: it goes to a parked worker reserved for it, and otherwise
+/// starts a new thread. Submission never blocks.
+///
+/// Three bounds hold together:
+///
+/// - Each job arrives with an admission permit (a [`PendingOpenSlot`]). The
+///   worker releases it only after the pool state shows that worker parked or
+///   retired, so every busy worker and every queued job holds a permit and
+///   busy workers never outnumber admitted opens.
+/// - `max_workers` caps live threads, busy and parked. It is checked under
+///   the state lock on every spawn and does not rely on the permit quota.
+/// - `max_idle` caps parked threads. A worker that finishes while that many
+///   are parked exits at once; parked workers exit after `idle_timeout`.
+///
+/// With the external-open workers that share the permit quota, the broker
+/// therefore runs at most `OPEN_QUEUE_CAPACITY + max_idle` such threads.
+struct ConnectWorkers<Job = LocalConnectJob, Permit = PendingOpenSlot> {
+    state: Mutex<ConnectWorkerState<Job, Permit>>,
+    wake: Condvar,
+    limits: ConnectWorkerLimits,
+    /// Threads started over the pool's lifetime.
+    spawned: AtomicUsize,
+}
+
+struct ConnectWorkerState<Job, Permit> {
+    /// Jobs handed to parked workers. Each entry reserved one parked worker
+    /// when it was queued, so `queue.len()` never exceeds the parked count.
+    queue: VecDeque<(Job, Permit)>,
+    /// Parked workers not reserved for a queued job.
+    idle: usize,
+    /// Live worker threads: busy, parked, or between the two.
+    workers: usize,
+}
+
+/// Accounts for a worker thread lost to a panic that escaped its job. A
+/// worker that retires in order removes itself under the state lock, in the
+/// same step that stops counting it as parked, and disarms this guard.
+struct WorkerExit<'a, Job, Permit>(&'a ConnectWorkers<Job, Permit>);
+
+impl<Job, Permit> WorkerExit<'_, Job, Permit> {
+    /// Retire the calling worker in the critical section `state` guards.
+    fn retire(self, state: &mut ConnectWorkerState<Job, Permit>) {
+        state.workers -= 1;
+        std::mem::forget(self);
+    }
+}
+
+impl<Job, Permit> Drop for WorkerExit<'_, Job, Permit> {
+    fn drop(&mut self) {
+        lock(&self.0.state).workers -= 1;
+    }
+}
+
+impl<Job: PoolJob, Permit: Send + 'static> ConnectWorkers<Job, Permit> {
+    fn new(limits: ConnectWorkerLimits) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ConnectWorkerState {
+                queue: VecDeque::new(),
+                idle: 0,
+                workers: 0,
+            }),
+            wake: Condvar::new(),
+            limits,
+            spawned: AtomicUsize::new(0),
         })
-        .map_err(|error| io::Error::other(format!("start local-connect worker: {error}")))?;
-    Ok(())
+    }
+
+    /// Hand `job` to a parked worker, or start a worker for it, without
+    /// blocking.
+    ///
+    /// On failure the job and its permit are dropped, which releases the
+    /// admission slot and connector; the caller reports the error to the
+    /// blocked syscall. A pool at `max_workers` with no parked worker refuses
+    /// with `EAGAIN`, the result an exhausted admission quota gives.
+    fn submit(self: &Arc<Self>, job: Job, permit: Permit) -> io::Result<()> {
+        {
+            let mut state = lock(&self.state);
+            if state.idle > 0 {
+                // Reserve one parked worker for this job so a concurrent
+                // submission cannot count on the same one.
+                state.idle -= 1;
+                state.queue.push_back((job, permit));
+                drop(state);
+                self.wake.notify_one();
+                return Ok(());
+            }
+            if state.workers >= self.limits.max_workers {
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+            state.workers += 1;
+        }
+        let pool = Arc::clone(self);
+        let started = std::thread::Builder::new()
+            .name("openshell-local-connect".to_string())
+            .spawn(move || pool.work(job, permit));
+        match started {
+            Ok(_) => {
+                self.spawned.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                lock(&self.state).workers -= 1;
+                Err(io::Error::other(format!(
+                    "start local-connect worker: {error}"
+                )))
+            }
+        }
+    }
+
+    fn work(self: Arc<Self>, first: Job, permit: Permit) {
+        // Declared before the exit guard, so on every way out of this
+        // function, an escaped job panic included, the live-worker count
+        // drops before the permit is released. A submission admitted by the
+        // freed permit therefore never sees this thread still counted, and
+        // the live-worker cap cannot refuse it spuriously.
+        let mut held = Some(permit);
+        let exit = WorkerExit(&*self);
+        let mut job = first;
+        loop {
+            job.run_contained();
+            let mut state = lock(&self.state);
+            if let Some((next, next_permit)) = state.queue.pop_front() {
+                // Take the queued job directly. The parked worker reserved
+                // for it stays parked and becomes available again.
+                state.idle += 1;
+                drop(state);
+                job = next;
+                // Releases the finished job's permit.
+                drop(held.replace(next_permit));
+                continue;
+            }
+            if state.idle >= self.limits.max_idle {
+                // Enough workers are parked. The live count drops here,
+                // under the lock; the permit is released on return.
+                exit.retire(&mut state);
+                return;
+            }
+            state.idle += 1;
+            // This worker is now recorded as parked; release the finished
+            // job's permit.
+            drop(held.take());
+            let deadline = Instant::now() + self.limits.idle_timeout;
+            job = loop {
+                // A queued job always has a reserved parked worker, so take
+                // it even at the deadline. Its reservation already removed
+                // one worker from `idle`.
+                if let Some((next, next_permit)) = state.queue.pop_front() {
+                    drop(held.replace(next_permit));
+                    break next;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    // The queue is empty, so this parked worker is one of
+                    // the unreserved ones `idle` counts.
+                    state.idle -= 1;
+                    exit.retire(&mut state);
+                    return;
+                }
+                state = self
+                    .wake
+                    .wait_timeout(state, deadline.saturating_duration_since(now))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            };
+        }
+    }
+
+    #[cfg(test)]
+    fn spawned(&self) -> usize {
+        self.spawned.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn workers(&self) -> usize {
+        lock(&self.state).workers
+    }
 }
 
 /// Record a completed or in-progress loopback TCP connect, unless the
@@ -1406,7 +1755,9 @@ fn bind_socket(
     notification: Notification,
 ) -> io::Result<()> {
     let fd = raw_fd(notification.args[0])?;
-    if !socket_address_is_inet(notification.tid, notification.args[1], notification.args[2])? {
+    let (address_family, copied_local) =
+        read_socket_family_and_addr(notification.tid, notification.args[1], notification.args[2])?;
+    if !matches!(address_family, libc::AF_INET | libc::AF_INET6) {
         if lock(registry)
             .resolve_for_native_fallback(notification.tid, fd)?
             .is_some()
@@ -1415,7 +1766,7 @@ fn bind_socket(
         }
         return listener.respond_continue(notification.id);
     }
-    let local = read_socket_addr(notification.tid, notification.args[1], notification.args[2])?;
+    let local = copied_local?;
     if !local.ip().is_loopback() && !local.ip().is_unspecified() {
         return Err(io::Error::from_raw_os_error(libc::EACCES));
     }
@@ -1797,11 +2148,43 @@ fn read_socket_addr(tid: u32, address: u64, length: u64) -> io::Result<SocketAdd
     }
 }
 
-fn socket_address_is_inet(tid: u32, address: u64, length: u64) -> io::Result<bool> {
-    Ok(matches!(
-        read_socket_family(tid, address, length)?,
-        libc::AF_INET | libc::AF_INET6
-    ))
+/// Copy a workload socket address once and return its family together with
+/// the decoded INET address.
+///
+/// `connect` and `bind` first need the family, to leave non-INET addresses to
+/// the kernel, and then the address. Reading both from one copy halves the
+/// task-memory reads and decides both from the same bytes. The outer result
+/// is exactly [`read_socket_family`]'s and the inner one exactly
+/// [`read_socket_addr`]'s: a length the address read refuses, or a copy of the
+/// full length that fails (for example a tail in an unmapped page), falls
+/// back to those two reads so every error is the one they report.
+fn read_socket_family_and_addr(
+    tid: u32,
+    address: u64,
+    length: u64,
+) -> io::Result<(i32, io::Result<SocketAddr>)> {
+    let Ok(byte_length) = usize::try_from(length) else {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    };
+    if address == 0 || byte_length < size_of::<libc::sa_family_t>() {
+        return Err(io::Error::from_raw_os_error(libc::EFAULT));
+    }
+    if byte_length <= size_of::<libc::sockaddr_storage>() {
+        let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+        // SAFETY: the zeroed storage is valid for byte access and
+        // `byte_length` was bounded by its size.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), byte_length)
+        };
+        if task_memory::read_exact(tid, address, bytes).is_ok() {
+            // SAFETY: every byte of the zeroed storage is initialized.
+            let storage = unsafe { storage.assume_init() };
+            let family = i32::from(storage.ss_family);
+            return Ok((family, decode_sockaddr(storage, byte_length)));
+        }
+    }
+    let family = read_socket_family(tid, address, length)?;
+    Ok((family, read_socket_addr(tid, address, length)))
 }
 
 fn read_socket_family(tid: u32, address: u64, length: u64) -> io::Result<i32> {
@@ -2135,6 +2518,410 @@ mod tests {
         let detached = launcher.execute(move || std::fs::read(path)).unwrap();
         assert_eq!(detached.unwrap_err().raw_os_error(), Some(libc::ENOENT));
     }
+
+    /// `openat2` with the given `open_how` fields.
+    fn raw_openat2(
+        path: &std::ffi::CStr,
+        flags: i32,
+        mode: u64,
+        resolve: u64,
+        size: usize,
+    ) -> io::Result<std::fs::File> {
+        let how = [u64::try_from(flags).expect("open flags"), mode, resolve];
+        // SAFETY: path is NUL-terminated and how spans at least size bytes.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                how.as_ptr(),
+                size,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful openat2 returns one newly owned descriptor.
+        Ok(unsafe { std::fs::File::from_raw_fd(i32::try_from(fd).expect("open fd fits")) })
+    }
+
+    fn raw_openat(path: *const libc::c_char, flags: i32) -> io::Result<std::fs::File> {
+        // SAFETY: the caller passes a NUL-terminated path.
+        let fd = unsafe { libc::openat(libc::AT_FDCWD, path, flags, 0o600) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful openat returns one newly owned descriptor.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    fn errno_of<T>(result: io::Result<T>) -> Option<i32> {
+        result.err().and_then(|error| error.raw_os_error())
+    }
+
+    /// A copy of `path` that ends at the last byte before an unmapped page,
+    /// so reading past its terminator faults.
+    ///
+    /// The following page is unmapped rather than `PROT_NONE`: a forced read
+    /// through `/proc/<tid>/mem` succeeds on an inaccessible private mapping,
+    /// and only fails where nothing is mapped.
+    struct PathBeforeUnmappedPage {
+        /// The one page that stays mapped and holds the path.
+        mapping: *mut libc::c_void,
+        page_size: usize,
+        path: *const libc::c_char,
+    }
+
+    impl PathBeforeUnmappedPage {
+        fn new(path: &std::ffi::CStr) -> Self {
+            let bytes = path.to_bytes_with_nul();
+            // The base page size is a property of the running kernel (4K,
+            // 16K, or 64K on ARM64), not a constant.
+            // SAFETY: sysconf has no preconditions.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            let page_size = usize::try_from(page_size).expect("base page size");
+            assert!(page_size.is_power_of_two());
+            assert!(bytes.len() <= page_size, "path must fit in one page");
+            // SAFETY: a fresh private mapping of two base pages, which mmap
+            // returns page aligned. The second page is unmapped again and the
+            // copy stays inside the first.
+            unsafe {
+                let mapping = libc::mmap(
+                    std::ptr::null_mut(),
+                    2 * page_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                assert_ne!(mapping, libc::MAP_FAILED);
+                // Nothing keeps the hole reserved: an unrelated mapping made
+                // later by this process may land in it, which would only make
+                // the read past the terminator succeed instead of fault.
+                let hole = mapping.cast::<u8>().add(page_size);
+                assert_eq!(libc::munmap(hole.cast(), page_size), 0);
+                let start = hole.sub(bytes.len());
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), start, bytes.len());
+                Self {
+                    mapping,
+                    page_size,
+                    path: start.cast(),
+                }
+            }
+        }
+    }
+
+    impl Drop for PathBeforeUnmappedPage {
+        fn drop(&mut self) {
+            // SAFETY: only the page still owned from `new`; the hole after it
+            // was released there and may belong to another mapping by now.
+            unsafe { libc::munmap(self.mapping, self.page_size) };
+        }
+    }
+
+    #[test]
+    fn injected_provider_descriptors_and_open_classification_keep_syscall_results() {
+        use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start broker");
+        let provider = "/run/openshell/providers/acme/client.toml";
+        broker
+            .provider_files()
+            .replace(HashMap::from([(provider.to_string(), "0123456789".into())]))
+            .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let ordinary = scratch.path().join("ordinary");
+        std::fs::write(&ordinary, "ordinary").unwrap();
+        let created = scratch.path().join("created");
+
+        let outcome = launcher
+            .execute(move || -> Result<(), String> {
+                let check = |condition: bool, what: &str| {
+                    if condition {
+                        Ok(())
+                    } else {
+                        Err(format!("{what}: {}", io::Error::last_os_error()))
+                    }
+                };
+                let provider_path = std::ffi::CString::new(provider).unwrap();
+                let missing = c"/run/openshell/providers/acme/missing";
+                let read_only = libc::O_RDONLY | libc::O_CLOEXEC;
+
+                // Two injected descriptors: one file, two file offsets.
+                let mut first = std::fs::File::open(provider).map_err(|e| e.to_string())?;
+                let mut second = raw_openat2(&provider_path, read_only, 0, 0, 24)
+                    .map_err(|e| format!("openat2 provider file: {e}"))?;
+                let mut head = [0_u8; 4];
+                first.read_exact(&mut head).map_err(|e| e.to_string())?;
+                let mut whole = String::new();
+                second
+                    .read_to_string(&mut whole)
+                    .map_err(|e| e.to_string())?;
+                let mut rest = String::new();
+                first.read_to_string(&mut rest).map_err(|e| e.to_string())?;
+                check(
+                    &head == b"0123" && whole == "0123456789" && rest == "456789",
+                    "injected descriptors share a file offset",
+                )?;
+                let identity = |file: &std::fs::File| {
+                    let metadata = file.metadata().expect("injected descriptor metadata");
+                    (metadata.dev(), metadata.ino(), metadata.mode() & 0o7777)
+                };
+                check(
+                    identity(&first) == identity(&second) && identity(&first).2 == 0o600,
+                    "opens of one revision are one private file",
+                )?;
+                check(
+                    first.write_at(b"changed", 0).is_err() && first.set_len(0).is_err(),
+                    "injected descriptor is writable",
+                )?;
+
+                // Close-on-exec follows the request, for both entry points.
+                let close_on_exec = |file: &std::fs::File| {
+                    // SAFETY: F_GETFD on a live descriptor.
+                    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+                    flags & libc::FD_CLOEXEC != 0
+                };
+                let inherited = raw_openat(provider_path.as_ptr(), libc::O_RDONLY)
+                    .map_err(|e| format!("openat provider file: {e}"))?;
+                check(
+                    close_on_exec(&second) && !close_on_exec(&inherited),
+                    "close-on-exec does not follow the open flags",
+                )?;
+                let inherited = raw_openat2(&provider_path, libc::O_RDONLY, 0, 0, 24)
+                    .map_err(|e| format!("openat2 provider file: {e}"))?;
+                check(!close_on_exec(&inherited), "openat2 forced close-on-exec")?;
+
+                // Managed flags keep their errno through openat and openat2.
+                for (flags, errno) in [
+                    (libc::O_WRONLY, libc::EACCES),
+                    (libc::O_RDWR, libc::EACCES),
+                    (libc::O_RDONLY | libc::O_CREAT, libc::EACCES),
+                    (libc::O_RDONLY | libc::O_TRUNC, libc::EACCES),
+                    (libc::O_RDONLY | libc::O_APPEND, libc::EACCES),
+                    // O_TMPFILE includes the O_DIRECTORY bit, so a directory
+                    // open is refused as a creating one.
+                    (libc::O_RDONLY | libc::O_DIRECTORY, libc::EACCES),
+                    (libc::O_RDONLY | libc::O_DIRECT, libc::EINVAL),
+                    (libc::O_RDONLY | libc::O_PATH, libc::EINVAL),
+                ] {
+                    check(
+                        errno_of(raw_openat(provider_path.as_ptr(), flags)) == Some(errno),
+                        &format!("openat provider file with flags {flags:#o}"),
+                    )?;
+                    check(
+                        errno_of(raw_openat2(&provider_path, flags, 0, 0, 24)) == Some(errno),
+                        &format!("openat2 provider file with flags {flags:#o}"),
+                    )?;
+                }
+                // An openat2 request the broker cannot serve exactly.
+                for (mode, resolve, size) in [(0, 0x08, 24), (0o600, 0, 24), (0, 0, 16)] {
+                    check(
+                        errno_of(raw_openat2(&provider_path, read_only, mode, resolve, size))
+                            == Some(libc::EINVAL),
+                        "openat2 provider file with unsupported open_how",
+                    )?;
+                }
+                // A file that is not published is absent whatever the flags.
+                check(
+                    errno_of(raw_openat(missing.as_ptr(), libc::O_WRONLY)) == Some(libc::ENOENT)
+                        && errno_of(raw_openat2(missing, read_only, 0, 0x08, 24))
+                            == Some(libc::ENOENT),
+                    "unpublished provider file",
+                )?;
+
+                // Ordinary opens are the kernel's, with every open_how field.
+                let ordinary = std::ffi::CString::new(ordinary.to_str().unwrap()).unwrap();
+                let created = std::ffi::CString::new(created.to_str().unwrap()).unwrap();
+                // RESOLVE_NO_MAGICLINKS: refused for a provider file above.
+                let mut content = String::new();
+                raw_openat2(&ordinary, read_only, 0, 0x02, 24)
+                    .and_then(|mut file| file.read_to_string(&mut content))
+                    .map_err(|e| format!("openat2 ordinary file: {e}"))?;
+                check(content == "ordinary", "ordinary file content")?;
+                raw_openat2(
+                    &created,
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                    0,
+                    24,
+                )
+                .and_then(|mut file| file.write_all(b"created"))
+                .map_err(|e| format!("openat2 creating an ordinary file: {e}"))?;
+                check(
+                    errno_of(raw_openat2(&ordinary, read_only, 0, 0, 16)) == Some(libc::EINVAL)
+                        && errno_of(raw_openat(std::ptr::null(), libc::O_RDONLY))
+                            == Some(libc::EFAULT),
+                    "the kernel's own errors for an ordinary open",
+                )?;
+                // A short path that ends right before an unmapped page.
+                let short = PathBeforeUnmappedPage::new(c"/etc/passwd");
+                raw_openat(short.path, libc::O_RDONLY)
+                    .map_err(|e| format!("ordinary path before an unmapped page: {e}"))?;
+                // Shorter than the six classification bytes: that copy
+                // fails, and the kernel still resolves the path.
+                let shorter = PathBeforeUnmappedPage::new(c"/etc");
+                raw_openat(shorter.path, libc::O_RDONLY)
+                    .map_err(|e| format!("five-byte path before an unmapped page: {e}"))?;
+
+                // The caller's thread name file is served by the broker, not
+                // continued: the kernel would ignore O_EXCL without O_CREAT,
+                // the broker reports EEXIST.
+                let comm = c"/proc/thread-self/comm";
+                let comm_at_page_end = PathBeforeUnmappedPage::new(comm);
+                let exclusive = libc::O_WRONLY | libc::O_EXCL;
+                check(
+                    errno_of(raw_openat(comm.as_ptr(), exclusive)) == Some(libc::EEXIST)
+                        && errno_of(raw_openat2(comm, exclusive, 0, 0, 24)) == Some(libc::EEXIST)
+                        && errno_of(raw_openat(comm_at_page_end.path, exclusive))
+                            == Some(libc::EEXIST),
+                    "thread name open was not mediated",
+                )?;
+                raw_openat2(comm, libc::O_WRONLY | libc::O_CLOEXEC, 0, 0, 24)
+                    .and_then(|mut file| file.write_all(b"renamed"))
+                    .map_err(|e| format!("rename thread through openat2: {e}"))?;
+                let name = std::fs::read_to_string("/proc/thread-self/comm")
+                    .map_err(|e| format!("read thread name: {e}"))?;
+                check(name == "renamed\n", "thread was not renamed")?;
+                raw_openat(comm_at_page_end.path, libc::O_WRONLY | libc::O_CLOEXEC)
+                    .and_then(|mut file| file.write_all(b"again"))
+                    .map_err(|e| format!("rename thread through openat: {e}"))?;
+                let name = std::fs::read_to_string("/proc/thread-self/comm")
+                    .map_err(|e| format!("read thread name: {e}"))?;
+                check(name == "again\n", "thread was not renamed again")?;
+                // Other /proc paths, and a directory open, stay the kernel's.
+                std::fs::read_to_string("/proc/self/status")
+                    .map_err(|e| format!("read /proc/self/status: {e}"))?;
+                raw_openat(c"/proc/self".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
+                    .map_err(|e| format!("open /proc/self: {e}"))?;
+                Ok(())
+            })
+            .unwrap();
+        outcome.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(scratch.path().join("created")).unwrap(),
+            "created"
+        );
+        broker.confirm_healthy().expect("broker stays healthy");
+    }
+
+    #[test]
+    fn native_provider_files_are_real_files_read_without_notification() {
+        use crate::linux::seccomp_notify::OpenMediation;
+        use crate::provider_files::ProviderFiles;
+        use crate::provider_store::NativeStore;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = NativeStore::open_unmounted_for_test(directory.path()).unwrap();
+        let provider_files = ProviderFiles::native_for_test(store);
+        assert_eq!(provider_files.open_mediation(), OpenMediation::WriteCapable);
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start_with(provider_files.open_mediation())
+                .expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test_with_provider_files(listener, provider_files)
+            .expect("start broker");
+        // The workload reads through the store's public directory, which a
+        // driver mounts read-only at /run/openshell.
+        let path = "/run/openshell/providers/acme/client.toml".to_string();
+        let exposed = directory.path().join("public/providers/acme/client.toml");
+        let store_device = std::fs::metadata(directory.path()).unwrap().dev();
+
+        broker
+            .provider_files()
+            .replace(HashMap::from([(path.clone(), "version = 1\n".into())]))
+            .unwrap();
+        let (first, device) = launcher
+            .execute({
+                let exposed = exposed.clone();
+                move || -> io::Result<(String, u64)> {
+                    let mut file = std::fs::File::open(exposed)?;
+                    let device = file.metadata()?.dev();
+                    let mut content = String::new();
+                    io::Read::read_to_string(&mut file, &mut content)?;
+                    Ok((content, device))
+                }
+            })
+            .unwrap()
+            .expect("native open");
+        assert_eq!(first, "version = 1\n");
+        assert_eq!(device, store_device, "a real file, not an injected memfd");
+        let mut old_descriptor = launcher
+            .execute({
+                let exposed = exposed.clone();
+                move || std::fs::File::open(exposed)
+            })
+            .unwrap()
+            .expect("open old version");
+
+        // The provider path itself is no longer served by injection: under
+        // native delivery it is whatever the mount shows, and this test has
+        // no mount there.
+        let unserved = launcher
+            .execute({
+                let path = path.clone();
+                move || std::fs::read(path)
+            })
+            .unwrap();
+        assert!(unserved.is_err(), "native delivery must not inject a memfd");
+
+        broker
+            .provider_files()
+            .replace(HashMap::from([(path, "version = 2\n".into())]))
+            .unwrap();
+        let mut old_content = String::new();
+        io::Read::read_to_string(&mut old_descriptor, &mut old_content).unwrap();
+        assert_eq!(old_content, "version = 1\n");
+        let second = launcher
+            .execute({
+                let exposed = exposed.clone();
+                move || std::fs::read_to_string(exposed)
+            })
+            .unwrap()
+            .expect("second open");
+        assert_eq!(second, "version = 2\n");
+
+        // Mediated opens still reach the broker and are continued: a
+        // write-capable open and openat2 both work on an ordinary file.
+        let scratch = directory.path().join("scratch");
+        let written = launcher
+            .execute({
+                move || -> io::Result<String> {
+                    std::fs::write(&scratch, "written")?;
+                    let path = std::ffi::CString::new(scratch.to_str().unwrap()).unwrap();
+                    let how = [libc::O_CLOEXEC as u64, 0, 0];
+                    let fd = unsafe {
+                        libc::syscall(
+                            libc::SYS_openat2,
+                            libc::AT_FDCWD,
+                            path.as_ptr(),
+                            how.as_ptr(),
+                            24_usize,
+                        )
+                    };
+                    if fd < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let mut file = unsafe {
+                        std::fs::File::from_raw_fd(i32::try_from(fd).expect("open fd fits"))
+                    };
+                    let mut content = String::new();
+                    io::Read::read_to_string(&mut file, &mut content)?;
+                    Ok(content)
+                }
+            })
+            .unwrap()
+            .expect("mediated opens continue");
+        assert_eq!(written, "written");
+
+        broker.provider_files().replace(HashMap::new()).unwrap();
+        let detached = launcher.execute(move || std::fs::read(exposed)).unwrap();
+        assert_eq!(detached.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+        broker.confirm_healthy().expect("broker stays healthy");
+    }
+
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -2173,7 +2960,7 @@ mod tests {
         assert_eq!(registry.retained_preconnect_count(), 1);
 
         let registry = Mutex::new(registry);
-        let mut observed = std::collections::VecDeque::from([64, 63]);
+        let mut observed = VecDeque::from([64, 63]);
         prepare_registry_for_socket_with_count(&registry, 128, || {
             observed
                 .pop_front()
@@ -2209,7 +2996,7 @@ mod tests {
         registry.commit(tentative).unwrap();
 
         let registry = Mutex::new(registry);
-        let mut observed = std::collections::VecDeque::from([120, 112]);
+        let mut observed = VecDeque::from([120, 112]);
         ensure_descriptor_headroom_with_count(&registry, 128, 16, || {
             observed
                 .pop_front()
@@ -3209,6 +3996,862 @@ mod tests {
             "mediated socket creation waited {blocking_wait:?} behind a slow connect"
         );
         assert_eq!(nonblocking_result, Some(libc::EINPROGRESS));
+    }
+
+    /// A pool job that reports its worker thread and optionally waits.
+    struct TestJob {
+        release: Option<std::sync::mpsc::Receiver<()>>,
+        done: std::sync::mpsc::Sender<std::thread::ThreadId>,
+        panic: bool,
+    }
+
+    impl PoolJob for TestJob {
+        fn run_contained(self) {
+            if let Some(release) = &self.release {
+                let _ = release.recv();
+            }
+            let _ = self.done.send(std::thread::current().id());
+            assert!(!self.panic, "test job escapes its containment");
+        }
+    }
+
+    /// An admission permit that counts itself, like `PendingOpenSlot`.
+    struct TestPermit(Arc<AtomicUsize>);
+
+    impl TestPermit {
+        fn acquire(held: &Arc<AtomicUsize>) -> Self {
+            held.fetch_add(1, Ordering::AcqRel);
+            Self(Arc::clone(held))
+        }
+
+        /// Admit like `acquire_pending_open_slot`: refuse at `quota`.
+        fn try_acquire(held: &Arc<AtomicUsize>, quota: usize) -> Option<Self> {
+            held.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < quota).then_some(current + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(held)))
+        }
+    }
+
+    impl Drop for TestPermit {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    type TestPool = Arc<ConnectWorkers<TestJob, TestPermit>>;
+
+    fn test_pool(max_workers: usize, max_idle: usize, idle_timeout: Duration) -> TestPool {
+        ConnectWorkers::new(ConnectWorkerLimits {
+            max_workers,
+            max_idle,
+            idle_timeout,
+        })
+    }
+
+    fn quick_job(done: &std::sync::mpsc::Sender<std::thread::ThreadId>) -> TestJob {
+        TestJob {
+            release: None,
+            done: done.clone(),
+            panic: false,
+        }
+    }
+
+    fn blocked_job(
+        done: &std::sync::mpsc::Sender<std::thread::ThreadId>,
+    ) -> (TestJob, std::sync::mpsc::Sender<()>) {
+        let (release, wait) = std::sync::mpsc::channel();
+        (
+            TestJob {
+                release: Some(wait),
+                done: done.clone(),
+                panic: false,
+            },
+            release,
+        )
+    }
+
+    fn wait_for(mut condition: impl FnMut() -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// The pool's structural invariants, checked under its lock.
+    fn assert_pool_invariants(pool: &TestPool) {
+        let state = lock(&pool.state);
+        assert!(state.workers <= pool.limits.max_workers, "live worker cap");
+        assert!(state.idle <= pool.limits.max_idle, "parked worker cap");
+        assert!(
+            state.idle + state.queue.len() <= state.workers,
+            "parked and reserved workers are live workers"
+        );
+    }
+
+    #[test]
+    fn connect_workers_reuse_a_parked_thread() {
+        let held = Arc::new(AtomicUsize::new(0));
+        let pool = test_pool(8, 4, Duration::from_secs(30));
+        let (done, finished) = std::sync::mpsc::channel();
+        let mut threads = std::collections::HashSet::new();
+        for _ in 0..16 {
+            pool.submit(quick_job(&done), TestPermit::acquire(&held))
+                .unwrap();
+            threads.insert(finished.recv_timeout(Duration::from_secs(10)).unwrap());
+            // The worker parks before the next submission reserves it.
+            wait_for(|| lock(&pool.state).idle == 1, "worker to park");
+            // A parked worker holds no admission permit.
+            wait_for(|| held.load(Ordering::Acquire) == 0, "permit release");
+        }
+        assert_eq!(threads.len(), 1, "sequential jobs share one worker");
+        assert_eq!(pool.spawned(), 1);
+        assert_eq!(pool.workers(), 1);
+    }
+
+    #[test]
+    fn connect_workers_never_queue_behind_a_busy_worker() {
+        // A blocked job models a connect to a full listener. Later jobs must
+        // start at once on other threads, and the pool must not leak the
+        // reservation when the blocked ones finish.
+        let held = Arc::new(AtomicUsize::new(0));
+        let pool = test_pool(8, 4, Duration::from_secs(30));
+        let (done, finished) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        for _ in 0..3 {
+            let (job, release) = blocked_job(&done);
+            releases.push(release);
+            pool.submit(job, TestPermit::acquire(&held)).unwrap();
+        }
+        assert_eq!(pool.workers(), 3);
+        assert_eq!(lock(&pool.state).idle, 0);
+        let started = Instant::now();
+        pool.submit(quick_job(&done), TestPermit::acquire(&held))
+            .unwrap();
+        let quick = finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(pool.spawned(), 4);
+        let mut blocked = std::collections::HashSet::new();
+        for release in releases {
+            release.send(()).unwrap();
+            blocked.insert(finished.recv_timeout(Duration::from_secs(10)).unwrap());
+        }
+        assert_eq!(blocked.len(), 3);
+        assert!(!blocked.contains(&quick));
+        wait_for(|| lock(&pool.state).idle == 4, "all workers to park");
+        // Parked workers absorb a burst without new threads, and every
+        // queued job is taken.
+        for _ in 0..4 {
+            pool.submit(quick_job(&done), TestPermit::acquire(&held))
+                .unwrap();
+        }
+        for _ in 0..4 {
+            finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        assert_eq!(pool.spawned(), 4);
+        wait_for(|| held.load(Ordering::Acquire) == 0, "permit release");
+        assert!(lock(&pool.state).queue.is_empty());
+        assert_pool_invariants(&pool);
+    }
+
+    #[test]
+    fn connect_workers_exit_after_the_idle_timeout() {
+        let held = Arc::new(AtomicUsize::new(0));
+        let pool = test_pool(8, 4, Duration::from_millis(50));
+        let (done, finished) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            pool.submit(quick_job(&done), TestPermit::acquire(&held))
+                .unwrap();
+        }
+        for _ in 0..2 {
+            finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        wait_for(|| pool.workers() == 0, "idle workers to exit");
+        assert_eq!(lock(&pool.state).idle, 0);
+        assert_eq!(held.load(Ordering::Acquire), 0);
+        // The pool starts a fresh worker afterwards.
+        let before = pool.spawned();
+        pool.submit(quick_job(&done), TestPermit::acquire(&held))
+            .unwrap();
+        finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(pool.spawned(), before + 1);
+    }
+
+    #[test]
+    fn connect_workers_account_for_a_worker_lost_to_a_panic() {
+        let held = Arc::new(AtomicUsize::new(0));
+        let pool = test_pool(8, 4, Duration::from_secs(30));
+        let (done, finished) = std::sync::mpsc::channel();
+        pool.submit(
+            TestJob {
+                release: None,
+                done: done.clone(),
+                panic: true,
+            },
+            TestPermit::acquire(&held),
+        )
+        .unwrap();
+        finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The lost worker gives back both its live registration and the
+        // admission permit of the job that took it down.
+        wait_for(|| pool.workers() == 0, "panicked worker to be accounted");
+        wait_for(|| held.load(Ordering::Acquire) == 0, "permit release");
+        assert_eq!(lock(&pool.state).idle, 0);
+        pool.submit(quick_job(&done), TestPermit::acquire(&held))
+            .unwrap();
+        finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(pool.spawned(), 2);
+    }
+
+    #[test]
+    fn connect_workers_refuse_beyond_the_live_worker_cap() {
+        // The live-thread cap is the pool's own: it holds even when the
+        // caller's admission quota would allow more.
+        let held = Arc::new(AtomicUsize::new(0));
+        let pool = test_pool(3, 2, Duration::from_secs(30));
+        let (done, finished) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        for _ in 0..3 {
+            let (job, release) = blocked_job(&done);
+            releases.push(release);
+            pool.submit(job, TestPermit::acquire(&held)).unwrap();
+        }
+        assert_eq!(pool.workers(), 3);
+        let started = Instant::now();
+        let error = pool
+            .submit(quick_job(&done), TestPermit::acquire(&held))
+            .expect_err("a fourth live worker must be refused");
+        assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a refused submission must not wait for a worker"
+        );
+        // The refused job gave its permit back and started nothing.
+        assert_eq!(held.load(Ordering::Acquire), 3);
+        assert_eq!(pool.spawned(), 3);
+        assert_eq!(pool.workers(), 3);
+        assert!(lock(&pool.state).queue.is_empty());
+        for release in releases {
+            release.send(()).unwrap();
+            finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        // Two park, the third retires at once rather than after the timeout.
+        wait_for(|| pool.workers() == 2, "surplus worker to retire");
+        wait_for(|| held.load(Ordering::Acquire) == 0, "permit release");
+        assert_eq!(lock(&pool.state).idle, 2);
+        // Capacity is available again.
+        pool.submit(quick_job(&done), TestPermit::acquire(&held))
+            .unwrap();
+        finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(pool.spawned(), 3);
+    }
+
+    #[test]
+    fn connect_workers_retire_beyond_the_idle_cap() {
+        // A burst of blocking connects must not leave a parked thread each.
+        let held = Arc::new(AtomicUsize::new(0));
+        let pool = test_pool(64, 2, Duration::from_secs(30));
+        let (done, finished) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        for _ in 0..32 {
+            let (job, release) = blocked_job(&done);
+            releases.push(release);
+            pool.submit(job, TestPermit::acquire(&held)).unwrap();
+        }
+        assert_eq!(pool.workers(), 32);
+        assert_eq!(held.load(Ordering::Acquire), 32);
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for _ in 0..32 {
+            finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        wait_for(|| pool.workers() == 2, "surplus workers to retire");
+        wait_for(|| held.load(Ordering::Acquire) == 0, "permit release");
+        assert_eq!(lock(&pool.state).idle, 2);
+        assert_pool_invariants(&pool);
+    }
+
+    #[test]
+    fn connect_worker_permit_outlives_its_busy_worker() {
+        // The permit is released only once the pool state records the worker
+        // parked or retired. Sampled under the pool lock, busy workers and
+        // queued jobs therefore never outnumber held permits, so a
+        // submission admitted by a freed permit cannot find the freeing
+        // thread still counted as busy. With the admission quota equal to
+        // the live-worker cap, as in the broker, the cap must therefore
+        // never refuse a job the quota admitted.
+        const QUOTA: usize = 6;
+        let held = Arc::new(AtomicUsize::new(0));
+        let pool = test_pool(QUOTA, 2, Duration::from_millis(5));
+        let (done, finished) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let (pool, held, stop) = (Arc::clone(&pool), Arc::clone(&held), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut samples = 0_usize;
+                while !stop.load(Ordering::Acquire) {
+                    {
+                        let state = lock(&pool.state);
+                        // Read the permits while holding the lock: a worker
+                        // changes its state under the lock before releasing.
+                        let permits = held.load(Ordering::Acquire);
+                        let busy = state.workers - state.idle - state.queue.len();
+                        assert!(
+                            busy + state.queue.len() <= permits,
+                            "{busy} busy and {} queued exceed {permits} permits",
+                            state.queue.len()
+                        );
+                        assert!(state.workers <= pool.limits.max_workers);
+                        assert!(state.idle <= pool.limits.max_idle);
+                    }
+                    samples += 1;
+                    std::thread::yield_now();
+                }
+                samples
+            })
+        };
+        let submitters = (0..8)
+            .map(|_| {
+                let (pool, held, done) = (Arc::clone(&pool), Arc::clone(&held), done.clone());
+                std::thread::spawn(move || {
+                    for round in 0..400 {
+                        // Wait for admission, as a blocked workload retries.
+                        let permit = loop {
+                            if let Some(permit) = TestPermit::try_acquire(&held, QUOTA) {
+                                break permit;
+                            }
+                            std::thread::yield_now();
+                        };
+                        pool.submit(quick_job(&done), permit)
+                            .expect("the worker cap refused an admitted job");
+                        if round % 16 == 0 {
+                            // Let parked workers reach their idle timeout so
+                            // retirement races with submission too.
+                            std::thread::sleep(Duration::from_millis(6));
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for submitter in submitters {
+            submitter.join().unwrap();
+        }
+        // Every job ran: none was stranded in the queue by a worker that
+        // retired or timed out.
+        for _ in 0..3_200 {
+            finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        wait_for(|| held.load(Ordering::Acquire) == 0, "permit release");
+        wait_for(|| pool.workers() == 0, "workers to time out");
+        stop.store(true, Ordering::Release);
+        assert!(sampler.join().expect("invariant sampler") > 0);
+        let state = lock(&pool.state);
+        assert_eq!((state.idle, state.queue.len()), (0, 0));
+    }
+
+    #[test]
+    fn connect_workers_do_not_starve_queued_jobs_at_the_idle_cap() {
+        // With one parked slot, jobs queued to the parked worker while
+        // others finish and retire must still all run, and promptly.
+        let held = Arc::new(AtomicUsize::new(0));
+        let pool = test_pool(16, 1, Duration::from_secs(30));
+        let (done, finished) = std::sync::mpsc::channel();
+        for _ in 0..200 {
+            let mut releases = Vec::new();
+            for _ in 0..3 {
+                let (job, release) = blocked_job(&done);
+                releases.push(release);
+                pool.submit(job, TestPermit::acquire(&held)).unwrap();
+            }
+            // Finish the blocked jobs while submitting quick ones, so
+            // reservation, direct takeover, and retirement interleave.
+            for release in releases {
+                release.send(()).unwrap();
+                pool.submit(quick_job(&done), TestPermit::acquire(&held))
+                    .unwrap();
+            }
+            for _ in 0..6 {
+                finished
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("a queued job was starved");
+            }
+            assert_pool_invariants(&pool);
+        }
+        wait_for(|| held.load(Ordering::Acquire) == 0, "permit release");
+        wait_for(|| pool.workers() == 1, "surplus workers to retire");
+        let state = lock(&pool.state);
+        assert_eq!((state.idle, state.queue.len()), (1, 0));
+    }
+
+    /// Accept and hold every connection so blocking connects complete.
+    fn accepting_service() -> SocketAddr {
+        let service = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = service.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Leak each accepted connection so it stays open for the test.
+            for stream in service.incoming() {
+                let Ok(stream) = stream else { break };
+                std::mem::forget(stream);
+            }
+        });
+        address
+    }
+
+    #[test]
+    fn blocking_loopback_connects_reuse_one_worker_and_release_their_slots() {
+        let address = accepting_service();
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let peers = launcher
+            .execute(move || -> io::Result<Vec<SocketAddr>> {
+                (0..24)
+                    .map(|_| {
+                        let socket = socket2::Socket::new(
+                            socket2::Domain::IPV4,
+                            socket2::Type::STREAM,
+                            None,
+                        )?;
+                        // A blocking connect: the worker path, not the
+                        // dispatcher's nonblocking one.
+                        socket.connect(&address.into())?;
+                        Ok(socket.peer_addr()?.as_socket().unwrap())
+                    })
+                    .collect()
+            })
+            .expect("launcher result")
+            .expect("blocking connects");
+        assert!(peers.iter().all(|peer| *peer == address));
+        assert_eq!(
+            broker.connect_workers.spawned(),
+            1,
+            "sequential blocking connects must not start a thread each"
+        );
+        // Each job returned its admission slot when it finished.
+        wait_for(
+            || broker.active_opens.load(Ordering::Acquire) == 0,
+            "admission slots to be released",
+        );
+    }
+
+    #[test]
+    fn blocked_loopback_connects_do_not_delay_another_blocking_connect() {
+        // Several blocking connects wait on a listener with a full backlog.
+        // A blocking connect to a healthy listener must not queue behind
+        // them, and unrelated mediation must stay prompt.
+        let saturated =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        saturated
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        saturated.listen(0).unwrap();
+        let stalled = saturated.local_addr().unwrap().as_socket().unwrap();
+        let healthy = accepting_service();
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let (connect_wait, socket_wait) = launcher
+            .execute(move || {
+                let filled = TcpStream::connect(stalled).expect("fill accept queue");
+                let pending = (0..3)
+                    .map(|_| std::thread::spawn(move || TcpStream::connect(stalled)))
+                    .collect::<Vec<_>>();
+                std::thread::sleep(Duration::from_millis(500));
+                let started = Instant::now();
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                        .unwrap();
+                socket.connect(&healthy.into()).expect("healthy connect");
+                let connect_wait = started.elapsed();
+                let started = Instant::now();
+                drop(UdpSocket::bind("127.0.0.1:0"));
+                let socket_wait = started.elapsed();
+                // Leave the stalled connects running; closing the listener
+                // when the test ends resets them.
+                drop(pending);
+                drop(filled);
+                (connect_wait, socket_wait)
+            })
+            .expect("launcher result");
+        assert!(
+            connect_wait < Duration::from_secs(2),
+            "blocking connect waited {connect_wait:?} behind stalled connects"
+        );
+        assert!(
+            socket_wait < Duration::from_secs(2),
+            "socket creation waited {socket_wait:?} behind stalled connects"
+        );
+        // Three workers are still waiting; a fourth served the healthy one.
+        assert!(broker.connect_workers.spawned() >= 4);
+        assert!(broker.active_opens.load(Ordering::Acquire) >= 3);
+        drop(saturated);
+        wait_for(
+            || broker.active_opens.load(Ordering::Acquire) == 0,
+            "stalled connects to release their slots",
+        );
+    }
+
+    #[test]
+    fn blocking_loopback_connect_admission_is_bounded() {
+        let address = accepting_service();
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let connect = move || {
+            let socket =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            let result = socket
+                .connect(&address.into())
+                .err()
+                .and_then(|error| error.raw_os_error());
+            // A refused admission leaves the socket unconnected and usable.
+            (result, socket.peer_addr().is_ok(), socket)
+        };
+        // Occupy every admission slot, as that many waiting opens would.
+        broker
+            .active_opens
+            .store(OPEN_QUEUE_CAPACITY, Ordering::Release);
+        let (refused, connected, socket) = launcher.execute(connect).expect("launcher result");
+        assert_eq!(refused, Some(libc::EAGAIN));
+        assert!(!connected);
+        assert_eq!(broker.connect_workers.spawned(), 0);
+        assert_eq!(
+            broker.active_opens.load(Ordering::Acquire),
+            OPEN_QUEUE_CAPACITY
+        );
+        // One slot frees; the same socket then connects.
+        broker
+            .active_opens
+            .store(OPEN_QUEUE_CAPACITY - 1, Ordering::Release);
+        let retried = launcher
+            .execute(move || {
+                socket
+                    .connect(&address.into())
+                    .err()
+                    .and_then(|error| error.raw_os_error())
+            })
+            .expect("launcher result");
+        assert_eq!(retried, None);
+        wait_for(
+            || broker.active_opens.load(Ordering::Acquire) == OPEN_QUEUE_CAPACITY - 1,
+            "the admitted connect to release its slot",
+        );
+    }
+
+    #[test]
+    fn local_connect_commit_ignores_a_replaced_descriptor() {
+        let metadata = SocketMetadata {
+            family: InetFamily::V4,
+            kind: InetKind::Tcp,
+            close_on_exec: true,
+            nonblocking: false,
+            creator_generation: 1,
+        };
+        let mut registry = SocketRegistry::new(1, 2).unwrap();
+        let mut create = || {
+            let socket = OwnedFd::from(
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap(),
+            );
+            let installed = rustix::io::fcntl_dupfd_cloexec(&socket, 3).unwrap();
+            let tentative = registry.stage(socket, metadata).unwrap();
+            let identity = registry.commit(tentative).unwrap();
+            (installed, identity)
+        };
+        let (original, original_identity) = create();
+        let (replacement, replacement_identity) = create();
+        // The workload replaces the descriptor while a worker waits in the
+        // blocking connect of the original socket.
+        // SAFETY: both descriptors are live; replace only the test-owned FD.
+        assert_eq!(
+            unsafe { libc::dup2(replacement.as_raw_fd(), original.as_raw_fd()) },
+            original.as_raw_fd()
+        );
+        let registry = Mutex::new(registry);
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        commit_local_connect(
+            &registry,
+            std::process::id(),
+            original.as_raw_fd(),
+            original_identity,
+            peer,
+        );
+        {
+            let registry = lock(&registry);
+            let entry = registry
+                .resolve(std::process::id(), original.as_raw_fd())
+                .unwrap();
+            assert_eq!(entry.identity(), replacement_identity);
+            assert_eq!(entry.state(), &SocketState::Created);
+            assert!(entry.retained_preconnect().is_ok());
+        }
+        // The matching identity is recorded and releases the source.
+        commit_local_connect(
+            &registry,
+            std::process::id(),
+            original.as_raw_fd(),
+            replacement_identity,
+            peer,
+        );
+        let registry = lock(&registry);
+        let entry = registry
+            .resolve(std::process::id(), original.as_raw_fd())
+            .unwrap();
+        assert_eq!(entry.state(), &SocketState::Local { peer });
+        assert!(entry.retained_preconnect().is_err());
+    }
+
+    #[test]
+    fn descriptor_headroom_counts_once_without_pressure() {
+        let registry = Mutex::new(SocketRegistry::new(1, 2).unwrap());
+        let mut counts = 0;
+        prepare_registry_for_socket_with_count(&registry, 1_024, || {
+            counts += 1;
+            Ok(32)
+        })
+        .unwrap();
+        assert_eq!(counts, 1, "socket creation enumerates descriptors once");
+        let mut counts = 0;
+        ensure_descriptor_headroom_with_count(&registry, 1_024, 16, || {
+            counts += 1;
+            Ok(32)
+        })
+        .unwrap();
+        assert_eq!(counts, 1, "exec headroom enumerates descriptors once");
+    }
+
+    #[test]
+    fn descriptor_headroom_recounts_after_collection_and_fails_closed() {
+        let registry = Mutex::new(SocketRegistry::new(1, 2).unwrap());
+        // Ambient use grows past the reserve and collection frees nothing:
+        // the recount after collection must refuse the socket.
+        let mut observed = VecDeque::from([64, 64]);
+        let error = prepare_registry_for_socket_with_count(&registry, 128, || {
+            observed
+                .pop_front()
+                .ok_or_else(|| io::Error::other("unexpected descriptor recount"))
+        })
+        .expect_err("exhausted headroom must refuse the socket");
+        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+        assert!(observed.is_empty(), "collection is followed by one recount");
+        // Use that grows only after the single count is seen by the next
+        // request, exactly as a second count taken moments later would be.
+        let mut observed = VecDeque::from([63, 64, 64]);
+        let mut count = || {
+            observed
+                .pop_front()
+                .ok_or_else(|| io::Error::other("unexpected descriptor recount"))
+        };
+        prepare_registry_for_socket_with_count(&registry, 128, &mut count).unwrap();
+        assert_eq!(
+            prepare_registry_for_socket_with_count(&registry, 128, &mut count)
+                .expect_err("grown ambient use must refuse the next socket")
+                .raw_os_error(),
+            Some(libc::EMFILE)
+        );
+        let mut observed = VecDeque::from([120, 120]);
+        assert_eq!(
+            ensure_descriptor_headroom_with_count(&registry, 128, 16, || {
+                observed
+                    .pop_front()
+                    .ok_or_else(|| io::Error::other("unexpected descriptor recount"))
+            })
+            .expect_err("exhausted exec headroom")
+            .raw_os_error(),
+            Some(libc::EMFILE)
+        );
+        assert!(observed.is_empty());
+    }
+
+    #[test]
+    fn single_copy_socket_address_matches_the_separate_reads() {
+        let tid = std::process::id();
+        let errno = |error: &io::Error| error.raw_os_error();
+        let compare = |address: u64, length: u64| {
+            let family = read_socket_family(tid, address, length);
+            let combined = read_socket_family_and_addr(tid, address, length);
+            match (&family, &combined) {
+                (Ok(family), Ok((combined_family, combined_addr))) => {
+                    assert_eq!(family, combined_family, "family at length {length}");
+                    let separate = read_socket_addr(tid, address, length);
+                    match (&separate, combined_addr) {
+                        (Ok(separate), Ok(combined)) => assert_eq!(separate, combined),
+                        (Err(separate), Err(combined)) => {
+                            assert_eq!(errno(separate), errno(combined), "length {length}");
+                        }
+                        _ => panic!("address results differ at length {length}"),
+                    }
+                }
+                (Err(family), Err(combined)) => {
+                    assert_eq!(errno(family), errno(combined), "length {length}");
+                }
+                _ => panic!("family results differ at length {length}"),
+            }
+            combined
+        };
+
+        let v4: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let v6: SocketAddr = "[::1]:9090".parse().unwrap();
+        for expected in [v4, v6] {
+            with_sockaddr(expected, |pointer, length| {
+                let (family, address) = compare(pointer as u64, u64::from(length)).unwrap();
+                assert!(matches!(family, libc::AF_INET | libc::AF_INET6));
+                assert_eq!(address.unwrap(), expected);
+                // A truncated INET address keeps its family and is refused.
+                let (family, address) = compare(pointer as u64, 8).unwrap();
+                assert!(matches!(family, libc::AF_INET | libc::AF_INET6));
+                assert_eq!(errno(&address.unwrap_err()), Some(libc::EAFNOSUPPORT));
+                // Lengths the kernel would fault or refuse.
+                assert_eq!(
+                    errno(&compare(pointer as u64, 1).unwrap_err()),
+                    Some(libc::EFAULT)
+                );
+                assert_eq!(errno(&compare(0, 16).unwrap_err()), Some(libc::EFAULT));
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        // A non-INET family is reported without decoding an address.
+        let mut unix: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        unix.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX).unwrap();
+        let (family, address) = compare(
+            std::ptr::addr_of!(unix) as u64,
+            size_of::<libc::sockaddr_un>() as u64,
+        )
+        .unwrap();
+        assert_eq!(family, libc::AF_UNIX);
+        assert_eq!(errno(&address.unwrap_err()), Some(libc::EAFNOSUPPORT));
+
+        // An address whose declared length runs into an unmapped page, or
+        // exceeds sockaddr_storage, still yields the family from its first
+        // bytes; only the address read fails, as before.
+        // SAFETY: map two private pages and make the second inaccessible.
+        let page = 4096_usize;
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        // SAFETY: the second page lies within the fresh mapping.
+        assert_eq!(
+            unsafe { libc::mprotect(mapping.cast::<u8>().add(page).cast(), page, libc::PROT_NONE) },
+            0
+        );
+        let tail = size_of::<libc::sockaddr_in>();
+        // SAFETY: the last `tail` bytes of the first page are writable.
+        let location = unsafe { mapping.cast::<u8>().add(page - tail) };
+        with_sockaddr(v4, |pointer, _| {
+            // SAFETY: source and destination are live and do not overlap.
+            unsafe { std::ptr::copy_nonoverlapping(pointer.cast::<u8>(), location, tail) };
+            Ok(())
+        })
+        .unwrap();
+        let exact = compare(location as u64, tail as u64).unwrap();
+        assert_eq!(exact.1.unwrap(), v4);
+        for length in [tail as u64 + 1, 128, 129, 4096] {
+            let (family, address) = compare(location as u64, length).unwrap();
+            assert_eq!(family, libc::AF_INET, "length {length}");
+            assert!(address.is_err(), "length {length}");
+        }
+        // SAFETY: unmap the mapping created above.
+        unsafe { libc::munmap(mapping, page * 2) };
+    }
+
+    #[test]
+    fn socket_option_fast_path_pairs_are_never_denied() {
+        use crate::linux::seccomp_notify::SETSOCKOPT_FAST_PATH;
+        assert!(!SETSOCKOPT_FAST_PATH.is_empty());
+        for (level, option) in SETSOCKOPT_FAST_PATH {
+            // The filter allows these pairs without asking the broker, so
+            // each must be one the broker would continue, and must fit the
+            // non-negative i32 the broker requires.
+            assert!(
+                !socket_option_is_denied(*level, *option),
+                "{level}/{option} is denied but takes the filter fast path"
+            );
+            assert!(*level >= 0 && *option >= 0);
+        }
+        assert!(SETSOCKOPT_FAST_PATH.contains(&(libc::IPPROTO_TCP, libc::TCP_NODELAY)));
+    }
+
+    #[test]
+    fn workload_socket_options_keep_their_results_with_the_filter_fast_path() {
+        const HIGH_WORD: u64 = 1 << 32;
+        let address = accepting_service();
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let results = launcher
+            .execute(move || -> io::Result<Vec<Option<i32>>> {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+                socket.connect(&address.into())?;
+                let raw = |level: u64, option: u64| {
+                    let value: libc::c_int = 1;
+                    // SAFETY: the value pointer and length describe one int.
+                    let result = unsafe {
+                        libc::syscall(
+                            libc::SYS_setsockopt,
+                            socket.as_raw_fd(),
+                            level,
+                            option,
+                            std::ptr::addr_of!(value),
+                            size_of::<libc::c_int>(),
+                        )
+                    };
+                    (result < 0).then(|| io::Error::last_os_error().raw_os_error().unwrap())
+                };
+                let arg = |value: i32| u64::from(value.cast_unsigned());
+                let tcp = arg(libc::IPPROTO_TCP);
+                let sol = arg(libc::SOL_SOCKET);
+                let results = vec![
+                    // Filter fast path.
+                    raw(tcp, arg(libc::TCP_NODELAY)),
+                    raw(sol, arg(libc::SO_REUSEADDR)),
+                    raw(sol, arg(libc::SO_KEEPALIVE)),
+                    // Broker-continued.
+                    raw(sol, arg(libc::SO_RCVBUF)),
+                    // Broker-denied.
+                    raw(sol, arg(libc::SO_BINDTOIFINDEX)),
+                    raw(tcp, arg(libc::TCP_FASTOPEN_CONNECT)),
+                    // Unrepresentable arguments keep the broker's EINVAL,
+                    // including for an otherwise whitelisted pair.
+                    raw(tcp | HIGH_WORD, arg(libc::TCP_NODELAY)),
+                    raw(tcp, arg(libc::TCP_NODELAY) | HIGH_WORD),
+                    raw(tcp, arg(libc::TCP_NODELAY) | 0x8000_0000),
+                    raw(sol | 0x8000_0000, arg(libc::SO_REUSEADDR)),
+                ];
+                // The fast path really set the option on the socket.
+                assert!(socket.tcp_nodelay()?);
+                assert!(socket.keepalive()?);
+                Ok(results)
+            })
+            .expect("launcher result")
+            .expect("workload socket");
+        assert_eq!(
+            results,
+            vec![
+                None,
+                None,
+                None,
+                None,
+                Some(libc::EPERM),
+                Some(libc::EPERM),
+                Some(libc::EINVAL),
+                Some(libc::EINVAL),
+                Some(libc::EINVAL),
+                Some(libc::EINVAL),
+            ]
+        );
     }
 
     #[test]

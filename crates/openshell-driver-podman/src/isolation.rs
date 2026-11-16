@@ -287,6 +287,7 @@ pub fn bootstrap_archives(
         workload_identity: identity.clone(),
         provisioning_evidence: provisioning_evidence.clone(),
         child_env: child_env.clone(),
+        provider_file_store: None,
     };
     let runtime_descriptor = SandboxRuntimeDescriptor {
         boundary_id: sandbox_id.into(),

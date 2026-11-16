@@ -22,6 +22,12 @@ tests/tmachine/        # QEMU test machines, Ansible playbooks, and the Session 
 tests/runner/          # openshell-test-runner: runs a test family in a tmachine environment
 ```
 
+## Performance benchmarks
+
+See [Docker driver performance benchmark](benchmarks/docker/README.md) for the
+paired Docker/OpenShell workload benchmark (`mise run perf:docker`) and the
+native/filtered seccomp broker microbenchmark (`mise run perf:seccomp`).
+
 ## Rust Tests
 
 Unit tests live inline with `#[cfg(test)] mod tests` blocks. Integration tests

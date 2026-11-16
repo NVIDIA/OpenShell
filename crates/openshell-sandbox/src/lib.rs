@@ -36,6 +36,8 @@ pub mod process;
 #[cfg(target_os = "linux")]
 mod provider_files;
 #[cfg(target_os = "linux")]
+mod provider_store;
+#[cfg(target_os = "linux")]
 mod pty;
 #[cfg(target_os = "linux")]
 pub mod sandbox;

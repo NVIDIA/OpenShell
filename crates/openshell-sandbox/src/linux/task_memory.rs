@@ -55,13 +55,37 @@ pub fn read_exact(tid: u32, address: u64, destination: &mut [u8]) -> io::Result<
         )
     });
     match copied {
-        Ok(copied) => require_exact(copied, destination.len(), "task-memory read"),
+        Ok(copied) => {
+            #[cfg(feature = "perf-harness")]
+            PROCESS_VM_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            require_exact(copied, destination.len(), "task-memory read")
+        }
         Err(error) if syscall_profile_denied(&error) => {
+            #[cfg(feature = "perf-harness")]
+            PROC_MEM_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             read_exact_from_proc_mem(tid, address, destination)
                 .map_err(|fallback| fallback_error("read", &error, fallback))
         }
         Err(error) => Err(error),
     }
+}
+
+#[cfg(feature = "perf-harness")]
+static PROCESS_VM_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "perf-harness")]
+static PROC_MEM_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Task-memory reads by backend: `process_vm_readv`, then `/proc/<tid>/mem`.
+///
+/// Counted only in the opt-in performance harness, to establish which
+/// backend a container posture uses.
+#[cfg(feature = "perf-harness")]
+#[must_use]
+pub fn read_backend_counts() -> (u64, u64) {
+    (
+        PROCESS_VM_READS.load(std::sync::atomic::Ordering::Relaxed),
+        PROC_MEM_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 fn syscall_profile_denied(error: &io::Error) -> bool {

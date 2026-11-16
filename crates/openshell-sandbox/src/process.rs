@@ -80,9 +80,47 @@ pub(crate) fn prepare_child_sandbox(
     workdir: Option<&str>,
     runtime_read_only: &[PathBuf],
 ) -> Result<Option<sandbox::linux::PreparedSandbox>> {
-    let effective_policy = policy_with_runtime_read_only(policy, runtime_read_only);
+    let mut effective_policy = policy_with_runtime_read_only(policy, runtime_read_only);
+    grant_native_provider_files(
+        &mut effective_policy,
+        workdir,
+        crate::provider_files::native_public_root(),
+    );
     let prepared = sandbox::linux::prepare_capability_free(&effective_policy, workdir)?;
     Ok(Some(prepared))
+}
+
+/// Keep natively delivered provider files readable under a user filesystem
+/// policy.
+///
+/// Virtual delivery injects descriptors, which no filesystem policy can
+/// refuse. Native delivery opens real files, so a policy that lists paths
+/// must also list the store's public root, read-only. A policy that lists
+/// nothing adds no Landlock layer, and the mandatory baseline already grants
+/// the root; adding a path then would create a layer that denies everything
+/// else.
+#[cfg(target_os = "linux")]
+pub(crate) fn grant_native_provider_files(
+    policy: &mut SandboxPolicy,
+    workdir: Option<&str>,
+    public_root: Option<&Path>,
+) {
+    let Some(public_root) = public_root else {
+        return;
+    };
+    let filesystem = &policy.filesystem;
+    let restricts = !filesystem.read_only.is_empty()
+        || !filesystem.read_write.is_empty()
+        || (filesystem.include_workdir && workdir.is_some());
+    if restricts
+        && !policy
+            .filesystem
+            .read_only
+            .iter()
+            .any(|path| path == public_root)
+    {
+        policy.filesystem.read_only.push(public_root.to_path_buf());
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1931,6 +1969,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_provider_files_stay_readable_under_a_restricting_policy() {
+        let root = Path::new("/run/openshell");
+        // Virtual delivery changes nothing.
+        let mut policy = policy_with_process(ProcessPolicy::default());
+        policy.filesystem.read_only = vec![PathBuf::from("/usr")];
+        let unchanged = policy.clone();
+        grant_native_provider_files(&mut policy, Some("/sandbox"), None);
+        assert_eq!(policy.filesystem.read_only, unchanged.filesystem.read_only);
+
+        // A policy that lists paths gains the public root, read-only, once.
+        grant_native_provider_files(&mut policy, None, Some(root));
+        grant_native_provider_files(&mut policy, None, Some(root));
+        assert_eq!(
+            policy.filesystem.read_only,
+            vec![PathBuf::from("/usr"), root.to_path_buf()]
+        );
+        assert!(policy.filesystem.read_write.is_empty());
+
+        // An included workdir alone makes a restricting layer.
+        let mut policy = policy_with_process(ProcessPolicy::default());
+        policy.filesystem.include_workdir = true;
+        grant_native_provider_files(&mut policy, Some("/sandbox"), Some(root));
+        assert_eq!(policy.filesystem.read_only, vec![root.to_path_buf()]);
+
+        // A policy with no paths adds no Landlock layer; the baseline already
+        // grants the root, and listing it would deny everything else.
+        let mut policy = policy_with_process(ProcessPolicy::default());
+        policy.filesystem.include_workdir = false;
+        grant_native_provider_files(&mut policy, Some("/sandbox"), Some(root));
+        assert!(policy.filesystem.read_only.is_empty());
+        let mut policy = policy_with_process(ProcessPolicy::default());
+        policy.filesystem.include_workdir = true;
+        grant_native_provider_files(&mut policy, None, Some(root));
+        assert!(policy.filesystem.read_only.is_empty());
     }
 
     #[cfg(target_os = "linux")]

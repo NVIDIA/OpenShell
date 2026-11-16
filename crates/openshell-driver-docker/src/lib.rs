@@ -119,6 +119,21 @@ const BOUNDARY_SOCKET_MOUNT_PATH: &str = "/.openshell/channel/control/supervisor
 const BOUNDARY_CERTIFICATE_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
 const BOUNDARY_PRIVATE_KEY_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.key";
 const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/supervisor";
+/// Writable mount of the whole provider-file volume in the workload
+/// container. The sandbox's mandatory Landlock baseline withholds the
+/// `/.openshell` hierarchy from the workload.
+const PROVIDER_FILES_PRIVATE_MOUNT_PATH: &str = "/.openshell/provider-files";
+/// Read-only mount of the provider-file volume's public directory, at the
+/// parent of the path provider files are addressed by.
+const PROVIDER_FILES_PUBLIC_MOUNT_PATH: &str = openshell_core::container_paths::RUN_ROOT;
+const PROVIDER_FILES_PUBLIC_SUBPATH: &str = "public";
+const PROVIDER_FILES_STAGING_SUBPATH: &str = "staging";
+/// Records on the workload container that it was created with the
+/// provider-file mounts.
+const LABEL_PROVIDER_FILES: &str = "openshell.ai/provider-files";
+const LABEL_PROVIDER_FILES_NATIVE: &str = "native";
+/// Docker Engine API version that introduced `VolumeOptions.Subpath`.
+const VOLUME_SUBPATH_API_VERSION: (u32, u32) = (1, 45);
 const SUPERVISOR_PROXY_AUTH_MOUNT_PATH: &str = "/.openshell/supervisor/upstream-proxy-auth";
 const SUPERVISOR_PROXY_CA_BUNDLE_MOUNT_PATH: &str =
     "/.openshell/supervisor/upstream-proxy-ca-bundle.pem";
@@ -374,6 +389,58 @@ struct DockerDriverRuntimeConfig {
     /// Immutable gateway-normalized additional destination trust. This is
     /// deliberately separate from `DockerComputeConfig` and sandbox input.
     network_trust: Option<NetworkSupervisorTrustBundle>,
+    provider_files: DockerProviderFiles,
+}
+
+/// How new sandboxes receive provider files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerProviderFiles {
+    /// The sandbox intercepts every workload open and injects provider files.
+    /// The default: it needs no mount beyond the sandbox's own.
+    Virtual,
+    /// A provider-file volume the workload reads natively. Experimental, and
+    /// selected only by a build with `experimental-native-provider-files`.
+    Native,
+}
+
+/// Whether this build opted in to the experimental native provider-file
+/// volume. It is a build-time choice: no gateway configuration or environment
+/// variable selects it.
+const NATIVE_PROVIDER_FILES_OPT_IN: bool = cfg!(feature = "experimental-native-provider-files");
+
+/// Chooses how new sandboxes receive provider files.
+///
+/// Delivery is virtual unless the build opted in to the native volume and the
+/// daemon can mount the volume subpath it depends on.
+fn select_docker_provider_files(
+    api_version: Option<&str>,
+    native_opt_in: bool,
+) -> DockerProviderFiles {
+    if native_opt_in && docker_supports_volume_subpath(api_version) {
+        DockerProviderFiles::Native
+    } else {
+        DockerProviderFiles::Virtual
+    }
+}
+
+impl DockerDriverRuntimeConfig {
+    fn native_provider_files(&self) -> bool {
+        self.provider_files == DockerProviderFiles::Native
+    }
+}
+
+/// Whether the daemon's highest API version can mount a volume subpath.
+///
+/// The public provider-file mount is a subpath of the volume. An unreported
+/// or unparsable version counts as unsupported.
+fn docker_supports_volume_subpath(api_version: Option<&str>) -> bool {
+    let Some((major, minor)) = api_version.and_then(|version| version.split_once('.')) else {
+        return false;
+    };
+    match (major.parse::<u32>(), minor.parse::<u32>()) {
+        (Ok(major), Ok(minor)) => (major, minor) >= VOLUME_SUBPATH_API_VERSION,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -926,6 +993,21 @@ impl DockerComputeDriver {
         if let Some(warning) = unsupported_docker_engine_warning(&version) {
             warn!("{warning}");
         }
+        let provider_files = select_docker_provider_files(
+            version.api_version.as_deref(),
+            NATIVE_PROVIDER_FILES_OPT_IN,
+        );
+        if NATIVE_PROVIDER_FILES_OPT_IN {
+            match provider_files {
+                DockerProviderFiles::Native => {
+                    info!("Experimental native provider-file volumes enabled for new sandboxes");
+                }
+                DockerProviderFiles::Virtual => info!(
+                    api_version = version.api_version.as_deref().unwrap_or("unknown"),
+                    "Docker daemon cannot mount a volume subpath; sandboxes keep virtual provider files"
+                ),
+            }
+        }
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
@@ -1027,6 +1109,7 @@ impl DockerComputeDriver {
                 host_gateway_ip,
                 supervisor_gateway_name: docker_config.supervisor_gateway_name.clone(),
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
+                provider_files,
                 guest_tls,
                 gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
@@ -1323,6 +1406,7 @@ impl DockerComputeDriver {
                     })?;
                     if name == docker_channel_volume_name_by_id(sandbox_id, &self.config)
                         || name == docker_control_volume_name_by_id(sandbox_id, &self.config)
+                        || name == docker_provider_files_volume_name_by_id(sandbox_id, &self.config)
                     {
                         if volume.driver != "local"
                             || !volume.options.is_empty()
@@ -4198,17 +4282,34 @@ fn docker_control_volume_name_by_id(
     )
 }
 
+/// The volume that carries provider files to the workload. It is separate
+/// from the channel, control, and supervisor volumes, so mounting it exposes
+/// no bootstrap key, socket, or supervisor credential.
+fn docker_provider_files_volume_name_by_id(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> String {
+    docker_channel_volume_name_by_id(sandbox_id, config).replacen(
+        "openshell-channel-",
+        "openshell-provider-files-",
+        1,
+    )
+}
+
 async fn create_docker_channel_volume(
     docker: &Docker,
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
     create: bool,
 ) -> Result<(), Status> {
-    let names = [
+    let mut names = vec![
         docker_channel_volume_name(sandbox, config),
         docker_supervisor_volume_name(sandbox, config),
         docker_control_volume_name_by_id(&sandbox.id, config),
     ];
+    if config.native_provider_files() {
+        names.push(docker_provider_files_volume_name_by_id(&sandbox.id, config));
+    }
     for (index, name) in names.iter().enumerate() {
         if let Err(error) =
             create_docker_runtime_volume(docker, sandbox, config, name.clone(), create).await
@@ -4290,6 +4391,12 @@ async fn remove_docker_channel_volume_by_id(
     remove_docker_volume(
         docker,
         &docker_control_volume_name_by_id(sandbox_id, config),
+    )
+    .await?;
+    // Absent for sandboxes created without native provider files.
+    remove_docker_volume(
+        docker,
+        &docker_provider_files_volume_name_by_id(sandbox_id, config),
     )
     .await
 }
@@ -4735,6 +4842,7 @@ async fn prepare_docker_boundary_files(
         host_gateway_ip: config.host_gateway_ip,
         workload_identity: workload_identity.clone(),
         child_env: docker_child_environment(sandbox),
+        provider_file_store: docker_provider_file_store(config),
     }
     .provision()
     .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -4753,6 +4861,11 @@ async fn prepare_docker_boundary_files(
         tls.private_key_pem.as_bytes(),
     )
     .await?;
+    if config.native_provider_files() {
+        // Must precede the bundle upload, which mounts the container's
+        // volumes and with them the public subpath.
+        stage_docker_provider_files_volume(docker, sandbox, config, workload_identity).await?;
+    }
     stage_docker_sandbox_bundle(
         docker,
         container_id,
@@ -6181,6 +6294,10 @@ fn build_container_create_body_for_image(
         })?;
         driver_mounts::validate_mount_control_path(volume, BOUNDARY_MOUNT_PATH)
             .map_err(Status::failed_precondition)?;
+        if config.native_provider_files() {
+            driver_mounts::validate_mount_control_path(volume, PROVIDER_FILES_PRIVATE_MOUNT_PATH)
+                .map_err(Status::failed_precondition)?;
+        }
     }
     let mount_targets = driver_config.mounts.iter().map(|mount| {
         match mount {
@@ -6191,12 +6308,15 @@ fn build_container_create_body_for_image(
         }
         .as_str()
     });
-    driver_mounts::validate_workspace_mount_targets(
-        mount_targets,
-        &workspace_root,
-        &[BOUNDARY_MOUNT_PATH],
-    )
-    .map_err(Status::failed_precondition)?;
+    // The public provider-file target lies in a reserved control root, which
+    // mount-target validation already refuses; the private one does not.
+    let control_paths: &[&str] = if config.native_provider_files() {
+        &[BOUNDARY_MOUNT_PATH, PROVIDER_FILES_PRIVATE_MOUNT_PATH]
+    } else {
+        &[BOUNDARY_MOUNT_PATH]
+    };
+    driver_mounts::validate_workspace_mount_targets(mount_targets, &workspace_root, control_paths)
+        .map_err(Status::failed_precondition)?;
     let mut user_mounts = docker_driver_mounts(driver_config)?;
     user_mounts.push(Mount {
         target: Some(BOUNDARY_MOUNT_PATH.to_string()),
@@ -6222,6 +6342,10 @@ fn build_container_create_body_for_image(
         ..Default::default()
     });
 
+    if config.native_provider_files() {
+        user_mounts.extend(docker_provider_files_mounts(&sandbox.id, config));
+    }
+
     let user_bind_strings = docker_driver_bind_strings(driver_config)?;
     let device_requests = gpu_device_ids.map(|device_ids| {
         vec![DeviceRequest {
@@ -6244,6 +6368,15 @@ fn build_container_create_body_for_image(
             .is_some_and(|config| !config.fields.is_empty())
             .to_string(),
     );
+    if config.native_provider_files() {
+        labels.insert(
+            LABEL_PROVIDER_FILES.to_string(),
+            LABEL_PROVIDER_FILES_NATIVE.to_string(),
+        );
+    } else {
+        // A template cannot claim mounts the driver did not create.
+        labels.remove(LABEL_PROVIDER_FILES);
+    }
     labels.insert(
         LABEL_MANAGED_BY.to_string(),
         LABEL_MANAGED_BY_VALUE.to_string(),
@@ -6345,6 +6478,168 @@ fn build_container_create_body_for_image(
         networking_config: None,
         ..Default::default()
     })
+}
+
+/// The two workload-container mounts of the provider-file volume.
+///
+/// The sandbox runtime and the workload share one UID, so file modes cannot
+/// keep the workload from changing a provider file. The runtime writes
+/// through the whole-volume mount beneath `/.openshell`, which Landlock hides
+/// from the workload. The workload reads through a read-only mount of the
+/// volume's `public` directory, where the kernel refuses writes and metadata
+/// changes. Image volumes, user mounts, and the workspace cannot overlap
+/// either target: both lie in reserved `OpenShell` paths.
+fn docker_provider_files_mounts(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> [Mount; 2] {
+    let source = docker_provider_files_volume_name_by_id(sandbox_id, config);
+    [
+        Mount {
+            target: Some(PROVIDER_FILES_PRIVATE_MOUNT_PATH.to_string()),
+            source: Some(source.clone()),
+            typ: Some(MountTypeEnum::VOLUME),
+            read_only: Some(false),
+            volume_options: Some(MountVolumeOptions {
+                no_copy: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Mount {
+            target: Some(PROVIDER_FILES_PUBLIC_MOUNT_PATH.to_string()),
+            source: Some(source),
+            typ: Some(MountTypeEnum::VOLUME),
+            read_only: Some(true),
+            volume_options: Some(MountVolumeOptions {
+                no_copy: Some(true),
+                subpath: Some(PROVIDER_FILES_PUBLIC_SUBPATH.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ]
+}
+
+/// The store the sandbox runtime is told about, matching
+/// [`docker_provider_files_mounts`].
+fn docker_provider_file_store(
+    config: &DockerDriverRuntimeConfig,
+) -> Option<openshell_sandbox_backend::boundary_protocol::ProviderFileStore> {
+    config.native_provider_files().then(|| {
+        openshell_sandbox_backend::boundary_protocol::ProviderFileStore {
+            private_root: PathBuf::from(PROVIDER_FILES_PRIVATE_MOUNT_PATH),
+            public_root: PathBuf::from(PROVIDER_FILES_PUBLIC_MOUNT_PATH),
+        }
+    })
+}
+
+/// The initial layout of the provider-file volume: the public directory with
+/// an empty generation, and the private staging directory, all owned by the
+/// workload identity the sandbox runtime runs as.
+fn docker_provider_files_archive(identity: &ResolvedWorkloadIdentity) -> Result<Vec<u8>, Status> {
+    let mut archive = tar::Builder::new(Vec::new());
+    for (path, mode) in [
+        (PROVIDER_FILES_PUBLIC_SUBPATH.to_string(), 0o755),
+        (format!("{PROVIDER_FILES_PUBLIC_SUBPATH}/providers"), 0o700),
+        (PROVIDER_FILES_STAGING_SUBPATH.to_string(), 0o700),
+    ] {
+        append_docker_archive_directory(&mut archive, &path, mode, identity.uid, identity.gid)?;
+    }
+    archive
+        .into_inner()
+        .map_err(|error| Status::internal(format!("finish provider file archive: {error}")))
+}
+
+/// Lay out the provider-file volume before the workload container mounts it.
+///
+/// Docker resolves the public mount's subpath whenever it mounts the
+/// container's volumes, including for an archive upload, so the directory
+/// must exist before the sandbox bundle is staged. A container that is never
+/// started mounts the whole volume and receives the layout.
+async fn stage_docker_provider_files_volume(
+    docker: &Docker,
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    identity: &ResolvedWorkloadIdentity,
+) -> Result<(), Status> {
+    let stager_name = format!(
+        "{}-provider-files-stage",
+        container_name_for_sandbox(sandbox)
+    );
+    let _ = docker
+        .remove_container(
+            &stager_name,
+            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+        )
+        .await;
+    let [private_mount, _] = docker_provider_files_mounts(&sandbox.id, config);
+    let created = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(stager_name.as_str())
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some(config.supervisor_image_id.clone()),
+                // Docker's copyUIDGID upload uses Config.User when it is set,
+                // overriding the archive's numeric ownership. Stage as the
+                // identity that will own the directories.
+                user: Some(format!("{}:{}", identity.uid, identity.gid)),
+                entrypoint: Some(vec![SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string()]),
+                labels: Some(docker_auxiliary_container_labels(
+                    sandbox,
+                    config,
+                    LABEL_ISOLATION_ROLE_STAGING,
+                )),
+                host_config: Some(HostConfig {
+                    network_mode: Some("none".to_string()),
+                    mounts: Some(vec![private_mount]),
+                    cap_drop: Some(vec!["ALL".to_string()]),
+                    security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "create Docker provider file staging container: {error}"
+            ))
+        })?;
+    let result = match docker_provider_files_archive(identity) {
+        Ok(archive) => docker
+            .upload_to_container(
+                &created.id,
+                Some(
+                    UploadToContainerOptionsBuilder::default()
+                        .path(PROVIDER_FILES_PRIVATE_MOUNT_PATH)
+                        .copy_uidgid("true")
+                        .build(),
+                ),
+                bollard::body_full(Bytes::from(archive)),
+            )
+            .await
+            .map_err(|error| {
+                Status::internal(format!("stage Docker provider file volume: {error}"))
+            }),
+        Err(status) => Err(status),
+    };
+    let cleanup = docker
+        .remove_container(
+            &created.id,
+            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+        )
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "remove Docker provider file staging container: {error}"
+            ))
+        });
+    result?;
+    cleanup
 }
 
 /// Reject driver requests that arrive with neither a sandbox id nor a
