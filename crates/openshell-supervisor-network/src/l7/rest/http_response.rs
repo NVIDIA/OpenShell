@@ -379,11 +379,8 @@ fn validate_http_response_header_block(headers: &[u8]) -> Result<()> {
     let header_lines = &headers[..headers.len() - 2];
     let mut lines = header_lines
         .split(|byte| *byte == b'\n')
-        .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
-    let status_line = lines
-        .next()
-        .ok_or_else(|| miette!("HTTP response status line is missing"))?;
-    validate_http_response_status_line(status_line)?;
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .skip(1);
 
     while let Some(line) = lines.next() {
         if line.is_empty() {
@@ -417,26 +414,6 @@ fn validate_http_response_header_block(headers: &[u8]) -> Result<()> {
         http::HeaderValue::from_bytes(&line[colon + 1..])
             .map_err(|_| miette!("HTTP response field value is malformed"))?;
     }
-    Ok(())
-}
-
-fn validate_http_response_status_line(status_line: &[u8]) -> Result<()> {
-    let remainder = if let Some(remainder) = status_line.strip_prefix(b"HTTP/1.0 ") {
-        remainder
-    } else if let Some(remainder) = status_line.strip_prefix(b"HTTP/1.1 ") {
-        remainder
-    } else {
-        return Err(miette!(
-            "HTTP response status line must use HTTP/1.0 or HTTP/1.1"
-        ));
-    };
-    if remainder.len() < 3 || (remainder.len() > 3 && remainder[3] != b' ') {
-        return Err(miette!("HTTP response status line is malformed"));
-    }
-    http::StatusCode::from_bytes(&remainder[..3])
-        .map_err(|_| miette!("HTTP response status code is invalid"))?;
-    http::HeaderValue::from_bytes(remainder.get(4..).unwrap_or_default())
-        .map_err(|_| miette!("HTTP response reason phrase is malformed"))?;
     Ok(())
 }
 
@@ -3028,16 +3005,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn correlated_response_without_reason_phrase_retains_legacy_tolerance() {
-        let correlation = test_correlation("empty-reason");
-        let (outcome, client) = relay_bytes(
-            b"HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n",
-            Some(&correlation),
-        )
-        .await;
-        outcome.expect("tolerated status line");
-        assert!(client.starts_with(b"HTTP/1.1 200\r\n"));
-        assert_eq!(request_id_header_count(&client), 1);
+    async fn correlated_response_preserves_legacy_status_line_tolerance() {
+        for status in [
+            "HTTP/1.1 200",
+            "HTTP/1.1  200 OK",
+            "HTTP/1.1\t200 OK",
+            "HTTP/1.2 200 OK",
+        ] {
+            let response = format!("{status}\r\nContent-Length: 0\r\n\r\n");
+            let (outcome, client) = relay_bytes(response.as_bytes(), None).await;
+            outcome.expect("legacy status line");
+            assert_eq!(client, response.as_bytes());
+
+            let correlation = test_correlation("legacy-status");
+            let (outcome, client) = relay_bytes(response.as_bytes(), Some(&correlation)).await;
+            outcome.unwrap_or_else(|error| panic!("{status:?}: {error}"));
+            assert!(client.starts_with(format!("{status}\r\n").as_bytes()));
+            assert_eq!(request_id_header_count(&client), 1);
+            assert_eq!(
+                crate::test_support::response_request_id(&client),
+                "legacy-status"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3242,7 +3231,7 @@ mod tests {
     }
 
     #[test]
-    fn response_head_validation_rejects_malformed_syntax() {
+    fn response_head_validation_rejects_ambiguous_header_blocks() {
         let cases: &[(&str, &[u8])] = &[
             ("incomplete block", b"HTTP/1.1 200 OK\r\nX-Test: yes\r\n"),
             ("bare LF", b"HTTP/1.1 200 OK\r\nX-Test: yes\n\r\n"),
@@ -3251,10 +3240,6 @@ mod tests {
                 "obsolete fold",
                 b"HTTP/1.1 200 OK\r\nX-Test: yes\r\n continued\r\n\r\n",
             ),
-            ("unsupported protocol", b"HTTP/2 200 OK\r\n\r\n"),
-            ("invalid status range", b"HTTP/1.1 099 Nope\r\n\r\n"),
-            ("non-numeric status", b"HTTP/1.1 2O0 Nope\r\n\r\n"),
-            ("four-digit status", b"HTTP/1.1 2000 Nope\r\n\r\n"),
             ("malformed field", b"HTTP/1.1 200 OK\r\nX-Test\r\n\r\n"),
             ("empty field name", b"HTTP/1.1 200 OK\r\n: value\r\n\r\n"),
             (
@@ -3273,7 +3258,6 @@ mod tests {
                 "field delete byte",
                 b"HTTP/1.1 200 OK\r\nX-Test: value\x7f\r\n\r\n",
             ),
-            ("reason control byte", b"HTTP/1.1 200 O\x00K\r\n\r\n"),
             (
                 "early empty line",
                 b"HTTP/1.1 200 OK\r\n\r\nX-Smuggled: yes\r\n\r\n",

@@ -336,6 +336,10 @@ application-owned correlation. The receipt is a join key, not proof of identity,
 authorization or downstream execution. L4 and uninspected traffic do not provide
 this receipt guarantee.
 
+Receipt insertion retains existing status-line tolerance. Ambiguous header line
+endings and folded fields are rejected so upstream headers cannot hide a forged
+receipt.
+
 One primary HTTP Activity record is emitted when the final response head is
 written, with `unmapped.http_event_kind: "request"`. If the request ends earlier,
 a guard emits the available outcome. The response header does not prove that

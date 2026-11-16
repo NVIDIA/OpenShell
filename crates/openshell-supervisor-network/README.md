@@ -84,4 +84,5 @@ legacy bounded deny-span behavior. End HTTP tracing before an upgraded session.
 The request span ends after its owned stages, not when response headers are logged.
 The `openshell.upstream.send` stage measures request writes and flush; response
 handling is measured separately. Receipt filtering preserves raw HTTP bytes
-and borrows unchanged header blocks.
+and borrows unchanged header blocks. It retains the existing status-line parsing
+but rejects ambiguous header line endings and folded fields.

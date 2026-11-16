@@ -105,7 +105,6 @@ struct Route<'a> {
     method: &'a str,
     binary: &'a str,
     enforcement: &'a str,
-    deny_path: Option<&'a str>,
     body_rewrite: bool,
     protocol: &'a str,
 }
@@ -117,7 +116,6 @@ fn route<'a>(name: &'a str, path: &'a str) -> Route<'a> {
         method: "GET",
         binary: "/usr/bin/curl",
         enforcement: "enforce",
-        deny_path: None,
         body_rewrite: false,
         protocol: "rest",
     }
@@ -187,10 +185,6 @@ impl Fixture {
                 if route.protocol == "mcp" {
                     endpoint["mcp"] = serde_json::json!({"versions": ["2025-11-25"]});
                 }
-                // An explicit empty deny_rules list is invalid authored policy.
-                if let Some(path) = route.deny_path {
-                    endpoint["deny_rules"] = serde_json::json!([{"method": "GET", "path": path}]);
-                }
                 if route.body_rewrite {
                     endpoint["request_body_credential_rewrite"] = true.into();
                 }
@@ -247,11 +241,7 @@ impl Fixture {
     }
 
     fn grant_key(&self, path: &str, owner: &str) -> String {
-        let snapshot = self.state.snapshot();
-        format!(
-            "{HOST}\t{PORT}\t{path}\trev:{}\tinstallation:{}\t{owner}:access_token",
-            snapshot.revision, snapshot.installation_id
-        )
+        self.state.snapshot().scoped_key(&key(path, owner))
     }
 
     fn reload_policy(&mut self) {
@@ -1041,20 +1031,12 @@ async fn token_grant_refusal_never_creates_a_denial_only_span() {
                     .all(|span| span.name != "openshell.upstream.send")
             );
         }
-        let records: Vec<_> = evidence
-            .events
-            .iter()
-            .filter(|event| event["class_uid"] == 4002)
-            .collect();
-        assert_eq!(records.len(), 1, "{:?}", evidence.events);
-        assert_eq!(records[0]["action"], "Denied");
-        assert_eq!(records[0]["http_response"]["code"], 502);
-        let receipt = records[0]["metadata"]["correlation_uid"].as_str().unwrap();
-        assert!(
-            evidence
-                .output
-                .to_ascii_lowercase()
-                .contains(&format!("x-openshell-request-id: {receipt}\r\n"))
+        let (record, _) = crate::test_support::assert_http_request_records(&evidence.events, 0);
+        assert_eq!(record["action"], "Denied");
+        assert_eq!(record["http_response"]["code"], 502);
+        assert_eq!(
+            record["metadata"]["correlation_uid"],
+            crate::test_support::response_request_id(evidence.output.as_bytes())
         );
     }
 }
@@ -1488,11 +1470,7 @@ async fn transformed_jsonrpc_body_selects_final_operation_owner() {
         std::str::from_utf8(&injected.raw_header).expect("injected HTTP request"),
         "aud-transformed",
     );
-    let snapshot = state.snapshot();
-    let expected_key = format!(
-        "{HOST}\t{PORT}\t/api/**\trev:{}\tinstallation:{}\ttransformed:access_token",
-        snapshot.revision, snapshot.installation_id
-    );
+    let expected_key = state.snapshot().scoped_key(&key("/api/**", "transformed"));
     resolver.assert_calls(&[(&expected_key, "aud-transformed")]);
 }
 
