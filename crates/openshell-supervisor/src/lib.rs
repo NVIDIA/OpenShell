@@ -3091,12 +3091,27 @@ async fn reload_gateway_policy_runtime(
 }
 
 fn validate_live_filesystem_policy(
-    applied: Option<&openshell_core::proto::SandboxPolicy>,
+    installed: Option<&openshell_core::proto::SandboxPolicy>,
     candidate: Option<&openshell_core::proto::SandboxPolicy>,
 ) -> Result<()> {
-    let (Some(applied), Some(candidate)) = (applied, candidate) else {
+    let (Some(applied), Some(candidate)) = (installed, candidate) else {
         return Ok(());
     };
+    let mut candidate = candidate.clone();
+    if !applied.network_policies.is_empty() {
+        let (ro, rw) = proxy_baseline_paths();
+        // Global policies retain their raw gateway form. Restore only the
+        // proxy prerequisites that startup actually installed.
+        enrich_proto_baseline_paths_with(&mut candidate, &ro, &rw, |path| {
+            applied.filesystem.as_ref().is_some_and(|filesystem| {
+                filesystem
+                    .read_only
+                    .iter()
+                    .chain(&filesystem.read_write)
+                    .any(|installed| installed == path)
+            })
+        });
+    }
     let same_paths = |left: &[String], right: &[String]| {
         left.iter().collect::<std::collections::HashSet<_>>() == right.iter().collect()
     };
@@ -3827,7 +3842,9 @@ struct PolicyPollLoopContext {
     endpoint_observation_tx: Option<openshell_core::endpoint_status::EndpointObservationSender>,
     /// Single FIFO consumed by the endpoint status reporter.
     endpoint_status_rx: Option<openshell_core::endpoint_status::EndpointStatusReceiver>,
-    /// Gateway policy currently installed in OPA, absent for local overrides.
+    /// Policy installed at startup, including its filesystem prerequisites.
+    /// Kept unchanged when gateway updates replace the policy in OPA.
+    /// Absent for local overrides.
     endpoint_policy: Option<openshell_core::proto::SandboxPolicy>,
     /// Session accepted by `ConnectSupervisor`; `None` suspends endpoint reports.
     supervisor_session_id: tokio::sync::watch::Receiver<Option<String>>,
@@ -4710,7 +4727,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         if policy_runtime_changed {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
             let runtime_result = match validate_live_filesystem_policy(
-                current_endpoint_policy.as_ref(),
+                ctx.endpoint_policy.as_ref(),
                 result.policy.as_ref(),
             ) {
                 Ok(()) => {
@@ -8521,6 +8538,91 @@ network_policies:
                 handle.abort();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn global_policy_retry_uses_installed_filesystem_after_missing_initial_acknowledgement() {
+        use openshell_core::proto::{FilesystemPolicy, PolicySource};
+
+        let mut policy = proto_tcp_policy_fixture();
+        policy.filesystem = Some(FilesystemPolicy {
+            include_workdir: true,
+            read_only: vec!["/usr".into(), "/tmp".into()],
+            ..Default::default()
+        });
+        let initial = settings_poll_result(Some(policy.clone()), 1, PolicySource::Global);
+        let mut installed = policy.clone();
+        let (ro, rw) = proxy_baseline_paths();
+        assert!(enrich_proto_baseline_paths_with(
+            &mut installed,
+            &ro,
+            &rw,
+            |path| matches!(path, "/proc" | "/dev/null"),
+        ));
+        let engine = Arc::new(OpaEngine::from_proto(&installed).expect("build OPA engine"));
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.endpoint_policy = Some(installed);
+        ctx.transparent_tcp = TransparentTcpReloadState {
+            capable: true,
+            substrate_ready: true,
+        };
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        let observed_polls = client.polled_sandboxes.clone();
+        let wait_for_polls = |count: usize| {
+            let observed_polls = observed_polls.clone();
+            async move {
+                timeout(Duration::from_secs(1), async {
+                    while observed_polls.lock().await.len() < count {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("policy poll loop stalled");
+            }
+        };
+        // A global policy is never acknowledged by the first poll, so its raw
+        // gateway form is reconciled against the policy startup installed.
+        polls.send(initial).unwrap();
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        wait_for_polls(2).await;
+        assert!(engine.fail_closed_reason().is_none());
+        assert_eq!(engine.current_generation(), 1);
+
+        let mut network_only = policy;
+        network_only
+            .network_policies
+            .values_mut()
+            .next()
+            .expect("network rule")
+            .endpoints[0]
+            .port = 6380;
+        let mut changed = network_only.clone();
+        let network_only = settings_poll_result(Some(network_only), 2, PolicySource::Global);
+        polls.send(network_only).unwrap();
+        wait_for_polls(3).await;
+        assert!(engine.fail_closed_reason().is_none());
+        assert_eq!(engine.current_generation(), 2);
+
+        changed
+            .filesystem
+            .as_mut()
+            .expect("filesystem policy")
+            .read_only
+            .push("/app".into());
+        let mut changed = settings_poll_result(Some(changed), 3, PolicySource::Global);
+        changed.policy_validation_failure_mode = PolicyValidationFailureMode::FailClosed;
+        polls.send(changed).unwrap();
+        wait_for_polls(4).await;
+        assert!(engine.fail_closed_reason().is_some());
+        expect_no_policy_report(&mut reports).await;
+        handle.abort();
     }
 
     #[tokio::test]
