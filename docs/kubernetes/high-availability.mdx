@@ -198,7 +198,10 @@ another replica.
 Shared supervisors spread across gateway replicas. A supervisor that starts,
 restarts, or loses its replica goes to the first replica on the gateway ring
 that serves fewer than its even share of supervisors, and a stopping replica
-hands its supervisors over the same way. A supervisor that reconnects after a
+hands its supervisors over the same way. Spreading is best effort: each
+replica places supervisors on its own, so after many supervisors reconnect at
+once a replica can serve about 20% more than its share until they reconnect
+again. A supervisor that reconnects after a
 token refresh or a short interruption stays on its replica, and supervisors
 never move when a replica joins, so a replica added without a rollout fills
 only as supervisors restart.

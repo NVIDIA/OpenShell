@@ -8,6 +8,10 @@
 //! the pool's member records plus the placements this replica made that the
 //! records do not show yet, so a burst of arrivals or a replica handing off
 //! its supervisors does not pile onto one replica.
+//!
+//! Replicas do not coordinate, so the spread is best effort: concurrent
+//! arrivals at different replicas can leave one above its share, and
+//! established supervisors never move to correct it.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -217,5 +221,36 @@ mod tests {
             counts(&homes),
             HashMap::from([("gw-0", 1), ("gw-1", 1), ("gw-2", 1)])
         );
+    }
+
+    /// Replicas place hosts without coordinating, so this interleaving
+    /// leaves one replica a host above its share.
+    #[test]
+    fn interleaved_arrivals_can_leave_a_replica_one_above_its_share() {
+        let replicas = ["gw-0", "gw-1", "gw-2"];
+        let ring = GatewayRing::new(replicas);
+        let spreads: Vec<_> = replicas
+            .iter()
+            .map(|_| SupervisorSpread::default())
+            .collect();
+        let mut hosts: Vec<_> = (0..3).map(|i| (i, 0, false)).collect();
+
+        for member in [2, 2, 1, 1, 0, 1] {
+            let (at, hops, accepted) = &mut hosts[member];
+            assert!(!*accepted);
+            match spreads[*at].route(&ring, replicas[*at], &format!("sup-{member}"), *hops < 2) {
+                Some(next) => {
+                    *at = replicas.iter().position(|id| *id == next).unwrap();
+                    *hops += 1;
+                }
+                None => *accepted = true,
+            }
+        }
+        assert!(hosts.iter().all(|(_, _, accepted)| *accepted));
+        let mut counts = [0; 3];
+        for (at, _, _) in hosts {
+            counts[at] += 1;
+        }
+        assert_eq!(counts, [1, 2, 0]);
     }
 }
