@@ -57,6 +57,10 @@ For durable retention, collect supervisor output or files and workload container
 
 The gateway's separate `ocsf_log` configuration writes gateway-produced OCSF events to JSONL. It does not persist supervisor log lines received over gRPC or main process output.
 
+## Console Colors
+
+The gateway and compute drivers color their console logs only when the output stream is a terminal that renders ANSI, so logs collected from containers and services are plain text. Set `NO_COLOR` to any non-empty value to disable color on a terminal, or `FORCE_COLOR` to keep it when piping output.
+
 ## Loss Awareness and Resume
 
 The watch stream behind `openshell logs` is loss-aware. Each resumable event (log line or platform event) carries an opaque `cursor` token. Status snapshots and warnings carry an empty cursor.
