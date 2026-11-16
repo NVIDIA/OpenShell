@@ -77,7 +77,9 @@ Its Lean specification and proofs are in `ai-openshell/cedar-spec`.
 
 ## Integration
 
-- `openshell-policy` validates Cedar sources behind its opt-in `cedar`
+- `openshell-policy-cedar-adapter` converts Cedar analysis to filesystem grants,
+  TLS inspection checks, and MCP inventory without depending on shared policy
+  composition. `openshell-policy` validates Cedar sources behind its opt-in `cedar`
   feature. This crate is linked only when `openshell-gateway` and
   `openshell-supervisor` are built with their `cedar` feature. Release Dev
   builds enable it; source builds opt in with `--features experimental`. Stable and
@@ -198,8 +200,8 @@ Its Lean specification and proofs are in `ai-openshell/cedar-spec`.
   enforcing decision.
 - `CedarOnlyEngine` attaches a `CedarDestination` to each allowed
   connection's `EgressAuthorization`. It replaces the YAML destination modes
-  below the host gateway aliases: every resolved address must avoid the
-  always-blocked ranges, lie in the ranges of every allowing permit that has
+  below the host gateway aliases. Networking enforces always-blocked ranges
+  before backend policy; every remaining address must lie in the ranges of every allowing permit that has
   them, and pass a Cedar evaluation with `destination_ip` set; a private
   address also needs a permit that names the host exactly or only ranged
   permits. Control-plane ports are blocked unless only public-only permits

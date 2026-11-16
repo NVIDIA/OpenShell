@@ -36,7 +36,10 @@ backend once at startup. `opa::OpaEngine` implements the YAML backend here;
 
 The proxy, relay, and policy DNS use shared decisions and generation guards.
 An admitted connection carries an opaque destination authorizer that checks
-resolved addresses against the same policy snapshot. Reloads stage and commit
+resolved addresses against the same policy snapshot. Networking applies its
+always-blocked address checks before the authorizer and blocks control-plane
+ports for IP literals independently of the backend. Explicit trusted gateway
+aliases retain their pinned validation. Reloads stage and commit
 through the backend contract, preserving atomic policy, middleware, and
 credential publication without inspecting concrete engine variants.
 

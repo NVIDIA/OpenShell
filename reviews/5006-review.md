@@ -38,6 +38,31 @@ branch. Its local debug supervisor image used the distroless C++ base to supply
 view check now verifies structured middleware data instead of an absent text
 heading.
 
+## Boundary follow-up
+
+The shared policy facade now dispatches Cedar validation through
+`openshell-policy-cedar-adapter`, which owns message conversion, TLS inspection
+analysis, and MCP inventory. Runtime-only protocol and provider-rule translation
+live in `openshell-policy-cedar-runtime`. Shared policy APIs expose no concrete
+Cedar engine types.
+
+Networking enforces always-blocked addresses and IP-literal control-plane port
+restrictions before consulting backend authorizers, including transparent pinned
+addresses. Explicit trusted gateway modes retain their existing exceptions.
+
+`rust:verify:cedar-off` checks default product dependency graphs, compiles the
+gateway and supervisor, and runs YAML policy and unsupported-Cedar tests. Branch
+Checks runs it in the Linux x86_64 Rust test job, separately from workspace
+feature unification. Standalone example/testkit lockfiles include the extracted
+primitives crate.
+
+Local verification passes: 2,911 affected Rust library tests plus the direct
+transparent-address regression, 292 policy tests and 18 unsupported-Cedar tests
+without Cedar, strict Clippy across affected crates,
+and all 39 Docker Cedar checks with freshly built gateway, supervisor, CLI, and
+static sandbox binaries. The Docker supervisor image uses the distroless C++
+base to supply `libgcc_s`; production defaults are unchanged.
+
 ## Recommendation
 
 Refactor the boundaries before merging. The two Cedar crates are a good start,

@@ -860,7 +860,7 @@ impl CedarOnlyEngine {
     ///
     /// Returns an error if the engine lock is poisoned.
     pub fn effective_filesystem(&self) -> Result<openshell_policy::EffectiveFilesystem> {
-        Ok(openshell_policy::cedar::engine_filesystem(
+        Ok(openshell_policy_cedar_adapter::engine_filesystem(
             &self.read_engine()?.cedar,
         ))
     }

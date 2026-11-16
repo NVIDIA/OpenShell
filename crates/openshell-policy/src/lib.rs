@@ -10,7 +10,7 @@
 //! runtime protobuf model and owns runtime-dependent validation.
 
 #[cfg(feature = "cedar")]
-pub mod cedar;
+mod cedar;
 mod compose;
 pub mod endpoint_status;
 mod l7_validate;
@@ -1940,12 +1940,9 @@ fn validate_cedar_policy_source(
     }
     #[cfg(feature = "cedar")]
     {
-        cedar::validate(policy.cedar_source(), &policy.endpoint_settings, violations).map_or_else(
-            ValidationOutput::default,
-            |engine| ValidationOutput {
-                warnings: engine.warnings().iter().map(ToString::to_string).collect(),
-            },
-        )
+        ValidationOutput {
+            warnings: cedar::validate(policy.cedar_source(), &policy.endpoint_settings, violations),
+        }
     }
     #[cfg(not(feature = "cedar"))]
     {
@@ -2423,30 +2420,7 @@ fn endpoint_setting_rejected_fields(
         .collect()
 }
 
-/// Returns the ports an endpoint selector lists, as written: `ports`, or else
-/// the singular `port`, even when it is unset (0).
-#[must_use]
-pub fn selector_ports(endpoint: &NetworkEndpoint) -> &[u32] {
-    if endpoint.ports.is_empty() {
-        std::slice::from_ref(&endpoint.port)
-    } else {
-        &endpoint.ports
-    }
-}
-
-/// Returns the ports an endpoint selector covers: [`selector_ports`]
-/// without an unset singular `port`.
-#[must_use]
-pub fn effective_endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
-    if endpoint.ports.is_empty() {
-        (endpoint.port != 0)
-            .then_some(endpoint.port)
-            .into_iter()
-            .collect()
-    } else {
-        endpoint.ports.clone()
-    }
-}
+pub use openshell_core::policy_l7::{effective_endpoint_ports, selector_ports};
 
 /// Validates an explicit process identity.
 ///

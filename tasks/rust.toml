@@ -102,3 +102,7 @@ run = [
   # Guard: webpki-root-certs must not appear either (webpki-roots re-exports it).
   "bash -c 'if cargo tree -p openshell-supervisor -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then echo \"ERROR: webpki-root-certs found in system CA roots build\" >&2; exit 1; fi'",
 ]
+
+["rust:verify:cedar-off"]
+description = "Check default gateway and supervisor builds and policy tests without Cedar"
+run = "bash tasks/scripts/verify-cedar-off.sh"

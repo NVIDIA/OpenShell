@@ -707,3 +707,28 @@ pub struct EffectiveFilesystem {
     /// only for grants derived from the policy text.
     pub needs_proxy_baseline: bool,
 }
+
+/// Returns the ports an endpoint selector lists, as written: `ports`, or else
+/// the singular `port`, even when it is unset (0).
+#[must_use]
+pub fn selector_ports(endpoint: &crate::proto::NetworkEndpoint) -> &[u32] {
+    if endpoint.ports.is_empty() {
+        std::slice::from_ref(&endpoint.port)
+    } else {
+        &endpoint.ports
+    }
+}
+
+/// Returns the ports an endpoint selector covers: [`selector_ports`]
+/// without an unset singular `port`.
+#[must_use]
+pub fn effective_endpoint_ports(endpoint: &crate::proto::NetworkEndpoint) -> Vec<u32> {
+    if endpoint.ports.is_empty() {
+        (endpoint.port != 0)
+            .then_some(endpoint.port)
+            .into_iter()
+            .collect()
+    } else {
+        endpoint.ports.clone()
+    }
+}

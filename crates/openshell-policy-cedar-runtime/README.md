@@ -9,3 +9,7 @@ The supervisor's `policy_runtime` composition module constructs this backend
 only with the `cedar` feature. Networking receives the shared policy handle and
 does not select or inspect a Cedar implementation. The gateway's policy
 validation remains composed through `openshell-policy`.
+
+Shared Cedar-to-message analysis lives in `openshell-policy-cedar-adapter`.
+The shared policy facade performs format dispatch and common validation;
+runtime-only protocol and provider translation remain here.

@@ -164,7 +164,7 @@ pub(crate) fn build_validation_plan(
 /// host. Only a public-only connection may use them. A provider endpoint's
 /// `allowed_ips` block them too, as they do for a YAML provider endpoint.
 pub(crate) fn policy_blocks_control_plane(policy: &DestinationPolicy, host: &str) -> bool {
-    policy.blocks_control_plane(host)
+    normalize_host_lookup_key(host).parse::<IpAddr>().is_ok() || policy.blocks_control_plane(host)
 }
 
 /// Returns whether sandbox `/etc/hosts` entries may resolve a policy-backed
@@ -183,6 +183,21 @@ fn policy_address_binding(policy: &DestinationPolicy) -> AddressBinding {
     } else {
         AddressBinding::NameAuthorized
     }
+}
+
+/// Apply networking's address-safety floor before backend-specific policy.
+/// Trusted gateway exceptions use their explicit pinned modes instead.
+pub(crate) fn policy_address_rejection(
+    policy: &DestinationPolicy,
+    host: &str,
+    ip: IpAddr,
+) -> Option<String> {
+    if is_always_blocked_ip(ip) {
+        return Some(format!(
+            "{host} resolves to always-blocked address {ip}, connection rejected"
+        ));
+    }
+    policy.rejection(host, ip)
 }
 
 /// Checks every resolved address of a policy-backed sandbox's connection, rejecting
@@ -206,7 +221,7 @@ pub(crate) fn validate_policy_resolved_addrs(
     }
     addrs
         .iter()
-        .find_map(|addr| policy.rejection(host, addr.ip()))
+        .find_map(|addr| policy_address_rejection(policy, host, addr.ip()))
         .map_or(Ok(()), Err)
 }
 
@@ -336,7 +351,7 @@ pub(crate) fn filter_resolved_addresses(
             AddressAuthorization::PinnedResolved(pinned) if !pinned.contains(&ip) => Some(format!(
                 "{host} resolves to unpinned address {ip}, connection rejected"
             )),
-            AddressAuthorization::Policy(policy) => policy.rejection(host, ip),
+            AddressAuthorization::Policy(policy) => policy_address_rejection(policy, host, ip),
             AddressAuthorization::DefaultPublicOnly
             | AddressAuthorization::ExactDeclaredHost
             | AddressAuthorization::PinnedResolved(_) => None,
@@ -497,6 +512,128 @@ mod tests {
             sandbox_entrypoint_pid: 0,
             plan,
         }
+    }
+
+    #[derive(Debug)]
+    struct PermissivePolicy;
+
+    impl openshell_policy_runtime_interface::ResolvedAddressPolicy for PermissivePolicy {
+        fn rejection(&self, _host: &str, _ip: IpAddr) -> Option<String> {
+            None
+        }
+        fn blocks_control_plane(&self, _host: &str) -> bool {
+            false
+        }
+        fn ip_constrained(&self) -> bool {
+            false
+        }
+        fn allows_gateway(&self, _ip: IpAddr) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_authorization_cannot_override_network_address_restrictions() {
+        let policy = DestinationPolicy::new(PermissivePolicy);
+        let plan = DestinationValidationPlan {
+            address_authorization: AddressAuthorization::Policy(Box::new(policy.clone())),
+        };
+        for address in [
+            "127.0.0.1",
+            "::1",
+            "169.254.169.254",
+            "fe80::1",
+            "0.0.0.0",
+            "::",
+        ] {
+            let ip: IpAddr = address.parse().unwrap();
+            assert!(
+                policy_address_rejection(&policy, "example.test", ip).is_some(),
+                "{ip}"
+            );
+            assert!(
+                validate_policy_resolved_addrs(
+                    &policy,
+                    "example.test",
+                    443,
+                    &[SocketAddr::new(ip, 443)]
+                )
+                .is_err(),
+                "{ip}"
+            );
+            assert!(
+                filter_resolved_addresses(&plan, "example.test", 443, &[ip]).is_err(),
+                "{ip}"
+            );
+            assert!(
+                validate_destination(request(address, &plan)).await.is_err(),
+                "{ip}"
+            );
+        }
+        let public: IpAddr = "203.0.113.7".parse().unwrap();
+        let private: IpAddr = "10.1.2.3".parse().unwrap();
+        let blocked: IpAddr = "169.254.169.254".parse().unwrap();
+        assert_eq!(
+            filter_resolved_addresses(&plan, "example.test", 443, &[blocked, public, private])
+                .unwrap(),
+            vec![public, private]
+        );
+        for host in ["10.1.2.3", "10.1.2.3.", "[fd00::1]"] {
+            assert!(
+                validate_policy_resolved_addrs(
+                    &policy,
+                    host,
+                    10250,
+                    &[SocketAddr::new(private, 10250)]
+                )
+                .is_err(),
+                "{host}"
+            );
+            assert!(
+                filter_resolved_addresses(&plan, host, 10250, &[private]).is_err(),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn transparent_pinned_addresses_keep_the_network_safety_floor() {
+        use super::super::egress::{
+            EgressDecision, EgressIntent, EndpointDecision, ProcessIdentityEvidence,
+        };
+        let mut decision = EgressDecision {
+            intent: EgressIntent::transparent_tcp("example.test".into(), 443),
+            action: crate::policy_types::NetworkAction::Allow {
+                matched_policy: None,
+            },
+            policy_generation: 0,
+            engine: "test",
+            identity: ProcessIdentityEvidence::Available,
+            endpoint: EndpointDecision {
+                destination_policy: Some(DestinationPolicy::new(PermissivePolicy)),
+                ..EndpointDecision::default()
+            },
+            binary: None,
+            binary_pid: None,
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        };
+        let public: IpAddr = "203.0.113.7".parse().unwrap();
+        let private: IpAddr = "10.1.2.3".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let metadata: IpAddr = "169.254.169.254".parse().unwrap();
+        assert_eq!(
+            super::super::policy_admitted_addresses(
+                &decision,
+                443,
+                vec![loopback, public, metadata, private]
+            ),
+            vec![public, private]
+        );
+        decision.intent.destination.host = "10.1.2.3".into();
+        assert!(
+            super::super::policy_admitted_addresses(&decision, 10250, vec![private]).is_empty()
+        );
     }
 
     /// Regression test: the shared upstream dial boundary sets `TCP_NODELAY`.

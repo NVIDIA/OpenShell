@@ -329,6 +329,13 @@ jobs:
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/testkit/Cargo.toml
 
+      - name: Verify policy builds without Cedar
+        if: matrix.system == 'x86_64-linux'
+        shell: nix develop -c bash -euo pipefail {0}
+        env:
+          OPENSHELL_TELEMETRY_ENABLED: "false"
+        run: bash tasks/scripts/verify-cedar-off.sh
+
   rust-postgres-test:
     name: Rust PostgreSQL tests
     needs: pr_metadata

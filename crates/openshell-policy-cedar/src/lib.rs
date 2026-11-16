@@ -82,7 +82,7 @@ const PROCESS_GROUP_ATTR: &str = "group";
 
 /// The input to one `Sandbox::Action::"NetworkConnect"` authorization.
 ///
-/// Mirrors the fields `openshell_supervisor_network::policy_types::NetworkInput`
+/// Mirrors the fields `openshell_policy_runtime_interface::policy_types::NetworkInput`
 /// supplies to a policy engine. No request has been read at CONNECT time, so
 /// the `NetworkConnect` context has no `method`, `path`, or `command`; a
 /// policy that reads them on this action fails validation.
@@ -183,7 +183,7 @@ impl L7Evaluation {
 ///
 /// Evaluated per request within a connection that `NetworkConnect` already
 /// permitted.
-/// Mirrors the fields `openshell_supervisor_network::l7::relay::L7EvalContext`
+/// Mirrors the fields `openshell_policy_runtime_interface::L7PolicyContext`
 /// / `L7RequestInfo` supply, narrowed to what the `Sandbox::HttpRequest`
 /// Cedar action declares in its schema. Fields that do not apply to a
 /// request's protocol keep their default (`""`, `false`, or empty).

@@ -2126,13 +2126,12 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "glob",
- "ipnet",
  "jsonwebtoken",
  "miette",
  "nix",
  "openshell-crypto",
  "openshell-extension-core",
+ "openshell-policy-primitives",
  "openshell-policy-schema",
  "prost",
  "prost-types",
@@ -2194,6 +2193,14 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+]
+
+[[package]]
+name = "openshell-policy-primitives"
+version = "0.0.0"
+dependencies = [
+ "glob",
+ "ipnet",
 ]
 
 [[package]]

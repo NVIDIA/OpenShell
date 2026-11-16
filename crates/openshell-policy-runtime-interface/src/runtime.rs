@@ -32,7 +32,12 @@ pub struct L7PolicyContext {
 }
 
 /// An immutable address authorizer captured with an egress decision.
+///
 /// Implementations must evaluate against that decision's policy generation.
+/// Networking always rejects loopback, link-local, metadata, and unspecified
+/// addresses before calling `rejection`. Explicit proxy host-gateway aliases
+/// use separate pinned validation and `allows_gateway`. A backend may further
+/// restrict addresses; it cannot relax networking's safety floor.
 pub trait ResolvedAddressPolicy: fmt::Debug + Send + Sync {
     fn rejection(&self, host: &str, ip: IpAddr) -> Option<String>;
     fn blocks_control_plane(&self, host: &str) -> bool;

@@ -36,6 +36,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-policy-runtime-interface/` | Policy runtime interface | Engine-neutral decisions, request metadata, snapshots, and staged reload contracts |
 | `crates/openshell-policy-cedar/` | Cedar policy engine | Validation, Landlock/L7/DNS derivation, and evaluation for Cedar-authored sandbox policies; linked only with the gateway and supervisor `cedar` feature (development builds) |
 | `crates/openshell-policy-cedar-schema/` | Cedar policy schema | Canonical Cedar schema and entity, action, and context names; linked only with the `cedar` feature |
+| `crates/openshell-policy-cedar-adapter/` | Cedar message adapter | Cedar analysis, filesystem grants, and endpoint inventory shared by gateway and runtime composition |
 | `crates/openshell-policy-cedar-runtime/` | Cedar runtime adapter | Implements the policy runtime contracts; selected by supervisor composition with the `cedar` feature |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |

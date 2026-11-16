@@ -1886,12 +1886,11 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
- "glob",
- "ipnet",
  "miette",
  "nix",
  "openshell-crypto",
  "openshell-extension-core",
+ "openshell-policy-primitives",
  "openshell-policy-schema",
  "prost",
  "prost-types",
@@ -1942,6 +1941,14 @@ dependencies = [
  "tokio",
  "tonic",
  "tower",
+]
+
+[[package]]
+name = "openshell-policy-primitives"
+version = "0.0.0"
+dependencies = [
+ "glob",
+ "ipnet",
 ]
 
 [[package]]

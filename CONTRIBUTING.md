@@ -311,6 +311,12 @@ The normal Rust workspace build, check, lint, and test tasks enable the
 `--features experimental` to select it in direct Cargo builds; Cargo's `dev` profile
 does not enable it automatically. Prerelease and stable builds leave it off.
 
+`mise run rust:verify:cedar-off` checks the default gateway and supervisor
+package graphs and builds, YAML policy tests, and Cedar rejection tests without
+`experimental`. Run it when changing policy backend selection or feature wiring.
+Workspace builds select the Cedar runtime member and unify its shared policy
+features, so use per-package checks to verify that Cedar is excluded.
+
 On this branch, the development bundle includes Cedar. Build the gateway and
 supervisor with `--features experimental`, or use published Release Dev artifacts.
 
@@ -389,6 +395,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
 | `crates/openshell-policy-cedar/` | Validation and evaluation for Cedar-authored sandbox policies, enabled by the `cedar` feature and included in the development `experimental` feature |
 | `crates/openshell-policy-cedar-schema/` | Canonical Cedar schema and entity, action, and context names, linked only with the `cedar` feature |
+| `crates/openshell-policy-cedar-adapter/` | Cedar analysis adapted to policy messages for gateway and runtime composition |
 | `crates/openshell-policy-cedar-runtime/` | Cedar implementation of the shared runtime contracts, selected by supervisor composition |
 | `crates/openshell-policy-runtime-interface/` | Shared policy decisions, request metadata, snapshots, and staged reload contracts; no engine implementations |
 | `crates/openshell-policy-primitives/` | Pure host, path, and IP semantics with no protobuf or transport dependencies |

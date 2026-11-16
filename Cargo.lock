@@ -5217,7 +5217,7 @@ dependencies = [
  "hickory-proto",
  "miette",
  "openshell-core",
- "openshell-policy-cedar",
+ "openshell-policy-cedar-adapter",
  "openshell-policy-schema",
  "prost-types",
  "serde",
@@ -5241,6 +5241,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-policy-cedar-adapter"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "openshell-core",
+ "openshell-policy-cedar",
+]
+
+[[package]]
 name = "openshell-policy-cedar-runtime"
 version = "0.0.0"
 dependencies = [
@@ -5251,6 +5260,7 @@ dependencies = [
  "openshell-ocsf",
  "openshell-policy",
  "openshell-policy-cedar",
+ "openshell-policy-cedar-adapter",
  "openshell-policy-runtime-interface",
  "openshell-supervisor-middleware",
  "serde_json",

@@ -1121,40 +1121,40 @@ fn pinned_transparent_plan(
         std::time::Instant::now(),
     )?;
     let addresses =
-        cedar_admitted_addresses(decision, destination.port(), mapping.pinned_addresses());
+        policy_admitted_addresses(decision, destination.port(), mapping.pinned_addresses());
     build_pinned_validation_plan(addresses).map_err(|_| MappingLookupError::InvalidMapping)
 }
 
-/// Keeps the pinned policy DNS addresses a Cedar sandbox's decision admits.
+/// Keeps the pinned policy DNS addresses admitted by the decision's authorizer.
 ///
 /// Policy DNS pins addresses per endpoint record, without the requesting
-/// process; a Cedar connection also needs every pinned address it dials to
-/// pass its own destination rules, which can name the process and forbid
-/// addresses. YAML decisions keep every pinned address.
-fn cedar_admitted_addresses(
+/// process; a connection with an address authorizer must also pass its
+/// destination rules and the networking address-safety floor. Decisions
+/// without an authorizer keep the addresses policy DNS already validated.
+fn policy_admitted_addresses(
     decision: &EgressDecision,
     port: u16,
     addresses: Vec<IpAddr>,
 ) -> Vec<IpAddr> {
-    let Some(cedar) = decision.endpoint.destination_policy.as_ref() else {
+    let Some(policy) = decision.endpoint.destination_policy.as_ref() else {
         return addresses;
     };
     let host = &decision.intent.destination.host;
     if BLOCKED_CONTROL_PLANE_PORTS.contains(&port)
-        && destination::policy_blocks_control_plane(cedar, host)
+        && destination::policy_blocks_control_plane(policy, host)
     {
         return Vec::new();
     }
     addresses
         .into_iter()
         .filter(|ip| {
-            let rejection = cedar.rejection(host, *ip);
+            let rejection = destination::policy_address_rejection(policy, host, *ip);
             // Plumbing, not a decision event: the connection still dials
             // the admitted addresses, and its decision is logged on its own.
             // A caller left with no address reports the denial as OCSF, and
             // policy DNS drops answers YAML `allowed_ips` reject the same way.
             if let Some(reason) = &rejection {
-                debug!(host, %ip, reason, "Cedar destination rules dropped a pinned address");
+                debug!(host, %ip, reason, "Policy destination rules dropped a pinned address");
             }
             rejection.is_none()
         })
@@ -1428,13 +1428,13 @@ async fn handle_transparent_tcp_connection(
         .map_err(|error| {
             miette::miette!("transparent TCP pinned destination is invalid: {error}")
         })?;
-    let admitted = cedar_admitted_addresses(
+    let admitted = policy_admitted_addresses(
         &decision,
         port,
         connector.addrs().iter().map(SocketAddr::ip).collect(),
     );
     if admitted.is_empty() {
-        let reason = "no pinned address passed the Cedar destination rules";
+        let reason = "no pinned address passed the policy destination rules";
         emit_transparent_policy_denial(&decision, workload_addr, &host, port);
         emit_denial(
             &denial_tx,

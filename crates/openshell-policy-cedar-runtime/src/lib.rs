@@ -11,5 +11,6 @@ pub mod cedar_provider_rules;
 pub use cedar_only::CedarOnlyEngine;
 
 mod backend;
+mod protocol;
 
 pub use openshell_policy::runtime_validation as policy_validation;

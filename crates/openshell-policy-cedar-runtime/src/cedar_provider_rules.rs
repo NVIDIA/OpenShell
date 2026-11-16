@@ -5,18 +5,20 @@
 //!
 //! The gateway delivers attached providers' rules to a Cedar sandbox in
 //! `provider_credential_rules`, with each endpoint stamped with the owner of
-//! its token grants. `openshell_policy::cedar` validates them and compiles
-//! them to Cedar; this module supplies the sandbox-specific preparation in
-//! between: symlinked binaries resolved in the sandbox, and the protocol
-//! spellings, L7 checks, MCP tool aliases, and access presets the YAML engine
-//! applies when it loads the same rules. No Rego is involved.
+//! its token grants. This module validates and normalizes those rules,
+//! resolves binary symlinks in the sandbox, and compiles them to Cedar.
+//! Normalization applies the same protocol spellings, L7 checks, MCP tool
+//! aliases, and access presets as the YAML engine. No Rego is involved.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::BuildHasher;
 
 use miette::Result;
 use openshell_core::proto::{NetworkPolicyRule, SandboxPolicy as ProtoSandboxPolicy};
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
-use openshell_policy_cedar::TokenGrantRules;
+use openshell_policy_cedar::{
+    ProviderEndpoint, ProviderPolicy, RuleMatcher, TokenGrantRules, ValueMatcher,
+};
 use serde_json::Value;
 
 use crate::policy_data::{
@@ -33,15 +35,15 @@ use crate::policy_data::{
 ///
 /// Returns an error when the rules fail the validation a YAML sandbox
 /// applies to them, or the generated Cedar does not load.
-pub fn compile<S: std::hash::BuildHasher>(
+pub fn compile<S: BuildHasher>(
     rules: &HashMap<String, NetworkPolicyRule, S>,
     entrypoint_pid: u32,
 ) -> Result<Option<TokenGrantRules>> {
-    let Some(policy) = openshell_policy::cedar::provider_token_grant_policy(rules)? else {
+    let Some(policy) = provider_token_grant_policy(rules)? else {
         return Ok(None);
     };
     let data = normalized_rules(&policy, entrypoint_pid)?;
-    let compiled = openshell_policy::cedar::compile_provider_token_grants(&data)?;
+    let compiled = compile_provider_token_grants(&data)?;
     report(&compiled);
     Ok(Some(compiled))
 }
@@ -123,6 +125,167 @@ fn report(compiled: &TokenGrantRules) {
             ))
             .build()
     );
+}
+
+/// Validates the provider credential rules of a Cedar sandbox as a YAML
+/// sandbox validates its provider rules.
+///
+/// Returns `None` when no endpoint carries a token-grant owner, since the
+/// rules are compiled only for token-grant owner selection.
+///
+/// # Errors
+///
+/// Returns an error when the rules fail policy validation or have ambiguous
+/// endpoint selectors.
+fn provider_token_grant_policy<S: BuildHasher>(
+    rules: &HashMap<String, NetworkPolicyRule, S>,
+) -> Result<Option<ProtoSandboxPolicy>> {
+    let stamped = rules
+        .values()
+        .flat_map(|rule| &rule.endpoints)
+        .any(|endpoint| !endpoint.token_grant_owner.is_empty());
+    if !stamped {
+        return Ok(None);
+    }
+    let policy = openshell_policy::validate_and_canonicalize_sandbox_policy(ProtoSandboxPolicy {
+        network_policies: rules
+            .iter()
+            .map(|(name, rule)| (name.clone(), rule.clone()))
+            .collect(),
+        ..Default::default()
+    })
+    .map_err(|error| {
+        miette::miette!(
+            "provider credential rules failed validation ({} violations)",
+            error.violations().len()
+        )
+    })?;
+    let ambiguities = openshell_policy::find_endpoint_ambiguities(&policy);
+    if !ambiguities.is_empty() {
+        return Err(miette::miette!(
+            "provider credential rules have {} ambiguous endpoint selectors",
+            ambiguities.len()
+        ));
+    }
+    Ok(Some(policy))
+}
+
+/// Compiles provider rules to Cedar for token-grant owner selection.
+///
+/// `data` holds the rules of [`provider_token_grant_policy`] normalized as
+/// the sandbox's Rego engine reads them: `{"network_policies": {name:
+/// {"binaries": [{"path": ...}], "endpoints": [...]}}}`, with protocols,
+/// rule aliases, and access presets already expanded.
+///
+/// # Errors
+///
+/// Returns an error when the generated Cedar does not load.
+fn compile_provider_token_grants(data: &Value) -> Result<TokenGrantRules> {
+    let mut policies: Vec<ProviderPolicy> = data["network_policies"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, policy)| ProviderPolicy {
+            name: name.clone(),
+            binaries: strings(&policy["binaries"], |binary| binary["path"].as_str()),
+            endpoints: policy["endpoints"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(provider_endpoint)
+                .collect(),
+        })
+        .collect();
+    policies.sort_by(|left, right| left.name.cmp(&right.name));
+    TokenGrantRules::compile(&policies)
+        .map_err(|e| miette::miette!("provider credential rules failed to compile: {e}"))
+}
+
+/// Collects the strings `get` reads from each element of `array`.
+fn strings<'a>(array: &'a Value, get: impl Fn(&'a Value) -> Option<&'a str>) -> Vec<String> {
+    array
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(get)
+        .map(str::to_string)
+        .collect()
+}
+
+fn text(value: &Value, key: &str) -> String {
+    value[key].as_str().unwrap_or_default().to_string()
+}
+
+/// Reads one normalized endpoint as the Rego rules read it.
+fn provider_endpoint(endpoint: &Value) -> ProviderEndpoint {
+    ProviderEndpoint {
+        host: text(endpoint, "host"),
+        ports: endpoint["ports"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .filter_map(|port| u16::try_from(port).ok())
+            .collect(),
+        path: text(endpoint, "path"),
+        has_allowed_ips: endpoint["allowed_ips"]
+            .as_array()
+            .is_some_and(|ips| !ips.is_empty()),
+        protocol: text(endpoint, "protocol"),
+        token_grant_owner: text(endpoint, "token_grant_owner"),
+        mcp_allow_all_known_methods: endpoint["mcp_allow_all_known_mcp_methods"]
+            .as_bool()
+            .unwrap_or(false),
+        // Rego reads an allow rule's selectors under `allow`.
+        rules: endpoint["rules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|rule| rule.get("allow"))
+            .map(rule_matcher)
+            .collect(),
+        deny_rules: endpoint["deny_rules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(rule_matcher)
+            .collect(),
+    }
+}
+
+fn rule_matcher(rule: &Value) -> RuleMatcher {
+    let selector = |key: &str| rule.get(key).and_then(Value::as_str).map(str::to_string);
+    RuleMatcher {
+        method: selector("method"),
+        path: selector("path"),
+        command: selector("command"),
+        operation_type: selector("operation_type"),
+        operation_name: selector("operation_name"),
+        fields: strings(&rule["fields"], Value::as_str),
+        query: value_matchers(&rule["query"]),
+        params: value_matchers(&rule["params"]),
+    }
+}
+
+/// Reads matchers as `query_value_matches` does: a string is one glob, and
+/// an object matches its non-empty `glob` or any of its `any` globs.
+fn value_matchers(matchers: &Value) -> BTreeMap<String, ValueMatcher> {
+    matchers
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(key, matcher)| {
+            let mut globs = Vec::new();
+            if let Some(glob) = matcher.as_str() {
+                globs.push(glob.to_string());
+            }
+            if let Some(glob) = matcher["glob"].as_str().filter(|glob| !glob.is_empty()) {
+                globs.push(glob.to_string());
+            }
+            globs.extend(strings(&matcher["any"], Value::as_str));
+            (key.clone(), ValueMatcher { globs })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -243,9 +406,8 @@ mod tests {
             ..Default::default()
         };
         let data = normalized_rules(&policy, 0).expect("normalize provider rules");
-        let actual = openshell_policy::cedar::compile_provider_token_grants(&data)
-            .expect("compile normalized rules");
-        let mut query = std::collections::BTreeMap::from([(
+        let actual = compile_provider_token_grants(&data).expect("compile normalized rules");
+        let mut query = BTreeMap::from([(
             "env".into(),
             ValueMatcher {
                 globs: vec!["prod*".into(), "staging".into()],
@@ -289,7 +451,7 @@ mod tests {
                     mcp_allow_all_known_methods: true,
                     rules: vec![RuleMatcher {
                         method: Some("tools/call".into()),
-                        params: std::collections::BTreeMap::from([(
+                        params: BTreeMap::from([(
                             "name".into(),
                             ValueMatcher {
                                 globs: vec!["read_*".into()],

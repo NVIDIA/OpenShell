@@ -110,7 +110,7 @@ impl LoadedPolicy {
             .flat_map(|rule| &rule.endpoints)
             .chain(&policy.endpoint_settings)
             .filter(|endpoint| {
-                openshell_policy::cedar::tls_skip_inspected_endpoint(&cedar, endpoint, false)
+                openshell_policy_cedar_adapter::tls_skip_inspected_endpoint(&cedar, endpoint, false)
                     .is_some()
             })
             .count();
@@ -136,7 +136,9 @@ impl LoadedPolicy {
             entrypoint_pid,
         )?;
         Ok(Self {
-            mcp_endpoints: openshell_policy::endpoint_status::cedar_mcp_endpoints(policy, &cedar),
+            mcp_endpoints: openshell_policy_cedar_adapter::endpoint_status::cedar_mcp_endpoints(
+                policy, &cedar,
+            ),
             binary_aliases: BinaryAliases::resolve(cedar.binary_alias_paths(), entrypoint_pid),
             binary_globs: BinaryGlobs::compile(&cedar, token_grants.as_ref()),
             cedar,
@@ -998,8 +1000,7 @@ fn provider_config(endpoint: &openshell_core::proto::NetworkEndpoint) -> Endpoin
 /// endpoint is a `websocket` endpoint with `websocket_graphql_policy` set,
 /// which a YAML endpoint gets from its GraphQL operation rules.
 fn apply_inspection(config: &mut EndpointConfig, inspection: L7Endpoint) {
-    config.protocol =
-        EndpointProtocol::L7(openshell_policy::cedar::l7_protocol(inspection.protocol));
+    config.protocol = EndpointProtocol::L7(crate::protocol::l7_protocol(inspection.protocol));
     config.websocket_graphql_policy = inspection.protocol.websocket_graphql_messages();
     config.enforcement = EnforcementSetting::from(inspection.enforcement.as_str());
     if inspection.protocol == L7Protocol::Mcp {
