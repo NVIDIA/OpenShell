@@ -34,7 +34,7 @@ pub const CONTRACT_VERSION: &str = "1.0";
 pub struct ContractConversionError(String);
 
 impl ContractConversionError {
-    pub(super) fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }

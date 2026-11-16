@@ -4530,6 +4530,7 @@ name = "openshell-driver-contract"
 version = "0.0.0"
 dependencies = [
  "openshell-crypto",
+ "openshell-driver-contract",
  "prost",
  "prost-reflect",
  "protoc-bin-vendored",
@@ -5085,6 +5086,7 @@ dependencies = [
  "openshell-binary-identity",
  "openshell-core",
  "openshell-crypto",
+ "openshell-driver-contract",
  "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-policy",
@@ -5282,6 +5284,7 @@ dependencies = [
  "nix 0.29.0",
  "openshell-core",
  "openshell-crypto",
+ "openshell-driver-contract",
  "openshell-extension-core",
  "openshell-isolation-interface",
  "openshell-ocsf",

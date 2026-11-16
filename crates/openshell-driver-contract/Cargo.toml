@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+openshell-driver-contract = { path = ".", features = ["write"] }
 prost-reflect = { workspace = true }
 openshell-crypto = { workspace = true }
 rcgen = { workspace = true }

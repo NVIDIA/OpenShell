@@ -23,6 +23,7 @@
 //! fields and is removed when its replacement has shipped. Readers of the legacy
 //! encoding reject unknown fields, so a writer must not add any.
 
+mod codec;
 pub mod convert;
 pub mod model;
 pub mod proto;
