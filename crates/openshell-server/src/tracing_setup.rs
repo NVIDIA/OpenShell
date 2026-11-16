@@ -63,6 +63,7 @@ where
 
 pub fn install(
     filter_directives: &str,
+    log_format: openshell_core::LogFormat,
     tracing_log_bus: &TracingLogBus,
     ocsf_log: Option<&crate::ocsf_log::OcsfLog>,
     otlp: Option<&OtlpExport>,
@@ -106,11 +107,21 @@ pub fn install(
                     metadata.target() == openshell_ocsf::OCSF_TARGET
                 })),
         )
-        .with(
+        .with((log_format == openshell_core::LogFormat::Text).then(|| {
             tracing_subscriber::fmt::layer()
                 .event_format(GatewayEventFormat)
                 .with_ansi(openshell_core::color::stdout_ansi())
-                .with_filter(filter_from(filter_directives)),
+                .with_filter(filter_from(filter_directives))
+        }))
+        .with(
+            // JSON escapes control characters, so ANSI is never wanted here.
+            (log_format == openshell_core::LogFormat::Json).then(|| {
+                tracing_subscriber::fmt::layer()
+                    .fmt_fields(tracing_subscriber::fmt::format::JsonFields::new())
+                    .event_format(crate::console_json::JsonEventFormat)
+                    .with_ansi(false)
+                    .with_filter(filter_from(filter_directives))
+            }),
         )
         .with(
             tracing_log_bus

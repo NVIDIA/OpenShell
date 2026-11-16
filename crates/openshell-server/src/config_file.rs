@@ -109,6 +109,9 @@ pub struct GatewayFileSection {
     // ── Logging ──────────────────────────────────────────────────────────
     #[serde(default)]
     pub log_level: Option<String>,
+    /// Console log line format: `text` or `json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_format: Option<openshell_core::LogFormat>,
 
     // ── Database ─────────────────────────────────────────────────────────
     /// Connection ceiling for the persistence pool. One shared pool serves
@@ -2870,6 +2873,29 @@ config_delivery_mode = "push"
             r#"
 [openshell.gateway]
 config_delivery_mode = "enabled"
+"#,
+        );
+        assert!(load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn parses_log_format_and_rejects_unknown_value() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+log_format = "json"
+"#,
+        );
+        let file = load(tmp.path()).unwrap();
+        assert_eq!(
+            file.openshell.gateway.log_format,
+            Some(openshell_core::LogFormat::Json)
+        );
+
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+log_format = "logfmt"
 "#,
         );
         assert!(load(tmp.path()).is_err());

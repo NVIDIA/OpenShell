@@ -278,6 +278,8 @@ health_bind_address   = "0.0.0.0:8081"
 metrics_bind_address  = "0.0.0.0:9090"
 
 log_level             = "info"
+# Console log format: "text" (default) or "json" for one JSON object per line.
+log_format            = "text"
 
 # Activate only after retiring incompatible gateways and outstanding driver work.
 enable_sandbox_updates = false
@@ -671,6 +673,28 @@ On Postgres, the gateway holds its mutation advisory locks on a separate lock po
 On Postgres, each replica opens both pools, so plan for `(database_max_connections + database_lock_max_connections) × replicaCount` connections, 14 per replica with the defaults, and keep that total below the server's own `max_connections` (and below any connection-pooler limit in front of it). Rollouts run extra pods; refer to [Size PostgreSQL Connections](/kubernetes/high-availability#size-postgresql-connections). Raising either ceiling past what the server admits moves the failure from a slow acquire to a refused connection.
 
 On SQLite, writers are serialized regardless of pool size, so a larger ceiling buys read concurrency only. A gateway that needs more write throughput wants an external Postgres database (`server.externalDbSecret`), not a larger SQLite pool.
+
+## Console Log Format
+
+`[openshell.gateway] log_format` selects how the gateway writes its console logs to stdout. The default, `text`, writes human-readable lines. `json` writes one JSON object per line, never colored, for log collectors that parse structured entries. The equivalent flag and environment variable are `--log-format` and `OPENSHELL_LOG_FORMAT`, and Helm deployments set `server.logFormat`.
+
+```json
+{"timestamp":"2026-11-16T20:24:07.178513Z","severity":"INFO","message":"Starting OpenShell server","target":"openshell_server::cli","bind":"127.0.0.1:8080"}
+```
+
+Each object has these keys:
+
+| Key | Content |
+|---|---|
+| `timestamp` | RFC 3339 time in UTC. |
+| `severity` | `DEBUG` (for `trace` and `debug`), `INFO`, `WARNING`, or `ERROR`. |
+| `message` | The log message. |
+| `target` | The module that emitted the event. |
+| `spans` | Names of the enclosing spans, outermost first, when there are any. |
+
+Event fields and the fields of enclosing spans appear as further top-level keys. A field whose name matches one of the keys above appears as `field.<name>`. Google Cloud Logging and other collectors that follow its conventions map `timestamp`, `severity`, and `message` to the log entry's metadata.
+
+Gateway OCSF events put their shorthand in `message` and the full OCSF record in an `ocsf` object. Their `severity` follows the OCSF severity: Informational is `INFO`, Low is `NOTICE`, Medium is `WARNING`, High is `ERROR`, Critical is `CRITICAL`, and Fatal is `ALERT`.
 
 ## OCSF JSONL Output
 
