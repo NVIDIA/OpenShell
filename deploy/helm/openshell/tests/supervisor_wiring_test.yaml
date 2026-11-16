@@ -104,7 +104,7 @@ tests:
             name: supervisor-token
             secret:
               secretName: openshell-supervisor-token
-  - it: omits the gateway admin socket when delegation is disabled
+  - it: mounts the Workload API through CSI without hostPath when broker identity is disabled
     template: templates/statefulset.yaml
     set:
       gatewayConfig:
