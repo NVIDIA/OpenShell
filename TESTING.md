@@ -275,35 +275,9 @@ per family when the `test:e2e` label is set, and a failure fails the Core E2E
 result. Release Dev and Release Qualification run the conformance and feature
 families. To run a suite in another environment on CI, add a row.
 
-### Conformance with gateway config push
-
-The `ubuntu-docker-rootful-config-push` environment runs the gateway with
-`config_delivery_mode = "push"`, so supervisors receive configuration over
-their session instead of polling for it. Its setup playbook,
-`tests/tmachine/ansible/playbooks/config-push.yaml`, adds the setting to the
-environment's gateway overrides (see
-[Gateway overrides in an environment](#gateway-overrides-in-an-environment)),
-which k3s installers ignore.
-
-A push gateway lets a supervisor without push support keep polling, so the
-conformance suite passes either way. The `config-push` feature suite
-(`tests/suites/features/config-push`) fails unless a new sandbox's supervisor
-reports a pushed-configuration session. CI runs both in the environment:
-
-```shell
-nix run .#openshell-test-runner -- run \
-  --environment ubuntu-docker-rootful-config-push --installer deb \
-  --family conformance --package conformance
-nix run .#openshell-test-runner -- run \
-  --environment ubuntu-docker-rootful-config-push --installer deb \
-  --family features --package config-push
-```
-
-Without KVM, run both against a local Docker gateway in push mode:
-
-```shell
-mise run e2e:testkit:push
-```
+CI also runs the conformance family in `ubuntu-docker-rootful-config-push`,
+whose gateway pushes configuration to supervisors. The `config-push` feature
+suite runs there too and fails if push is not in use.
 
 ### Adding a feature suite
 
