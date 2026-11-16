@@ -17,6 +17,16 @@ Manual admission does not change the bot's automatic trust policy for ready PRs.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
+### Monitoring dashboards
+
+`Monitoring Mixin` runs in Branch Checks when files under
+`deploy/openshell-mixin/` change relative to the PR or merge queue base. It skips
+unrelated changes. Manual Branch Checks runs always include this check.
+The job runs `mise run monitoring:check` to install locked Grafonnet dependencies,
+validate formatting and PromQL syntax, test configuration and composition, install
+and render a fresh jsonnet-bundler consumer, and render the dashboards. Use the
+same command locally; dependency installation needs network access.
+
 ### Protobuf API compatibility
 
 `Protobuf Compatibility` runs in Branch Checks and Pre-release through the shared

@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod app_listener;
 pub mod auth;
+pub mod color;
 pub mod compute;
 pub mod config;
 pub mod container_paths;

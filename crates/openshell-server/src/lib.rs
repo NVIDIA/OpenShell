@@ -323,6 +323,9 @@ pub(crate) struct ServerStartupConfig {
 /// Server state shared across handlers.
 #[derive(Debug)]
 pub struct ServerState {
+    pub(crate) discovery: grpc::service_discovery::DiscoveryState,
+    /// Process-local bound on active discovery streams.
+    pub(crate) discovery_watches: Arc<tokio::sync::Semaphore>,
     /// Server configuration.
     pub config: Config,
 
@@ -674,6 +677,8 @@ impl ServerState {
             service_route_index,
             gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
             gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            discovery: grpc::service_discovery::DiscoveryState::default(),
+            discovery_watches: Arc::new(tokio::sync::Semaphore::new(32)),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -1317,6 +1322,7 @@ pub(crate) async fn run_server(
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     grpc::service_advertisement::spawn_cleanup(state.clone(), shutdown_rx.clone());
+    grpc::mutation_replay::spawn_expiry_sweeper(state.clone(), shutdown_rx.clone());
     provider_profile_sources::spawn_refresh(state.clone());
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
@@ -3178,7 +3184,11 @@ mod tests {
                 .iter()
                 .map(|service| service.name.as_str())
                 .collect::<Vec<_>>(),
-            ["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
+            [
+                "openshell.v1.OpenShell",
+                "openshell.v1.SandboxUpdates",
+                "openshell.v1.ServiceDiscovery"
+            ]
         );
 
         stop_listener(shutdown, handle).await;

@@ -200,11 +200,10 @@ fn endpoint_host(
     let base_domain = config.base_domains.first()?;
     Some(discriminator.map_or_else(
         || {
-            if service.is_empty() {
-                format!("{workspace}--{sandbox}.{base_domain}")
-            } else {
-                format!("{workspace}--{sandbox}--{service}.{base_domain}")
-            }
+            format!(
+                "{}.{base_domain}",
+                service_route_readable_label(workspace, sandbox, service)
+            )
         },
         |gateway_name| {
             format!(
@@ -219,6 +218,15 @@ fn endpoint_host(
             )
         },
     ))
+}
+
+/// Readable DNS label shared by discovery and gateway routing.
+pub fn service_route_readable_label(workspace: &str, sandbox: &str, service: &str) -> String {
+    if service.is_empty() {
+        format!("{workspace}--{sandbox}")
+    } else {
+        format!("{workspace}--{sandbox}--{service}")
+    }
 }
 
 /// Returns the stable, one-label DNS name for a service route.

@@ -64,6 +64,12 @@
 #   `vault`; the Rust `credential_drivers` e2e test validates the active
 #   backend. Vault mode installs a dev OpenBao fixture because it exposes the
 #   Vault-compatible API used by the driver.
+#
+# Trace collector fixture:
+#   Set OPENSHELL_E2E_KUBE_JAEGER=1 to deploy a Jaeger collector, point the
+#   gateway's OTLP export at it, and export OPENSHELL_E2E_JAEGER_QUERY_URL for
+#   tests that query the spans it received. Otherwise the gateway exports no
+#   traces.
 
 set -euo pipefail
 
@@ -134,6 +140,11 @@ ADDITIONAL_CA_SERVER_PID=""
 ADDITIONAL_CA_SERVER_LOG="${WORKDIR}/additional-ca-server.log"
 ADDITIONAL_CA_DIR="${WORKDIR}/additional-ca"
 ADDITIONAL_CA_SOURCE_CREATED=0
+JAEGER_FIXTURE_MANIFEST="${ROOT}/e2e/kubernetes/jaeger-fixture.yaml"
+JAEGER_FIXTURE_SERVICE="openshell-e2e-jaeger"
+JAEGER_FIXTURE_DEPLOYED=0
+JAEGER_PORTFORWARD_PID=""
+JAEGER_PORTFORWARD_LOG="${WORKDIR}/portforward-jaeger.log"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -247,6 +258,41 @@ deploy_postgres_fixture() {
     --ignore-not-found >/dev/null 2>&1 || true
   kctl -n "${NAMESPACE}" create secret generic "${secret_name}" \
     --from-literal=uri="${pg_uri}"
+}
+
+deploy_jaeger_fixture() {
+  local values_file="$1"
+
+  echo "Deploying Jaeger trace collector fixture ${JAEGER_FIXTURE_SERVICE}..."
+  kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+  kctl -n "${NAMESPACE}" apply -f "${JAEGER_FIXTURE_MANIFEST}"
+  JAEGER_FIXTURE_DEPLOYED=1
+  kctl -n "${NAMESPACE}" rollout status "deployment/${JAEGER_FIXTURE_SERVICE}" --timeout=120s
+
+  cat >"${values_file}" <<EOF
+gatewayConfig:
+  openshell.gateway.otlp:
+    endpoint: http://${JAEGER_FIXTURE_SERVICE}.${NAMESPACE}.svc.cluster.local:4317
+EOF
+}
+
+start_jaeger_portforward() {
+  local port
+  port="$(e2e_pick_port)"
+  kctl -n "${NAMESPACE}" port-forward "svc/${JAEGER_FIXTURE_SERVICE}" \
+    "${port}:16686" >"${JAEGER_PORTFORWARD_LOG}" 2>&1 &
+  JAEGER_PORTFORWARD_PID=$!
+
+  for _ in $(seq 1 30); do
+    if curl -sf -o /dev/null --connect-timeout 1 "http://127.0.0.1:${port}/api/v3/services"; then
+      export OPENSHELL_E2E_JAEGER_QUERY_URL="http://127.0.0.1:${port}"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: Jaeger query port-forward did not become reachable" >&2
+  cat "${JAEGER_PORTFORWARD_LOG}" >&2 || true
+  return 1
 }
 
 use_envoy_gateway() {
@@ -523,6 +569,7 @@ cleanup() {
 
   stop_gateway_portforward
   e2e_stop_process "${ADDITIONAL_CA_SERVER_PID}" "additional CA HTTPS fixture"
+  e2e_stop_process "${JAEGER_PORTFORWARD_PID}" "Jaeger query port-forward"
 
   if [ "${ADDITIONAL_CA_SOURCE_CREATED}" = "1" ] \
      && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ] \
@@ -590,6 +637,12 @@ cleanup() {
 
   if [ "${VAULT_FIXTURE_DEPLOYED}" = "1" ]; then
     cleanup_vault_fixture
+  fi
+
+  if [ "${JAEGER_FIXTURE_DEPLOYED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
+    kctl -n "${NAMESPACE}" delete -f "${JAEGER_FIXTURE_MANIFEST}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+    JAEGER_FIXTURE_DEPLOYED=0
   fi
 
   if [ "${ENVOY_GATEWAY_CONFIG_APPLIED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
@@ -1492,6 +1545,11 @@ if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
     helm_values_args+=(--values "${values_file}")
   done
 fi
+if [ "${OPENSHELL_E2E_KUBE_JAEGER:-0}" = "1" ]; then
+  JAEGER_VALUES="${WORKDIR}/jaeger-values.yaml"
+  deploy_jaeger_fixture "${JAEGER_VALUES}"
+  helm_values_args+=(--values "${JAEGER_VALUES}")
+fi
 if use_envoy_gateway; then
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
   install_envoy_gateway
@@ -1601,6 +1659,9 @@ else
 
   start_health_portforward || exit 1
   wait_for_shared_supervisors || exit 1
+  if [ "${JAEGER_FIXTURE_DEPLOYED}" = "1" ]; then
+    start_jaeger_portforward || exit 1
+  fi
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_E2E_DRIVER="kubernetes"

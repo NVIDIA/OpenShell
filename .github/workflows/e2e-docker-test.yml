@@ -25,10 +25,6 @@ on:
         required: false
         type: boolean
         default: false
-      external-driver-binary:
-        required: false
-        type: string
-        default: ""
       suite-matrix:
         required: false
         type: string
@@ -77,11 +73,6 @@ jobs:
       - uses: ./.github/actions/setup-e2e-gateway
         with:
           artifact-name: ${{ inputs.gateway-artifact }}
-
-      - if: inputs.external-driver-binary != ''
-        uses: ./.github/actions/setup-e2e-driver
-        with:
-          binary: ${{ inputs.external-driver-binary }}
 
       - name: Check out MCP conformance tests
         if: matrix.mcp
