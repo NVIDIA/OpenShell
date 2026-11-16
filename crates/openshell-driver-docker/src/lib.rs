@@ -34,6 +34,11 @@ use openshell_container_runtime::gpu::{
     validate_cdi_gpu_device_request,
 };
 use openshell_container_runtime::proto_struct::deserialize_optional_non_empty_string_list;
+use openshell_driver_contract::ResolvedWorkloadIdentity;
+use openshell_driver_contract::{
+    BoundaryConfig, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
+    SandboxTlsServerConfig, generate_sandbox_tls_material,
+};
 use openshell_driver_sdk::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_driver_sdk::driver_mounts;
 use openshell_driver_sdk::driver_utils::{
@@ -42,11 +47,6 @@ use openshell_driver_sdk::driver_utils::{
     SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED,
 };
 use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
-use openshell_driver_sdk::legacy_contract::ResolvedWorkloadIdentity;
-use openshell_driver_sdk::legacy_contract::{
-    BoundaryConfig, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
-    SandboxTlsServerConfig, generate_sandbox_tls_material,
-};
 use openshell_driver_sdk::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -127,10 +127,9 @@ const SUPERVISOR_PROXY_CA_BUNDLE_MOUNT_PATH: &str =
     "/.openshell/supervisor/upstream-proxy-ca-bundle.pem";
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_container_runtime::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
-const DRIVER_ADMITTED_BACKEND: &str = openshell_driver_sdk::legacy_contract::BUILTIN_BACKEND_NAME;
+const DRIVER_ADMITTED_BACKEND: &str = openshell_driver_contract::BUILTIN_BACKEND_NAME;
 const LABEL_ISOLATION_BACKEND: &str = "openshell.ai/isolation-backend";
-const LABEL_ISOLATION_BACKEND_OPEN_SHELL: &str =
-    openshell_driver_sdk::legacy_contract::BUILTIN_BACKEND_NAME;
+const LABEL_ISOLATION_BACKEND_OPEN_SHELL: &str = openshell_driver_contract::BUILTIN_BACKEND_NAME;
 const LABEL_ISOLATION_ROLE: &str = "openshell.ai/isolation-role";
 const LABEL_ISOLATION_ROLE_SANDBOX: &str = "sandbox";
 const LABEL_ISOLATION_ROLE_SUPERVISOR: &str = "supervisor";
@@ -5089,7 +5088,7 @@ async fn stage_docker_supervisor_bundle(
         .is_some_and(|descriptor| {
             matches!(
                 descriptor.transport,
-                openshell_driver_sdk::legacy_contract::SandboxTransport::RuntimeInitiatedUnix { .. }
+                openshell_driver_contract::SandboxTransport::RuntimeInitiatedUnix { .. }
             )
         });
     let mut mounts = vec![Mount {
@@ -5535,7 +5534,7 @@ async fn spawn_docker_control_process(
         .is_some_and(|descriptor| {
             matches!(
                 descriptor.transport,
-                openshell_driver_sdk::legacy_contract::SandboxTransport::RuntimeInitiatedUnix { .. }
+                openshell_driver_contract::SandboxTransport::RuntimeInitiatedUnix { .. }
             )
         });
     command.extend(docker_network_trust_supervisor_args(
@@ -6381,7 +6380,7 @@ fn build_container_create_body_for_image(
             // exactly as written so short names never expand to host domains.
             dns_search: Some(vec![".".to_string()]),
             tmpfs: Some(HashMap::from([(
-                openshell_driver_sdk::legacy_contract::SUPERVISOR_CA_RUNTIME_DIR.to_string(),
+                openshell_driver_contract::SUPERVISOR_CA_RUNTIME_DIR.to_string(),
                 format!(
                     "rw,noexec,nosuid,nodev,size=1m,uid={},gid={},mode=0755",
                     workload_identity.uid, workload_identity.gid

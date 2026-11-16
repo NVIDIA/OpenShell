@@ -8,14 +8,13 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
 use serde::{Deserialize, Serialize};
 
 use super::BUILTIN_BACKEND_NAME;
 use super::identity::{
     BackendDescriptor, BackendError, ProvisioningEvidence, ResolvedWorkloadIdentity,
 };
-use crate::sandbox_session::SandboxSessionId;
+use super::sandbox_session::SandboxSessionId;
 
 /// Shortest accepted route handle, in bytes.
 pub const MIN_ROUTE_HANDLE_LEN: usize = 16;
@@ -85,7 +84,7 @@ impl SandboxTransport {
     pub fn validate(&self) -> Result<(), &'static str> {
         let valid = match self {
             Self::Unix { socket_path } | Self::RuntimeInitiatedUnix { socket_path } => {
-                crate::paths::is_posix_absolute(socket_path)
+                super::paths::is_posix_absolute(socket_path)
             }
             Self::Tcp {
                 authority,
@@ -161,56 +160,6 @@ impl fmt::Debug for SandboxTlsMaterial {
             .field("private_key_pem", &"<redacted>")
             .finish()
     }
-}
-
-/// Generate a generation-pinned TLS server identity for the Sandbox Protocol.
-///
-/// The CA private key is local to this function and is discarded after the
-/// server leaf is signed. The JWT, rather than certificate time, determines
-/// caller authorization and renewal.
-pub fn generate_sandbox_tls_material(
-    session_id: SandboxSessionId,
-) -> Result<SandboxTlsMaterial, BackendError> {
-    let server_name = format!("sandbox.{session_id}.openshell.internal");
-    let ca_key = openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519)
-        .map_err(|error| BackendError::Descriptor(format!("generate sandbox CA key: {error}")))?;
-    let mut ca_params = CertificateParams::default();
-    ca_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
-    ca_params.not_after = rcgen::date_time_ymd(4096, 1, 1);
-    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(DnType::CommonName, "OpenShell sandbox session CA");
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).map_err(|error| {
-        BackendError::Descriptor(format!("generate sandbox CA certificate: {error}"))
-    })?;
-
-    let sandbox_key =
-        openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519).map_err(|error| {
-            BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
-        })?;
-    let mut sandbox_params = CertificateParams::new(vec![server_name.clone()])
-        .map_err(|error| BackendError::Descriptor(format!("build sandbox certificate: {error}")))?;
-    sandbox_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
-    sandbox_params.not_after = rcgen::date_time_ymd(4096, 1, 1);
-    sandbox_params
-        .distinguished_name
-        .push(DnType::CommonName, "OpenShell sandbox runtime");
-    sandbox_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let sandbox = openshell_crypto::pki::signed_by(sandbox_params, &sandbox_key, &ca, &ca_key)
-        .map_err(|error| {
-            BackendError::Descriptor(format!("sign sandbox TLS server certificate: {error}"))
-        })?;
-
-    Ok(SandboxTlsMaterial {
-        server_name,
-        trust_anchor_pem: ca.pem(),
-        certificate_chain_pem: sandbox.pem(),
-        private_key_pem: sandbox_key
-            .serialize_pem()
-            .map_err(|error| BackendError::Descriptor(format!("export sandbox key: {error}")))?,
-    })
 }
 
 /// Boundary-side listener provisioned by a compute driver.
@@ -333,9 +282,9 @@ pub struct BoundaryConfig {
     /// Fresh gateway-issued identity for this exact launch.
     pub session_id: SandboxSessionId,
     /// Monotonic signed supervisor replacement within this generation.
-    pub session_rotation: crate::jwt::SessionRotation,
+    pub session_rotation: super::session_values::SessionRotation,
     /// Durable authorization epoch required in every Sandbox Protocol JWT.
-    pub auth_epoch: crate::jwt::CredentialEpoch,
+    pub auth_epoch: super::session_values::CredentialEpoch,
     /// Gateway identity expected in Sandbox Protocol JWTs.
     pub gateway_id: String,
     /// Immutable current and staged-next gateway verification keys.
@@ -398,27 +347,4 @@ impl BoundaryConfig {
         serde_json::to_vec(self)
             .map_err(|error| BackendError::Descriptor(format!("encode boundary config: {error}")))
     }
-}
-
-/// Validate driver-specific immutable coordinates before a boundary binds them.
-///
-/// Claim values are opaque to the common protocol, but empty or
-/// whitespace-bearing identifiers cannot safely distinguish runtime objects.
-pub fn validate_resource_claims(
-    claims: &std::collections::BTreeMap<String, String>,
-) -> Result<(), BackendError> {
-    for (key, value) in claims {
-        if key.is_empty() || key.chars().any(char::is_whitespace) {
-            return Err(BackendError::Descriptor(
-                "boundary resource-claim keys must be non-empty and contain no whitespace"
-                    .to_string(),
-            ));
-        }
-        if value.is_empty() || value.chars().any(char::is_whitespace) {
-            return Err(BackendError::Descriptor(format!(
-                "boundary resource claim {key:?} must be non-empty and contain no whitespace"
-            )));
-        }
-    }
-    Ok(())
 }

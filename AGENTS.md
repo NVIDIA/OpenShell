@@ -40,6 +40,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
 | `crates/openshell-crypto/` | Crypto backend | Backend-neutral primitives and TLS, PKI, JWT adapters; AWS-LC implementation |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
+| `crates/openshell-driver-contract/` | Driver contract | Documents a compute driver hands to the supervisor and sandbox boundary (runtime descriptor, boundary configuration): Rust types, `sandbox_runtime.proto` messages, and file read/write; `openshell-driver-sdk` re-exports it |
 | `crates/openshell-driver-sdk/` | Driver SDK | Narrow contract shared by core and the compute drivers: compute-driver proto, sandbox environment, JWT session tokens, extension protocol, admission and mount validation; `openshell-core` re-exports it |
 | `crates/openshell-container-runtime/` | Container runtime helpers | Code used only by the desktop compute drivers (Docker, Podman, VM): CDI GPU selection, local API socket discovery, supervisor cache and tar helpers; depends on the SDK, never on `openshell-core` |
 | `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |

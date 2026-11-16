@@ -46,15 +46,15 @@ use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
 use openshell_container_runtime::gpu::validate_specific_gpu_device_request;
 use openshell_container_runtime::proto_struct::deserialize_optional_non_empty_string_list;
-use openshell_driver_sdk::UpstreamProxyConfig;
-use openshell_driver_sdk::config::DEFAULT_STOP_TIMEOUT_SECS;
-use openshell_driver_sdk::driver_mounts;
-use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
-use openshell_driver_sdk::legacy_contract::{
+use openshell_driver_contract::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsMaterial, SandboxTlsServerConfig, SandboxTransport,
     generate_sandbox_tls_material,
 };
+use openshell_driver_sdk::UpstreamProxyConfig;
+use openshell_driver_sdk::config::DEFAULT_STOP_TIMEOUT_SECS;
+use openshell_driver_sdk::driver_mounts;
+use openshell_driver_sdk::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_driver_sdk::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -225,7 +225,7 @@ const HOST_ADDITIONAL_CA_TEMP_PREFIX: &str = ".additional-ca.";
 const HOST_ADDITIONAL_CA_TEMP_SUFFIX: &str = ".tmp";
 /// The backend this driver admits. VM-specific placement remains inside the
 /// opaque runtime descriptor.
-const DRIVER_ADMITTED_BACKEND: &str = openshell_driver_sdk::legacy_contract::BUILTIN_BACKEND_NAME;
+const DRIVER_ADMITTED_BACKEND: &str = openshell_driver_contract::BUILTIN_BACKEND_NAME;
 const HOST_SUPERVISOR_BINARY: &str = "host-runtime/openshell-supervisor";
 const VM_CONTROL_SOCKET: &str = "control.sock";
 const VM_CONTROL_PORT: u32 = 5500;

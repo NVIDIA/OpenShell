@@ -31,7 +31,7 @@ pub use runtime::{
 };
 pub use runtime::{BoundaryTransport, BoundaryTransportConnector, validate_runtime_coordinates};
 
-pub use openshell_driver_sdk::legacy_contract::{
+pub use openshell_driver_contract::{
     ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM, BUILTIN_BACKEND_NAME as BACKEND_NAME,
     GPU_RESOURCE_CLAIM, SUPERVISOR_CA_RUNTIME_DIR, SUPERVISOR_CA_RUNTIME_ROOT,
 };

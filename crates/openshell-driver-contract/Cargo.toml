@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-driver-contract"
+description = "The documents a compute driver hands to the supervisor and the sandbox boundary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+openshell-crypto = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+openshell-crypto = { workspace = true }
+rcgen = { workspace = true }
+tempfile = "3"
+
+[features]
+default = []
+## Generating what a driver hands over: the sandbox TLS material.
+write = ["dep:openshell-crypto", "dep:rcgen"]
+
+[lints]
+workspace = true

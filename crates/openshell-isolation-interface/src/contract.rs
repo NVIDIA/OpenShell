@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 
 pub use openshell_core::SandboxSessionId;
 pub use openshell_core::policy::SandboxPolicy;
-pub use openshell_driver_sdk::legacy_contract::{
+pub use openshell_driver_contract::{
     BackendDescriptor, BackendError, BackendErrorKind, ProvisioningEvidence, ResolveError,
     ResolvedWorkloadIdentity, Sha256Digest,
 };

@@ -80,6 +80,7 @@ tempfile = "3"
 [dev-dependencies]
 hyper-util = { workspace = true }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["write"] }
 rcgen = { workspace = true }
 tempfile = "3"
 tower = { workspace = true }

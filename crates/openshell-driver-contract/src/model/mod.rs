@@ -1,19 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The current, Rust-defined form of what a compute driver hands to the
-//! supervisor and the sandbox boundary.
-//!
-//! # Legacy
-//!
-//! This module describes a format that is expected to be replaced by a
-//! language-neutral specification. It exists so that drivers can stop depending
-//! on `openshell-core` and `openshell-sandbox-backend` today. It accepts no new
-//! fields and is removed when the replacement format has shipped and the
-//! supported releases no longer read this one. See `rfc/` for the migration.
-//!
-//! The documents are serialized as JSON by their `serde` implementations.
-//! Readers reject unknown fields, so a writer must not add any.
+//! The types of the documents a compute driver hands to the supervisor and the
+//! sandbox boundary. They do no I/O.
+
+pub mod boundary;
+pub mod identity;
+pub mod paths;
+pub mod sandbox_session;
+pub mod session_values;
+
+pub use boundary::*;
+pub use identity::*;
+pub use sandbox_session::{SandboxSessionId, SandboxSessionIdError};
+pub use session_values::{CredentialEpoch, SessionRotation, SessionValueError};
 
 /// Stable isolation backend name implemented by `openshell-sandbox`. Reserved:
 /// no externally registered backend may use it.
@@ -36,13 +36,3 @@ pub const SUPERVISOR_CA_RUNTIME_ROOT: &str = "/run/openshell-supervisor-ca";
 /// Keeping the material below the mount root lets runtimes that cannot assign
 /// tmpfs ownership create this child as the unprivileged sandbox identity.
 pub const SUPERVISOR_CA_RUNTIME_DIR: &str = "/run/openshell-supervisor-ca/material";
-
-#[cfg(feature = "legacy-contract")]
-pub mod boundary;
-#[cfg(feature = "legacy-contract")]
-pub mod identity;
-
-#[cfg(feature = "legacy-contract")]
-pub use boundary::*;
-#[cfg(feature = "legacy-contract")]
-pub use identity::*;

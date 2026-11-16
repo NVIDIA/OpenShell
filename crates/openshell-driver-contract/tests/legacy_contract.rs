@@ -1,16 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The legacy driver-contract documents against golden JSON examples.
+//! The legacy encoding of the driver-contract documents against golden JSON
+//! examples.
 //!
 //! The examples in `tests/legacy_contract/examples` are the bytes that existing
 //! drivers write and existing readers accept. Each must decode and re-encode to
 //! the same JSON, so a change to a type that alters its encoding fails here.
 
-#![cfg(feature = "legacy-contract")]
-
-use openshell_driver_sdk::jwt::{SandboxLaunchAuthentication, SupervisorAuthBundle};
-use openshell_driver_sdk::legacy_contract::{BoundaryConfig, SandboxRuntimeDescriptor};
+use openshell_driver_contract::{BoundaryConfig, SandboxRuntimeDescriptor};
 use serde_json::{Value, json};
 
 macro_rules! example {
@@ -29,9 +27,6 @@ const EXAMPLES: &[(&str, &str)] = &[
     example!("SandboxRuntimeDescriptor.runtime-initiated-routed.json"),
     example!("SandboxRuntimeDescriptor.tcp.json"),
     example!("SandboxRuntimeDescriptor.vsock.json"),
-    example!("SupervisorAuthBundle.minimal.json"),
-    example!("SupervisorAuthBundle.full.json"),
-    example!("SandboxLaunchAuthentication.json"),
 ];
 
 fn document_type(file: &str) -> &str {
@@ -58,8 +53,6 @@ fn round_trip(document_type: &str, document: &Value) -> Result<Value, String> {
     match document_type {
         "BoundaryConfig" => through::<BoundaryConfig>(document),
         "SandboxRuntimeDescriptor" => through::<SandboxRuntimeDescriptor>(document),
-        "SupervisorAuthBundle" => through::<SupervisorAuthBundle>(document),
-        "SandboxLaunchAuthentication" => through::<SandboxLaunchAuthentication>(document),
         other => panic!("no type registered for {other}"),
     }
 }
@@ -89,8 +82,6 @@ fn readers_reject_unknown_top_level_fields() {
     for file in [
         "BoundaryConfig.runtime-initiated-unix.json",
         "SandboxRuntimeDescriptor.tcp.json",
-        "SupervisorAuthBundle.minimal.json",
-        "SandboxLaunchAuthentication.json",
     ] {
         assert_rejected(file, |document| {
             document["unexpected"] = json!(true);
@@ -152,9 +143,4 @@ fn some_rules_are_enforced_after_decoding() {
     document["transport"]["route"] = json!("short");
     let descriptor: SandboxRuntimeDescriptor = serde_json::from_value(document).unwrap();
     assert!(descriptor.transport.validate().is_err());
-
-    let mut document = example("SupervisorAuthBundle.full.json");
-    document["traces_otlp_tls"] = json!(9);
-    let bundle: SupervisorAuthBundle = serde_json::from_value(document).unwrap();
-    assert!(bundle.validate().is_err());
 }

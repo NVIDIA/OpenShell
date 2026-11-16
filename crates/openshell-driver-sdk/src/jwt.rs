@@ -70,52 +70,7 @@ mod session {
         }
     }
 
-    /// Monotonic order for authenticated Sandbox Protocol connections.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-    #[serde(transparent)]
-    pub struct CredentialEpoch(u64);
-
-    impl CredentialEpoch {
-        pub fn new(value: u64) -> Result<Self, SessionJwtError> {
-            if value == 0 {
-                return Err(SessionJwtError::InvalidCredentialEpoch);
-            }
-            Ok(Self(value))
-        }
-
-        #[must_use]
-        pub const fn get(self) -> u64 {
-            self.0
-        }
-    }
-
-    /// Monotonic identity for Sandbox Protocol attachment state.
-    ///
-    /// This is a protocol coordination value, not part of JWT authorization.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-    #[serde(transparent)]
-    pub struct SessionRotation(u64);
-
-    impl SessionRotation {
-        pub fn new(value: u64) -> Result<Self, SessionJwtError> {
-            if value == 0 {
-                return Err(SessionJwtError::InvalidSessionRotation);
-            }
-            Ok(Self(value))
-        }
-
-        #[must_use]
-        pub const fn get(self) -> u64 {
-            self.0
-        }
-
-        pub fn successor(self) -> Result<Self, SessionJwtError> {
-            self.0
-                .checked_add(1)
-                .ok_or(SessionJwtError::SessionRotationOverflow)
-                .and_then(Self::new)
-        }
-    }
+    pub use openshell_driver_contract::{CredentialEpoch, SessionRotation};
 
     /// The only component authorized by either sandbox-session token profile.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1278,6 +1233,17 @@ mod session {
             }
         }
         Ok(())
+    }
+
+    impl From<openshell_driver_contract::SessionValueError> for SessionJwtError {
+        fn from(error: openshell_driver_contract::SessionValueError) -> Self {
+            use openshell_driver_contract::SessionValueError as Value;
+            match error {
+                Value::InvalidCredentialEpoch => Self::InvalidCredentialEpoch,
+                Value::InvalidSessionRotation => Self::InvalidSessionRotation,
+                Value::SessionRotationOverflow => Self::SessionRotationOverflow,
+            }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

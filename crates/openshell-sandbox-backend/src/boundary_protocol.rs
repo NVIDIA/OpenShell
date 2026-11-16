@@ -20,10 +20,12 @@ use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, NetworkMode, NetworkPolicy,
     ProcessPolicy, ProxyPolicy, SandboxPolicy,
 };
-pub use openshell_driver_sdk::legacy_contract::{
+#[cfg(any(test, feature = "write"))]
+pub use openshell_driver_contract::generate_sandbox_tls_material;
+pub use openshell_driver_contract::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsMaterial, SandboxTlsServerConfig, SandboxTransport,
-    generate_sandbox_tls_material, validate_resource_claims,
+    validate_resource_claims,
 };
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;

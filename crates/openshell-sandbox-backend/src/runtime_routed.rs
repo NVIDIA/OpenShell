@@ -46,7 +46,7 @@ pub const ROUTE_PREFACE_VERSION: u8 = 1;
 /// [`RouteReply`] before the TLS handshake.
 pub const ROUTE_PREFACE_VERSION_V2: u8 = 2;
 /// Longest accepted route handle, in bytes.
-pub use openshell_driver_sdk::legacy_contract::{
+pub use openshell_driver_contract::{
     MAX_ROUTE_HANDLE_LEN, MIN_ROUTE_HANDLE_LEN, validate_route_handle,
 };
 /// Status bytes of a version 2 reply. An accept and a redirect are followed
