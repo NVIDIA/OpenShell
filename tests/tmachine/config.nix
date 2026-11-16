@@ -25,6 +25,7 @@ let
   qemu = qemuPkgs.qemu.override { hostCpuOnly = true; };
   # Every installer loads the sandbox workload image tests run python3 in.
   e2ePythonImage = "../../artifacts/images/openshell-e2e-python-dev.tar";
+  postgresFixture = "../../e2e/kubernetes/postgres-fixture.yaml";
   k3sInputs = {
     agent_sandbox_version = "0.5.0";
     openshell_cli_binary = "../../artifacts/binaries/${muslTarget}/openshell";
@@ -66,6 +67,8 @@ let
         "ansible/playbooks/test-tools.yaml"
         "ansible/playbooks/k3s.yaml"
       ];
+      # k3s.yaml pulls the image of the k3s-ha installer's PostgreSQL fixture.
+      inputs.openshell_postgres_fixture = postgresFixture;
     };
     fedora-podman-rootful = fedoraPodman "rootful";
     fedora-podman-rootless = fedoraPodman "rootless";
@@ -91,7 +94,8 @@ let
         inherit (parent) use_galaxy;
         playbooks = parent.playbooks ++ setup.playbooks;
         inputs =
-          (if parent ? driver then { environment_driver = parent.driver; } else { })
+          (parent.inputs or { })
+          // (if parent ? driver then { environment_driver = parent.driver; } else { })
           // (setup.inputs or { });
       };
     };
@@ -153,6 +157,7 @@ let
         inherit (base) machine;
         setup = {
           inherit (base) use_galaxy playbooks;
+          inputs = base.inputs or { };
         };
       }) bases
       ++ featureEnvironments
@@ -170,7 +175,7 @@ let
         use_galaxy = false;
         playbooks = [ "ansible/playbooks/openshell-k3s-ha.yaml" ];
         inputs = k3sInputs // {
-          openshell_postgres_fixture = "../../e2e/kubernetes/postgres-fixture.yaml";
+          openshell_postgres_fixture = postgresFixture;
         };
       }
       {

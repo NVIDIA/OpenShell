@@ -32,9 +32,12 @@ const NEXTEST_LOG: &str = "nextest.log";
 // disk can take minutes to report healthy.
 const READY_TIMEOUT_SECS: u64 = 300;
 /// How long the nextest run may take in total. Individual tests are bounded
-/// by the nextest profile's slow-timeout; this catches a run that stops
-/// making progress some other way.
+/// by the nextest profile's slow-timeout or [`PROGRAM_TEST_TIMEOUT_SECS`];
+/// this catches a run that stops making progress some other way.
 const RUN_TIMEOUT: Duration = Duration::from_mins(45);
+/// How long a test program gives each test before stopping it. A test that
+/// stalls fails in minutes instead of at the program's 15-minute default.
+const PROGRAM_TEST_TIMEOUT_SECS: &str = "180";
 /// Slack beyond the readiness check's own timeout for SSH and process start.
 const READY_SLACK: Duration = Duration::from_mins(1);
 /// nextest's exit code when a test failed, as opposed to nextest itself
@@ -342,7 +345,14 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         // The program runs its tests one at a time, and writes the report
         // where `collect_results` looks for it.
         Kind::Program => {
-            tests.extend([program.as_str(), "run", "--junit", &junit]);
+            tests.extend([
+                program.as_str(),
+                "run",
+                "--timeout",
+                PROGRAM_TEST_TIMEOUT_SECS,
+                "--junit",
+                &junit,
+            ]);
             // `run` takes name filters as arguments, after `--` so that one
             // starting with a dash isn't read as an option.
             if !run.filters.is_empty() {

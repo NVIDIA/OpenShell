@@ -60,7 +60,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// A machine booted from a throwaway overlay of the installed disk.
 ///
 /// The VM stops when the session is dropped, so a caller that fails or
-/// panics cannot leak it. Call [`Session::down`] for a clean shutdown.
+/// panics cannot leak it. Call [`Session::down`] to stop it and wait until
+/// QEMU has exited.
 pub struct Session {
     // Declared before `_dir` so the VM stops before its disk is removed.
     vm: QemuVm,
@@ -173,13 +174,14 @@ impl Session {
             .context("open SSH shell in tmachine VM")
     }
 
-    /// Power the machine off and wait for QEMU to exit.
+    /// Stop the machine and wait for QEMU to exit.
     ///
-    /// This never panics and never fails: teardown has no useful recovery,
-    /// so a guest that does not power off cleanly is killed and the problem
-    /// is logged to stderr.
+    /// QEMU is killed rather than the guest powered off: the overlay is
+    /// thrown away, so a clean shutdown would only cost time. Copy out
+    /// anything the guest holds first. This never panics and never fails.
     pub async fn down(self) {
-        self.vm.power_off_or_kill().await;
+        let Self { mut vm, .. } = self;
+        vm.kill().await;
     }
 }
 

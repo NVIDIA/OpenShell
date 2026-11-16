@@ -254,8 +254,10 @@ combined with `--package`. With it, `--filter` (repeatable) takes parts of test
 names, as the program does, such as `--filter policy_advisor::`, rather than a
 nextest filterset. The runner runs the program's `ready`
 and `run` commands in the guest and still writes `junit.xml` and `nextest.log`
-(the program's output) to the results directory. Branch E2E builds
-`openshell-conformance` once and passes it to every conformance row this way.
+(the program's output) to the results directory. It stops a test that runs
+longer than two minutes under nextest, or three minutes under a program.
+Branch E2E builds `openshell-conformance` once and passes it to every
+conformance row this way.
 
 `openshell-test-runner build --family <family> --out <dir>` builds a family's
 test bundle for the guest without booting a VM, and `run --bundle <dir>` runs
