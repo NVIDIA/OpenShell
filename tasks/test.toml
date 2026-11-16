@@ -28,6 +28,7 @@ depends = [
   "test:review-readiness",
   "test:merge-gateway-toml",
   "test:accepted-work",
+  "test:label-issue",
 ]
 
 ["test:merge-gateway-toml"]
@@ -112,6 +113,14 @@ hide = true
 ["test:accepted-work"]
 description = "Test the shared accepted-work library"
 run = "uv run --no-project python -m unittest discover -s tasks/scripts -p label_accepted_work_test.py"
+hide = true
+
+["test:label-issue"]
+description = "Test issue labeling and stale closure provenance"
+run = [
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p 'label_issue*_test.py'",
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p stale_closure_test.py",
+]
 hide = true
 
 [e2e]
