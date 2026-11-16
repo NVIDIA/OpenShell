@@ -1058,6 +1058,10 @@ pub enum PolicyViolation {
     },
     /// A network endpoint uses a wildcard shape that does not match runtime semantics.
     InvalidHostWildcard { policy_name: String, host: String },
+    /// A newly authored wildcard host lacks a fixed suffix of at least two DNS
+    /// labels after its last wildcard (e.g. `**.*.*` or `*.*.com`). Reported
+    /// only by [`validate_authored_host_selectors`].
+    OverbroadHostWildcard { policy_name: String, host: String },
     /// `credential_signing` is set but `signing_service` is missing.
     MissingSigningService { policy_name: String, host: String },
     /// `credential_signing` has an unrecognized value.
@@ -1203,6 +1207,15 @@ impl fmt::Display for PolicyViolation {
                     "network policy '{policy_name}': invalid host wildcard '{host}'; \
                      middle DNS label wildcards must be the entire label '*' and recursive '**' \
                      is only allowed as the entire first label"
+                )
+            }
+            Self::OverbroadHostWildcard { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': host wildcard '{host}' is too broad; \
+                     a wildcard host must end in at least two fixed DNS labels after its \
+                     last wildcard, such as '*.example.com' or 's3.*.amazonaws.com'; \
+                     list other hosts explicitly"
                 )
             }
             Self::MissingSigningService { policy_name, host } => {
@@ -1702,6 +1715,66 @@ fn host_wildcard_shape_invalid(host: &str) -> bool {
         .skip(1)
         .copied()
         .any(|label| label.contains("**") || (label.contains('*') && label != "*"))
+}
+
+/// Minimum number of fixed DNS labels that must follow the last wildcard label
+/// of a newly authored host selector.
+const MIN_FIXED_SUFFIX_LABELS: usize = 2;
+
+/// Whether a wildcard host leaves fewer than [`MIN_FIXED_SUFFIX_LABELS`] fixed
+/// labels after its last wildcard label, so it can match names under
+/// unrelated registrable domains (`**.*.*`, `*.*.com`, `api.github.*`).
+pub(crate) fn host_wildcard_overbroad(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
+    let Some(last_wildcard) = labels.iter().rposition(|label| label.contains('*')) else {
+        return false;
+    };
+    labels.len() - last_wildcard - 1 < MIN_FIXED_SUFFIX_LABELS
+}
+
+/// Check host selectors that are being authored now, as opposed to loaded
+/// from durable state or delivered to a supervisor.
+///
+/// These rules are intentionally not part of [`validate_sandbox_policy`]:
+/// that function also gates stored-policy reads and supervisor activation,
+/// and policies stored before a rule existed must keep loading. Call this on
+/// create and full-replacement write paths; merge operations apply it to each
+/// `AddRule` fragment.
+pub fn validate_authored_host_selectors(
+    policy: &SandboxPolicy,
+) -> std::result::Result<(), Vec<PolicyViolation>> {
+    let mut network_policies: Vec<_> = policy.network_policies.iter().collect();
+    network_policies.sort_by_key(|(name, _)| *name);
+    let mut violations = Vec::new();
+    for (key, rule) in network_policies {
+        collect_authored_rule_host_violations(key, rule, &mut violations);
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+/// Append authoring-only host selector violations for one network rule.
+pub(crate) fn collect_authored_rule_host_violations(
+    key: &str,
+    rule: &NetworkPolicyRule,
+    violations: &mut Vec<PolicyViolation>,
+) {
+    let name = if rule.name.is_empty() {
+        key
+    } else {
+        rule.name.as_str()
+    };
+    for endpoint in &rule.endpoints {
+        if host_wildcard_overbroad(&endpoint.host) {
+            violations.push(PolicyViolation::OverbroadHostWildcard {
+                policy_name: name.to_string(),
+                host: endpoint.host.clone(),
+            });
+        }
+    }
 }
 
 /// Validate that an explicit-TCP host selector can produce names accepted by
@@ -3836,6 +3909,101 @@ network_policies:
                     .any(|v| matches!(v, PolicyViolation::InvalidHostWildcard { .. })),
                 "expected bare host wildcard {host:?} to be rejected, got {violations:?}"
             );
+        }
+    }
+
+    fn policy_with_endpoint_host(host: &str) -> SandboxPolicy {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "wildcard".into(),
+            NetworkPolicyRule {
+                name: "wildcard".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: host.into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    #[test]
+    fn authored_host_selectors_reject_wildcards_without_fixed_suffix() {
+        for host in [
+            "**.*.*",
+            "*.*.*",
+            "**.*.*.*",
+            "a*.*",
+            "*.*.com",
+            "**.*.com",
+            "foo.*.com",
+            "a*.com",
+            "api.github.*",
+            "*.example.*",
+        ] {
+            let violations =
+                validate_authored_host_selectors(&policy_with_endpoint_host(host)).expect_err(host);
+            assert_eq!(
+                violations,
+                vec![PolicyViolation::OverbroadHostWildcard {
+                    policy_name: "wildcard".into(),
+                    host: host.into(),
+                }],
+                "{host}"
+            );
+            let message = violations[0].to_string();
+            assert!(
+                message.contains("at least two fixed DNS labels") && message.contains(host),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn authored_host_selectors_accept_anchored_wildcards() {
+        for host in [
+            "example.com",
+            "*.example.com",
+            "**.example.com",
+            "*-api.example.com",
+            "*.*.example.com",
+            "s3.*.amazonaws.com",
+            "*.s3.*.amazonaws.com",
+            "*.co.uk",
+            "10.0.0.1",
+        ] {
+            let policy = policy_with_endpoint_host(host);
+            validate_sandbox_policy(&policy).unwrap_or_else(|v| panic!("{host}: {v:?}"));
+            validate_authored_host_selectors(&policy).unwrap_or_else(|v| panic!("{host}: {v:?}"));
+        }
+
+        let mut hostless = restrictive_default_policy();
+        hostless.network_policies.insert(
+            "hostless".into(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    port: 443,
+                    allowed_ips: vec!["203.0.113.0/24".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        validate_authored_host_selectors(&hostless).expect("hostless endpoint");
+    }
+
+    /// Policies stored before the authoring rule existed must keep loading:
+    /// `validate_sandbox_policy` gates stored-policy reads and supervisor
+    /// activation, so it must not reject these selectors.
+    #[test]
+    fn stored_overbroad_wildcard_still_passes_load_validation() {
+        for host in ["**.*.*", "*.*.com"] {
+            let policy = policy_with_endpoint_host(host);
+            validate_and_canonicalize_sandbox_policy(policy.clone())
+                .unwrap_or_else(|error| panic!("{host}: {error}"));
+            assert!(validate_authored_host_selectors(&policy).is_err(), "{host}");
         }
     }
 

@@ -1568,7 +1568,8 @@ fn redacted_policy_violation_category(violation: &PolicyViolation) -> &'static s
         PolicyViolation::TldWildcard { .. }
         | PolicyViolation::TcpEndpointIpLiteral { .. }
         | PolicyViolation::InvalidTcpEndpointHost { .. }
-        | PolicyViolation::InvalidHostWildcard { .. } => "invalid network endpoint host",
+        | PolicyViolation::InvalidHostWildcard { .. }
+        | PolicyViolation::OverbroadHostWildcard { .. } => "invalid network endpoint host",
         PolicyViolation::MissingEndpointHost { .. }
         | PolicyViolation::MissingTcpEndpointHost { .. } => "missing network endpoint host",
         PolicyViolation::MissingEndpointPort { .. }
