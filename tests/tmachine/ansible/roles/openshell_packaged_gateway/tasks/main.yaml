@@ -21,6 +21,14 @@
     name: openshell_gateway
     tasks_from: "{{ openshell_gateway_driver }}.yaml"
 
+# With an external driver, the gateway selects it by name and reaches it over
+# its socket. It starts after the images load, which it needs, and before the
+# gateway, which connects to it at startup.
+- name: Run the compute driver as an external service
+  ansible.builtin.include_role:
+    name: openshell_external_driver
+  when: openshell_external_driver_binary is defined
+
 - name: Create packaged gateway environment directory
   become: true
   ansible.builtin.file:
@@ -41,7 +49,7 @@
     group: "{{ openshell_gateway_user }}"
     mode: "0600"
     content: |
-      OPENSHELL_COMPUTE_DRIVER={{ openshell_gateway_driver }}
+      OPENSHELL_COMPUTE_DRIVER={{ openshell_external_driver_name | default(openshell_gateway_driver) }}
       OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
       OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
 

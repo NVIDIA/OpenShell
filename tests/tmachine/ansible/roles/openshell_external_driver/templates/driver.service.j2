@@ -1,0 +1,23 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+[Unit]
+Description=OpenShell {{ openshell_external_driver_name }} compute driver (external)
+After={{ openshell_external_driver_requires }}
+Requires={{ openshell_external_driver_requires }}
+
+[Service]
+User={{ openshell_gateway_user }}
+{% if openshell_external_driver_supplementary_groups | default('') %}
+SupplementaryGroups={{ openshell_external_driver_supplementary_groups }}
+{% endif %}
+RuntimeDirectory=openshell-driver-{{ openshell_gateway_driver }}
+Environment=OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
+Environment=OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
+ExecStart=/usr/local/bin/{{ openshell_external_driver_binary_name }} \
+  --bind-socket {{ openshell_external_driver_socket }} \
+  --config /etc/openshell/driver-{{ openshell_external_driver_name }}.toml \
+  --gateway-bind {{ openshell_gateway_bind_address }}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
