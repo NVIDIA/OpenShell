@@ -88,7 +88,7 @@ tests:
           pattern: '(?m)^proxy_ca_bundle = "/schema-v2/ca\.crt"$'
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?m)^sandbox_runtime = \{ boundary_port = 7700 \}$'
+          pattern: '(?m)^sandbox_runtime = \{ boundary_port = 7700, pod_anti_affinity = "preferred", pod_anti_affinity_namespace_selector = \{  \} \}$'
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: legacy\.example|6600|proxy-ca
@@ -100,7 +100,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?m)^sandbox_runtime = \{ boundary_port = 6600 \}$'
+          pattern: '(?m)^sandbox_runtime = \{ boundary_port = 6600, pod_anti_affinity = "preferred", pod_anti_affinity_namespace_selector = \{  \} \}$'
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: network_policy_enforced

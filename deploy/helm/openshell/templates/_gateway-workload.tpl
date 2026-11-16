@@ -31,7 +31,8 @@ metadata:
     {{- end }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
-    {{- with .Values.podLabels }}
+    openshell.ai/runtime-role: gateway
+    {{- with (omit .Values.podLabels "openshell.ai/runtime-role") }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:

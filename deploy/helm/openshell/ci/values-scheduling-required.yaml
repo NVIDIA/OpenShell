@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Layer with values-supervisor.yaml and values-tls-port-forward.yaml for E2E.
+scheduling:
+  workloadSupervisorAntiAffinity: required

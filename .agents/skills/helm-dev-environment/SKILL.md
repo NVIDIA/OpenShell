@@ -50,6 +50,7 @@ Port mappings created at cluster time (cannot be changed without recreating):
 | `8080` | Port `80` via k3d load balancer | Envoy Gateway LoadBalancer service (`values-gateway.yaml`) |
 
 Override with env vars before running `helm:k3s:create`:
+- `HELM_K3S_NODES` (default: `1`; accepts `1`, `2`, or `3` total nodes for a new cluster)
 - `HELM_K3S_LB_HOST_PORT` (default: `8080`)
 - `HELM_K3S_PRELOAD_SANDBOX_IMAGE` (default:
   `nvcr.io/nvidia/base/ubuntu:24.04`; set to an empty value to skip)
@@ -125,8 +126,8 @@ chart renders the gateway's
 `recovery_timeout_secs` from `supervisor.recoveryTimeoutSeconds`, default 60;
 the driver's `shared_supervisor` table stays unchanged), a
 RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with a 60-second
-grace period, no affinity unless `supervisor.affinity` is set (top-level
-`affinity` applies only to the gateway), the pool identity env vars
+grace period, preferred role anti-affinity merged with `supervisor.affinity`
+(top-level `affinity` applies only to the gateway), the pool identity env vars
 (`OPENSHELL_SUPERVISOR_POOL_MEMBER_ID` and `_ADVERTISE_IP` from the Pod name
 and IP), and a `maxUnavailable: 1` PodDisruptionBudget unless
 `supervisor.podDisruptionBudget.enabled=false` (default `true`; toggling it
@@ -272,6 +273,42 @@ with the collector ports only. A successful plaintext `helm:skaffold:run`
 registers the gateway under the worktree-specific k3d
 cluster name and selects it as the active gateway. Keep the forwarding
 task running while using those endpoints.
+
+### Role scheduling validation
+
+Workloads, supervisors, and gateways use `openshell.ai/runtime-role` with values
+`workload`, `supervisor`, and `gateway`. Workload/supervisor anti-affinity defaults
+to preferred and matches across all namespaces. Set
+`scheduling.workloadSupervisorAntiAffinity=required` for hard separation or
+`off` to opt out; `scheduling.namespaceSelector` narrows the namespace scope.
+Node selectors and tolerations remain opt-in. Gateways use the top-level chart
+fields; supervisors use `supervisor.nodeSelector` and `supervisor.tolerations`;
+workloads use gateway TOML `sandbox_runtime.workload_placement`.
+
+Create an isolated cluster with up to three nodes:
+
+```bash
+HELM_K3S_CLUSTER_NAME=openshell-scheduling HELM_K3S_NODES=3 \
+HELM_K3S_LB_HOST_PORT=18080 mise run helm:k3s:create
+```
+
+`HELM_K3S_NODES` affects new clusters only; it does not resize an existing one.
+Use `mise run e2e:kubernetes:scheduling` for the shared-supervisor create/restart
+checks. Against the isolated cluster, set `OPENSHELL_E2E_KUBE_CONTEXT` and
+`OPENSHELL_E2E_KUBE_BUILD_IMAGES=1` to build matching branch images.
+Layer `ci/values-scheduling-required.yaml` through
+`OPENSHELL_E2E_KUBE_EXTRA_VALUES` and set `OPENSHELL_E2E_SCHEDULING_MODE=required`
+for hard separation. The `ci/values-scheduling-pools.yaml` fixture additionally
+requires one node labeled `openshell.ai/node-pool=<role>` for each of
+`gateway`, `supervisor`, and `workload`. Taint the two worker pools with
+`openshell.ai/node-pool=<role>:NoSchedule` to exercise tolerations; leave the
+gateway node untainted for the local-path storage provisioner
+(or configure that provisioner to tolerate the gateway taint). Set
+`OPENSHELL_E2E_SCHEDULING_POOLS=1` to verify their nodes. Add the managed-workspace
+overlay to check cross-namespace placement. Verify a one-eligible-node preferred
+case as well. Do not cordon, relabel, or taint nodes in another development
+cluster. A pending required workload gets fresh bounded startup grace when
+capacity returns; it must not be reaped immediately after becoming scheduled.
 
 ### Viewing local traces
 

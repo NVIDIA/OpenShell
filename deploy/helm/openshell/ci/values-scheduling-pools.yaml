@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Opt-in placement fixture: label/taint one node for each role before installing.
+nodeSelector:
+  openshell.ai/node-pool: gateway
+tolerations:
+  - key: openshell.ai/node-pool
+    operator: Equal
+    value: gateway
+    effect: NoSchedule
+supervisor:
+  nodeSelector:
+    openshell.ai/node-pool: supervisor
+  tolerations:
+    - key: openshell.ai/node-pool
+      operator: Equal
+      value: supervisor
+      effect: NoSchedule
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    sandbox_runtime:
+      workload_placement:
+        node_selector:
+          openshell.ai/node-pool: workload
+        tolerations:
+          - key: openshell.ai/node-pool
+            operator: Equal
+            value: workload
+            effect: NoSchedule

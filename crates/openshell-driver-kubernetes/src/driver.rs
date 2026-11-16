@@ -2151,6 +2151,7 @@ impl KubernetesComputeDriver {
             .namespace_for_workspace(&sandbox.workspace, self.operator_allowlist.as_ref())
             .map_err(tonic::Status::failed_precondition)?;
         let params = SandboxPodParams {
+            scheduling: Some(&self.config.sandbox_runtime),
             default_image: &self.config.default_image,
             image_pull_secrets: &self.config.image_pull_secrets,
             default_runtime_class_name: &self.config.default_runtime_class_name,
@@ -2642,6 +2643,7 @@ impl KubernetesComputeDriver {
         })?;
         let log_level = openshell_core::driver_utils::sandbox_log_level(sandbox, "info");
         let params = SandboxPodParams {
+            scheduling: Some(&self.config.sandbox_runtime),
             default_image: &self.config.default_image,
             image_pull_policy: self.config.image_pull_policy,
             image_pull_secrets: &image_pull_secrets,
@@ -3585,9 +3587,27 @@ impl KubernetesComputeDriver {
             ),
             &self.config.supervisor_runtime_class_name,
         );
-        pods.create(&PostParams::default(), &pod)
+        let mut value = serde_json::to_value(pod)
+            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+        value["metadata"]["labels"][crate::scheduling::ROLE_LABEL] = "supervisor".into();
+        crate::scheduling::configure_affinity(
+            &mut value["spec"],
+            self.config.sandbox_runtime.pod_anti_affinity,
+            &self
+                .config
+                .sandbox_runtime
+                .pod_anti_affinity_namespace_selector,
+            "workload",
+        );
+        let pod: Pod = serde_json::from_value(value)
+            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+        let admitted = pods
+            .create(&PostParams::default(), &pod)
             .await
-            .map_err(KubernetesDriverError::from_kube)?
+            .map_err(KubernetesDriverError::from_kube)?;
+        crate::scheduling::validate_supervisor(&admitted, &self.config.sandbox_runtime)
+            .map_err(KubernetesDriverError::Precondition)?;
+        admitted
             .metadata
             .uid
             .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
@@ -3842,6 +3862,8 @@ impl KubernetesComputeDriver {
             agent_gid,
             &names.sandbox_secret,
         )?;
+        crate::scheduling::validate_workload(&workload_pod, &self.config.sandbox_runtime)
+            .map_err(KubernetesDriverError::Precondition)?;
         let workload_pod_uid =
             workload_pod.metadata.uid.clone().ok_or_else(|| {
                 KubernetesDriverError::Message("workload Pod has no UID".to_string())
@@ -4362,6 +4384,11 @@ impl KubernetesComputeDriver {
             ));
         }
 
+        let old_template = &object.data["spec"]["podTemplate"];
+        let mut template = old_template.clone();
+        crate::scheduling::configure_workload(&mut template, &self.config.sandbox_runtime)
+            .map_err(KubernetesDriverError::Precondition)?;
+        let scheduling_patch = crate::scheduling::merge_patch(old_template, &template);
         let control_connection = KubernetesControlConnection::RuntimeInitiated;
         let placement = self.new_generation_placement();
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
@@ -4539,6 +4566,12 @@ impl KubernetesComputeDriver {
                         &init_containers,
                         &image_pull_secrets,
                     );
+                    if let Some(fields) = scheduling_patch["spec"].as_object() {
+                        running_patch["spec"]["podTemplate"]["spec"].as_object_mut().expect("restart spec").extend(fields.clone());
+                    }
+                    if let Some(metadata) = scheduling_patch.get("metadata") {
+                        running_patch["spec"]["podTemplate"]["metadata"] = metadata.clone();
+                    }
                     running_patch
                 },
             )
@@ -5534,6 +5567,74 @@ impl KubernetesComputeDriver {
         }
     }
 
+    async fn bootstrap_waiting_for_scheduling(
+        &self,
+        object: &DynamicObject,
+    ) -> Result<bool, KubernetesDriverError> {
+        if sandbox_runtime_bootstrap_phase(object) != Some(SandboxRuntimeBootstrapPhase::Released) {
+            return Ok(false);
+        }
+        let namespace = object
+            .metadata
+            .namespace
+            .as_deref()
+            .unwrap_or(&self.config.namespace);
+        let Some(name) = object.metadata.name.as_deref() else {
+            return Ok(false);
+        };
+        let Some(annotations) = object.metadata.annotations.as_ref() else {
+            return Ok(false);
+        };
+        let Some(uid) = annotations.get(ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID) else {
+            return Ok(false);
+        };
+        let pods = Api::<Pod>::namespaced(self.client.clone(), namespace);
+        let Some(workload) = tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(name))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message("timed out checking workload scheduling".into())
+            })?
+            .map_err(KubernetesDriverError::from_kube)?
+        else {
+            return Ok(false);
+        };
+        if workload.metadata.uid.as_ref() != Some(uid) {
+            return Ok(false);
+        }
+        let mut generation_pods = vec![workload];
+        if let Some(uid) = annotations.get(ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID) {
+            let sandbox_id =
+                sandbox_id_from_object(object).map_err(KubernetesDriverError::Precondition)?;
+            let name = SandboxRuntimeNames::new(&sandbox_id).supervisor_pod;
+            let Some(supervisor) = tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(&name))
+                .await
+                .map_err(|_| {
+                    KubernetesDriverError::Message(
+                        "timed out checking supervisor scheduling".into(),
+                    )
+                })?
+                .map_err(KubernetesDriverError::from_kube)?
+            else {
+                return Ok(false);
+            };
+            if supervisor.metadata.uid.as_ref() != Some(uid) {
+                return Ok(false);
+            }
+            generation_pods.push(supervisor);
+        }
+        if generation_pods.iter().any(|pod| {
+            pod.metadata.deletion_timestamp.is_some()
+                || pod.status.as_ref().is_some_and(|status| {
+                    matches!(status.phase.as_deref(), Some("Failed" | "Succeeded"))
+                })
+        }) {
+            return Ok(false);
+        }
+        Ok(generation_pods.iter().any(|pod| {
+            crate::scheduling::scheduling_wait(pod, openshell_core::time::now_ms(), 300_000)
+        }))
+    }
+
     async fn reap_stale_sandbox_runtime_bootstrap(
         &self,
         lookup_api: &AgentSandboxApi,
@@ -5545,6 +5646,14 @@ impl KubernetesComputeDriver {
             Duration::from_secs(self.config.runtime_bootstrap_grace_seconds),
         ) {
             return;
+        }
+        match self.bootstrap_waiting_for_scheduling(object).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                debug!(%error, "could not verify scheduling wait; bootstrap cleanup will retry");
+                return;
+            }
         }
         if sandbox_runtime_bootstrap_operation(object) != Some("create") {
             warn!(
@@ -7462,6 +7571,10 @@ fn apply_supervisor_sandbox_runtime_boundary(
         serde_json::json!(crate::sandbox_runtime::pair_label_value(params.sandbox_id)),
     );
     labels.insert(
+        crate::scheduling::ROLE_LABEL.to_string(),
+        serde_json::json!("workload"),
+    );
+    labels.insert(
         BOUNDARY_ROLE_LABEL.to_string(),
         serde_json::json!("workload"),
     );
@@ -7820,6 +7933,7 @@ fn default_workspace_volume_claim_templates(
 /// Parameters shared by `sandbox_to_k8s_spec` and `sandbox_template_to_k8s`.
 #[allow(clippy::struct_excessive_bools)]
 struct SandboxPodParams<'a> {
+    scheduling: Option<&'a crate::KubernetesSandboxRuntimeConfig>,
     default_image: &'a str,
     image_pull_policy: Option<crate::KubernetesImagePullPolicy>,
     image_pull_secrets: &'a [String],
@@ -7844,6 +7958,7 @@ struct SandboxPodParams<'a> {
 impl Default for SandboxPodParams<'_> {
     fn default() -> Self {
         Self {
+            scheduling: None,
             default_image: "",
             image_pull_policy: None,
             image_pull_secrets: &[],
@@ -7953,6 +8068,12 @@ fn sandbox_to_k8s_spec(
         );
     }
 
+    let config = params.scheduling.cloned().unwrap_or_default();
+    crate::scheduling::configure_workload(
+        root.get_mut("podTemplate")
+            .expect("pod template is required"),
+        &config,
+    )?;
     Ok(serde_json::Value::Object(
         std::iter::once(("spec".to_string(), serde_json::Value::Object(root))).collect(),
     ))

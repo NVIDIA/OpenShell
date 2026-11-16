@@ -83,6 +83,14 @@ spec:
       {{- end }}
     spec:
       restartPolicy: OnFailure
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       serviceAccountName: {{ $hookName }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -155,6 +163,14 @@ spec:
       {{- end }}
     spec:
       restartPolicy: OnFailure
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       serviceAccountName: {{ $hookName }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

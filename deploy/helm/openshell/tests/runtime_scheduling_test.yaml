@@ -1,0 +1,153 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: runtime role scheduling
+templates:
+  - templates/statefulset.yaml
+  - templates/deployment.yaml
+  - templates/supervisor.yaml
+  - templates/gateway-config.yaml
+  - templates/certgen.yaml
+set:
+  gatewayConfig:
+    openshell.drivers.kubernetes:
+      supervisor_topology: gateway
+tests:
+  - it: labels gateway pods without modifying controller selectors
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.metadata.labels["openshell.ai/runtime-role"]
+          value: gateway
+      - notExists:
+          path: spec.selector.matchLabels["openshell.ai/runtime-role"]
+      - notExists:
+          path: spec.template.spec.nodeSelector
+      - notExists:
+          path: spec.template.spec.tolerations
+  - it: labels Deployment gateway pods too
+    template: templates/deployment.yaml
+    set:
+      workload.kind: Deployment
+      server.externalDbSecret: test-postgres
+    asserts:
+      - equal:
+          path: spec.template.metadata.labels["openshell.ai/runtime-role"]
+          value: gateway
+  - it: defaults supervisors to soft cross namespace separation without node restrictions
+    template: templates/supervisor.yaml
+    asserts:
+      - equal:
+          path: spec.template.metadata.labels["openshell.ai/runtime-role"]
+          value: supervisor
+      - equal:
+          path: spec.template.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0]
+          value:
+            weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  openshell.ai/runtime-role: workload
+              namespaceSelector: {}
+              topologyKey: kubernetes.io/hostname
+      - notExists:
+          path: spec.template.spec.nodeSelector
+      - notExists:
+          path: spec.template.spec.tolerations
+  - it: merges required role separation with custom affinity and namespace scope
+    template: templates/supervisor.yaml
+    set:
+      scheduling:
+        workloadSupervisorAntiAffinity: required
+        namespaceSelector:
+          matchLabels:
+            scheduling.example.com/group: a
+      supervisor:
+        nodeSelector:
+          pool: supervisor
+        tolerations:
+          - key: pool
+            operator: Equal
+            value: supervisor
+            effect: NoSchedule
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: rack
+                labelSelector:
+                  matchLabels:
+                    openshell.ai/runtime-role: gateway
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution
+          count: 2
+      - equal:
+          path: spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[1].namespaceSelector.matchLabels
+          value:
+            scheduling.example.com/group: a
+      - equal:
+          path: spec.template.spec.nodeSelector
+          value:
+            pool: supervisor
+      - equal:
+          path: spec.template.spec.tolerations[0].value
+          value: supervisor
+  - it: allows opting out while retaining role labels
+    template: templates/supervisor.yaml
+    set:
+      scheduling.workloadSupervisorAntiAffinity: "off"
+    asserts:
+      - notExists:
+          path: spec.template.spec.affinity
+      - equal:
+          path: spec.template.metadata.labels["openshell.ai/runtime-role"]
+          value: supervisor
+  - it: honors direct gateway configuration on supervisors
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          sandbox_runtime:
+            pod_anti_affinity: required
+    asserts:
+      - exists:
+          path: spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution
+  - it: rejects contradictory chart and gateway policies
+    template: templates/supervisor.yaml
+    set:
+      scheduling.workloadSupervisorAntiAffinity: required
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          sandbox_runtime:
+            pod_anti_affinity: preferred
+    asserts:
+      - failedTemplate:
+          errorMessage: scheduling.workloadSupervisorAntiAffinity conflicts with gatewayConfig sandbox_runtime.pod_anti_affinity
+  - it: rejects gateway role overrides
+    template: templates/supervisor.yaml
+    set:
+      podLabels:
+        openshell.ai/runtime-role: supervisor
+    asserts:
+      - failedTemplate:
+          errorMessage: podLabels cannot override openshell.ai/runtime-role=gateway
+  - it: places PKI hooks with the gateway on opt in infrastructure nodes
+    template: templates/certgen.yaml
+    documentIndex: 3
+    set:
+      nodeSelector:
+        pool: infrastructure
+      tolerations:
+        - key: pool
+          operator: Equal
+          value: infrastructure
+          effect: NoSchedule
+    asserts:
+      - equal:
+          path: spec.template.spec.nodeSelector
+          value:
+            pool: infrastructure
+      - equal:
+          path: spec.template.spec.tolerations[0].value
+          value: infrastructure
+      - notExists:
+          path: spec.template.metadata.labels["openshell.ai/runtime-role"]

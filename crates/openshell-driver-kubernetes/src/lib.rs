@@ -10,6 +10,8 @@ mod lifecycle;
 pub mod otel_tracing;
 mod resource_admission;
 mod sandbox_runtime;
+mod scheduling;
+pub use scheduling::{KubernetesPodAntiAffinity, KubernetesWorkloadPlacement};
 mod shared_supervisor;
 
 pub use config::{

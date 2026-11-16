@@ -88,6 +88,31 @@ The supervisor Pod has a direct, non-controller owner reference to the Sandbox
 resource. This links its garbage-collection lifecycle to the sandbox without
 competing with the Agent Sandbox controller for workload-Pod ownership.
 
+### Scheduling
+
+The operator-owned `sandbox_runtime.pod_anti_affinity` defaults to `preferred`;
+`required` enforces workload/supervisor node separation and `off` removes the
+generated rule. The driver uses the reserved `openshell.ai/runtime-role` label
+(`workload` or `supervisor`), hostname topology, and a native
+`pod_anti_affinity_namespace_selector` (empty means all namespaces). Helm also
+labels gateways and shared supervisors and renders reciprocal supervisor rules.
+
+Optional `sandbox_runtime.workload_placement.node_selector` and `tolerations`
+apply independently of caller driver-config opt-in. Conflicting caller selectors
+fail; tolerations append without duplicates. A reserved template annotation
+records operator additions so stop/start can replace them while preserving
+caller placement and unrelated admission rules. Restart reconciles only the
+reserved role anti-affinity term, using a merge patch that clears removed keys.
+Admission checks validate required workload placement before releasing the
+bootstrap scheduling gate. A verified unschedulable generation may wait for
+capacity; once bound, its scheduling transition starts a bounded startup grace.
+
+Standalone drivers expose `--pod-anti-affinity`,
+`--pod-anti-affinity-namespace-selector` (JSON), and `--workload-placement` (JSON),
+with corresponding `OPENSHELL_K8S_*` environment variables. See the
+[gateway configuration reference](../../docs/how-it-works/gateways/configuration.mdx#kubernetes-pod-placement)
+for deployment examples and cross-namespace scope.
+
 When the gateway exports OTLP traces, the driver sets
 `OPENSHELL_OTLP_ENDPOINT` on the supervisor Pod to the gateway's endpoint and
 `TRACEPARENT` to the trace context of the operation that created the Pod. The

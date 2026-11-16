@@ -3,6 +3,13 @@
 
 # Default values for OpenShell
 
+# Scheduling policy for workload/supervisor roles. Does not constrain gateway placement.
+scheduling:
+  # -- Workload/supervisor anti-affinity: preferred (default), required, or off. Null inherits gatewayConfig, then preferred. Sets both driver and shared-supervisor policy.
+  workloadSupervisorAntiAffinity: null
+  # -- (object) Native namespace label selector for role anti-affinity. Null inherits gatewayConfig, then {} (all namespaces).
+  namespaceSelector: null
+
 # -- Number of OpenShell gateway replicas. Values greater than 1 require
 # server.externalDbSecret because the default SQLite backend is per pod.
 replicaCount: 1
@@ -130,7 +137,11 @@ supervisor:
     seccompProfile:
       # -- Seccomp profile applied to the shared supervisor pod.
       type: RuntimeDefault
-  # -- Affinity rules for the shared supervisor pod, rendered only when
+  # -- Optional node selector for shared supervisors. Empty imposes no pool restriction.
+  nodeSelector: {}
+  # -- Optional tolerations for shared supervisors. Empty adds no tolerations.
+  tolerations: []
+  # -- Additional affinity rules merged with the shared supervisor role policy, rendered only when
   # gatewayConfig selects supervisor_topology = "gateway". Top-level affinity
   # applies only to the gateway pod.
   affinity: {}

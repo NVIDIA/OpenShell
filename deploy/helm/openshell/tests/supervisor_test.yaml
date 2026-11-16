@@ -344,8 +344,9 @@ tests:
           path: spec.template.spec.terminationGracePeriodSeconds
           value: 60
         documentIndex: 0
-      - notExists:
-          path: spec.template.spec.affinity
+      - equal:
+          path: spec.template.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].weight
+          value: 100
         documentIndex: 0
       - contains:
           path: spec.template.spec.containers[0].env

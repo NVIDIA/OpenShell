@@ -24,6 +24,8 @@ CLUSTER_NAME="${HELM_K3S_CLUSTER_NAME:-openshell-dev${_suffix:+-${_suffix}}}"
 # k3d caps cluster names at 32 chars; validated in cmd_create so the operator
 # gets an actionable hint instead of a deep-stack k3d validation error.
 K3D_CLUSTER_NAME_MAX=32
+# One server plus optional agents for isolated scheduling validation.
+CLUSTER_NODES="${HELM_K3S_NODES:-1}"
 # Host port forwarded to port 80 via the k3d load balancer.
 # Used by Envoy Gateway's LoadBalancer service (values-gateway.yaml).
 HOST_LB_PORT="${HELM_K3S_LB_HOST_PORT:-8080}"
@@ -73,6 +75,7 @@ Environment:
   HELM_K3S_CLUSTER_NAME        k3d cluster name (default: openshell-dev-<branch-suffix>)
                                Each git worktree gets its own cluster derived from its branch name.
                                Override to share a single cluster across worktrees.
+  HELM_K3S_NODES               Total nodes for a new cluster: 1 (default), 2, or 3
   HELM_K3S_KUBECONFIG          kubeconfig file to write/merge (default: repo kubeconfig or \$KUBECONFIG)
   HELM_K3S_LB_HOST_PORT        Host port mapped to load balancer port 80 (default: 8080)
   HELM_K3S_PRELOAD_SANDBOX_IMAGE
@@ -394,6 +397,11 @@ EOF
     exit 1
   fi
 
+  if [[ ! "${CLUSTER_NODES}" =~ ^[123]$ ]]; then
+    echo "error: HELM_K3S_NODES must be 1, 2, or 3." >&2
+    exit 1
+  fi
+
   local lb_port_map="${HOST_LB_PORT}:80@loadbalancer"
 
   if k3d_cluster_exists; then
@@ -403,6 +411,7 @@ EOF
     echo "Creating k3d cluster '${CLUSTER_NAME}'..."
     k3d cluster create "${CLUSTER_NAME}" \
       --wait \
+      --agents "$((CLUSTER_NODES - 1))" \
       --kubeconfig-update-default=false \
       --kubeconfig-switch-context=false \
       --port "${lb_port_map}" \

@@ -1459,7 +1459,98 @@ gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes
 [openshell.drivers.kubernetes.sandbox_runtime]
 # TLS-protected boundary listener reached only by the paired control pod.
 boundary_port = 5500
+# Workload/supervisor node separation: preferred (default), required, or off.
+pod_anti_affinity = "preferred"
 ```
+
+### Kubernetes pod placement
+
+OpenShell labels pods with `openshell.ai/runtime-role`: `workload`, `supervisor`,
+or `gateway`. The Kubernetes driver labels workloads and dedicated supervisors;
+Helm labels gateways and shared supervisors. These labels do not change Service
+or controller selectors and can be used in native pod affinity rules. To target
+gateways, select `openshell.ai/runtime-role: gateway` in your own rules under
+`supervisor.affinity` or the gateway's top-level Helm `affinity`. These rules
+coexist with the generated workload/supervisor policy.
+
+Workloads and supervisors prefer separate nodes by default. Set
+`sandbox_runtime.pod_anti_affinity = "required"` to require separation, or `"off"`
+to omit the generated rule. Required mode leaves pods Pending when separation
+cannot be satisfied. Preferred mode permits single-node deployments. Gateway
+placement is independent; the default rule does not select gateways.
+
+Rules use `kubernetes.io/hostname` and select the opposite role across **all
+namespaces**, including other OpenShell installations. To limit the scope, label
+the participating namespaces and configure a native namespace label selector:
+
+```toml
+[openshell.drivers.kubernetes.sandbox_runtime.pod_anti_affinity_namespace_selector.matchLabels]
+"example.com/openshell-group" = "production"
+```
+
+In Helm, `scheduling.workloadSupervisorAntiAffinity` sets the policy for both the
+driver and shared-supervisor Deployment. It inherits gateway TOML when unset,
+then defaults to `preferred`. `scheduling.namespaceSelector` similarly sets both
+sides' namespace selector. Contradictory chart and gateway settings are rejected.
+For example:
+
+```yaml
+scheduling:
+  workloadSupervisorAntiAffinity: required
+  namespaceSelector:
+    matchLabels:
+      example.com/openshell-group: production
+```
+
+For independently deployed shared supervisors, apply the supervisor role label
+and configure native anti-affinity against workloads in the supervisor Pod
+template. Use the same namespace scope and policy strength as the gateway:
+
+```yaml
+metadata:
+  labels:
+    openshell.ai/runtime-role: supervisor
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              openshell.ai/runtime-role: workload
+          namespaceSelector: {}
+          topologyKey: kubernetes.io/hostname
+```
+
+This example selects all namespaces. For soft separation, put the term under
+`preferredDuringSchedulingIgnoredDuringExecution` as a `podAffinityTerm` with
+`weight: 100`. `off` only removes OpenShell-generated rules; operator-authored
+rules remain effective. The gateway never changes independently deployed
+supervisor pods.
+
+Node selectors and tolerations are opt-in and empty by default. To select a
+sandbox node pool without enabling caller driver config:
+
+```toml
+[openshell.drivers.kubernetes.sandbox_runtime.workload_placement]
+node_selector = { "openshell.ai/node-pool" = "sandbox" }
+tolerations = [{ key = "openshell.ai/node-pool", operator = "Equal", value = "sandbox", effect = "NoSchedule" }]
+```
+
+For gateway placement, use Helm's `nodeSelector` and `tolerations`; shared
+supervisors use `supervisor.nodeSelector` and `supervisor.tolerations`. PKI hook
+Jobs inherit gateway node selectors and tolerations. For
+example, set both selectors to `openshell.ai/node-pool: infrastructure` to run
+infrastructure together and workloads elsewhere. Selectors constrain eligible
+nodes. Tolerations permit use of tainted nodes and do not select a pool.
+Anti-affinity alone does not reserve nodes for future supervisors.
+
+Operator workload selectors merge with caller selectors; conflicting values
+are rejected. Operator tolerations append without duplicates and retain caller
+tolerations. Placement is applied on creation and stop/start, preserving
+unrelated affinity. Running pods are not moved or continuously evicted. Recreate
+existing gateway/supervisor pods to acquire the role labels during rollout;
+older unlabeled pods are not selected. A capacity wait does not consume the
+workload's bounded startup grace after scheduling.
 
 The Kubernetes driver always creates the workload `NetworkPolicy` before
 releasing a sandbox Pod. Your cluster CNI must enforce ingress and egress

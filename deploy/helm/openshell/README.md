@@ -653,6 +653,8 @@ discovery endpoint or its TLS CA.
 | sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
 | sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
 | sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
+| scheduling.namespaceSelector | object | `nil` | Native namespace label selector for role anti-affinity. Null inherits gatewayConfig, then {} (all namespaces). |
+| scheduling.workloadSupervisorAntiAffinity | string | `nil` | Workload/supervisor anti-affinity: preferred (default), required, or off. Null inherits gatewayConfig, then preferred. Sets both driver and shared-supervisor policy. |
 | securityContext.allowPrivilegeEscalation | bool | `false` | Whether the gateway container can gain additional privileges. |
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
@@ -745,7 +747,7 @@ discovery endpoint or its TLS CA.
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
-| supervisor.affinity | object | `{}` | Affinity rules for the shared supervisor pod, rendered only when gatewayConfig selects supervisor_topology = "gateway". Top-level affinity applies only to the gateway pod. |
+| supervisor.affinity | object | `{}` | Additional affinity rules merged with the shared supervisor role policy, rendered only when gatewayConfig selects supervisor_topology = "gateway". Top-level affinity applies only to the gateway pod. |
 | supervisor.autoscaling.behavior | object | `{"scaleDown":{"policies":[{"periodSeconds":120,"type":"Pods","value":1}],"stabilizationWindowSeconds":300}}` | HPA scaling behavior. Remove at most one member every two minutes, after a five-minute stabilization window, to allow ownership handoff. |
 | supervisor.autoscaling.enabled | bool | `false` | Enable memory-based autoscaling of the shared supervisor Deployment. Requires supervisor_topology = "gateway" and the Kubernetes resource metrics API (usually Metrics Server). When enabled, the HPA owns the replica count and supervisor.replicas is ignored. |
 | supervisor.autoscaling.maxReplicas | int | `4` | Maximum supervisor replicas. |
@@ -757,6 +759,7 @@ discovery endpoint or its TLS CA.
 | supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
 | supervisor.network.additionalCaConfigMapName | string | `""` | Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust. |
+| supervisor.nodeSelector | object | `{}` | Optional node selector for shared supervisors. Empty imposes no pool restriction. |
 | supervisor.podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget with maxUnavailable 1 for the shared supervisor, used only when gatewayConfig selects supervisor_topology = "gateway". Disable it only when maintenance must evict more than one supervisor Pod at a time, or evict a member while another is unavailable. |
 | supervisor.podSecurityContext.fsGroup | int | `65534` | fsGroup assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.runAsGroup | int | `65534` | Primary GID assigned to the shared supervisor pod. |
@@ -766,6 +769,7 @@ discovery endpoint or its TLS CA.
 | supervisor.recoveryTimeoutSeconds | int | `60` | Seconds a sandbox workload stays frozen after losing its pool member's supervision before the sandbox runtime terminates it, rendered as [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an integer from 30 to 300. Null leaves the gateway's pool default of 60 seconds. |
 | supervisor.replicas | int | `1` | Shared supervisor pool members, used only when gatewayConfig selects supervisor_topology = "gateway". The gateway always coordinates the shared supervisor as a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. 1 has no failover; use 2 or more to survive losing a member. Only the supervisor Deployment's replica count depends on this value, so changing it neither restarts the gateway nor replaces running members. Ignored when supervisor.autoscaling.enabled is true. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
+| supervisor.tolerations | list | `[]` | Optional tolerations for shared supervisors. Empty adds no tolerations. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | topologySpreadConstraints | list | `[]` | Topology spread constraints for the gateway pod, used to spread replicas across zones or nodes. Empty = omit the field. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"caBundle":{"configMapName":"","key":"ca.crt"},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |

@@ -1064,6 +1064,18 @@ kubectl -n openshell get "${GATEWAY_DEPLOYMENT}" -o jsonpath="{.spec.template.sp
 helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage|workload'
 ```
 
+Workload/supervisor node separation is preferred by default. Check
+`sandbox_runtime.pod_anti_affinity` in gateway configuration and
+`scheduling.workloadSupervisorAntiAffinity` in Helm values. Required mode needs
+separate eligible nodes; inspect both roles' `FailedScheduling` events. The
+reserved pod label `openshell.ai/runtime-role` has values `workload`,
+`supervisor`, and `gateway`; role anti-affinity selects across all namespaces
+unless `pod_anti_affinity_namespace_selector` / `scheduling.namespaceSelector`
+restricts scope. Node selectors/tolerations are opt-in: check gateway chart
+fields, `supervisor.nodeSelector` / `supervisor.tolerations`, and
+`sandbox_runtime.workload_placement`. Existing unlabeled pods need recreation.
+The published gateway configuration reference documents the supported fields.
+
 The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes. Kubernetes sandboxes take the configured supervisor and runtime images each time they start, so a sandbox that kept running through an upgrade uses its previous images until its next stop and start.
 
 For vulnerability reports, record the running image digest and scan that exact
@@ -1749,7 +1761,6 @@ verify workload identity/memory survives and new connections reach the replaceme
 Shared serving leases last at most fifteen seconds from issuance, independently
 of configuration renewal; include membership failure detection when measuring a
 partition's stale-owner interval. Storage failures prevent renewal.
-
 
 Application ingress consumers call the separate `openshell.v1.ServiceDiscovery`
 service, rather than `OpenShell`. Discovery snapshots share a one-second cache

@@ -9,6 +9,8 @@ release:
   name: openshell
   namespace: gateway
 set:
+  scheduling:
+    workloadSupervisorAntiAffinity: off
   gatewayConfig:
     openshell.drivers.kubernetes:
       supervisor_topology: gateway
