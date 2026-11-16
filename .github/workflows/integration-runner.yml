@@ -15,7 +15,7 @@ on:
         required: true
         type: string
       category:
-        description: Integration-test category, used for the job name and concurrency key
+        description: Integration-test category, used for job and artifact names
         required: false
         type: string
       test-matrix:
@@ -31,10 +31,6 @@ permissions:
   actions: read
   contents: read
   packages: read
-
-concurrency:
-  group: ${{ github.workflow }}-integration-${{ inputs.category }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   integration:

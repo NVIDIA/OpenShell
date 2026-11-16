@@ -51,12 +51,6 @@ permissions:
   contents: read
   packages: read
 
-# github.workflow is the caller's name here, so scope the group to this
-# workflow to avoid colliding with (and cancelling) the caller's other jobs.
-concurrency:
-  group: ${{ github.workflow }}-e2e-suites-${{ inputs.family }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   # The rows live here, in one place. Add an environment or a suite by adding a
   # row; the runner needs no list of its own.

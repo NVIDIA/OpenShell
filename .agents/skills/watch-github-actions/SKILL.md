@@ -123,6 +123,12 @@ JSON output for scripting:
 gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId, status: .status, branch: .headBranch, url: .url}'
 ```
 
+## E2E and dev release concurrency
+
+`Release Dev` serializes complete runs in the `release-dev` concurrency group without cancelling the active run. New arrivals replace the pending run. A pending cancellation is expected during frequent main updates; cancellation of active E2E by another dev run is not. Inspect the job annotations for the cancellation reason.
+
+`Branch E2E Checks` still cancels superseded runs on the same mirrored PR branch. The reusable `e2e-suites.yml` and `integration-runner.yml` workflows leave concurrency to their callers. Manual `Integration Tests` runs can finish independently on the same branch and category.
+
 ## View Job Logs
 
 For Kubernetes app-listener E2E failures during kind setup, inspect the uploaded

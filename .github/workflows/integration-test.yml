@@ -17,7 +17,7 @@ on:
         type: string
         default: ""
       category:
-        description: Integration-test category, used for the job name and concurrency key
+        description: Integration-test category, used for job and artifact names
         required: true
         type: string
         default: driver-specific

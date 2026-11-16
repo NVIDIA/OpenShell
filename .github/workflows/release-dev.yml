@@ -9,6 +9,10 @@ permissions:
   contents: read
   packages: read
 
+concurrency:
+  group: release-dev
+  cancel-in-progress: false
+
 defaults:
   run:
     shell: bash
