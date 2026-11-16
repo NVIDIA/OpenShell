@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          args=(--repo "$GH_REPO" --pr "$PR_NUMBER" --apply)
+          args=(--repo "$GH_REPO" --pr "$PR_NUMBER" --event "$PR_ACTION" --apply)
           if [ "$PR_ACTION" = opened ]; then
             args+=(--label-accepted-work)
           fi

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Offline tests for roster parsing and PR reviewer reconciliation."""
+"""Offline tests for PR acceptance, roster parsing, and reviewer reconciliation."""
 
 from __future__ import annotations
 
@@ -26,16 +26,37 @@ CATEGORIES = {
 }
 REPO = "owner/repo"
 PULL = "repos/owner/repo/pulls/42"
+ROSTER = Path("REVIEWERS.md")
+DRAFTED = {"data": {"convertPullRequestToDraft": {"pullRequest": {"isDraft": True}}}}
 
 
-def pr(*labels, requested=(), author="author", draft=False, state="open"):
+def pr(*labels, requested=(), author="author", draft=False, state="open", body=""):
     return {
         "number": 42,
         "state": state,
         "draft": draft,
         "user": {"login": author},
+        "node_id": "PR_node_42",
+        "body": body,
         "labels": [{"name": label} for label in labels],
         "requested_reviewers": [{"login": login} for login in requested],
+    }
+
+
+def graphql_pr(value, *, cursor=None):
+    return {
+        "repository": {
+            "pullRequest": {
+                **value,
+                "labels": {
+                    "nodes": value["labels"],
+                    "pageInfo": {
+                        "hasNextPage": cursor is not None,
+                        "endCursor": cursor,
+                    },
+                },
+            }
+        }
     }
 
 
@@ -259,15 +280,481 @@ class GitHubTests(unittest.TestCase):
         self.assertIn("/timeline?per_page=100", api.call_args.args[0])
 
 
+class AcceptanceTests(unittest.TestCase):
+    @staticmethod
+    def member(permission="READ", login="author", cursor=None):
+        return {
+            "data": {
+                "repository": {
+                    "collaborators": {
+                        "edges": [{"permission": permission, "node": {"login": login}}],
+                        "pageInfo": {
+                            "hasNextPage": cursor is not None,
+                            "endCursor": cursor,
+                        },
+                    }
+                }
+            }
+        }
+
+    @staticmethod
+    def linked(*numbers, repository=REPO, cursor=None):
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "closingIssuesReferences": {
+                            "nodes": [
+                                {
+                                    "number": n,
+                                    "repository": {"nameWithOwner": repository},
+                                }
+                                for n in numbers
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": cursor is not None,
+                                "endCursor": cursor,
+                            },
+                        }
+                    }
+                }
+            }
+        }
+
+    @staticmethod
+    def issue(author="author", accepted=True, cursor=None):
+        return {
+            "data": {
+                "repository": {
+                    "issueOrPullRequest": {
+                        "author": {"login": author},
+                        "labels": {
+                            "nodes": [{"name": "state:accepted"}] if accepted else [],
+                            "pageInfo": {
+                                "hasNextPage": cursor is not None,
+                                "endCursor": cursor,
+                            },
+                        },
+                    }
+                }
+            }
+        }
+
+    def test_dependabot_remains_exempt_without_lookups(self):
+        with mock.patch.object(
+            routing, "_api", side_effect=AssertionError("No lookups")
+        ):
+            self.assertTrue(
+                routing._accepted_work(REPO, 42, pr(author="dependabot[bot]"))
+            )
+
+    def test_write_maintain_and_admin_return_without_looking_up_issues(self):
+        for permission in ("WRITE", "MAINTAIN", "ADMIN"):
+            with (
+                self.subTest(permission=permission),
+                mock.patch.object(
+                    routing, "_api", return_value=self.member(permission)
+                ) as api,
+            ):
+                self.assertTrue(
+                    routing._accepted_work(REPO, 42, pr(body="See #9999999"))
+                )
+                api.assert_called_once()
+                self.assertNotIn("pullRequest", api.call_args.kwargs["data"]["query"])
+
+    def test_acceptance_recorded_on_pr_needs_no_further_lookups(self):
+        with mock.patch.object(routing, "_api") as api:
+            self.assertTrue(routing._accepted_work(REPO, 42, pr("state:accepted")))
+        api.assert_not_called()
+
+    def test_collaborator_search_result_must_match_the_pr_author(self):
+        with mock.patch.object(
+            routing,
+            "_api",
+            side_effect=[
+                self.member("ADMIN", login="someone-else"),
+                self.linked(),
+            ],
+        ):
+            self.assertFalse(routing._accepted_work(REPO, 42, pr()))
+
+    def test_qualifying_description_reference_skips_all_closing_link_queries(self):
+        with mock.patch.object(
+            routing,
+            "_api",
+            side_effect=[
+                self.member(),
+                self.issue(),
+            ],
+        ) as api:
+            self.assertTrue(routing._accepted_work(REPO, 42, pr(body="Related to #1")))
+        self.assertEqual(api.call_count, 2)
+
+    def test_qualifying_closing_reference_skips_later_pages(self):
+        with mock.patch.object(
+            routing,
+            "_api",
+            side_effect=[
+                self.member(),
+                self.linked(1, cursor="unneeded-page"),
+                self.issue(),
+            ],
+        ) as api:
+            self.assertTrue(routing._accepted_work(REPO, 42, pr()))
+        self.assertEqual(api.call_count, 3)
+
+    def test_description_and_closing_references_require_acceptance_not_same_submitter(
+        self,
+    ):
+        for body in (
+            "",
+            "Related to #1",
+            "Related to owner/repo#1",
+            "Related to OWNER/REPO#1",
+            "Related to https://github.com/owner/repo/issues/1",
+        ):
+            for author, accepted, expected in (
+                ("AUTHOR", True, True),
+                ("someone-else", True, True),
+                ("author", False, False),
+                ("someone-else", False, False),
+            ):
+                with (
+                    self.subTest(body=body, author=author, accepted=accepted),
+                    mock.patch.object(
+                        routing,
+                        "_api",
+                        side_effect=(
+                            [
+                                self.member(),
+                                self.linked(1),
+                                self.issue(author, accepted),
+                            ]
+                            if not body
+                            else [self.member(), self.issue(author, accepted)]
+                            + ([] if expected else [self.linked()])
+                        ),
+                    ) as api,
+                ):
+                    self.assertEqual(
+                        routing._accepted_work(REPO, 42, pr(body=body)), expected
+                    )
+                    lookups = [
+                        call.kwargs["data"]["variables"]["number"]
+                        for call in api.call_args_list
+                        if "issueOrPullRequest" in call.kwargs["data"]["query"]
+                    ]
+                    self.assertEqual(lookups, [1])
+
+    def test_one_qualifying_issue_is_enough_and_duplicate_references_are_read_once(
+        self,
+    ):
+        with mock.patch.object(
+            routing,
+            "_api",
+            side_effect=[
+                self.member(),
+                self.issue(accepted=False),
+                self.linked(1, 2),
+                self.issue(),
+            ],
+        ) as api:
+            self.assertTrue(routing._accepted_work(REPO, 42, pr(body="Related to #1")))
+        self.assertEqual(api.call_count, 4)
+
+    def test_paginates_permission_lookup_before_querying_issues(self):
+        with mock.patch.object(
+            routing,
+            "_api",
+            side_effect=[
+                self.member(login="someone-else", cursor="next-page"),
+                self.member("WRITE"),
+            ],
+        ) as api:
+            self.assertTrue(routing._accepted_work(REPO, 42, pr()))
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(
+            api.call_args.kwargs["data"]["variables"]["cursor"], "next-page"
+        )
+
+    def test_reads_later_closing_reference_pages(self):
+        with mock.patch.object(
+            routing,
+            "_api",
+            side_effect=[
+                self.member(),
+                self.linked(cursor="next-page"),
+                self.linked(1),
+                self.issue(),
+            ],
+        ) as api:
+            self.assertTrue(routing._accepted_work(REPO, 42, pr()))
+        self.assertEqual(
+            api.call_args_list[2].kwargs["data"]["variables"]["cursor"], "next-page"
+        )
+
+    def test_reads_later_label_pages_on_the_referenced_issue(self):
+        with mock.patch.object(
+            routing,
+            "_api",
+            side_effect=[
+                self.member(),
+                self.linked(1),
+                self.issue(accepted=False, cursor="next-page"),
+                self.issue(),
+            ],
+        ) as api:
+            self.assertTrue(routing._accepted_work(REPO, 42, pr()))
+        self.assertEqual(
+            api.call_args.kwargs["data"]["variables"]["cursor"], "next-page"
+        )
+
+    def test_cross_repository_references_do_not_qualify(self):
+        with mock.patch.object(
+            routing,
+            "_api",
+            side_effect=[
+                self.member(),
+                self.linked(1, repository="other/repo"),
+            ],
+        ) as api:
+            self.assertFalse(
+                routing._accepted_work(
+                    REPO,
+                    42,
+                    pr(
+                        body=(
+                            "Related to other/repo#1 and https://github.com/other/repo/issues/1"
+                        )
+                    ),
+                )
+            )
+        self.assertEqual(api.call_count, 2)
+
+    def test_missing_issues_do_not_qualify_and_other_graphql_errors_propagate(self):
+        for error_type in ("NOT_FOUND", "FORBIDDEN"):
+            error = subprocess.CalledProcessError(
+                1,
+                "gh",
+                output=json.dumps({"errors": [{"type": error_type}]}),
+            )
+            with (
+                self.subTest(error_type=error_type),
+                mock.patch.object(
+                    routing,
+                    "_api",
+                    side_effect=[
+                        self.member(),
+                        error,
+                        self.linked(),
+                    ],
+                ),
+            ):
+                if error_type == "NOT_FOUND":
+                    self.assertFalse(
+                        routing._accepted_work(REPO, 42, pr(body="See #1"))
+                    )
+                else:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        routing._accepted_work(REPO, 42, pr(body="See #1"))
+
+    def test_pull_request_references_do_not_qualify(self):
+        with mock.patch.object(
+            routing,
+            "_api",
+            side_effect=[
+                self.member(),
+                {"data": {"repository": {"issueOrPullRequest": {}}}},
+                self.linked(),
+            ],
+        ):
+            self.assertFalse(routing._accepted_work(REPO, 42, pr(body="See #1")))
+
+    def test_missing_description_reference_falls_back_to_qualifying_closing_link(self):
+        missing = subprocess.CalledProcessError(
+            1,
+            "gh",
+            output=json.dumps({"errors": [{"type": "NOT_FOUND"}]}),
+        )
+        with mock.patch.object(
+            routing,
+            "_api",
+            side_effect=[
+                self.member(),
+                missing,
+                self.linked(2),
+                self.issue(),
+            ],
+        ):
+            self.assertTrue(routing._accepted_work(REPO, 42, pr(body="Related to #1")))
+
+    def test_first_draft_conversion_comments_once_and_subsequent_attempts_are_silent(
+        self,
+    ):
+        comments = f"repos/{REPO}/issues/42/comments"
+        posted = {"user": {"type": "Bot"}, "body": ""}
+        with (
+            mock.patch.object(
+                routing,
+                "_api",
+                side_effect=[
+                    pr(),
+                    DRAFTED,
+                    [],
+                    posted,
+                    pr(),
+                    DRAFTED,
+                    [posted],
+                    pr(),
+                    DRAFTED,
+                    [posted],
+                ],
+            ) as api,
+            mock.patch.object(routing, "_accepted_work", return_value=False),
+            mock.patch.object(routing, "_load_reviewers") as load,
+        ):
+            for attempt in range(3):
+                with self.assertRaisesRegex(ValueError, "not accepted work"):
+                    routing.check_review_readiness(
+                        ROSTER, REPO, 42, apply=True, event="ready_for_review"
+                    )
+                if attempt == 0:
+                    posted["body"] = api.call_args.kwargs["data"]["body"]
+            self.assertEqual(
+                sum(
+                    "convertPullRequestToDraft"
+                    in call.kwargs.get("data", {}).get("query", "")
+                    for call in api.call_args_list
+                ),
+                3,
+            )
+            self.assertEqual(
+                sum(
+                    call.args[0] == comments and call.kwargs.get("method") == "POST"
+                    for call in api.call_args_list
+                ),
+                1,
+            )
+            load.assert_not_called()
+
+    def test_existing_notice_suppresses_comment_and_all_pages_are_read(self):
+        comments = f"repos/{REPO}/issues/42/comments"
+        for previous, should_post in (
+            ([{"user": {"type": "User"}, "body": routing.DRAFT_COMMENT}], False),
+            ([{"user": {"type": "Bot"}, "body": "unrelated comment"}], True),
+            ([{"user": None, "body": None}], True),
+            (
+                [{"user": {"type": "Bot"}, "body": None}] * 100
+                + [{"user": {"type": "Bot"}, "body": routing.DRAFT_COMMENT}],
+                False,
+            ),
+        ):
+            with (
+                self.subTest(previous=previous, should_post=should_post),
+                mock.patch.object(
+                    routing,
+                    "_api",
+                    side_effect=[
+                        pr(),
+                        DRAFTED,
+                        previous,
+                        {},
+                    ],
+                ) as api,
+                mock.patch.object(routing, "_accepted_work", return_value=False),
+                self.assertRaisesRegex(ValueError, "not accepted work"),
+            ):
+                routing.check_review_readiness(ROSTER, REPO, 42, apply=True)
+            self.assertIn(
+                mock.call(f"{comments}?per_page=100", pages=True), api.call_args_list
+            )
+            self.assertEqual(
+                any(
+                    call.kwargs.get("method") == "POST" and call.args[0] == comments
+                    for call in api.call_args_list
+                ),
+                should_post,
+            )
+
+    def test_comment_lookup_or_post_failure_still_leaves_pr_drafted(self):
+        for posting in (False, True):
+            error = subprocess.CalledProcessError(1, "gh")
+            with (
+                self.subTest(posting=posting),
+                mock.patch.object(
+                    routing,
+                    "_api",
+                    side_effect=(
+                        [pr(), DRAFTED, [], error]
+                        if posting
+                        else [pr(), DRAFTED, error]
+                    ),
+                ) as api,
+                mock.patch.object(routing, "_accepted_work", return_value=False),
+                mock.patch.object(routing, "_load_reviewers") as load,
+                self.assertRaises(subprocess.CalledProcessError),
+            ):
+                routing.check_review_readiness(ROSTER, REPO, 42, apply=True)
+            self.assertIn(
+                "convertPullRequestToDraft",
+                api.call_args_list[1].kwargs["data"]["query"],
+            )
+            load.assert_not_called()
+
+    def test_lookup_errors_fail_without_drafting_or_requesting_reviewers(self):
+        with (
+            mock.patch.object(
+                routing,
+                "_api",
+                side_effect=[
+                    pr(),
+                    subprocess.CalledProcessError(1, "gh"),
+                ],
+            ) as api,
+            mock.patch.object(routing, "_load_reviewers") as load,
+            self.assertRaises(subprocess.CalledProcessError),
+        ):
+            routing.check_review_readiness(ROSTER, REPO, 42, apply=True)
+        self.assertEqual(api.call_count, 2)
+        load.assert_not_called()
+
+    def test_draft_conversion_errors_propagate(self):
+        with (
+            mock.patch.object(
+                routing,
+                "_api",
+                side_effect=[pr(), subprocess.CalledProcessError(1, "gh")],
+            ),
+            mock.patch.object(routing, "_accepted_work", return_value=False),
+            self.assertRaises(subprocess.CalledProcessError),
+        ):
+            routing.check_review_readiness(ROSTER, REPO, 42, apply=True)
+
+
 class ReconciliationTests(unittest.TestCase):
-    def run_routing(self, categories, *, snapshots, responses, apply=True):
+    def setUp(self):
+        self.accepted = mock.patch.object(routing, "_accepted_work", return_value=True)
+        self.accepted.start()
+        self.addCleanup(self.accepted.stop)
+        self.roster = mock.Mock(spec=Path)
+        self.roster.read_text.return_value = DOCUMENT
+        parser = mock.patch.object(routing, "parse_reviewers", return_value=CATEGORIES)
+        self.parser = parser.start()
+        self.addCleanup(parser.stop)
+
+    def run_routing(
+        self, categories, *, snapshots, responses, apply=True, event="opened"
+    ):
+        self.parser.return_value = categories
         with (
             mock.patch.object(routing, "_api", side_effect=responses) as api,
             mock.patch.object(
                 routing, "_load_reviewers", side_effect=snapshots
             ) as load,
         ):
-            plan = routing.check_review_readiness(categories, REPO, 42, apply=apply)
+            plan = routing.check_review_readiness(
+                self.roster, REPO, 42, apply=apply, event=event
+            )
         return plan, api, load
 
     def test_initial_assignment_excludes_author_without_extra_refresh(self):
@@ -315,15 +802,20 @@ class ReconciliationTests(unittest.TestCase):
         )
         self.assertEqual(plan.add, ("carol",))
 
-    def test_draft_and_closed_prs_skip_all_routing(self):
-        for value in (pr(draft=True), pr(state="closed")):
-            with self.subTest(value=value):
-                plan, api, load = self.run_routing(
-                    CATEGORIES, snapshots=[], responses=[value]
+    def test_label_changes_reconcile_without_rechecking_acceptance(self):
+        for event in ("labeled", "unlabeled"):
+            with (
+                self.subTest(event=event),
+                mock.patch.object(routing, "_accepted_work") as accepted,
+            ):
+                plan, _, _ = self.run_routing(
+                    CATEGORIES,
+                    snapshots=[reviewers()],
+                    responses=[pr("area:build"), None],
+                    event=event,
                 )
-                self.assertIsNone(plan)
-                api.assert_called_once_with(PULL)
-                load.assert_not_called()
+                self.assertEqual(plan.add, ("dave",))
+                accepted.assert_not_called()
 
     def test_preview_makes_no_changes(self):
         plan, api, _ = self.run_routing(
@@ -376,7 +868,7 @@ class ReconciliationTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaisesRegex(ValueError, "routing changed"):
-                    routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
+                    routing.check_review_readiness(self.roster, REPO, 42, apply=True)
                 self.assertTrue(
                     all(
                         call.kwargs.get("method", "GET") == "GET"
@@ -417,6 +909,29 @@ class ReconciliationTests(unittest.TestCase):
 
 
 class AcceptedWorkIntegrationTests(unittest.TestCase):
+    def test_unaccepted_new_ready_pr_is_drafted_before_roster_or_reviewer_reads(self):
+        with (
+            mock.patch.object(
+                routing, "_api", side_effect=[pr(), DRAFTED, [], {}]
+            ) as api,
+            mock.patch.object(routing, "check_pr_accepted_work", return_value=False),
+            mock.patch.object(routing, "_accepted_work", return_value=False),
+            mock.patch.object(routing, "_load_reviewers") as load,
+            self.assertRaisesRegex(ValueError, "not accepted work"),
+        ):
+            routing.check_review_readiness(
+                Path("missing-roster"),
+                REPO,
+                42,
+                apply=True,
+                label_accepted_work=True,
+                maintainers={"maintainer"},
+            )
+        self.assertIn(
+            "convertPullRequestToDraft", api.call_args_list[1].kwargs["data"]["query"]
+        )
+        load.assert_not_called()
+
     def run_check(self, value, *, accepted=True, apply=True, opened=True):
         with (
             mock.patch.object(routing, "_api", side_effect=[value, None]) as api,
@@ -432,6 +947,7 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
                 REPO,
                 42,
                 apply=apply,
+                event="opened" if opened else "labeled",
                 label_accepted_work=opened,
                 maintainers={"maintainer"},
             )
@@ -461,7 +977,7 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
         load.assert_not_called()
 
     def test_nonqualifying_pr_is_not_labeled(self):
-        plan, api, _, _ = self.run_check(pr(), accepted=False)
+        plan, api, _, _ = self.run_check(pr(draft=True), accepted=False)
         self.assertFalse(plan.accepted_work)
         self.assertEqual(plan.add_labels, ())
         api.assert_called_once_with(PULL)
@@ -603,6 +1119,47 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_opened_pr_option_loads_trusted_maintainer_roster(self):
+        with tempfile.TemporaryDirectory() as directory:
+            roster = Path(directory) / "REVIEWERS.md"
+            roster.write_text(DOCUMENT, encoding="utf-8")
+            maintainers = Path(directory) / "MAINTAINERS.md"
+            maintainers.write_text("[@maintainer](https://github.com/maintainer)")
+            with (
+                mock.patch.object(
+                    routing,
+                    "check_review_readiness",
+                    return_value=routing.ReviewPlan((), (), True, ("state:accepted",)),
+                ) as check,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                result = routing.main(
+                    [
+                        "--repo",
+                        REPO,
+                        "--pr",
+                        "42",
+                        "--reviewers",
+                        str(roster),
+                        "--maintainers",
+                        str(maintainers),
+                        "--label-accepted-work",
+                    ]
+                )
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                json.loads(output.getvalue())["add_labels"], ["state:accepted"]
+            )
+            check.assert_called_once_with(
+                roster,
+                REPO,
+                42,
+                apply=False,
+                event="opened",
+                label_accepted_work=True,
+                maintainers={"maintainer"},
+            )
+
     def test_emits_plan_and_passes_apply_option(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "REVIEWERS.md"
@@ -640,61 +1197,355 @@ class CliTests(unittest.TestCase):
                 },
             )
             check.assert_called_once_with(
-                {"area:runtime": {"alice"}},
+                path,
                 REPO,
                 42,
                 apply=True,
+                event="opened",
                 label_accepted_work=False,
                 maintainers=None,
             )
 
-    def test_opened_pr_option_loads_trusted_maintainer_roster(self):
-        with tempfile.TemporaryDirectory() as directory:
-            roster = Path(directory) / "REVIEWERS.md"
-            roster.write_text(DOCUMENT, encoding="utf-8")
-            maintainers = Path(directory) / "MAINTAINERS.md"
-            maintainers.write_text("[@maintainer](https://github.com/maintainer)")
-            with (
-                mock.patch.object(
-                    routing,
-                    "check_review_readiness",
-                    return_value=routing.ReviewPlan((), (), True, ("state:accepted",)),
-                ) as check,
-                contextlib.redirect_stdout(io.StringIO()) as output,
-            ):
-                result = routing.main(
+    def test_both_cli_modes_use_the_same_acceptance_policy(self):
+        cases = [
+            ("WRITE", "", (), {}, (), True),
+            ("READ", "", (), {}, ("state:accepted",), True),
+            ("READ", "Related to #1", (), {1: ("author", True)}, (), True),
+            ("READ", "Closes #1", (1,), {1: ("someone-else", True)}, (), True),
+            (
+                "READ",
+                "Closes #1 and #2",
+                (1, 2),
+                {1: ("author", True), 2: ("author", False)},
+                (),
+                True,
+            ),
+            ("READ", "Related to #1", (), {1: ("author", False)}, (), False),
+            ("READ", "", (), {}, (), False),
+        ]
+        for mode in ("preview", "acceptance-api", "acceptance-event"):
+            acceptance_only = mode != "preview"
+            for permission, body, linked, issues, labels, expected in cases:
+                with (
+                    self.subTest(mode=mode, body=body, issues=issues, labels=labels),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    path = Path(directory) / "REVIEWERS.md"
+                    path.write_text(DOCUMENT, encoding="utf-8")
+                    value = pr("area:runtime", *labels, body=body)
+
+                    def api(
+                        endpoint,
+                        *,
+                        value=value,
+                        mode=mode,
+                        permission=permission,
+                        linked=linked,
+                        issues=issues,
+                        **kwargs,
+                    ):
+                        if endpoint == PULL:
+                            return value
+                        self.assertEqual(endpoint, "graphql")
+                        query = kwargs["data"]["query"]
+                        self.assertNotIn("mutation", query)
+                        if "user: author" in query:
+                            self.assertNotEqual(mode, "acceptance-event")
+                            self.assertEqual(kwargs["data"]["variables"]["number"], 42)
+                            return {"data": graphql_pr(value)}
+                        if "collaborators" in query:
+                            return AcceptanceTests.member(permission)
+                        if "closingIssuesReferences" in query:
+                            return AcceptanceTests.linked(*linked)
+                        self.assertIn("issueOrPullRequest", query)
+                        author, accepted = issues[kwargs["data"]["variables"]["number"]]
+                        return AcceptanceTests.issue(author, accepted)
+
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (
+                        mock.patch.object(routing, "_api", side_effect=api),
+                        mock.patch.object(
+                            routing, "_load_reviewers", return_value=reviewers()
+                        ) as load,
+                        contextlib.redirect_stdout(output),
+                        contextlib.redirect_stderr(errors),
+                    ):
+                        argv = ["--repo", REPO, "--pr", "42", "--reviewers", str(path)]
+                        if acceptance_only:
+                            argv.append("--acceptance-only")
+                        if mode == "acceptance-event":
+                            event_path = Path(directory) / "event.json"
+                            event_path.write_text(json.dumps({"pull_request": value}))
+                            argv.extend(["--event-path", str(event_path)])
+                        status = routing.main(argv)
+                    self.assertEqual(status, 0 if expected else 1)
+                    if expected:
+                        self.assertEqual(
+                            json.loads(output.getvalue()),
+                            {"accepted": True}
+                            if acceptance_only
+                            else {
+                                "add": ["alice"],
+                                "remove": [],
+                                "accepted_work": None,
+                                "add_labels": [],
+                            },
+                        )
+                    else:
+                        self.assertIn(routing.ACCEPTANCE_ERROR, errors.getvalue())
+                    if acceptance_only:
+                        load.assert_not_called()
+
+    def test_acceptance_only_reads_later_pr_label_pages(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                routing,
+                "_graphql",
+                side_effect=[
+                    graphql_pr(pr("topic:policy"), cursor="next-page"),
+                    graphql_pr(pr("state:accepted")),
+                ],
+            ) as query,
+            mock.patch.object(
+                routing, "_api", side_effect=AssertionError("No further lookups")
+            ),
+            mock.patch.object(routing, "check_review_readiness") as route,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(
+                routing.main(
                     [
                         "--repo",
                         REPO,
                         "--pr",
                         "42",
-                        "--reviewers",
-                        str(roster),
-                        "--maintainers",
-                        str(maintainers),
-                        "--label-accepted-work",
+                        "--acceptance-only",
                     ]
-                )
-            self.assertEqual(result, 0)
-            self.assertEqual(
-                json.loads(output.getvalue())["add_labels"], ["state:accepted"]
+                ),
+                0,
             )
-            check.assert_called_once_with(
-                {"area:runtime": {"alice"}},
-                REPO,
-                42,
-                apply=False,
-                label_accepted_work=True,
-                maintainers={"maintainer"},
+        self.assertEqual(json.loads(output.getvalue()), {"accepted": True})
+        self.assertEqual(query.call_args.kwargs["cursor"], "next-page")
+        route.assert_not_called()
+
+    def test_acceptance_only_checks_drafts_and_closed_prs_without_routing(self):
+        for value in (pr(), pr(draft=True), pr(state="closed")):
+            for accepted in (False, True):
+                with self.subTest(value=value, accepted=accepted):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (
+                        mock.patch.object(
+                            routing, "_graphql", return_value=graphql_pr(value)
+                        ) as query,
+                        mock.patch.object(
+                            routing, "_accepted_work", return_value=accepted
+                        ) as check,
+                        mock.patch.object(routing, "check_review_readiness") as route,
+                        mock.patch.object(routing, "parse_reviewers") as parse,
+                        mock.patch.object(
+                            routing.Path,
+                            "read_text",
+                            side_effect=AssertionError(
+                                "Acceptance-only must not read the roster"
+                            ),
+                        ),
+                        contextlib.redirect_stdout(output),
+                        contextlib.redirect_stderr(errors),
+                    ):
+                        status = routing.main(
+                            ["--repo", REPO, "--pr", "42", "--acceptance-only"]
+                        )
+                    self.assertEqual(status, 0 if accepted else 1)
+                    check.assert_called_once_with(REPO, 42, value)
+                    query.assert_called_once()
+                    self.assertNotIn("mutation", query.call_args.args[0])
+                    route.assert_not_called()
+                    parse.assert_not_called()
+
+    def test_acceptance_only_lookup_errors_fail_without_routing(self):
+        for metadata_error in (False, True):
+            error = subprocess.CalledProcessError(1, "gh")
+            with (
+                self.subTest(metadata_error=metadata_error),
+                mock.patch.object(
+                    routing,
+                    "_graphql",
+                    side_effect=error if metadata_error else None,
+                    return_value=graphql_pr(pr()),
+                ),
+                mock.patch.object(
+                    routing, "_accepted_work", side_effect=error
+                ) as check,
+                mock.patch.object(routing, "check_review_readiness") as route,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(
+                    routing.main(["--repo", REPO, "--pr", "42", "--acceptance-only"]), 1
+                )
+                route.assert_not_called()
+                if metadata_error:
+                    check.assert_not_called()
+
+    def test_invalid_event_payload_fails_without_api_calls_or_routing(self):
+        for contents in (None, "not JSON"):
+            with (
+                self.subTest(contents=contents),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory) / "event.json"
+                if contents is not None:
+                    path.write_text(contents)
+                with (
+                    mock.patch.object(routing, "_api") as api,
+                    mock.patch.object(routing, "check_review_readiness") as route,
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    self.assertEqual(
+                        routing.main(
+                            [
+                                "--repo",
+                                REPO,
+                                "--pr",
+                                "42",
+                                "--acceptance-only",
+                                "--event-path",
+                                str(path),
+                            ]
+                        ),
+                        1,
+                    )
+                api.assert_not_called()
+                route.assert_not_called()
+
+    def test_acceptance_only_cannot_be_combined_with_apply(self):
+        with (
+            mock.patch.object(routing, "_api") as api,
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as error,
+        ):
+            routing.main(["--repo", REPO, "--pr", "42", "--acceptance-only", "--apply"])
+        self.assertEqual(error.exception.code, 2)
+        api.assert_not_called()
+
+    def test_rejected_pr_does_not_need_a_readable_valid_roster(self):
+        for contents in (None, "not a registry"):
+            for apply in (False, True):
+                with (
+                    self.subTest(contents=contents, apply=apply),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    path = Path(directory) / "REVIEWERS.md"
+                    if contents is not None:
+                        path.write_text(contents, encoding="utf-8")
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (
+                        mock.patch.object(
+                            routing, "_api", side_effect=[pr(), DRAFTED, [], {}]
+                        ) as api,
+                        mock.patch.object(
+                            routing, "_accepted_work", return_value=False
+                        ),
+                        mock.patch.object(routing, "parse_reviewers") as parse,
+                        mock.patch.object(routing, "_load_reviewers") as load,
+                        contextlib.redirect_stdout(output),
+                        contextlib.redirect_stderr(errors),
+                    ):
+                        argv = ["--reviewers", str(path), "--repo", REPO, "--pr", "42"]
+                        self.assertEqual(
+                            routing.main(argv + (["--apply"] if apply else [])), 1
+                        )
+                    self.assertIn("not accepted work", errors.getvalue())
+                    self.assertEqual(output.getvalue(), "")
+                    parse.assert_not_called()
+                    load.assert_not_called()
+                    self.assertEqual(api.call_count, 4 if apply else 1)
+                    if apply:
+                        self.assertIn(
+                            "convertPullRequestToDraft",
+                            api.call_args_list[1].kwargs["data"]["query"],
+                        )
+
+    def test_accepted_pr_reads_real_roster_and_previews_reviewers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "REVIEWERS.md"
+            path.write_text(DOCUMENT, encoding="utf-8")
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    routing, "_api", return_value=pr("area:runtime")
+                ) as api,
+                mock.patch.object(
+                    routing, "_accepted_work", return_value=True
+                ) as accepted,
+                mock.patch.object(routing, "_load_reviewers", return_value=reviewers()),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    routing.main(
+                        [
+                            "--reviewers",
+                            str(path),
+                            "--repo",
+                            REPO,
+                            "--pr",
+                            "42",
+                        ]
+                    ),
+                    0,
+                )
+            accepted.assert_called_once()
+            api.assert_called_once_with(PULL)
+            self.assertEqual(
+                json.loads(output.getvalue()),
+                {
+                    "add": ["alice"],
+                    "remove": [],
+                    "accepted_work": None,
+                    "add_labels": [],
+                },
             )
 
-    def test_invalid_registry_fails_before_contacting_github(self):
+    def test_closed_and_draft_prs_skip_missing_roster_and_acceptance(self):
+        for value in (pr(draft=True), pr(state="closed")):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "missing.md"
+                output = io.StringIO()
+                with (
+                    mock.patch.object(routing, "_api", return_value=value) as api,
+                    mock.patch.object(routing, "_accepted_work") as accepted,
+                    contextlib.redirect_stdout(output),
+                ):
+                    self.assertEqual(
+                        routing.main(
+                            [
+                                "--reviewers",
+                                str(path),
+                                "--repo",
+                                REPO,
+                                "--pr",
+                                "42",
+                            ]
+                        ),
+                        0,
+                    )
+                api.assert_called_once_with(PULL)
+                accepted.assert_not_called()
+                self.assertEqual(
+                    json.loads(output.getvalue()), {"skipped": "closed or draft PR"}
+                )
+
+    def test_accepted_pr_with_invalid_registry_fails_before_reviewer_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "REVIEWERS.md"
             path.write_text("not a registry", encoding="utf-8")
             output, errors = io.StringIO(), io.StringIO()
             with (
-                mock.patch.object(routing, "_api") as api,
+                mock.patch.object(
+                    routing, "_api", return_value=pr("area:runtime")
+                ) as api,
+                mock.patch.object(routing, "_accepted_work", return_value=True),
                 contextlib.redirect_stdout(output),
                 contextlib.redirect_stderr(errors),
             ):
@@ -711,7 +1562,7 @@ class CliTests(unittest.TestCase):
                     ),
                     1,
                 )
-            api.assert_not_called()
+            api.assert_called_once_with(PULL)
             self.assertEqual(output.getvalue(), "")
             self.assertIn("no area/topic", errors.getvalue())
 
