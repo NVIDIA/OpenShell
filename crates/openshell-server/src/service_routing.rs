@@ -187,9 +187,6 @@ fn endpoint_scheme(config: &openshell_core::Config) -> &'static str {
     if config.tls.is_none()
         || (config.bind_address.ip().is_loopback()
             && config.service_routing.enable_loopback_service_http
-            && !config.mtls_auth.enabled
-            && !config.mtls_auth.operator_enabled
-            && config.oidc.is_none()
             && !config.service_routing.auth_enabled)
     {
         "http"
@@ -2163,6 +2160,38 @@ mod tests {
             endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
             Some("https://default--my-sandbox--web.dev.openshell.localhost:8080/")
         );
+    }
+
+    #[test]
+    fn configured_gateway_auth_does_not_change_the_disabled_service_auth_scheme() {
+        for mode in ["mtls", "operator", "oidc"] {
+            let mut cfg = openshell_core::Config::new(Some(tls_config()))
+                .with_bind_address("127.0.0.1:8080".parse().unwrap())
+                .with_server_sans(["*.dev.openshell.localhost"]);
+            match mode {
+                "mtls" => cfg.mtls_auth.enabled = true,
+                "operator" => cfg.mtls_auth.operator_enabled = true,
+                "oidc" => {
+                    cfg.oidc = Some(
+                        serde_json::from_value(serde_json::json!({
+                            "issuer": "https://issuer.example.com",
+                            "audience": "openshell"
+                        }))
+                        .unwrap(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
+                Some("http://default--my-sandbox--web.dev.openshell.localhost:8080/")
+            );
+            cfg.service_routing.auth_enabled = true;
+            assert_eq!(
+                endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
+                Some("https://default--my-sandbox--web.dev.openshell.localhost:8080/")
+            );
+        }
     }
 
     #[test]

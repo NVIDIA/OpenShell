@@ -18,6 +18,11 @@ is `false`, which preserves existing service routing and its header, cookie,
 and path handling. The supervisor app-listener setting does not enable
 this authentication gate.
 
+With gateway TLS configured, enabling service authentication advertises HTTPS
+service URLs on loopback too. Clients must trust the gateway certificate. With
+the flag disabled, configured mTLS or OIDC does not change the existing
+loopback HTTP URL behavior.
+
 When enabled, gateway-mediated HTTP requests and WebSocket upgrades authenticate with the
 configured gateway identity and require workspace user access. OIDC users need
 the configured user or admin role and, when scope enforcement is enabled,
@@ -118,6 +123,9 @@ it admits at most 1,024 outstanding application credential revocations.
 
 Direct supervisor app-listener access delegates authentication to the ingress
 provider. Gateway browser sessions and credentials do not authorize that path.
+The listener strips the gateway's `__Host-openshell-service-session` and
+`__Host-openshell-service-login` cookies, while preserving other application
+cookies, including names such as `__Host-openshell-app`.
 
 ## Gateway Resolution
 
