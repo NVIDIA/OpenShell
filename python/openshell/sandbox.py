@@ -860,16 +860,6 @@ class SandboxClient:
     def health(self) -> openshell_pb2.HealthResponse:
         return self._stub.Health(openshell_pb2.HealthRequest(), timeout=self._timeout)
 
-    def _require_cedar_policy_support(self, spec: openshell_pb2.SandboxSpec) -> None:
-        if (
-            spec.policy.cedar_policy_source
-            and "openshell.policy.cedar.v1" not in self.health().supported_capabilities
-        ):
-            raise SandboxError(
-                "gateway does not advertise Cedar policy support; "
-                "Cedar policies require a development build of the gateway and supervisor"
-            )
-
     def create(
         self,
         *,
@@ -880,7 +870,6 @@ class SandboxClient:
         service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
-        self._require_cedar_policy_support(request_spec)
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
@@ -909,7 +898,6 @@ class SandboxClient:
         if not workload_template.strip():
             raise SandboxError("workload_template is required")
         request_spec = spec if spec is not None else openshell_pb2.SandboxSpec()
-        self._require_cedar_policy_support(request_spec)
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),

@@ -152,11 +152,11 @@ use cedar_policy::{
     ResourceConstraint, Schema, ValidationMode, Validator,
 };
 use ipnet::IpNet;
-use openshell_core::endpoint_path::path_specificity;
-use openshell_core::host_pattern::HostPattern;
 use openshell_policy_cedar_schema::{
     DeclaredAttributes, actions, context_fields, endpoint_fields, entity_types,
 };
+use openshell_policy_primitives::endpoint_path::path_specificity;
+use openshell_policy_primitives::host_pattern::HostPattern;
 use serde_json::Value;
 
 use crate::{AuthorizedNetworkEndpoint, CedarEngineError, FilesystemGrants};
@@ -2135,7 +2135,7 @@ fn parse_range(literal: &str) -> Result<IpNet, String> {
         .parse::<IpNet>()
         .or_else(|_| literal.parse::<IpAddr>().map(IpNet::from))
         .map_err(|_| format!("ip({literal:?}) is not an address or CIDR range"))?;
-    if openshell_core::net::is_always_blocked_net(range) {
+    if openshell_policy_primitives::net::is_always_blocked_net(range) {
         return Err(format!(
             "ip({literal:?}) overlaps loopback, link-local, or unspecified addresses, which \
              are blocked regardless of policy"
@@ -2325,7 +2325,7 @@ fn host_tokens(pattern: &str) -> Vec<HostToken> {
 ///
 /// This is exact, character by character, so the load-time ambiguity and
 /// conflict checks reject only selectors that can really share a host, and
-/// [`HostOverlaps`] bounds its work. `openshell_core::host_pattern`'s
+/// [`HostOverlaps`] bounds its work. `openshell_policy_primitives::host_pattern`'s
 /// `host_patterns_overlap`, which YAML ambiguity checks, the prover, and the
 /// TLS-skip checks of Cedar endpoint settings use, compares label by label
 /// and may report an overlap that does not exist: it treats any two globs in
@@ -3514,7 +3514,9 @@ mod overlap_tests {
             for right in &hosts {
                 if host_patterns_overlap(left, right) {
                     assert_eq!(
-                        openshell_core::host_pattern::host_patterns_overlap(left, right),
+                        openshell_policy_primitives::host_pattern::host_patterns_overlap(
+                            left, right
+                        ),
                         Ok(true),
                         "{left} vs {right}"
                     );

@@ -5,24 +5,18 @@
 
 //! Networking component of the `OpenShell` supervisor.
 //!
-//! Owns the egress proxy, L7 enforcement, the OPA and Cedar policy engines,
+//! Owns the egress proxy, L7 enforcement, policy runtime contracts,
 //! identity cache, TLS interception, and credential injection. The denial-event channel is
 //! owned by the orchestrator; this crate produces denials but does not
 //! aggregate them.
 
 mod binary_resolution;
-#[cfg(feature = "cedar")]
-pub mod cedar_only;
-// Builds without the `cedar` feature keep the Cedar engine's types, but none
-// can be constructed: loading a Cedar policy fails, so every Cedar branch of
-// the proxy is unreachable.
-#[cfg(not(feature = "cedar"))]
-#[path = "cedar_disabled.rs"]
-pub mod cedar_only;
+#[cfg(all(test, feature = "cedar"))]
+pub use openshell_policy_cedar_runtime::{cedar_only, cedar_provider_rules};
 #[cfg(all(test, feature = "cedar"))]
 mod cedar_parity_tests;
-#[cfg(feature = "cedar")]
-mod cedar_provider_rules;
+#[cfg(all(test, feature = "cedar"))]
+mod cedar_runtime_tests;
 mod google_cloud_metadata;
 #[cfg(target_os = "windows")]
 pub mod host;

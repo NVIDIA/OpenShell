@@ -15,9 +15,9 @@ use super::{
     resolve_and_check_declared_endpoint, resolve_and_check_trusted_gateway,
     resolve_and_reject_internal, resolve_socket_addrs,
 };
-use crate::cedar_only::CedarDestination;
 use ipnet::IpNet;
 use openshell_core::net::{connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip};
+use openshell_policy_runtime_interface::DestinationPolicy;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpStream;
 
@@ -40,9 +40,8 @@ pub(crate) enum AddressAuthorization {
     /// unopened connector.
     #[allow(dead_code, reason = "used when the policy DNS adapter lands")]
     PinnedResolved(Vec<IpAddr>),
-    /// A Cedar sandbox's connection: each resolved address must pass
-    /// [`cedar_address_rejection`].
-    Cedar(Box<CedarDestination>),
+    /// A backend-provided authorizer bound to the admitted policy snapshot.
+    Policy(Box<DestinationPolicy>),
 }
 
 /// Fully materialized input to shared destination validation.
@@ -71,8 +70,8 @@ pub(crate) enum DestinationDenialKind {
     AllowedIps,
     DeclaredEndpoint,
     InternalAddress,
-    /// A Cedar sandbox's destination address rules rejected the address.
-    CedarAddress,
+    /// The policy backend rejected a destination address.
+    PolicyAddress,
 }
 
 #[derive(Debug)]
@@ -98,12 +97,10 @@ impl DestinationDenial {
 
 /// Select one current destination-validation mode without changing precedence.
 ///
-/// A Cedar sandbox passes `cedar`, which replaces the modes below the host
-/// gateway aliases. Those aliases keep their pinned address, which Cedar must
+/// A policy-backed sandbox passes `policy`, which replaces the modes below the host
+/// gateway aliases. Those aliases keep their pinned address, which the backend must
 /// also allow. As in YAML, provider `allowed_ips` do not apply to an alias's
 /// pinned address.
-// Without the `cedar` feature, `CedarDestination` is uninhabited.
-#[cfg_attr(not(feature = "cedar"), allow(unreachable_code))]
 pub(crate) fn build_validation_plan(
     host: &str,
     normalized_host: &str,
@@ -111,23 +108,21 @@ pub(crate) fn build_validation_plan(
     trusted_host_gateway: Option<IpAddr>,
     raw_allowed_ips: &[String],
     exact_declared_endpoint_host: bool,
-    cedar: Option<&CedarDestination>,
+    policy: Option<&DestinationPolicy>,
 ) -> Result<DestinationValidationPlan, DestinationDenial> {
     let gateway_ip = if is_host_gateway_alias(normalized_host) {
         backend_host_gateway.or(trusted_host_gateway)
     } else {
         None
     };
-    if let (Some(ip), Some(cedar)) = (gateway_ip, cedar) {
-        let allowed = cedar
-            .allows(ip)
-            .map_err(|error| DestinationDenial::new(DestinationDenialKind::CedarAddress, error))?;
+    if let (Some(ip), Some(policy)) = (gateway_ip, policy) {
+        let allowed = policy
+            .allows_gateway(ip)
+            .map_err(|error| DestinationDenial::new(DestinationDenialKind::PolicyAddress, error))?;
         if !allowed {
             return Err(DestinationDenial::new(
-                DestinationDenialKind::CedarAddress,
-                format!(
-                    "Cedar policy denies {host} at host gateway address {ip}, connection rejected"
-                ),
+                DestinationDenialKind::PolicyAddress,
+                format!("Policy denies {host} at host gateway address {ip}, connection rejected"),
             ));
         }
     }
@@ -139,8 +134,8 @@ pub(crate) fn build_validation_plan(
         && let Some(expected_ip) = trusted_host_gateway
     {
         AddressAuthorization::TrustedGatewayAlias { expected_ip }
-    } else if let Some(cedar) = cedar {
-        AddressAuthorization::Cedar(Box::new(cedar.clone()))
+    } else if let Some(policy) = policy {
+        AddressAuthorization::Policy(Box::new(policy.clone()))
     } else if !raw_allowed_ips.is_empty() {
         AddressAuthorization::ExplicitAllowedIps(parse_allowed_ips(raw_allowed_ips).map_err(
             |reason| DestinationDenial::new(DestinationDenialKind::InvalidAllowedIps, reason),
@@ -161,99 +156,18 @@ pub(crate) fn build_validation_plan(
     })
 }
 
-/// Returns why a Cedar sandbox rejects resolved address `ip` for a
-/// connection to `host`, or `None` when it is admitted.
-///
-/// Reproduces the YAML modes on the connection's allowing permits, never
-/// admitting an address that YAML would reject whichever matching endpoint
-/// it consulted first:
-///
-/// - Loopback, link-local (including cloud metadata), and unspecified
-///   addresses are always rejected.
-/// - Every allowing permit with a `destination_ip` condition must admit the
-///   address, as a YAML endpoint's `allowed_ips` restricts every address.
-/// - A private address also needs a permit that names the host exactly, or
-///   only permits with `destination_ip` conditions; a permit without one is
-///   public-only unless it names the host, as a YAML endpoint without
-///   `allowed_ips` is.
-/// - Every matching provider endpoint with `allowed_ips` must admit the
-///   address, as those ranges restrict a YAML provider endpoint's
-///   connections. They only narrow: providers grant no access, so they never
-///   count toward admitting a private address.
-/// - Cedar, with every policy, must allow the connection to the address.
-pub(crate) fn cedar_address_rejection(
-    cedar: &CedarDestination,
-    host: &str,
-    ip: IpAddr,
-) -> Option<String> {
-    if is_always_blocked_ip(ip) {
-        return Some(format!(
-            "{host} resolves to always-blocked address {ip}, connection rejected"
-        ));
-    }
-    let conditions = cedar.address_conditions();
-    if !conditions
-        .iter()
-        .all(|ranges| ranges.iter().any(|range| range.contains(&ip)))
-    {
-        return Some(format!(
-            "{host} resolves to {ip} which is not in the policy's destination_ip ranges, \
-             connection rejected"
-        ));
-    }
-    if let Some(reason) = cedar_provider_rejection(cedar, host, ip) {
-        return Some(reason);
-    }
-    let private_admitted =
-        cedar.names_endpoint() || (!conditions.is_empty() && !cedar.unconstrained_permit());
-    if is_internal_ip(ip) && !private_admitted {
-        return Some(format!(
-            "{host} resolves to internal address {ip}, connection rejected"
-        ));
-    }
-    match cedar.allows(ip) {
-        Ok(true) => None,
-        Ok(false) => Some(format!(
-            "Cedar policy denies {host} at address {ip}, connection rejected"
-        )),
-        Err(error) => Some(format!(
-            "Cedar policy evaluation failed for {host} at address {ip}: {error}"
-        )),
-    }
-}
-
-/// Returns why the `allowed_ips` of a provider endpoint matching a Cedar
-/// sandbox's connection to `host` reject resolved address `ip`, or `None`
-/// when every such endpoint admits it.
-fn cedar_provider_rejection(cedar: &CedarDestination, host: &str, ip: IpAddr) -> Option<String> {
-    cedar
-        .provider_ranges()
-        .iter()
-        .find_map(|ranges| match ranges {
-            Err(reason) => Some(format!("{host}: {reason}, connection rejected")),
-            Ok(ranges) if !ranges.iter().any(|range| range.contains(&ip)) => Some(format!(
-                "{host} resolves to {ip} which is not in its provider endpoint's allowed_ips, \
-             connection rejected"
-            )),
-            Ok(_) => None,
-        })
-}
-
-/// Returns whether a Cedar sandbox blocks control-plane ports for a
+/// Returns whether a policy-backed sandbox blocks control-plane ports for a
 /// connection to `host`.
 ///
 /// YAML blocks them in every mode that can admit a private address: an
 /// endpoint with `allowed_ips`, an IP literal host, or an exactly declared
 /// host. Only a public-only connection may use them. A provider endpoint's
 /// `allowed_ips` block them too, as they do for a YAML provider endpoint.
-pub(crate) fn cedar_blocks_control_plane(cedar: &CedarDestination, host: &str) -> bool {
-    !cedar.address_conditions().is_empty()
-        || !cedar.provider_ranges().is_empty()
-        || cedar.names_endpoint()
-        || normalize_host_lookup_key(host).parse::<IpAddr>().is_ok()
+pub(crate) fn policy_blocks_control_plane(policy: &DestinationPolicy, host: &str) -> bool {
+    policy.blocks_control_plane(host)
 }
 
-/// Returns whether sandbox `/etc/hosts` entries may resolve a Cedar
+/// Returns whether sandbox `/etc/hosts` entries may resolve a policy-backed
 /// sandbox's connection.
 ///
 /// They may only when every resolved address is then checked against fixed
@@ -263,18 +177,18 @@ pub(crate) fn cedar_blocks_control_plane(cedar: &CedarDestination, host: &str) -
 /// authorizes the connection, so the supervisor resolver is authoritative,
 /// as it is for a YAML exact or wildcard host: accepting the workload's
 /// hosts file there would let it choose the address the name authorizes.
-fn cedar_address_binding(cedar: &CedarDestination) -> AddressBinding {
-    if cedar.address_conditions().is_empty() && cedar.provider_ranges().is_empty() {
-        AddressBinding::NameAuthorized
-    } else {
+fn policy_address_binding(policy: &DestinationPolicy) -> AddressBinding {
+    if policy.ip_constrained() {
         AddressBinding::IpConstrained
+    } else {
+        AddressBinding::NameAuthorized
     }
 }
 
-/// Checks every resolved address of a Cedar sandbox's connection, rejecting
+/// Checks every resolved address of a policy-backed sandbox's connection, rejecting
 /// the connection if any is rejected, as CONNECT and forward HTTP do.
-pub(crate) fn validate_cedar_resolved_addrs(
-    cedar: &CedarDestination,
+pub(crate) fn validate_policy_resolved_addrs(
+    policy: &DestinationPolicy,
     host: &str,
     port: u16,
     addrs: &[SocketAddr],
@@ -285,14 +199,14 @@ pub(crate) fn validate_cedar_resolved_addrs(
             normalize_host_lookup_key(host)
         ));
     }
-    if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) && cedar_blocks_control_plane(cedar, host) {
+    if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) && policy_blocks_control_plane(policy, host) {
         return Err(format!(
             "port {port} is a blocked control-plane port, connection rejected"
         ));
     }
     addrs
         .iter()
-        .find_map(|addr| cedar_address_rejection(cedar, host, addr.ip()))
+        .find_map(|addr| policy.rejection(host, addr.ip()))
         .map_or(Ok(()), Err)
 }
 
@@ -338,9 +252,9 @@ pub(crate) fn filter_resolved_addresses(
         AddressAuthorization::ExactDeclaredHost => (DestinationDenialKind::DeclaredEndpoint, true),
         AddressAuthorization::DefaultPublicOnly => (DestinationDenialKind::InternalAddress, false),
         AddressAuthorization::PinnedResolved(_) => (DestinationDenialKind::AllowedIps, false),
-        AddressAuthorization::Cedar(cedar) => (
-            DestinationDenialKind::CedarAddress,
-            cedar_blocks_control_plane(cedar, host),
+        AddressAuthorization::Policy(policy) => (
+            DestinationDenialKind::PolicyAddress,
+            policy_blocks_control_plane(policy, host),
         ),
     };
 
@@ -422,7 +336,7 @@ pub(crate) fn filter_resolved_addresses(
             AddressAuthorization::PinnedResolved(pinned) if !pinned.contains(&ip) => Some(format!(
                 "{host} resolves to unpinned address {ip}, connection rejected"
             )),
-            AddressAuthorization::Cedar(cedar) => cedar_address_rejection(cedar, host, ip),
+            AddressAuthorization::Policy(policy) => policy.rejection(host, ip),
             AddressAuthorization::DefaultPublicOnly
             | AddressAuthorization::ExactDeclaredHost
             | AddressAuthorization::PinnedResolved(_) => None,
@@ -552,17 +466,17 @@ pub(crate) async fn validate_destination(
             .copied()
             .map(|address| SocketAddr::new(address, port))
             .collect(),
-        AddressAuthorization::Cedar(cedar) => {
+        AddressAuthorization::Policy(policy) => {
             let addrs = resolve_socket_addrs(
                 host,
                 port,
                 sandbox_entrypoint_pid,
-                cedar_address_binding(cedar),
+                policy_address_binding(policy),
             )
             .await
             .map_err(|reason| DestinationDenial::new(DestinationDenialKind::Resolution, reason))?;
-            validate_cedar_resolved_addrs(cedar, host, port, &addrs).map_err(|reason| {
-                DestinationDenial::new(DestinationDenialKind::CedarAddress, reason)
+            validate_policy_resolved_addrs(policy, host, port, &addrs).map_err(|reason| {
+                DestinationDenial::new(DestinationDenialKind::PolicyAddress, reason)
             })?;
             addrs
         }
@@ -767,7 +681,7 @@ mod tests {
 
     #[cfg(feature = "cedar")]
     /// The destination rules of `binary`'s allowed Cedar connection.
-    fn cedar_destination(policy: &str, host: &str, port: u16) -> CedarDestination {
+    fn destination_policy(policy: &str, host: &str, port: u16) -> DestinationPolicy {
         let engine = crate::cedar_only::CedarOnlyEngine::from_policy_str(policy)
             .expect("Cedar policy loads");
         engine
@@ -780,7 +694,7 @@ mod tests {
                 cmdline_paths: Vec::new(),
             })
             .expect("request evaluates")
-            .cedar_destination
+            .destination_policy
             .expect("the connection is allowed")
     }
 
@@ -803,8 +717,8 @@ when {
 
     #[cfg(feature = "cedar")]
     #[test]
-    fn cedar_destination_replaces_the_yaml_modes() {
-        let cedar = cedar_destination(HOSTLESS_8080, "svc.example", 8080);
+    fn destination_policy_replaces_the_yaml_modes() {
+        let cedar = destination_policy(HOSTLESS_8080, "svc.example", 8080);
         let plan = build_validation_plan(
             "svc.example",
             "svc.example",
@@ -817,7 +731,7 @@ when {
         .unwrap();
         assert_eq!(
             plan.address_authorization,
-            AddressAuthorization::Cedar(Box::new(cedar))
+            AddressAuthorization::Policy(Box::new(cedar))
         );
     }
 
@@ -827,31 +741,34 @@ when {
     /// authorizes by name alone, exact or glob, resolves through the
     /// supervisor resolver, as a YAML declared or wildcard host does.
     #[test]
-    fn cedar_address_binding_follows_the_yaml_modes() {
-        let constrained = cedar_destination(HOSTLESS_8080, "svc.example", 8080);
+    fn policy_address_binding_follows_the_yaml_modes() {
+        let constrained = destination_policy(HOSTLESS_8080, "svc.example", 8080);
         assert_eq!(
-            cedar_address_binding(&constrained),
+            policy_address_binding(&constrained),
             AddressBinding::IpConstrained
         );
 
-        let exact = cedar_destination(
+        let exact = destination_policy(
             r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
                        resource == Sandbox::NetworkEndpoint::"db.example:443");"#,
             "db.example",
             443,
         );
         assert_eq!(
-            cedar_address_binding(&exact),
+            policy_address_binding(&exact),
             AddressBinding::NameAuthorized
         );
 
-        let glob = cedar_destination(
+        let glob = destination_policy(
             r#"permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
                when { resource.host like("*.example.com", ".") && resource.port == 443 };"#,
             "api.example.com",
             443,
         );
-        assert_eq!(cedar_address_binding(&glob), AddressBinding::NameAuthorized);
+        assert_eq!(
+            policy_address_binding(&glob),
+            AddressBinding::NameAuthorized
+        );
     }
 
     #[cfg(feature = "cedar")]
@@ -859,7 +776,7 @@ when {
     fn cedar_must_allow_the_host_gateway_address() {
         let trusted_ip = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
         let alias = "host.openshell.internal";
-        let cedar = cedar_destination(HOSTLESS_8080, alias, 8080);
+        let cedar = destination_policy(HOSTLESS_8080, alias, 8080);
         let denial = build_validation_plan(
             alias,
             alias,
@@ -870,9 +787,9 @@ when {
             Some(&cedar),
         )
         .expect_err("the gateway address is outside the permit's range");
-        assert_eq!(denial.kind, DestinationDenialKind::CedarAddress);
+        assert_eq!(denial.kind, DestinationDenialKind::PolicyAddress);
 
-        let named = cedar_destination(
+        let named = destination_policy(
             r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
                        resource == Sandbox::NetworkEndpoint::"host.openshell.internal:8080");"#,
             alias,
@@ -905,12 +822,12 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
 forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
 when { context has destination_ip && context.destination_ip.isInRange(ip("10.9.0.0/16")) };
 "#;
-        let cedar = cedar_destination(policy, "db.example", 443);
+        let cedar = destination_policy(policy, "db.example", 443);
         assert!(
-            validate_cedar_resolved_addrs(&cedar, "db.example", 443, &addrs(&["10.8.1.1"], 443))
+            validate_policy_resolved_addrs(&cedar, "db.example", 443, &addrs(&["10.8.1.1"], 443))
                 .is_ok()
         );
-        let error = validate_cedar_resolved_addrs(
+        let error = validate_policy_resolved_addrs(
             &cedar,
             "db.example",
             443,
@@ -920,7 +837,7 @@ when { context has destination_ip && context.destination_ip.isInRange(ip("10.9.0
         assert!(error.contains("Cedar policy denies"), "{error}");
 
         let plan = DestinationValidationPlan {
-            address_authorization: AddressAuthorization::Cedar(Box::new(cedar)),
+            address_authorization: AddressAuthorization::Policy(Box::new(cedar)),
         };
         let kept = filter_resolved_addresses(
             &plan,
@@ -934,15 +851,15 @@ when { context has destination_ip && context.destination_ip.isInRange(ip("10.9.0
 
     #[cfg(feature = "cedar")]
     #[test]
-    fn cedar_blocks_control_plane_ports_where_yaml_does() {
-        let glob = cedar_destination(
+    fn policy_blocks_control_plane_ports_where_yaml_does() {
+        let glob = destination_policy(
             r#"permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
                when { resource.host like("*.example.com", ".") && resource.port == 6443 };"#,
             "api.example.com",
             6443,
         );
         assert!(
-            validate_cedar_resolved_addrs(
+            validate_policy_resolved_addrs(
                 &glob,
                 "api.example.com",
                 6443,
@@ -951,13 +868,13 @@ when { context has destination_ip && context.destination_ip.isInRange(ip("10.9.0
             .is_ok(),
             "a public-only connection may use a control-plane port, as in YAML"
         );
-        let exact = cedar_destination(
+        let exact = destination_policy(
             r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
                        resource == Sandbox::NetworkEndpoint::"api.example.com:6443");"#,
             "api.example.com",
             6443,
         );
-        let error = validate_cedar_resolved_addrs(
+        let error = validate_policy_resolved_addrs(
             &exact,
             "api.example.com",
             6443,
@@ -984,16 +901,18 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
 "#;
         let private = addrs(&["10.1.1.1"], 443);
         // A glob alone is public-only, so a range cannot widen it.
-        let glob = cedar_destination(policy, "svc.corp.example", 443);
-        assert!(validate_cedar_resolved_addrs(&glob, "svc.corp.example", 443, &private).is_err());
+        let glob = destination_policy(policy, "svc.corp.example", 443);
+        assert!(validate_policy_resolved_addrs(&glob, "svc.corp.example", 443, &private).is_err());
         // Only ranged permits allow this host: their range decides.
-        let ranged = cedar_destination(policy, "other.example", 443);
-        assert!(validate_cedar_resolved_addrs(&ranged, "other.example", 443, &private).is_ok());
+        let ranged = destination_policy(policy, "other.example", 443);
+        assert!(validate_policy_resolved_addrs(&ranged, "other.example", 443, &private).is_ok());
         // An exactly named host may resolve privately, within the range.
-        let named = cedar_destination(policy, "named.corp.example", 443);
-        assert!(validate_cedar_resolved_addrs(&named, "named.corp.example", 443, &private).is_ok());
+        let named = destination_policy(policy, "named.corp.example", 443);
         assert!(
-            validate_cedar_resolved_addrs(
+            validate_policy_resolved_addrs(&named, "named.corp.example", 443, &private).is_ok()
+        );
+        assert!(
+            validate_policy_resolved_addrs(
                 &named,
                 "named.corp.example",
                 443,
@@ -1008,14 +927,16 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
     /// The destination rules of curl's allowed Cedar connection to
     /// `host:port` on a sandbox with one provider endpoint for `host:port`
     /// whose `allowed_ips` are `ranges`.
-    fn cedar_destination_with_provider(
+    fn destination_policy_with_provider(
         policy: &str,
         host: &str,
         port: u16,
         ranges: &[&str],
-    ) -> CedarDestination {
+    ) -> DestinationPolicy {
         let mut proto = openshell_core::proto::SandboxPolicy {
-            cedar_policy_source: policy.to_string(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: policy.to_string(),
+            }),
             ..Default::default()
         };
         proto.provider_credential_rules.insert(
@@ -1043,7 +964,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
                 cmdline_paths: Vec::new(),
             })
             .expect("request evaluates")
-            .cedar_destination
+            .destination_policy
             .expect("the connection is allowed")
     }
 
@@ -1059,18 +980,19 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
     #[test]
     fn provider_ranges_narrow_the_addresses_cedar_admits() {
         let host = "api.corp.example";
-        let unranged = cedar_destination(EXACT_CORP, host, 443);
+        let unranged = destination_policy(EXACT_CORP, host, 443);
         assert!(
-            validate_cedar_resolved_addrs(&unranged, host, 443, &addrs(&["10.6.0.1"], 443)).is_ok(),
+            validate_policy_resolved_addrs(&unranged, host, 443, &addrs(&["10.6.0.1"], 443))
+                .is_ok(),
             "Cedar alone admits a private address for an exactly named host"
         );
 
-        let ranged = cedar_destination_with_provider(EXACT_CORP, host, 443, &["10.5.0.0/16"]);
+        let ranged = destination_policy_with_provider(EXACT_CORP, host, 443, &["10.5.0.0/16"]);
         assert!(
-            validate_cedar_resolved_addrs(&ranged, host, 443, &addrs(&["10.5.0.1"], 443)).is_ok()
+            validate_policy_resolved_addrs(&ranged, host, 443, &addrs(&["10.5.0.1"], 443)).is_ok()
         );
         for outside in [&["10.6.0.1"][..], &["8.8.8.8"], &["10.5.0.1", "10.6.0.1"]] {
-            let error = validate_cedar_resolved_addrs(&ranged, host, 443, &addrs(outside, 443))
+            let error = validate_policy_resolved_addrs(&ranged, host, 443, &addrs(outside, 443))
                 .unwrap_err();
             assert!(
                 error.contains("provider endpoint's allowed_ips"),
@@ -1079,7 +1001,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         }
 
         let plan = DestinationValidationPlan {
-            address_authorization: AddressAuthorization::Cedar(Box::new(ranged)),
+            address_authorization: AddressAuthorization::Policy(Box::new(ranged)),
         };
         let kept = filter_resolved_addresses(
             &plan,
@@ -1101,14 +1023,14 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
 permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
 when { resource.host like("*.corp.example", ".") && (resource.port == 443 || resource.port == 6443) };
 "#;
-        let ranged = cedar_destination_with_provider(glob, host, 443, &["10.5.0.0/16"]);
-        let error = validate_cedar_resolved_addrs(&ranged, host, 443, &addrs(&["10.5.0.1"], 443))
+        let ranged = destination_policy_with_provider(glob, host, 443, &["10.5.0.0/16"]);
+        let error = validate_policy_resolved_addrs(&ranged, host, 443, &addrs(&["10.5.0.1"], 443))
             .unwrap_err();
         assert!(error.contains("internal address"), "{error}");
 
-        let control_plane = cedar_destination_with_provider(glob, host, 6443, &["8.8.8.0/24"]);
+        let control_plane = destination_policy_with_provider(glob, host, 6443, &["8.8.8.0/24"]);
         let error =
-            validate_cedar_resolved_addrs(&control_plane, host, 6443, &addrs(&["8.8.8.8"], 6443))
+            validate_policy_resolved_addrs(&control_plane, host, 6443, &addrs(&["8.8.8.8"], 6443))
                 .unwrap_err();
         assert!(error.contains("control-plane port"), "{error}");
     }
@@ -1117,8 +1039,8 @@ when { resource.host like("*.corp.example", ".") && (resource.port == 443 || res
     #[test]
     fn invalid_provider_ranges_reject_every_address() {
         let host = "api.corp.example";
-        let invalid = cedar_destination_with_provider(EXACT_CORP, host, 443, &["not-an-ip"]);
-        let error = validate_cedar_resolved_addrs(&invalid, host, 443, &addrs(&["8.8.8.8"], 443))
+        let invalid = destination_policy_with_provider(EXACT_CORP, host, 443, &["not-an-ip"]);
+        let error = validate_policy_resolved_addrs(&invalid, host, 443, &addrs(&["8.8.8.8"], 443))
             .unwrap_err();
         assert!(error.contains("invalid CIDR/IP"), "{error}");
     }

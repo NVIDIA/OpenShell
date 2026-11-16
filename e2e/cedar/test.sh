@@ -513,7 +513,12 @@ expect_contains "logs: a staged audit forbid is logged" "$sandbox_logs" "cedar_a
 
 policy_view="$("$OPENSHELL_BIN" policy get "$SANDBOX" --full 2>&1 || true)"
 expect_contains "policy get: shows the Cedar policy" "$policy_view" 'Sandbox::Action::"NetworkConnect"'
-expect_contains "policy get: shows middleware as its own section" "$policy_view" "# Middleware"
+policy_json="$("$OPENSHELL_BIN" policy get "$SANDBOX" --full --output json 2>/dev/null || true)"
+if printf '%s' "$policy_json" | python3 -c 'import json,sys; policy=json.load(sys.stdin)["policy"]; assert policy["network_middlewares"]["redact-keys"]["middleware"] == "openshell/regex"'; then
+    pass "policy get: includes middleware alongside Cedar source"
+else
+    fail "policy get: includes middleware alongside Cedar source" "$policy_json"
+fi
 
 echo
 if [[ "$FAILURES" -gt 0 ]]; then

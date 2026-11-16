@@ -20,14 +20,12 @@ use openshell_ocsf::{
 };
 use std::collections::HashMap;
 use std::future::Future;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_TEXT_MESSAGE_BYTES: usize = openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES;
-pub const MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES: usize = 32;
-pub const MAX_QUEUED_WEBSOCKET_ASSEMBLIES: usize = MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES * 2;
 const MAX_RAW_FRAME_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MESSAGE_FRAGMENTS: usize = 4096;
 const TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
@@ -42,59 +40,7 @@ const OPCODE_PING: u8 = 0x9;
 const OPCODE_PONG: u8 = 0xA;
 const CREDENTIAL_ENDPOINT_MISMATCH: &str = "websocket credential endpoint mismatch";
 
-#[derive(Clone, Debug)]
-pub struct WebSocketAssemblyBudget {
-    active: Arc<Semaphore>,
-    waiters: Arc<Semaphore>,
-}
-
-impl Default for WebSocketAssemblyBudget {
-    fn default() -> Self {
-        Self::new(
-            MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES,
-            MAX_QUEUED_WEBSOCKET_ASSEMBLIES,
-        )
-    }
-}
-
-impl WebSocketAssemblyBudget {
-    pub fn new(active: usize, waiters: usize) -> Self {
-        Self {
-            active: Arc::new(Semaphore::new(active)),
-            waiters: Arc::new(Semaphore::new(waiters)),
-        }
-    }
-
-    pub async fn reserve(&self) -> Result<WebSocketAssemblyAdmissionOutcome> {
-        if let Ok(active) = Arc::clone(&self.active).try_acquire_owned() {
-            return Ok(WebSocketAssemblyAdmissionOutcome::Admitted(
-                WebSocketAssemblyAdmission { _active: active },
-            ));
-        }
-        let Ok(waiter) = Arc::clone(&self.waiters).try_acquire_owned() else {
-            return Ok(WebSocketAssemblyAdmissionOutcome::QueueExhausted);
-        };
-        let active = Arc::clone(&self.active)
-            .acquire_owned()
-            .await
-            .map_err(|_| miette!("websocket assembly admission semaphore closed"))?;
-        drop(waiter);
-        Ok(WebSocketAssemblyAdmissionOutcome::Admitted(
-            WebSocketAssemblyAdmission { _active: active },
-        ))
-    }
-}
-
-#[derive(Debug)]
-pub struct WebSocketAssemblyAdmission {
-    _active: OwnedSemaphorePermit,
-}
-
-#[derive(Debug)]
-pub enum WebSocketAssemblyAdmissionOutcome {
-    Admitted(WebSocketAssemblyAdmission),
-    QueueExhausted,
-}
+pub use openshell_policy_runtime_interface::l7::websocket::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebSocketTerminationCause {

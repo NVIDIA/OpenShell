@@ -4268,7 +4268,7 @@ async fn policy_update_rejects_a_cedar_sandbox_before_merging() {
     *server.openshell.state.sandbox_config_policy.lock().await =
         Some(openshell_core::proto::SandboxPolicy {
             version: 1,
-            cedar_policy_source: r#"permit(principal, action == Sandbox::Action::"NetworkConnect", resource == Sandbox::NetworkEndpoint::"api.github.com:443");"#.to_string(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy { source: r#"permit(principal, action == Sandbox::Action::"NetworkConnect", resource == Sandbox::NetworkEndpoint::"api.github.com:443");"#.to_string() }),
             ..Default::default()
         });
     let tls = test_tls(&server);
@@ -4324,7 +4324,9 @@ async fn cedar_discovery_sync_rejects_legacy_gateway_before_policy_mutation() {
     Environment::from_pairs(&[("OPENSHELL_SANDBOX_TOKEN", "compatibility-test-token")])
         .run_async(async {
             let policy = openshell_core::proto::SandboxPolicy {
-                cedar_policy_source: "permit(principal, action, resource);".to_string(),
+                cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                    source: "permit(principal, action, resource);".to_string(),
+                }),
                 ..Default::default()
             };
             let gateway_endpoint = openshell_core::grpc_client::GatewayEndpoint::new(

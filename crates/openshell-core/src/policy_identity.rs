@@ -318,7 +318,9 @@ mod policy_hash_tests {
 
     fn cedar_policy_with_provider_rules() -> ProtoSandboxPolicy {
         ProtoSandboxPolicy {
-            cedar_policy_source: "permit(principal, action, resource);".into(),
+            cedar_policy: Some(crate::proto::CedarPolicy {
+                source: "permit(principal, action, resource);".into(),
+            }),
             provider_credential_rules: HashMap::from([
                 ("alpha".into(), provider_rule("alpha.example.test")),
                 ("beta".into(), provider_rule("beta.example.test")),
@@ -329,7 +331,9 @@ mod policy_hash_tests {
 
     fn cedar_policy_with_endpoint_settings() -> ProtoSandboxPolicy {
         ProtoSandboxPolicy {
-            cedar_policy_source: "permit(principal, action, resource);".into(),
+            cedar_policy: Some(crate::proto::CedarPolicy {
+                source: "permit(principal, action, resource);".into(),
+            }),
             endpoint_settings: vec![NetworkEndpoint {
                 host: "graphql.example.test".into(),
                 graphql_persisted_queries: HashMap::from([

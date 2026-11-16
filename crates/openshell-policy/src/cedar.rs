@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cedar-authored sandbox policies (`cedar_policy_source`).
+//! Cedar-authored sandbox policies (`cedar_policy.source`).
 //!
 //! Built only with the `cedar` feature. Validation, load-time warnings,
 //! filesystem-grant derivation, and provider-rule adaptation for Cedar
@@ -145,16 +145,15 @@ pub fn engine_filesystem(engine: &CedarEngine) -> EffectiveFilesystem {
 /// `websocket-graphql` is a `websocket` endpoint; whether the relay applies
 /// GraphQL message policy is carried separately (see
 /// [`openshell_policy_cedar::L7Protocol::websocket_graphql_messages`]).
-impl From<openshell_policy_cedar::L7Protocol> for crate::L7Protocol {
-    fn from(protocol: openshell_policy_cedar::L7Protocol) -> Self {
-        use openshell_policy_cedar::L7Protocol as Cedar;
-        match protocol {
-            Cedar::Rest => Self::Rest,
-            Cedar::JsonRpc => Self::JsonRpc,
-            Cedar::Mcp => Self::Mcp,
-            Cedar::Graphql => Self::Graphql,
-            Cedar::Websocket | Cedar::WebsocketGraphql => Self::Websocket,
-        }
+pub fn l7_protocol(protocol: openshell_policy_cedar::L7Protocol) -> crate::L7Protocol {
+    use crate::L7Protocol;
+    use openshell_policy_cedar::L7Protocol as Cedar;
+    match protocol {
+        Cedar::Rest => L7Protocol::Rest,
+        Cedar::JsonRpc => L7Protocol::JsonRpc,
+        Cedar::Mcp => L7Protocol::Mcp,
+        Cedar::Graphql => L7Protocol::Graphql,
+        Cedar::Websocket | Cedar::WebsocketGraphql => L7Protocol::Websocket,
     }
 }
 
@@ -343,7 +342,7 @@ mod tests {
             (Cedar::Websocket, L7Protocol::Websocket),
             (Cedar::WebsocketGraphql, L7Protocol::Websocket),
         ] {
-            assert_eq!(L7Protocol::from(cedar), expected, "{cedar}");
+            assert_eq!(super::l7_protocol(cedar), expected, "{cedar}");
             // The same protocol the proxy's config parser reads from the label.
             assert_eq!(
                 L7Protocol::parse(cedar.config_label()),

@@ -543,7 +543,9 @@ impl Engines {
             ..Default::default()
         };
         let cedar = openshell_core::proto::SandboxPolicy {
-            cedar_policy_source: scenario.cedar.to_string(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: scenario.cedar.to_string(),
+            }),
             provider_credential_rules: rules,
             ..Default::default()
         };
@@ -559,7 +561,9 @@ impl Engines {
         let file = openshell_policy::parse_middleware_yaml(scenario.settings)
             .unwrap_or_else(|error| panic!("{}: settings parse: {error:?}", scenario.name));
         let policy = openshell_core::proto::SandboxPolicy {
-            cedar_policy_source: scenario.cedar.to_string(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: scenario.cedar.to_string(),
+            }),
             network_middlewares: file.network_middlewares,
             endpoint_settings: file.endpoint_settings,
             ..Default::default()
@@ -590,11 +594,11 @@ impl Engines {
                 let yaml = self
                     .opa
                     .clone_engine_for_tunnel(self.opa.current_generation())
-                    .and_then(|tunnel| tunnel.evaluate_request(&ctx, request));
+                    .and_then(|tunnel| tunnel.evaluate_request(&ctx.policy_context(), request));
                 let cedar = self
                     .cedar
                     .l7_handle(self.cedar.current_generation())
-                    .evaluate_request(&ctx, request);
+                    .evaluate_request(&ctx.policy_context(), request);
                 (
                     request_outcome(&yaml.map(|(allowed, _)| allowed)),
                     request_outcome(&cedar.map(|(allowed, _)| allowed)),
@@ -704,11 +708,11 @@ impl Engines {
                 let yaml = self
                     .opa
                     .clone_engine_for_tunnel(self.opa.current_generation())
-                    .and_then(|tunnel| tunnel.evaluate_request(&ctx, request));
+                    .and_then(|tunnel| tunnel.evaluate_request(&ctx.policy_context(), request));
                 let cedar = self
                     .cedar
                     .l7_handle(self.cedar.current_generation())
-                    .evaluate_request(&ctx, request);
+                    .evaluate_request(&ctx.policy_context(), request);
                 (deny_reason_outcome(&yaml), deny_reason_outcome(&cedar))
             }
             Probe::Relay(exchange) => self.relayed(&exchange.ctx, |relay| {

@@ -92,6 +92,17 @@ pub struct L7EvalContext {
 }
 
 impl L7EvalContext {
+    pub fn policy_context(&self) -> openshell_policy_runtime_interface::L7PolicyContext {
+        openshell_policy_runtime_interface::L7PolicyContext {
+            host: self.host.clone(),
+            port: self.port,
+            policy_name: self.policy_name.clone(),
+            binary_path: self.binary_path.clone(),
+            ancestors: self.ancestors.clone(),
+            cmdline_paths: self.cmdline_paths.clone(),
+        }
+    }
+
     /// Whether the inspected transport is plaintext rather than TLS-terminated.
     fn is_plaintext(&self) -> bool {
         self.request_default_port == Some(80)
@@ -3126,14 +3137,15 @@ pub fn evaluate_l7_request(
         && !jsonrpc.calls.is_empty()
     {
         if jsonrpc.has_response {
-            let (allowed, reason) = engine.evaluate_request(ctx, request)?;
+            let (allowed, reason) = engine.evaluate_request(&ctx.policy_context(), request)?;
             if !allowed {
                 return Ok((false, reason));
             }
         }
         for call in &jsonrpc.calls {
             let item_request = jsonrpc_request_for_call(request, call);
-            let (allowed, reason) = engine.evaluate_request(ctx, &item_request)?;
+            let (allowed, reason) =
+                engine.evaluate_request(&ctx.policy_context(), &item_request)?;
             if !allowed {
                 return Ok((false, reason));
             }
@@ -3141,7 +3153,7 @@ pub fn evaluate_l7_request(
         return Ok((true, String::new()));
     }
 
-    engine.evaluate_request(ctx, request)
+    engine.evaluate_request(&ctx.policy_context(), request)
 }
 
 fn evaluate_jsonrpc_l7_request_for_log(
@@ -3151,7 +3163,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
     jsonrpc: &crate::l7::jsonrpc::JsonRpcRequestInfo,
 ) -> Result<JsonRpcEvaluation> {
     if jsonrpc.has_response {
-        let (allowed, reason) = engine.evaluate_request(ctx, request)?;
+        let (allowed, reason) = engine.evaluate_request(&ctx.policy_context(), request)?;
         if !allowed || !jsonrpc.is_batch || jsonrpc.calls.is_empty() {
             return Ok(JsonRpcEvaluation {
                 allowed,
@@ -3166,7 +3178,8 @@ fn evaluate_jsonrpc_l7_request_for_log(
         let mut first_denied_reason = None;
         for call in &jsonrpc.calls {
             let item_request = jsonrpc_request_for_call(request, call);
-            let (allowed, reason) = engine.evaluate_request(ctx, &item_request)?;
+            let (allowed, reason) =
+                engine.evaluate_request(&ctx.policy_context(), &item_request)?;
             if !allowed {
                 if first_denied_reason.is_none() {
                     first_denied_reason = Some(reason);
@@ -3198,7 +3211,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
         });
     }
 
-    let (allowed, reason) = engine.evaluate_request(ctx, request)?;
+    let (allowed, reason) = engine.evaluate_request(&ctx.policy_context(), request)?;
     Ok(JsonRpcEvaluation {
         allowed,
         reason,
@@ -3357,30 +3370,8 @@ fn emit_transformed_body_decision(
     ocsf_emit!(event);
 }
 
-pub(crate) fn jsonrpc_policy_input(
-    info: &crate::l7::jsonrpc::JsonRpcRequestInfo,
-) -> serde_json::Value {
-    let call = if info.is_batch {
-        None
-    } else {
-        info.calls.first()
-    };
-    serde_json::json!({
-        "method": call.map(|call| call.method.as_str()),
-        "params": call.map(|call| &call.params),
-        "tool": call.and_then(|call| call.tool.as_deref()),
-        "mcp_method_classification": call
-            .and_then(|call| call.mcp_classification),
-        "receive_stream": info.receive_stream,
-        "has_response": info.has_response,
-        // Rust keeps the inspection failure kind typed. Rego's stable boundary is
-        // still the original diagnostic string or null.
-        "error": info
-            .error
-            .as_ref()
-            .map(crate::l7::jsonrpc::JsonRpcInspectionError::detail),
-    })
-}
+#[cfg(test)]
+use openshell_policy_runtime_interface::l7::jsonrpc_policy_input;
 
 /// A batch may be allowed by several endpoints, but one credential owner must
 /// admit every member before its token can authenticate the combined request.
@@ -3420,28 +3411,7 @@ fn admitted_token_grant_owners_once(
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
 ) -> Result<HashSet<String>> {
-    engine.admitted_token_grant_owners(ctx, request)
-}
-
-pub(crate) fn l7_request_policy_input(
-    ctx: &L7EvalContext,
-    request: &L7RequestInfo,
-) -> serde_json::Value {
-    serde_json::json!({
-        "network": { "host": ctx.host, "port": ctx.port },
-        "exec": {
-            "path": ctx.binary_path,
-            "ancestors": ctx.ancestors,
-            "cmdline_paths": ctx.cmdline_paths,
-        },
-        "request": {
-            "method": request.action,
-            "path": request.target,
-            "query_params": request.query_params.clone(),
-            "graphql": request.graphql.clone(),
-            "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
-        }
-    })
+    engine.admitted_token_grant_owners(&ctx.policy_context(), request)
 }
 
 /// Relay HTTP traffic with credential injection only (no L7 OPA evaluation).

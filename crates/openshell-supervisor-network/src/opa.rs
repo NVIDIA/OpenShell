@@ -182,12 +182,6 @@ impl RegoTunnelEvaluator {
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))
     }
 
-    /// Test-only: the tunnel's Rego engine, for evaluating rules directly.
-    #[cfg(test)]
-    pub(crate) fn engine_for_tests(&self) -> std::sync::MutexGuard<'_, regorus::Engine> {
-        self.lock().expect("OPA engine lock")
-    }
-
     /// Queries the ordered middleware chain for a destination within this tunnel.
     ///
     /// # Errors
@@ -205,10 +199,12 @@ impl RegoTunnelEvaluator {
     /// Returns an error if the evaluation fails. Callers treat an error as a denial.
     pub(crate) fn evaluate_request(
         &self,
-        ctx: &crate::l7::relay::L7EvalContext,
+        ctx: &openshell_policy_runtime_interface::L7PolicyContext,
         request: &crate::l7::L7RequestInfo,
     ) -> Result<(bool, String)> {
-        let input = regorus_input(crate::l7::relay::l7_request_policy_input(ctx, request))?;
+        let input = regorus_input(
+            openshell_policy_runtime_interface::l7::l7_request_policy_input(ctx, request),
+        )?;
 
         let mut engine = self.lock()?;
         engine.set_input(input);
@@ -241,10 +237,12 @@ impl RegoTunnelEvaluator {
     /// Returns an error if the evaluation fails. Callers inject no token on error.
     pub(crate) fn admitted_token_grant_owners(
         &self,
-        ctx: &crate::l7::relay::L7EvalContext,
+        ctx: &openshell_policy_runtime_interface::L7PolicyContext,
         request: &crate::l7::L7RequestInfo,
     ) -> Result<std::collections::HashSet<String>> {
-        let input = regorus_input(crate::l7::relay::l7_request_policy_input(ctx, request))?;
+        let input = regorus_input(
+            openshell_policy_runtime_interface::l7::l7_request_policy_input(ctx, request),
+        )?;
         let owners = {
             let mut engine = self.lock()?;
             engine.set_input(input);
@@ -594,7 +592,7 @@ impl OpaEngine {
                 matched_endpoints: Vec::new(),
                 exact_declared_endpoint_host: false,
                 generation,
-                cedar_destination: None,
+                destination_policy: None,
             });
         }
 
@@ -633,7 +631,7 @@ impl OpaEngine {
             matched_endpoints,
             exact_declared_endpoint_host,
             generation,
-            cedar_destination: None,
+            destination_policy: None,
         })
     }
 
@@ -750,6 +748,15 @@ impl OpaEngine {
         commit_credentials: impl FnOnce(),
     ) -> Result<PolicyGenerationGuard> {
         let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
+        self.commit_prepared_configuration(new, registry, commit_credentials)
+    }
+
+    pub(crate) fn commit_prepared_configuration(
+        &self,
+        new: Self,
+        registry: Option<MiddlewareRegistry>,
+        commit_credentials: impl FnOnce(),
+    ) -> Result<PolicyGenerationGuard> {
         let new_engine = new
             .engine
             .into_inner()
@@ -1115,7 +1122,7 @@ impl OpaEngine {
                 "policy changed before L7 tunnel started [expected_generation:{expected_generation} current_generation:{generation}]"
             ));
         }
-        Ok(TunnelPolicyEngine::rego(
+        Ok(TunnelPolicyEngine::new(
             generation_guard_for(
                 expected_generation,
                 generation,
@@ -2598,7 +2605,7 @@ mod tests {
             },
         );
         ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -4965,7 +4972,7 @@ process:
             },
         );
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -5591,7 +5598,7 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -5665,7 +5672,7 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -5744,7 +5751,7 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -7492,7 +7499,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -7552,7 +7559,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -7613,7 +7620,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -7676,7 +7683,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -7738,7 +7745,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -7801,13 +7808,20 @@ network_policies:
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
         // Verify the cloned engine can evaluate
-        let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
-        let mut eng = cloned.rego_evaluator_for_tests().engine_for_tests();
-        set_regorus_input(&mut eng, input_json).unwrap();
-        let val = eng
-            .eval_rule("data.openshell.sandbox.allow_request".into())
-            .unwrap();
-        assert_eq!(val, regorus::Value::from(true));
+        let context = openshell_policy_runtime_interface::L7PolicyContext {
+            host: "api.example.com".into(),
+            port: 8080,
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        let request = crate::l7::L7RequestInfo {
+            action: "GET".into(),
+            target: "/repos/myorg/foo".into(),
+            query_params: std::collections::HashMap::default(),
+            graphql: None,
+            jsonrpc: None,
+        };
+        assert!(cloned.evaluate_request(&context, &request).unwrap().0);
     }
 
     #[test]
@@ -7840,16 +7854,23 @@ network_policies:
         assert!(engine.reload(TEST_POLICY, invalid_l7_data).is_err());
         assert_eq!(engine.current_generation(), 1);
 
-        let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
         let cloned = engine
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
-        let mut eng = cloned.rego_evaluator_for_tests().engine_for_tests();
-        set_regorus_input(&mut eng, input_json).unwrap();
-        let val = eng
-            .eval_rule("data.openshell.sandbox.allow_request".into())
-            .unwrap();
-        assert_eq!(val, regorus::Value::from(true));
+        let context = openshell_policy_runtime_interface::L7PolicyContext {
+            host: "api.example.com".into(),
+            port: 8080,
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        let request = crate::l7::L7RequestInfo {
+            action: "GET".into(),
+            target: "/repos/myorg/foo".into(),
+            query_params: std::collections::HashMap::default(),
+            graphql: None,
+            jsonrpc: None,
+        };
+        assert!(cloned.evaluate_request(&context, &request).unwrap().0);
     }
 
     #[test]
@@ -9250,7 +9271,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -9323,7 +9344,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -9556,7 +9577,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
             version: 1,
@@ -10539,7 +10560,7 @@ network_policies:
             process: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
         };
@@ -11225,7 +11246,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
         };
@@ -11391,7 +11412,7 @@ process:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
-            cedar_policy_source: String::new(),
+            cedar_policy: None,
             provider_credential_rules: std::collections::HashMap::default(),
             endpoint_settings: Vec::new(),
         };

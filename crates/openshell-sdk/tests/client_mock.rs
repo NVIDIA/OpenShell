@@ -2531,7 +2531,9 @@ async fn cedar_template_create_checks_gateway_before_mutation() {
         let spec = || SandboxTemplateCreateSpec {
             template_name: "python".to_string(),
             policy: Some(proto::SandboxPolicy {
-                cedar_policy_source: "permit(principal, action, resource);".to_string(),
+                cedar_policy: Some(proto::CedarPolicy {
+                    source: "permit(principal, action, resource);".to_string(),
+                }),
                 ..Default::default()
             }),
             ..Default::default()

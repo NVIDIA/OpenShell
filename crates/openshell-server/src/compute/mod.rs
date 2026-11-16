@@ -8467,7 +8467,9 @@ mod tests {
             let mut sandbox = Sandbox::default();
             sandbox.set_phase(SandboxPhase::Provisioning as i32);
             sandbox.spec.get_or_insert_with(Default::default).policy = Some(PublicSandboxPolicy {
-                cedar_policy_source: "permit(principal, action, resource);".to_string(),
+                cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                    source: "permit(principal, action, resource);".to_string(),
+                }),
                 ..Default::default()
             });
             sandbox.status.as_mut().unwrap().configuration_admission =

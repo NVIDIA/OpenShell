@@ -45,7 +45,7 @@ pub(super) struct EndpointDecision {
     /// Whether policy matched the requested hostname exactly (not by glob).
     pub(super) exact_declared_host: bool,
     /// For a Cedar sandbox, how resolved addresses are checked.
-    pub(super) cedar_destination: Option<crate::cedar_only::CedarDestination>,
+    pub(super) destination_policy: Option<openshell_policy_runtime_interface::DestinationPolicy>,
 }
 
 impl Default for EndpointDecision {
@@ -57,7 +57,7 @@ impl Default for EndpointDecision {
             policy_configs: Vec::new(),
             matched_endpoints: Vec::new(),
             exact_declared_host: false,
-            cedar_destination: None,
+            destination_policy: None,
         }
     }
 }
@@ -70,7 +70,7 @@ impl EndpointDecision {
             policy_configs: authorization.endpoint_configs.clone(),
             matched_endpoints: authorization.matched_endpoints.clone(),
             exact_declared_host: authorization.exact_declared_endpoint_host,
-            cedar_destination: authorization.cedar_destination.clone(),
+            destination_policy: authorization.destination_policy.clone(),
             ..Self::default()
         }
     }

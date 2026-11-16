@@ -3,13 +3,12 @@
 
 use openshell_core::policy_identity::deterministic_policy_hash;
 use openshell_ocsf::ActionId;
-use openshell_policy_cedar::IpNet;
 
 use super::l7::{UNREGISTERED_PERSISTED_QUERY, staged_audit_event};
 use super::routes::{AliasTarget, BinaryAliases, RequestRoute, UNMATCHED_PATH};
 use super::*;
+use crate::L7PolicyContext as L7EvalContext;
 use crate::l7::L7RequestInfo;
-use crate::l7::relay::L7EvalContext;
 use crate::policy_types::{DnsRecord, EndpointProtocol, TlsSetting};
 
 const POLICY: &str = r#"
@@ -217,7 +216,7 @@ fn reload_with_identical_policy_source_is_a_no_op() {
 #[test]
 fn tunnel_engine_delegates_l7_decisions_to_cedar() {
     let cedar = Arc::new(CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses"));
-    let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+    let engine = openshell_policy_runtime_interface::PolicyEngine::from(Arc::clone(&cedar));
 
     let tunnel = engine
         .tunnel_engine(cedar.current_generation())
@@ -230,112 +229,12 @@ fn tunnel_engine_delegates_l7_decisions_to_cedar() {
 }
 
 #[tokio::test]
-async fn cedar_mcp_routes_observe_the_configured_inventory_identity() {
-    use openshell_core::endpoint_status::{
-        EndpointConfigVersion, EndpointInventoryEntry, EndpointResult, endpoint_id,
-        endpoint_status_channel,
-    };
-    use openshell_core::proto::NetworkEndpoint;
-    let source = r#"
-permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
-when { resource.host like("*.example.com", ".") && resource.port == 443 };
-@protocol("mcp") @path("/mcp/**")
-permit (principal, action == Sandbox::Action::"HttpRequest", resource)
-when { resource.host like("*.example.com", ".") && resource.port == 443 };
-@protocol("rest") @path("/rest/**")
-permit (principal, action == Sandbox::Action::"HttpRequest", resource)
-when { resource.host like("*.example.com", ".") && resource.port == 443 };
-"#;
-    let provider = NetworkEndpoint {
-        host: "*.example.com".to_string(),
-        ports: vec![8443, 443],
-        path: "/mcp/provider/**".to_string(),
-        provider_credentialed: true,
-        ..Default::default()
-    };
-    let setting = NetworkEndpoint {
-        host: "api.example.com".to_string(),
-        port: 443,
-        path: "/mcp/scoped".to_string(),
-        allow_encoded_slash: true,
-        ..Default::default()
-    };
-    let mut policy = provider_policy(source, vec![provider.clone()]);
-    policy.endpoint_settings.push(setting.clone());
-    let policy = openshell_policy::validate_and_canonicalize_sandbox_policy(policy)
-        .expect("canonical policy");
-    let engine = CedarOnlyEngine::from_proto(&policy).expect("policy loads");
-    let descriptors =
-        openshell_policy::endpoint_status::configured_mcp_endpoints(&policy).expect("inventory");
-    let (sender, mut receiver) = endpoint_status_channel();
-    let mut tracker = receiver.tracker();
-    sender
-        .reset(
-            EndpointConfigVersion {
-                policy_hash: deterministic_policy_hash(&policy),
-                provider_env_revision: 1,
-            },
-            descriptors
-                .iter()
-                .map(|endpoint| EndpointInventoryEntry {
-                    endpoint_id: endpoint_id(endpoint),
-                    uses_provider_credentials: endpoint.provider_credentialed,
-                })
-                .collect(),
-        )
-        .await
-        .expect("reset");
-    assert!(tracker.apply(receiver.recv().await.expect("reset received")));
-    let base = NetworkEndpoint {
-        host: "*.example.com".to_string(),
-        port: 443,
-        path: "/mcp/**".to_string(),
-        ..Default::default()
-    };
-    for (host, path, expected) in [
-        ("api.example.com", "/mcp/item", &base),
-        ("other.example.com", "/mcp/item", &base),
-        ("api.example.com", "/mcp/provider/item", &provider),
-        ("other.example.com", "/mcp/provider/item", &provider),
-        ("api.example.com", "/mcp/scoped", &setting),
-    ] {
-        let loaded = engine.read_engine().expect("lock");
-        let config = loaded.request_config(host, 443, path).expect("route");
-        let selected = crate::l7::parse_l7_config(&config).expect("MCP config");
-        assert_eq!(selected.endpoint_id, endpoint_id(expected), "{host}{path}");
-        let observer = crate::l7::EndpointObserver::begin(Some(&sender), &selected)
-            .expect("observation starts");
-        observer.observe(EndpointResult::HttpResponseReceived);
-    }
-    let rest = engine
-        .read_engine()
-        .expect("lock")
-        .request_config("api.example.com", 443, "/rest/item")
-        .expect("REST route");
-    let rest = crate::l7::parse_l7_config(&rest).expect("REST config");
-    assert!(crate::l7::EndpointObserver::begin(Some(&sender), &rest).is_none());
-    while let Ok(command) = receiver.try_recv() {
-        tracker.apply(command);
-    }
-    let snapshot = tracker.snapshot().expect("snapshot");
-    for expected in [&base, &provider, &setting] {
-        assert!(
-            snapshot
-                .endpoints
-                .iter()
-                .any(|endpoint| endpoint.endpoint_id == endpoint_id(expected)
-                    && endpoint.result == EndpointResult::HttpResponseReceived)
-        );
-    }
-}
-
-#[tokio::test]
 async fn websocket_admission_is_shared_across_forward_tunnels_and_reload() {
     use crate::l7::websocket::{WebSocketAssemblyAdmissionOutcome, WebSocketAssemblyBudget};
     let mut cedar = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
     cedar.websocket_assembly_budget = WebSocketAssemblyBudget::new(1, 1);
     let cedar = Arc::new(cedar);
-    let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+    let engine = openshell_policy_runtime_interface::PolicyEngine::from(Arc::clone(&cedar));
     let first = engine
         .tunnel_engine(cedar.current_generation())
         .expect("first tunnel");
@@ -395,7 +294,7 @@ async fn websocket_admission_is_shared_across_forward_tunnels_and_reload() {
 #[test]
 fn tunnel_engine_tracks_the_cedar_generation() {
     let cedar = Arc::new(CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses"));
-    let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+    let engine = openshell_policy_runtime_interface::PolicyEngine::from(Arc::clone(&cedar));
     let tunnel = engine
         .tunnel_engine(cedar.current_generation())
         .expect("tunnel builds");
@@ -417,7 +316,7 @@ fn tunnel_engine_tracks_the_cedar_generation() {
 #[test]
 fn tunnel_engine_rejects_a_stale_cedar_generation() {
     let cedar = Arc::new(CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses"));
-    let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+    let engine = openshell_policy_runtime_interface::PolicyEngine::from(Arc::clone(&cedar));
     let decided_at = cedar.current_generation();
     cedar
         .reload_from_policy_str(&format!("{POLICY}\n// changed\n"))
@@ -463,7 +362,7 @@ fn middleware_only_reload_advances_the_cedar_generation_and_closes_tunnels() {
     let cedar = Arc::new(
         CedarOnlyEngine::from_proto(&middleware_policy("api.example.com")).expect("policy loads"),
     );
-    let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+    let engine = openshell_policy_runtime_interface::PolicyEngine::from(Arc::clone(&cedar));
     let policy_generation = cedar.current_generation();
     let middleware_generation = engine.middleware_generation();
     let tunnel = engine
@@ -552,7 +451,7 @@ fn chain_names(chain: Vec<openshell_supervisor_middleware::ChainEntry>) -> Vec<S
 #[test]
 fn quarantine_entry_and_exit_stale_the_configuration_guard() {
     let cedar = Arc::new(CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses"));
-    let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+    let engine = openshell_policy_runtime_interface::PolicyEngine::from(Arc::clone(&cedar));
     let policy_generation = cedar.current_generation();
     let before = engine
         .configuration_generation_guard()
@@ -595,13 +494,18 @@ fn a_commit_that_fails_to_resolve_changes_nothing() {
     let cedar = Arc::new(
         CedarOnlyEngine::from_proto(&middleware_policy("api.example.com")).expect("policy loads"),
     );
-    let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+    let engine = openshell_policy_runtime_interface::PolicyEngine::from(Arc::clone(&cedar));
     let input = middleware_input("api.example.com");
 
     // A changed policy with changed middleware, staged before the
     // entrypoint process is known, so the commit has to resolve it.
     let mut candidate = middleware_policy("other.example.com");
-    candidate.cedar_policy_source.push_str("\n// changed\n");
+    candidate
+        .cedar_policy
+        .as_mut()
+        .unwrap()
+        .source
+        .push_str("\n// changed\n");
     let mut staged = cedar.stage(&candidate, 0).expect("stage");
     staged.fail_binary_resolution_for_tests();
     cedar.resolve_binary_symlinks(PID).expect("resolves");
@@ -658,7 +562,7 @@ fn passthrough_middleware_closes_after_a_middleware_only_reload() {
     let cedar = Arc::new(
         CedarOnlyEngine::from_proto(&middleware_policy("api.example.com")).expect("policy loads"),
     );
-    let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+    let engine = openshell_policy_runtime_interface::PolicyEngine::from(Arc::clone(&cedar));
     let guard = engine
         .generation_guard(cedar.current_generation())
         .expect("tunnel guard");
@@ -853,12 +757,18 @@ when {{ resource.port == 8443 }};
         authorization.endpoint_configs[0]
     );
     let destination = authorization
-        .cedar_destination
+        .destination_policy
         .expect("the connection is allowed");
-    assert_eq!(
-        destination.provider_ranges(),
-        [Ok(vec!["10.0.0.0/8".parse::<IpNet>().unwrap()])],
-        "the ranges travel with the destination rules, not the config"
+    assert!(destination.ip_constrained());
+    assert!(
+        destination
+            .rejection("api.example.com", "10.2.3.4".parse().unwrap())
+            .is_none()
+    );
+    assert!(
+        destination
+            .rejection("api.example.com", "11.2.3.4".parse().unwrap())
+            .is_some()
     );
 
     let guards = engine
@@ -894,20 +804,24 @@ fn allowed_connections_carry_their_destination_rules() {
     assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
     assert!(authorization.exact_declared_endpoint_host);
     let destination = authorization
-        .cedar_destination
+        .destination_policy
         .expect("an allowed connection carries its destination rules");
-    assert_eq!(
-        destination.address_conditions(),
-        [vec!["10.2.0.0/16".parse::<IpNet>().unwrap()]]
+    assert!(destination.ip_constrained());
+    assert!(
+        destination
+            .rejection("db.corp.net", "10.2.3.4".parse().unwrap())
+            .is_none()
     );
-    assert!(!destination.unconstrained_permit());
-    assert_eq!(destination.allows("10.2.3.4".parse().unwrap()), Ok(true));
-    assert_eq!(destination.allows("10.3.3.4".parse().unwrap()), Ok(false));
+    assert!(
+        destination
+            .rejection("db.corp.net", "10.3.3.4".parse().unwrap())
+            .is_some()
+    );
 
     input.port = 5433;
     let denied = engine.authorize_egress(&input).expect("request evaluates");
     assert!(matches!(denied.action, NetworkAction::Deny { .. }));
-    assert!(denied.cedar_destination.is_none());
+    assert!(denied.destination_policy.is_none());
 }
 
 #[test]
@@ -1384,7 +1298,7 @@ fn token_grant_owners_fail_closed_when_tunnel_generation_is_stale() {
 #[test]
 fn tunnel_engine_delegates_token_grant_owners_to_cedar() {
     let cedar = Arc::new(owner_engine(OWNER_POLICY));
-    let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+    let engine = openshell_policy_runtime_interface::PolicyEngine::from(Arc::clone(&cedar));
     let tunnel = engine
         .tunnel_engine(cedar.current_generation())
         .expect("tunnel builds");
@@ -1604,7 +1518,7 @@ fn mcp_settings_replace_the_default_revision() {
     let configs = parsed_configs(&default, "api.example.com");
     assert_eq!(
         configs[0].mcp_versions,
-        vec![openshell_policy_schema::DEFAULT_MCP_PROTOCOL_VERSION]
+        vec![openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION]
     );
     assert!(configs[0].mcp_strict_tool_names);
 }
@@ -2035,13 +1949,6 @@ fn query_params_reach_cedar_decoded() {
     assert!(decide(&[("tag", &["foo-a", "foo-b"])]).0);
     assert!(!decide(&[("tag", &["foo-a", "evil"])]).0);
     assert!(!decide(&[]).0);
-
-    // Through the relay's parser, which decodes keys and values.
-    let (_, parsed) = crate::l7::rest::parse_target_query("/download?t%61g=foo%2Da&tag=foo-x+y")
-        .expect("target parses");
-    let mut request = request("GET", "/download");
-    request.query_params = parsed;
-    assert!(tunnel.evaluate_request(&ctx(), &request).unwrap().0);
 }
 
 #[test]
@@ -2528,4 +2435,27 @@ fn resolution_finds_symlinked_policy_binaries() {
     assert_eq!(engine.current_generation(), generation + 1);
     assert!(!allowed(&target), "the old target is no longer an alias");
     assert!(allowed(&retarget), "the new target is");
+}
+
+#[test]
+fn destination_control_plane_checks_recognize_bracketed_ip_literals() {
+    let engine = CedarOnlyEngine::from_policy_str(
+        r#"permit(principal, action == Sandbox::Action::"NetworkConnect", resource);"#,
+    )
+    .unwrap();
+    for host in [
+        "8.8.8.8",
+        "[8.8.8.8]",
+        "2606:4700:4700::1111",
+        "[2606:4700:4700::1111]",
+    ] {
+        let authorization = engine.authorize_egress(&curl_input(host)).unwrap();
+        assert!(
+            authorization
+                .destination_policy
+                .unwrap()
+                .blocks_control_plane(host),
+            "{host}"
+        );
+    }
 }

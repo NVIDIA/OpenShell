@@ -156,9 +156,9 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
-    // Cedar policies add cedar_policy_source and the gateway-managed
+    // Cedar policies add the explicitly present CedarPolicy message and the gateway-managed
     // provider_credential_rules map to SandboxPolicy in both closures. Existing
-    // rows decode both empty and remain YAML policies.
+    // rows decode no Cedar message and remain YAML policies.
     // Cedar endpoint settings add the repeated endpoint_settings field to
     // SandboxPolicy in both closures. Existing rows decode it empty, so stored
     // Cedar policies keep their current behavior.
@@ -174,11 +174,11 @@ mod tests {
     // SandboxPhase enum. Stored rows never carried those values, so prior
     // payloads decode unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "b6786baeae2cc577c11fd48837d37b3cf038f662569639a4fdd207ecfd310e8b";
+        "0128adb550d8a576c994196b7399b18d975d4d433f544422621e21164c820580";
     const DURABLE_SCHEMA_SHA256: &str =
-        "64e9d327f7220b0c63151995f922ea81ed8c2b6bd38720096def578dfc01c060";
+        "c916749a87e6ec66d3cb46c57de4ae669ac71ca1123d4af118739a2131e0e6fb";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "f97da31f52d0508a34392ad5e1e14ff1d13bbc5384ce6b232fd0dc29e8d3ca7c";
+        "391fecc05b29b8e2eb789ba172f93bb07175b10992df9f8f8680c0ff60912ea8";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -712,9 +712,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (332, 31),
-                (96, 22),
-                (84, 22),
+                (333, 31),
+                (97, 22),
+                (85, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

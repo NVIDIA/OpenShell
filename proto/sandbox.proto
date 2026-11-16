@@ -34,7 +34,7 @@ message SandboxPolicy {
   // can be selected per request.
   map<string, NetworkMiddlewareConfig> network_middlewares = 6;
   // Raw Cedar policy source (.cedar syntax, against the canonical schema
-  // published by the openshell-policy-cedar-schema crate). When non-empty,
+  // published by the openshell-policy-cedar-schema crate). When present,
   // this sandbox's network, per-request, and filesystem decisions come
   // entirely from Cedar: Landlock grants are derived from the Cedar text
   // (plus the supervisor's baseline paths), and `filesystem` is not used.
@@ -44,7 +44,7 @@ message SandboxPolicy {
   // `network_policies` or `filesystem` paths are also set.
   // A sandbox cannot switch between Cedar and YAML after creation, and
   // global policies must be YAML.
-  string cedar_policy_source = 7;
+  CedarPolicy cedar_policy = 7;
   // Gateway-managed, for Cedar policies only: the network rules of the
   // sandbox's attached providers, keyed like provider-composed
   // `network_policies` entries. They supply endpoint settings for credential
@@ -60,8 +60,13 @@ message SandboxPolicy {
   // `graphql_max_body_bytes`, `mcp` (`versions`, `strict_tool_names`),
   // `persisted_queries`, and `graphql_persisted_queries`. The Cedar policy
   // decides access and inspection; these settings apply to the connections
-  // and requests it inspects. Rejected when `cedar_policy_source` is empty.
+  // and requests it inspects. Rejected when `cedar_policy` is absent.
   repeated NetworkEndpoint endpoint_settings = 9;
+}
+
+// Cedar-authored policy. Message presence selects Cedar even for empty source.
+message CedarPolicy {
+  string source = 1;
 }
 
 // Filesystem access policy.

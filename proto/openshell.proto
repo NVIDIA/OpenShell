@@ -2876,7 +2876,7 @@ message UpdateConfigRequest {
   // The new policy to apply.
   //
   // Sandbox scope (`global=false`):
-  // - only network_policies and cedar_policy_source may differ from
+  // - only network_policies and cedar_policy may differ from
   //   create-time policy; static fields must match version 1.
   //
   // Global scope (`global=true`):

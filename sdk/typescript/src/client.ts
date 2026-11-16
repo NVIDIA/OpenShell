@@ -1212,8 +1212,8 @@ export class SandboxClient {
   }
 
   /** Check before sending Cedar through either the curated or raw client. */
-  async requireCedarPolicySupport(policy?: { cedarPolicySource?: string }): Promise<void> {
-    if (!policy?.cedarPolicySource) return;
+  async requireCedarPolicySupport(policy?: { cedarPolicy?: { source?: string } }): Promise<void> {
+    if (!policy?.cedarPolicy) return;
     const info = await this.grpc.health({});
     if (!info.supportedCapabilities.includes('openshell.policy.cedar.v1'))
       throw new SdkError(

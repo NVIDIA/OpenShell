@@ -33,8 +33,8 @@ use crate::policy_data::{
 ///
 /// Returns an error when the rules fail the validation a YAML sandbox
 /// applies to them, or the generated Cedar does not load.
-pub fn compile(
-    rules: &HashMap<String, NetworkPolicyRule>,
+pub fn compile<S: std::hash::BuildHasher>(
+    rules: &HashMap<String, NetworkPolicyRule, S>,
     entrypoint_pid: u32,
 ) -> Result<Option<TokenGrantRules>> {
     let Some(policy) = openshell_policy::cedar::provider_token_grant_policy(rules)? else {
@@ -186,7 +186,7 @@ mod tests {
             token_grant_owner: "mcp-owner".into(),
             mcp: Some(McpOptions {
                 versions: vec![
-                    openshell_policy_schema::DEFAULT_MCP_PROTOCOL_VERSION
+                    openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION
                         .as_str()
                         .to_string(),
                 ],

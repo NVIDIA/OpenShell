@@ -4,8 +4,8 @@
 //! Cedar as the sole, authoritative network policy engine for a sandbox.
 //!
 //! [`CedarOnlyEngine`] evaluates an authored `.cedar` policy directly. It is
-//! selected instead of [`crate::opa::OpaEngine`], never alongside it:
-//! a sandbox's `SandboxPolicy.cedar_policy_source` being non-empty is what
+//! selected instead of `OpaEngine`, never alongside it:
+//! presence of `SandboxPolicy.cedar_policy` is what
 //! makes a sandbox use this engine instead of OPA, decided once at policy
 //! load (see `crates/openshell-supervisor/src/lib.rs::load_policy`).
 //!
@@ -14,7 +14,7 @@
 //! Per-request L7 enforcement is covered by
 //! [`openshell_policy_cedar::CedarEngine::evaluate_l7`] via
 //! [`CedarL7TunnelEngine`], the handle each inspected tunnel's
-//! [`crate::policy_engine::TunnelPolicyEngine`] delegates to. [`l7_endpoint_configs_for`] populates
+//! [`openshell_policy_runtime_interface::TunnelPolicyEngine`] delegates to. [`l7_endpoint_configs_for`] populates
 //! `EgressAuthorization::endpoint_configs` for every endpoint an
 //! `HttpRequest` policy names, exactly in its scope or as a host glob in its
 //! conditions, so the proxy routes an allowed CONNECT into L7 inspection
@@ -113,10 +113,10 @@ mod routes;
 #[cfg(test)]
 mod tests;
 
-pub use destination::CedarDestination;
-pub(crate) use l7::CedarL7TunnelEngine;
+use destination::CedarDestination;
+pub use l7::CedarL7TunnelEngine;
 use routes::LoadedPolicy;
-pub(crate) use routes::ProviderRanges;
+pub use routes::ProviderRanges;
 
 /// User and group entity id sent with every Cedar request.
 ///
@@ -180,7 +180,7 @@ impl PolicyInputs {
             .collect();
         provider_rules.sort_by(|left, right| left.0.cmp(&right.0));
         Self {
-            source: policy.cedar_policy_source.clone(),
+            source: policy.cedar_source().to_owned(),
             provider_rules,
             endpoint_settings: policy.endpoint_settings.clone(),
         }
@@ -190,7 +190,9 @@ impl PolicyInputs {
 /// Builds a policy holding only Cedar text, for callers without provider rules.
 fn policy_from_source(policy_src: &str) -> ProtoSandboxPolicy {
     ProtoSandboxPolicy {
-        cedar_policy_source: policy_src.to_string(),
+        cedar_policy: Some(openshell_core::proto::CedarPolicy {
+            source: policy_src.to_string(),
+        }),
         ..Default::default()
     }
 }
@@ -198,7 +200,7 @@ fn policy_from_source(policy_src: &str) -> ProtoSandboxPolicy {
 /// Cedar-backed, fully authoritative network policy evaluator.
 ///
 /// No hidden fallback to OPA: a sandbox either uses this engine for every
-/// network decision, or [`crate::opa::OpaEngine`] for every network
+/// network decision, or `OpaEngine` for every network
 /// decision, chosen once at policy load.
 #[derive(Debug)]
 pub struct CedarOnlyEngine {
@@ -229,7 +231,7 @@ impl CedarOnlyEngine {
     /// endpoint settings, and network middlewares.
     ///
     /// The engine starts with no middleware services connected; see
-    /// [`crate::policy_engine::PolicyEngine::replace_middleware_registry`].
+    /// [`openshell_policy_runtime_interface::PolicyBackend::replace_middleware_registry`].
     ///
     /// The policy gets the validation every gateway-delivered policy gets
     /// (see [`crate::policy_validation::validate_sandbox_policy`]), as
@@ -244,7 +246,7 @@ impl CedarOnlyEngine {
     pub fn from_proto(policy: &ProtoSandboxPolicy) -> Result<Self> {
         let validated = crate::policy_validation::validate_sandbox_policy_report(policy)?;
         let policy = validated.policy;
-        let loaded = LoadedPolicy::from_proto(&policy, validated.cedar, 0)?;
+        let loaded = LoadedPolicy::from_proto(&policy, None, 0)?;
         let (generation_tx, _) = watch::channel(0);
         Ok(Self {
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
@@ -272,19 +274,17 @@ impl CedarOnlyEngine {
         self.generation.load(Ordering::Acquire)
     }
 
-    pub(crate) fn websocket_assembly_budget(
-        &self,
-    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+    pub fn websocket_assembly_budget(&self) -> crate::l7::websocket::WebSocketAssemblyBudget {
         self.websocket_assembly_budget.clone()
     }
 
     /// Returns the sandbox's middleware configs, services, and generation.
-    pub(crate) fn middleware(&self) -> &MiddlewareState {
+    pub fn middleware(&self) -> &MiddlewareState {
         &self.middleware
     }
 
     /// Builds the L7 decision handle for a tunnel pinned at `captured_generation`.
-    pub(crate) fn l7_handle(&self, captured_generation: u64) -> CedarL7TunnelEngine {
+    pub fn l7_handle(&self, captured_generation: u64) -> CedarL7TunnelEngine {
         CedarL7TunnelEngine {
             engine: Arc::clone(&self.engine),
             generation: Arc::clone(&self.generation),
@@ -403,7 +403,7 @@ impl CedarOnlyEngine {
                 middleware,
             });
         }
-        let loaded = LoadedPolicy::from_proto(&policy, validated.cedar, entrypoint_pid)?;
+        let loaded = LoadedPolicy::from_proto(&policy, None, entrypoint_pid)?;
         Ok(StagedCedarPolicy {
             policy: Some((loaded, inputs)),
             entrypoint_pid,
@@ -633,7 +633,7 @@ impl CedarOnlyEngine {
     /// Cedar generation advances, which closes every pinned tunnel, and so
     /// does the middleware generation, which stales the configuration guard
     /// the policy poll loop watches (see
-    /// [`crate::policy_engine::PolicyEngine::configuration_generation_guard`]),
+    /// [`openshell_policy_runtime_interface::PolicyBackend::configuration_generation_guard`]),
     /// as `OpaEngine::enter_fail_closed` stales both with its one counter.
     ///
     /// Returns the new Cedar generation.
@@ -772,7 +772,7 @@ impl CedarOnlyEngine {
                 matched_endpoints: Vec::new(),
                 exact_declared_endpoint_host: false,
                 generation,
-                cedar_destination: None,
+                destination_policy: None,
             });
         }
         request.binary_aliases = guard
@@ -782,7 +782,7 @@ impl CedarOnlyEngine {
             .binary_globs
             .matching(&request.binary_path, &request.ancestors)?;
         // Decided before the host resolves: an allow means Cedar allows some
-        // address, and `cedar_destination` checks each resolved one.
+        // address, and `destination_policy` checks each resolved one.
         let evaluation = guard
             .cedar
             .authorize_network(&request)
@@ -822,11 +822,13 @@ impl CedarOnlyEngine {
             Vec::new()
         };
 
-        let cedar_destination = allowed.then(|| CedarDestination {
-            engine: Arc::clone(&guard.cedar),
-            provider_ranges: guard.provider_ranges(&request.host, request.port),
-            request,
-            evaluation,
+        let destination_policy = allowed.then(|| {
+            openshell_policy_runtime_interface::DestinationPolicy::new(CedarDestination {
+                engine: Arc::clone(&guard.cedar),
+                provider_ranges: guard.provider_ranges(&request.host, request.port),
+                request,
+                evaluation,
+            })
         });
 
         Ok(EgressAuthorization {
@@ -835,7 +837,7 @@ impl CedarOnlyEngine {
             matched_endpoints,
             exact_declared_endpoint_host,
             generation,
-            cedar_destination,
+            destination_policy,
         })
     }
 

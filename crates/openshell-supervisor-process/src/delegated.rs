@@ -417,7 +417,7 @@ mod tests {
             None,
             tokio::sync::mpsc::channel(1).0,
             tokio::sync::watch::channel(false).0,
-            false,
+            Vec::new(),
             None,
         )
         .await;

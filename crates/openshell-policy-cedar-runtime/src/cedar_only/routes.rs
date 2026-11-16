@@ -85,7 +85,7 @@ impl LoadedPolicy {
         let cedar = match cedar {
             Some(cedar) => cedar,
             None => Arc::new(
-                CedarEngine::from_policy_str(&policy.cedar_policy_source)
+                CedarEngine::from_policy_str(policy.cedar_source())
                     .map_err(|e| miette::miette!("{e}"))?,
             ),
         };
@@ -998,12 +998,13 @@ fn provider_config(endpoint: &openshell_core::proto::NetworkEndpoint) -> Endpoin
 /// endpoint is a `websocket` endpoint with `websocket_graphql_policy` set,
 /// which a YAML endpoint gets from its GraphQL operation rules.
 fn apply_inspection(config: &mut EndpointConfig, inspection: L7Endpoint) {
-    config.protocol = EndpointProtocol::L7(inspection.protocol.into());
+    config.protocol =
+        EndpointProtocol::L7(openshell_policy::cedar::l7_protocol(inspection.protocol));
     config.websocket_graphql_policy = inspection.protocol.websocket_graphql_messages();
     config.enforcement = EnforcementSetting::from(inspection.enforcement.as_str());
     if inspection.protocol == L7Protocol::Mcp {
         config.mcp_versions = vec![
-            openshell_policy_schema::DEFAULT_MCP_PROTOCOL_VERSION
+            openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION
                 .as_str()
                 .to_string(),
         ];

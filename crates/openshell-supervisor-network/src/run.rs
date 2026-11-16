@@ -670,40 +670,10 @@ fn resolve_policy_binary_symlinks(
     proto: &ProtoSandboxPolicy,
     pid: u32,
 ) {
-    match engine {
-        crate::policy_engine::PolicyEngine::Opa(opa) => {
-            match opa.reload_from_proto_with_pid(proto, pid) {
-                Ok(_) => {
-                    info!(
-                        pid = pid,
-                        "Policy binary symlink resolution complete \
-                         (check logs above for per-binary results)"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to rebuild OPA engine with symlink resolution \
-                         (non-fatal, falling back to literal path matching): {e}"
-                    );
-                }
-            }
-        }
-        crate::policy_engine::PolicyEngine::Cedar(cedar) => {
-            match cedar.resolve_binary_symlinks(pid) {
-                Ok(()) => {
-                    info!(
-                        pid = pid,
-                        "Policy binary symlink resolution complete \
-                     (check logs above for per-binary results)"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to resolve Cedar policy binary symlinks \
-                     (non-fatal, binary_aliases stays empty): {e}"
-                    );
-                }
-            }
+    match engine.resolve_binary_symlinks(proto, pid) {
+        Ok(()) => info!(pid, "Policy binary symlink resolution complete"),
+        Err(error) => {
+            warn!(%error, "Failed to resolve policy binary symlinks (non-fatal, falling back to literal paths)");
         }
     }
 }

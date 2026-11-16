@@ -1108,7 +1108,7 @@ pub(super) fn validate_static_fields_unchanged(
     // Checked first so a format switch is reported as such rather than as
     // whichever static field happens to differ between the two formats.
     // The supervisor picks its authoritative policy engine (OPA or Cedar)
-    // once at startup from whether cedar_policy_source was set; a live
+    // once at startup from whether cedar_policy was present; a live
     // reload only ever re-evaluates within that same engine. Flipping
     // formats via update would leave the originally-chosen engine stale
     // (silently evaluating against the old policy) while the other engine's
@@ -2389,7 +2389,9 @@ mod tests {
         use openshell_core::proto::NetworkPolicyRule;
 
         let mut policy = ProtoSandboxPolicy {
-            cedar_policy_source: "permit(principal, action, resource);".into(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, action, resource);".into(),
+            }),
             ..Default::default()
         };
         policy
@@ -2416,9 +2418,11 @@ mod tests {
             ..Default::default()
         };
         let cedar = ProtoSandboxPolicy {
-            cedar_policy_source: r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
                 resource == Sandbox::NetworkEndpoint::"mcp.example.com:443");"#
-                .into(),
+                    .into(),
+            }),
             endpoint_settings: vec![setting.clone()],
             ..Default::default()
         };
@@ -2493,7 +2497,9 @@ mod tests {
     fn validate_static_fields_rejects_switching_from_yaml_to_cedar() {
         let baseline = ProtoSandboxPolicy::default();
         let new = ProtoSandboxPolicy {
-            cedar_policy_source: "permit(principal, action, resource);".into(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, action, resource);".into(),
+            }),
             provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
@@ -2504,7 +2510,9 @@ mod tests {
     #[test]
     fn validate_static_fields_reports_a_format_switch_before_other_static_fields() {
         let baseline = ProtoSandboxPolicy {
-            cedar_policy_source: "permit(principal, action, resource);".into(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, action, resource);".into(),
+            }),
             provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
@@ -2526,7 +2534,9 @@ mod tests {
     #[test]
     fn validate_static_fields_rejects_switching_from_cedar_to_yaml() {
         let baseline = ProtoSandboxPolicy {
-            cedar_policy_source: "permit(principal, action, resource);".into(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, action, resource);".into(),
+            }),
             provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
@@ -2550,7 +2560,9 @@ mod tests {
         use openshell_core::proto::ProcessPolicy;
 
         let baseline = ProtoSandboxPolicy {
-            cedar_policy_source: CONNECT_PYPI.into(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: CONNECT_PYPI.into(),
+            }),
             process: Some(ProcessPolicy {
                 run_as_user: "1000".into(),
                 run_as_group: "sandbox".into(),
@@ -2558,7 +2570,9 @@ mod tests {
             ..Default::default()
         };
         let same = ProtoSandboxPolicy {
-            cedar_policy_source: CONNECT_EXAMPLE.into(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: CONNECT_EXAMPLE.into(),
+            }),
             ..baseline.clone()
         };
         assert!(validate_static_fields_unchanged(&baseline, &same).is_ok());
@@ -2595,12 +2609,16 @@ mod tests {
     #[test]
     fn validate_static_fields_allows_cedar_policy_source_change_within_cedar() {
         let baseline = ProtoSandboxPolicy {
-            cedar_policy_source: CONNECT_PYPI.into(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: CONNECT_PYPI.into(),
+            }),
             provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
         let new = ProtoSandboxPolicy {
-            cedar_policy_source: CONNECT_EXAMPLE.into(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: CONNECT_EXAMPLE.into(),
+            }),
             provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
@@ -2620,7 +2638,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         ProtoSandboxPolicy {
-            cedar_policy_source,
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: cedar_policy_source,
+            }),
             provider_credential_rules: HashMap::default(),
             ..Default::default()
         }

@@ -4,7 +4,7 @@
 //! Cedar policy evaluation for `OpenShell` sandboxes.
 //!
 //! [`CedarEngine`] is the authoritative policy engine for a sandbox
-//! whose policy is authored in Cedar (`SandboxPolicy.cedar_policy_source`).
+//! whose policy is authored in Cedar (`SandboxPolicy.cedar_source()`).
 //! It evaluates `NetworkConnect` and per-request `HttpRequest` decisions at
 //! request time, and derives Landlock grants, L7 inspection routing, and DNS
 //! eligibility from the policy text once, at construction. Construction

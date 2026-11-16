@@ -11,6 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openshell-policy-runtime-interface = { path = "../openshell-policy-runtime-interface" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 sha2 = { workspace = true }
 openshell-binary-identity = { path = "../openshell-binary-identity" }
@@ -19,7 +20,6 @@ openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
-openshell-policy-cedar = { path = "../openshell-policy-cedar", optional = true }
 openshell-policy-schema = { path = "../openshell-policy-schema" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 
@@ -35,7 +35,6 @@ bytes = { workspace = true }
 flate2 = "1"
 futures = { workspace = true }
 glob = { workspace = true }
-globset = { version = "0.4", default-features = false, optional = true }
 hex = "0.4"
 hickory-proto = "0.26.1"
 ipnet = "2"
@@ -65,11 +64,13 @@ webpki-roots = { workspace = true, optional = true }
 [features]
 default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
-# Enforces Cedar-authored sandbox policies. Without it, the supervisor
-# rejects Cedar policies. Enabled through `openshell-supervisor/cedar`.
-cedar = ["dep:openshell-policy-cedar", "dep:globset", "openshell-policy/cedar"]
+# Enables shared Cedar validation and the Cedar parity tests. The runtime
+# backend is selected by `openshell-supervisor/cedar`.
+cedar = ["openshell-policy/cedar"]
 
 [dev-dependencies]
+openshell-policy-cedar = { path = "../openshell-policy-cedar" }
+openshell-policy-cedar-runtime = { path = "../openshell-policy-cedar-runtime" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 
 openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }

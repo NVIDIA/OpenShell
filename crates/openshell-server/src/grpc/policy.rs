@@ -12862,7 +12862,7 @@ mod tests {
         let state = test_server_state().await;
         let policy = ProtoSandboxPolicy {
             version: 1,
-            cedar_policy_source: "permit(principal, action == Sandbox::Action::\"NetworkConnect\", resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");".to_string(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy { source: "permit(principal, action == Sandbox::Action::\"NetworkConnect\", resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");".to_string() }),
             ..Default::default()
         };
         state
@@ -12898,7 +12898,7 @@ mod tests {
                         .into_inner()
                         .policy
                         .unwrap()
-                        .cedar_policy_source
+                        .cedar_source()
                         .is_empty()
                 );
             } else {
@@ -12929,7 +12929,7 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(legacy_yaml.policy.unwrap().cedar_policy_source.is_empty());
+        assert!(legacy_yaml.policy.unwrap().cedar_source().is_empty());
     }
 
     #[cfg(feature = "cedar")]
@@ -12943,10 +12943,12 @@ mod tests {
             .unwrap();
         let cedar_policy = ProtoSandboxPolicy {
             version: 1,
-            cedar_policy_source: "permit(principal, \
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, \
                 action == Sandbox::Action::\"NetworkConnect\", \
                 resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
-                .to_string(),
+                    .to_string(),
+            }),
             ..Default::default()
         };
         state
@@ -14439,10 +14441,12 @@ mod tests {
             .unwrap();
         let cedar_policy = ProtoSandboxPolicy {
             version: 1,
-            cedar_policy_source: "permit(principal, \
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, \
                 action == Sandbox::Action::\"NetworkConnect\", \
                 resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
-                .to_string(),
+                    .to_string(),
+            }),
             ..Default::default()
         };
         state
@@ -22879,10 +22883,12 @@ mod tests {
                 global: true,
                 policy: Some(ProtoSandboxPolicy {
                     version: 1,
-                    cedar_policy_source: "permit(principal, \
+                    cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                        source: "permit(principal, \
                         action == Sandbox::Action::\"NetworkConnect\", \
                         resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
-                        .to_string(),
+                            .to_string(),
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -22900,10 +22906,12 @@ mod tests {
 
         let cedar = ProtoSandboxPolicy {
             version: 1,
-            cedar_policy_source: "permit(principal, \
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, \
                 action == Sandbox::Action::\"NetworkConnect\", \
                 resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
-                .to_string(),
+                    .to_string(),
+            }),
             ..Default::default()
         };
         let state = test_server_state().await;

@@ -1305,9 +1305,11 @@ pub mod test_support {
     pub fn cedar_policy() -> openshell_core::proto::SandboxPolicy {
         openshell_core::proto::SandboxPolicy {
             version: 1,
-            cedar_policy_source: r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
                 resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#
-                .to_string(),
+                    .to_string(),
+            }),
             ..Default::default()
         }
     }
@@ -1317,7 +1319,8 @@ pub mod test_support {
     #[cfg(feature = "cedar")]
     pub fn cedar_policy_with_warning() -> openshell_core::proto::SandboxPolicy {
         openshell_core::proto::SandboxPolicy {
-            cedar_policy_source: r#"
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: r#"
 permit (principal, action == Sandbox::Action::"HttpRequest",
         resource == Sandbox::NetworkEndpoint::"api.example.com:443")
 when { context.method == "GET" };
@@ -1326,7 +1329,8 @@ forbid (principal, action == Sandbox::Action::"HttpRequest",
         resource == Sandbox::NetworkEndpoint::"api.example.com:443")
 when { context.method == "DELETE" };
 "#
-            .to_string(),
+                .to_string(),
+            }),
             ..cedar_policy()
         }
     }

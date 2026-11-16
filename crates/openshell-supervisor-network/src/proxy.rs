@@ -987,8 +987,8 @@ pub(crate) fn connect_destination_outcome_for_test(
         destination::AddressAuthorization::ExactDeclaredHost => {
             validate_declared_endpoint_resolved_addrs(host, port, &addrs)
         }
-        destination::AddressAuthorization::Cedar(cedar) => {
-            destination::validate_cedar_resolved_addrs(cedar, host, port, &addrs)
+        destination::AddressAuthorization::Policy(cedar) => {
+            destination::validate_policy_resolved_addrs(cedar, host, port, &addrs)
         }
         other => panic!("no host gateway is configured, but the plan is {other:?}"),
     };
@@ -1136,19 +1136,19 @@ fn cedar_admitted_addresses(
     port: u16,
     addresses: Vec<IpAddr>,
 ) -> Vec<IpAddr> {
-    let Some(cedar) = decision.endpoint.cedar_destination.as_ref() else {
+    let Some(cedar) = decision.endpoint.destination_policy.as_ref() else {
         return addresses;
     };
     let host = &decision.intent.destination.host;
     if BLOCKED_CONTROL_PLANE_PORTS.contains(&port)
-        && destination::cedar_blocks_control_plane(cedar, host)
+        && destination::policy_blocks_control_plane(cedar, host)
     {
         return Vec::new();
     }
     addresses
         .into_iter()
         .filter(|ip| {
-            let rejection = destination::cedar_address_rejection(cedar, host, *ip);
+            let rejection = cedar.rejection(host, *ip);
             // Plumbing, not a decision event: the connection still dials
             // the admitted addresses, and its decision is logged on its own.
             // A caller left with no address reports the denial as OCSF, and
@@ -2320,7 +2320,7 @@ fn destination_denial_detail(kind: DestinationDenialKind) -> &'static str {
         DestinationDenialKind::AllowedIps => "allowed_ips check failed",
         DestinationDenialKind::DeclaredEndpoint => "declared endpoint check failed",
         DestinationDenialKind::InternalAddress => "internal address",
-        DestinationDenialKind::CedarAddress => "destination address check failed",
+        DestinationDenialKind::PolicyAddress => "destination address check failed",
     }
 }
 
@@ -4171,7 +4171,7 @@ fn hydrate_destination_plan(
         trusted_host_gateway,
         &raw_allowed_ips,
         exact_declared_host,
-        decision.endpoint.cedar_destination.as_ref(),
+        decision.endpoint.destination_policy.as_ref(),
     )?;
     decision.endpoint.destination = Some(plan);
     Ok(())
@@ -5857,10 +5857,8 @@ async fn handle_forward_proxy(
     // Cedar sandbox it comes from the middleware state, whose generation
     // moves independently of Cedar's, so pin its own generation here; Cedar
     // staleness stays enforced by `forward_generation_guard`.
-    let middleware_expected_generation = match &network_engine {
-        PolicyEngine::Opa(_) => forward_generation_guard.captured_generation(),
-        PolicyEngine::Cedar(_) => network_engine.middleware_generation(),
-    };
+    let middleware_expected_generation = network_engine
+        .forward_middleware_generation(forward_generation_guard.captured_generation());
     let mut websocket_extensions = crate::l7::rest::WebSocketExtensionMode::Preserve;
     let mut forward_tunnel_engine: Option<crate::policy_engine::TunnelPolicyEngine> = None;
     // L7 endpoint config and evaluated request info, carried past the L7

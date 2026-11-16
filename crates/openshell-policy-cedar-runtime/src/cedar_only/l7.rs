@@ -38,9 +38,9 @@ impl CedarL7TunnelEngine {
     ///
     /// Returns an error if the tunnel's generation is stale, the engine lock
     /// is poisoned, or Cedar fails to evaluate the request.
-    pub(crate) fn evaluate_request(
+    pub fn evaluate_request(
         &self,
-        ctx: &crate::l7::relay::L7EvalContext,
+        ctx: &crate::L7PolicyContext,
         request: &crate::l7::L7RequestInfo,
     ) -> Result<(bool, String)> {
         let guard = self.read_pinned()?;
@@ -66,9 +66,9 @@ impl CedarL7TunnelEngine {
     ///
     /// Returns an error if the tunnel's generation is stale, the engine lock
     /// is poisoned, or an evaluation fails. Callers inject no token on error.
-    pub(crate) fn admitted_token_grant_owners(
+    pub fn admitted_token_grant_owners(
         &self,
-        ctx: &crate::l7::relay::L7EvalContext,
+        ctx: &crate::L7PolicyContext,
         request: &crate::l7::L7RequestInfo,
     ) -> Result<std::collections::HashSet<String>> {
         let none = std::collections::HashSet::new;
@@ -133,7 +133,7 @@ impl CedarL7TunnelEngine {
     /// operation is allowed.
     fn decide(
         policy: &LoadedPolicy,
-        ctx: &crate::l7::relay::L7EvalContext,
+        ctx: &crate::L7PolicyContext,
         request: &crate::l7::L7RequestInfo,
         staged_audit: StagedAudit,
     ) -> Result<(bool, String)> {
@@ -155,7 +155,7 @@ impl CedarL7TunnelEngine {
     /// denied before evaluation.
     fn prepare(
         policy: &LoadedPolicy,
-        ctx: &crate::l7::relay::L7EvalContext,
+        ctx: &crate::L7PolicyContext,
         request: &crate::l7::L7RequestInfo,
     ) -> Result<Prepared> {
         let mut base = HttpRequestInput {
@@ -235,6 +235,11 @@ impl CedarL7TunnelEngine {
                 base.mcp_method_class = match call.mcp_classification {
                     Some(crate::l7::jsonrpc::McpMethodClassification::Available) => "available",
                     Some(crate::l7::jsonrpc::McpMethodClassification::Extension) => "extension",
+                    Some(_) => {
+                        return Ok(Prepared::Denied(
+                            "unsupported MCP method classification".to_string(),
+                        ));
+                    }
                     None => "",
                 }
                 .to_string();
@@ -295,7 +300,7 @@ impl CedarL7TunnelEngine {
     /// field over the engine's length cap, is denied with that reason.
     fn evaluate_one(
         cedar: &CedarEngine,
-        ctx: &crate::l7::relay::L7EvalContext,
+        ctx: &crate::L7PolicyContext,
         request: &crate::l7::L7RequestInfo,
         l7_request: &HttpRequestInput,
         staged_audit: StagedAudit,
@@ -385,11 +390,7 @@ struct PersistedQueryRegistry {
 impl PersistedQueryRegistry {
     /// Reads the registry from the endpoint config the relay selects for
     /// `target`, which carries the matching `endpoint_settings`.
-    fn for_request(
-        policy: &LoadedPolicy,
-        ctx: &crate::l7::relay::L7EvalContext,
-        target: &str,
-    ) -> Self {
+    fn for_request(policy: &LoadedPolicy, ctx: &crate::L7PolicyContext, target: &str) -> Self {
         let Some(config) = policy.request_config(&ctx.host, ctx.port, target) else {
             return Self::default();
         };
@@ -441,7 +442,7 @@ enum StagedAudit {
 ///
 /// The request itself is decided, and logged by the relay, without them.
 pub(super) fn staged_audit_event(
-    ctx: &crate::l7::relay::L7EvalContext,
+    ctx: &crate::L7PolicyContext,
     request: &crate::l7::L7RequestInfo,
     allowed: bool,
     staged: &Decision,

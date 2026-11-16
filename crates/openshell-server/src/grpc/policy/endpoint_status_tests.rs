@@ -490,12 +490,14 @@ async fn report_endpoint_status_does_not_wait_for_unrelated_sandbox_guard() {
 #[test]
 fn cedar_endpoint_statuses_accept_configured_wildcard_observation() {
     let policy = ProtoSandboxPolicy {
-        cedar_policy_source: r#"
+        cedar_policy: Some(openshell_core::proto::CedarPolicy {
+            source: r#"
 @protocol("mcp") @path("/mcp/**")
 permit (principal, action == Sandbox::Action::"HttpRequest", resource)
 when { resource.host like("*.example.com", ".") && resource.port == 443 };
 "#
-        .to_string(),
+            .to_string(),
+        }),
         ..Default::default()
     };
     let expected = expected_endpoint_statuses(&policy);

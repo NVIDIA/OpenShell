@@ -99,7 +99,9 @@ fn assert_symlink_parity(scenario: &Scenario<'_>, resolution: Resolution) {
     let yaml = openshell_policy::parse_sandbox_policy(scenario.yaml)
         .unwrap_or_else(|error| panic!("{}: YAML policy parses: {error:?}", scenario.name));
     let cedar = openshell_core::proto::SandboxPolicy {
-        cedar_policy_source: scenario.cedar.to_string(),
+        cedar_policy: Some(openshell_core::proto::CedarPolicy {
+            source: scenario.cedar.to_string(),
+        }),
         ..Default::default()
     };
     let load = |pid: u32| {

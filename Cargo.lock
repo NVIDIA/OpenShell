@@ -4773,14 +4773,13 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
- "glob",
- "ipnet",
  "jsonwebtoken",
  "miette",
  "nix 0.29.0",
  "openshell-crypto",
  "openshell-extension-core",
  "openshell-otel",
+ "openshell-policy-primitives",
  "openshell-policy-schema",
  "prost",
  "prost-types",
@@ -5233,11 +5232,30 @@ dependencies = [
  "globset",
  "ipnet",
  "miette",
- "openshell-core",
  "openshell-policy-cedar-schema",
+ "openshell-policy-primitives",
  "serde_json",
  "stacker",
  "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "openshell-policy-cedar-runtime"
+version = "0.0.0"
+dependencies = [
+ "globset",
+ "ipnet",
+ "miette",
+ "openshell-core",
+ "openshell-ocsf",
+ "openshell-policy",
+ "openshell-policy-cedar",
+ "openshell-policy-runtime-interface",
+ "openshell-supervisor-middleware",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
@@ -5249,6 +5267,32 @@ dependencies = [
  "miette",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "openshell-policy-primitives"
+version = "0.0.0"
+dependencies = [
+ "glob",
+ "ipnet",
+]
+
+[[package]]
+name = "openshell-policy-runtime-interface"
+version = "0.0.0"
+dependencies = [
+ "glob",
+ "globset",
+ "libc",
+ "miette",
+ "openshell-core",
+ "openshell-ocsf",
+ "openshell-supervisor-middleware",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5532,6 +5576,8 @@ dependencies = [
  "openshell-ocsf",
  "openshell-otel",
  "openshell-policy",
+ "openshell-policy-cedar-runtime",
+ "openshell-policy-runtime-interface",
  "openshell-sandbox-backend",
  "openshell-supervisor-control",
  "openshell-supervisor-middleware",
@@ -5625,7 +5671,6 @@ dependencies = [
  "flate2",
  "futures",
  "glob",
- "globset",
  "hex",
  "hickory-proto",
  "http 1.4.0",
@@ -5643,6 +5688,8 @@ dependencies = [
  "openshell-otel",
  "openshell-policy",
  "openshell-policy-cedar",
+ "openshell-policy-cedar-runtime",
+ "openshell-policy-runtime-interface",
  "openshell-policy-schema",
  "openshell-providers",
  "openshell-sandbox-backend",

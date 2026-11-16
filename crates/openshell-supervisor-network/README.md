@@ -29,25 +29,19 @@ several instances serves `/v1/denials` from a per-instance
 
 ## Policy engines
 
-A sandbox's policy format selects one engine at load, and it decides every
-network request for that sandbox: `opa::OpaEngine` evaluates a YAML policy
-with Rego, and `cedar_only::CedarOnlyEngine` evaluates a policy with
-`cedar_policy_source`. `policy_engine::PolicyEngine` dispatches between them,
-and `policy_engine::TunnelPolicyEngine` does the same for one inspected
-tunnel's L7 decisions.
+Networking consumes `PolicyEngine` and `TunnelPolicyEngine` from
+`openshell-policy-runtime-interface`. Supervisor composition selects the
+backend once at startup. `opa::OpaEngine` implements the YAML backend here;
+`openshell-policy-cedar-runtime` implements Cedar in a separate crate.
 
-- `policy_types` holds the engine-neutral inputs, results, endpoint configs,
-  and generation guards the proxy, relay, and policy DNS read. The OPA engine
-  converts its Rego results into them in `opa`.
-- `policy_data` shapes YAML network policy data for Rego, and for the Cedar
-  engine's provider rules (`cedar_provider_rules`).
-- `policy_validation` validates a delivered policy, of either format, before
-  an engine loads it, and keeps authored values out of its errors.
-- `network_middleware` selects network middleware without Rego, for Cedar
-  sandboxes.
+The proxy, relay, and policy DNS use shared decisions and generation guards.
+An admitted connection carries an opaque destination authorizer that checks
+resolved addresses against the same policy snapshot. Reloads stage and commit
+through the backend contract, preserving atomic policy, middleware, and
+credential publication without inspecting concrete engine variants.
 
-The `cedar` feature, enabled through `openshell-supervisor/cedar`, builds
-`cedar_only/`, whose `mod.rs` holds the engine and its public surface.
-Without it, `cedar_disabled.rs` provides the same public surface with
-uninhabited types whose `from_proto` rejects every Cedar policy, so the
-Cedar branches compile but cannot run. Keep the two surfaces in step.
+`policy_types`, `policy_data`, `binary_resolution`, and `network_middleware`
+reexport shared runtime helpers. `policy_validation` reexports the policy
+composition layer's bounded validation diagnostics. The `cedar` feature enables
+Cedar validation and the parity tests; it does not import the Cedar runtime into
+production networking code.

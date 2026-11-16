@@ -23,6 +23,7 @@ mod config_runtime;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+mod policy_runtime;
 mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;
@@ -3285,14 +3286,9 @@ fn prepare_startup_configuration(
     // it builds, as a reload validates while staging. A Cedar policy builds
     // no OPA engine (see `openshell_supervisor_network::policy_engine`), and
     // a build without Cedar support rejects it here.
-    let engine = PolicyEngine::from_proto(policy)?;
+    let engine = policy_runtime::from_proto(policy)?;
     let mut process_policy = SandboxPolicy::try_from(policy.clone())?;
-    let filesystem = match &engine {
-        // The engine just loaded this policy; its grants need no second load.
-        PolicyEngine::Cedar(cedar) => cedar.effective_filesystem()?,
-        PolicyEngine::Opa(_) => openshell_policy::effective_filesystem(policy)
-            .map_err(|violation| miette::miette!("{violation}"))?,
-    };
+    let filesystem = engine.effective_filesystem(policy)?;
     process_policy.filesystem = filesystem.filesystem.map(Into::into).unwrap_or_default();
     // Same baseline a YAML policy gets, under the same condition: YAML adds
     // it to its own `filesystem` section only when the policy has network
@@ -3574,66 +3570,20 @@ async fn reload_gateway_configuration_runtime(
             miette::miette!("runtime reload requires a policy payload but none was returned"),
         ));
     };
-    match (engine, policy.is_cedar()) {
-        (PolicyEngine::Cedar(_), false) => {
-            return Err(GatewayRuntimeReloadError::PolicyValidation(
-                miette::miette!(
-                    "candidate policy is YAML, but this sandbox enforces a Cedar policy; \
-                     a sandbox cannot switch policy formats; previous policy remains active"
-                ),
-            ));
-        }
-        (PolicyEngine::Opa(_), true) => {
-            return Err(GatewayRuntimeReloadError::PolicyValidation(
-                miette::miette!(
-                    "candidate policy is Cedar, but this sandbox enforces a YAML policy; \
-                     a sandbox cannot switch policy formats; previous policy remains active"
-                ),
-            ));
-        }
-        _ => {}
-    }
-    match engine {
-        PolicyEngine::Opa(engine) => {
-            // Policy-only change: the installed registry already matches the
-            // delivered service set, so swap the engine alone. This must not
-            // require middleware reachability.
-            let registry = if middleware.registry_changed {
-                Some(connect_reload_middleware(&middleware).await?)
-            } else {
-                None
-            };
-            engine
-                .reload_configuration_from_proto_with_pid(
-                    policy,
-                    entrypoint_pid,
-                    registry,
-                    commit_credentials,
-                )
-                .map_err(GatewayRuntimeReloadError::PolicyValidation)
-        }
-        PolicyEngine::Cedar(cedar) => {
-            // Staging validates the candidate as startup does (the same
-            // validation a YAML policy's sections get, including middleware
-            // and endpoint settings, then Cedar's own load), so a rejected
-            // candidate leaves the policy, middleware, and credentials on the
-            // previous revision and is reported before any service connects.
-            let staged = cedar
-                .stage(policy, entrypoint_pid)
-                .map_err(GatewayRuntimeReloadError::PolicyValidation)?;
-            let registry = if middleware.registry_changed {
-                Some(connect_reload_middleware(&middleware).await?)
-            } else {
-                None
-            };
-            // Existing guards become stale before credentials change, and the
-            // Cedar policy, middleware, and credentials publish together or
-            // not at all.
-            cedar
-                .commit_configuration(staged, registry, commit_credentials)
-                .map_err(GatewayRuntimeReloadError::PolicyValidation)
-        }
-    }
+    let staged = engine
+        .stage(policy, entrypoint_pid)
+        .map_err(GatewayRuntimeReloadError::PolicyValidation)?;
+    let registry = if middleware.registry_changed {
+        Some(connect_reload_middleware(&middleware).await?)
+    } else {
+        None
+    };
+    let mut commit_credentials = Some(commit_credentials);
+    staged
+        .commit(registry, &mut || {
+            commit_credentials.take().expect("commit runs once")();
+        })
+        .map_err(GatewayRuntimeReloadError::PolicyValidation)
 }
 
 /// Connects the middleware services a reload delivers.
@@ -6777,6 +6727,11 @@ network_policies:
         ));
         assert!(engine.fail_closed_reason().is_none());
         assert_gateway_policy_authorization(&engine, "allowed.example.com", generation);
+        assert_eq!(
+            connections.load(Ordering::Relaxed),
+            0,
+            "invalid policy must be rejected before connecting middleware"
+        );
 
         // Repair only the rejected scalar: the endpoint change must now install
         // with both runtime provenance flags and one new generation.
@@ -6787,7 +6742,7 @@ network_policies:
         assert_gateway_policy_authorization(&engine, "repaired.example.com", generation + 1);
         assert_eq!(
             connections.load(Ordering::Relaxed),
-            if registry_changed { 2 } else { 0 }
+            usize::from(registry_changed)
         );
     }
 
@@ -6858,9 +6813,8 @@ network_policies:
         assert!(matches!(origin, LoadedPolicyOrigin::LocalOverride));
         assert!(matches!(registry, MiddlewareRegistryStatus::Synchronized));
         assert!(!proposals && !extension_authentication_enabled);
-        let Some(PolicyEngine::Opa(engine)) = engine else {
-            panic!("local startup installs OPA");
-        };
+        let engine = engine.expect("local startup installs a policy engine");
+        assert_eq!(engine.label(), "opa");
         assert!(engine.binary_identity_required());
         // Installing the built-in registry creates the first active generation.
         assert_eq!(engine.current_generation(), 1);
@@ -6873,27 +6827,53 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
         };
+        let decision = engine.authorize_egress(&input).expect("allowed binary");
+        assert!(matches!(
+            decision.action,
+            openshell_supervisor_network::policy_types::NetworkAction::Allow { .. }
+        ));
+        let tunnel = engine
+            .tunnel_engine(decision.generation)
+            .expect("startup tunnel");
+        let ctx = openshell_policy_runtime_interface::L7PolicyContext {
+            host: input.host.clone(),
+            port: input.port,
+            binary_path: input.binary_path.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let mut request = openshell_supervisor_network::l7::L7RequestInfo {
+            action: "GET".into(),
+            target: "/".into(),
+            query_params: std::collections::HashMap::from([(
+                "scope".into(),
+                vec!["public-a".into()],
+            )]),
+            graphql: None,
+            jsonrpc: None,
+        };
         assert!(
-            engine
-                .evaluate_network(&input)
-                .expect("allowed binary")
-                .allowed
+            tunnel
+                .evaluate_request(&ctx, &request)
+                .expect("public scope")
+                .0
         );
-        let endpoint = engine
-            .query_endpoint_config_json(&input)
-            .expect("query startup endpoint")
-            .expect("startup endpoint must exist");
-        assert_eq!(
-            endpoint["rules"][0]["allow"]["query"]["scope"],
-            serde_json::json!({ "glob": "public-*" }),
+        request
+            .query_params
+            .insert("scope".into(), vec!["private-a".into()]);
+        assert!(
+            !tunnel
+                .evaluate_request(&ctx, &request)
+                .expect("private scope")
+                .0
         );
         input.binary_path = "/usr/bin/unlisted".into();
-        assert!(
-            !engine
-                .evaluate_network(&input)
+        assert!(matches!(
+            engine
+                .authorize_egress(&input)
                 .expect("unlisted binary")
-                .allowed
-        );
+                .action,
+            openshell_supervisor_network::policy_types::NetworkAction::Deny { .. }
+        ));
 
         // A malformed new startup must fail before returning an active evaluator.
         std::fs::write(&data_path, "network_policies: []\n").expect("write malformed policy");
@@ -6983,17 +6963,19 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
     pub fn cedar_proto_policy(source: &str) -> openshell_core::proto::SandboxPolicy {
         openshell_core::proto::SandboxPolicy {
             version: 1,
-            cedar_policy_source: source.to_string(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: source.to_string(),
+            }),
             ..Default::default()
         }
     }
 
     #[cfg(feature = "cedar")]
-    pub fn cedar_engine() -> Arc<openshell_supervisor_network::cedar_only::CedarOnlyEngine> {
+    pub fn cedar_engine() -> Arc<openshell_policy_cedar_runtime::CedarOnlyEngine> {
         Arc::new(
-            openshell_supervisor_network::cedar_only::CedarOnlyEngine::from_proto(
-                &cedar_proto_policy(CEDAR_RELOAD_POLICY),
-            )
+            openshell_policy_cedar_runtime::CedarOnlyEngine::from_proto(&cedar_proto_policy(
+                CEDAR_RELOAD_POLICY,
+            ))
             .expect("build Cedar engine"),
         )
     }
@@ -7234,7 +7216,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         let (engine, _, _) =
             prepare_startup_configuration(&snapshot, &policy, &startup_provider(0))
                 .expect("Cedar startup configuration");
-        assert!(matches!(engine, PolicyEngine::Cedar(_)), "{engine:?}");
+        assert_eq!(engine.label(), "cedar");
     }
 
     /// A supervisor built without Cedar refuses a Cedar policy at startup.

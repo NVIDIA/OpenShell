@@ -25,9 +25,8 @@ pub fn configured_mcp_endpoints(policy: &SandboxPolicy) -> Result<Vec<NetworkEnd
     }
     #[cfg(feature = "cedar")]
     {
-        let cedar =
-            openshell_policy_cedar::CedarEngine::from_policy_str(&policy.cedar_policy_source)
-                .map_err(|error| miette::miette!("{error}"))?;
+        let cedar = openshell_policy_cedar::CedarEngine::from_policy_str(policy.cedar_source())
+            .map_err(|error| miette::miette!("{error}"))?;
         Ok(cedar_mcp_endpoints(policy, &cedar))
     }
     #[cfg(not(feature = "cedar"))]
@@ -138,7 +137,9 @@ when { resource.host like("*.example.com", ".") && resource.port == 443 };
             ..Default::default()
         };
         let policy = SandboxPolicy {
-            cedar_policy_source: source.to_string(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: source.to_string(),
+            }),
             provider_credential_rules: std::collections::HashMap::from([(
                 "provider".to_string(),
                 NetworkPolicyRule {
@@ -200,7 +201,9 @@ permit (principal, action == Sandbox::Action::"HttpRequest",
             ..Default::default()
         };
         let policy = SandboxPolicy {
-            cedar_policy_source: source.to_string(),
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: source.to_string(),
+            }),
             provider_credential_rules: std::collections::HashMap::from([(
                 "provider".to_string(),
                 NetworkPolicyRule {

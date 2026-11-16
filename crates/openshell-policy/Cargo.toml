@@ -22,7 +22,7 @@ prost-types = { workspace = true }
 
 [features]
 default = []
-# Validates and interprets Cedar-authored policies (`cedar_policy_source`).
+# Validates and interprets Cedar-authored policies (`cedar_policy.source`).
 # Without it, any policy with Cedar source fails validation as unsupported.
 # Only the gateway and supervisor enable it, through their own `cedar`
 # features; clients carry Cedar documents without linking the engine.

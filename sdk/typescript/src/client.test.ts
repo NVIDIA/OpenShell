@@ -2554,7 +2554,7 @@ describe('Cedar gateway compatibility', () => {
         return {};
       },
     });
-    const policy = { cedarPolicySource: 'permit(principal, action, resource);' };
+    const policy = { cedarPolicy: {} };
     const calls = [
       () => c.create({ policy }),
       () => c.create({ rawSpec: { policy } }),
@@ -2574,8 +2574,8 @@ it('advertises Cedar support when reading sandbox-authenticated configuration', 
     getSandbox: () => readySandbox('cedar', 'id'),
     getSandboxConfig: (request) => {
       expect(request.supportedCapabilities).toEqual(['openshell.policy.cedar.v1']);
-      return { policy: { cedarPolicySource: 'permit(principal, action, resource);' } };
+      return { policy: { cedarPolicy: { source: 'permit(principal, action, resource);' } } };
     },
   });
-  expect((await c.getConfig('cedar')).policy?.cedarPolicySource).toContain('permit');
+  expect((await c.getConfig('cedar')).policy?.cedarPolicy?.source).toContain('permit');
 });

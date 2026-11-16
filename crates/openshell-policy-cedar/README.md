@@ -2,7 +2,7 @@
 
 `openshell-policy-cedar` loads and evaluates sandbox policies authored in
 [Cedar](https://www.cedarpolicy.com/). A policy is either YAML or Cedar for the
-life of a sandbox. A non-empty `SandboxPolicy.cedar_policy_source`, authored as
+life of a sandbox. Presence of `SandboxPolicy.cedar_policy`, whose source is authored as
 a `.cedar` file, selects Cedar. It is mutually exclusive with
 `network_policies` and filesystem paths. Middleware and endpoint settings are
 configuration rather than policy, so a Cedar sandbox gets them from a separate
@@ -115,9 +115,9 @@ Its Lean specification and proofs are in `ai-openshell/cedar-spec`.
   logs. A JSON-RPC request with a non-uppercase method, a hash-only GraphQL
   persisted query, a host with a trailing `.`, and a NUL in a matched string
   admit no owner, since Cedar sees them differently from Rego.
-- In `openshell-supervisor-network`, `PolicyEngine` is either the OPA engine or
-  `CedarOnlyEngine`, and it is the only engine that network decision points
-  receive. A Cedar sandbox builds no OPA engine and evaluates no Rego.
+- `openshell-policy-cedar-runtime` adapts this engine to the shared
+  `PolicyBackend` contract. Supervisor composition constructs it and networking
+  receives an opaque `PolicyEngine` handle. A Cedar sandbox builds no OPA engine and evaluates no Rego.
   `CedarOnlyEngine` owns the policy's `network_middlewares`, the connected
   middleware services, and a middleware generation; middleware is selected in
   Rust with the same code YAML sandboxes use on their Rego data. Inspected
@@ -138,7 +138,7 @@ Its Lean specification and proofs are in `ai-openshell/cedar-spec`.
   `resource.port ==` top-level `when` conjunct, in the shapes policy DNS
   accepts. A glob entry inspects every host it matches, as a YAML wildcard
   endpoint with request rules does. `CedarEngine::l7_endpoints` selects a
-  host's entries with `openshell_core::host_pattern`, the matcher YAML
+  host's entries with `openshell_policy_primitives::host_pattern`, the matcher YAML
   endpoints, endpoint settings, and policy DNS use: the exact entry and every
   glob entry the host matches, whose paths are inspected together (the exact
   entry's declaration of a path takes precedence). Entries that can select

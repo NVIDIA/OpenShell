@@ -828,16 +828,18 @@ mod tests {
     /// generation; a quarantine must stale it as it stales a YAML guard.
     #[test]
     fn cedar_quarantine_invalidates_installed_policy_evidence() {
-        use openshell_supervisor_network::cedar_only::CedarOnlyEngine;
+        use openshell_policy_cedar_runtime::CedarOnlyEngine;
         use openshell_supervisor_network::policy_engine::PolicyEngine;
 
         let tracker = Tracker::new();
         let credentials = ProviderCredentialState::from_child_env_snapshot(6, HashMap::new());
         let policy = openshell_core::proto::SandboxPolicy {
             version: 1,
-            cedar_policy_source: r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
         resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#
-                .to_string(),
+                    .to_string(),
+            }),
             ..Default::default()
         };
         let engine = PolicyEngine::from(Arc::new(CedarOnlyEngine::from_proto(&policy).unwrap()));

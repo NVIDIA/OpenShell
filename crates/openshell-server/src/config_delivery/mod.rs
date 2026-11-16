@@ -1668,10 +1668,12 @@ mod tests {
     async fn reconciliation_withholds_cedar_from_a_session_without_cedar_support() {
         let cedar = openshell_core::proto::SandboxPolicy {
             version: 1,
-            cedar_policy_source: "permit(principal, action == \
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, action == \
                 Sandbox::Action::\"NetworkConnect\", resource == \
                 Sandbox::NetworkEndpoint::\"api.github.com:443\");"
-                .to_string(),
+                    .to_string(),
+            }),
             ..Default::default()
         };
         for supported_capabilities in [
@@ -1713,8 +1715,8 @@ mod tests {
             ) {
                 assert!(snapshot.configuration_admitted);
                 assert_eq!(
-                    snapshot.policy.expect("Cedar policy").cedar_policy_source,
-                    cedar.cedar_policy_source
+                    snapshot.policy.expect("Cedar policy").cedar_source(),
+                    cedar.cedar_source()
                 );
             } else {
                 // Never an empty policy an older supervisor would apply as

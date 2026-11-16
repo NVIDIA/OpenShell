@@ -1108,7 +1108,7 @@ fn endpoint_cond(scope: &mut Scope, endpoint: &ProviderEndpoint) -> Cond {
 }
 
 /// Matches the request path against an endpoint path pattern, as
-/// `openshell_core::endpoint_path::matches` does: empty, `**`, and `/**`
+/// `openshell_policy_primitives::endpoint_path::matches` does: empty, `**`, and `/**`
 /// match every path, `P/**` matches `P` and below, and other patterns are
 /// globs whose `*` also matches `/`.
 fn endpoint_path_cond(scope: &mut Scope, path: &str) -> Cond {

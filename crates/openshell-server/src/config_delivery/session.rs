@@ -2591,10 +2591,12 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         let sandbox_id = "sb-push-cedar";
         let policy = SandboxPolicy {
             version: 1,
-            cedar_policy_source: "permit(principal, action == \
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, action == \
                 Sandbox::Action::\"NetworkConnect\", resource == \
                 Sandbox::NetworkEndpoint::\"api.github.com:443\");"
-                .to_string(),
+                    .to_string(),
+            }),
             ..Default::default()
         };
 
@@ -2605,8 +2607,8 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             capable
                 .policy
                 .expect("Cedar policy delivered")
-                .cedar_policy_source,
-            policy.cedar_policy_source
+                .cedar_source(),
+            policy.cedar_source()
         );
 
         // Never an empty policy an older supervisor would apply as YAML.

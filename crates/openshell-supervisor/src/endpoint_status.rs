@@ -1196,12 +1196,14 @@ mod tests {
     #[test]
     fn cedar_mcp_inventory_uses_configured_wildcard_identity() {
         let policy = SandboxPolicy {
-            cedar_policy_source: r#"
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: r#"
 @protocol("mcp") @path("/mcp/**")
 permit (principal, action == Sandbox::Action::"HttpRequest", resource)
 when { resource.host like("*.example.com", ".") && resource.port == 443 };
 "#
-            .to_string(),
+                .to_string(),
+            }),
             ..Default::default()
         };
         assert_eq!(

@@ -7,32 +7,13 @@ use crate::l7::provider::{L7Provider, L7Request};
 use apollo_parser::Parser;
 use apollo_parser::cst;
 use miette::{Result, miette};
-use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct GraphqlRequestInfo {
-    pub operations: Vec<GraphqlOperationInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct GraphqlOperationInfo {
-    pub operation_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation_name: Option<String>,
-    pub fields: Vec<String>,
-    pub persisted_query: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub persisted_query_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub persisted_query_id: Option<String>,
-}
+pub use openshell_policy_runtime_interface::l7::graphql::*;
 
 pub struct GraphqlHttpRequest {
     pub request: L7Request,
