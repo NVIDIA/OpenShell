@@ -63,5 +63,5 @@ async fn supervisor_session_receives_pushed_configuration(cx: &mut Context) -> R
     .await?;
 
     sandbox.delete().await?;
-    cx.expect_absent(&sandbox).await
+    sandbox.expect_absent().await
 }
