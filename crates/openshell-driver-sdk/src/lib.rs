@@ -26,6 +26,8 @@ pub mod gpu;
 pub mod image;
 #[cfg(feature = "jwt")]
 pub mod jwt;
+#[cfg(feature = "jwt")]
+pub mod launch_credentials;
 pub mod net;
 pub mod network_trust;
 pub mod paths;

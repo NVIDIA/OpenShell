@@ -40,7 +40,10 @@ pub fn binary_path(legacy: &Path) -> PathBuf {
 }
 
 /// A contract document that has a legacy JSON form and a binary protobuf form.
-/// The encoding half is used only by the `write` feature.
+///
+/// The encoding half is used only by the `write` feature. The contract crate
+/// implements it for the runtime descriptor and the boundary configuration;
+/// `openshell-driver-sdk` implements it for the documents it defines.
 #[cfg_attr(not(feature = "write"), allow(dead_code))]
 pub trait Codec: Serialize + DeserializeOwned + Sized {
     /// The name of the legacy file a driver writes this document to.

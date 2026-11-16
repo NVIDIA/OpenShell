@@ -31,6 +31,7 @@ pub mod read;
 #[cfg(feature = "write")]
 pub mod write;
 
+pub use codec::Codec;
 pub use model::*;
 pub use read::validate_resource_claims;
 #[cfg(feature = "write")]

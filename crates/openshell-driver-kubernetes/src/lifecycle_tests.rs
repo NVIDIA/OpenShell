@@ -301,13 +301,13 @@ mod lifecycle_reconciliation {
         let mut create = Box::pin(driver.create_sandbox(&sandbox));
         let mut stop = Box::pin(driver.stop_sandbox("sandbox-1"));
         let mut delete = Box::pin(driver.delete_sandbox("sandbox-1"));
-        let mut start = Box::pin(driver.start_sandbox("sandbox-1", "", &[], ""));
+        let mut start = Box::pin(driver.start_sandbox("sandbox-1", "", LaunchAuthenticationFields::default(), ""));
         assert!(futures::poll!(&mut create).is_pending());
         assert!(futures::poll!(&mut stop).is_pending());
         assert!(futures::poll!(&mut delete).is_pending());
         assert!(futures::poll!(&mut start).is_pending());
         driver
-            .start_sandbox("sandbox-2", "", &[], "")
+            .start_sandbox("sandbox-2", "", LaunchAuthenticationFields::default(), "")
             .await
             .unwrap_err();
         // Cancel queued mutations, then let start obtain the gate. Its normal

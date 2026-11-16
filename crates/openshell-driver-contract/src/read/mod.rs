@@ -31,13 +31,13 @@ pub enum ReadError {
 /// binary file beside it. The result is not validated beyond decoding; the
 /// caller validates it before acting on it.
 pub fn boundary_config(path: &Path) -> Result<BoundaryConfig, ReadError> {
-    read_document(path)
+    document(path)
 }
 
 /// Read the runtime descriptor whose legacy file is `path`, preferring the
 /// binary file beside it.
 pub fn runtime_descriptor(path: &Path) -> Result<SandboxRuntimeDescriptor, ReadError> {
-    read_document(path)
+    document(path)
 }
 
 /// Remove every form of the single-use document whose legacy file is `path`.
@@ -94,7 +94,10 @@ pub fn descriptor_payload(path: &Path, backend_name: &str) -> Result<Vec<u8>, Re
     })
 }
 
-fn read_document<T: Codec>(legacy: &Path) -> Result<T, ReadError> {
+/// Read any document that has a [`Codec`], such as the supervisor authentication
+/// bundle that `openshell-driver-sdk` defines, preferring the binary file beside
+/// the legacy one.
+pub fn document<T: Codec>(legacy: &Path) -> Result<T, ReadError> {
     let preferred = binary_path(legacy);
     match std::fs::read(&preferred) {
         Ok(bytes) => return Ok(T::from_binary(&bytes)?),

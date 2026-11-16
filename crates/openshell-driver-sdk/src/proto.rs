@@ -8,6 +8,9 @@
 //! `openshell-core` compiles the remaining protos and refers to these types by
 //! extern path.
 
+/// Encoded `FileDescriptorSet` of the protos in this module.
+pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(env!("OPENSHELL_DRIVER_SDK_DESCRIPTOR_PATH"));
+
 #[allow(
     clippy::all,
     clippy::pedantic,
