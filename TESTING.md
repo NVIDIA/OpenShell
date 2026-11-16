@@ -341,7 +341,9 @@ hardware-free CDI devices and the host files they reference. The environment
 tells the suite where its scenarios are with `OPENSHELL_TEST_CDI_SCENARIOS`, the
 path of a document that names the device kind, each scenario and the checks it
 expects. Any environment that creates matching devices and sets the variable
-can run the suite. The expectations characterize the sandbox's behavior today,
+can run the suite. A scenario can expect sandbox creation to fail with a given
+report (`rejected`) and can be limited to some compute drivers (`drivers`). The
+expectations characterize the sandbox's behavior today,
 not a specification, and the `echo-socket` check needs `perl` in the workload
 image, which the default image has.
 

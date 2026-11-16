@@ -284,6 +284,7 @@ pub fn bootstrap_archives(
         },
         resource_claims: resource_claims.clone(),
         resource_claim_files: BTreeMap::new(),
+        cdi_context: None,
         workload_identity: identity.clone(),
         provisioning_evidence: provisioning_evidence.clone(),
         child_env: child_env.clone(),

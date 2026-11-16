@@ -302,39 +302,15 @@ fn cdi_nvidia_gpu_suffix(id: &str) -> Option<&str> {
     id.strip_prefix(CDI_NVIDIA_GPU_PREFIX)
 }
 
-// Local equivalent of the upstream CDI parser until its public API is released:
-// https://github.com/cncf-tags/container-device-interface-rs/pull/177
-fn is_qualified_name(device: &str) -> bool {
-    let Some((kind, name)) = device.split_once('=') else {
-        return false;
-    };
-    let Some((vendor, class)) = kind.split_once('/') else {
-        return false;
-    };
-    let valid_component = |value: &str, device_name: bool| {
-        let bytes = value.as_bytes();
-        bytes.first().is_some_and(|byte| {
-            if device_name {
-                byte.is_ascii_alphanumeric()
-            } else {
-                byte.is_ascii_alphabetic()
-            }
-        }) && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-            && bytes.iter().all(|byte| {
-                byte.is_ascii_alphanumeric()
-                    || matches!(byte, b'_' | b'-' | b'.')
-                    || (device_name && *byte == b':')
-            })
-    };
-    valid_component(vendor, false) && valid_component(class, false) && valid_component(name, true)
-}
-
 /// Validate vendor-agnostic CDI qualified names without resolving or authorizing devices.
 ///
 /// # Errors
 /// Returns an error for host paths or malformed `<vendor>/<class>=<name>` selectors.
 pub fn validate_cdi_device_names(devices: &[String], field: &str) -> Result<(), String> {
-    if devices.iter().any(|device| !is_qualified_name(device)) {
+    if devices
+        .iter()
+        .any(|device| !crate::cdi_name::is_qualified_name(device))
+    {
         return Err(format!(
             "{field} must contain CDI qualified names (<vendor>/<class>=<name>)"
         ));

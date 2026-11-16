@@ -1,0 +1,8 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+[openshell]
+version = 2
+
+[openshell.drivers.{{ openshell_gateway_driver }}]
+sandbox_runtime_image = "docker.io/openshell/sandbox:tmachine"
+supervisor_image = "docker.io/openshell/supervisor:tmachine"

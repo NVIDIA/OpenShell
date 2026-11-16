@@ -71,6 +71,22 @@ async fn omitted_access_file(cx: &mut Context) -> testkit::Result {
     cdi::scenario(cx, "omitted-access-file").await
 }
 
+/// An NVIDIA MPS pipe directory mounted with `noexec`, the one writable
+/// directory mount CDI is allowed. The expectations record that its pipes are
+/// usable.
+#[testkit::test]
+async fn mps_pipe_directory(cx: &mut Context) -> testkit::Result {
+    cdi::scenario(cx, "mps-pipe-directory").await
+}
+
+/// The same directory without `noexec`, which is not an MPS pipe directory by
+/// the rules OpenShell accepts. The expectations record that sandbox creation
+/// is rejected.
+#[testkit::test]
+async fn mps_pipe_directory_without_noexec(cx: &mut Context) -> testkit::Result {
+    cdi::scenario(cx, "mps-pipe-directory-without-noexec").await
+}
+
 /// A character device node injected from `/dev/null` with read-write
 /// permissions. The expectations record whether a non-root workload can write
 /// it.
@@ -85,4 +101,19 @@ async fn device_node(cx: &mut Context) -> testkit::Result {
 #[testkit::test]
 async fn unix_socket(cx: &mut Context) -> testkit::Result {
     cdi::scenario(cx, "unix-socket").await
+}
+
+/// A device node readable only through a supplementary group that the spec adds
+/// with `additionalGids`. The expectations record that the non-root workload is
+/// in that group. Docker only: the Podman driver rejects a group added at
+/// runtime by a CDI device (NVIDIA/OpenShell#5305).
+#[testkit::test]
+async fn device_node_with_gid(cx: &mut Context) -> testkit::Result {
+    cdi::scenario_on(
+        cx,
+        "device-node-with-gid",
+        &["docker"],
+        "the Podman driver rejects supplementary groups added by CDI (NVIDIA/OpenShell#5305)",
+    )
+    .await
 }
