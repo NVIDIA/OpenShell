@@ -275,9 +275,6 @@ per family when the `test:e2e` label is set, and a failure fails the Core E2E
 result. Release Dev and Release Qualification run the conformance and feature
 families. To run a suite in another environment on CI, add a row.
 
-CI also runs the conformance family in `ubuntu-docker-rootful-config-push`,
-whose gateway pushes configuration to supervisors.
-
 ### Adding a feature suite
 
 Feature suites live in the `tests/suites/features` workspace, one crate per
