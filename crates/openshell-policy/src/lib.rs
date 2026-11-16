@@ -1447,9 +1447,21 @@ pub fn validate_filesystem_paths(
 /// Return whether `path` designates a filesystem root, such as `/`, `C:\`, `\`,
 /// `\\?\C:\` or `\\server\share`. The check is lexical rather than host-OS based
 /// because the sandbox platform, not the gateway, decides what a path means.
+/// Windows spellings are matched in any mix of separators, because the MXC
+/// driver converts `/` to `\` before it uses a path.
 fn is_filesystem_root(path: &str) -> bool {
-    fn only_root_components(rest: &str) -> bool {
-        rest.split('/').all(|c| c.is_empty() || c == ".")
+    // Win32 drops trailing dots and spaces from a component, so `C:\...` and
+    // `/ ` name a root. Verbatim (`\\?\`) and NT (`\??\`) paths keep every
+    // component as written.
+    fn only_root_components(rest: &str, literal: bool) -> bool {
+        rest.split('/').all(|c| {
+            let c = if literal {
+                c
+            } else {
+                c.trim_end_matches(['.', ' '])
+            };
+            c.is_empty() || c == "."
+        })
     }
     // Skip up to `count` leading names (volume, server or share).
     fn skip_names(mut rest: &str, count: usize) -> &str {
@@ -1461,25 +1473,28 @@ fn is_filesystem_root(path: &str) -> bool {
     }
 
     let normalized = path.replace('\\', "/");
-    if path.starts_with(r"\\") {
-        let rest = &normalized[2..];
-        return match rest.split_once('/') {
-            Some(("?" | ".", tail)) => {
-                let (volume, tail) = tail.split_once('/').unwrap_or((tail, ""));
-                if volume.eq_ignore_ascii_case("UNC") {
-                    only_root_components(skip_names(tail, 2))
-                } else {
-                    only_root_components(tail)
-                }
-            }
-            _ => only_root_components(skip_names(rest, 2)),
+    let namespace = [("//?/", true), ("/??/", true), ("//./", false)]
+        .into_iter()
+        .find_map(|(prefix, literal)| normalized.strip_prefix(prefix).map(|tail| (tail, literal)));
+    if let Some((tail, literal)) = namespace {
+        let (volume, tail) = tail.split_once('/').unwrap_or((tail, ""));
+        return if volume.eq_ignore_ascii_case("UNC") {
+            only_root_components(skip_names(tail, 2), literal)
+        } else {
+            only_root_components(tail, literal)
         };
+    }
+    // Two leading separators start a UNC path when either is a backslash; a
+    // leading `//` keeps its POSIX meaning.
+    if normalized.starts_with("//") && path.as_bytes()[..2].contains(&b'\\') {
+        return only_root_components(skip_names(&normalized[2..], 2), false);
     }
     match normalized.as_bytes() {
         [drive, b':', b'/', ..] if drive.is_ascii_alphabetic() => {
-            only_root_components(&normalized[2..])
+            only_root_components(&normalized[2..], false)
         }
-        [b'/', ..] => only_root_components(&normalized),
+        // On Windows a leading `/` or `\` is the root of the current drive.
+        [b'/', ..] => only_root_components(&normalized, false),
         _ => false,
     }
 }
@@ -3726,8 +3741,40 @@ network_policies:
             r"\\?\C:\work",
             r"\\localhost\C$\work",
             r"\\?\UNC\server\share\work",
+            r"\\?\C:\...",
+            r"\??\C:\ ",
+            "//tmp/x",
+            "/tmp/...",
         ] {
             assert!(!is_filesystem_root(path), "{path} is not a filesystem root");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_windows_root_aliases_as_read_write_path() {
+        for root in [
+            "//?/C:/",
+            r"/\?\C:\",
+            r"\??\C:\",
+            "//./C:/",
+            "C:/...",
+            "C:/ ",
+            "C:/. ",
+            r"\...",
+            "/...",
+            "/ ",
+            r"\\.\C:\...",
+            r"\\server\share\. ",
+            r"/\server\share",
+        ] {
+            let violations = validate_filesystem_paths(&[], &[root.to_string()])
+                .expect_err("root alias read_write path must be rejected");
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+                "{root:?} should be overly broad, got {violations:?}"
+            );
         }
     }
 
