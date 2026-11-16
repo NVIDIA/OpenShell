@@ -26,26 +26,18 @@ impl Error {
         }
     }
 
-    /// A gateway's refusal, keeping its status code for [`Error::grpc_code`].
-    pub fn from_status(status: &tonic::Status) -> Self {
-        Self {
-            code: Some(status.code()),
-            ..Self::from_error(status)
-        }
-    }
-
     /// The gRPC status code, when the gateway refused a request.
     pub fn grpc_code(&self) -> Option<tonic::Code> {
         self.code
     }
 
-    pub fn from_display(error: impl fmt::Display) -> Self {
+    pub(crate) fn from_display(error: impl fmt::Display) -> Self {
         Self::msg(error.to_string())
     }
 
     /// An error with its sources, so a wrapper such as tonic's
     /// "transport error" still says what went wrong underneath.
-    pub fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
+    pub(crate) fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
         let mut message = error.to_string();
         let mut source = error.source();
         while let Some(cause) = source {
@@ -82,6 +74,34 @@ impl From<SdkError> for Error {
             code: error.grpc_status().map(tonic::Status::code),
             ..Self::from_error(&error)
         }
+    }
+}
+
+/// A gateway's refusal, keeping its status code for [`Error::grpc_code`].
+impl From<tonic::Status> for Error {
+    fn from(status: tonic::Status) -> Self {
+        Self {
+            code: Some(status.code()),
+            ..Self::from_error(&status)
+        }
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::from_error(&error)
+    }
+}
+
+impl From<serde_yml::Error> for Error {
+    fn from(error: serde_yml::Error) -> Self {
+        Self::from_error(&error)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::from_error(&error)
     }
 }
 

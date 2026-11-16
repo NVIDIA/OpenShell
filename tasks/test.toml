@@ -27,6 +27,8 @@ depends = [
   "test:cargo-lockfile-alignment",
   "test:review-readiness",
   "test:merge-gateway-toml",
+  "test:accepted-work",
+  "test:label-issue",
 ]
 
 ["test:merge-gateway-toml"]
@@ -106,6 +108,19 @@ hide = true
 ["test:review-readiness"]
 description = "Test PR review readiness and reviewer reconciliation"
 run = "uv run --no-project python -m unittest discover -s tasks/scripts -p check_review_readiness_test.py"
+hide = true
+
+["test:accepted-work"]
+description = "Test the shared accepted-work library"
+run = "uv run --no-project python -m unittest discover -s tasks/scripts -p label_accepted_work_test.py"
+hide = true
+
+["test:label-issue"]
+description = "Test issue labeling and stale closure provenance"
+run = [
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p 'label_issue*_test.py'",
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p stale_closure_test.py",
+]
 hide = true
 
 [e2e]
@@ -205,6 +220,22 @@ run = "e2e/rust/e2e-docker.sh"
 ["e2e:workload:build"]
 description = "Build the Docker E2E workload fixture"
 run = "CONTAINER_ENGINE=docker bash tasks/scripts/e2e-build-workload.sh"
+
+["e2e:middleware-http-hooks"]
+description = "Run the HTTP hooks content-guard middleware example against the current gateway and Docker supervisor"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONTAINER_ENGINE=docker bash tasks/scripts/e2e-build-workload.sh
+TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}/content-guard"
+cargo build --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml \
+  --target-dir "${TARGET_DIR}"
+export OPENSHELL_E2E_CONTENT_GUARD_BIN="${TARGET_DIR}/debug/supervisor-middleware-content-guard"
+export OPENSHELL_E2E_REQUIRE_MIDDLEWARE=1
+exec e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml \
+  --features e2e-docker --test supervisor_middleware_http_hooks -- --nocapture
+"""
 
 ["e2e:websocket-conformance"]
 description = "Run focused WebSocket conformance e2e tests against a Docker-backed gateway"
@@ -349,6 +380,11 @@ description = "Run Kubernetes e2e with operator workspace mode (pre-provisioned 
 env = { OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-workspace-operator.yaml", OPENSHELL_E2E_KUBE_TEST = "workspace_namespace_operator", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes,e2e-kubernetes-workspace-operator" }
 run = "e2e/rust/e2e-kubernetes.sh"
 
+["e2e:kubernetes:tracing"]
+description = "Run Kubernetes e2e with a Jaeger collector and verify it receives gateway and Kubernetes compute-driver spans"
+env = { OPENSHELL_E2E_KUBE_CONFORMANCE = "0", OPENSHELL_E2E_KUBE_JAEGER = "1", OPENSHELL_E2E_KUBE_TEST = "kubernetes_tracing", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes,e2e-kubernetes-tracing" }
+run = "e2e/rust/e2e-kubernetes.sh"
+
 ["e2e:vm"]
 description = "Start openshell-gateway with the VM compute driver and run VM e2e tests"
 run = "e2e/rust/e2e-vm.sh"
@@ -356,11 +392,6 @@ run = "e2e/rust/e2e-vm.sh"
 ["e2e:gateway:no-compute-drivers"]
 description = "Build and launch-check openshell-gateway without compiled compute drivers"
 run = "bash e2e/no-compute-driver-gateway.sh"
-
-["e2e:docker:external-driver"]
-description = "Run Docker conformance with a driver-free gateway and external Docker driver binary"
-env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1", OPENSHELL_E2E_DOCKER_FEATURES = "e2e-conformance-only" }
-run = "e2e/rust/e2e-docker.sh"
 
 ["e2e:podman:external-driver"]
 description = "Run Podman conformance with a driver-free gateway and external Podman driver binary"

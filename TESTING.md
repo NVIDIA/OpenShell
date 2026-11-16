@@ -124,8 +124,7 @@ plugin through its Windows `.cmd` launcher, and installs the matching locked
 ARM64 Rolldown binding when Node itself is ARM64. The helper preserves lockfile
 resolution; it must not upgrade unrelated test dependencies.
 
-`mise run --skip-tools go:ci` retains race detection except on Windows ARM64,
-where Go does not support it. Windows token-file tests explicitly skip POSIX
+Windows token-file tests explicitly skip POSIX
 mode-bit assertions; those skips do not establish Windows ACL protection.
 Use a checkout with LF text files when running Unix-shell fixture checks.
 
@@ -360,6 +359,21 @@ nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful-keycloak --installer deb \
   --family features --package keycloak-provider-refresh
 ```
+
+A suite that needs setup beyond a container engine runs in a feature
+environment, named `<base>-<feature>`, such as `ubuntu-docker-rootful-keycloak`
+or `ubuntu-docker-rootful-cdi`. `features` in `tests/tmachine/config.nix` lists
+each feature's setup playbooks, the inputs they read, and the bases it supports.
+To add one, add an entry there and use the generated environment name in the
+suite's row in `.github/workflows/e2e-suites.yml`. The CDI suite
+(`tests/suites/features/cdi`) runs in `ubuntu-docker-rootful-cdi`, which creates
+hardware-free CDI devices and the host files they reference. The environment
+tells the suite where its scenarios are with `OPENSHELL_TEST_CDI_SCENARIOS`, the
+path of a document that names the device kind, each scenario and the checks it
+expects. Any environment that creates matching devices and sets the variable
+can run the suite. The expectations characterize the sandbox's behavior today,
+not a specification, and the `echo-socket` check needs `perl` in the workload
+image, which the default image has.
 
 ### Python E2E (`e2e/python/`)
 
@@ -839,6 +853,7 @@ Available task variants:
 | `e2e:kubernetes:shared-supervisor` | One-member shared supervisor pool for the gateway's sandboxes (gateway TLS through the port-forward) |
 | `e2e:kubernetes:shared-supervisor-ha` | Two-replica shared supervisor pool behind two gateway replicas on PostgreSQL: kills the member that owns a sandbox and checks the sandbox is adopted, not restarted; crashes and restarts gateways and checks each sandbox's session stays on its supervisor's gateway |
 | `e2e:kubernetes:shared-supervisor-scaling` | One-member shared supervisor pool: scales it to two members and back with `helm upgrade`, checking sandboxes stay running and the removed member hands its sandboxes off |
+| `e2e:kubernetes:tracing` | Deploys a Jaeger collector, exports gateway traces to it, and fails unless Jaeger receives gateway and Kubernetes compute-driver spans for a new sandbox. The only Kubernetes lane that exports traces |
 
 Kubernetes e2e environment variables:
 
@@ -848,6 +863,8 @@ Kubernetes e2e environment variables:
 | `OPENSHELL_E2E_KUBE_TEST` | Scope to a single test (e.g. `smoke`) |
 | `OPENSHELL_E2E_KUBE_EXTRA_VALUES` | Colon-separated additional Helm values files |
 | `OPENSHELL_E2E_KUBE_CHART`, `OPENSHELL_E2E_KUBECONFIG` | Set by the harness for tests that upgrade the release, such as the supervisor pool scaling test: the chart it installed, and the kubeconfig passed as `--kubeconfig` to kubectl and helm. Set them yourself when running such a test directly against an existing release |
+| `OPENSHELL_E2E_KUBE_CONFORMANCE` | `0` skips the conformance suites that otherwise run before the lane's Rust tests |
+| `OPENSHELL_E2E_KUBE_JAEGER` | `1` deploys a Jaeger collector, points gateway OTLP export at it, and sets `OPENSHELL_E2E_JAEGER_QUERY_URL` to its query API. Unset, the gateway exports no traces |
 | `OPENSHELL_E2E_KUBE_TLS` | `1` reaches the gateway over mTLS through the port-forward; pair it with an overlay that keeps gateway TLS on, such as `ci/values-tls-port-forward.yaml` |
 | `OPENSHELL_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
 | `IMAGE_TAG` | Gateway/supervisor image tag (default: `latest` for existing clusters) |
@@ -865,7 +882,7 @@ cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test sync
 Run a single Docker-only test directly with cargo:
 
 ```shell
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test docker_preflight
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test docker_corporate_proxy
 ```
 
 The harness (`e2e/rust/src/harness/`) provides:

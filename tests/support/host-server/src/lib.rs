@@ -15,7 +15,7 @@ mod websocket;
 
 use std::time::Duration;
 
-use testkit::{Error, Result, ResultExt as _};
+use testkit::{Result, ResultExt as _};
 use tokio::net::TcpListener;
 
 pub use http::{HttpRecorder, Request};
@@ -29,11 +29,9 @@ const MAX_REQUEST: usize = 1024 * 1024;
 async fn bind() -> Result<(TcpListener, u16)> {
     let listener = TcpListener::bind(("0.0.0.0", 0))
         .await
-        .map_err(|error| Error::from_error(&error))
         .context("bind a host server")?;
     let port = listener
         .local_addr()
-        .map_err(|error| Error::from_error(&error))
         .context("read the host server's address")?
         .port();
     Ok((listener, port))

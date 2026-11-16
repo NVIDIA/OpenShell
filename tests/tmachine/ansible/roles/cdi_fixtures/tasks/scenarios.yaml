@@ -1,0 +1,215 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Load named CDI scenarios
+  ansible.builtin.include_vars:
+    file: scenarios.yaml
+
+- name: Collect scenario fixtures
+  ansible.builtin.set_fact:
+    cdi_scenario_fixtures: >-
+      {{ cdi_scenario_common_fixtures
+         + (cdi_scenarios | map(attribute='fixtures', default=[]) | flatten) }}
+
+- name: Create the scenario fixture root
+  become: true
+  ansible.builtin.file:
+    path: "{{ cdi_scenario_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create scenario fixture directories
+  become: true
+  ansible.builtin.file:
+    path: "{{ cdi_scenario_dir }}/{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'dir') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Write scenario fixture files
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ cdi_scenario_dir }}/{{ item.path }}"
+    content: "{{ item.content }}"
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'file') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Create scenario fixture named pipes
+  become: true
+  ansible.builtin.command:
+    argv: [mkfifo, "--mode={{ item.mode }}", "{{ cdi_scenario_dir }}/{{ item.path }}"]
+    creates: "{{ cdi_scenario_dir }}/{{ item.path }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'fifo') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Set scenario fixture pipe ownership
+  become: true
+  ansible.builtin.file:
+    path: "{{ cdi_scenario_dir }}/{{ item.path }}"
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'fifo') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+# A service that creates the socket, not a socket unit: on SELinux hosts systemd
+# labels a socket it creates from the policy's default for the path, which
+# denies /var/lib.
+# A process creates a file with its directory's type, so the socket the service
+# creates inherits this one, and does so again on every boot. On SELinux hosts
+# (Fedora) a container cannot stat a socket of the default /usr/local type. The
+# file module ignores the type where SELinux is not enabled.
+- name: Label the socket fixture directory for containers
+  become: true
+  ansible.builtin.file:
+    path: "{{ cdi_scenario_dir }}/socket"
+    state: directory
+    setype: container_file_t
+
+- name: Check for systemd-socket-activate
+  ansible.builtin.stat:
+    path: /usr/bin/systemd-socket-activate
+  register: cdi_socket_activate
+
+- name: Require systemd-socket-activate for the socket fixture
+  ansible.builtin.assert:
+    that: [cdi_socket_activate.stat.exists]
+    fail_msg: systemd-socket-activate is not installed; the socket fixture needs it
+
+- name: Install the socket fixture unit
+  become: true
+  ansible.builtin.template:
+    src: openshell-cdi-echo.service.j2
+    dest: /etc/systemd/system/openshell-cdi-echo.service
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Start the persistent socket fixture
+  block:
+    - name: Start the socket fixture service
+      become: true
+      ansible.builtin.systemd_service:
+        name: openshell-cdi-echo.service
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+    - name: Wait for the socket fixture
+      become: true
+      ansible.builtin.wait_for:
+        path: "{{ cdi_scenario_dir }}/socket/echo.sock"
+        state: present
+        timeout: 15
+
+    # Connect as an unprivileged user, as a sandbox workload would. A fixture
+    # that exists but does not echo would otherwise pass the scenario, which
+    # only checks the socket's file type.
+    - name: Check that the socket fixture echoes
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+          - -c
+          - |
+            import socket, sys
+            payload = b"openshell-cdi-echo\n"
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(5)
+            s.connect(sys.argv[1])
+            s.sendall(payload)
+            s.shutdown(socket.SHUT_WR)
+            data = b""
+            while True:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+            sys.exit(0 if data == payload else 1)
+          - "{{ cdi_scenario_dir }}/socket/echo.sock"
+      changed_when: false
+
+  rescue:
+    - name: Collect socket fixture diagnostics
+      become: true
+      ansible.builtin.shell: |
+        systemctl status openshell-cdi-echo.service --no-pager -l
+        journalctl -u openshell-cdi-echo.service --no-pager -n 40
+        ls -lZd {{ cdi_scenario_dir }}/socket
+        (ausearch -m avc,user_avc -ts recent 2>&1 || true) | tail -20
+      changed_when: false
+      failed_when: false
+      register: cdi_socket_diagnostics
+
+    - name: Report why the socket fixture did not start
+      ansible.builtin.fail:
+        msg: "openshell-cdi-echo.service did not start:\n{{ cdi_socket_diagnostics.stdout }}\n{{ cdi_socket_diagnostics.stderr }}"
+
+# The device-node scenario injects /dev/tmachine-cdi-null, a copy of /dev/null,
+# from a host node at the same path. A rootless runtime cannot create nodes, so
+# it bind-mounts the host node, and the container sees the host node's SELinux
+# type: it needs the type of /dev/null, which containers may use. /dev is
+# recreated on every boot, so a service creates and labels the node each time.
+# The label is ignored where SELinux is not enabled.
+- name: Install the host device node unit
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/openshell-cdi-device.service
+    content: |
+      [Unit]
+      Description=OpenShell tmachine CDI host device node fixture
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/rm -f /dev/tmachine-cdi-null
+      ExecStart=/usr/bin/mknod --mode=0666 /dev/tmachine-cdi-null c 1 3
+      ExecStart=-/usr/bin/chcon --type=null_device_t /dev/tmachine-cdi-null
+
+      [Install]
+      WantedBy=multi-user.target
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Create the host device node
+  become: true
+  ansible.builtin.systemd_service:
+    name: openshell-cdi-device.service
+    daemon_reload: true
+    enabled: true
+    state: restarted
+
+- name: Generate named CDI scenario devices
+  become: true
+  ansible.builtin.template:
+    src: scenarios.yaml.j2
+    dest: "{{ cdi_spec_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Publish scenario expectations for the CDI feature tests
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ cdi_fixture_root }}/scenarios.json"
+    content: >-
+      {{ {'kind': cdi_device_kind,
+          'common_checks': cdi_scenario_common_checks,
+          'scenarios': cdi_scenarios | items2dict(key_name='name', value_name='expect')}
+         | to_nice_json }}
+    owner: root
+    group: root
+    mode: "0644"

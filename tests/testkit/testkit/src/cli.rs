@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{Error, Result, ResultExt};
 use crate::gateway::{ENDPOINT_ENV, GATEWAY_ENV, Gateway, WORKSPACE_ENV};
+use crate::output::Outcome;
 
 /// How long one CLI invocation may take.
 pub const CLI_TIMEOUT: Duration = Duration::from_mins(5);
@@ -136,7 +137,6 @@ impl Cli {
             .await
             .map_err(|_| Error::msg(format!("timed out after {CLI_TIMEOUT:?}")))
             .context(format!("run {command}"))?
-            .map_err(|error| Error::from_error(&error))
             .context(format!("run {command}"))?;
         Ok(CliOutput {
             command,
@@ -148,35 +148,54 @@ impl Cli {
     }
 }
 
+/// The characters the CLI's error reports draw around wrapped lines: the
+/// gutter, the error marker, and the box corners.
+const REPORT_GUTTER: [char; 6] = ['│', '×', '╰', '─', '╭', '├'];
+
 impl CliOutput {
     /// Fail unless the command exited 0.
     pub fn success(self) -> Result<Self> {
-        crate::ensure!(
-            self.exit_code == 0,
-            "`{}` exited with {}; stderr: {}",
-            self.command,
-            self.exit_code,
-            self.stderr.trim()
-        );
+        self.check(|outcome| outcome.success())?;
         Ok(self)
     }
 
     /// Fail unless the command exited non-zero, e.g. when a request must be
     /// rejected.
     pub fn failure(self) -> Result<Self> {
-        crate::ensure!(
-            self.exit_code != 0,
-            "`{}` succeeded but was expected to fail; stdout: {}",
-            self.command,
-            self.stdout.trim()
-        );
+        self.check(|outcome| outcome.failure())?;
         Ok(self)
+    }
+
+    /// Fail unless the command exited 0 and printed exactly `expected`.
+    pub fn expect_stdout(self, expected: &str) -> Result<Self> {
+        self.check(|outcome| outcome.stdout_is(expected))?;
+        Ok(self)
+    }
+
+    fn check(&self, check: impl FnOnce(&Outcome<'_>) -> Result) -> Result {
+        let what = format!("`{}`", self.command);
+        check(&Outcome {
+            what: &what,
+            exit_code: self.exit_code,
+            stdout: &self.stdout,
+            stderr: &self.stderr,
+        })
+    }
+
+    /// Stdout and stderr as one line of words, for matching an error report.
+    /// The CLI wraps reports to the terminal width and draws a gutter, so
+    /// match against this rather than the raw output.
+    pub fn report_text(&self) -> String {
+        format!("{} {}", self.stdout, self.stderr)
+            .replace(REPORT_GUTTER, " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Parse stdout as JSON, from a command run with `--output json`.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
         serde_json::from_str(&self.stdout)
-            .map_err(|error| Error::from_error(&error))
             .context(format!("parse JSON output of `{}`", self.command))
     }
 }

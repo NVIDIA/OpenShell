@@ -126,16 +126,7 @@ spec:
         {{- end }}
         # Most gateway settings live in the ConfigMap-backed TOML file
         # mounted at /etc/openshell/gateway.toml. Secret-bearing settings use
-        # env vars that the TOML references by name. Some process-level
-        # settings consumed by libraries outside gateway code also remain here.
-        {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
-        # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
-        # outbound TLS verification. This is a process-level env var
-        # consumed by the TLS stack itself, not by gateway code, so it
-        # cannot be represented in the gateway TOML schema.
-        - name: SSL_CERT_FILE
-          value: /etc/openshell-tls/oidc-ca/ca.crt
-        {{- end }}
+        # env vars that the TOML references by name.
         # The gateway stages normalized, content-addressed supervisor trust
         # artifacts under its XDG state directory. Keep that state on a
         # dedicated writable volume for both StatefulSet and Deployment modes.

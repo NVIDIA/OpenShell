@@ -13,10 +13,8 @@ impl YamlFile {
         let file = tempfile::Builder::new()
             .suffix(".yaml")
             .tempfile()
-            .map_err(|error| Error::from_error(&error))
             .context("create a temporary YAML file")?;
         std::fs::write(file.path(), contents)
-            .map_err(|error| Error::from_error(&error))
             .context(format!("write {}", file.path().display()))?;
         Ok(Self(file))
     }
