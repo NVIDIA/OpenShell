@@ -1397,9 +1397,9 @@ where
                 return Ok(status_response(status));
             }
 
-            req.extensions_mut().insert(principal);
+            req.extensions_mut().insert(principal.clone());
             let call = inner.ready().await?.call(req);
-            audit::with_request(path, origin, call).await
+            audit::with_audited_request(path, origin, &principal, call).await
         })
     }
 }
@@ -4376,6 +4376,361 @@ mod tests {
                 serde_json::json!([{"uid": "sandbox-b", "type": "sandbox"}])
             );
             assert_boundary_finding(&events[0], &events[1]);
+        }
+
+        /// Answers every request with `code`.
+        #[derive(Clone)]
+        struct StatusHandler(tonic::Code);
+
+        impl<B: Send + 'static> Service<Request<B>> for StatusHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                let code = self.0;
+                Box::pin(async move { Ok(tonic::Status::new(code, "refused").into_http()) })
+            }
+        }
+
+        /// Never answers, as a handler would when its client disconnects
+        /// first.
+        #[derive(Clone)]
+        struct PendingHandler;
+
+        impl<B: Send + 'static> Service<Request<B>> for PendingHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        /// Answers with headers and then a body that sends a data frame and
+        /// ends with `code` in its trailers, or never ends when `code` is
+        /// `None`, as a streaming handler does.
+        #[derive(Clone)]
+        struct StreamHandler(Option<tonic::Code>);
+
+        impl<B: Send + 'static> Service<Request<B>> for StreamHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                use http_body::Frame;
+                use http_body_util::StreamBody;
+                let body = self.0.map_or_else(
+                    || {
+                        tonic::body::Body::new(StreamBody::new(tokio_stream::pending::<
+                            Result<Frame<Bytes>, Infallible>,
+                        >()))
+                    },
+                    |code| {
+                        let mut trailers = http::HeaderMap::new();
+                        trailers.insert("grpc-status", (code as i32).into());
+                        tonic::body::Body::new(StreamBody::new(tokio_stream::iter([
+                            Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"frame"))),
+                            Ok(Frame::trailers(trailers)),
+                        ])))
+                    },
+                );
+                Box::pin(async move { Ok(Response::new(body)) })
+            }
+        }
+
+        /// Refuses the caller as a non-member of a workspace, as a handler
+        /// checking workspace membership would.
+        #[derive(Clone)]
+        struct WorkspaceDenialHandler;
+
+        impl<B: Send + 'static> Service<Request<B>> for WorkspaceDenialHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: Request<B>) -> Self::Future {
+                let principal = req.extensions().get::<Principal>().cloned().unwrap();
+                Box::pin(async move {
+                    let status = audit::deny(
+                        &principal,
+                        AuthzDenial::NotWorkspaceMember {
+                            workspace: "team-a",
+                        },
+                        "not a member",
+                    );
+                    Ok(status.into_http())
+                })
+            }
+        }
+
+        fn user_router<S>(inner: S) -> AuthGrpcRouter<S> {
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(user("alice")),
+            )))]);
+            AuthGrpcRouter::new(inner, Some(chain), None).with_connection_source(peer())
+        }
+
+        fn request_with_id(path: &str) -> Request<Full<Bytes>> {
+            Request::builder()
+                .uri(path)
+                .header("x-request-id", REQUEST_ID)
+                .body(Full::new(Bytes::new()))
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn user_mutation_emits_one_api_activity_record() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let (recorder, _) = PrincipalRecorder::new();
+
+            user_router(recorder)
+                .call(request_with_id("/openshell.v1.OpenShell/DeleteSandbox"))
+                .await
+                .unwrap();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            let event = &events[0];
+            assert_mutation(event, "DeleteSandbox", 4);
+            assert_eq!(event["status_id"], 1, "{event}");
+            assert_eq!(event["severity_id"], 1, "{event}");
+            assert_eq!(
+                event["actor"],
+                serde_json::json!({"user": {"uid": "alice", "type_id": 1, "type": "User"}})
+            );
+            assert_eq!(event["src_endpoint"]["ip"], PEER_IP, "{event}");
+            assert_eq!(event["metadata"]["correlation_uid"], REQUEST_ID, "{event}");
+        }
+
+        #[tokio::test]
+        async fn operator_mutation_names_the_operator() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let mut router = AuthGrpcRouter::with_peer_identity(
+                PrincipalRecorder::new().0,
+                None,
+                None,
+                Some(operator_principal().identity),
+                false,
+                false,
+            )
+            .with_operator(Some(operator_principal()));
+
+            router
+                .call(empty_request("/openshell.v1.OpenShell/CreateProvider"))
+                .await
+                .unwrap();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_mutation(&events[0], "CreateProvider", 1);
+            assert_eq!(
+                events[0]["actor"],
+                serde_json::json!({"user": {"uid": "operator", "type_id": 2, "type": "Admin"}})
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_mutation_records_the_grpc_code() {
+            for (code, detail, severity_id) in [
+                (tonic::Code::InvalidArgument, "rejected:invalid_argument", 2),
+                (tonic::Code::NotFound, "rejected:not_found", 2),
+                (
+                    tonic::Code::FailedPrecondition,
+                    "rejected:failed_precondition",
+                    2,
+                ),
+                (tonic::Code::Internal, "error:internal", 3),
+                (tonic::Code::Unavailable, "error:unavailable", 3),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+
+                user_router(StatusHandler(code))
+                    .call(request_with_id("/openshell.v1.OpenShell/UpdateProvider"))
+                    .await
+                    .unwrap();
+
+                let events = authorization_events(&capture);
+                assert_eq!(events.len(), 1, "{code:?}: {events:?}");
+                let event = &events[0];
+                assert_mutation(event, "UpdateProvider", 3);
+                assert_eq!(event["status_id"], 2, "{event}");
+                assert_eq!(event["status_detail"], detail, "{event}");
+                assert_eq!(event["severity_id"], severity_id, "{event}");
+            }
+        }
+
+        #[tokio::test]
+        async fn cancelled_mutation_records_an_unknown_outcome() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+
+            let mut router = user_router(PendingHandler);
+            let call = router.call(request_with_id("/openshell.v1.OpenShell/CreateWorkspace"));
+            tokio::time::timeout(Duration::from_millis(10), call)
+                .await
+                .unwrap_err();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            let event = &events[0];
+            assert_mutation(event, "CreateWorkspace", 1);
+            assert_eq!(event["status_id"], 0, "{event}");
+            assert_eq!(event["status_detail"], "unknown:cancelled", "{event}");
+            assert_eq!(event["severity_id"], 3, "{event}");
+        }
+
+        #[tokio::test]
+        async fn streamed_mutation_records_the_status_its_stream_ends_with() {
+            use http_body_util::BodyExt;
+            for (code, status_id, detail) in [
+                (tonic::Code::Ok, 1, None),
+                (tonic::Code::Unavailable, 2, Some("error:unavailable")),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+
+                let res = user_router(StreamHandler(Some(code)))
+                    .call(request_with_id("/openshell.v1.OpenShell/ExecSandbox"))
+                    .await
+                    .unwrap();
+                assert!(authorization_events(&capture).is_empty());
+                res.into_body().collect().await.unwrap();
+
+                let events = authorization_events(&capture);
+                assert_eq!(events.len(), 1, "{events:?}");
+                let event = &events[0];
+                assert_mutation(event, "ExecSandbox", 99);
+                assert_eq!(event["status_id"], status_id, "{event}");
+                assert_eq!(
+                    event.get("status_detail").and_then(|d| d.as_str()),
+                    detail,
+                    "{event}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn dropped_stream_records_an_unknown_outcome() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+
+            let res = user_router(StreamHandler(None))
+                .call(request_with_id("/openshell.v1.OpenShell/ForwardTcp"))
+                .await
+                .unwrap();
+            drop(res);
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            let event = &events[0];
+            assert_mutation(event, "ForwardTcp", 99);
+            assert_eq!(event["status_id"], 0, "{event}");
+            assert_eq!(event["status_detail"], "unknown:cancelled", "{event}");
+        }
+
+        #[tokio::test]
+        async fn handler_denial_is_the_only_record_of_a_mutation() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+
+            let res = user_router(WorkspaceDenialHandler)
+                .call(request_with_id("/openshell.v1.OpenShell/DeleteProvider"))
+                .await
+                .unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authorization_denial(&events[0], "DeleteProvider", "not_workspace_member");
+            assert_eq!(events[0]["activity_id"], 4, "{}", events[0]);
+        }
+
+        #[tokio::test]
+        async fn router_denial_of_a_mutation_names_its_activity() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(user("alice")),
+            )))]);
+            let policy = AuthzPolicy {
+                admin_role: "openshell-admin".to_string(),
+                user_role: "openshell-user".to_string(),
+                scopes_enabled: false,
+            };
+            let mut router =
+                AuthGrpcRouter::new(PrincipalRecorder::new().0, Some(chain), Some(policy));
+
+            router
+                .call(empty_request("/openshell.v1.OpenShell/CreateSandbox"))
+                .await
+                .unwrap();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authorization_denial(&events[0], "CreateSandbox", "missing_role");
+            assert_eq!(events[0]["activity_id"], 1, "{}", events[0]);
+        }
+
+        #[tokio::test]
+        async fn sandbox_principal_and_read_calls_are_not_recorded() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
+            )))]);
+            let mut sandbox_router =
+                AuthGrpcRouter::new(PrincipalRecorder::new().0, Some(chain), None);
+
+            sandbox_router
+                .call(empty_request("/openshell.v1.OpenShell/UpdateConfig"))
+                .await
+                .unwrap();
+            user_router(PrincipalRecorder::new().0)
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+
+            assert!(authorization_events(&capture).is_empty());
+        }
+
+        /// Assert that `event` is a gateway mutation record for `operation`.
+        fn assert_mutation(event: &serde_json::Value, operation: &str, activity_id: u8) {
+            openshell_ocsf_validate::validate_event(event)
+                .unwrap_or_else(|e| panic!("{e}\n{event}"));
+            assert_eq!(event["class_uid"], 6003, "{event}");
+            assert_eq!(event["activity_id"], activity_id, "{event}");
+            assert_eq!(event["api"]["operation"], operation, "{event}");
+            assert_eq!(
+                event["api"]["service"]["name"], "openshell.v1.OpenShell",
+                "{event}"
+            );
+            assert_eq!(
+                event["http_request"]["url"]["path"],
+                format!("/openshell.v1.OpenShell/{operation}"),
+                "{event}"
+            );
         }
 
         #[tokio::test]

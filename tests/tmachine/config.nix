@@ -208,6 +208,23 @@ let
         };
       }
       {
+        # The deb installer, with the Docker compute driver run as an external service,
+        # built from the same revision as the gateway.
+        name = "deb-external-docker-driver";
+        use_galaxy = false;
+        playbooks = [
+          "ansible/playbooks/openshell-deb.yaml"
+        ];
+        inputs = {
+          openshell_deb = "../../artifacts/packages/openshell.deb";
+          openshell_e2e_python_image = e2ePythonImage;
+          openshell_external_driver_binary = "../../artifacts/external-drivers/${gnuTarget}/openshell-driver-docker";
+          openshell_external_driver_name = "external";
+          openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
+        };
+      }
+      {
         name = "rpm";
         use_galaxy = false;
         playbooks = [ "ansible/playbooks/openshell-rpm.yaml" ];

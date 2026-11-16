@@ -418,6 +418,8 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run ci`        | Full local CI checks (lint, compile/type checks, tests) |
 | `mise run docs`      | Validate Fern docs locally                              |
 | `mise run helm:docs` | Regenerate the Helm chart README                        |
+| `mise run monitoring:generate` | Render OpenShell Grafana dashboards           |
+| `mise run monitoring:check` | Check and render the monitoring mixin            |
 | `mise run clean`     | Clean build artifacts                                   |
 
 ## Project Structure
@@ -505,7 +507,7 @@ Authors with `WRITE`, `MAINTAIN`, or `ADMIN` access may open a PR that only fixe
 
 ### Automatic Acceptance Labeling
 
-The existing [review-readiness workflow](.github/workflows/review-readiness.yml) checks [accepted work](#accepted-work) when a PR is opened and adds `state:accepted` if it qualifies. This includes drafts and PRs awaiting area/topic classification. Reviewer requests still wait until a PR is ready and has an area label.
+The existing [review-readiness workflow](.github/workflows/review-readiness.yml) checks [accepted work](#accepted-work) when a PR is opened and adds `state:accepted` if it qualifies. The label event's `intent.rationale` contains JSON with `schema: openshell-acceptance-v1` and a `basis`: `maintainer`, `repository_permission` (with `permission`), or `accepted_issue` (with issue number and author/assignee `relationship`). This includes drafts and PRs awaiting area/topic classification. Reviewer requests still wait until a PR is ready and has an area label.
 
 This is an additive check at creation, not continuous reconciliation: later edits, permission changes, and issue-label or assignment changes do not refresh or remove the PR label. The shared library is read-only; review-readiness applies the label. The label does not replace the issue-acceptance gate or merge approvals.
 

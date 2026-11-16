@@ -818,18 +818,9 @@ impl Drop for GatewayProxyConfig {
 }
 
 /// Skip unless this run owns a Docker gateway it can reconfigure.
-///
-/// The external-driver lane launches `openshell-driver-docker` from the shell
-/// wrapper rather than from the gateway, so gateway config changes never reach
-/// the driver and the test would assert against a driver that has no proxy
-/// settings at all.
 fn should_run(label: &str) -> bool {
     if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("docker") {
         eprintln!("Skipping {label}: e2e driver is not docker");
-        return false;
-    }
-    if std::env::var("OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER").as_deref() == Ok("1") {
-        eprintln!("Skipping {label}: the external Docker driver is not configured by the gateway");
         return false;
     }
     match ManagedGateway::from_env() {

@@ -505,6 +505,8 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// `Sandbox` embeds `SandboxCommands`, which is intentionally large.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     // ===================================================================
     // SANDBOX COMMANDS
@@ -1578,6 +1580,11 @@ enum SandboxCommands {
             default_value = "never"
         )]
         restart_policy: String,
+
+        /// Seconds to wait without provisioning progress before giving up
+        /// (default: 300, or `OPENSHELL_PROVISION_TIMEOUT`).
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<std::num::NonZeroU32>,
 
         /// Auto-create missing providers from local credentials.
         ///
@@ -3416,6 +3423,7 @@ async fn run_async() -> Result<()> {
                     no_tty,
                     detach,
                     restart_policy,
+                    timeout,
                     auto_providers,
                     no_auto_providers,
                     labels,
@@ -3511,6 +3519,7 @@ async fn run_async() -> Result<()> {
                             detach,
                             suppress_credential_warnings: no_credential_warnings,
                             restart_policy: &restart_policy,
+                            provision_timeout_secs: timeout.map(std::num::NonZeroU32::get),
                         },
                         &cli.workspace,
                         &tls,
@@ -6371,6 +6380,20 @@ mod tests {
             }) => assert_eq!(restart_policy, "on-failure"),
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_create_timeout_parses() {
+        let cli =
+            Cli::try_parse_from(["openshell", "sandbox", "create", "--timeout", "900"]).unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { timeout, .. }),
+                ..
+            }) => assert_eq!(timeout, std::num::NonZeroU32::new(900)),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["openshell", "sandbox", "create", "--timeout", "0"]).is_err());
     }
 
     #[test]

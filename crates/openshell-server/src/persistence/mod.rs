@@ -6,6 +6,7 @@
 mod image_activation;
 mod legacy_time_wire;
 pub mod lock_order;
+mod mutation_admission;
 pub mod mutation_lock;
 mod postgres;
 #[cfg(test)]
@@ -16,6 +17,7 @@ mod sqlite;
 pub use crate::storage_proto::{
     StoredDraftChunk as DraftChunkRecord, StoredPolicyRevision as PolicyRecord,
 };
+pub use mutation_admission::ADMISSION_OBJECT_TYPE as MUTATION_ADMISSION_OBJECT_TYPE;
 
 use openshell_core::{Error as CoreError, Result as CoreResult};
 use prost::Message;
@@ -769,6 +771,61 @@ impl Store {
             labels,
             max_count
         ))
+    }
+
+    /// Insert a durable mutation admission unless its caller bucket already
+    /// holds `limit` admissions. Returns `Ok(None)` when the bucket is full.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.create_mutation_admission", otel.status_code = tracing::field::Empty, object.id = %id, workspace = %bucket, max_count = limit)
+    )]
+    pub async fn create_mutation_admission(
+        &self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        limit: u32,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        store_dispatch_traced!(self.create_mutation_admission(id, name, bucket, payload, limit))
+    }
+
+    /// List completed mutation admissions last written at or before
+    /// `cutoff_ms`, oldest first, optionally for one bucket. Admissions are
+    /// rewritten only once, on completion, so `resource_version > 1` marks them
+    /// for every gateway version.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.list_completed_mutation_admissions", otel.status_code = tracing::field::Empty, limit = limit)
+    )]
+    pub async fn list_completed_mutation_admissions(
+        &self,
+        bucket: Option<&str>,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> PersistenceResult<Vec<mutation_admission::CompletedAdmission>> {
+        store_dispatch_traced!(self.list_completed_mutation_admissions(bucket, cutoff_ms, limit))
+    }
+
+    /// Delete mutation admissions by id and mark their buckets for recount.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.delete_mutation_admissions", otel.status_code = tracing::field::Empty, object_count = ids.len())
+    )]
+    pub async fn delete_mutation_admissions(&self, ids: &[String]) -> PersistenceResult<u64> {
+        store_dispatch_traced!(self.delete_mutation_admissions(ids))
+    }
+
+    /// Backdate an object's last write to exercise expiry.
+    #[cfg(test)]
+    pub async fn backdate(&self, id: &str, updated_at_ms: i64) -> PersistenceResult<()> {
+        store_dispatch!(self.backdate(id, updated_at_ms))
     }
 
     /// Fetch an object by id.

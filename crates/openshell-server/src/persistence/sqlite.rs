@@ -36,6 +36,10 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
 }
 static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+use super::mutation_admission::{
+    self, ADMISSION_OBJECT_TYPE, AdmissionTx, COUNTER_OBJECT_TYPE, CompletedAdmission, Counter,
+    RECOUNT_STATUS, counter_id,
+};
 use super::{
     DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, EXISTING_IDS_BATCH_SIZE, POLICY_OBJECT_TYPE,
 };
@@ -798,6 +802,118 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         }))
+    }
+
+    pub async fn create_mutation_admission(
+        &self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        limit: u32,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        let tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        mutation_admission::admit(SqliteAdmission(tx), id, name, bucket, payload, limit).await
+    }
+
+    pub async fn list_completed_mutation_admissions(
+        &self,
+        bucket: Option<&str>,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> PersistenceResult<Vec<CompletedAdmission>> {
+        // The object type is a literal so the planner can use the partial indexes
+        // from migration 010, whose predicate it must match exactly.
+        let rows: Vec<(String, Vec<u8>)> = match bucket {
+            None => {
+                sqlx::query_as(
+                    "SELECT id, payload FROM objects
+WHERE object_type = 'mutation_admission_v1' AND resource_version > 1 AND updated_at_ms <= ?1
+ORDER BY updated_at_ms LIMIT ?2",
+                )
+                .bind(cutoff_ms)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+            }
+            Some(bucket) => {
+                sqlx::query_as(
+                    "SELECT id, payload FROM objects
+WHERE object_type = 'mutation_admission_v1' AND resource_version > 1 AND workspace = ?1
+  AND updated_at_ms <= ?2
+ORDER BY updated_at_ms LIMIT ?3",
+                )
+                .bind(bucket)
+                .bind(cutoff_ms)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| map_db_error(&e))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, payload)| CompletedAdmission { id, payload })
+            .collect())
+    }
+
+    pub async fn delete_mutation_admissions(&self, ids: &[String]) -> PersistenceResult<u64> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        let mut deleted = 0_u64;
+        for ids in ids.chunks(DELETE_MANY_BATCH_SIZE) {
+            let mut mark = QueryBuilder::<Sqlite>::new("UPDATE objects SET status = ");
+            mark.push_bind(RECOUNT_STATUS)
+                .push(" WHERE object_type = ")
+                .push_bind(COUNTER_OBJECT_TYPE)
+                .push(" AND workspace IN (SELECT workspace FROM objects WHERE object_type = ")
+                .push_bind(ADMISSION_OBJECT_TYPE)
+                .push(" AND id IN (");
+            let mut separated = mark.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated("))");
+            mark.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+            let mut delete =
+                QueryBuilder::<Sqlite>::new("DELETE FROM objects WHERE object_type = ");
+            delete.push_bind(ADMISSION_OBJECT_TYPE).push(" AND id IN (");
+            let mut separated = delete.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            deleted += delete
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?
+                .rows_affected();
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(deleted)
+    }
+
+    #[cfg(test)]
+    pub async fn backdate(&self, id: &str, updated_at_ms: i64) -> PersistenceResult<()> {
+        sqlx::query("UPDATE objects SET updated_at_ms = ?1 WHERE id = ?2")
+            .bind(updated_at_ms)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(())
     }
 
     pub async fn get(
@@ -2105,6 +2221,86 @@ fn write_result_from_row(row: &sqlx::sqlite::SqliteRow) -> WriteResult {
 fn row_resource_version(row: &sqlx::sqlite::SqliteRow) -> u64 {
     let resource_version: i64 = row.try_get("resource_version").unwrap_or(1);
     resource_version.max(1).cast_unsigned()
+}
+
+struct SqliteAdmission(sqlx::Transaction<'static, Sqlite>);
+
+impl AdmissionTx for SqliteAdmission {
+    async fn counter(&mut self, bucket: &str) -> PersistenceResult<Option<Counter>> {
+        let row: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+            "SELECT hit_count, status, updated_at_ms FROM objects WHERE object_type = ?1 AND id = ?2",
+        )
+        .bind(COUNTER_OBJECT_TYPE)
+        .bind(counter_id(bucket))
+        .fetch_optional(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(row.map(|(count, status, updated_at_ms)| Counter {
+            count,
+            recount: status.is_some(),
+            updated_at_ms,
+        }))
+    }
+
+    async fn count(&mut self, bucket: &str) -> PersistenceResult<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE object_type = ?1 AND workspace = ?2")
+            .bind(ADMISSION_OBJECT_TYPE)
+            .bind(bucket)
+            .fetch_one(&mut *self.0)
+            .await
+            .map_err(|e| map_db_error(&e))
+    }
+
+    async fn insert(
+        &mut self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        now_ms: i64,
+    ) -> PersistenceResult<()> {
+        sqlx::query(
+            "INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, '{}', 1)",
+        )
+        .bind(ADMISSION_OBJECT_TYPE)
+        .bind(id)
+        .bind(name)
+        .bind(bucket)
+        .bind(payload)
+        .bind(now_ms)
+        .execute(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    async fn put_counter(
+        &mut self,
+        bucket: &str,
+        counter: &Counter,
+        now_ms: i64,
+    ) -> PersistenceResult<()> {
+        sqlx::query(
+            "INSERT INTO objects (object_type, id, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version, hit_count, status)
+VALUES (?1, ?2, ?3, X'', ?4, ?4, '{}', 1, ?5, ?6)
+ON CONFLICT (id) DO UPDATE SET hit_count = excluded.hit_count, status = excluded.status, updated_at_ms = excluded.updated_at_ms",
+        )
+        .bind(COUNTER_OBJECT_TYPE)
+        .bind(counter_id(bucket))
+        .bind(bucket)
+        .bind(now_ms)
+        .bind(counter.count)
+        .bind(counter.recount.then_some(RECOUNT_STATUS))
+        .execute(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    async fn commit(self) -> PersistenceResult<()> {
+        self.0.commit().await.map_err(|e| map_db_error(&e))
+    }
 }
 
 fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
