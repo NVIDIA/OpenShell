@@ -76,4 +76,46 @@ try {
     Get-ChildItem -LiteralPath $cacheFixture -Directory -Recurse | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { Remove-Item -LiteralPath $_.FullName }
     Remove-Item -LiteralPath $cacheFixture
 }
+# Graceful-stop decision used by the gateway-restart E2E scenario (pure function).
+$e2eRunner = Join-Path $PSScriptRoot '../../crates/openshell-driver-mxc/examples/run-mxc-e2e.ps1'
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($e2eRunner, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw ($errors | Out-String) }
+foreach ($function in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    if ($function.Name -eq 'Get-GracefulStopFailure') { Invoke-Expression $function.Extent.Text }
+}
+if (-not (Get-Command Get-GracefulStopFailure -ErrorAction SilentlyContinue)) { throw 'Get-GracefulStopFailure not found in the E2E runner.' }
+if ($null -ne (Get-GracefulStopFailure 0 $true)) { throw 'Clean graceful stop rejected.' }
+$count++
+if ((Get-GracefulStopFailure 1 $true) -notmatch 'code 1') { throw 'Nonzero exit after the shutdown message accepted.' }
+$count++
+if ((Get-GracefulStopFailure -1073741510 $true) -notmatch 'code -1073741510') { throw 'Ctrl-C default-handler exit (0xC000013A) accepted as graceful.' }
+$count++
+if (-not (Get-GracefulStopFailure 0 $false)) { throw 'Exit 0 without the shutdown message accepted.' }
+$count++
+if ((Get-GracefulStopFailure $null $true) -notmatch 'unavailable') { throw 'Missing exit code accepted.' }
+$count++
+if ((Get-GracefulStopFailure 1 $false) -notmatch 'code 1') { throw 'Nonzero exit must be reported before the missing log line.' }
+$count++
+# The decision only protects the scenario if it is consulted after Ctrl-C, fails the
+# scenario, and does so before the replacement gateway is started. Check that order
+# in the runner's syntax tree so moving or dropping the call fails here.
+function Get-CommandOffsets($Root, [string] $Name) {
+    return @($Root.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq $Name }, $true) |
+        ForEach-Object { $_.Extent.StartOffset })
+}
+$ctrlC = @(Get-CommandOffsets $ast 'Send-CtrlC')
+$checks = @(Get-CommandOffsets $ast 'Get-GracefulStopFailure')
+$starts = @(Get-CommandOffsets $ast 'Start-Gw')
+if ($ctrlC.Count -ne 1) { throw 'Expected exactly one Send-CtrlC call in the E2E runner.' }
+if ($checks.Count -ne 1) { throw 'Expected exactly one Get-GracefulStopFailure call in the E2E runner.' }
+if ($checks[0] -lt $ctrlC[0]) { throw 'The graceful-stop check must come after Ctrl-C is sent.' }
+$restart = @($starts | Where-Object { $_ -gt $ctrlC[0] } | Select-Object -First 1)
+if ($restart.Count -ne 1) { throw 'No replacement gateway start found after Ctrl-C.' }
+if ($checks[0] -gt $restart[0]) { throw 'The graceful-stop check must come before the replacement gateway starts.' }
+$throws = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.ThrowStatementAst] -and $node.Extent.Text -match 'stopFailure' }, $true) |
+    Where-Object { $_.Extent.StartOffset -gt $checks[0] -and $_.Extent.StartOffset -lt $restart[0] })
+if ($throws.Count -ne 1) { throw 'The graceful-stop check result must fail the scenario before the replacement gateway starts.' }
+$count++
 Write-Host "$count remote-script regression checks passed. No runtime qualification claimed."

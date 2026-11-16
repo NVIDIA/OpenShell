@@ -606,6 +606,18 @@ public static class SendCtrlC {
     return $verdict[0]
 }
 
+# Decide whether a gateway that was sent Ctrl-C shut down gracefully. Returns why it
+# did not, or $null when it did. The "Shutdown signal received" log line only proves
+# that shutdown began (it is logged before cleanup is awaited, and cleanup can still
+# fail), so a graceful stop must also exit with code 0. Pure, so it is unit-tested in
+# tasks/scripts/test-mxc-remote-tests.ps1.
+function Get-GracefulStopFailure($ExitCode, [bool] $LoggedShutdown) {
+    if ($null -eq $ExitCode) { return 'gateway exit code is unavailable after Ctrl-C' }
+    if ($ExitCode -ne 0) { return "gateway exited with code $ExitCode after Ctrl-C; a graceful shutdown must exit 0" }
+    if (-not $LoggedShutdown) { return 'gateway exited without logging a graceful shutdown (it was not a graceful stop)' }
+    return $null
+}
+
 # Wait until a sandbox's whole process tree exists, then return it as
 # @{ pid = name }. Only processes under $gwProc, plus the process whose command
 # line carries $nonce, are included, so unrelated MXC sandboxes on the host are
@@ -1183,9 +1195,9 @@ try {
                     if ($sent -ne 'sent') { throw "could not send Ctrl-C to the gateway: $sent" }
                     if (-not $gw.WaitForExit(60000)) { throw 'gateway did not exit within 60 s of Ctrl-C (no graceful shutdown)' }
                     Info "gateway exited (exit code $($gw.ExitCode))"
-                    if (-not (Select-String -Path $gwLog, $gwErrLog -Pattern 'Shutdown signal received' -Quiet -ErrorAction SilentlyContinue)) {
-                        throw 'gateway exited without logging a graceful shutdown (it was not a graceful stop)'
-                    }
+                    $loggedShutdown = [bool](Select-String -Path $gwLog, $gwErrLog -Pattern 'Shutdown signal received' -Quiet -ErrorAction SilentlyContinue)
+                    $stopFailure = Get-GracefulStopFailure $gw.ExitCode $loggedShutdown
+                    if ($stopFailure) { throw $stopFailure }
                     $survivors = @(Wait-TreeGone $victims 30)
                     if ($survivors.Count -gt 0) {
                         throw "sandbox processes survived a graceful gateway stop: $($survivors -join ', ')"
