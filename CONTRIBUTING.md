@@ -213,7 +213,8 @@ uses the same static MSVC runtime. CMake and a C++ compiler are required on
 cold builds. Source lives under `.cache/windows-z3-source`; Cargo caches the
 compiled library separately. `Z3_SRC_SOURCE_DIR` can point
 to a local Z3 5.1.0 source tree instead of downloading it.
-The wrapper keeps Z3 optimized in development and test builds, matching the
+The wrapper uses Ninja to preserve MSVC optimization flags and keeps Z3
+optimized in development and test builds, matching the
 previous prebuilt solver's performance. Rust application debug settings stay
 unchanged; the dependency profile lives in `.cargo/windows-msvc.toml`.
 

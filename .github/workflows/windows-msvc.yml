@@ -90,7 +90,7 @@ jobs:
           # wrapper; build steps still inherit sccache from the job.
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-static-v2-${{ matrix.arch }}
+          shared-key: windows-msvc-static-v3-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
@@ -158,7 +158,7 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-static-v2-${{ matrix.arch }}
+          shared-key: windows-msvc-static-v3-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
@@ -219,7 +219,7 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-static-v2-${{ matrix.arch }}
+          shared-key: windows-msvc-static-v3-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"

@@ -295,7 +295,7 @@ function Configure-Arm64CrossBuild([string[]] $RustTargets) {
     Write-Host "==> ARM64 cross-build toolchain"
     Write-Host "    clang-cl: $clangCl"
     Write-Host "    ninja:    $ninja"
-    Write-Host "    Z3:       MSVC cl.exe with the Visual Studio generator"
+    Write-Host "    Z3:       MSVC cl.exe with Ninja"
 }
 
 function Get-HostArch {
@@ -447,11 +447,22 @@ function Invoke-VsCargo {
         [Parameter(Mandatory = $true)] [string] $LogName
     )
 
+    # cmake-rs clears MSVC's configuration optimization flags when it selects
+    # the Visual Studio generator implicitly. Ninja preserves /O2 for Release
+    # Z3, including the dependency profile used by development/test builds.
+    $ninja = Resolve-NinjaPath
+    Add-PathEntry (Split-Path -Parent $ninja)
+
     if ($CargoArgs.StartsWith('cargo ') -and $CargoArgs -notmatch '--manifest-path') {
         # The old prebuilt solver was optimized even in debug/test builds.
         # An unoptimized native Z3 can exhaust otherwise unchanged solver budgets.
         $config = Join-Path $RepoRoot '.cargo/windows-msvc.toml'
-        $CargoArgs = 'cargo --config "' + $config + '" ' + $CargoArgs.Substring(6)
+        if ($CargoArgs.StartsWith('cargo nextest run ')) {
+            # Nextest starts Cargo itself; global Cargo options are not forwarded.
+            $CargoArgs = 'cargo nextest run --config "' + $config + '" ' + $CargoArgs.Substring(18)
+        } else {
+            $CargoArgs = 'cargo --config "' + $config + '" ' + $CargoArgs.Substring(6)
+        }
     }
 
     & rustup target add $RustTarget
@@ -476,6 +487,10 @@ function Invoke-VsCargo {
         "set `"CARGO_TARGET_DIR=$TargetDir`"",
         "set `"CARGO_BUILD_JOBS=$WindowsBuildJobs`"",
         "set `"CARGO_INCREMENTAL=0`"",
+        "set `"CMAKE_GENERATOR=Ninja`"",
+        # z3-src adds MSBuild's -m unless a C++ launcher is configured. Use
+        # CMake's portable passthrough when no compiler cache was requested.
+        'if not defined CMAKE_CXX_COMPILER_LAUNCHER (set "CMAKE_CXX_COMPILER_LAUNCHER=cmake;-E;env")',
         "set `"RUSTC_WRAPPER=$rustcWrapper`""
     )
     if ($hostArch -eq "amd64" -and $RustTarget -eq "aarch64-pc-windows-msvc") {

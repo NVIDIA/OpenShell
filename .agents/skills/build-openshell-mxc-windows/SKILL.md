@@ -186,7 +186,7 @@ The lane targets a Windows host with Visual Studio Build Tools and rustup.
 | Visual C++ ARM64 tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath` | Required for native ARM64 check, build, and tests and for x64-to-ARM64 check/build. Tests always require a native runner. |
 | Visual C++ ARM64 Spectre-mitigated libraries | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre -property installationPath` | Required by `regorus` through `msvc_spectre_libs`; the build fails when the selected MSVC toolset lacks `lib\spectre\arm64`. |
 | Visual C++ Clang tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath` | Provides host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for ARM64 crypto dependencies such as `aws-lc-sys`. On ARM64, the wrapper uses `VC\Tools\Llvm\Arm64\bin`. |
-| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Provides CMake and Ninja for native dependencies, including static Z3. The x64-to-ARM64 path adds Ninja to `PATH`. |
+| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Provides CMake and Ninja for native dependencies, including static Z3. The wrapper adds Ninja to `PATH`. |
 | Windows SDK | `where.exe rc.exe` from a Developer PowerShell | Install an SDK containing target libraries and ARM64 tools. |
 | Rust via rustup | `rustc --version` | Add each target being validated: `x86_64-pc-windows-msvc` and/or `aarch64-pc-windows-msvc`. The wrapper also adds the selected target. |
 | mise | `mise --version` | Used as a task runner only. |
@@ -524,7 +524,10 @@ The first check downloads a checksum-pinned Z3 5.1.0 source archive unless
 feature builds a static library and selects the static MSVC runtime from the
 Windows targets' `crt-static` setting. Keep this source pin separate from the
 z3-src crate's bundled solver version. Cargo caches compiled Z3 per target;
-cold builds require CMake and take longer than prebuilt-library downloads.
+cold builds require CMake and Ninja and take longer than prebuilt-library downloads.
+The wrapper uses Ninja explicitly: implicit Visual Studio generator selection
+in cmake-rs clears MSVC's Release optimization flags. Verify `/O2` in the
+generated build rules when investigating solver performance.
 The wrapper explicitly loads `.cargo/windows-msvc.toml` for workspace commands
 so native Z3 uses Release optimization in dev/test builds. Do not loosen solver
 budgets to compensate for a Debug native solver. Other Rust debug profiles and

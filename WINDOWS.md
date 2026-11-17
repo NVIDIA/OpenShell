@@ -81,7 +81,7 @@ require `libz3.dll` or the Visual C++ redistributable. Windows system DLLs and
 the separate MXC executor remain required.
 
 The build compiles checksum-pinned Z3 5.1.0 source with the static runtime.
-Cold builds require CMake and take longer; Cargo caches the compiled library. Compile and test hosts do not
+Cold builds require CMake and Ninja and take longer; Cargo caches the compiled library. Compile and test hosts do not
 need a working MXC runtime; running native sandboxes does. These tasks do not
 install an MSI, register a Windows service, or publish a release.
 
