@@ -110,6 +110,7 @@ async fn auto_created_provider_credential_available_in_sandbox(
     // keeps the default policy's rules from conflicting with the provider's.
     let policy = YamlFile::new(&policy::to_yaml(&policy::base())?)?;
     let sandbox_name = cx.name("ac");
+    let image = testkit::python_image();
     cx.track(&sandbox_name);
     let create = cx
         .cli_with_env(
@@ -121,6 +122,8 @@ async fn auto_created_provider_credential_available_in_sandbox(
                 &sandbox_name,
                 "--no-tty",
                 "--detach",
+                "--from",
+                &image,
                 "--policy",
                 policy.path()?,
                 "--provider",
