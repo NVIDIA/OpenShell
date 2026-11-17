@@ -2882,7 +2882,7 @@ pub(super) async fn handle_forward_tcp(
     // The main process may finish between minting the SSH token and opening
     // its transport. Keep the relay reachable until terminal delivery is
     // finalized so fast commands can attach without a readiness race.
-    if !sandbox_relay_reachable(state, &sandbox) {
+    if !sandbox_relay_reachable(state, &sandbox).await? {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -3430,11 +3430,19 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
 // SSH session handlers
 // ---------------------------------------------------------------------------
 
-fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
-    let phase = SandboxPhase::try_from(sandbox.phase()).ok();
-    matches!(phase, Some(SandboxPhase::Ready))
-        || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
-            && state.supervisor_sessions.has_session(sandbox.object_id()))
+/// Whether a relay into the sandbox can open: always when `Ready`, and after
+/// the main process exits while its supervisor is connected to any replica.
+async fn sandbox_relay_reachable(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<bool, Status> {
+    match SandboxPhase::try_from(sandbox.phase()).ok() {
+        Some(SandboxPhase::Ready) => Ok(true),
+        Some(SandboxPhase::Completed | SandboxPhase::Error) => {
+            crate::supervisor_session::supervisor_connected(state, sandbox.object_id()).await
+        }
+        _ => Ok(false),
+    }
 }
 
 pub(super) async fn handle_create_ssh_session(
@@ -3453,7 +3461,7 @@ pub(super) async fn handle_create_ssh_session(
     .await?;
     let sandbox_id = sandbox.object_id().to_string();
 
-    if !sandbox_relay_reachable(state, &sandbox) {
+    if !sandbox_relay_reachable(state, &sandbox).await? {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -9660,10 +9668,10 @@ mod tests {
                 .supervisor_sessions
                 .finalize_main_process_exit("sandbox-work")
         );
-        assert!(sandbox_relay_reachable(&state, &sandbox));
+        assert!(sandbox_relay_reachable(&state, &sandbox).await.unwrap());
 
         assert!(state.supervisor_sessions.disconnect("sandbox-work"));
-        assert!(!sandbox_relay_reachable(&state, &sandbox));
+        assert!(!sandbox_relay_reachable(&state, &sandbox).await.unwrap());
     }
 
     #[tokio::test]
