@@ -13,6 +13,22 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: leaves gateway service routing enabled by the runtime default when omitted
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_routing_enabled\s*='
+
+  - it: disables gateway service routing through canonical configuration
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig.gateway.service_routing_enabled: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_routing_enabled\s*=\s*false$'
+
   - it: disables the WebSocket tunnel unless explicitly enabled for an edge proxy
     template: templates/gateway-config.yaml
     asserts:

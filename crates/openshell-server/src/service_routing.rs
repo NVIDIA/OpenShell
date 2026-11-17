@@ -163,6 +163,9 @@ pub fn endpoint_url(
     sandbox: &str,
     service: &str,
 ) -> Option<String> {
+    if !config.service_routing.enabled {
+        return None;
+    }
     let host = endpoint_host(
         config.service_routing_discriminator(),
         &config.service_routing,
@@ -510,6 +513,12 @@ pub async fn proxy_sandbox_service_request(
     state: Arc<ServerState>,
     req: Request<Body>,
 ) -> impl IntoResponse {
+    if !state.config.service_routing.enabled {
+        return service_error_response(
+            StatusCode::NOT_FOUND,
+            "Gateway service routing is disabled",
+        );
+    }
     let Some(host) = request_host(&req).map(str::to_string) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1365,6 +1374,64 @@ fn http_activity_for_method(method: &Method) -> ActivityId {
 mod tests {
     use super::*;
     use openshell_core::config::ServiceHostnameFormat;
+
+    #[tokio::test]
+    async fn disabled_gateway_routing_rejects_http_and_websocket_on_both_routers() {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        for hashed in [false, true] {
+            for listener_enabled in [false, true] {
+                let mut state = crate::grpc::test_support::test_server_state().await;
+                let inner = Arc::get_mut(&mut state).unwrap();
+                inner.config.service_routing.enabled = false;
+                inner.config.supervisor_app_listener.enabled = listener_enabled;
+                inner.config.name = "gateway-a".into();
+                inner.config.service_routing.service_hostname_format = if hashed {
+                    ServiceHostnameFormat::Hashed
+                } else {
+                    ServiceHostnameFormat::Readable
+                };
+                inner.service_route_index =
+                    Arc::new(ServiceRouteIndex::new(Some("gateway-a".into())));
+                inner
+                    .service_route_index
+                    .register("default", "my-sandbox", "web")
+                    .unwrap();
+                let host = if hashed {
+                    "enh47uqyj7bpyttz.openshell.localhost"
+                } else {
+                    "default--my-sandbox--web.openshell.localhost"
+                };
+                for service_only in [false, true] {
+                    for websocket in [false, true] {
+                        let router = if service_only {
+                            crate::service_http_router(state.clone())
+                        } else {
+                            crate::http_router(state.clone())
+                        };
+                        let mut request = Request::builder().uri("/app").header(header::HOST, host);
+                        if websocket {
+                            request = request
+                                .header(header::CONNECTION, "upgrade")
+                                .header(header::UPGRADE, "websocket")
+                                .header("sec-websocket-version", "13")
+                                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+                        }
+                        let response = router
+                            .oneshot(request.body(Body::empty()).unwrap())
+                            .await
+                            .unwrap();
+                        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                        assert_eq!(
+                            response.into_body().collect().await.unwrap().to_bytes(),
+                            "Gateway service routing is disabled"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn endpoint() -> ServiceEndpoint {
         ServiceEndpoint {

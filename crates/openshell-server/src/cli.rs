@@ -332,6 +332,10 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_SERVICE_HOSTNAME_FORMAT")]
     service_hostname_format: Option<ServiceHostnameFormat>,
 
+    /// Publish gateway service URLs and enable gateway-mediated application routing.
+    #[arg(long, env = "OPENSHELL_SERVICE_ROUTING_ENABLED", default_value_t = true, action = ArgAction::Set)]
+    service_routing_enabled: bool,
+
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[arg(
         long,
@@ -669,6 +673,7 @@ fn prepare_server_config_with_drivers(
         )
         .with_server_sans(args.server_sans.clone())
         .with_service_hostname_format(args.service_hostname_format.unwrap_or_default())
+        .with_service_routing(args.service_routing_enabled)
         .with_loopback_service_http(args.enable_loopback_service_http)
         .with_websocket_tunnel(args.enable_websocket_tunnel);
     config
@@ -1658,6 +1663,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "service_hostname_format")
     {
         args.service_hostname_format = Some(*format);
+    }
+    if let Some(enabled) = file.service_routing_enabled
+        && arg_defaulted(matches, "service_routing_enabled")
+    {
+        args.service_routing_enabled = enabled;
     }
     if let Some(enabled) = file.enable_loopback_service_http
         && arg_defaulted(matches, "enable_loopback_service_http")
@@ -5002,6 +5012,38 @@ enable_loopback_service_http = false
     }
 
     #[test]
+    fn gateway_service_routing_defaults_on_and_honors_config_precedence() {
+        Environment::new()
+            .remove("OPENSHELL_SERVICE_ROUTING_ENABLED")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                assert!(args.service_routing_enabled);
+                assert!(openshell_core::Config::new(None).service_routing.enabled);
+                let file =
+                    config_file_from_toml("[openshell.gateway]\nservice_routing_enabled = false\n");
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(!args.service_routing_enabled);
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--service-routing-enabled=true"]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(args.service_routing_enabled);
+            });
+        Environment::new()
+            .set("OPENSHELL_SERVICE_ROUTING_ENABLED", "true")
+            .run(|| {
+                let file =
+                    config_file_from_toml("[openshell.gateway]\nservice_routing_enabled = false\n");
+                let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(args.service_routing_enabled);
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--service-routing-enabled=false"]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(!args.service_routing_enabled);
+            });
+    }
+
+    #[test]
     fn server_config_preparation_applies_and_validates_hashed_hostnames() {
         let state = tempfile::tempdir().unwrap();
         let local_tls = tempfile::tempdir().unwrap();
@@ -5013,11 +5055,12 @@ enable_loopback_service_http = false
                 local_tls.path().to_str().unwrap(),
             )
             .remove("OPENSHELL_SERVICE_HOSTNAME_FORMAT")
+            .remove("OPENSHELL_SERVICE_ROUTING_ENABLED")
             .run(|| {
                 let config_path = state.path().join("gateway.toml");
                 std::fs::write(
                     &config_path,
-                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nname = \"gateway-west\"\nservice_hostname_format = \"hashed\"\n",
+                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nname = \"gateway-west\"\nservice_hostname_format = \"hashed\"\nservice_routing_enabled = false\n",
                 )
                 .unwrap();
 
@@ -5034,6 +5077,7 @@ enable_loopback_service_http = false
 
                 let prepared = super::prepare_server_config(&mut args, &matches)
                     .expect("server config is prepared");
+                assert!(!prepared.config.service_routing.enabled);
                 assert_eq!(
                     prepared.config.service_routing_discriminator(),
                     Some("gateway-west")

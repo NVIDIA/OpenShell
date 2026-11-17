@@ -358,6 +358,8 @@ config_delivery_mode = "poll"
 # Wildcard DNS SANs (e.g. "*.dev.openshell.localhost") also enable sandbox
 # service URLs under that domain.
 server_sans                  = ["openshell", "*.dev.openshell.localhost"]
+# Publish gateway service URLs and forward application traffic through the gateway.
+service_routing_enabled      = true
 # Allow plaintext HTTP routing for loopback sandbox service URLs.
 enable_loopback_service_http = true
 # Hostname format for exposed sandbox services. "hashed" makes service URLs
@@ -612,6 +614,19 @@ Sandbox service URLs default to a readable composite hostname:
 and `https://<workspace>--<sandbox>.<base-domain>/` for the unnamed endpoint.
 The base domain is the first wildcard DNS SAN in `server_sans`; gateways
 without SANs use the built-in `openshell.localhost`.
+
+`service_routing_enabled` defaults to `true`. Set it to `false` to stop publishing
+gateway service URLs and reject gateway-mediated application HTTP requests and
+WebSocket upgrades with `404`. Control-plane APIs, service declarations, direct
+supervisor listeners, and discovery remain available. The setting also accepts
+`--service-routing-enabled=false` or `OPENSHELL_SERVICE_ROUTING_ENABLED=false`,
+with CLI > environment > TOML > default precedence. In Helm, use
+`gatewayConfig.gateway.service_routing_enabled: false`.
+
+With gateway routing disabled, `gateway_url` is empty and `gateway_service_urls`
+is empty. A configured application origin supplies the preferred URL; without
+one, preferred URLs are empty. Idempotent retries preserve recorded preferred
+URLs; explicit application/gateway fields reflect the current configuration.
 
 `service_hostname_format` selects the hostname format for exposed sandbox
 services when multiple gateways share one service base domain behind a single

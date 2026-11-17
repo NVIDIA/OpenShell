@@ -874,7 +874,9 @@ async fn handle_create_sandbox_inner(
         if !endpoint.application_url.is_empty() {
             application_service_urls.insert(exposure.service.clone(), endpoint.application_url);
         }
-        gateway_service_urls.insert(exposure.service.clone(), endpoint.gateway_url);
+        if !endpoint.gateway_url.is_empty() {
+            gateway_service_urls.insert(exposure.service.clone(), endpoint.gateway_url);
+        }
         service_urls.insert(exposure.service.clone(), endpoint.url);
     }
 
@@ -4369,9 +4371,11 @@ pub(super) fn refresh_response_urls(state: &ServerState, response: &mut SandboxR
             service,
             state.config.service_routing_discriminator(),
         );
-        response
-            .gateway_service_urls
-            .insert(service.clone(), gateway);
+        if !gateway.is_empty() {
+            response
+                .gateway_service_urls
+                .insert(service.clone(), gateway);
+        }
         if let Some(application) = application {
             response
                 .application_service_urls

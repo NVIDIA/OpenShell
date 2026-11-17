@@ -191,6 +191,9 @@ pub struct GatewayFileSection {
     pub config_delivery_mode: Option<openshell_core::config::ConfigDeliveryMode>,
 
     // ── Service routing ──────────────────────────────────────────────────
+    /// Publish gateway URLs and forward application requests. Defaults to true.
+    #[serde(default)]
+    pub service_routing_enabled: Option<bool>,
     /// Subject Alternative Names configured on the gateway server certificate.
     /// Wildcard DNS SANs also enable sandbox service URLs under that domain.
     #[serde(default)]

@@ -637,6 +637,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_routing_opt_out_preserves_installed_application_discovery() {
+        use super::super::service_advertisement::test_support::installed_fixture_for_gateway;
+        use openshell_core::config::ServiceHostnameFormat;
+        for format in [
+            ServiceHostnameFormat::Readable,
+            ServiceHostnameFormat::Hashed,
+        ] {
+            let (mut state, owner, report) =
+                installed_fixture_for_gateway("gateway-a", format).await;
+            let config = &mut Arc::get_mut(&mut state).unwrap().config;
+            config.service_routing.enabled = false;
+            config.supervisor_app_listener.public_url =
+                Some("https://services.example.com:10443".into());
+            accept(&state, &owner, &report, current_time_ms() + 10_000)
+                .await
+                .unwrap();
+            let discovered = snapshot(&state, "default").await.unwrap();
+            assert_eq!(discovered.routes.len(), 1);
+            assert_eq!(
+                discovered.routes[0].hostname,
+                report.routes[0].application_hostname
+            );
+            let response = super::super::service::handle_get_service(
+                &state,
+                authed_request(openshell_core::proto::GetServiceRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    sandbox: "demo".into(),
+                    name: "web".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert!(response.gateway_url.is_empty());
+            assert_eq!(response.url, response.application_url);
+            assert_eq!(
+                response.url,
+                format!("https://{}:10443/", discovered.routes[0].hostname)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn hashed_urls_discovery_and_installed_routes_use_the_same_gateway_identity() {
         use super::super::service_advertisement::test_support::installed_fixture_for_gateway;
         use openshell_core::config::ServiceHostnameFormat;

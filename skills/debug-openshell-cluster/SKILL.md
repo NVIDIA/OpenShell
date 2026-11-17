@@ -1811,6 +1811,9 @@ Watches recheck bearer credentials and membership every second. Allow one refres
 interval for withdrawals; route lease expiry remains independently enforced.
 
 For incorrect public service URLs, inspect
+`[openshell.gateway].service_routing_enabled` first. When false, gateway URL fields
+are empty and gateway application requests return `404`; direct listener and
+discovery behavior is independent. Then inspect
 `[openshell.supervisor.app_listener].public_url`. It is an external HTTPS origin
 whose hostname matches `domain`; its port is independent of the listener port.
 Service responses identify the application and gateway paths separately. A

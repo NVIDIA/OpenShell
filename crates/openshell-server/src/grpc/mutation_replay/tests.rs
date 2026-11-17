@@ -110,6 +110,82 @@ async fn url_replay_state() -> (Arc<ServerState>, tempfile::TempDir) {
 }
 
 #[tokio::test]
+async fn create_url_maps_follow_independent_routing_flags_and_replays_keep_recorded_urls() {
+    for gateway_enabled in [false, true] {
+        for application_enabled in [false, true] {
+            let (mut state, _directory) = url_replay_state().await;
+            let config = &mut Arc::get_mut(&mut state).unwrap().config;
+            config.service_routing.enabled = gateway_enabled;
+            config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+                enabled: application_enabled,
+                domain: "services.example.com".into(),
+                public_url: application_enabled
+                    .then(|| "https://services.example.com:10443".into()),
+                ..Default::default()
+            };
+            let request = CreateSandboxRequest {
+                name: "routing-matrix".into(),
+                spec: Some(SandboxSpec::default()),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                service_exposures: ["", "web"]
+                    .into_iter()
+                    .map(|service| SandboxServiceExposure {
+                        service: service.into(),
+                        target_port: 8080,
+                        ..Default::default()
+                    })
+                    .collect(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                ..Default::default()
+            };
+            let original = run(&state, authed_request(request.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                original.gateway_service_urls.len(),
+                if gateway_enabled { 2 } else { 0 }
+            );
+            assert_eq!(
+                original.application_service_urls.len(),
+                if application_enabled { 2 } else { 0 }
+            );
+            for service in ["", "web"] {
+                if application_enabled {
+                    assert_eq!(
+                        original.service_urls[service],
+                        original.application_service_urls[service]
+                    );
+                } else if gateway_enabled {
+                    assert_eq!(
+                        original.service_urls[service],
+                        original.gateway_service_urls[service]
+                    );
+                } else {
+                    assert!(original.service_urls[service].is_empty());
+                }
+            }
+            let config = &mut Arc::get_mut(&mut state).unwrap().config;
+            config.service_routing.enabled = !gateway_enabled;
+            config.supervisor_app_listener.enabled = !application_enabled;
+            config.supervisor_app_listener.public_url =
+                (!application_enabled).then(|| "https://services.example.com:10443".into());
+            let replay = run(&state, authed_request(request)).await.unwrap();
+            assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+            assert_eq!(replay.get_ref().service_urls, original.service_urls);
+            assert_eq!(
+                replay.get_ref().gateway_service_urls.len(),
+                if gateway_enabled { 0 } else { 2 }
+            );
+            assert_eq!(
+                replay.get_ref().application_service_urls.len(),
+                if application_enabled { 0 } else { 2 }
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn create_replay_preserves_recorded_urls_and_refreshes_explicit_origins() {
     let (mut state, _directory) = url_replay_state().await;
     let request = CreateSandboxRequest {
@@ -229,7 +305,7 @@ async fn expose_replay_preserves_recorded_url_when_origins_change_or_are_disable
     let config = &mut Arc::get_mut(&mut state).unwrap().config;
     config.supervisor_app_listener.enabled = false;
     config.supervisor_app_listener.public_url = None;
-    let without_application = run(&state, authed_request(request)).await.unwrap();
+    let without_application = run(&state, authed_request(request.clone())).await.unwrap();
     assert_eq!(
         without_application
             .metadata()
@@ -244,6 +320,16 @@ async fn expose_replay_preserves_recorded_url_when_origins_change_or_are_disable
         without_application.get_ref().gateway_url,
         replay.get_ref().gateway_url
     );
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .config
+        .service_routing
+        .enabled = false;
+    let without_either_path = run(&state, authed_request(request)).await.unwrap();
+    assert_eq!(without_either_path.get_ref().url, original.url);
+    assert_eq!(without_either_path.get_ref().endpoint, original.endpoint);
+    assert!(without_either_path.get_ref().gateway_url.is_empty());
+    assert!(without_either_path.get_ref().application_url.is_empty());
 }
 
 #[tokio::test]

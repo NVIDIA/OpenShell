@@ -753,55 +753,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_application_origin_is_published_before_installation() {
-        let mut state = test_server_state().await;
-        Arc::get_mut(&mut state)
-            .unwrap()
-            .config
-            .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
-            enabled: true,
-            port: 9443,
-            domain: "services.example.com".into(),
-            public_url: Some("https://services.example.com:10443".into()),
-        };
-        seed_sandbox(&state, "demo").await;
-        for name in ["", "web"] {
-            let created = handle_expose_service(
-                &state,
-                authed_request(ExposeServiceRequest {
-                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                    sandbox: "demo".into(),
-                    name: name.into(),
-                    target_port: 8080,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap()
-            .into_inner();
-            let label = if name.is_empty() {
-                "default--demo"
-            } else {
-                "default--demo--web"
-            };
-            assert_eq!(
-                created.url,
-                format!("https://{label}.services.example.com:10443/")
-            );
-            assert_eq!(created.application_url, created.url);
-            assert!(created.gateway_url.contains("openshell.localhost"));
-            let fetched = handle_get_service(
-                &state,
-                authed_request(GetServiceRequest {
-                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                    sandbox: "demo".into(),
-                    name: name.into(),
-                }),
-            )
-            .await
-            .unwrap()
-            .into_inner();
-            assert_eq!(created, fetched);
+    async fn application_and_gateway_url_publication_are_independent() {
+        for gateway_enabled in [false, true] {
+            for application_enabled in [false, true] {
+                let mut state = test_server_state().await;
+                let config = &mut Arc::get_mut(&mut state).unwrap().config;
+                config.service_routing.enabled = gateway_enabled;
+                config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+                    enabled: application_enabled,
+                    port: 9443,
+                    domain: "services.example.com".into(),
+                    public_url: application_enabled
+                        .then(|| "https://services.example.com:10443".into()),
+                };
+                seed_sandbox(&state, "demo").await;
+                for name in ["", "web"] {
+                    let created = handle_expose_service(
+                        &state,
+                        authed_request(ExposeServiceRequest {
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            sandbox: "demo".into(),
+                            name: name.into(),
+                            target_port: 8080,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap()
+                    .into_inner();
+                    assert_eq!(!created.gateway_url.is_empty(), gateway_enabled);
+                    assert_eq!(!created.application_url.is_empty(), application_enabled);
+                    if application_enabled {
+                        let label = if name.is_empty() {
+                            "default--demo"
+                        } else {
+                            "default--demo--web"
+                        };
+                        assert_eq!(
+                            created.application_url,
+                            format!("https://{label}.services.example.com:10443/")
+                        );
+                        assert_eq!(created.url, created.application_url);
+                    } else {
+                        assert_eq!(created.url, created.gateway_url);
+                    }
+                    let fetched = handle_get_service(
+                        &state,
+                        authed_request(GetServiceRequest {
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            sandbox: "demo".into(),
+                            name: name.into(),
+                        }),
+                    )
+                    .await
+                    .unwrap()
+                    .into_inner();
+                    assert_eq!(created, fetched);
+                }
+            }
         }
     }
 
