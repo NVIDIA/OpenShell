@@ -32,7 +32,7 @@ In the Helm chart, set the table under `gatewayConfig`. The gateway passes the e
 
 These are OpenShell's own spans. Spans that the agent produces travel separately, through the [agent trace relay](/observability/overview#agent-traces).
 
-Store operations, health checks, periodic supervisor RPCs (`GetSandboxConfig` and `ReportProviderReadiness`), and connection-level egress diagnostics use DEBUG level. Set the gateway or sandbox log level to `debug` to include them. Inspected HTTP request spans and their executed stage children use INFO level, including allowed requests. Their volume is not limited by the legacy denial-span budgets. See [query and capacity migration](/observability/ocsf-json-export#update-existing-queries) before enabling supervisor trace export.
+Store operations, health checks, periodic supervisor RPCs (`GetSandboxConfig` and `ReportProviderReadiness`), and connection-level egress diagnostics use DEBUG level. Set the gateway or sandbox log level to `debug` to include them. Inspected HTTP request spans and their executed stage children use INFO level, including allowed requests. Their volume is not limited by the legacy denial-span budgets. See [size supervisor trace collection](/observability/ocsf-json-export#size-supervisor-trace-collection) before enabling supervisor trace export.
 
 ## Span Names
 
