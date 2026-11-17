@@ -78,8 +78,9 @@ fn policy_lint_runs_offline_and_reports_file_errors() {
     std::fs::write(
         &file,
         format!(
-            "version: 1\nnetwork_policies:\n  large:\n    name: {}\n",
-            "x".repeat(openshell_policy::MAX_AUTHORED_POLICY_SIZE)
+            "version: 1\nnetwork_policies:\n  large:\n    name: {}\n    endpoints:\n{}",
+            "x".repeat(openshell_policy::MAX_AUTHORED_POLICY_SIZE),
+            "      - {host: example.com, port: 443, tls: skip}\n      - {host: example.com, port: 443}\n".repeat(128)
         ),
     )
     .unwrap();
@@ -90,6 +91,11 @@ fn policy_lint_runs_offline_and_reports_file_errors() {
             .combined
             .contains("policy serialized size exceeds maximum"),
         "{}",
+        oversized.combined
+    );
+    assert!(
+        !oversized.combined.contains("overlap"),
+        "oversized files must be rejected before collecting endpoint pairs: {}",
         oversized.combined
     );
     let missing = dir.path().join("missing.yaml");

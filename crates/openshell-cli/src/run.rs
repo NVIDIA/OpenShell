@@ -5426,6 +5426,13 @@ pub async fn sandbox_upload(
 
 pub fn sandbox_policy_lint(policy_path: &str) -> Result<()> {
     let policy = openshell_policy::parse_sandbox_policy_file(Path::new(policy_path))?;
+    let size = policy.encoded_len();
+    if size > openshell_policy::MAX_AUTHORED_POLICY_SIZE {
+        miette::bail!(
+            "policy serialized size exceeds maximum ({size} > {})",
+            openshell_policy::MAX_AUTHORED_POLICY_SIZE
+        );
+    }
     let mut violations: Vec<String> = openshell_policy::find_endpoint_ambiguities(&policy)
         .iter()
         .map(ToString::to_string)
