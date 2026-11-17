@@ -22,6 +22,11 @@ const MAX_PAGES: usize = 1000;
 /// supervisor session (#4949).
 const ATTACH_BEFORE_EXIT: &str = "sleep 5";
 
+/// The flag that runs the main without or with a terminal, and a name suffix
+/// for it. With `--tty` the main gets a PTY and the CLI attaches with
+/// `ssh -tt`, as it does when run from a terminal.
+const TERMINAL_MODES: [(&str, &str); 2] = [("--no-tty", ""), ("--tty", "t")];
+
 /// `openshell status` succeeds, and a sandbox created with the CLI is
 /// retrievable and Ready, appears in `sandbox list`, runs `sandbox exec`, and is
 /// gone from `sandbox list` after `sandbox delete`.
@@ -90,92 +95,98 @@ async fn cli_stop_start_delete(cx: &mut Context) -> testkit::Result {
 }
 
 /// `sandbox create -- <command>` without `--detach` streams the main
-/// process's output and exits with its exit code. The sandbox is kept by
-/// default: one whose main exited 0 is listed and Completed, and one whose
-/// main exited 7 is in Error with exit code 7.
+/// process's output and exits with its exit code, with and without a terminal
+/// for the main. The sandbox is kept by default: one whose main exited 0 is
+/// listed and Completed, and one whose main exited 7 is in Error with exit
+/// code 7.
 #[testkit::test]
 async fn cli_attached_create_streams_main_and_reports_exit(cx: &mut Context) -> testkit::Result {
-    let completed = cx.name("ac0");
-    cx.track(&completed);
-    let script = format!("{ATTACH_BEFORE_EXIT}; echo OK");
-    let output = cx
-        .cli([
-            "sandbox", "create", "--name", &completed, "--", "sh", "-c", &script,
-        ])
-        .await?
-        .success()?;
-    expect_streamed(&output, "OK")?;
-    testkit::ensure!(
-        find_listed(cx, &completed).await?.is_some(),
-        "sandbox {completed} is not listed after its main exited; sandboxes are kept by default"
-    );
-    // The phase can trail the CLI's exit by a status update.
-    cx.adopt(&completed).await?.wait_finished().await?;
-    let got = get_json(cx, &completed).await?;
-    testkit::ensure!(
-        got["phase"] == "Completed",
-        "sandbox {completed} is in phase {}; expected Completed",
-        got["phase"]
-    );
+    for (terminal, suffix) in TERMINAL_MODES {
+        let completed = cx.name(&format!("ac0{suffix}"));
+        cx.track(&completed);
+        let script = format!("{ATTACH_BEFORE_EXIT}; echo OK");
+        let output = cx
+            .cli([
+                "sandbox", "create", "--name", &completed, terminal, "--", "sh", "-c", &script,
+            ])
+            .await?
+            .success()?;
+        expect_streamed(&output, "OK")?;
+        testkit::ensure!(
+            find_listed(cx, &completed).await?.is_some(),
+            "sandbox {completed} is not listed after its main exited; sandboxes are kept by default"
+        );
+        // The phase can trail the CLI's exit by a status update.
+        cx.adopt(&completed).await?.wait_finished().await?;
+        let got = get_json(cx, &completed).await?;
+        testkit::ensure!(
+            got["phase"] == "Completed",
+            "sandbox {completed} is in phase {}; expected Completed",
+            got["phase"]
+        );
 
-    let failed = cx.name("ac7");
-    cx.track(&failed);
-    let script = format!("{ATTACH_BEFORE_EXIT}; echo failed-main; exit 7");
-    let output = cx
-        .cli([
-            "sandbox", "create", "--name", &failed, "--", "sh", "-c", &script,
-        ])
-        .await?;
-    testkit::ensure!(
-        output.exit_code == 7,
-        "`{}` exited with {}; expected the main process's 7; stderr: {}",
-        output.command,
-        output.exit_code,
-        output.stderr.trim()
-    );
-    expect_streamed(&output, "failed-main")?;
-    cx.adopt(&failed).await?.wait_finished().await?;
-    let got = get_json(cx, &failed).await?;
-    testkit::ensure!(
-        got["phase"] == "Error" && got["exit_code"] == 7,
-        "sandbox {failed} is in phase {} with exit code {}; expected Error with 7",
-        got["phase"],
-        got["exit_code"]
-    );
+        let failed = cx.name(&format!("ac7{suffix}"));
+        cx.track(&failed);
+        let script = format!("{ATTACH_BEFORE_EXIT}; echo failed-main; exit 7");
+        let output = cx
+            .cli([
+                "sandbox", "create", "--name", &failed, terminal, "--", "sh", "-c", &script,
+            ])
+            .await?;
+        testkit::ensure!(
+            output.exit_code == 7,
+            "`{}` exited with {}; expected the main process's 7; stderr: {}",
+            output.command,
+            output.exit_code,
+            output.stderr.trim()
+        );
+        expect_streamed(&output, "failed-main")?;
+        cx.adopt(&failed).await?.wait_finished().await?;
+        let got = get_json(cx, &failed).await?;
+        testkit::ensure!(
+            got["phase"] == "Error" && got["exit_code"] == 7,
+            "sandbox {failed} is in phase {} with exit code {}; expected Error with 7",
+            got["phase"],
+            got["exit_code"]
+        );
+    }
     Ok(())
 }
 
 /// `sandbox create --no-keep -- <command>` streams the main process's output,
 /// exits with its exit code, and then deletes the sandbox, whether the main
-/// exited 0 or 17.
+/// exited 0 or 17, with and without a terminal for the main.
 #[testkit::test]
 async fn cli_no_keep_removes_sandbox_after_main_exit(cx: &mut Context) -> testkit::Result {
-    for (suffix, code, marker) in [("nk0", 0, "OK"), ("nk17", 17, "ephemeral-failure")] {
-        let name = cx.name(suffix);
-        cx.track(&name);
-        let script = format!("{ATTACH_BEFORE_EXIT}; echo {marker}; exit {code}");
-        let output = cx
-            .cli([
-                "sandbox",
-                "create",
-                "--name",
-                &name,
-                "--no-keep",
-                "--",
-                "sh",
-                "-c",
-                &script,
-            ])
-            .await?;
-        testkit::ensure!(
-            output.exit_code == code,
-            "`{}` exited with {}; expected the main process's {code}; stderr: {}",
-            output.command,
-            output.exit_code,
-            output.stderr.trim()
-        );
-        expect_streamed(&output, marker)?;
-        wait_unlisted(cx, &name).await?;
+    for (terminal, terminal_suffix) in TERMINAL_MODES {
+        for (suffix, code, marker) in [("nk0", 0, "OK"), ("nk17", 17, "ephemeral-failure")] {
+            let name = cx.name(&format!("{suffix}{terminal_suffix}"));
+            cx.track(&name);
+            let script = format!("{ATTACH_BEFORE_EXIT}; echo {marker}; exit {code}");
+            let output = cx
+                .cli([
+                    "sandbox",
+                    "create",
+                    "--name",
+                    &name,
+                    "--no-keep",
+                    terminal,
+                    "--",
+                    "sh",
+                    "-c",
+                    &script,
+                ])
+                .await?;
+            testkit::ensure!(
+                output.exit_code == code,
+                "`{}` exited with {}; expected the main process's {code}; stderr: {}",
+                output.command,
+                output.exit_code,
+                output.stderr.trim()
+            );
+            expect_streamed(&output, marker)?;
+            wait_unlisted(cx, &name).await?;
+        }
     }
     Ok(())
 }
