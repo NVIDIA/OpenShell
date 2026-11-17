@@ -143,6 +143,11 @@ without a workload; an interrupted create requires explicit recovery/removal.
 This option advertises the optional workload update capability. The gateway's
 separate `enable_sandbox_updates` setting must also be enabled to accept updates.
 
+Persistence metadata uses the driver-owned `openshell.ai/docker-workspace-storage`
+and `openshell.ai/docker-workspace-volume-identity` container labels. The older
+generic `openshell.ai/workspace-storage` and `openshell.ai/workspace-volume-identity`
+keys remain caller labels; their presence does not select persistent storage.
+
 ### Stopped Workload Image Updates
 
 The Docker updater implements the existing configuration-update RPC for
@@ -195,6 +200,11 @@ cargo test --locked -p openshell-driver-docker --lib \
 
 The Docker CLI must be on `PATH` and use the same daemon as the SDK. On Docker
 Desktop, set `DOCKER_HOST` to the socket reported by `docker context inspect`.
+
+For authenticated gateway/supervisor qualification, including SSH exec,
+replacement, gateway restart, interrupted credential-publication repair and
+complete API deletion, run the separate
+[Docker update testkit suite](../../tests/suites/features/docker-updates/README.md).
 
 Stop terminates the supervisor companion, allowing it 10 seconds to stop the
 workload, and stops the workload container without removing it. Docker retains

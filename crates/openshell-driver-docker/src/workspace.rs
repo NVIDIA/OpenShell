@@ -20,8 +20,11 @@ use tonic::Status;
 
 pub const ROLE_LABEL: &str = "openshell.ai/storage-role";
 pub const ROLE: &str = "workspace";
-pub const IDENTITY_LABEL: &str = "openshell.ai/workspace-volume-identity";
-pub const MODE_LABEL: &str = "openshell.ai/workspace-storage";
+// Use Docker-specific keys introduced with this feature. The generic
+// workspace-storage/workspace-volume-identity keys were previously accepted as
+// caller labels; neither strip nor reinterpret them on legacy containers.
+pub const IDENTITY_LABEL: &str = "openshell.ai/docker-workspace-volume-identity";
+pub const MODE_LABEL: &str = "openshell.ai/docker-workspace-storage";
 pub const PERSISTENT_MODE: &str = "persistent-v1";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Storage {
@@ -410,6 +413,22 @@ pub mod tests {
             "Mounts": [{"Type": "volume", "Name": volume.name, "Destination": "/sandbox", "RW": true}]
         })).unwrap();
         (container, volume, config)
+    }
+
+    #[test]
+    fn legacy_workspace_labels_are_not_a_driver_storage_record() {
+        // These keys were previously accepted as arbitrary template labels.
+        // Their values, even persistent-v1 or invalid JSON, must not turn an
+        // existing writable-layer container into a driver-owned volume claim.
+        for labels in [
+            serde_json::json!({"openshell.ai/workspace-storage":"persistent-v1"}),
+            serde_json::json!({"openshell.ai/workspace-volume-identity":"not-json"}),
+            serde_json::json!({"openshell.ai/workspace-storage":"persistent-v1", "openshell.ai/workspace-volume-identity":"not-json"}),
+        ] {
+            let container =
+                serde_json::from_value(serde_json::json!({"Config":{"Labels":labels}})).unwrap();
+            assert!(recorded_identity(&container).unwrap().is_none());
+        }
     }
 
     #[test]

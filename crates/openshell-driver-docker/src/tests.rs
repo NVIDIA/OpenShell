@@ -3838,6 +3838,36 @@ fn build_container_create_body_limits_writable_runtime_storage_to_supervisor_ca(
 }
 
 #[test]
+fn legacy_workspace_template_labels_are_preserved() {
+    let mut sandbox = test_sandbox();
+    let labels = &mut sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .labels;
+    labels.insert(
+        "openshell.ai/workspace-storage".into(),
+        "caller-layout".into(),
+    );
+    labels.insert(
+        "openshell.ai/workspace-volume-identity".into(),
+        "caller-identity".into(),
+    );
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let labels = body.labels.unwrap();
+    assert_eq!(labels["openshell.ai/workspace-storage"], "caller-layout");
+    assert_eq!(
+        labels["openshell.ai/workspace-volume-identity"],
+        "caller-identity"
+    );
+    assert!(!labels.contains_key(workspace::MODE_LABEL));
+    assert!(!labels.contains_key(workspace::IDENTITY_LABEL));
+}
+
+#[test]
 fn build_container_create_body_uses_runtime_namespace_label() {
     // Regression test: the namespace label must come from the driver's
     // runtime config, not from `DriverSandbox.namespace`. The gateway

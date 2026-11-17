@@ -724,6 +724,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "docker-updates"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "uuid",
+]
+
+[[package]]
 name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
