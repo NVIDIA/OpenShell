@@ -670,6 +670,10 @@ Create sandbox with initial policy
   Verify reload succeeded ─────────┘
 ```
 
+Validate an authored policy offline with `openshell policy lint policy.yaml`
+before creating or updating a sandbox. Gateway-dependent provider, middleware
+registration, image and driver checks are deferred until application.
+
 ### Step 1: Create sandbox with initial policy
 
 ```bash
