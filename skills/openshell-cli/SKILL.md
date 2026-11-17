@@ -161,7 +161,11 @@ slots, update the imported profile with explicit placement and upgrade the
 gateway before the supervisor. Older gateways cannot forward placement metadata;
 older supervisors retain their previous behavior. Updating example YAML does not
 update an imported profile. Check provider readiness after changing placement and
-launch a new process if retained references were revoked.
+launch a new process if retained references were revoked. For path-based APIs
+that use one token across multiple methods, a terminal `/**` in `path_template`
+permits the fixed path and its descendants, such as `/bot{credential}/**`.
+Templates without that suffix still match exactly, and endpoint bindings remain
+independently enforced.
 
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port

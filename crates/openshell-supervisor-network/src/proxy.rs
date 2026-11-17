@@ -14993,6 +14993,79 @@ network_policies:
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
     }
 
+    #[test]
+    fn forward_rewrite_resolves_a_subtree_path_credential_only_in_its_slot() {
+        use openshell_core::proto::{
+            ProviderProfileCredential, StaticCredentialBinding, StaticCredentialEndpointBinding,
+        };
+        use openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX;
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("BOT_TOKEN".into(), "123456:synthetic".into())]),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                format!("{STATIC_CREDENTIAL_METADATA_PREFIX}BOT_TOKEN"),
+                ProviderProfileCredential {
+                    env_vars: vec!["BOT_TOKEN".into()],
+                    auth_style: "path".into(),
+                    path_template: "/bot{credential}/**".into(),
+                    ..Default::default()
+                },
+            )]),
+            TestHashMap::from([(
+                "BOT_TOKEN".into(),
+                StaticCredentialBinding {
+                    credential_identity: "provider:BOT_TOKEN".into(),
+                    workload_credential_handle: String::new(),
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "bot-api.example.com".into(),
+                        port: 80,
+                        path: "/**".into(),
+                    }],
+                },
+            )]),
+            Vec::new(),
+        )
+        .unwrap();
+        let placeholder = state.snapshot().child_env["BOT_TOKEN"].clone();
+        let resolver = state
+            .resolver_for_endpoint("bot-api.example.com", 80, "/")
+            .unwrap();
+
+        for method in ["sendMessage", "getUpdates"] {
+            let path = format!("/bot{placeholder}/{method}");
+            let raw = format!(
+                "POST http://bot-api.example.com{path} HTTP/1.1\r\nHost: bot-api.example.com\r\n\r\n"
+            );
+            let rewritten = rewrite_forward_request(
+                raw.as_bytes(),
+                raw.len(),
+                &path,
+                "bot-api.example.com",
+                Some(&resolver),
+            )
+            .expect("every method below the credential prefix should resolve");
+            assert!(
+                String::from_utf8_lossy(&rewritten)
+                    .starts_with(&format!("POST /bot123456:synthetic/{method} HTTP/1.1\r\n"))
+            );
+        }
+
+        let moved = format!("/echo/bot{placeholder}/getMe");
+        let raw = format!(
+            "POST http://bot-api.example.com{moved} HTTP/1.1\r\nHost: bot-api.example.com\r\n\r\n"
+        );
+        let error = rewrite_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            &moved,
+            "bot-api.example.com",
+            Some(&resolver),
+        )
+        .expect_err("a credential outside its declared slot must not resolve");
+        assert!(error.is_placement_mismatch());
+    }
+
     #[tokio::test]
     async fn forward_initial_body_is_classified_separately_from_auth_headers() {
         use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};

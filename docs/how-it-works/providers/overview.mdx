@@ -495,7 +495,7 @@ declaration. Older supervisors keep their previous behavior.
 | Declared header value | Agent reads `$API_KEY` from env and places it in the declared header. | `Authorization: Bearer <placeholder>` |
 | Header value (Basic auth) | Agent base64-encodes `user:<placeholder>` in an `Authorization: Basic` header. The proxy decodes, resolves, and re-encodes. | `Authorization: Basic <base64>` |
 | Declared query parameter value | Agent uses the profile's `query_param`. | `GET /api?key=<placeholder>` |
-| Declared URL path slot | Agent uses the profile's `path_template`, including concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
+| Declared URL path slot | Agent uses the profile's `path_template`, including concatenated patterns. A terminal `/**` also accepts every path below the slot. | `POST /bot<placeholder>/sendMessage` |
 | AWS SigV4 signing | An endpoint configures `credential_signing`, and the proxy signs with the endpoint-bound AWS credentials. | `credential_signing: sigv4` |
 
 The proxy does not rewrite cookies, response content, unsupported request

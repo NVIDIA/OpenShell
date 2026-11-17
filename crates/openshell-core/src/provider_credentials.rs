@@ -3,7 +3,7 @@
 
 //! Runtime provider credential snapshots.
 
-use crate::secrets::{CredentialPlacement, SecretResolver};
+use crate::secrets::{CredentialPlacement, PathTemplate, SecretResolver};
 use crate::{
     endpoint_path::EndpointPathPattern,
     host_pattern::HostPattern,
@@ -100,8 +100,6 @@ impl std::error::Error for StaticCredentialBindingError {}
 
 /// Reserved entries in the existing credential map carry static placement only.
 pub const STATIC_CREDENTIAL_METADATA_PREFIX: &str = "static-env:";
-
-const CREDENTIAL_PATH_SLOT: &str = "{credential}";
 
 fn split_static_credential_metadata(
     credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
@@ -1175,14 +1173,7 @@ fn compile_credential_placement(
         {
             CredentialPlacement::QueryParam(metadata.query_param.trim().to_string())
         }
-        "path"
-            if metadata.path_template.starts_with('/')
-                && metadata.path_template.matches(CREDENTIAL_PATH_SLOT).count() == 1
-                && !metadata
-                    .path_template
-                    .chars()
-                    .any(|c| c.is_control() || "?#".contains(c)) =>
-        {
+        "path" if PathTemplate::parse(&metadata.path_template).is_some() => {
             CredentialPlacement::PathTemplate(metadata.path_template.clone())
         }
         _ => {
@@ -1685,6 +1676,52 @@ mod tests {
             assert_eq!(query.is_ok(), style == "query");
             assert_eq!(path.is_ok(), style == "path");
         }
+    }
+
+    #[test]
+    fn subtree_path_template_serves_every_method_with_one_credential() {
+        let env = HashMap::from([("API_KEY".into(), "123456:synthetic".into())]);
+        let bindings =
+            HashMap::from([("API_KEY".into(), binding("bot-api.example.com", 443, "/**"))]);
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            env.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            bindings.clone(),
+            vec![],
+        )
+        .unwrap();
+        let mut metadata = placement_metadata("path");
+        metadata.values_mut().next().unwrap().path_template = "/bot{credential}/**".into();
+        assert_eq!(
+            state
+                .install_bound_environment(8, env, HashMap::new(), metadata, bindings, vec![])
+                .unwrap(),
+            1
+        );
+        let reference = state.snapshot().child_env["API_KEY"].clone();
+        for method in ["sendMessage", "getUpdates", "editMessageText"] {
+            let target = format!("/bot{reference}/{method}");
+            let resolver = state
+                .resolver_for_endpoint("bot-api.example.com", 443, &target)
+                .unwrap();
+            assert_eq!(
+                crate::secrets::rewrite_target_for_eval(&target, &resolver)
+                    .unwrap()
+                    .resolved,
+                format!("/bot123456:synthetic/{method}")
+            );
+        }
+        let moved = format!("/v1/{reference}/getMe");
+        let resolver = state
+            .resolver_for_endpoint("bot-api.example.com", 443, &moved)
+            .unwrap();
+        assert!(
+            crate::secrets::rewrite_target_for_eval(&moved, &resolver)
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
     }
 
     #[test]

@@ -198,6 +198,76 @@ pub enum CredentialPlacement {
     PathTemplate(String),
 }
 
+/// Authored `path_template` of a credential placed in the request path.
+///
+/// A template is a request path with exactly one `{credential}` slot. It
+/// matches only that path, unless it ends in `/**`. The terminal `/**` also
+/// matches everything below the path through the slot, so one credential serves
+/// every method of an API that keeps its token in a path prefix. A `*` anywhere
+/// else is an ordinary character.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathTemplate {
+    /// The template without a terminal `/**`.
+    prefix: String,
+    /// Byte offset of the credential slot within `prefix`.
+    slot_offset: usize,
+    subtree: bool,
+}
+
+impl PathTemplate {
+    /// The slot a credential placeholder occupies.
+    pub const SLOT: &'static str = "{credential}";
+    const SUBTREE_SUFFIX: &'static str = "/**";
+
+    /// Parse an authored template, or `None` when it cannot place a credential.
+    #[must_use]
+    pub fn parse(template: &str) -> Option<Self> {
+        if !template.starts_with('/')
+            || template.matches(Self::SLOT).count() != 1
+            || template.chars().any(|c| c.is_control() || "?#".contains(c))
+        {
+            return None;
+        }
+        let (prefix, subtree) = template
+            .strip_suffix(Self::SUBTREE_SUFFIX)
+            .map_or((template, false), |prefix| (prefix, true));
+        Some(Self {
+            slot_offset: prefix.find(Self::SLOT)?,
+            prefix: prefix.to_string(),
+            subtree,
+        })
+    }
+
+    /// Whether the template ends in `/**`.
+    #[must_use]
+    pub fn is_subtree(&self) -> bool {
+        self.subtree
+    }
+
+    /// Match a request path whose own credential token was replaced by the slot.
+    ///
+    /// `slot_at` is where that replacement happened in `normalized`. It must
+    /// equal the declared slot: `{credential}` text the client wrote itself is
+    /// not a slot, and would otherwise let the real token sit in the wildcard.
+    fn permits_subtree(&self, normalized: &str, slot_at: usize) -> bool {
+        if slot_at != self.slot_offset {
+            return false;
+        }
+        let Some(tail) = normalized.strip_prefix(self.prefix.as_str()) else {
+            return false;
+        };
+        if tail.is_empty() {
+            return true;
+        }
+        // Descendants only: the slot's segment cannot continue past the template.
+        tail.strip_prefix('/').is_some_and(|descendants| {
+            descendants
+                .split('/')
+                .all(|segment| segment != "." && segment != "..")
+        })
+    }
+}
+
 /// The actual destination of a workload-provided credential placeholder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestCredentialLocation {
@@ -513,9 +583,11 @@ impl SecretResolver {
                 Some(RequestCredentialLocation::Path(actual)),
             ) => {
                 // Normalize only this credential's slot; all other path text must match.
+                let subtree = PathTemplate::parse(expected).filter(PathTemplate::is_subtree);
                 let mut normalized = String::new();
                 let mut pos = 0;
                 let mut slots = 0;
+                let mut slot_at = 0;
                 while pos < actual.len() {
                     let next_canonical = actual[pos..]
                         .find(PLACEHOLDER_PREFIX)
@@ -533,14 +605,19 @@ impl SecretResolver {
                         return false;
                     };
                     if placeholder_env_key(token) == Some(key) {
-                        normalized.push_str("{credential}");
+                        slot_at = normalized.len();
+                        normalized.push_str(PathTemplate::SLOT);
                         slots += 1;
                     } else {
                         normalized.push_str(token);
                     }
                     pos = end;
                 }
-                slots == 1 && normalized == *expected
+                slots == 1
+                    && subtree.as_ref().map_or_else(
+                        || normalized == *expected,
+                        |template| template.permits_subtree(&normalized, slot_at),
+                    )
             }
             _ => false,
         }
@@ -1860,6 +1937,179 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn path_subtree_template_permits_the_base_and_every_descendant() {
+        let resolver = placement_resolver(CredentialPlacement::PathTemplate(
+            "/bot{credential}/**".into(),
+        ));
+        let token = "openshell:resolve:env:v1_TOKEN";
+        for (suffix, resolved) in [
+            ("/sendMessage", "/botsecret-value/sendMessage"),
+            ("/getUpdates", "/botsecret-value/getUpdates"),
+            ("/files/a/b", "/botsecret-value/files/a/b"),
+            ("/", "/botsecret-value/"),
+            ("", "/botsecret-value"),
+        ] {
+            let result = rewrite_target_for_eval(&format!("/bot{token}{suffix}"), &resolver)
+                .unwrap_or_else(|error| panic!("{suffix:?} must be permitted: {error}"));
+            assert_eq!(result.resolved, resolved);
+            assert_eq!(result.redacted, format!("/bot[CREDENTIAL]{suffix}"));
+        }
+        let encoded = format!("/bot{}/getMe", fully_percent_encoded(token));
+        assert!(rewrite_target_for_eval(&encoded, &resolver).is_ok());
+    }
+
+    #[test]
+    fn path_subtree_template_keeps_the_credential_in_its_declared_slot() {
+        let resolver = placement_resolver(CredentialPlacement::PathTemplate(
+            "/bot{credential}/**".into(),
+        ));
+        let token = "openshell:resolve:env:v1_TOKEN";
+        let forged_slot = "{credential}";
+        let encoded_forged_slot = "%7Bcredential%7D";
+        for target in [
+            // The fixed text around the slot must match.
+            format!("/other{token}/getMe"),
+            format!("/prefix/bot{token}/getMe"),
+            // The slot ends at a path boundary, so a sibling segment is not a descendant.
+            format!("/bot{token}.suffix/getMe"),
+            format!("/bot{token}-extra/getMe"),
+            // One occurrence only, even when the second one is in the wildcard tail.
+            format!("/bot{token}/echo/{token}"),
+            // Literal `{credential}` text is not a credential slot. The real token
+            // would otherwise land in the wildcard tail.
+            format!("/bot{forged_slot}/echo/{token}"),
+            format!("/bot{encoded_forged_slot}/echo/{token}"),
+            // The credential may not appear where the template declares no slot.
+            format!("/{token}/getMe"),
+        ] {
+            assert!(
+                rewrite_target_for_eval(&target, &resolver)
+                    .unwrap_err()
+                    .is_placement_mismatch(),
+                "{target} must be a placement mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn path_subtree_template_rejects_dot_segments_in_the_wildcard_tail() {
+        let resolver = placement_resolver(CredentialPlacement::PathTemplate(
+            "/bot{credential}/**".into(),
+        ));
+        let token = "openshell:resolve:env:v1_TOKEN";
+        for target in [
+            format!("/bot{token}/../admin"),
+            format!("/bot{token}/a/./b"),
+            format!("/bot{token}/%2e%2e/admin"),
+        ] {
+            assert!(
+                rewrite_target_for_eval(&target, &resolver)
+                    .unwrap_err()
+                    .is_placement_mismatch(),
+                "{target} must be a placement mismatch"
+            );
+        }
+        // A dot inside a segment name is an ordinary character.
+        assert!(rewrite_target_for_eval(&format!("/bot{token}/file..txt"), &resolver).is_ok());
+    }
+
+    #[test]
+    fn path_subtree_template_does_not_widen_other_credentials() {
+        let (_, resolver) = SecretResolver::from_provider_env_for_revision(
+            HashMap::from([
+                ("TOKEN".to_string(), "secret-value".to_string()),
+                ("OTHER".to_string(), "other-value".to_string()),
+            ]),
+            HashMap::new(),
+            1,
+        );
+        let resolver = resolver.unwrap().with_placements(HashMap::from([
+            (
+                "TOKEN".to_string(),
+                CredentialPlacement::PathTemplate("/bot{credential}/**".into()),
+            ),
+            (
+                "OTHER".to_string(),
+                CredentialPlacement::Header("x-other".into()),
+            ),
+        ]));
+        // OTHER declares a header, so the TOKEN wildcard tail cannot carry it.
+        assert!(
+            rewrite_target_for_eval(
+                "/botopenshell:resolve:env:v1_TOKEN/openshell:resolve:env:v1_OTHER",
+                &resolver
+            )
+            .unwrap_err()
+            .is_placement_mismatch()
+        );
+    }
+
+    #[test]
+    fn path_template_grammar_recognizes_only_a_terminal_subtree_marker() {
+        let exact = PathTemplate::parse("/bot{credential}/sendMessage").unwrap();
+        assert!(!exact.is_subtree());
+
+        let subtree = PathTemplate::parse("/bot{credential}/**").unwrap();
+        assert!(subtree.is_subtree());
+        assert!(
+            PathTemplate::parse("/{credential}/**")
+                .unwrap()
+                .is_subtree()
+        );
+
+        // `*` elsewhere, and a single `*`, are ordinary characters.
+        for template in [
+            "/bot{credential}/*",
+            "/bot{credential}/**/x",
+            "/*/{credential}",
+            "/bot{credential}**",
+        ] {
+            assert!(
+                !PathTemplate::parse(template).unwrap().is_subtree(),
+                "{template}"
+            );
+        }
+
+        // The slot appears exactly once and the path stays a bare path.
+        for template in [
+            "/bot/**",
+            "/bot{credential}/{credential}/**",
+            "bot{credential}/**",
+            "/bot{credential}/**?x=1",
+            "/bot{credential}/**#x",
+            "/bot{credential}/\n**",
+            "",
+        ] {
+            assert!(PathTemplate::parse(template).is_none(), "{template:?}");
+        }
+    }
+
+    #[test]
+    fn literal_star_in_an_exact_path_template_stays_literal() {
+        // Only a terminal `/**` is a wildcard. Every other template keeps its
+        // exact meaning, including the `*` characters it already contained.
+        for template in [
+            "/bot{credential}/*",
+            "/bot{credential}/a*",
+            "/*/{credential}",
+        ] {
+            let resolver = placement_resolver(CredentialPlacement::PathTemplate(template.into()));
+            let token = "openshell:resolve:env:v1_TOKEN";
+            let literal = template.replace("{credential}", token);
+            assert!(
+                rewrite_target_for_eval(&literal, &resolver).is_ok(),
+                "{template} must still match itself literally"
+            );
+            assert!(
+                rewrite_target_for_eval(&format!("/bot{token}/sendMessage"), &resolver)
+                    .unwrap_err()
+                    .is_placement_mismatch(),
+                "{template} must not match other paths"
+            );
+        }
     }
 
     fn fully_percent_encoded(marker: &str) -> String {
