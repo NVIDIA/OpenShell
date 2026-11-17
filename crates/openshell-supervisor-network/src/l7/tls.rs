@@ -8,6 +8,8 @@
 //! store, terminates TLS from the client (presenting dynamic certs per hostname),
 //! inspects the plaintext HTTP, then re-encrypts to upstream using real root CAs.
 
+use rustls::pki_types::pem::PemObject as _;
+
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -105,7 +107,7 @@ impl SandboxCa {
         let ca_key = KeyPair::from_pem(private_key_pem)
             .into_diagnostic()
             .wrap_err("parse proxy CA private key")?;
-        let certificates = rustls_pemfile::certs(&mut certificate_pem.as_bytes())
+        let certificates = CertificateDer::pem_reader_iter(&mut certificate_pem.as_bytes())
             .collect::<std::result::Result<Vec<_>, _>>()
             .into_diagnostic()
             .wrap_err("parse proxy CA certificate")?;
@@ -114,7 +116,9 @@ impl SandboxCa {
                 "proxy CA certificate file must contain exactly one certificate"
             ));
         }
-        let private_key = rustls_pemfile::private_key(&mut private_key_pem.as_bytes())
+        let private_key = PrivateKeyDer::pem_reader_iter(&mut private_key_pem.as_bytes())
+            .next()
+            .transpose()
             .into_diagnostic()
             .wrap_err("parse proxy CA private key")?
             .ok_or_else(|| miette!("proxy CA private key file contains no private key"))?;
@@ -455,9 +459,9 @@ fn load_pem_certs_into_store(
     }
     let mut reader = BufReader::new(pem_data.as_bytes());
     // Collect all results so we can count PEM blocks that fail base64
-    // decoding — rustls_pemfile::certs silently drops those, so without
+    // decoding — CertificateDer::pem_reader_iter silently drops those, so without
     // this they wouldn't be reflected in the `ignored` count.
-    let all_results: Vec<_> = rustls_pemfile::certs(&mut reader).collect();
+    let all_results: Vec<_> = CertificateDer::pem_reader_iter(&mut reader).collect();
     let pem_errors = all_results.iter().filter(|r| r.is_err()).count();
     let certs: Vec<CertificateDer<'static>> =
         all_results.into_iter().filter_map(Result::ok).collect();
@@ -555,7 +559,7 @@ fn pem_encode_certificates(certificates: &[CertificateDer<'_>]) -> String {
 pub fn parse_pem_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file = std::fs::File::open(path).into_diagnostic()?;
     let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_reader_iter(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
         .into_diagnostic()
 }
@@ -762,7 +766,7 @@ mod tests {
         // Bundle should be parseable as PEM certificates
         let mut reader = BufReader::new(bundle_pem.as_bytes());
         assert!(
-            rustls_pemfile::certs(&mut reader).any(|r| r.is_ok()),
+            CertificateDer::pem_reader_iter(&mut reader).any(|r| r.is_ok()),
             "bundle should contain at least one cert",
         );
     }
@@ -771,7 +775,7 @@ mod tests {
     fn generate_ca_ders(count: usize) -> Vec<CertificateDer<'static>> {
         (0..count)
             .map(|_| {
-                rustls_pemfile::certs(&mut generate_ca_pem().as_bytes())
+                CertificateDer::pem_reader_iter(&mut generate_ca_pem().as_bytes())
                     .next()
                     .unwrap()
                     .unwrap()
@@ -786,7 +790,7 @@ mod tests {
         let pem = pem_encode_certificates(&certificates);
 
         assert!(pem.lines().all(|line| line.len() <= 64));
-        let decoded = rustls_pemfile::certs(&mut pem.as_bytes())
+        let decoded = CertificateDer::pem_reader_iter(&mut pem.as_bytes())
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(decoded, certificates);
@@ -821,10 +825,10 @@ mod tests {
                 write_ca_files(&ca, dir.path(), &read_system_ca_bundle()).unwrap();
 
             let bundle = std::fs::read(bundle_path).unwrap();
-            let mut bundled = rustls_pemfile::certs(&mut bundle.as_slice())
+            let mut bundled = CertificateDer::pem_reader_iter(&mut bundle.as_slice())
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .unwrap();
-            let sandbox_ca = rustls_pemfile::certs(&mut ca.cert_pem().as_bytes())
+            let sandbox_ca = CertificateDer::pem_reader_iter(&mut ca.cert_pem().as_bytes())
                 .next()
                 .unwrap()
                 .unwrap();

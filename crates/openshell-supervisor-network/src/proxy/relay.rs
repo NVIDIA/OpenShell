@@ -369,6 +369,7 @@ mod tests {
     use super::*;
     #[cfg(target_os = "windows")]
     use crate::opa::NetworkInput;
+    use rustls::pki_types::pem::PemObject as _;
     #[cfg(target_os = "windows")]
     use std::path::PathBuf;
     #[cfg(target_os = "windows")]
@@ -487,7 +488,9 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca = SandboxCa::generate().unwrap();
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
+        for cert in
+            rustls::pki_types::CertificateDer::pem_reader_iter(&mut ca.cert_pem().as_bytes())
+        {
             roots.add(cert.unwrap()).unwrap();
         }
         let config = Arc::new(
