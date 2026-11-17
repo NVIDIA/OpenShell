@@ -72,11 +72,6 @@ path = "tests/vm_overlay.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
-name = "service_bearer_passthrough"
-path = "tests/service_bearer_passthrough.rs"
-required-features = ["e2e-docker"]
-
-[[test]]
 name = "rootfs_tar"
 path = "tests/rootfs_tar.rs"
 required-features = ["e2e-vm"]
@@ -271,13 +266,11 @@ sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.9"
-rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = { package = "noyalib", version = "0.0.53", default-features = false, features = ["std", "compat-serde-yaml"] }
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 tower = "0.5"
 url = "2"
 
