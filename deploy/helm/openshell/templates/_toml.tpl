@@ -104,9 +104,10 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- $gateway := get $config "openshell.gateway" | default dict -}}
 {{- if not (hasKey $gateway "name") -}}{{- $_ := set $gateway "name" (get $legacyServer "name" | default (include "openshell.fullname" .)) -}}{{- end -}}
 {{/* The Service and probes own listener ports, so keep runtime listeners aligned. */}}
-{{- $_ := set $gateway "bind_address" (printf "0.0.0.0:%v" .Values.service.port) -}}
-{{- if .Values.service.healthPort -}}{{- $_ := set $gateway "health_bind_address" (printf "0.0.0.0:%v" .Values.service.healthPort) -}}{{- else -}}{{- $_ := unset $gateway "health_bind_address" -}}{{- end -}}
-{{- if include "openshell.metricsEnabled" . -}}{{- $_ := set $gateway "metrics_bind_address" (printf "0.0.0.0:%v" .Values.service.metricsPort) -}}{{- else -}}{{- $_ := unset $gateway "metrics_bind_address" -}}{{- end -}}
+{{- $listenHost := include "openshell.listenHost" .Values.gateway.listenAddress -}}
+{{- $_ := set $gateway "bind_address" (printf "%s:%v" $listenHost .Values.service.port) -}}
+{{- if .Values.service.healthPort -}}{{- $_ := set $gateway "health_bind_address" (printf "%s:%v" $listenHost .Values.service.healthPort) -}}{{- else -}}{{- $_ := unset $gateway "health_bind_address" -}}{{- end -}}
+{{- if include "openshell.metricsEnabled" . -}}{{- $_ := set $gateway "metrics_bind_address" (printf "%s:%v" $listenHost .Values.service.metricsPort) -}}{{- else -}}{{- $_ := unset $gateway "metrics_bind_address" -}}{{- end -}}
 {{- range $legacyKey, $runtimeKey := dict "logLevel" "log_level" "enableLoopbackServiceHttp" "enable_loopback_service_http" "enableWebsocketTunnel" "enable_websocket_tunnel" "policyValidationFailureMode" "policy_validation_failure_mode" -}}
 {{- if not (hasKey $gateway $runtimeKey) -}}{{- $_ := set $gateway $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
 {{- end -}}

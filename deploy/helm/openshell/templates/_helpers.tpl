@@ -596,6 +596,10 @@ default to enabled; an explicit false must not be replaced by that default.
 {{- if $enabled -}}true{{- end -}}
 {{- end }}
 
+{{- define "openshell.listenHost" -}}
+{{- if contains ":" . -}}[{{ . }}]{{- else -}}{{ . }}{{- end -}}
+{{- end }}
+
 {{/*
 Validate a non-empty, user-provided Kubernetes Secret name. Secret data never
 passes through Helm values into gateway.toml; only this reference is rendered.

@@ -1373,6 +1373,8 @@ Kubernetes configurations set `namespace`, `service_account_name`, and `enable_u
 
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 
+On IPv6 clusters, set the Helm values `gateway.listenAddress` and `supervisor.listenAddress` to `::`.
+
 ```toml
 [openshell]
 version = 2
