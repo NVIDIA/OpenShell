@@ -371,9 +371,14 @@ ORDER BY id LIMIT $2",
             return Err(conflict(Some(resource_version(&sandbox))));
         }
         let image_state_id = state_id(sandbox_id);
+        let frozen_policy_id = super::frozen_policy::frozen_policy_id(sandbox_id);
         for (object_type, id) in [
             ("sandbox", sandbox_id),
             (IMAGE_STATE_OBJECT_TYPE, image_state_id.as_str()),
+            (
+                super::frozen_policy::FROZEN_POLICY_OBJECT_TYPE,
+                frozen_policy_id.as_str(),
+            ),
         ] {
             match &mut tx {
                 ImageTransaction::Sqlite(tx) => {

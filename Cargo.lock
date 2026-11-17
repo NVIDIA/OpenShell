@@ -4452,6 +4452,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tonic-reflection",
  "tonic-types",
  "tracing",
  "tracing-subscriber",

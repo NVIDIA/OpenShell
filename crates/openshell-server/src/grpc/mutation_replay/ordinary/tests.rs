@@ -24,6 +24,83 @@ async fn protected_state() -> (tempfile::TempDir, Arc<ServerState>) {
     (directory, state)
 }
 
+#[tokio::test]
+async fn global_policy_replay_preserves_frozen_sandbox_report() {
+    let (_directory, state) = protected_state().await;
+    let policy = openshell_policy::restrictive_default_policy();
+    let sandbox = Sandbox {
+        metadata: Some(meta("frozen-report")),
+        ..Default::default()
+    };
+    state.store.create_frozen_sandbox(&sandbox).await.unwrap();
+    let stored = state
+        .store
+        .get_message::<Sandbox>(sandbox.object_id())
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .store
+        .accept_frozen_sandbox_configuration(
+            stored,
+            openshell_core::proto::FrozenSandboxPolicy {
+                policy: Some(policy.clone()),
+                policy_hash: openshell_core::policy_identity::deterministic_policy_hash(&policy),
+                policy_source: openshell_core::proto::PolicySource::Sandbox.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let request = openshell_core::proto::UpdateFrozenGlobalConfigRequest {
+        request_id: id(),
+        global: true,
+        policy: Some(policy),
+        ..Default::default()
+    };
+    let service = crate::grpc::OpenShellService::new(Arc::clone(&state));
+    for field in [
+        "workspace_scope",
+        "sandbox",
+        "merge_operations",
+        "annotations",
+        "expected_resource_version",
+    ] {
+        let mut invalid = request.clone();
+        invalid.request_id = id();
+        match field {
+            "workspace_scope" => {
+                invalid.workspace_scope =
+                    Some(openshell_core::proto::workspace_selector("default"));
+            }
+            "sandbox" => invalid.sandbox = "frozen-report".into(),
+            "merge_operations" => invalid
+                .merge_operations
+                .push(openshell_core::proto::PolicyMergeOperation::default()),
+            "annotations" => {
+                invalid.annotations.insert("example".into(), "value".into());
+            }
+            "expected_resource_version" => invalid.expected_resource_version = 1,
+            _ => unreachable!(),
+        }
+        let error = openshell_core::proto::frozen_sandbox_policies_server::FrozenSandboxPolicies::update_global_config(
+            &service, authed_request(invalid)).await.unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument, "{field}");
+        assert!(
+            error
+                .message()
+                .contains("unsupported for global configuration"),
+            "{field}: {error}"
+        );
+    }
+    let original = run(&state, authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(original.frozen_sandboxes, ["default/frozen-report"]);
+    assert_eq!(replay(&state, request).await, original);
+}
+
 fn configure_key(state: &mut Arc<ServerState>, directory: &tempfile::TempDir) {
     let key = directory.path().join("private-key");
     std::fs::write(&key, b"test-only stable private fingerprint material").unwrap();
@@ -263,6 +340,49 @@ async fn replay<M: Mutation + Clone>(state: &Arc<ServerState>, req: M) -> M::Out
         "true"
     );
     response.into_inner()
+}
+
+#[tokio::test]
+async fn frozen_policy_create_replays_mode_without_colliding_with_ordinary_create() {
+    let (_directory, state) = protected_state().await;
+    let ordinary = create_sandbox("frozen-replay");
+    let request = openshell_core::proto::CreateFrozenSandboxRequest {
+        workspace_scope: ordinary.workspace_scope.clone(),
+        spec: ordinary.spec.clone(),
+        name: ordinary.name.clone(),
+        request_id: ordinary.request_id.clone(),
+        ..Default::default()
+    };
+    let created = run(&state, authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(created.frozen_policy.as_ref().unwrap().requested);
+    assert!(created.frozen_policy.as_ref().unwrap().policy.is_none());
+    let returned = replay(&state, request.clone()).await;
+    assert_eq!(
+        returned.sandbox.as_ref().unwrap().object_id(),
+        created.sandbox.as_ref().unwrap().object_id()
+    );
+    assert!(returned.frozen_policy.unwrap().requested);
+    // Identical caller request ids are independent across the two RPC services.
+    assert_eq!(
+        run(&state, authed_request(ordinary))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let sandbox = created.sandbox.unwrap();
+    state
+        .store
+        .delete_sandbox_with_image_state_if(sandbox.object_id(), sandbox.get_resource_version())
+        .await
+        .unwrap();
+    assert_eq!(
+        reason(&run(&state, authed_request(request)).await.unwrap_err()),
+        "REQUEST_REPLAY_UNAVAILABLE"
+    );
 }
 
 #[tokio::test]

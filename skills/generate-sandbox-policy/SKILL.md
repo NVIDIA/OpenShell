@@ -13,6 +13,11 @@ This skill translates a user's plain-language policy intent into a valid sandbox
 
 The output is a `network_policies` YAML block, an optional `network_middlewares` block, and optionally a full policy file that conforms to the sandbox policy schema.
 
+When the sandbox was created with `--frozen`, inspect its initialized state
+before proposing a policy update. A frozen sandbox requires deletion and
+recreation with the newly reviewed policy. Freeze is a creation option, not a
+YAML policy field; credential values may rotate without changing authorization.
+
 ## Step 1: Gather Inputs
 
 ### Determine the Detail Tier
