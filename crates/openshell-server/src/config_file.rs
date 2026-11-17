@@ -111,6 +111,9 @@ pub struct GatewayFileSection {
     pub log_level: Option<String>,
 
     // ── Database ─────────────────────────────────────────────────────────
+    /// Explicit identity source; connection URL stays environment-only.
+    #[serde(default)]
+    pub database_auth: Option<openshell_core::config::DatabaseAuthMode>,
     /// Connection ceiling for the persistence pool. One shared pool serves
     /// every database-backed RPC, so this is also the gateway's ceiling on
     /// concurrent database work. On Postgres, each replica also opens up to

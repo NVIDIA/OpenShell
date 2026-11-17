@@ -3,6 +3,7 @@
 
 //! Persistence layer for `OpenShell` Server.
 
+mod azure_workload_identity;
 mod image_activation;
 mod legacy_time_wire;
 pub mod lock_order;
@@ -503,6 +504,28 @@ impl Store {
         max_connections: Option<u32>,
         lock_max_connections: Option<u32>,
     ) -> CoreResult<PersistenceResult<Self>> {
+        Self::try_connect_with_database_auth(
+            url,
+            max_connections,
+            lock_max_connections,
+            openshell_core::config::DatabaseAuthMode::Default,
+        )
+        .await
+    }
+
+    pub(crate) async fn try_connect_with_database_auth(
+        url: &str,
+        max_connections: Option<u32>,
+        lock_max_connections: Option<u32>,
+        auth: openshell_core::config::DatabaseAuthMode,
+    ) -> CoreResult<PersistenceResult<Self>> {
+        if auth == openshell_core::config::DatabaseAuthMode::AzureWorkloadIdentity
+            && !(url.starts_with("postgres://") || url.starts_with("postgresql://"))
+        {
+            return Err(CoreError::config(
+                "azure-workload-identity database authentication requires PostgreSQL",
+            ));
+        }
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
             if let Some(configured) = max_connections
                 && configured < postgres::MIN_MAX_CONNECTIONS
@@ -515,8 +538,23 @@ impl Store {
                 )));
             }
             Ok(async {
-                let store =
-                    PostgresStore::connect(url, max_connections, lock_max_connections).await?;
+                let identity =
+                    if auth == openshell_core::config::DatabaseAuthMode::AzureWorkloadIdentity {
+                        Some(
+                            azure_workload_identity::AzureWorkloadIdentity::from_env()
+                                .map_err(|error| PersistenceError::Config(error.to_string()))?,
+                        )
+                    } else {
+                        None
+                    };
+                let store = PostgresStore::connect_with_identity(
+                    url,
+                    max_connections,
+                    lock_max_connections
+                        .unwrap_or(mutation_lock::MUTATION_LOCK_POOL_MAX_CONNECTIONS),
+                    identity,
+                )
+                .await?;
                 store.migrate().await?;
                 Ok(Self::Postgres(store))
             }
@@ -1548,7 +1586,16 @@ pub fn current_time_ms() -> i64 {
 }
 
 fn map_db_error(error: &sqlx::Error) -> PersistenceError {
-    if matches!(error, sqlx::Error::PoolTimedOut) {
+    let unavailable = match error {
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Io(error) => error.get_ref().is_some_and(
+            <dyn std::error::Error + Send + Sync + 'static>::is::<
+                azure_workload_identity::CredentialUnavailable,
+            >,
+        ),
+        _ => false,
+    };
+    if unavailable {
         return PersistenceError::Unavailable(error.to_string());
     }
     if let sqlx::Error::Database(db) = error
