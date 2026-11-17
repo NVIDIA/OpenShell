@@ -164,7 +164,7 @@ jobs:
           # environment needs its own key; its installers share it. No
           # restore-keys fallback: restoring an older entry would carry its
           # stale disks into the new one, which then only grows.
-          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/config.nix', 'tests/tmachine/images.nix', 'tests/tmachine/src/qemu/setup.rs', 'tests/tmachine/src/qemu/layer.rs', 'scripts/keycloak-realm.json') }}
+          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/config.nix', 'tests/tmachine/images.nix', 'tests/tmachine/src/qemu/setup.rs', 'tests/tmachine/src/qemu/layer.rs', 'tests/tmachine/src/qemu/ansible_hash.rs', 'scripts/keycloak-realm.json') }}
 
       - name: Download integration inputs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

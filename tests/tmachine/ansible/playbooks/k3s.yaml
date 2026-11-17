@@ -71,3 +71,31 @@
         creates: /usr/local/bin/helm
       environment:
         DESIRED_VERSION: "v{{ helm_version }}"
+
+    # This layer is cached across runs, so it must not carry cluster
+    # credentials: every disk built on it would share one CA, token and admin
+    # kubeconfig. Stop K3s and delete the state it created on first start,
+    # keeping the containerd image store (agent/containerd) and the K3s data
+    # directory. The next start generates fresh credentials.
+    - name: Stop K3s and its containers
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s-killall.sh]
+      changed_when: true
+
+    - name: Remove the K3s credentials and cluster state
+      ansible.builtin.shell: |
+        set -eu
+        cd /var/lib/rancher/k3s
+        rm -rf server/tls server/cred server/db server/token server/agent-token server/node-token
+        find agent -maxdepth 1 -type f \( -name '*.crt' -o -name '*.key' -o -name '*.kubeconfig' \) -delete
+        rm -rf /etc/rancher/node/password /etc/rancher/k3s/k3s.yaml /var/lib/kubelet/pods /var/lib/cni
+      changed_when: true
+
+    - name: Check no K3s credentials remain
+      ansible.builtin.shell: |
+        find /var/lib/rancher/k3s/server /var/lib/rancher/k3s/agent /etc/rancher/k3s /etc/rancher/node \
+          -maxdepth 1 \( -name '*.crt' -o -name '*.key' -o -name '*.kubeconfig' -o -name token -o -name password \
+             -o -name 'k3s.yaml' -o -name '*.db' -o -name tls -o -name cred \) -print
+      register: k3s_leftover_credentials
+      changed_when: false
+      failed_when: k3s_leftover_credentials.stdout | length > 0
