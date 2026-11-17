@@ -208,6 +208,62 @@ jobs:
           retention-days: 5
           if-no-files-found: error
 
+  # The test bundles of the tmachine E2E suites rows that don't run
+  # openshell-conformance, built once per run instead of in every row (see
+  # e2e-suites.yml). The rows only run on amd64, so only the x86_64 guest
+  # target is built. Each bundle holds its whole family; a row picks its
+  # package at run time. Rust Cache (rust-cache.yml) saves the cache on main;
+  # keep the env and build commands aligned with its e2e-bundles job.
+  build-e2e-bundles:
+    name: E2E suite bundles (x86_64-unknown-linux-musl)
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.run_integration == 'true'
+    permissions:
+      contents: read
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/setup-nix
+        with:
+          prepare-shell: "true"
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: e2e-bundles-v1-x86_64-unknown-linux-musl
+      - name: Build the bundles
+        env:
+          # One target directory for every family, so later families reuse
+          # testkit-ready and the dependencies the first one built. It is the
+          # root target directory, which setup-rust caches.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          # Every row downloads the bundles. Line tables keep backtraces
+          # readable at a third of the size of full debuginfo.
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: |
+          set -euo pipefail
+          # Retry dependency preparation, then build once.
+          nix build --no-link .#openshell-test-runner || nix build --no-link .#openshell-test-runner
+          for family in features drivers/podman; do
+            nix run .#openshell-test-runner -- build \
+              --family "$family" --out "artifacts/e2e-bundles/${family//\//-}"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openshell-e2e-bundle-features-x86_64-unknown-linux-musl
+          path: artifacts/e2e-bundles/features
+          retention-days: 5
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openshell-e2e-bundle-drivers-podman-x86_64-unknown-linux-musl
+          path: artifacts/e2e-bundles/drivers-podman
+          retention-days: 5
+          if-no-files-found: error
+
   build-external-drivers:
     name: ${{ matrix.binary }} (${{ matrix.triple }})
     needs: [pr_metadata, version]
@@ -219,8 +275,8 @@ jobs:
         include:
           - package: openshell-driver-docker
             binary: openshell-driver-docker
-            triple: aarch64-unknown-linux-gnu
-            runner: linux-arm64-cpu8
+            triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
           - package: openshell-driver-podman
             binary: openshell-driver-podman
             triple: x86_64-unknown-linux-gnu
@@ -283,7 +339,6 @@ jobs:
     if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       contents: read
-      packages: read
     uses: ./.github/workflows/deb-package.yml
     with:
       checkout-ref: ${{ github.sha }}
@@ -344,7 +399,7 @@ jobs:
           if-no-files-found: error
 
   prepare-integration:
-    needs: [pr_metadata, build-binaries-linux, build-images, build-deb, build-rpm, build-tmachine-test-inputs]
+    needs: [pr_metadata, build-binaries-linux, build-images, build-deb, build-rpm, build-tmachine-test-inputs, build-external-drivers]
     if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       actions: read
@@ -355,6 +410,7 @@ jobs:
       deb-artifact-name: deb-linux-amd64
       rpm-artifact-name: rpm-linux-x86_64
       test-inputs-artifact-name: openshell-tmachine-test-inputs
+      external-drivers: true
 
   # Run driver-independent conformance tests.
   conformance-integration:
@@ -366,7 +422,8 @@ jobs:
     uses: ./.github/workflows/e2e-suites.yml
     with:
       family: conformance
-      prebuilt-conformance: true
+      prebuilt: true
+      external-drivers: true
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
     secrets:
@@ -375,7 +432,7 @@ jobs:
   # Run the testkit feature suites (tests/suites/features) on tmachine. The
   # environments and suites are listed in e2e-suites.yml.
   feature-specific-integration:
-    needs: prepare-integration
+    needs: [prepare-integration, build-e2e-bundles]
     permissions:
       actions: read
       contents: read
@@ -383,6 +440,7 @@ jobs:
     uses: ./.github/workflows/e2e-suites.yml
     with:
       family: features
+      prebuilt: true
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
     secrets:
@@ -391,7 +449,7 @@ jobs:
   # Run the testkit driver suites (tests/suites/drivers) on tmachine. The
   # environments and suites are listed in e2e-suites.yml.
   driver-specific-integration:
-    needs: prepare-integration
+    needs: [prepare-integration, build-e2e-bundles]
     permissions:
       actions: read
       contents: read
@@ -399,13 +457,13 @@ jobs:
     uses: ./.github/workflows/e2e-suites.yml
     with:
       family: drivers
+      prebuilt: true
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-  # Run the Podman e2e suite on tmachine. It needs the binary installer's CLI
-  # path and local HTTP gateway.
+  # Run the Podman e2e suite on tmachine against the packaged gateway.
   podman-e2e-integration:
     needs: prepare-integration
     permissions:
@@ -419,7 +477,7 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"}
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"e2e-podman"}
         ]
 
   docker-e2e:
@@ -486,23 +544,6 @@ jobs:
       prebuilt-conformance: true
       suite-name: additional-ca
       test-name: additional_ca
-
-  docker-external-driver-e2e:
-    needs: [pr_metadata, build-binaries-linux, build-conformance, build-gateway-plain, build-external-drivers, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-docker-test.yml
-    with:
-      prebuilt-conformance: true
-      image-tag: ${{ github.sha }}
-      runner: linux-arm64-cpu8
-      gateway-artifact: openshell-gateway-plain-aarch64-unknown-linux-gnu
-      external-driver-binary: openshell-driver-docker
-      suite-matrix: >-
-        [{"suite":"external-driver","cmd":"mise run --no-deps --skip-deps e2e:docker:external-driver","apt_packages":"openssh-client","python_proto":false,"mcp":false}]
 
   podman-external-driver-e2e:
     needs: [pr_metadata, build-binaries-linux, build-conformance, build-gateway-plain, build-external-drivers, build-images]
@@ -659,6 +700,20 @@ jobs:
       job-name: Kubernetes E2E (workspace operator mode)
       e2e-task: e2e:kubernetes:workspace-operator
 
+  kubernetes-tracing-e2e:
+    needs: [pr_metadata, build-binaries-linux, build-conformance, build-images]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      prebuilt-conformance: true
+      image-tag: ${{ github.sha }}
+      job-name: Kubernetes E2E (trace export)
+      e2e-task: e2e:kubernetes:tracing
+
   kubernetes-ha-e2e:
     needs: [pr_metadata, build-binaries-linux, build-conformance, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
@@ -706,7 +761,6 @@ jobs:
       - podman-additional-ca-e2e
       - vm-e2e
       - vm-additional-ca-e2e
-      - docker-external-driver-e2e
       - podman-external-driver-e2e
       - vm-external-driver-e2e
       - kubernetes-e2e
@@ -714,6 +768,7 @@ jobs:
       - kubernetes-external-driver-e2e
       - kubernetes-workspace-managed-e2e
       - kubernetes-workspace-operator-e2e
+      - kubernetes-tracing-e2e
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:

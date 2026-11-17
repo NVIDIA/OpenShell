@@ -175,6 +175,8 @@ pub struct SharedHostConfig {
     pub runtime_listen: SocketAddr,
     /// Time a withdrawn sandbox instance may take to stop its workload.
     pub removal_grace: Duration,
+    /// Initial boundary attachment and image-policy discovery budget.
+    pub attach_request_timeout: Duration,
     /// This process's identity as a member of the supervisor pool.
     pub pool: PoolIdentity,
 }
@@ -187,6 +189,7 @@ pub struct SharedHost {
     router: Arc<RuntimeRouter>,
     gateway_endpoint: String,
     removal_grace: Duration,
+    attach_request_timeout: Duration,
     /// Assignments of the latest snapshot that could not be admitted, reported
     /// as failed instances until the gateway withdraws them.
     rejected: Mutex<BTreeMap<String, SandboxInstanceStatusReport>>,
@@ -305,6 +308,7 @@ impl SharedHost {
             router,
             gateway_endpoint: config.gateway_endpoint,
             removal_grace: config.removal_grace,
+            attach_request_timeout: config.attach_request_timeout,
             rejected: Mutex::new(BTreeMap::new()),
             desired_routes: Mutex::new(None),
             pool: config.pool,
@@ -816,6 +820,7 @@ impl SharedHost {
             auth_bundle: registration.auth,
             admitted_isolation_backend: Some(openshell_sandbox_backend::BACKEND_NAME.to_string()),
             main_exit_marker: None,
+            attach_request_timeout: self.attach_request_timeout,
             trace_context: registration.trace_context,
             // One process cannot hold a per-sandbox workload identity, so
             // providers that need one fail closed.
@@ -1009,7 +1014,17 @@ enum StreamEnd {
         accepted: bool,
         redial: Option<String>,
     },
+    /// The gateway sent the host to another replica; dial it at once.
+    /// `accepted` records whether the gateway had accepted the host.
+    Redirected {
+        peer_endpoint: String,
+        accepted: bool,
+    },
 }
+
+/// Redirects a host follows in a row: the replica a redirect names may find
+/// itself full and send the host on once more.
+const REDIRECT_HOPS: u32 = 2;
 
 /// What a gateway sends a host on its assignment stream.
 type GatewayInbound = std::pin::Pin<
@@ -1095,6 +1110,11 @@ async fn attach_with(
     // unanswered ones is still quick.
     let mut unanswered = 0_u32;
     let mut redial = None;
+    // `hops`: redirects followed since the host was last placed. `stay`: the
+    // attempt after a failed redirect stays wherever the Service lands it, so
+    // a stale ring cannot send it back to the replica it could not reach.
+    let mut hops = 0_u32;
+    let mut stay = false;
     tokio::pin!(shutdown);
     loop {
         connection_epoch += 1;
@@ -1105,16 +1125,40 @@ async fn attach_with(
                 member_id: host.pool.member_id.clone(),
                 runtime_address: host.pool.runtime_address.to_string(),
             }),
+            accepts_redirect: !stay
+                && if hops == 0 {
+                    redial.is_none()
+                } else {
+                    hops < REDIRECT_HOPS
+                },
         };
+        let accepts_redirect = hello.accepts_redirect;
         let attempt_timeout = timings.attempt_timeout(unanswered);
         let end = tokio::select! {
             end = run_stream(&host, connector.as_ref(), &reconciler, hello, &timings, attempt_timeout, redial.as_deref()) => end,
             () = &mut shutdown => return reconciler.shut_down().await,
         };
-        let StreamEnd::Lost {
-            accepted,
-            redial: next,
-        } = end;
+        let (accepted, next) = match end {
+            StreamEnd::Redirected {
+                peer_endpoint,
+                accepted,
+            } if accepted || accepts_redirect => {
+                tracing::info!(%peer_endpoint, "gateway redirected the supervisor host");
+                if accepted {
+                    failed = 0;
+                    unanswered = 0;
+                    hops = 0;
+                }
+                hops += 1;
+                stay = false;
+                redial = Some(peer_endpoint);
+                continue;
+            }
+            StreamEnd::Redirected { accepted, .. } => (accepted, None),
+            StreamEnd::Lost { accepted, redial } => (accepted, redial),
+        };
+        stay = hops > 0 && !accepted;
+        hops = 0;
         redial = next;
         if accepted {
             failed = 0;
@@ -1481,6 +1525,10 @@ async fn run_stream(
                         tracing::error!(reason = %rejected.reason, "gateway rejected the supervisor host");
                         break lost(accepted);
                     }
+                    Some(host_gateway_message::Payload::Redirect(redirect)) if !redirect.peer_endpoint.is_empty() => {
+                        break StreamEnd::Redirected { peer_endpoint: redirect.peer_endpoint, accepted };
+                    }
+                    Some(host_gateway_message::Payload::Redirect(_)) => break lost(accepted),
                     Some(host_gateway_message::Payload::Assignments(snapshot)) => {
                         if !accepted {
                             tracing::warn!("gateway sent assignments before accepting the host");
@@ -1621,6 +1669,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
@@ -1657,6 +1706,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
@@ -1778,6 +1828,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
@@ -1874,6 +1925,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
@@ -1938,9 +1990,10 @@ mod tests {
             Some(SandboxInstancePhaseReport::Supervising)
         );
         assert!(kept_stops.try_recv().is_err());
-        let mut stream = tokio::net::TcpStream::connect(host.router.local_addr())
-            .await
-            .unwrap();
+        let mut stream =
+            openshell_core::net::connect_tcp_nodelay_best_effort(host.router.local_addr())
+                .await
+                .unwrap();
         assert_eq!(
             openshell_sandbox_backend::runtime_routed::negotiate_route(&mut stream, elsewhere)
                 .await
@@ -1959,6 +2012,7 @@ mod tests {
     }
 
     /// How one connection attempt to a [`FakeGateway`] goes.
+    #[derive(Clone, Copy)]
     enum Attempt {
         /// Never opens.
         Hang,
@@ -2094,6 +2148,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
@@ -2317,6 +2372,89 @@ mod tests {
         assert_eq!(next.endpoint, None);
     }
 
+    fn accepts_redirect(message: Option<HostMessage>) -> bool {
+        match message {
+            Some(HostMessage {
+                payload: Some(host_message::Payload::Hello(hello)),
+            }) => hello.accepts_redirect,
+            other => panic!("expected a hello, got {other:?}"),
+        }
+    }
+
+    fn redirect_to(peer_endpoint: &str) -> HostGatewayMessage {
+        openshell_supervisor_control::controller::redirect(peer_endpoint.to_string())
+    }
+
+    /// A redirected host dials the named replica at once and takes one more
+    /// redirect from it, then stays; when the replica it was sent to does not
+    /// accept it, the host asks the replica the Service picks to keep it.
+    #[tokio::test(start_paused = true)]
+    async fn a_redirected_host_follows_at_most_two_redirects_then_stays() {
+        let (_host, _gateway, mut streams, _root) = attach_pool_host(vec![Attempt::Now; 5]);
+        let mut first = streams.recv().await.unwrap();
+        assert!(accepts_redirect(first.outbound.recv().await));
+        first
+            .inbound
+            .send(Ok(redirect_to("https://gw-b:8443")))
+            .await
+            .unwrap();
+
+        let mut second = streams.recv().await.unwrap();
+        assert_eq!(second.endpoint.as_deref(), Some("https://gw-b:8443"));
+        assert_eq!(second.at, first.at);
+        assert!(accepts_redirect(second.outbound.recv().await));
+        second
+            .inbound
+            .send(Ok(redirect_to("https://gw-c:8443")))
+            .await
+            .unwrap();
+
+        let mut third = streams.recv().await.unwrap();
+        assert_eq!(third.endpoint.as_deref(), Some("https://gw-c:8443"));
+        assert_eq!(third.at, first.at);
+        assert!(!accepts_redirect(third.outbound.recv().await));
+        drop(third);
+
+        let mut fallback = streams.recv().await.unwrap();
+        assert_eq!(fallback.endpoint, None);
+        assert!(!accepts_redirect(fallback.outbound.recv().await));
+        drop(fallback);
+
+        let mut next = streams.recv().await.unwrap();
+        assert!(accepts_redirect(next.outbound.recv().await));
+    }
+
+    /// A host accepted where a redirect sent it follows that replica's own
+    /// redirect when it stops, at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_host_follows_a_later_handoff_redirect() {
+        let (_host, _gateway, mut streams, _root) = attach_pool_host(vec![Attempt::Now; 3]);
+        let first = streams.recv().await.unwrap();
+        first
+            .inbound
+            .send(Ok(redirect_to("https://gw-b:8443")))
+            .await
+            .unwrap();
+
+        let second = streams.recv().await.unwrap();
+        second
+            .inbound
+            .send(Ok(accepted_by("https://gw-b:8443")))
+            .await
+            .unwrap();
+        let handed_off = tokio::time::Instant::now();
+        second
+            .inbound
+            .send(Ok(redirect_to("https://gw-c:8443")))
+            .await
+            .unwrap();
+
+        let mut third = streams.recv().await.unwrap();
+        assert_eq!(third.endpoint.as_deref(), Some("https://gw-c:8443"));
+        assert_eq!(third.at, handed_off);
+        assert!(accepts_redirect(third.outbound.recv().await));
+    }
+
     /// A replica that keeps writing but stops reading fills the host's
     /// outbound queue; the blocked send gives up within the silence budget
     /// rather than the ordinary send bound.
@@ -2447,6 +2585,7 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),

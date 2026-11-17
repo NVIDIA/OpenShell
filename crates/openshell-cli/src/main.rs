@@ -193,8 +193,9 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
-                        openshell_cli::oidc_auth::oidc_refresh_token(
+                        openshell_cli::oidc_auth::oidc_renew_token(
                             &bundle,
+                            meta.oidc_audience.as_deref(),
                             meta.oidc_scopes.as_deref(),
                             insecure,
                         ),
@@ -504,6 +505,8 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// `Sandbox` embeds `SandboxCommands`, which is intentionally large.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     // ===================================================================
     // SANDBOX COMMANDS
@@ -1578,6 +1581,11 @@ enum SandboxCommands {
         )]
         restart_policy: String,
 
+        /// Seconds to wait without provisioning progress before giving up
+        /// (default: 300, or `OPENSHELL_PROVISION_TIMEOUT`).
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<std::num::NonZeroU32>,
+
         /// Auto-create missing providers from local credentials.
         ///
         /// Without this flag, an interactive prompt asks per-provider;
@@ -2155,6 +2163,13 @@ enum DraftCommands {
 
 #[derive(Subcommand, Debug)]
 enum PolicyCommands {
+    /// Validate an authored policy file offline, without a gateway.
+    #[command(help_template = LEAF_HELP_TEMPLATE)]
+    Lint {
+        /// Path to the authored policy YAML file.
+        #[arg(value_hint = ValueHint::FilePath)]
+        policy: String,
+    },
     /// Update policy on a live sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
@@ -2511,6 +2526,10 @@ enum WorkspaceCommands {
         /// Labels to attach to the workspace (KEY=VALUE).
         #[arg(long = "label", value_name = "KEY=VALUE")]
         labels: Vec<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Fetch a workspace by name.
@@ -2519,6 +2538,10 @@ enum WorkspaceCommands {
         /// Workspace name.
         #[arg(add = ArgValueCompleter::new(completers::complete_workspace_names))]
         name: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// List workspaces.
@@ -2775,7 +2798,12 @@ async fn run_async() -> Result<()> {
         // Top-level status
         // -----------------------------------------------------------
         Some(Commands::Status { output }) => {
-            if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+            // A gateway named on the command line must be registered.
+            let resolved = match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                Err(err) if cli.gateway.is_some() => return Err(err),
+                resolved => resolved,
+            };
+            if let Ok(ctx) = resolved {
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
                 run::gateway_status(
@@ -3063,12 +3091,16 @@ async fn run_async() -> Result<()> {
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
         Some(Commands::Policy {
+            command: Some(PolicyCommands::Lint { policy }),
+        }) => run::sandbox_policy_lint(&policy)?,
+        Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match policy_cmd {
+                PolicyCommands::Lint { .. } => unreachable!("offline lint is dispatched above"),
                 PolicyCommands::Set {
                     name,
                     policy,
@@ -3402,6 +3434,7 @@ async fn run_async() -> Result<()> {
                     no_tty,
                     detach,
                     restart_policy,
+                    timeout,
                     auto_providers,
                     no_auto_providers,
                     labels,
@@ -3497,6 +3530,7 @@ async fn run_async() -> Result<()> {
                             detach,
                             suppress_credential_warnings: no_credential_warnings,
                             restart_policy: &restart_policy,
+                            provision_timeout_secs: timeout.map(std::num::NonZeroU32::get),
                         },
                         &cli.workspace,
                         &tls,
@@ -3858,11 +3892,15 @@ async fn run_async() -> Result<()> {
             apply_auth(&mut tls, &ctx.name)?;
 
             match command {
-                WorkspaceCommands::Create { name, labels } => {
-                    run::workspace_create(endpoint, &name, &labels, &tls).await?;
+                WorkspaceCommands::Create {
+                    name,
+                    labels,
+                    output,
+                } => {
+                    run::workspace_create(endpoint, &name, &labels, output.as_str(), &tls).await?;
                 }
-                WorkspaceCommands::Get { name } => {
-                    run::workspace_get(endpoint, &name, &tls).await?;
+                WorkspaceCommands::Get { name, output } => {
+                    run::workspace_get(endpoint, &name, output.as_str(), &tls).await?;
                 }
                 WorkspaceCommands::List {
                     page_size,
@@ -6356,6 +6394,20 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_timeout_parses() {
+        let cli =
+            Cli::try_parse_from(["openshell", "sandbox", "create", "--timeout", "900"]).unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { timeout, .. }),
+                ..
+            }) => assert_eq!(timeout, std::num::NonZeroU32::new(900)),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["openshell", "sandbox", "create", "--timeout", "0"]).is_err());
+    }
+
+    #[test]
     fn sandbox_create_restart_policy_rejects_unknown_value() {
         assert!(
             Cli::try_parse_from([
@@ -6753,6 +6805,35 @@ mod tests {
                 assert!(all_workspaces);
             }
             other => panic!("expected SandboxTemplateCommands::List, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_create_and_get_accept_output_format() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "workspace",
+            "create",
+            "--name",
+            "team-ml",
+            "--output",
+            "json",
+        ])
+        .expect("workspace create --output should parse");
+        match cli.command {
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Create { output, .. }),
+            }) => assert_eq!(output.as_str(), "json"),
+            other => panic!("expected workspace create, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "workspace", "get", "team-ml", "-o", "yaml"])
+            .expect("workspace get -o should parse");
+        match cli.command {
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Get { output, .. }),
+            }) => assert_eq!(output.as_str(), "yaml"),
+            other => panic!("expected workspace get, got {other:?}"),
         }
     }
 

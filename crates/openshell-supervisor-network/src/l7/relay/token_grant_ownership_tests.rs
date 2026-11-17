@@ -31,6 +31,7 @@ use tokio::io::{AsyncReadExt, DuplexStream, ReadBuf};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tracing::instrument::WithSubscriber as _;
 
 const POLICY: &str = include_str!("../../../data/sandbox-policy.rego");
 const HOST: &str = "api.example.test";
@@ -104,7 +105,6 @@ struct Route<'a> {
     method: &'a str,
     binary: &'a str,
     enforcement: &'a str,
-    deny_path: Option<&'a str>,
     body_rewrite: bool,
     protocol: &'a str,
 }
@@ -116,7 +116,6 @@ fn route<'a>(name: &'a str, path: &'a str) -> Route<'a> {
         method: "GET",
         binary: "/usr/bin/curl",
         enforcement: "enforce",
-        deny_path: None,
         body_rewrite: false,
         protocol: "rest",
     }
@@ -186,10 +185,6 @@ impl Fixture {
                 if route.protocol == "mcp" {
                     endpoint["mcp"] = serde_json::json!({"versions": ["2025-11-25"]});
                 }
-                // An explicit empty deny_rules list is invalid authored policy.
-                if let Some(path) = route.deny_path {
-                    endpoint["deny_rules"] = serde_json::json!([{"method": "GET", "path": path}]);
-                }
                 if route.body_rewrite {
                     endpoint["request_body_credential_rewrite"] = true.into();
                 }
@@ -246,11 +241,7 @@ impl Fixture {
     }
 
     fn grant_key(&self, path: &str, owner: &str) -> String {
-        let snapshot = self.state.snapshot();
-        format!(
-            "{HOST}\t{PORT}\t{path}\trev:{}\tinstallation:{}\t{owner}:access_token",
-            snapshot.revision, snapshot.installation_id
-        )
+        self.state.snapshot().scoped_key(&key(path, owner))
     }
 
     fn reload_policy(&mut self) {
@@ -304,17 +295,20 @@ impl Fixture {
             notified: false,
         };
         let (mut relay_upstream, upstream) = tokio::io::duplex(16 * 1024);
-        let relay = tokio::spawn(async move {
-            crate::proxy::relay_inspected_http_stream_for_test(
-                &mut client,
-                &mut relay_upstream,
-                configs,
-                engine,
-                &middleware_engine,
-                &ctx,
-            )
-            .await
-        });
+        let relay = tokio::spawn(
+            async move {
+                crate::proxy::relay_inspected_http_stream_for_test(
+                    &mut client,
+                    &mut relay_upstream,
+                    configs,
+                    engine,
+                    &middleware_engine,
+                    &ctx,
+                )
+                .await
+            }
+            .with_current_subscriber(),
+        );
         Connection {
             app,
             relay,
@@ -1004,6 +998,70 @@ async fn failure_then_reconnect(route_selection: bool) {
 }
 
 #[tokio::test]
+async fn token_grant_refusal_never_creates_a_denial_only_span() {
+    use super::correlation_dispatch_tests::capture_request_spans;
+
+    for sampled in [true, false] {
+        let evidence = capture_request_spans(sampled, async {
+            let fixture = Fixture::new(&[route("a", "/a/**")], &[("/a/**", "a", "aud-a")], 1);
+            fixture.resolver.fail_once.store(true, Ordering::SeqCst);
+            let mut connection = fixture.connect();
+            let response = connection.exchange("GET", "/a/item", true).await;
+            assert!(connection.observes_eof().await);
+            let capture = connection.finish().await;
+            assert_eq!(capture.bytes_seen, 0);
+            response
+        })
+        .await;
+        evidence.assert_no_deny_span(sampled);
+        assert!(evidence.output.starts_with("HTTP/1.1 502"));
+        if sampled {
+            assert_eq!(
+                evidence
+                    .spans
+                    .iter()
+                    .filter(|span| span.name == "openshell.credential.prepare")
+                    .count(),
+                1
+            );
+            assert!(
+                evidence
+                    .spans
+                    .iter()
+                    .all(|span| span.name != "openshell.upstream.send")
+            );
+        }
+        let records: Vec<_> = evidence
+            .events
+            .iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(records.len(), 2, "{:?}", evidence.events);
+        assert_eq!(records[0]["action"], "Allowed");
+        assert!(
+            records[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("L7_REQUEST allow ")
+        );
+        assert_eq!(records[1]["action"], "Denied");
+        assert!(
+            records[1]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Token grant failed ")
+        );
+        for record in records {
+            assert!(record.get("http_response").is_none());
+            assert_eq!(
+                record["metadata"]["correlation_uid"],
+                crate::test_support::response_request_id(evidence.output.as_bytes())
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn single_endpoint_recovers_after_one_grant_failure() {
     failure_then_reconnect(false).await;
 }
@@ -1408,7 +1466,7 @@ async fn transformed_jsonrpc_body_selects_final_operation_owner() {
     // Supply the rebuilt body at the exact pre-grant helper boundary. This
     // does not claim a middleware service performed the rewrite.
     let transformed = body_request("/api/rpc", final_body);
-    let (injected, _) = timeout(
+    let (injected, _, _) = timeout(
         WAIT,
         prepare_inspected_request(
             transformed,
@@ -1417,6 +1475,7 @@ async fn transformed_jsonrpc_body_selects_final_operation_owner() {
             &config,
             &info,
             "request-final-body",
+            None,
             None,
         ),
     )
@@ -1431,11 +1490,7 @@ async fn transformed_jsonrpc_body_selects_final_operation_owner() {
         std::str::from_utf8(&injected.raw_header).expect("injected HTTP request"),
         "aud-transformed",
     );
-    let snapshot = state.snapshot();
-    let expected_key = format!(
-        "{HOST}\t{PORT}\t/api/**\trev:{}\tinstallation:{}\ttransformed:access_token",
-        snapshot.revision, snapshot.installation_id
-    );
+    let expected_key = state.snapshot().scoped_key(&key("/api/**", "transformed"));
     resolver.assert_calls(&[(&expected_key, "aud-transformed")]);
 }
 
@@ -1510,4 +1565,421 @@ async fn authorityless_body_refresh_cannot_forward_superseded_grant() {
 #[tokio::test]
 async fn route_selected_authorityless_body_refresh_cannot_forward_superseded_grant() {
     authorityless_body_refresh(true).await;
+}
+
+/// HTTP hook stage bound to both HTTP operations. It streams a request
+/// body through with a preflight mutation and a late one, and records the
+/// request headers its response preflight carries.
+struct ForwardedHeadStage {
+    response_request_headers: Arc<Mutex<Option<Vec<openshell_core::proto::HttpHeader>>>>,
+}
+
+#[tonic::async_trait]
+impl openshell_core::middleware::InProcessMiddleware for ForwardedHeadStage {
+    async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+        use openshell_core::proto::{
+            MiddlewareBinding, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+        };
+        openshell_core::proto::MiddlewareManifest {
+            name: "test/forwarded-head".into(),
+            service_version: "test".into(),
+            bindings: vec![
+                MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_payload_bytes: 4096,
+                    request_timeout: None,
+                },
+                MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpResponse as i32,
+                    phase: SupervisorMiddlewarePhase::PreReturn as i32,
+                    max_payload_bytes: 4096,
+                    request_timeout: None,
+                },
+            ],
+            expected_audience: String::new(),
+            extension: Some(
+                openshell_core::extension_protocol::http_hooks_middleware_metadata(
+                    "openshell/test-forwarded-head",
+                    "test",
+                ),
+            ),
+        }
+    }
+
+    async fn validate_config(
+        &self,
+        _middleware_name: &str,
+        _config: &prost_types::Struct,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        _request: openshell_core::middleware::HttpRequestView<'_>,
+    ) -> Result<openshell_core::proto::HttpRequestResult> {
+        Err(miette!("HTTP hook test stage"))
+    }
+
+    async fn open_http_request_hook(
+        &self,
+        mut events: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpRequestHookEvent>,
+    ) -> std::result::Result<openshell_core::middleware::HttpRequestHookResultStream, tonic::Status>
+    {
+        use openshell_core::proto::{
+            ExistingHeaderAction, HeaderMutation, HttpDuplexMode, HttpFinish, HttpInspect,
+            HttpOutputChunk, HttpOutputStart, HttpPreflightResult, HttpRequestHookResult,
+            WriteHeader, header_mutation, http_inspect, http_preflight_result,
+            http_request_hook_event, http_request_hook_result,
+        };
+        let write = |name: &str, value: &str| HeaderMutation {
+            operation: Some(header_mutation::Operation::Write(WriteHeader {
+                name: name.into(),
+                value: value.into(),
+                on_existing: ExistingHeaderAction::Overwrite as i32,
+            })),
+        };
+        let (preflight_mutation, late_mutation) = (
+            write("x-request-stage", "preflight"),
+            write("x-request-stage-late", "committed"),
+        );
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut declared = None;
+            while let Some(event) = events.recv().await {
+                let result = match event.event {
+                    Some(http_request_hook_event::Event::Preflight(preflight)) => {
+                        declared = preflight.declared_body_bytes;
+                        http_request_hook_result::Result::PreflightResult(HttpPreflightResult {
+                            decision: Some(http_preflight_result::Decision::Inspect(HttpInspect {
+                                mode: Some(http_inspect::Mode::Duplex(HttpDuplexMode {})),
+                            })),
+                            header_mutations: vec![preflight_mutation.clone()],
+                            ..Default::default()
+                        })
+                    }
+                    Some(http_request_hook_event::Event::Begin(_)) => {
+                        http_request_hook_result::Result::OutputStart(HttpOutputStart {
+                            header_mutations: vec![late_mutation.clone()],
+                            output_body_bytes: declared,
+                        })
+                    }
+                    Some(http_request_hook_event::Event::InputChunk(chunk)) => {
+                        http_request_hook_result::Result::OutputChunk(HttpOutputChunk {
+                            data: chunk.data,
+                        })
+                    }
+                    Some(http_request_hook_event::Event::InputEnd(_)) => {
+                        http_request_hook_result::Result::Finish(HttpFinish::default())
+                    }
+                    _ => break,
+                };
+                if sender
+                    .send(Ok(HttpRequestHookResult {
+                        result: Some(result),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+            receiver,
+        )))
+    }
+
+    async fn open_http_response_hook(
+        &self,
+        mut events: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseHookEvent>,
+    ) -> std::result::Result<openshell_core::middleware::HttpResponseHookResultStream, tonic::Status>
+    {
+        use openshell_core::proto::{
+            HttpContinue, HttpPreflightResult, HttpResponseHookResult, http_preflight_result,
+            http_response_hook_event, http_response_hook_result,
+        };
+        let captured = Arc::clone(&self.response_request_headers);
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let Some(http_response_hook_event::Event::Preflight(preflight)) = event.event
+                else {
+                    break;
+                };
+                *captured.lock().expect("response capture lock") =
+                    preflight.response.map(|response| response.request_headers);
+                let result =
+                    http_response_hook_result::Result::PreflightResult(HttpPreflightResult {
+                        decision: Some(http_preflight_result::Decision::ContinueWithoutBody(
+                            HttpContinue {},
+                        )),
+                        ..Default::default()
+                    });
+                if sender
+                    .send(Ok(HttpResponseHookResult {
+                        result: Some(result),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+            receiver,
+        )))
+    }
+}
+
+/// HTTP hook stage that streams a request body upstream in DUPLEX mode and
+/// denies it only after reading the whole input.
+struct DenyAfterOutputStage;
+
+#[tonic::async_trait]
+impl openshell_core::middleware::InProcessMiddleware for DenyAfterOutputStage {
+    async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+        use openshell_core::proto::{
+            MiddlewareBinding, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+        };
+        openshell_core::proto::MiddlewareManifest {
+            name: "test/deny-after-output".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_payload_bytes: 4096,
+                request_timeout: None,
+            }],
+            expected_audience: String::new(),
+            extension: Some(
+                openshell_core::extension_protocol::http_hooks_middleware_metadata(
+                    "openshell/test-deny-after-output",
+                    "test",
+                ),
+            ),
+        }
+    }
+
+    async fn validate_config(
+        &self,
+        _middleware_name: &str,
+        _config: &prost_types::Struct,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        _request: openshell_core::middleware::HttpRequestView<'_>,
+    ) -> Result<openshell_core::proto::HttpRequestResult> {
+        Err(miette!("HTTP hook test stage"))
+    }
+
+    async fn open_http_request_hook(
+        &self,
+        mut events: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpRequestHookEvent>,
+    ) -> std::result::Result<openshell_core::middleware::HttpRequestHookResultStream, tonic::Status>
+    {
+        use openshell_core::proto::{
+            HttpDenial, HttpDuplexMode, HttpInspect, HttpOutputChunk, HttpOutputStart,
+            HttpPreflightResult, HttpRequestHookResult, MiddlewareDiagnostics, http_inspect,
+            http_preflight_result, http_request_hook_event, http_request_hook_result,
+        };
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let result = match event.event {
+                    Some(http_request_hook_event::Event::Preflight(_)) => {
+                        http_request_hook_result::Result::PreflightResult(HttpPreflightResult {
+                            decision: Some(http_preflight_result::Decision::Inspect(HttpInspect {
+                                mode: Some(http_inspect::Mode::Duplex(HttpDuplexMode {})),
+                            })),
+                            ..Default::default()
+                        })
+                    }
+                    Some(http_request_hook_event::Event::Begin(_)) => {
+                        http_request_hook_result::Result::OutputStart(HttpOutputStart {
+                            header_mutations: Vec::new(),
+                            output_body_bytes: None,
+                        })
+                    }
+                    Some(http_request_hook_event::Event::InputChunk(chunk)) => {
+                        http_request_hook_result::Result::OutputChunk(HttpOutputChunk {
+                            data: chunk.data,
+                        })
+                    }
+                    Some(http_request_hook_event::Event::InputEnd(_)) => {
+                        http_request_hook_result::Result::Deny(HttpDenial {
+                            diagnostics: Some(MiddlewareDiagnostics::default()),
+                        })
+                    }
+                    _ => break,
+                };
+                if sender
+                    .send(Ok(HttpRequestHookResult {
+                        result: Some(result),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+            receiver,
+        )))
+    }
+}
+
+#[tokio::test]
+async fn duplex_request_deny_after_upstream_start_returns_403_and_aborts_upstream() {
+    let mut fixture = Fixture::new(
+        &[Route {
+            method: "POST",
+            ..route("items", "/v1/items")
+        }],
+        &[("/v1/items", "items", "aud-items")],
+        1,
+    );
+    let mut data: serde_json::Value =
+        serde_json::from_str(&fixture.policy_data).expect("fixture policy data");
+    data["network_middlewares"] = serde_json::json!({
+        "deny-after-output": {
+            "middleware": "test/deny-after-output",
+            "on_error": "fail_closed",
+            "endpoints": {"include": [HOST]},
+        }
+    });
+    fixture.policy_data = data.to_string();
+    fixture.reload_policy();
+    fixture.engine.set_middleware_runner_for_tests(
+        openshell_supervisor_middleware::ChainRunner::new(Arc::new(DenyAfterOutputStage)),
+    );
+
+    let mut connection = fixture.connect();
+    timeout(
+        WAIT,
+        connection.app.write_all(
+            format!(
+                "POST /v1/items HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+            )
+            .as_bytes(),
+        ),
+    )
+    .await
+    .expect("client request write completes")
+    .expect("client request write");
+    let response = connection.response().await;
+    assert!(
+        connection.observes_eof().await,
+        "the sandbox connection closes"
+    );
+    let capture = connection.finish().await;
+
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert!(
+        !response.contains("HTTP/1.1 204"),
+        "no upstream response is relayed: {response}"
+    );
+    // The upstream request started with a chunked body, which the denial
+    // leaves unterminated.
+    assert_eq!(capture.requests.len(), 1);
+    assert!(
+        capture.requests[0]
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked\r\n"),
+        "{}",
+        capture.requests[0]
+    );
+    assert!(
+        !capture.requests[0].ends_with("0\r\n\r\n"),
+        "the upstream body is not terminated: {:?}",
+        capture.requests[0]
+    );
+}
+
+#[tokio::test]
+async fn response_middleware_sees_the_forwarded_request_head_without_injected_grants() {
+    let mut fixture = Fixture::new(
+        &[Route {
+            method: "POST",
+            ..route("items", "/v1/items")
+        }],
+        &[("/v1/items", "items", "aud-items")],
+        1,
+    );
+    // The grant uses a header name the request-header sanitizer does not know.
+    let mut grants = credentials(&[("/v1/items", "items", "aud-items")]);
+    for credential in grants.values_mut() {
+        credential.auth_style = "header".into();
+        credential.header_name = "X-Api-Key".into();
+    }
+    fixture
+        .state
+        .install_environment(2, HashMap::new(), HashMap::new(), grants);
+    let mut data: serde_json::Value =
+        serde_json::from_str(&fixture.policy_data).expect("fixture policy data");
+    data["network_middlewares"] = serde_json::json!({
+        "forwarded-head": {
+            "middleware": "test/forwarded-head",
+            "on_error": "fail_closed",
+            "endpoints": {"include": [HOST]},
+        }
+    });
+    fixture.policy_data = data.to_string();
+    fixture.reload_policy();
+    let captured = Arc::new(Mutex::new(None));
+    fixture.engine.set_middleware_runner_for_tests(
+        openshell_supervisor_middleware::ChainRunner::new(Arc::new(ForwardedHeadStage {
+            response_request_headers: Arc::clone(&captured),
+        })),
+    );
+
+    let mut connection = fixture.connect();
+    timeout(
+        WAIT,
+        connection.app.write_all(
+            format!(
+                "POST /v1/items HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+            )
+            .as_bytes(),
+        ),
+    )
+    .await
+    .expect("client request write completes")
+    .expect("client request write");
+    let response = connection.response().await;
+    let capture = connection.finish().await;
+
+    assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+    assert_eq!(capture.requests.len(), 1);
+    let forwarded = capture.requests[0].to_ascii_lowercase();
+    assert!(
+        forwarded.contains("x-api-key: inert-aud-items\r\n"),
+        "{forwarded}"
+    );
+    assert!(
+        forwarded.contains("x-request-stage-late: committed\r\n"),
+        "{forwarded}"
+    );
+    let request_headers = captured
+        .lock()
+        .expect("response capture lock")
+        .clone()
+        .expect("response stage received a preflight");
+    assert_eq!(
+        request_headers
+            .iter()
+            .map(|header| (header.name.as_str(), header.value.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("content-type", "application/json"),
+            ("x-request-stage", "preflight"),
+            ("x-request-stage-late", "committed"),
+        ]
+    );
 }

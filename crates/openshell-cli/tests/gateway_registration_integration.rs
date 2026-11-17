@@ -7,7 +7,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{run, run_isolated};
+use common::{run, run_isolated, run_with_env};
 
 fn write_gateway_metadata(
     root: &Path,
@@ -90,6 +90,96 @@ fn status_without_gateway_prints_registration_hint() {
         output.combined.contains("openshell gateway add <endpoint>"),
         "{}",
         output.combined
+    );
+}
+
+#[test]
+fn status_with_unregistered_named_gateway_fails() {
+    let output = run_isolated(&["--gateway", "org-a", "status"]);
+    assert_ne!(output.code, 0, "{}", output.combined);
+    assert!(
+        output.combined.contains("Unknown gateway 'org-a'"),
+        "{}",
+        output.combined
+    );
+}
+
+#[test]
+fn status_with_unregistered_environment_gateway_fails() {
+    let config_dir = tempfile::tempdir().expect("create user config dir");
+    let system_dir = tempfile::tempdir().expect("create system config dir");
+    let output = run_with_env(
+        config_dir.path(),
+        system_dir.path(),
+        &["status"],
+        &[("OPENSHELL_GATEWAY", "org-a")],
+    );
+    assert_ne!(output.code, 0, "{}", output.combined);
+    assert!(
+        output.combined.contains("Unknown gateway 'org-a'"),
+        "{}",
+        output.combined
+    );
+}
+
+#[test]
+fn status_without_gateway_json_succeeds() {
+    let output = run_isolated(&["status", "--output", "json"]);
+    assert_eq!(output.code, 0, "{}", output.combined);
+    let status: serde_json::Value =
+        serde_json::from_str(&output.stdout).expect("parse status JSON");
+    assert_eq!(status["status"], "not_configured");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_with_unhealthy_registered_gateway_json_succeeds() {
+    let config_dir = tempfile::tempdir().expect("create user config dir");
+    let system_dir = tempfile::tempdir().expect("create system config dir");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind health endpoint");
+    let port = listener.local_addr().expect("local address").port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept health connection");
+            openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(|_| async {
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
+                            .body(http_body_util::Full::new(bytes::Bytes::new()))
+                            .expect("health response"),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    write_user_gateway_metadata(
+        config_dir.path(),
+        "offline",
+        &endpoint,
+        port,
+        false,
+        "plaintext",
+    );
+
+    let output = run(
+        config_dir.path(),
+        system_dir.path(),
+        &["--gateway", "offline", "status", "--output", "json"],
+    );
+    server.abort();
+    assert_eq!(output.code, 0, "{}", output.combined);
+    let status: serde_json::Value =
+        serde_json::from_str(&output.stdout).expect("parse status JSON");
+    assert!(
+        matches!(status["status"].as_str(), Some("disconnected" | "error")),
+        "{status}"
     );
 }
 

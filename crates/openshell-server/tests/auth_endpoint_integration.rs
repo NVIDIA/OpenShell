@@ -182,7 +182,9 @@ async fn start_auth_server(bind_addr: SocketAddr) -> (SocketAddr, tokio::task::J
 
 /// Make an HTTP/1.1 GET request and return (status, body).
 async fn http_get(addr: SocketAddr, uri: &str, headers: &[(&str, &str)]) -> (StatusCode, String) {
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+        .await
+        .unwrap();
     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(stream))
         .await
@@ -440,7 +442,9 @@ async fn plaintext_server_accepts_grpc_and_http() {
     );
 
     // HTTP over plaintext
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+        .await
+        .unwrap();
     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(stream))
         .await

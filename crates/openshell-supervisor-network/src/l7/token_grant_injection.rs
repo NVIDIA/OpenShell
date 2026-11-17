@@ -24,11 +24,11 @@ use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
     StatusId, ctx::ctx as ocsf_ctx,
 };
-use tracing::warn;
+use tracing::{Instrument as _, warn};
 
+use crate::l7::correlation::{RequestCorrelation, RequestStage};
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
-use crate::telemetry::egress_emit;
 
 /// Borrowed grant configuration for one endpoint-bound provider credential.
 pub struct TokenGrantRequest<'a> {
@@ -87,6 +87,21 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
                 })
                 .await
         })
+    }
+}
+
+/// Token grant headers reapplied after streamed middleware mutations.
+#[derive(Default)]
+pub struct InjectedHeaders(Vec<(String, String)>);
+
+impl InjectedHeaders {
+    pub fn apply(&self, raw_header: &[u8]) -> miette::Result<Vec<u8>> {
+        let mut raw_header = raw_header.to_vec();
+        for (name, value) in &self.0 {
+            raw_header =
+                inject_header(&raw_header, name, value).map_err(TokenGrantInjectionError::new)?;
+        }
+        Ok(raw_header)
     }
 }
 
@@ -174,15 +189,35 @@ pub fn pin_live_credentials(ctx: &mut L7EvalContext) -> Option<Arc<ProviderCrede
 /// `snapshot` by [`pin_live_credentials`]. `request_id` is the supervisor-minted
 /// ID of this exchange; it is sent to the token service and gateway and
 /// recorded on the refusal event.
+#[cfg(test)]
 pub async fn inject_for_selectors(
     req: L7Request,
     ctx: &L7EvalContext,
     snapshot: &ProviderCredentialSnapshot,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
-) -> Result<L7Request, TokenGrantInjectionError> {
+) -> Result<(L7Request, InjectedHeaders), TokenGrantInjectionError> {
+    inject_for_selectors_correlated(req, ctx, snapshot, request_id, observation_context, None).await
+}
+
+pub async fn inject_for_selectors_correlated(
+    req: L7Request,
+    ctx: &L7EvalContext,
+    snapshot: &ProviderCredentialSnapshot,
+    request_id: &str,
+    observation_context: Option<&EndpointObservationContext>,
+    correlation: Option<&RequestCorrelation>,
+) -> Result<(L7Request, InjectedHeaders), TokenGrantInjectionError> {
     let selected = select_scoped(snapshot, ctx, request_path(&req.target), None);
-    inject_or_report(req, ctx, selected, request_id, observation_context).await
+    inject_or_report(
+        req,
+        ctx,
+        selected,
+        request_id,
+        observation_context,
+        correlation,
+    )
+    .await
 }
 
 /// Inject only grants owned by endpoints that admitted the inspected request.
@@ -192,6 +227,7 @@ pub async fn inject_for_selectors(
 /// Credentials come from the pinned `snapshot`, and each selected key is scoped
 /// to its revision and installation after selection so the one-grant-per-header
 /// ambiguity check still compares the original credential identities.
+#[cfg(test)]
 pub(super) async fn inject_for_admitted_owners(
     req: L7Request,
     ctx: &L7EvalContext,
@@ -199,7 +235,28 @@ pub(super) async fn inject_for_admitted_owners(
     admitted_owners: &HashSet<String>,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
-) -> Result<L7Request, TokenGrantInjectionError> {
+) -> Result<(L7Request, InjectedHeaders), TokenGrantInjectionError> {
+    inject_for_admitted_owners_correlated(
+        req,
+        ctx,
+        snapshot,
+        admitted_owners,
+        request_id,
+        observation_context,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn inject_for_admitted_owners_correlated(
+    req: L7Request,
+    ctx: &L7EvalContext,
+    snapshot: &ProviderCredentialSnapshot,
+    admitted_owners: &HashSet<String>,
+    request_id: &str,
+    observation_context: Option<&EndpointObservationContext>,
+    correlation: Option<&RequestCorrelation>,
+) -> Result<(L7Request, InjectedHeaders), TokenGrantInjectionError> {
     let request_path = request_path(&req.target);
     let unowned = snapshot
         .dynamic_credentials
@@ -220,7 +277,15 @@ pub(super) async fn inject_for_admitted_owners(
     } else {
         select_scoped(snapshot, ctx, request_path, Some(admitted_owners))
     };
-    inject_or_report(req, ctx, selected, request_id, observation_context).await
+    inject_or_report(
+        req,
+        ctx,
+        selected,
+        request_id,
+        observation_context,
+        correlation,
+    )
+    .await
 }
 
 fn select_scoped(
@@ -251,10 +316,11 @@ async fn inject_or_report(
     selected: Result<Vec<(String, ProviderProfileCredential)>, TokenGrantInjectionError>,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
-) -> Result<L7Request, TokenGrantInjectionError> {
+    correlation: Option<&RequestCorrelation>,
+) -> Result<(L7Request, InjectedHeaders), TokenGrantInjectionError> {
     if selected.as_ref().is_ok_and(Vec::is_empty) {
         // Most requests need no grant; keep that path free of allocation.
-        return Ok(req);
+        return Ok((req, InjectedHeaders::default()));
     }
     let method = req.action.clone();
     let request_path = request_path(&req.target).to_string();
@@ -275,12 +341,19 @@ async fn inject_or_report(
     } else {
         Vec::new()
     };
+    let span = correlation.map_or_else(tracing::Span::none, |correlation| {
+        correlation.stage(RequestStage::CredentialPrepare)
+    });
     let result = match selected {
-        Ok(credentials) => inject_selected(req, ctx, credentials, request_id).await,
-        Err(error) => Err(error),
+        Ok(credentials) => {
+            inject_selected(req, ctx, credentials, request_id, correlation)
+                .instrument(span)
+                .await
+        }
+        Err(error) => span.in_scope(|| Err(error)),
     };
     if let Err(error) = &result {
-        report_refused_grant(ctx, &method, &request_path, request_id, error);
+        report_refused_grant(ctx, &method, &request_path, request_id, error, correlation);
     }
     if let Some((sender, context)) = ctx
         .endpoint_observation_tx
@@ -323,6 +396,7 @@ fn report_refused_grant(
     request_path: &str,
     request_id: &str,
     error: &TokenGrantInjectionError,
+    correlation: Option<&RequestCorrelation>,
 ) {
     let credential = error
         .credential
@@ -341,8 +415,9 @@ fn report_refused_grant(
             .map_or_else(|| "none".to_string(), |status| status.to_string()),
         "Token grant failed"
     );
-    egress_emit!(
-        HttpActivityBuilder::new(ocsf_ctx())
+    crate::l7::correlation::emit_request_events(
+        correlation,
+        [HttpActivityBuilder::new(ocsf_ctx())
             .activity(ActivityId::Fail)
             .action(ActionId::Denied)
             .disposition(DispositionId::Blocked)
@@ -355,7 +430,8 @@ fn report_refused_grant(
                 ctx.host, ctx.port
             ))
             .unmapped("request_id", request_id)
-            .build()
+            .unmapped("http_event_kind", "token_grant")
+            .build()],
     );
 }
 
@@ -367,7 +443,8 @@ async fn inject_selected(
     ctx: &L7EvalContext,
     credentials: Vec<(String, ProviderProfileCredential)>,
     request_id: &str,
-) -> Result<L7Request, TokenGrantInjectionError> {
+    correlation: Option<&RequestCorrelation>,
+) -> Result<(L7Request, InjectedHeaders), TokenGrantInjectionError> {
     let resolver = ctx
         .token_grant_resolver
         .as_ref()
@@ -393,14 +470,14 @@ async fn inject_selected(
         headers.push(token_grant_header(cred, &access_token).map_err(refused)?);
     }
 
-    let mut raw_header = req.raw_header;
-    for (name, value) in headers {
-        raw_header =
-            inject_header(&raw_header, &name, &value).map_err(TokenGrantInjectionError::new)?;
-    }
+    let injected = InjectedHeaders(headers);
+    let raw_header = injected
+        .apply(&req.raw_header)
+        .map_err(|_| TokenGrantInjectionError::new(injection_configuration_failure()))?;
     for (provider_key, _) in credentials {
-        egress_emit!(
-            HttpActivityBuilder::new(ocsf_ctx())
+        crate::l7::correlation::emit_request_events(
+            correlation,
+            [HttpActivityBuilder::new(ocsf_ctx())
                 .activity(ActivityId::Other)
                 .action(ActionId::Allowed)
                 .disposition(DispositionId::Allowed)
@@ -418,10 +495,11 @@ async fn inject_selected(
                     ctx.host,
                     ctx.port
                 ))
-                .build()
+                .unmapped("http_event_kind", "token_grant")
+                .build()],
         );
     }
-    Ok(L7Request { raw_header, ..req })
+    Ok((L7Request { raw_header, ..req }, injected))
 }
 
 fn request_path(target: &str) -> &str {
@@ -1080,6 +1158,7 @@ pub mod test_support {
             observation_context.as_ref(),
         )
         .await
+        .map(|(request, _)| request)
     }
 }
 
@@ -1521,7 +1600,9 @@ mod tests {
         authority: &EndpointObservationContext,
     ) -> Result<L7Request, TokenGrantInjectionError> {
         let snapshot = pin_live_credentials(ctx).expect("live provider credentials");
-        inject_for_selectors(grant_request(), ctx, &snapshot, REQUEST_ID, Some(authority)).await
+        inject_for_selectors(grant_request(), ctx, &snapshot, REQUEST_ID, Some(authority))
+            .await
+            .map(|(request, _)| request)
     }
 
     #[tokio::test]

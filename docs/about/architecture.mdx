@@ -195,10 +195,11 @@ tokens that last for the life of the sandbox run.
 
 ### What the agent can see
 
-The agent shares its side of the boundary with the **sandbox**, so
-the **sandbox** holds nothing worth stealing: no gateway signing key, no
-gateway JWT, and no provider credentials. It can verify that it's talking to
-the right **supervisor**, but it can't impersonate one.
+The agent shares its container or guest with the trusted **sandbox** runtime.
+The runtime holds no gateway signing key, gateway JWT, or provider credentials.
+It still protects its TLS private key and enforcement state from the agent.
+It can verify that it's talking to the right **supervisor**, but it can't
+impersonate one.
 
 If the **supervisor** disconnects, the **sandbox** freezes the agent. The same
 **supervisor** process can reconnect and resume it within the recovery window.
