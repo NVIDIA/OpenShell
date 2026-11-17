@@ -204,7 +204,7 @@ from this skill.
 | `OPENSHELL_MXC_SKIP_ARM64` | `0` | Set to `1` to skip ARM64 when using `all` tasks. |
 | `OPENSHELL_WINDOWS_BUILD_JOBS` | `CARGO_BUILD_JOBS`, then `4` | Positive Cargo job limit used by the wrapper. |
 | `CARGO_TARGET_DIR` | `target` under repo root | Override Cargo output location. Use a short absolute path when x64-to-ARM64 builds approach Windows path-length limits. |
-| `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing a target-compatible static `libz3.lib` built with `/MT`, used instead of the source build. Import libraries are rejected by release dependency checks. |
+| `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing a target-compatible static `libz3.lib` built with `/MT`. Directories containing `libz3.dll` fall back to the pinned source build; release dependency checks reject import libraries. |
 | `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
 | `Z3_SRC_SOURCE_DIR` | downloaded source cache | Optional local Z3 5.1.0 source tree; the default archive is checksum-pinned. |
 | `Z3_SYS_Z3_VERSION` | `5.1.0` | Pinned source version selected by the wrapper. |

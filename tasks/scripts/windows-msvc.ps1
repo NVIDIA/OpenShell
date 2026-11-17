@@ -377,7 +377,10 @@ function Resolve-Z3Source {
                 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
                 Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/Z3Prover/z3/archive/refs/tags/z3-$Z3Version.zip" -OutFile $archive
                 if ((Get-Sha256 $archive) -ne $Z3SourceSha256) { throw 'Z3 source archive checksum mismatch.' }
-                Expand-Archive -LiteralPath $archive -DestinationPath $staging
+                # Hosted ARM64 runners can expose a PowerShell 7 archive module
+                # to Windows PowerShell 5.1. Use the .NET API shared by both.
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                [IO.Compression.ZipFile]::ExtractToDirectory($archive, $staging)
                 New-Item -ItemType Directory -Path (Split-Path $source) -Force | Out-Null
                 Move-Item -LiteralPath (Join-Path $staging "z3-z3-$Z3Version") -Destination $source
             } finally { Remove-Item -LiteralPath $staging -Recurse -Force }
@@ -391,6 +394,11 @@ function Resolve-Z3Source {
 }
 
 function Configure-Z3 {
+    if ($env:Z3_LIBRARY_PATH_OVERRIDE -and (Test-Path -LiteralPath (Join-Path $env:Z3_LIBRARY_PATH_OVERRIDE 'libz3.dll'))) {
+        Write-Warning 'Ignoring the shared Z3 override; Windows packages require static Z3 and CRT linkage. Building pinned source instead.'
+        $env:Z3_LIBRARY_PATH_OVERRIDE = $null
+        $env:Z3_SYS_Z3_HEADER = $null
+    }
     if ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE)) {
         $env:Z3_SRC_SOURCE_DIR = Resolve-Z3Source
         $env:Z3_SYS_Z3_VERSION = $Z3Version

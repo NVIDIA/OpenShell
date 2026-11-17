@@ -217,6 +217,8 @@ To supply your own library, set `Z3_LIBRARY_PATH_OVERRIDE` to the directory
 containing a target-compatible, **static** `libz3.lib` built with `/MT`, and
 `Z3_SYS_Z3_HEADER` to its `z3.h`. Import libraries for `libz3.dll` are rejected
 by the release build's executable dependency check.
+If an inherited override points to a directory containing `libz3.dll`, the
+wrapper uses the pinned source build instead.
 
 ### Windows full build
 

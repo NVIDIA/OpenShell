@@ -71,4 +71,60 @@ try {
     if (-not $rejected) { throw 'Truncated PE image accepted.' }
     $count++
 } finally { Remove-Item -LiteralPath $fixture }
+
+# Exercise cold source preparation without network access, including the legacy
+# shared-Z3 environment used by the ARM64 CI host.
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'windows-msvc.ps1'), [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw ($errors | Out-String) }
+foreach ($name in @('Get-Sha256', 'Resolve-Z3Source', 'Configure-Z3')) {
+    $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+    if ($null -eq $function) { throw "Missing build helper: $name" }
+    Invoke-Expression $function.Extent.Text
+}
+$sourceFixture = Join-Path ([IO.Path]::GetTempPath()) ('openshell-source-test-' + [guid]::NewGuid().ToString('N'))
+try {
+    $scripts = Join-Path $sourceFixture 'input/z3-z3-5.1.0/scripts'
+    New-Item -ItemType Directory -Path $scripts -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $scripts 'VERSION.txt') -Value '5.1.0.0' -Encoding ASCII
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $sourceArchive = Join-Path $sourceFixture 'source.zip'
+    [IO.Compression.ZipFile]::CreateFromDirectory((Join-Path $sourceFixture 'input'), $sourceArchive)
+    function Invoke-WebRequest([switch] $UseBasicParsing, [string] $Uri, [string] $OutFile) {
+        Copy-Item -LiteralPath $sourceArchive -Destination $OutFile
+    }
+    $Z3Version = '5.1.0'
+    $Z3SourceSha256 = Get-Sha256 $sourceArchive
+    $Z3WorkspaceFeatures = '--features openshell-prover/vendored-z3'
+    $Z3ServerFeatures = '--features openshell-server/vendored-z3,openshell-prover/vendored-z3'
+    $WindowsBuildJobs = 2
+    $TargetDir = Join-Path $sourceFixture 'target'
+    $env:Z3_SRC_SOURCE_DIR = $null
+    $env:Z3_LIBRARY_PATH_OVERRIDE = $sourceFixture
+    Set-Content -LiteralPath (Join-Path $sourceFixture 'libz3.dll') -Value 'legacy shared runtime'
+    $features = Configure-Z3
+    if ($features.WorkspaceFeatures -notmatch 'vendored-z3' -or $env:Z3_LIBRARY_PATH_OVERRIDE) { throw 'Legacy shared override selected instead of static Z3.' }
+    $count++
+    if (-not (Test-Path -LiteralPath (Join-Path $env:Z3_SRC_SOURCE_DIR 'scripts/VERSION.txt'))) { throw 'Cold source extraction failed.' }
+    $count++
+    $env:Z3_SRC_SOURCE_DIR = $null
+    $Z3SourceSha256 = '0' * 64
+    # A verified cache can be reused without downloading another archive.
+    if (-not (Resolve-Z3Source)) { throw 'Source cache reuse failed.' }
+    $count++
+    $TargetDir = Join-Path $sourceFixture 'bad-checksum'
+    $rejected = $false
+    try { Resolve-Z3Source | Out-Null } catch {
+        if ($_.Exception.Message -notmatch 'checksum') { throw }
+        $rejected = $true
+    }
+    if (-not $rejected) { throw 'Unverified Z3 source archive accepted.' }
+    $count++
+    $env:Z3_SRC_SOURCE_DIR = Split-Path $scripts
+    Set-Content -LiteralPath (Join-Path $scripts 'VERSION.txt') -Value '5.3.2.0'
+    $rejected = $false
+    try { Resolve-Z3Source | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Wrong solver source version accepted.' }
+    $count++
+} finally { Remove-Item -LiteralPath $sourceFixture -Recurse -Force }
 Write-Host "$count static-runtime regression checks passed. No MXC qualification claimed."
