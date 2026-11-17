@@ -46,6 +46,8 @@ pub(crate) struct PublishRequest {
     pub(crate) allocation_identity: [u8; 32],
     pub(crate) policy_generation: u64,
     pub(crate) ttl: Duration,
+    /// Authored ports eligible for refresh, before DNS address filtering.
+    pub(crate) eligible_ports: BTreeSet<u16>,
     pub(crate) contracts: Vec<ResolvedPortContract>,
 }
 
@@ -59,6 +61,7 @@ pub(crate) struct ResolvedEndpointRecord {
     pub(crate) mapping_id: Uuid,
     pub(crate) created_at: Instant,
     pub(crate) expires_at: Instant,
+    pub(crate) eligible_ports: BTreeSet<u16>,
     pub(crate) contracts: Vec<ResolvedPortContract>,
 }
 
@@ -260,6 +263,7 @@ struct Publication {
     key: AllocationKey,
     policy_generation: u64,
     ttl: Duration,
+    eligible_ports: BTreeSet<u16>,
     contracts: Vec<ResolvedPortContract>,
 }
 
@@ -342,10 +346,7 @@ impl ResolvedEndpointStore {
         };
         if record.policy_generation != generation
             || record.is_observation()
-            || !record
-                .contracts
-                .iter()
-                .any(|contract| contract.port == port)
+            || !record.eligible_ports.contains(&port)
         {
             return Err(miette::miette!(
                 "expired mapping is not eligible for refresh"
@@ -392,9 +393,11 @@ impl ResolvedEndpointStore {
             return Err(PublishError::StalePolicy);
         }
         if request.ttl.is_zero()
+            || request.eligible_ports.contains(&0)
             || request.contracts.is_empty()
             || request.contracts.iter().any(|contract| {
                 contract.port == 0
+                    || !request.eligible_ports.contains(&contract.port)
                     || contract.pinned_addresses.is_empty()
                     || contract
                         .pinned_addresses
@@ -414,6 +417,7 @@ impl ResolvedEndpointStore {
                 },
                 policy_generation: request.policy_generation,
                 ttl: request.ttl,
+                eligible_ports: request.eligible_ports,
                 contracts: request.contracts,
             },
             now,
@@ -443,6 +447,7 @@ impl ResolvedEndpointStore {
                 },
                 policy_generation,
                 ttl: super::MAX_MAPPING_TTL,
+                eligible_ports: BTreeSet::new(),
                 contracts: Vec::new(),
             },
             now,
@@ -468,6 +473,7 @@ impl ResolvedEndpointStore {
             key,
             policy_generation,
             ttl,
+            eligible_ports,
             contracts,
         } = publication;
         let family = key.family;
@@ -539,6 +545,7 @@ impl ResolvedEndpointStore {
             mapping_id: Uuid::new_v4(),
             created_at: now,
             expires_at: now + ttl,
+            eligible_ports,
             contracts,
         };
         state.expired_allocations.remove(&synthetic_address);
@@ -701,6 +708,7 @@ mod tests {
             allocation_identity: [1; 32],
             policy_generation: generation,
             ttl,
+            eligible_ports: BTreeSet::from([5432]),
             contracts: vec![ResolvedPortContract {
                 endpoint_id: PolicyEndpointId {
                     policy_name: "database".to_string(),
@@ -1118,6 +1126,7 @@ mod tests {
         let mut other_port = second.clone();
         other_port.port = 443;
         other_port.pinned_addresses = vec!["203.0.113.10".parse().unwrap()];
+        request.eligible_ports.insert(443);
         request
             .contracts
             .extend([second.clone(), unrelated.clone(), other_port]);

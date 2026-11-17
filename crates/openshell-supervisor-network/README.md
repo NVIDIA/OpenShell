@@ -40,6 +40,10 @@ queries. Refreshes for one address share a lock; failed refreshes back off for
 one second and never authorize expired upstream addresses. The service is held
 weakly by the store to avoid an ownership cycle. Observation-only mappings,
 wrong ports, and mappings from a previous policy generation cannot refresh.
+Refresh eligibility uses the authored ports, independently of which ports the
+latest DNS addresses satisfied. Dispatch reauthorizes mapped connections and
+rebuilds their connectors from current pins instead of retaining staged pins
+across a refresh.
 
 ## Reserved destinations
 

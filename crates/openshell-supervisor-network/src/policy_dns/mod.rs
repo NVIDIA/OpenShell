@@ -24,7 +24,10 @@ mod store;
 mod wire;
 
 pub(crate) use name::NormalizedName;
-pub(crate) use resolver::{AddressFamily, SocketTrustedResolver, TrustedAnswer, TrustedResolver};
+pub(crate) use resolver::{
+    AddressFamily, ResolveError as TrustedResolveError, SocketTrustedResolver, TrustedAnswer,
+    TrustedResolver,
+};
 pub(crate) use runtime::{PolicyDnsRuntime, PolicyDnsRuntimeConfig};
 pub(crate) use store::{
     MappingLookup, MappingLookupError, PolicyEndpointId, PublishError, PublishRequest,
@@ -123,7 +126,7 @@ impl<R: TrustedResolver + 'static> MappingRefresher for PolicyDnsService<R> {
 
 impl<R: TrustedResolver + 'static> PolicyDnsService<R> {
     /// Use a weak reference because the service itself owns the mapping store.
-    fn enable_refresh(self: &Arc<Self>) {
+    pub(crate) fn enable_refresh(self: &Arc<Self>) {
         let refresher: Arc<dyn MappingRefresher> = self.clone();
         self.store.set_refresher(Arc::downgrade(&refresher));
     }
@@ -231,6 +234,10 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         // usable when the trusted resolver takes longer than the TTL floor.
         let now = now + started.elapsed();
         let allocation_identity = allocation_identity(&eligible);
+        let eligible_ports = eligible
+            .iter()
+            .flat_map(|endpoint| endpoint.ports.iter().copied())
+            .collect();
         let mut contracts = Vec::new();
         for endpoint in eligible {
             for port in endpoint.ports {
@@ -268,6 +275,7 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             allocation_identity,
             policy_generation: snapshot.generation,
             ttl,
+            eligible_ports,
             contracts,
         };
         let record = self.publish_guarded(
@@ -832,7 +840,14 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     fn refresh_service(ttl: Duration) -> Arc<PolicyDnsService<RefreshResolver>> {
-        let base = service(BASE_POLICY, vec![]);
+        refresh_service_with_policy(ttl, BASE_POLICY)
+    }
+
+    fn refresh_service_with_policy(
+        ttl: Duration,
+        policy: &str,
+    ) -> Arc<PolicyDnsService<RefreshResolver>> {
+        let base = service(policy, vec![]);
         let service = Arc::new(PolicyDnsService::new(
             base.policy,
             RefreshResolver {
@@ -906,6 +921,89 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                     .unwrap();
                 assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 2);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_partial_mapping_recovers_every_policy_eligible_port() {
+        let policy = BASE_POLICY.replace(
+            "- { host: db.example, port: 5432, protocol: tcp }",
+            "- { host: db.example, port: 5432, protocol: tcp, allowed_ips: [8.8.8.8/32] }\n      - { host: db.example, port: 443, protocol: tcp, allowed_ips: [8.8.4.4/32] }",
+        );
+        for initially_partial in [false, true] {
+            let service = refresh_service_with_policy(Duration::ZERO, &policy);
+            if !initially_partial {
+                service
+                    .resolver
+                    .answer
+                    .lock()
+                    .unwrap()
+                    .addresses
+                    .push("8.8.4.4".parse().unwrap());
+            }
+            let answer = expired_answer(&service).await;
+            if !initially_partial {
+                service.resolver.answer.lock().unwrap().addresses =
+                    vec!["8.8.8.8".parse().unwrap()];
+                service
+                    .store
+                    .refresh_if_expired(answer.address, 5432, answer.policy_generation)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    service.store.lookup(
+                        answer.address,
+                        443,
+                        answer.policy_generation,
+                        Instant::now()
+                    ),
+                    Err(MappingLookupError::PortMismatch)
+                ));
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+            }
+            // Sweeping the expired record must preserve policy eligibility,
+            // including ports missing from the last successful DNS contracts.
+            assert_eq!(service.store.expire(Instant::now()).unwrap(), 1);
+            service
+                .resolver
+                .answer
+                .lock()
+                .unwrap()
+                .addresses
+                .push("8.8.4.4".parse().unwrap());
+            let calls = service.resolver.calls.load(Ordering::SeqCst);
+            assert!(
+                service
+                    .store
+                    .refresh_if_expired(answer.address, 8443, answer.policy_generation)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), calls);
+            service
+                .store
+                .refresh_if_expired(answer.address, 443, answer.policy_generation)
+                .await
+                .unwrap();
+            let recovered = service
+                .store
+                .lookup(
+                    answer.address,
+                    443,
+                    answer.policy_generation,
+                    Instant::now(),
+                )
+                .unwrap();
+            assert_eq!(
+                recovered
+                    .pinned_addresses_for(&[PolicyEndpointId {
+                        policy_name: "database".into(),
+                        endpoint_index: 1
+                    }])
+                    .unwrap(),
+                ["8.8.4.4".parse::<IpAddr>().unwrap()]
+            );
+            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), calls + 1);
         }
     }
 

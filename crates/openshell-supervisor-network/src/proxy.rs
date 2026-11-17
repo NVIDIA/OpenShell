@@ -2646,6 +2646,7 @@ async fn handle_mediated_connection(
         .and_then(EndpointObservationSender::capture);
     let mut policy_local_transparent = false;
     let mut metadata_transparent = false;
+    let mut mapped_transparent_destination = None;
     let (mut preauthorized_decision, prevalidated_connector, preauthorized_span) =
         if let Some(transparent) = transparent_open {
             let destination = transparent.destination;
@@ -2658,12 +2659,20 @@ async fn handle_mediated_connection(
                 policy_local_transparent = true;
                 (None, None, None)
             } else {
-                let host =
+                let target =
                     resolve_transparent_target(destination, policy_dns_store.as_ref(), &opa_engine)
-                        .await?
-                        .host;
-                let (decision, connector) = transparent
-                    .authorization
+                        .await?;
+                let host = target.host;
+                // Dispatch may refresh a lease after staging captured its
+                // connector. Authorize again and build fresh pins below rather
+                // than pairing a refreshed mapping with the staged addresses.
+                let authorization = if target.intent.is_some() {
+                    mapped_transparent_destination = Some(destination);
+                    None
+                } else {
+                    transparent.authorization
+                };
+                let (decision, connector) = authorization
                     .map_or((None, None), |(decision, connector)| {
                         (Some(decision), Some(connector))
                     });
@@ -2985,8 +2994,27 @@ async fn handle_mediated_connection(
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
     if prevalidated_connector.is_none() {
-        match hydrate_destination_plan(&mut decision, *backend_host_gateway, *trusted_host_gateway)
-        {
+        let destination_result =
+            hydrate_destination_plan(&mut decision, *backend_host_gateway, *trusted_host_gateway)
+                .and_then(|()| {
+                    if let Some(destination) = mapped_transparent_destination {
+                        let plan = policy_dns_store
+                            .as_ref()
+                            .ok_or(MappingLookupError::Missing)
+                            .and_then(|store| {
+                                pinned_transparent_plan(store, destination, &decision)
+                            })
+                            .map_err(|error| DestinationDenial {
+                                kind: DestinationDenialKind::DeclaredEndpoint,
+                                reason: format!(
+                                    "transparent destination mapping is unavailable: {error}"
+                                ),
+                            })?;
+                        decision.endpoint.destination = Some(plan);
+                    }
+                    Ok(())
+                });
+        match destination_result {
             Ok(()) => {}
             Err(denial) => {
                 if let Some(observer) = connect_endpoint_observer.as_ref() {
@@ -7842,6 +7870,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                     allocation_identity: [1; 32],
                     policy_generation: generation,
                     ttl: std::time::Duration::from_secs(30),
+                    eligible_ports: std::collections::BTreeSet::from([port]),
                     contracts: vec![crate::policy_dns::ResolvedPortContract {
                         endpoint_id: PolicyEndpointId {
                             policy_name: policy_name.to_string(),
@@ -8122,6 +8151,146 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     #[tokio::test]
+    async fn dispatch_rebuilds_staged_connector_after_mapping_expiry() {
+        use crate::policy_dns::{
+            AddressFamily, NormalizedName, PolicyDnsService, TrustedAnswer, TrustedResolver,
+        };
+        use std::time::{Duration, Instant};
+
+        struct DispatchResolver(IpAddr);
+        impl TrustedResolver for DispatchResolver {
+            async fn resolve(
+                &self,
+                _: &NormalizedName,
+                _: AddressFamily,
+            ) -> std::result::Result<TrustedAnswer, crate::policy_dns::TrustedResolveError>
+            {
+                Ok(TrustedAnswer {
+                    addresses: vec![self.0],
+                    ttl: Duration::ZERO,
+                })
+            }
+        }
+
+        let Some(fresh_ip) = non_loopback_test_ipv4() else {
+            return;
+        };
+        // The staged connector targets A; dispatch must dial the refreshed B.
+        // Both listeners use the same port so only the selected IP differs.
+        let old_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_address = old_listener.local_addr().unwrap();
+        let port = old_address.port();
+        let fresh_listener = TcpListener::bind((fresh_ip, port)).await.unwrap();
+        let policy = POLICY_DNS_OPEN_POLICY.replace(
+            "port: 5432, protocol: tcp",
+            &format!("port: {port}, protocol: tcp, tls: skip"),
+        );
+        let engine = Arc::new(
+            native_identity_engine(
+                include_str!("../data/sandbox-policy.rego"),
+                &policy_with_native_executable_paths(&policy),
+            )
+            .unwrap(),
+        );
+        let cache = Arc::new(BinaryIdentityCache::new());
+        let store = policy_dns_test_store();
+        let service = Arc::new(PolicyDnsService::new(
+            engine.clone(),
+            DispatchResolver(fresh_ip.into()),
+            store.clone(),
+            None,
+        ));
+        service.enable_refresh();
+        let answer = service
+            .answer_query("db.example", AddressFamily::Ipv4, Instant::now())
+            .await
+            .unwrap();
+        let destination = SocketAddr::new(answer.address, port);
+        let (open, _) = staged_curl_open(destination, engine.current_generation());
+        let identity = open.binary_identity;
+        let mut decision = authorize_supplied_identity(
+            &engine,
+            &cache,
+            EgressIntent::connect("db.example".into(), port),
+            &identity,
+        );
+        assert!(!matches!(decision.action, NetworkAction::Deny { .. }));
+        decision.endpoint.destination = Some(DestinationValidationPlan {
+            address_authorization: destination::AddressAuthorization::PinnedResolved(vec![
+                old_address.ip(),
+            ]),
+        });
+        let old_connector =
+            destination::UpstreamConnector::new("db.example", port, vec![old_address]);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (stream, mut workload) = tokio::io::duplex(4096);
+        let handler = tokio::spawn(handle_mediated_connection(
+            tokio::io::BufReader::new(Box::new(stream)),
+            Some(identity),
+            None,
+            Some(TransparentOpen {
+                destination,
+                authorization: Some((decision, old_connector)),
+                connect_span: None,
+            }),
+            Some(store.clone()),
+            engine,
+            cache,
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            AgentProposals::default(),
+            Arc::new(None),
+            Arc::new(None),
+            Arc::new(None),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let server = async {
+            let mut upstream = tokio::select! {
+                old = old_listener.accept() => panic!("dispatch dialed stale connector: {old:?}"),
+                fresh = fresh_listener.accept() => fresh.unwrap().0,
+            };
+            set_tcp_nodelay_best_effort(&upstream);
+            let mut probe = [0; 5];
+            upstream.read_exact(&mut probe).await.unwrap();
+            assert_eq!(&probe, b"hello");
+            upstream.write_all(b"fresh").await.unwrap();
+            upstream.shutdown().await.unwrap();
+        };
+        let client = async {
+            workload.write_all(b"hello").await.unwrap();
+            workload.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            workload.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"fresh");
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, client);
+            handler.await.unwrap().unwrap();
+        })
+        .await
+        .expect("dispatch did not complete");
+        let fresh = store
+            .lookup(
+                answer.address,
+                port,
+                answer.policy_generation,
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            fresh.record.contracts[0].pinned_addresses,
+            [IpAddr::from(fresh_ip)]
+        );
+        assert_ne!(fresh.record.mapping_id, answer.mapping_id);
+    }
+
+    #[tokio::test]
     async fn staged_transparent_pins_preserve_process_destination_authorization() {
         for (family, private, public, second_public) in [
             (
@@ -8221,6 +8390,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
                                 allocation_identity: [1; 32],
                                 policy_generation: engine.current_generation(),
                                 ttl: std::time::Duration::from_secs(30),
+                                eligible_ports: std::collections::BTreeSet::from([5432]),
                                 contracts,
                             },
                             engine.current_generation(),
