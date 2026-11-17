@@ -282,6 +282,8 @@ uses the existing `windows:build:*` task, and validates the executable PE
 architecture before testing. `-BuildDirectory` selects a dedicated Cargo cache.
 `-SkipBuild` reuses existing artifacts without claiming they match current
 sources. `-Scenario` selects an existing harness scenario.
+The deprecated `-Z3DllPath` argument remains accepted for existing automation;
+it is ignored because packages embed Z3.
 
 The package contains the four statically linked OpenShell executables plus the
 test-only forwarding fixture. The remote runner verifies their PE architecture

@@ -221,6 +221,15 @@ by the release build's executable dependency check.
 If an inherited override points to a directory containing `libz3.dll`, the
 wrapper uses the pinned source build instead.
 
+Windows package builds intentionally stop linking shared Z3 installations.
+Existing automation using a prebuilt override can keep that environment setting
+when `libz3.dll` is in the override directory, but must provide CMake and a C++
+compiler for the source build. For offline builds, point `Z3_SRC_SOURCE_DIR`
+to a local Z3 5.1.0 source tree. To retain a custom binary library, rebuild it
+with `Z3_BUILD_LIBZ3_SHARED=OFF` and `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`,
+then update the override to that static library directory. A DLL import library
+without an adjacent DLL still fails the release dependency check.
+
 ### Windows full build
 
 Run these commands in a `windows`-based checkout. To build the full set of

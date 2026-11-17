@@ -10,6 +10,8 @@ param(
     [string] $IdentityFile = (Join-Path $env:USERPROFILE '.ssh/openshell-mxc-test'),
     [ValidateSet('auto', 'arm64', 'x64')] [string] $Architecture = 'auto',
     [string] $BuildDirectory,
+    # Deprecated: retained so existing callers can use static packages unchanged.
+    [string] $Z3DllPath,
     [string] $RemoteRoot,
     [string] $WxcExecPath,
     [string] $Scenario,
@@ -22,6 +24,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
+if ($PSBoundParameters.ContainsKey('Z3DllPath')) {
+    Write-Warning '-Z3DllPath is deprecated and ignored: Windows packages embed Z3.'
+}
 if ($HostName -notmatch '^[A-Za-z0-9.-]+$' -or $UserName -notmatch '^[A-Za-z0-9_.-]+$') {
     throw 'Use a hostname/IP and a simple SSH username (or configure an SSH alias).'
 }

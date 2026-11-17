@@ -431,6 +431,8 @@ imports of Z3 and redistributable CRT DLLs. Do not package `libz3.dll` or requir
 the Visual C++ redistributable for these binaries. The separate MXC executor
 retains its own prerequisites. The remote runner checks imports and gateway
 startup before E2E; do not count loader crashes as MXC enforcement failures.
+The deprecated `-Z3DllPath` argument remains accepted and ignored for existing
+automation; do not restore DLL packaging to implement it.
 Verify the SSH host key beforehand. Never send the private SSH key or bundle
 the harness signing-key directories. `-SkipBuild` is an explicit stale-artifact
 opt-in, not evidence that artifacts match current sources. See the MXC driver

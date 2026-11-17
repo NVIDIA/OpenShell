@@ -9,6 +9,14 @@ foreach ($name in @('test-mxc-remote.ps1', 'run-mxc-remote.ps1')) {
     $errors = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $name), [ref]$tokens, [ref]$errors)
     if ($errors.Count) { throw ($errors | Out-String) }
+    if ($name -eq 'test-mxc-remote.ps1') {
+        # Bind the real parameter block without running builds, SSH, or key checks.
+        $binding = [scriptblock]::Create($ast.ParamBlock.Extent.Text + '; $PSBoundParameters.Z3DllPath')
+        if ((& $binding -HostName localhost -UserName test -Z3DllPath 'legacy/libz3.dll') -ne 'legacy/libz3.dll') {
+            throw 'Legacy -Z3DllPath argument no longer binds.'
+        }
+        $count++
+    }
     # Load pure functions only; do not start builds or SSH sessions.
     foreach ($function in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
         if ($function.Name -in @('Quote-PS', 'Read-CacheHashes', 'Get-PeMachine')) { Invoke-Expression $function.Extent.Text }
