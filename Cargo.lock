@@ -4934,7 +4934,7 @@ dependencies = [
 name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
- "chrono",
+ "jiff",
  "openshell-ocsf-validate",
  "serde",
  "serde_json",

@@ -33,7 +33,9 @@ fn payload(record: &[u8]) -> serde_json::Value {
     assert!(line.ends_with('\n'));
     assert!(!line.contains('\x1b'));
     let (timestamp, json) = line.trim_end().split_once(" OCSF-JSON ").unwrap();
-    chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+    timestamp.parse::<jiff::Timestamp>().unwrap();
+    assert_eq!(timestamp.len(), 24);
+    assert!(timestamp.ends_with('Z'));
     serde_json::from_str(json).unwrap()
 }
 

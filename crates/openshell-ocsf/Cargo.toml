@@ -15,7 +15,7 @@ repository.workspace = true
 test-support = []
 
 [dependencies]
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_repr = "0.1"

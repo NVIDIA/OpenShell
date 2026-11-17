@@ -154,7 +154,7 @@ impl BaseEventData {
             activity_name: activity_name.to_string(),
             type_uid,
             type_name,
-            time: chrono::Utc::now().timestamp_millis(),
+            time: jiff::Timestamp::now().as_millisecond(),
             severity: severity_id,
             status: None,
             message: None,
