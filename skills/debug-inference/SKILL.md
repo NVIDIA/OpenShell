@@ -73,7 +73,12 @@ Launch the client after the attachment wait succeeds so it receives the updated 
 openshell sandbox exec <sandbox> -- <client-command>
 ```
 
-After updating an ordinary static provider, wait for that change and launch a new client. An existing process keeps its revision-scoped reference; readiness does not make the old reference resolve the replacement value. Diagnose managed-refresh credentials according to their own lifecycle.
+After updating an ordinary static provider, wait for that change and launch a
+new client. An existing process keeps its environment reference; readiness does
+not guarantee that it uses the replacement value. Retained revisions and
+`stable_placeholder: true` have different resolution behavior, as described in
+[Runtime Limitations](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles#runtime-limitations).
+Diagnose managed-refresh credentials according to their own lifecycle.
 
 Keep credentials and issued references out of diagnostic output. Acknowledged detach revokes future credential resolution and removes the reference from future process environments. Requests already forwarded may still finish:
 

@@ -71,8 +71,11 @@ A request can use a static credential only when all of these checks pass:
 | The calling binary and destination are allowed. | Effective sandbox network policy. |
 | The host, port, and canonical request path match the credential binding. | Provider profile endpoints, or an explicit sandbox policy binding for an endpointless profile. |
 | The request location matches declared placement, the default `Authorization` header, or an explicit body/WebSocket rewrite policy. | The credential's `auth_style` and its header, query parameter, or path template. |
-| The HTTP method, path, or protocol operation is allowed when L7 inspection is configured. | Effective sandbox network policy. |
+| The HTTP method, path, or protocol operation is allowed when L7 inspection uses `enforcement: enforce`. | Effective sandbox network policy. |
 | The credential has not expired. | Provider credential expiry metadata. |
+
+With `enforcement: audit`, request-rule violations are logged and forwarded.
+Credential binding, placement, and expiry checks still apply.
 
 Network policy and credential binding serve different purposes. Network policy
 authorizes traffic. A credential binding authorizes use of one provider
@@ -1231,9 +1234,23 @@ Running sandboxes periodically check for provider and policy changes. Use `--wai
 
 The policy effect applies to future effective policy reads after the sandbox observes the update. The credential environment effect applies only to new process launches after the update is observed, such as later SSH, exec, or SFTP sessions.
 
-Already-running processes keep the placeholder environment they started with. For ordinary static credentials, an existing reference retains its selected revision after a value update; readiness does not retarget that reference to the replacement value. After an update wait succeeds, launch a new process to receive the updated credential reference. Gateway-managed refresh follows its own reference lifecycle. Expiry, endpoint authorization, and acknowledged detach continue to apply when the proxy resolves retained references.
+Already-running processes keep the placeholder environment they started with.
+For ordinary static credentials, a retained revision can continue to resolve its
+previous value. After that revision leaves retained history, its reference can
+fall back to the current value only while it remains authorized for the same
+provider identity epoch. A revision-scoped reference is therefore not a
+permanent pin to one credential value. After an update wait succeeds, launch a
+new process to receive the updated credential reference. Expiry, endpoint
+authorization, and acknowledged detach continue to apply to retained references.
 
-For a static provider, the sequence is attach, wait, then launch client A; update, wait, then launch client B. B's first request uses the newly installed credential. Readiness does not establish that A has stopped using its retained revision or that an old upstream key can be retired.
+For credentials configured with
+[`stable_placeholder: true`](#keep-an-externally-updated-placeholder-stable), a
+process already holding a stable reference uses the current value after the
+supervisor installs a value-only update. Enabling the setting does not convert
+references in an existing process's environment. Gateway-managed refresh
+follows its own reference lifecycle.
+
+For an ordinary static provider, the sequence is attach, wait, then launch client A; update, wait, then launch client B. B's first request uses the newly installed credential. Readiness does not establish that A has stopped using the previous credential value or that an old upstream key can be retired.
 
 An acknowledged detachment removes its provider policy layer from the active effective policy, revokes future resolution for its existing placeholders, and removes its credential placeholders from future process environments. It does not remove strings from already-running process environments or undo requests already forwarded upstream.
 

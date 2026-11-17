@@ -23,18 +23,9 @@ const MAX_PAGES: usize = 1000;
 async fn cli_create_exec_list_delete(cx: &mut Context) -> testkit::Result {
     cx.cli(["status"]).await?.success()?;
 
-    let name = cx.name("cs");
-    cx.track(&name);
-    cx.cli(["sandbox", "create", "--name", &name, "--detach"])
-        .await?
-        .success()?;
-
-    let sandbox = cx.adopt(&name).await?;
-    let got: Value = cx
-        .cli(["sandbox", "get", &name, "--output", "json"])
-        .await?
-        .success()?
-        .json()?;
+    let sandbox = cx.cli_sandbox("cs").create().await?;
+    let name = sandbox.name().to_string();
+    let got = sandbox.get_json().await?;
     testkit::ensure!(
         got["name"] == name.as_str(),
         "sandbox get returned {:?}; expected {name:?}",
@@ -50,46 +41,27 @@ async fn cli_create_exec_list_delete(cx: &mut Context) -> testkit::Result {
     testkit::ensure!(listed.is_some(), "sandbox {name} is not in sandbox list");
 
     let marker = format!("openshell-e2e-{}", cx.run_id());
-    let exec = cx
-        .cli([
-            "sandbox", "exec", "--name", &name, "--no-tty", "--", "echo", &marker,
-        ])
-        .await?
-        .success()?;
-    testkit::ensure!(
-        exec.stdout == format!("{marker}\n"),
-        "sandbox exec stdout was {:?}; expected {:?}",
-        exec.stdout,
-        format!("{marker}\n")
-    );
+    cx.cli([
+        "sandbox", "exec", "--name", &name, "--no-tty", "--", "echo", &marker,
+    ])
+    .await?
+    .expect_stdout(&format!("{marker}\n"))?;
 
     cx.cli(["sandbox", "delete", &name]).await?.success()?;
     wait_unlisted(cx, &name).await?;
-    cx.expect_absent(&sandbox).await
+    sandbox.expect_absent().await
 }
 
 /// A sandbox created with the CLI can be stopped, rejects `sandbox exec` while
 /// stopped, starts again, and can be stopped and deleted.
 #[testkit::test]
 async fn cli_stop_start_delete(cx: &mut Context) -> testkit::Result {
-    let name = cx.name("cl");
-    cx.track(&name);
-    cx.cli([
-        "sandbox",
-        "create",
-        "--name",
-        &name,
-        "--detach",
-        "--no-tty",
-        "--",
-        "sh",
-        "-c",
-        "exec sleep infinity",
-    ])
-    .await?
-    .success()?;
-    let sandbox = cx.adopt(&name).await?;
-    sandbox.wait_ready().await?;
+    let sandbox = cx
+        .cli_sandbox("cl")
+        .command(["sh", "-c", "exec sleep infinity"])
+        .create_ready()
+        .await?;
+    let name = sandbox.name().to_string();
 
     cx.cli(["sandbox", "stop", &name]).await?.success()?;
     sandbox
@@ -108,7 +80,7 @@ async fn cli_stop_start_delete(cx: &mut Context) -> testkit::Result {
 
     cx.cli(["sandbox", "delete", &name]).await?.success()?;
     wait_unlisted(cx, &name).await?;
-    cx.expect_absent(&sandbox).await
+    sandbox.expect_absent().await
 }
 
 /// Wait until `sandbox list` no longer shows the sandbox.

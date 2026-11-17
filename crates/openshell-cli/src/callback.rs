@@ -236,13 +236,13 @@ mod tests {
                     IpAddr::V6("::1".parse::<Ipv6Addr>().expect("v6")),
                     addr.port(),
                 );
-                let stream = tokio::net::TcpStream::connect(v6)
+                let stream = openshell_core::net::connect_tcp_nodelay_best_effort(v6)
                     .await
                     .expect("[::1] callback must be reachable");
                 drop(stream);
 
                 let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port());
-                let refused = tokio::net::TcpStream::connect(v4).await;
+                let refused = openshell_core::net::connect_tcp_nodelay_best_effort(v4).await;
                 assert!(refused.is_err(), "IPv4 loopback must not reach a ::1 bind");
             })
             .await;

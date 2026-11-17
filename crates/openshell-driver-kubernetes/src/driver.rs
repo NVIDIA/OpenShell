@@ -612,10 +612,6 @@ fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     }
 }
 const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
-/// Unsupervised shared sandbox instances removed at once by one reconcile pass.
-/// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
-const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
-
 fn random_sandbox_runtime_token() -> Result<String, KubernetesDriverError> {
     use std::fmt::Write as _;
 
@@ -3544,9 +3540,8 @@ impl KubernetesComputeDriver {
             .ensure_network_additional_ca_config_map(namespace)
             .await?;
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        pods.create(
-            &PostParams::default(),
-            &crate::app_listener::configure_supervisor_pod(
+        let pod = crate::sandbox_runtime::with_runtime_class(
+            crate::app_listener::configure_supervisor_pod(
                 supervisor_pod(
                     namespace,
                     names,
@@ -3583,16 +3578,19 @@ impl KubernetesComputeDriver {
                         .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
                     owner,
                     &self.supervisor_otlp_environment(),
+                    self.config.sandbox_attach_request_timeout_seconds,
                 )
                 .map_err(KubernetesDriverError::Message)?,
                 &self.config.sandbox_runtime.app_listener,
             ),
-        )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?
-        .metadata
-        .uid
-        .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
+            &self.config.supervisor_runtime_class_name,
+        );
+        pods.create(&PostParams::default(), &pod)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?
+            .metadata
+            .uid
+            .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
     }
 
     /// Read the gateway's shared supervisor Service: its address and the
@@ -4102,6 +4100,7 @@ impl KubernetesComputeDriver {
             sandbox_api.api.clone(),
             cr_name.to_string(),
             Some(cr_uid.to_string()),
+            Duration::from_secs(self.config.runtime_bootstrap_grace_seconds),
         );
         Ok(())
     }
@@ -5543,7 +5542,7 @@ impl KubernetesComputeDriver {
         if !sandbox_runtime_bootstrap_is_stale(
             object,
             SystemTime::now(),
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
+            Duration::from_secs(self.config.runtime_bootstrap_grace_seconds),
         ) {
             return;
         }
@@ -5986,9 +5985,10 @@ fn spawn_sandbox_runtime_bootstrap_completion(
     sandboxes: Api<DynamicObject>,
     sandbox_name: String,
     expected_sandbox_uid: Option<String>,
+    bootstrap_grace: Duration,
 ) {
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + SANDBOX_RUNTIME_BOOTSTRAP_GRACE;
+        let deadline = tokio::time::Instant::now() + bootstrap_grace;
         match tokio::time::timeout_at(deadline, control.wait_available()).await {
             Ok(true) => {}
             Ok(false) | Err(_) => return,
@@ -10513,6 +10513,7 @@ mod tests {
     #[test]
     fn sandbox_runtime_bootstrap_marker_and_age_gate_rollback() {
         let started = Duration::from_hours(490_896);
+        let bootstrap_grace = Duration::from_mins(5);
         let mut object: DynamicObject = serde_json::from_value(serde_json::json!({
             "apiVersion": "agents.x-k8s.io/v1beta1",
             "kind": "Sandbox",
@@ -10535,13 +10536,13 @@ mod tests {
         let started_at = SystemTime::UNIX_EPOCH + started;
         assert!(!sandbox_runtime_bootstrap_is_stale(
             &object,
-            started_at + SANDBOX_RUNTIME_BOOTSTRAP_GRACE - Duration::from_secs(1),
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            started_at + bootstrap_grace - Duration::from_secs(1),
+            bootstrap_grace
         ));
         assert!(sandbox_runtime_bootstrap_is_stale(
             &object,
-            started_at + SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            started_at + bootstrap_grace,
+            bootstrap_grace
         ));
         object
             .metadata
@@ -10552,7 +10553,7 @@ mod tests {
         assert!(sandbox_runtime_bootstrap_is_stale(
             &object,
             started_at,
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
+            bootstrap_grace
         ));
         object
             .metadata

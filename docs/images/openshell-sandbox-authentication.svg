@@ -3,7 +3,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-labelledby="title desc">
   <title id="title">OpenShell sandbox authentication</title>
-  <desc id="desc">The compute driver gives the supervisor a bootstrap credential. The supervisor presents it to the gateway, which issues a gateway JWT and a sandbox JWT. The supervisor uses the gateway JWT with the gateway and the sandbox JWT over mutual TLS with the OpenShell Sandbox, which holds only the gateway's public key.</desc>
+  <desc id="desc">The gateway preissues a gateway JWT and a sandbox JWT for each sandbox generation. Dedicated supervisors receive the credential bundle through the compute driver; shared supervisors receive it in an assignment over a host stream authenticated with a separate supervisor-host JWT. The supervisor uses the gateway JWT for sandbox-specific gateway RPCs, verifies the sandbox's TLS server certificate, and presents the sandbox JWT to authenticate itself. The sandbox holds only the gateway's public key for JWT verification.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
@@ -37,12 +37,12 @@
   <rect x="40" y="70" width="360" height="420" rx="18" class="soft"/>
   <rect x="75" y="105" width="290" height="110" rx="14" class="trusted"/>
   <text x="220" y="145" text-anchor="middle" class="label">API Server</text>
-  <text x="220" y="171" text-anchor="middle" class="small">signs every JWT</text>
+  <text x="220" y="171" text-anchor="middle" class="small">signs the JWT pair</text>
   <text x="220" y="192" text-anchor="middle" class="small">checks the sandbox record</text>
   <rect x="75" y="360" width="290" height="100" rx="14" class="green"/>
   <text x="220" y="398" text-anchor="middle" class="label">Compute driver</text>
-  <text x="220" y="424" text-anchor="middle" class="small">delivers or verifies the</text>
-  <text x="220" y="444" text-anchor="middle" class="small">bootstrap credential</text>
+  <text x="220" y="424" text-anchor="middle" class="small">delivers the dedicated</text>
+  <text x="220" y="444" text-anchor="middle" class="small">supervisor credential bundle</text>
 
   <!-- Supervisor -->
   <rect x="530" y="105" width="240" height="355" rx="16" class="trusted"/>
@@ -64,22 +64,27 @@
   <text x="1080" y="285" text-anchor="middle" class="small">Fresh TLS certs per run</text>
   <rect x="945" y="398" width="270" height="62" rx="14" class="dark"/>
   <text x="1080" y="426" text-anchor="middle" style="font:700 18px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#fff">Agent</text>
-  <text x="1080" y="447" text-anchor="middle" style="font:500 13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#d1d5db">sees no credentials</text>
+  <text x="1080" y="447" text-anchor="middle" style="font:500 13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#d1d5db">receives placeholders</text>
   <path d="M1080 315 V398" class="line"/>
 
   <!-- Flows -->
+  <path d="M160 215 V360" class="line"/>
+  <text x="255" y="280" text-anchor="middle" class="tiny">PREISSUED</text>
+  <text x="255" y="300" text-anchor="middle" class="tiny">JWT PAIR</text>
+
   <path d="M365 410 H530" class="line"/>
-  <text x="466" y="398" text-anchor="middle" class="tiny">1 · BOOTSTRAP</text>
+  <text x="448" y="398" text-anchor="middle" class="tiny">JWT PAIR</text>
 
   <path d="M530 140 H365" class="line"/>
-  <text x="466" y="128" text-anchor="middle" class="tiny">2 · AUTHENTICATES</text>
+  <text x="448" y="128" text-anchor="middle" class="tiny">GATEWAY JWT</text>
 
   <path d="M365 185 H530" class="line"/>
-  <text x="466" y="207" text-anchor="middle" class="tiny">3 · ISSUES JWT PAIR</text>
+  <text x="448" y="207" text-anchor="middle" class="tiny">SHARED ASSIGNMENT</text>
+  <text x="448" y="225" text-anchor="middle" class="tiny">HOST JWT STREAM</text>
 
   <path d="M770 210 H945" class="flow"/>
-  <text x="845" y="198" text-anchor="middle" class="tiny">4 · SANDBOX JWT</text>
-  <text x="845" y="232" text-anchor="middle" class="tiny">MUTUAL TLS</text>
+  <text x="845" y="198" text-anchor="middle" class="tiny">SANDBOX JWT</text>
+  <text x="845" y="232" text-anchor="middle" class="tiny">SERVER TLS</text>
 
-  <text x="40" y="530" class="small">Every JWT names one sandbox and one run of it. Restarting a sandbox issues new tokens and TLS certificates.</text>
+  <text x="40" y="530" class="small">Each session JWT names one sandbox and one run of it. Restarting a sandbox issues new tokens and TLS certificates.</text>
 </svg>

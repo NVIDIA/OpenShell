@@ -57,7 +57,13 @@ loads the launch configuration from its arguments and environment and prepares
 push and the OCSF JSON settings with its logging layers, so renewal by either
 gateway client keeps both current. `run_sandbox_with_backend` sets the
 process-wide OCSF context, binds the readiness socket and port to instance
-readiness, and stops the instance on SIGTERM or SIGINT.
+readiness, and stops the instance on SIGTERM or SIGINT. Stopping gives the
+workload 5 seconds to exit after TERM, and the instance stops, including its
+exit report and trace flush, within 8 seconds. Telemetry exporters shut down
+after that and are not covered by this bound. A boundary connection lost while
+the process stops is not recovered; the workload's exit status is reported
+when the boundary returned it, otherwise the workload is reported as
+terminated.
 
 `sandbox_instance_host::SandboxInstanceHost` runs several sandbox instances in
 one process. Each instance gets its own Tokio runtime; every thread of that

@@ -2,13 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use aws_credential_types::Credentials;
+use aws_sigv4::SigningOutput;
 use aws_sigv4::http_request::{
-    PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
+    PayloadChecksumKind, SignableBody, SignableRequest, SigningInstructions, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use miette::{Result, miette};
 use std::time::SystemTime;
+
+/// Keep AWS signer diagnostics out of supervisor log sinks: the canonical
+/// request can contain the raw session token added during signing.
+fn sign_without_tracing<'a>(
+    request: SignableRequest<'a>,
+    params: &'a aws_sigv4::http_request::SigningParams<'a>,
+) -> std::result::Result<SigningOutput<SigningInstructions>, aws_sigv4::http_request::SigningError>
+{
+    tracing::dispatcher::with_default(&tracing::Dispatch::none(), || sign(request, params))
+}
 
 /// AWS regions contain a hyphen followed by a digit (e.g., `us-east-1`).
 /// Service names like `s3` or `bedrock-runtime` do not.
@@ -233,7 +244,7 @@ fn build_identity(access_key: &str, secret_key: &str, session_token: Option<&str
 
 fn rebuild_request(
     parts: &RequestParts<'_>,
-    instructions: &aws_sigv4::http_request::SigningInstructions,
+    instructions: &SigningInstructions,
     body: &[u8],
 ) -> Vec<u8> {
     let mut output = Vec::with_capacity(256 + body.len());
@@ -297,7 +308,7 @@ pub fn apply_sigv4_to_request(
     )
     .map_err(|e| miette!("SigV4 signable request: {e}"))?;
 
-    let (instructions, _signature) = sign(signable_request, &signing_params)
+    let (instructions, _signature) = sign_without_tracing(signable_request, &signing_params)
         .map_err(|e| miette!("SigV4 signing failed: {e}"))?
         .into_parts();
 
@@ -364,7 +375,7 @@ pub fn apply_sigv4_headers_only_with_body(
     )
     .map_err(|e| miette!("SigV4 signable request: {e}"))?;
 
-    let (instructions, _signature) = sign(signable_request, &signing_params)
+    let (instructions, _signature) = sign_without_tracing(signable_request, &signing_params)
         .map_err(|e| miette!("SigV4 signing failed: {e}"))?
         .into_parts();
 
@@ -374,6 +385,55 @@ pub fn apply_sigv4_headers_only_with_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_does_not_emit_the_canonical_request_to_tracing() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(log.reopen().unwrap())
+            .finish();
+        let session_token = "SYNTHETIC_SIGV4_SESSION_TOKEN";
+        let raw = b"GET /bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n";
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "test_capture", "before signing");
+            apply_sigv4_to_request(
+                raw,
+                "s3.us-east-1.amazonaws.com",
+                "us-east-1",
+                "s3",
+                "ASIATEST",
+                "synthetic-secret",
+                Some(session_token),
+            )
+            .unwrap();
+            for body in [
+                SignableBody::UnsignedPayload,
+                SignableBody::StreamingUnsignedPayloadTrailer,
+            ] {
+                apply_sigv4_headers_only_with_body(
+                    raw,
+                    "s3.us-east-1.amazonaws.com",
+                    "us-east-1",
+                    "s3",
+                    "ASIATEST",
+                    "synthetic-secret",
+                    Some(session_token),
+                    body,
+                )
+                .unwrap();
+            }
+            tracing::trace!(target: "test_capture", "after signing");
+        });
+
+        let events = std::fs::read_to_string(log.path()).unwrap();
+        assert!(events.contains("before signing"));
+        assert!(events.contains("after signing"));
+        assert!(!events.contains("aws_sigv4"));
+        assert!(!events.contains(session_token));
+    }
 
     #[test]
     fn extract_region_from_hostname() {

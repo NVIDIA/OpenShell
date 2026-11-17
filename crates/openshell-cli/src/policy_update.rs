@@ -268,11 +268,14 @@ fn l7_target_to_proto(target: &L7RuleTarget) -> ProtoL7RuleTarget {
     }
 }
 
-fn ensure_websocket_credential_rewrite_protocol(
+/// Require the endpoint protocol segment to be one of `allowed` for `option`.
+fn ensure_option_protocol(
     spec: &str,
     endpoint: &NetworkEndpoint,
+    option: &str,
+    allowed: &[&str],
 ) -> Result<()> {
-    if matches!(endpoint.protocol.as_str(), "rest" | "websocket") {
+    if allowed.contains(&endpoint.protocol.as_str()) {
         return Ok(());
     }
     let protocol = if endpoint.protocol.is_empty() {
@@ -280,25 +283,13 @@ fn ensure_websocket_credential_rewrite_protocol(
     } else {
         endpoint.protocol.as_str()
     };
+    let allowed = allowed
+        .iter()
+        .map(|protocol| format!("'{protocol}'"))
+        .collect::<Vec<_>>()
+        .join(" or ");
     Err(miette!(
-        "websocket-credential-rewrite endpoint option requires --add-endpoint protocol segment to be 'rest' or 'websocket'; got '{protocol}' in '{spec}'"
-    ))
-}
-
-fn ensure_request_body_credential_rewrite_protocol(
-    spec: &str,
-    endpoint: &NetworkEndpoint,
-) -> Result<()> {
-    if endpoint.protocol == "rest" {
-        return Ok(());
-    }
-    let protocol = if endpoint.protocol.is_empty() {
-        "<empty>"
-    } else {
-        endpoint.protocol.as_str()
-    };
-    Err(miette!(
-        "request-body-credential-rewrite endpoint option requires --add-endpoint protocol segment to be 'rest'; got '{protocol}' in '{spec}'"
+        "{option} endpoint option requires --add-endpoint protocol segment to be {allowed}; got '{protocol}' in '{spec}'"
     ))
 }
 
@@ -504,12 +495,16 @@ fn apply_add_endpoint_options(
             "allow-uninspected-credentials" => {
                 endpoint.allow_uninspected_credentials = true;
             }
+            "allow-encoded-slash" => {
+                ensure_option_protocol(spec, endpoint, option, &["rest", "websocket"])?;
+                endpoint.allow_encoded_slash = true;
+            }
             "websocket-credential-rewrite" => {
-                ensure_websocket_credential_rewrite_protocol(spec, endpoint)?;
+                ensure_option_protocol(spec, endpoint, option, &["rest", "websocket"])?;
                 endpoint.websocket_credential_rewrite = true;
             }
             "request-body-credential-rewrite" => {
-                ensure_request_body_credential_rewrite_protocol(spec, endpoint)?;
+                ensure_option_protocol(spec, endpoint, option, &["rest"])?;
                 endpoint.request_body_credential_rewrite = true;
             }
             _ if option.starts_with(ALLOWED_IP_OPTION_PREFIX) => {
@@ -521,7 +516,7 @@ fn apply_add_endpoint_options(
             }
             _ => {
                 return Err(miette!(
-                    "--add-endpoint options segment supports only 'allow-uninspected-credentials', 'websocket-credential-rewrite', 'request-body-credential-rewrite', and 'allowed-ip=<CIDR-or-IP>'; got '{option}' in '{spec}'"
+                    "--add-endpoint options segment supports only 'allow-uninspected-credentials', 'allow-encoded-slash', 'websocket-credential-rewrite', 'request-body-credential-rewrite', and 'allowed-ip=<CIDR-or-IP>'; got '{option}' in '{spec}'"
                 ));
             }
         }
@@ -829,6 +824,45 @@ mod tests {
         let endpoint = &rule.endpoints[0];
         assert_eq!(endpoint.protocol, "rest");
         assert!(endpoint.request_body_credential_rewrite);
+    }
+
+    #[test]
+    fn parse_add_endpoint_enables_allow_encoded_slash_on_rest_and_websocket() {
+        for protocol in ["rest", "websocket"] {
+            let plan = build_policy_update_plan(
+                &[format!(
+                    "registry.npmjs.org:443:full:{protocol}:enforce:allow-encoded-slash"
+                )],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+            )
+            .expect("plan should build");
+
+            let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+                panic!("expected add-rule preview");
+            };
+            assert!(rule.endpoints[0].allow_encoded_slash, "{protocol}");
+        }
+    }
+
+    #[test]
+    fn allow_encoded_slash_rejects_endpoint_without_http_protocol() {
+        for spec in [
+            "registry.npmjs.org:443::::allow-encoded-slash",
+            "registry.npmjs.org:443::tcp::allow-encoded-slash",
+        ] {
+            let error =
+                build_policy_update_plan(&[spec.to_string()], &[], &[], &[], &[], &[], None)
+                    .expect_err("plan should fail");
+            assert!(
+                error.to_string().contains("to be 'rest' or 'websocket'"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

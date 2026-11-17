@@ -1,0 +1,5 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+image_pull_policy = "if_not_present"
+sandbox_label = "tmachine"
+guest_tls_ca = "{{ openshell_gateway_home }}/.local/state/openshell/tls/ca.crt"

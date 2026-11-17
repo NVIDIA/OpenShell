@@ -282,6 +282,29 @@ mod tests {
     }
 
     #[test]
+    fn correlation_uid_can_be_set_on_any_event_class() {
+        let ctx = test_sandbox_context();
+        let mut event = AuthenticationBuilder::new(
+            &ctx,
+            User::other("user-1", "User"),
+            Service::new("gateway"),
+        )
+        .status(StatusId::Success)
+        .build();
+
+        event.base_mut().metadata.correlation_uid = Some("request-123".into());
+
+        assert_eq!(
+            event.base().metadata.correlation_uid.as_deref(),
+            Some("request-123")
+        );
+        assert_eq!(
+            serde_json::to_value(&event).unwrap()["metadata"]["correlation_uid"],
+            "request-123"
+        );
+    }
+
+    #[test]
     fn test_roundtrip_application_lifecycle() {
         let ctx = test_sandbox_context();
         let event = AppLifecycleBuilder::new(&ctx)

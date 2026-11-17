@@ -10,6 +10,7 @@
 """Reconcile PR reviewers from the merged REVIEWERS.md and current PR metadata.
 
 Preview with --repo OWNER/REPO --pr NUMBER; add --apply to update requests.
+For newly opened PRs, --label-accepted-work also adds state:accepted if qualified.
 Request all matching roster members, excluding the author. Preserve
 manual choices, unknown request provenance, and anyone who commented or reviewed.
 The parser and planning helpers are importable. No state is stored between runs.
@@ -19,21 +20,90 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+from check_maintainer_approval import parse_maintainers
+from label_accepted_work import ACCEPTED_LABEL, evaluate_pr_accepted_work
+
 HEADER = ["Name", "GitHub ID", "Company/Organization"]
-LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:-[a-z0-9]+)*")
+LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:[-:][a-z0-9]+)*")
 PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)", re.I)
+ADD_LABEL = """mutation($input: AddLabelsToLabelableInput!) {
+  addLabelsToLabelable(input: $input) { labelable { __typename } }
+}"""
+
+
+class LabelRoutingError(ValueError):
+    """The PR's area or topic labels prevent requesting reviewers."""
+
+
+def _api_action(method: str, path: str) -> str:
+    """Name the step a failed `gh api` call was performing."""
+    if path.endswith("/requested_reviewers"):
+        return (
+            "Removing reviewer requests"
+            if method == "DELETE"
+            else "Requesting reviewers"
+        )
+    if path.endswith("/labels") and method == "POST":
+        return "Adding labels"
+    if method == "GET":
+        return "Reading the PR from GitHub"
+    return "A GitHub API call"
+
+
+def _escape_annotation(text: str, *, prop: bool = False) -> str:
+    """Escape text for a GitHub Actions workflow command."""
+    text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    if prop:
+        text = text.replace(":", "%3A").replace(",", "%2C")
+    return text
+
+
+def describe_failure(exc: Exception) -> tuple[str, str]:
+    """Return a short category and an actionable message for a failure."""
+    if isinstance(exc, LabelRoutingError):
+        return "PR labels", str(exc)
+    if isinstance(exc, subprocess.CalledProcessError):
+        command = [str(part) for part in exc.cmd]
+        method = "GET"
+        if "--method" in command[:-1]:
+            method = command[command.index("--method") + 1]
+        path = command[2] if len(command) > 2 else ""
+        message = (
+            f"{_api_action(method, path)} failed with a GitHub API error: "
+            f"gh api {method} {path}"
+        )
+        detail = (exc.stderr or "").strip()
+        if detail:
+            message += f": {detail}"
+        message += f" (exit status {exc.returncode})"
+        return "GitHub API error", message
+    return "error", str(exc)
+
+
+def report_failure(exc: Exception, *, stream=None, env=None) -> None:
+    """Print the failure, plus an Actions error annotation when in Actions."""
+    stream = sys.stderr if stream is None else stream
+    env = os.environ if env is None else env
+    category, message = describe_failure(exc)
+    print(f"Review readiness: {message}", file=stream)
+    if env.get("GITHUB_ACTIONS") == "true":
+        title = _escape_annotation(f"Review Readiness: {category}", prop=True)
+        print(f"::error title={title}::{_escape_annotation(message)}", file=stream)
 
 
 @dataclass(frozen=True)
 class ReviewPlan:
     add: tuple[str, ...]
     remove: tuple[str, ...]
+    accepted_work: bool | None = None
+    add_labels: tuple[str, ...] = ()
 
 
 def parse_reviewers(markdown: str) -> dict[str, set[str]]:
@@ -85,11 +155,27 @@ def parse_reviewers(markdown: str) -> dict[str, set[str]]:
 def select_reviewers(categories: dict[str, set[str]], labels: set[str]) -> set[str]:
     """Return matching handles for one primary area and any number of topics."""
     relevant = {label for label in labels if label.startswith(("area:", "topic:"))}
-    if sum(label.startswith("area:") for label in relevant) != 1:
-        raise ValueError("a ready PR must have exactly one area label")
+    areas = sorted(label for label in relevant if label.startswith("area:"))
+    if not areas:
+        raise LabelRoutingError(
+            "This PR has no area label. A ready PR needs exactly one; add one."
+        )
+    if len(areas) > 1:
+        raise LabelRoutingError(
+            f"This PR has more than one area label: {', '.join(areas)}. "
+            "A ready PR needs exactly one; remove the others."
+        )
     unknown = relevant - categories.keys()
     if unknown:
-        raise ValueError("unknown area/topic labels: " + ", ".join(sorted(unknown)))
+        names = ", ".join(sorted(unknown))
+        if len(unknown) == 1:
+            raise LabelRoutingError(
+                f"There is an invalid area or topic label on this PR: {names}. "
+                "Remove it."
+            )
+        raise LabelRoutingError(
+            f"There are invalid area and topic labels on this PR: {names}. Remove them."
+        )
     return set().union(*(categories[label] for label in relevant))
 
 
@@ -206,21 +292,70 @@ def _routing_key(pr: dict):
     )
 
 
+def _add_accepted_label(repository: str, pr: dict, evidence: dict) -> None:
+    label = _api(f"repos/{repository}/labels/state%3Aaccepted")
+    rationale = json.dumps(
+        {"schema": "openshell-acceptance-v1", **evidence}, separators=(",", ":")
+    )
+    result = _api(
+        "graphql",
+        method="POST",
+        data={
+            "query": ADD_LABEL,
+            "variables": {
+                "input": {
+                    "labelableId": pr["node_id"],
+                    "labels": [{"labelId": label["node_id"], "rationale": rationale}],
+                }
+            },
+        },
+    )
+    if result.get("errors") or not result.get("data", {}).get("addLabelsToLabelable"):
+        raise ValueError("Could not apply accepted-work label with evidence")
+
+
 def check_review_readiness(
     categories: dict[str, set[str]],
     repository: str,
     number: int,
     *,
     apply=False,
+    label_accepted_work=False,
+    maintainers: set[str] | None = None,
 ) -> ReviewPlan | None:
-    """Plan or apply routing. Callers must serialize runs for the same PR."""
+    """Plan labeling and routing; callers serialize runs for the same PR.
+
+    Enable label_accepted_work for newly opened PRs, including drafts. Acceptance
+    is independent of readiness and classification; only reviewer routing needs
+    a ready PR with an area label. Labeling never removes an existing label.
+    """
     pull = f"repos/{repository}/pulls/{number}"
     pr = _api(pull)
-    if pr["state"] != "open" or pr["draft"]:
+    if pr["state"] != "open":
         return None
-    selected = select_reviewers(categories, {label["name"] for label in pr["labels"]})
+    accepted = None
+    add_labels = ()
+    labels = {label["name"] for label in pr["labels"]}
+    if label_accepted_work:
+        evidence = evaluate_pr_accepted_work(
+            repository, pr, maintainers or set(), api=_api
+        )
+        accepted = evidence is not None
+        if accepted and ACCEPTED_LABEL not in labels:
+            add_labels = (ACCEPTED_LABEL,)
+            if apply:
+                _add_accepted_label(repository, pr, evidence)
+    if pr["draft"] or not any(label.startswith("area:") for label in labels):
+        if pr["draft"] and not label_accepted_work:
+            return None
+        return ReviewPlan((), (), accepted, add_labels)
+    selected = select_reviewers(categories, labels)
     selected -= {pr["user"]["login"].lower()}
-    plan = plan_review_requests(selected, **_load_reviewers(repository, number, pr))
+    plan = replace(
+        plan_review_requests(selected, **_load_reviewers(repository, number, pr)),
+        accepted_work=accepted,
+        add_labels=add_labels,
+    )
     if apply:
         endpoint = f"{pull}/requested_reviewers"
         if plan.add:
@@ -233,7 +368,7 @@ def check_review_readiness(
             refreshed = plan_review_requests(
                 selected, **_load_reviewers(repository, number, latest)
             )
-            plan = ReviewPlan(plan.add, refreshed.remove)
+            plan = replace(plan, remove=refreshed.remove)
             if plan.remove:
                 _api(endpoint, method="DELETE", data={"reviewers": list(plan.remove)})
     return plan
@@ -242,6 +377,12 @@ def check_review_readiness(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reviewers", type=Path, default=Path("REVIEWERS.md"))
+    parser.add_argument("--maintainers", type=Path, default=Path("MAINTAINERS.md"))
+    parser.add_argument(
+        "--label-accepted-work",
+        action="store_true",
+        help="check and label accepted work on a newly opened PR",
+    )
     parser.add_argument("--repo", required=True, help="target OWNER/REPO")
     parser.add_argument("--pr", required=True, type=int, help="pull request number")
     parser.add_argument(
@@ -252,9 +393,28 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--repo must be OWNER/REPO and --pr must be positive")
     try:
         categories = parse_reviewers(args.reviewers.read_text(encoding="utf-8"))
-        plan = check_review_readiness(categories, args.repo, args.pr, apply=args.apply)
-    except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as exc:
-        print(f"Review readiness: {exc}", file=sys.stderr)
+        maintainers = (
+            parse_maintainers(args.maintainers.read_text(encoding="utf-8"))
+            if args.label_accepted_work
+            else None
+        )
+        plan = check_review_readiness(
+            categories,
+            args.repo,
+            args.pr,
+            apply=args.apply,
+            label_accepted_work=args.label_accepted_work,
+            maintainers=maintainers,
+        )
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        report_failure(exc)
         return 1
     print(
         json.dumps(
