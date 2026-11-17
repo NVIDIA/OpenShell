@@ -17,7 +17,6 @@
 //! gateway's client certificate.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Url;
@@ -130,7 +129,7 @@ fn client(gateway: &Gateway) -> Result<reqwest::Client> {
             .with_no_client_auth(),
     };
     reqwest::Client::builder()
-        .use_preconfigured_tls(Arc::new(tls))
+        .use_preconfigured_tls(tls)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(SERVICE_REQUEST_TIMEOUT)
@@ -153,8 +152,17 @@ fn private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use super::ServiceRequest;
+    use super::{ServiceRequest, client};
     use crate::gateway::Gateway;
+
+    /// reqwest accepts the rustls configuration only as a plain
+    /// `ClientConfig`; anything else fails when the client is built.
+    #[test]
+    fn client_accepts_the_tls_configuration() {
+        let gateway =
+            Gateway::from_endpoint("http://127.0.0.1:8080".to_string(), "default".to_string());
+        client(&gateway).expect("service HTTP client");
+    }
 
     fn request(endpoint: &str, service_url: &str) -> ServiceRequest {
         let gateway = Gateway::from_endpoint(endpoint.to_string(), "default".to_string());
