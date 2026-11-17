@@ -12,8 +12,8 @@ use crate::proxy::destination::{
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -266,7 +266,7 @@ struct Publication {
 struct StoreState {
     records: BTreeMap<IpAddr, ResolvedEndpointRecord>,
     allocations: BTreeMap<AllocationKey, IpAddr>,
-    expired_allocations: BTreeSet<IpAddr>,
+    expired_allocations: BTreeMap<IpAddr, ResolvedEndpointRecord>,
     next_ipv4: u32,
     end_ipv4: u32,
     next_ipv6: u128,
@@ -274,11 +274,15 @@ struct StoreState {
     next_mapping_generation: u64,
 }
 
+type RefreshLock = Arc<tokio::sync::Mutex<Option<Instant>>>;
+
 pub(crate) struct ResolvedEndpointStore {
     state: RwLock<StoreState>,
     config: StoreConfig,
     ipv4_pool_high_water_emitted: AtomicBool,
     ipv6_pool_high_water_emitted: AtomicBool,
+    refresher: OnceLock<Weak<dyn super::MappingRefresher>>,
+    refreshes: Mutex<BTreeMap<IpAddr, RefreshLock>>,
 }
 
 impl ResolvedEndpointStore {
@@ -291,7 +295,7 @@ impl ResolvedEndpointStore {
             state: RwLock::new(StoreState {
                 records: BTreeMap::new(),
                 allocations: BTreeMap::new(),
-                expired_allocations: BTreeSet::new(),
+                expired_allocations: BTreeMap::new(),
                 next_ipv4,
                 end_ipv4,
                 next_ipv6,
@@ -301,7 +305,81 @@ impl ResolvedEndpointStore {
             config,
             ipv4_pool_high_water_emitted: AtomicBool::new(false),
             ipv6_pool_high_water_emitted: AtomicBool::new(false),
+            refresher: OnceLock::new(),
+            refreshes: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(super) fn set_refresher(&self, refresher: Weak<dyn super::MappingRefresher>) {
+        let _ = self.refresher.set(refresher);
+    }
+
+    /// Refresh only an expired, policy-backed mapping from the same policy
+    /// generation. Never let an expired observation acquire an egress grant.
+    pub(crate) async fn refresh_if_expired(
+        &self,
+        address: IpAddr,
+        port: u16,
+        generation: u64,
+    ) -> miette::Result<()> {
+        if !matches!(
+            self.lookup_intent(address, port, generation, Instant::now()),
+            Err(MappingLookupError::Expired)
+        ) {
+            return Ok(());
+        }
+        let record = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| miette::miette!("mapping store lock poisoned"))?;
+            state
+                .records
+                .get(&address)
+                .or_else(|| state.expired_allocations.get(&address))
+                .cloned()
+                .ok_or_else(|| miette::miette!("expired mapping identity is unavailable"))?
+        };
+        if record.policy_generation != generation
+            || record.is_observation()
+            || !record
+                .contracts
+                .iter()
+                .any(|contract| contract.port == port)
+        {
+            return Err(miette::miette!(
+                "expired mapping is not eligible for refresh"
+            ));
+        }
+        // Entries are allocated only for known mappings, bounded by the store's
+        // allocation budget. A failed lookup cools down for one second.
+        let refresh = self
+            .refreshes
+            .lock()
+            .map_err(|_| miette::miette!("mapping refresh lock poisoned"))?
+            .entry(address)
+            .or_default()
+            .clone();
+        let mut failed_at = refresh.lock().await;
+        if self
+            .lookup_intent(address, port, generation, Instant::now())
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if failed_at.is_some_and(|failed| failed.elapsed() < super::MIN_MAPPING_TTL) {
+            return Err(miette::miette!(
+                "transparent TCP mapping refresh recently failed"
+            ));
+        }
+        let refresher = self
+            .refresher
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| miette::miette!("transparent TCP mapping refresh is unavailable"))?;
+        let result = refresher.refresh(&record).await;
+        *failed_at = result.as_ref().err().map(|_| Instant::now());
+        result
     }
 
     pub(crate) fn publish(
@@ -534,8 +612,9 @@ impl ResolvedEndpointStore {
             .filter_map(|(address, record)| (now >= record.expires_at).then_some(*address))
             .collect::<Vec<_>>();
         for address in &expired {
-            state.records.remove(address);
-            state.expired_allocations.insert(*address);
+            if let Some(record) = state.records.remove(address) {
+                state.expired_allocations.insert(*address, record);
+            }
         }
         Ok(expired.len())
     }
@@ -548,7 +627,7 @@ fn live_record(
     now: Instant,
 ) -> Result<&ResolvedEndpointRecord, MappingLookupError> {
     let Some(record) = state.records.get(&synthetic_address) else {
-        return if state.expired_allocations.contains(&synthetic_address) {
+        return if state.expired_allocations.contains_key(&synthetic_address) {
             Err(MappingLookupError::Expired)
         } else {
             Err(MappingLookupError::Missing)

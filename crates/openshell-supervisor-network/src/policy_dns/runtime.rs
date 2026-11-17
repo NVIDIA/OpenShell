@@ -112,6 +112,7 @@ impl PolicyDnsRuntime {
             store.clone(),
             trusted_host_gateway,
         ));
+        service.enable_refresh();
         let task = tokio::spawn(async move {
             if engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
@@ -202,6 +203,7 @@ impl PolicyDnsRuntime {
             store.clone(),
             trusted_host_gateway,
         ));
+        service.enable_refresh();
         let address = udp.local_addr().into_diagnostic()?;
 
         let udp_service = service.clone();

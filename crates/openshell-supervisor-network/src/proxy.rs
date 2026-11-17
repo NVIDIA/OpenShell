@@ -781,7 +781,7 @@ async fn preauthorize_transparent_open(
         ));
     }
     let TransparentTarget { host, intent } =
-        match resolve_transparent_target(destination, policy_dns_store, opa_engine) {
+        match resolve_transparent_target(destination, policy_dns_store, opa_engine).await {
             Ok(target) => target,
             Err(error) => {
                 warn!(%destination, %error, "Denied staged transparent connection");
@@ -1022,7 +1022,7 @@ struct TransparentTarget {
     intent: Option<MappingLookup>,
 }
 
-fn resolve_transparent_target(
+async fn resolve_transparent_target(
     destination: SocketAddr,
     policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
     opa_engine: &OpaEngine,
@@ -1033,6 +1033,13 @@ fn resolve_transparent_target(
             intent: None,
         });
     };
+    store
+        .refresh_if_expired(
+            destination.ip(),
+            destination.port(),
+            opa_engine.current_generation(),
+        )
+        .await?;
     match store.lookup_intent(
         destination.ip(),
         destination.port(),
@@ -1226,6 +1233,15 @@ async fn handle_transparent_tcp_connection(
     let workload_addr = client.peer_addr().into_diagnostic()?;
     let original = original_destination(&client).into_diagnostic()?;
     let current_generation = opa_engine.current_generation();
+    if let Err(error) = store
+        .refresh_if_expired(original.ip(), original.port(), current_generation)
+        .await
+    {
+        warn!(%original, %error, "Denied transparent connection after mapping refresh failed");
+        emit_transparent_mapping_denial(workload_addr, original, None, MappingLookupError::Expired);
+        emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+        return Ok(());
+    }
     let mapping = match store.lookup_intent(
         original.ip(),
         original.port(),
@@ -2642,12 +2658,10 @@ async fn handle_mediated_connection(
                 policy_local_transparent = true;
                 (None, None, None)
             } else {
-                let host = resolve_transparent_target(
-                    destination,
-                    policy_dns_store.as_ref(),
-                    &opa_engine,
-                )?
-                .host;
+                let host =
+                    resolve_transparent_target(destination, policy_dns_store.as_ref(), &opa_engine)
+                        .await?
+                        .host;
                 let (decision, connector) = transparent
                     .authorization
                     .map_or((None, None), |(decision, connector)| {
