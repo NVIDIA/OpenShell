@@ -692,8 +692,17 @@ password-based PostgreSQL authentication.
 Use a password-free database URL with an explicit mapped PostgreSQL role and
 `sslmode=verify-full`. Configure the PostgreSQL Entra principal for the gateway
 managed identity's object ID and grant it ownership of the OpenShell database
-so it can run migrations. Connect directly to PostgreSQL: session advisory locks
-require session affinity and cannot use transaction pooling.
+so it can run migrations. Also grant `USAGE` and `CREATE` on its `public`
+schema; Azure PostgreSQL can retain separate schema ownership after you change
+the database owner. Run this as the Entra administrator connected to the
+OpenShell database, replacing the role name if needed:
+
+```sql
+GRANT USAGE, CREATE ON SCHEMA public TO openshell_gateway;
+```
+
+Connect directly to PostgreSQL. Session advisory locks require session affinity
+and cannot use transaction pooling.
 
 For Helm, set the following values and create `openshell-db` with a `uri` key
 containing `postgresql://openshell_gateway@SERVER.postgres.database.azure.com/openshell?sslmode=verify-full`:
