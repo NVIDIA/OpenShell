@@ -1161,7 +1161,7 @@ fn parse_rejection_detail(error: &str, mode: ParseRejectionMode) -> String {
                 "{error}; set allow_encoded_slash: true on this endpoint if the upstream requires encoded slashes"
             ),
             ParseRejectionMode::Passthrough => format!(
-                "{error}; passthrough credential relay uses strict path parsing, so configure this endpoint with protocol: rest and allow_encoded_slash: true for encoded-slash APIs, or use tls: skip if HTTP parsing is not needed"
+                "{error}; set allow_encoded_slash: true on this endpoint if the upstream requires encoded slashes, or use tls: skip if HTTP parsing is not needed"
             ),
         }
     } else {
@@ -3773,16 +3773,20 @@ pub async fn relay_passthrough_with_credentials<C, U>(
     ctx: &L7EvalContext,
     generation_guard: &PolicyGenerationGuard,
     middleware_engine: Option<&crate::opa::OpaEngine>,
+    allow_encoded_slash: bool,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // Passthrough path: no L7 policy is enforced here, so use default
-    // (strict) canonicalization options. Calls to GitLab-style APIs that
-    // need `%2F` must be configured as L7 endpoints so the per-endpoint
-    // `allow_encoded_slash` opt-in applies.
-    let provider = crate::l7::rest::RestProvider::default();
+    // Passthrough path: no L7 policy is enforced here, but requests are still
+    // canonicalized. A matched modeless endpoint's `allow_encoded_slash`
+    // opt-in keeps `%2F` (npm scoped packages, GitLab-style APIs).
+    let provider =
+        crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
+            allow_encoded_slash,
+            ..Default::default()
+        });
     let mut request_count: u64 = 0;
     let mut grant_ctx = ctx.clone();
     loop {
@@ -6169,7 +6173,8 @@ network_policies:
             ParseRejectionMode::Passthrough,
         );
 
-        assert!(detail.contains("protocol: rest"));
+        // A modeless endpoint honors the opt-in itself: no protocol is needed.
+        assert!(!detail.contains("protocol: rest"));
         assert!(detail.contains("allow_encoded_slash: true"));
         assert!(detail.contains("tls: skip"));
     }
@@ -6937,6 +6942,7 @@ network_policies:
                 &ctx,
                 &generation_guard,
                 None,
+                false,
             )
             .await
         });
@@ -7040,6 +7046,7 @@ network_policies:
                 &ctx,
                 &generation_guard,
                 None,
+                false,
             )
             .await
         });
@@ -7148,6 +7155,7 @@ network_policies:
                 &ctx,
                 &generation_guard,
                 None,
+                false,
             )
             .await
         });
@@ -8841,6 +8849,7 @@ network_policies:
                 &ctx,
                 &generation_guard,
                 Some(engine_task.as_ref()),
+                false,
             )
             .await
         });
@@ -8943,6 +8952,7 @@ network_policies:
                     &ctx,
                     &generation_guard,
                     Some(engine.as_ref()),
+                    false,
                 )
                 .await
             });
@@ -9092,6 +9102,7 @@ network_policies:
                 &ctx,
                 &generation_guard,
                 None,
+                false,
             )
             .await
         });
@@ -9155,6 +9166,7 @@ network_policies:
                 &ctx,
                 &generation_guard,
                 None,
+                false,
             )
             .await
         });
@@ -9207,6 +9219,7 @@ network_policies:
                 &ctx,
                 &generation_guard,
                 None,
+                false,
             )
             .await
         });
@@ -9272,6 +9285,7 @@ network_policies:
                 &ctx,
                 &generation_guard,
                 None,
+                false,
             )
             .await
         });
@@ -11998,6 +12012,7 @@ network_policies:
                 &ctx,
                 &generation_guard,
                 None,
+                false,
             )
             .await
         });

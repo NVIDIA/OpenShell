@@ -543,6 +543,14 @@ pub fn parse_endpoint_credential_guard(val: &regorus::Value) -> EndpointCredenti
     }
 }
 
+/// Whether a modeless endpoint record (no `protocol`) accepts `%2F` in request
+/// paths. A modeless endpoint has no [`L7EndpointConfig`], so the route-less
+/// HTTP relay and the forward proxy read the opt-in from its matched record.
+pub(crate) fn modeless_endpoint_allows_encoded_slash(endpoint: &regorus::Value) -> bool {
+    get_object_str(endpoint, "protocol").is_none()
+        && get_object_bool(endpoint, "allow_encoded_slash").unwrap_or(false)
+}
+
 /// Extract a bool value from a regorus object. Returns `None` when the key
 /// is absent or not a boolean.
 fn get_object_bool(val: &regorus::Value, key: &str) -> Option<bool> {

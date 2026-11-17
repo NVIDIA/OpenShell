@@ -5815,13 +5815,17 @@ async fn handle_forward_proxy(
     //     strips hop-by-hop `Connection` headers and drops the upstream after
     //     the response instead of asking the upstream to close it.
     hydrate_l7_route(&mut decision);
+    // An inspected route re-checks the opt-in against the config that matches
+    // the path below. Without one, a matched modeless endpoint decides.
+    let allow_encoded_slash = match decision.endpoint.l7_route.as_ref() {
+        Some(route) if !route.configs.is_empty() => route
+            .configs
+            .iter()
+            .any(|snapshot| snapshot.config.allow_encoded_slash),
+        _ => decision.endpoint.modeless_allows_encoded_slash(),
+    };
     let canonicalize_options = crate::l7::path::CanonicalizeOptions {
-        allow_encoded_slash: decision.endpoint.l7_route.as_ref().is_some_and(|route| {
-            route
-                .configs
-                .iter()
-                .any(|snapshot| snapshot.config.allow_encoded_slash)
-        }),
+        allow_encoded_slash,
         ..Default::default()
     };
     let prepared_target = match prepare_forward_target(&path, canonicalize_options) {

@@ -107,9 +107,9 @@ same destination rules as the equivalent IPv4 address, `203.0.113.7`.
 
 When `protocol` is omitted, OpenShell allows any method and path. Unless the
 endpoint sets `tls: skip`, it still terminates TLS and rejects HTTP requests
-that are addressed to another host or have malformed paths, such as paths that
-contain `%2F`. It relays traffic that is neither TLS nor HTTP without inspecting
-it. For a protocol in which the server sends first, such as SMTP, set
+that are addressed to another host or have malformed paths. It also rejects
+paths that contain `%2F` unless the endpoint sets `allow_encoded_slash: true`.
+It relays traffic that is neither TLS nor HTTP without inspecting it. For a protocol in which the server sends first, such as SMTP, set
 `tls: skip`.
 
 Use an inspected endpoint when the request, not only the destination,

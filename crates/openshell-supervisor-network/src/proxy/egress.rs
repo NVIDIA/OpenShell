@@ -60,6 +60,15 @@ impl Default for EndpointDecision {
 }
 
 impl EndpointDecision {
+    /// Whether a modeless endpoint matched for this caller accepts `%2F` in
+    /// request paths. Like their allows, overlapping modeless endpoints combine:
+    /// one opt-in is enough.
+    pub(super) fn modeless_allows_encoded_slash(&self) -> bool {
+        self.matched_endpoints
+            .iter()
+            .any(|matched| crate::l7::modeless_endpoint_allows_encoded_slash(&matched.endpoint))
+    }
+
     pub(super) fn from_authorization(authorization: &crate::opa::EgressAuthorization) -> Self {
         Self {
             policy_configs: authorization.endpoint_configs.clone(),

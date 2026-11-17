@@ -20,6 +20,8 @@ enum PreparedHttpPolicy {
     },
     Passthrough {
         generation_guard: PolicyGenerationGuard,
+        /// A matched modeless endpoint opts in to `%2F` in request paths.
+        allow_encoded_slash: bool,
     },
 }
 
@@ -190,7 +192,10 @@ pub(super) fn prepare_http_relay<'a>(
                 return None;
             }
         };
-        PreparedHttpPolicy::Passthrough { generation_guard }
+        PreparedHttpPolicy::Passthrough {
+            generation_guard,
+            allow_encoded_slash: decision.endpoint.modeless_allows_encoded_slash(),
+        }
     };
 
     Some(RelayContext {
@@ -277,7 +282,10 @@ where
                 }
             }
         }
-        PreparedHttpPolicy::Passthrough { generation_guard } => {
+        PreparedHttpPolicy::Passthrough {
+            generation_guard,
+            allow_encoded_slash,
+        } => {
             tokio::select! {
                 result = crate::l7::relay::relay_passthrough_with_credentials(
                     client,
@@ -285,6 +293,7 @@ where
                     context.request,
                     &generation_guard,
                     Some(context.middleware_engine),
+                    allow_encoded_slash,
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
                     emit_stale_relay_close(context.request, &generation_guard);
@@ -639,7 +648,10 @@ mod tests {
 
         let context = prepare_http_relay(None, &engine, &decision, &request)
             .expect("current L4 generation should prepare a relay");
-        let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
+        let PreparedHttpPolicy::Passthrough {
+            generation_guard, ..
+        } = context.policy
+        else {
             panic!("route-less relay should use a generation guard");
         };
 
