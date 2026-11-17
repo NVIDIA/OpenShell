@@ -115,7 +115,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 - `cx.import_profile(profile)` to import a provider profile and return its
   `id`, and `cx.create_provider(name, type, credentials)` to create a
   provider, each with cleanup. `cx.install_provider(name, profile,
-  credentials)` does both.
+  credentials)` does both. Chain `.config(key, value)` before the `.await`
+  to set provider config.
 - `testkit::YamlFile` for YAML a CLI command reads from a file.
 - `cx.client()` for SDK calls testkit does not wrap.
 - `?` and `.context(..)` on I/O, JSON, YAML, SDK and gRPC results, which
