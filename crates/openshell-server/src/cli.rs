@@ -1069,6 +1069,25 @@ async fn run_from_args(
         warn!("{UNAUTHENTICATED_USERS_WARNING}");
     }
 
+    if !prepared.config.service_routing.enabled && !prepared.config.supervisor_app_listener.enabled
+    {
+        warn!(
+            "Sandbox service routing disabled: neither gateway routing nor the app listener is enabled"
+        );
+    }
+
+    if prepared.config.supervisor_app_listener.enabled {
+        info!(
+            domain = %prepared.config.supervisor_app_listener.domain,
+            port = prepared.config.supervisor_app_listener.port,
+            "App-listener-based service routing enabled"
+        );
+    }
+
+    if prepared.config.service_routing.enabled {
+        info!("Gateway-based service routing enabled");
+    }
+
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
 
     let result = Box::pin(run_server(
