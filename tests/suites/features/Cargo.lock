@@ -3116,6 +3116,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "routable-host-ip"
+version = "0.0.0"
+dependencies = [
+ "host-server-support",
+ "openshell-testkit",
+ "serde_json",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
