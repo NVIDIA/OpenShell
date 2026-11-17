@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::child::{ChildCommand, ChildStdio, GenerationChild};
 use base64::Engine as _;
 use futures::Stream;
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
@@ -27,7 +28,6 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
-use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
@@ -871,9 +871,9 @@ fn spawn_supervisor(
     auth_bundle_path: &Path,
     main: &openshell_core::sandbox_env::MainProcessConfig,
     job: &crate::job::GenerationJob,
-) -> Result<Child, String> {
-    let mut command = supervisor_command(context, descriptor_path, auth_bundle_path, main)?;
-    job.spawn(&mut command)
+) -> Result<GenerationChild, String> {
+    let command = supervisor_command(context, descriptor_path, auth_bundle_path, main)?;
+    job.spawn(&command)
         .map_err(|error| format!("start host openshell-supervisor: {error}"))
 }
 
@@ -882,14 +882,14 @@ fn supervisor_command(
     descriptor_path: &Path,
     auth_bundle_path: &Path,
     main: &openshell_core::sandbox_env::MainProcessConfig,
-) -> Result<Command, String> {
+) -> Result<ChildCommand, String> {
     let main_process_spec = mxc_main_process_spec(main)?;
-    let mut command = Command::new(&context.config.supervisor_binary_path);
+    // A `GenerationChild` is killed when dropped, as `kill_on_drop(true)` did.
+    let mut command = ChildCommand::new(&context.config.supervisor_binary_path);
     command
-        .kill_on_drop(true)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdin(ChildStdio::Null)
+        .stdout(ChildStdio::Piped)
+        .stderr(ChildStdio::Piped)
         .arg("--role")
         .arg("isolation-backend")
         .arg("--backend-descriptor-file")
@@ -963,8 +963,8 @@ enum RuntimePairExit {
 }
 
 async fn monitor_runtime_pair(
-    mut boundary: Child,
-    mut supervisor: Child,
+    mut boundary: GenerationChild,
+    mut supervisor: GenerationChild,
     mut shutdown: oneshot::Receiver<()>,
 ) -> RuntimePairExit {
     tokio::select! {
@@ -1543,7 +1543,7 @@ async fn wait_for_termination(
     }
 }
 
-fn attach_child_logs(sandbox_name: &str, component: &'static str, child: &mut Child) {
+fn attach_child_logs(sandbox_name: &str, component: &'static str, child: &mut GenerationChild) {
     if let Some(stdout) = child.stdout.take() {
         let sandbox_name = sandbox_name.to_string();
         tokio::spawn(async move {
@@ -1913,10 +1913,9 @@ mod tests {
         )
         .unwrap();
         let tls_dir = command
-            .as_std()
             .get_envs()
             .find(|(key, _)| *key == openshell_core::sandbox_env::PROXY_TLS_DIR)
-            .and_then(|(_, value)| value);
+            .map(|(_, value)| value);
         assert_eq!(
             tls_dir.map(Path::new),
             Some(host_state_dir.join(HOST_PROXY_TLS_DIR).as_path())
@@ -2841,17 +2840,20 @@ mod tests {
 
     #[tokio::test]
     async fn stop_terminates_and_reaps_both_runtime_processes() {
+        let job = crate::job::GenerationJob::new().expect("job");
         let spawn = || {
-            Command::new("powershell.exe")
+            let mut command = ChildCommand::new("powershell.exe");
+            command
                 .args([
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
                     "Start-Sleep -Seconds 60",
                 ])
-                .kill_on_drop(true)
-                .spawn()
-                .expect("real test process")
+                .stdin(ChildStdio::Null)
+                .stdout(ChildStdio::Null)
+                .stderr(ChildStdio::Null);
+            job.spawn(&command).expect("real test process")
         };
         let boundary = spawn();
         let supervisor = spawn();

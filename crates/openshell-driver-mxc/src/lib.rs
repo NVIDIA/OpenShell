@@ -18,6 +18,8 @@
 #![allow(clippy::result_large_err)]
 
 #[cfg(target_os = "windows")]
+mod child;
+#[cfg(target_os = "windows")]
 mod driver;
 #[cfg(target_os = "windows")]
 mod grpc;

@@ -1208,7 +1208,9 @@ const RETIRED_CORRELATION_TTL: Duration = PENDING_TTL;
 /// Query the kernel generation key for a spawned child while the driver still
 /// owns its process handle. This is the same value ETW appends under
 /// `EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY`.
-pub(crate) fn child_process_start_key(child: &tokio::process::Child) -> Result<u64, String> {
+pub(crate) fn child_process_start_key(
+    child: &impl crate::child::ProcessHandle,
+) -> Result<u64, String> {
     let raw_handle = child
         .raw_handle()
         .ok_or_else(|| "wxc-exec child handle is no longer available".to_string())?;

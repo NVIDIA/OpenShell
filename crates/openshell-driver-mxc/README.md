@@ -259,8 +259,9 @@ drivers need no UI-specific handling. UI policy itself does not require the
 
 The driver runs inside the gateway. Each sandbox generation runs in its own
 Windows job object with kill-on-close: the host supervisor and `wxc-exec` are
-started inside it, and the boundary and workload processes below them inherit
-it. When a generation stops, the job is terminated, and when the gateway process
+created inside it (the job is named in the `CreateProcessW` call, so no process
+of a generation ever exists outside its job, even if the gateway is killed
+mid-spawn), and the boundary and workload processes below them inherit it. When a generation stops, the job is terminated, and when the gateway process
 ends for any reason Windows closes the job and ends everything in it. In
 practice:
 

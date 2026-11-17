@@ -3,12 +3,12 @@
 
 //! `wxc-exec` `ProcessContainer` launcher and request types.
 
+use crate::child::{ChildCommand, ChildStdio, GenerationChild};
 use base64::Engine as _;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use thiserror::Error;
-use tokio::process::Command;
 use tracing::{debug, info};
 
 /// Stable MXC schema version shared by the mapper and live launcher.
@@ -265,15 +265,15 @@ impl WxcExecInvoker {
         self.mock
     }
 
-    fn real_command(&self) -> Command {
-        let mut command = Command::new(&self.exec_path);
+    /// Both processes in the runtime pair must die if their monitor is cancelled, not
+    /// only when it takes the explicit shutdown branch; a `GenerationChild` is killed
+    /// when dropped.
+    fn real_command(&self) -> ChildCommand {
+        let mut command = ChildCommand::new(&self.exec_path);
         command
-            // Both processes in the runtime pair must die if their monitor is
-            // cancelled, not only when it takes the explicit shutdown branch.
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stdin(ChildStdio::Piped)
+            .stdout(ChildStdio::Piped)
+            .stderr(ChildStdio::Piped);
         command
     }
 
@@ -282,7 +282,8 @@ impl WxcExecInvoker {
     fn mock_spawn_with_grants(
         process: &MxcProcess,
         grants: &[String],
-    ) -> Result<tokio::process::Child, InvokerError> {
+        job: &crate::job::GenerationJob,
+    ) -> Result<GenerationChild, InvokerError> {
         let cmd_norm = mock_normalize(&process.command_line);
         // The RFC 0012 boundary is launched with its granted bootstrap directory.
         // This check concerns bootstrap wiring, never workload authorization.
@@ -298,11 +299,10 @@ impl WxcExecInvoker {
                 |quoted| quoted.split_once('"'),
             )
             .unwrap_or((&process.command_line, ""));
-        let mut cmd = Command::new(if in_policy { program } else { "cmd" });
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true);
+        let mut cmd = ChildCommand::new(if in_policy { program } else { "cmd" });
+        cmd.stdin(ChildStdio::Null)
+            .stdout(ChildStdio::Inherit)
+            .stderr(ChildStdio::Inherit);
         if in_policy {
             debug!(command = %process.command_line, "mock exec: in-policy, running agent");
             // Retain the already-encoded Windows argv without another quoting pass.
@@ -313,7 +313,7 @@ impl WxcExecInvoker {
                 "echo Access is denied. (out-of-policy write blocked by AppContainer) 1>&2& exit 1",
             );
         }
-        let child = cmd.spawn()?;
+        let child = job.spawn(&cmd)?;
         Ok(child)
     }
 
@@ -335,7 +335,7 @@ impl WxcExecInvoker {
         network: Option<MxcNetwork>,
         ui: Option<MxcUi>,
         job: &crate::job::GenerationJob,
-    ) -> Result<tokio::process::Child, InvokerError> {
+    ) -> Result<GenerationChild, InvokerError> {
         let config = oneshot_config_json(
             container_id,
             &filesystem,
@@ -350,7 +350,7 @@ impl WxcExecInvoker {
                 .iter()
                 .map(|p| mock_normalize(p))
                 .collect();
-            return Self::mock_spawn_with_grants(&process, &grants);
+            return Self::mock_spawn_with_grants(&process, &grants, job);
         }
 
         let json = serde_json::to_string(&config)?;
@@ -388,9 +388,9 @@ impl WxcExecInvoker {
         }
 
         info!(container_id = %container_id, "wxc-exec one-shot processContainer spawn");
-        // Spawned inside the generation's job so the boundary and workload tree
-        // cannot outlive the driver; fails closed if the job cannot adopt it.
-        let child = job.spawn(&mut cmd)?;
+        // Created inside the generation's job, so the boundary and workload tree
+        // cannot outlive the driver; fails closed if it cannot be created there.
+        let child = job.spawn(&cmd)?;
         Ok(child)
     }
 }
@@ -415,15 +415,16 @@ mod tests {
         let powershell = PathBuf::from(std::env::var("SystemRoot").unwrap())
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");
         let invoker = WxcExecInvoker::new(powershell, false);
-        let child = invoker
-            .real_command()
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Start-Sleep -Seconds 60",
-            ])
-            .spawn()
+        let job = crate::job::GenerationJob::new().expect("job");
+        let mut command = invoker.real_command();
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 60",
+        ]);
+        let child = job
+            .spawn(&command)
             .expect("launch long-lived PowerShell process");
         // SAFETY: OpenProcess supplies a synchronization-only handle for the
         // child, retained through termination and closed exactly once below.

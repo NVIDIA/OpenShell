@@ -12,26 +12,27 @@
 //! driver's host process dies for any reason. Children inherit job membership
 //! and `BREAKAWAY_OK` is not set, so nothing can leave the job.
 //!
+//! The root processes are created as members of the job
+//! (`crate::child::spawn_in_job`), so there is no moment at which a process of the
+//! generation exists outside its job, even if the driver is killed during the spawn.
+//!
 //! The job lives with the driver rather than with whichever process hosts it,
 //! so the cleanup survives moving the driver out of the gateway.
+
+// `pub(crate)` documents what the driver may use; this module is private.
+#![allow(clippy::redundant_pub_crate)]
 
 use std::io;
 use std::mem::size_of;
 
-use tokio::process::{Child, Command};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-};
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
 };
-use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 use windows::core::PCWSTR;
 
-const CREATE_SUSPENDED: u32 = 0x0000_0004;
+use crate::child::{ChildCommand, GenerationChild};
 
 /// Owns a kill-on-close job object. Dropping it ends every member process.
 pub struct GenerationJob {
@@ -47,7 +48,7 @@ unsafe impl Sync for GenerationJob {}
 
 #[allow(unsafe_code)] // Win32 job object calls.
 impl GenerationJob {
-    pub fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         // SAFETY: plain Win32 calls with valid arguments; `info` outlives the
         // call and the size matches its type. No security attributes are
         // passed, so the handle is not inheritable and children cannot keep
@@ -69,45 +70,28 @@ impl GenerationJob {
         }
     }
 
-    /// Spawn `command` as a member of this job, with no window in which it can
-    /// run (or start children) outside it.
+    /// Start `command` as a member of this job.
     ///
-    /// The process is created suspended, assigned to the job, then resumed.
-    /// If it cannot be assigned it is killed and an error is returned: a
-    /// sandbox whose processes could outlive the driver must not start.
-    pub fn spawn(&self, command: &mut Command) -> io::Result<Child> {
-        command.creation_flags(CREATE_SUSPENDED);
-        let mut child = command.spawn()?;
-        match self.adopt_and_resume(&child) {
-            Ok(()) => Ok(child),
-            Err(error) => {
-                // Still suspended, so it has run no code. `kill_on_drop`
-                // retries if this kill fails.
-                let _ = child.start_kill();
-                Err(error)
-            }
-        }
-    }
-
-    fn adopt_and_resume(&self, child: &Child) -> io::Result<()> {
-        let pid = child
-            .id()
-            .ok_or_else(|| io::Error::other("child exited before it could be assigned to a job"))?;
-        let raw = child
-            .raw_handle()
-            .ok_or_else(|| io::Error::other("child handle unavailable"))?;
-        // SAFETY: `raw` is the live process handle owned by `child`.
-        unsafe { AssignProcessToJobObject(self.handle, HANDLE(raw)) }.map_err(|error| {
-            io::Error::other(format!("assign process {pid} to its sandbox job: {error}"))
-        })?;
-        resume_process(pid)
+    /// The process is created inside the job (the job is named in the
+    /// `CreateProcessW` call), so it is never outside it. If it cannot be created
+    /// there, the spawn fails and no process exists: a sandbox whose processes could
+    /// outlive the driver must not start.
+    ///
+    /// Call inside a tokio runtime.
+    pub(crate) fn spawn(&self, command: &ChildCommand) -> io::Result<GenerationChild> {
+        crate::child::spawn_in_job(self.handle, command)
     }
 
     /// End every process in the job now.
-    pub fn terminate(&self) {
+    pub(crate) fn terminate(&self) {
         // SAFETY: valid job handle. An already-empty job is not an error worth
         // reporting.
         let _ = unsafe { TerminateJobObject(self.handle, 1) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw(&self) -> HANDLE {
+        self.handle
     }
 }
 
@@ -120,73 +104,39 @@ impl Drop for GenerationJob {
     }
 }
 
-/// Resume every thread of a process created with `CREATE_SUSPENDED`.
-#[allow(unsafe_code)] // Toolhelp and thread calls.
-fn resume_process(pid: u32) -> io::Result<()> {
-    // SAFETY: the snapshot handle is closed on every path; `entry` outlives the
-    // calls and `dwSize` is set as the API requires.
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(io::Error::from)?;
-        let mut resumed = 0_u32;
-        let mut result = Ok(());
-        let mut entry = THREADENTRY32 {
-            dwSize: u32::try_from(size_of::<THREADENTRY32>()).map_err(io::Error::other)?,
-            ..Default::default()
-        };
-        let mut more = Thread32First(snapshot, &raw mut entry).is_ok();
-        while more {
-            if entry.th32OwnerProcessID == pid {
-                match OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) {
-                    Ok(thread) => {
-                        if ResumeThread(thread) == u32::MAX {
-                            result = Err(io::Error::last_os_error());
-                        } else {
-                            resumed += 1;
-                        }
-                        let _ = CloseHandle(thread);
-                    }
-                    Err(error) => result = Err(io::Error::from(error)),
-                }
-            }
-            more = Thread32Next(snapshot, &raw mut entry).is_ok();
-        }
-        let _ = CloseHandle(snapshot);
-        result?;
-        if resumed == 0 {
-            return Err(io::Error::other(format!(
-                "no thread of process {pid} could be resumed"
-            )));
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
-    use std::process::Stdio;
     use std::time::Duration;
 
-    use super::*;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::JobObjects::IsProcessInJob;
 
-    fn sleeper() -> Command {
-        let mut command = Command::new("cmd.exe");
+    use super::*;
+    use crate::child::{ChildStdio, spawn_suspended_in_job};
+
+    fn sleeper() -> ChildCommand {
+        let mut command = ChildCommand::new("cmd.exe");
         command
             .args(["/c", "ping -n 30 127.0.0.1 >nul"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+            .stdin(ChildStdio::Null)
+            .stdout(ChildStdio::Null)
+            .stderr(ChildStdio::Null);
         command
     }
 
     #[tokio::test]
     async fn spawned_process_runs_and_is_killed_by_terminate() {
         let job = GenerationJob::new().expect("job");
-        let mut child = job.spawn(&mut sleeper()).expect("spawn in job");
-        // Resumed: it must still be running (not stuck suspended, not exited).
+        let mut child = job.spawn(&sleeper()).expect("spawn in job");
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
-            child.try_wait().unwrap().is_none(),
+            tokio::time::timeout(Duration::from_millis(1), child.wait())
+                .await
+                .is_err(),
             "child should be running"
         );
         job.terminate();
@@ -201,40 +151,77 @@ mod tests {
     async fn dropping_the_job_kills_the_whole_tree() {
         let job = GenerationJob::new().expect("job");
         // cmd.exe starts ping.exe: a grandchild that inherits membership.
-        let mut child = job.spawn(&mut sleeper()).expect("spawn in job");
+        let mut child = job.spawn(&sleeper()).expect("spawn in job");
         tokio::time::sleep(Duration::from_millis(300)).await;
         drop(job);
-        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        // Closing the job ends members with exit code 0, so only that the
+        // process ended (not how) can be asserted.
+        tokio::time::timeout(Duration::from_secs(10), child.wait())
             .await
             .expect("child ended after the job closed")
             .unwrap();
-        // Closing the job ends members with exit code 0, so only that the
-        // process ended (not how) can be asserted.
-        let _ = status;
     }
 
-    /// Fail closed: if the process cannot be assigned to the job, `spawn`
-    /// returns an error (and kills the still-suspended child) instead of
-    /// handing back a process that could outlive the driver.
+    /// Fail closed: if the process cannot be created inside its job, the spawn fails
+    /// instead of handing back a process that could outlive the driver.
     #[tokio::test]
-    async fn assignment_failure_fails_the_spawn() {
-        // An invalid job handle makes `AssignProcessToJobObject` fail.
+    async fn an_unusable_job_fails_the_spawn() {
         let job = GenerationJob {
             handle: HANDLE::default(),
         };
-        let error = job.spawn(&mut sleeper()).expect_err("must fail closed");
+        let error = job.spawn(&sleeper()).err().expect("must fail closed");
         assert!(
-            error.to_string().contains("assign process"),
+            error.to_string().contains("sandbox job"),
             "unexpected error: {error}"
         );
         std::mem::forget(job); // do not CloseHandle the invalid handle
     }
 
-    /// Set (by the test below) on the re-run of this test binary that plays the
+    /// The property the job exists for, and the case a review found: the process is a
+    /// member of its job from the moment it exists, before it has run one instruction.
+    /// A process created the ordinary way is not, so the check can fail.
+    #[tokio::test]
+    async fn child_is_a_member_of_its_job_before_it_runs() {
+        let job = GenerationJob::new().expect("job");
+        let (child, thread) =
+            spawn_suspended_in_job(job.raw(), &sleeper()).expect("suspended spawn");
+        let handle = HANDLE(child.raw_handle().expect("process handle"));
+        let mut in_job = windows::core::BOOL::default();
+        // SAFETY: both handles are valid for the call.
+        unsafe { IsProcessInJob(handle, Some(job.raw()), &raw mut in_job) }
+            .expect("IsProcessInJob");
+        assert!(
+            in_job.as_bool(),
+            "a freshly created, not yet running child must already be in the job"
+        );
+        thread.resume().expect("resume");
+        drop(child);
+
+        // Negative control: a process created the ordinary way is not in the job.
+        let mut outsider = tokio::process::Command::new("cmd.exe")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("outsider");
+        let outsider_handle = HANDLE(outsider.raw_handle().expect("outsider handle"));
+        let mut outsider_in_job = windows::core::BOOL::default();
+        // SAFETY: both handles are valid for the call.
+        unsafe { IsProcessInJob(outsider_handle, Some(job.raw()), &raw mut outsider_in_job) }
+            .expect("IsProcessInJob");
+        assert!(
+            !outsider_in_job.as_bool(),
+            "the check must be able to say no"
+        );
+        let _ = outsider.kill().await;
+    }
+
+    // ---- Hard-killing the process that owns the job ----
+
+    /// Set (by the tests below) on the re-run of this test binary that plays the
     /// role of the driver's host process.
     const HOST_ENV: &str = "OPENSHELL_JOB_TEST_HOST";
+    const STRESS_ENV: &str = "OPENSHELL_JOB_TEST_STRESS_EXE";
 
-    #[allow(unsafe_code)]
     fn is_alive(pid: u32) -> bool {
         use windows::Win32::Foundation::WAIT_TIMEOUT;
         use windows::Win32::System::Threading::{
@@ -251,28 +238,52 @@ mod tests {
         }
     }
 
-    #[allow(unsafe_code)]
     fn child_pids(parent: u32) -> Vec<u32> {
-        use windows::Win32::System::Diagnostics::ToolHelp::{
-            PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
-        };
-        // SAFETY: the snapshot is closed before returning; `entry.dwSize` is set.
+        // SAFETY: the snapshot is closed before returning; `dwSize` is set.
         unsafe {
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).unwrap();
-            let mut entry = PROCESSENTRY32 {
-                dwSize: u32::try_from(size_of::<PROCESSENTRY32>()).unwrap(),
+            let mut entry = PROCESSENTRY32W {
+                dwSize: u32::try_from(size_of::<PROCESSENTRY32W>()).unwrap(),
                 ..Default::default()
             };
             let mut found = Vec::new();
-            let mut more = Process32First(snapshot, &raw mut entry).is_ok();
+            let mut more = Process32FirstW(snapshot, &raw mut entry).is_ok();
             while more {
                 if entry.th32ParentProcessID == parent {
                     found.push(entry.th32ProcessID);
                 }
-                more = Process32Next(snapshot, &raw mut entry).is_ok();
+                more = Process32NextW(snapshot, &raw mut entry).is_ok();
             }
             let _ = CloseHandle(snapshot);
             found
+        }
+    }
+
+    /// How many running processes have this executable file name.
+    fn count_named(exe_name: &str) -> usize {
+        // SAFETY: the snapshot is closed before returning; `dwSize` is set.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).unwrap();
+            let mut entry = PROCESSENTRY32W {
+                dwSize: u32::try_from(size_of::<PROCESSENTRY32W>()).unwrap(),
+                ..Default::default()
+            };
+            let mut count = 0;
+            let mut more = Process32FirstW(snapshot, &raw mut entry).is_ok();
+            while more {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                if String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case(exe_name)
+                {
+                    count += 1;
+                }
+                more = Process32NextW(snapshot, &raw mut entry).is_ok();
+            }
+            let _ = CloseHandle(snapshot);
+            count
         }
     }
 
@@ -284,7 +295,7 @@ mod tests {
             return;
         }
         let job = GenerationJob::new().expect("job");
-        let child = job.spawn(&mut sleeper()).expect("spawn in job");
+        let child = job.spawn(&sleeper()).expect("spawn in job");
         let root = child.id().expect("pid");
         tokio::time::sleep(Duration::from_millis(700)).await; // let cmd start ping
         let grandchildren = child_pids(root)
@@ -303,11 +314,16 @@ mod tests {
     #[tokio::test]
     async fn hard_killing_the_job_owner_ends_the_whole_tree() {
         use std::io::{BufRead as _, BufReader};
+        use std::process::Stdio;
         if std::env::var_os(HOST_ENV).is_some() {
             return; // inside the helper run
         }
         let mut host = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "job::tests::hard_kill_host_helper", "--nocapture"])
+            .args([
+                "--exact",
+                "job::tests::hard_kill_host_helper",
+                "--nocapture",
+            ])
             .env(HOST_ENV, "1")
             .stdout(Stdio::piped())
             .spawn()
@@ -341,10 +357,80 @@ mod tests {
         panic!("processes survived the hard kill of their job owner: {tree:?}");
     }
 
+    /// A host that starts generations as fast as it can, keeping a few alive, until killed.
+    /// A no-op in a normal test run.
     #[tokio::test]
-    async fn a_failed_spawn_is_reported_not_swallowed() {
-        let job = GenerationJob::new().expect("job");
-        let mut command = Command::new("definitely-not-a-real-binary.exe");
-        assert!(job.spawn(&mut command).is_err());
+    async fn spawn_loop_host_helper() {
+        let Some(exe) = std::env::var_os(STRESS_ENV) else {
+            return;
+        };
+        let mut live: std::collections::VecDeque<(GenerationJob, GenerationChild)> =
+            std::collections::VecDeque::new();
+        println!("READY");
+        loop {
+            let job = GenerationJob::new().expect("job");
+            let mut command = ChildCommand::new(&exe);
+            command
+                .args(["/c", "ping -n 60 127.0.0.1 >nul"])
+                .stdin(ChildStdio::Null)
+                .stdout(ChildStdio::Null)
+                .stderr(ChildStdio::Null);
+            if let Ok(child) = job.spawn(&command) {
+                live.push_back((job, child));
+            }
+            if live.len() > 6 {
+                live.pop_front();
+            }
+        }
+    }
+
+    /// Hard-kill a host at many different moments while it is starting generations; no
+    /// process of any generation may survive, including one killed mid-spawn.
+    #[tokio::test]
+    async fn hard_killing_a_host_mid_spawn_leaves_no_process() {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::Stdio;
+        if std::env::var_os(HOST_ENV).is_some() || std::env::var_os(STRESS_ENV).is_some() {
+            return; // inside a helper run
+        }
+        // A copy of cmd.exe under a name nothing else has, so survivors are countable.
+        let name = format!("mxc-job-stress-{}.exe", std::process::id());
+        let exe = std::env::temp_dir().join(&name);
+        let system = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/cmd.exe");
+        std::fs::copy(system, &exe).expect("copy cmd.exe");
+
+        for trial in 0..12u64 {
+            let mut host = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "job::tests::spawn_loop_host_helper",
+                    "--nocapture",
+                ])
+                .env(STRESS_ENV, &exe)
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("start stress host");
+            let mut lines = BufReader::new(host.stdout.take().unwrap()).lines();
+            while lines.next().expect("host exited early").unwrap() != "READY" {}
+            // Different, unrelated delays so the kill lands at different points.
+            tokio::time::sleep(Duration::from_millis(40 + (trial * 37) % 260)).await;
+            host.kill().expect("hard-kill the host");
+            host.wait().unwrap();
+
+            let mut left = usize::MAX;
+            for _ in 0..100 {
+                left = count_named(&name);
+                if left == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert_eq!(
+                left, 0,
+                "trial {trial}: {left} process(es) survived the hard kill of the host"
+            );
+        }
+        let _ = std::fs::remove_file(&exe);
     }
 }
