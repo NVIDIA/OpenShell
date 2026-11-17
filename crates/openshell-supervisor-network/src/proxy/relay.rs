@@ -499,6 +499,138 @@ mod tests {
         assert_response_lifecycle(caller.unwrap(), client.unwrap()).await;
     }
 
+    /// Policy for a modeless endpoint (no `protocol`): `allow_encoded_slash`
+    /// set to `Some(value)` or omitted with `None`.
+    fn modeless_policy_engine(allow_encoded_slash: Option<bool>) -> OpaEngine {
+        let flag = allow_encoded_slash
+            .map(|value| format!("        allow_encoded_slash: {value}\n"))
+            .unwrap_or_default();
+        let data = format!(
+            "network_policies:\n  modeless:\n    name: modeless\n    endpoints:\n      - host: example.com\n        port: 80\n{flag}    binaries:\n      - path: /usr/bin/client\n"
+        );
+        OpaEngine::from_strings(POLICY_REGO, &data).expect("modeless policy should load")
+    }
+
+    /// The decision production builds for the modeless endpoint: the matched
+    /// endpoint metadata comes from the policy, not a default.
+    fn modeless_decision(engine: &OpaEngine) -> EgressDecision {
+        let authorization = engine
+            .authorize_egress(&crate::opa::NetworkInput {
+                host: "example.com".to_string(),
+                port: 80,
+                binary_path: std::path::PathBuf::from("/usr/bin/client"),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                authorization.action,
+                NetworkAction::Allow {
+                    matched_policy: Some(_)
+                }
+            ),
+            "the modeless endpoint should allow the client"
+        );
+        EgressDecision {
+            endpoint: EndpointDecision::from_authorization(&authorization),
+            ..decision(authorization.generation)
+        }
+    }
+
+    /// Relay `GET /plain`, then `GET {target}`, through the route-less HTTP
+    /// relay a modeless endpoint gets. Returns the request lines that reached
+    /// the upstream.
+    async fn relay_modeless_requests(
+        allow_encoded_slash: Option<bool>,
+        target: &str,
+    ) -> Vec<String> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        let engine = modeless_policy_engine(allow_encoded_slash);
+        let decision = modeless_decision(&engine);
+        let request = request_context();
+        let context = prepare_http_relay(None, &engine, &decision, &request)
+            .expect("modeless endpoint should prepare a relay");
+        assert!(matches!(
+            context.policy,
+            PreparedHttpPolicy::Passthrough { .. }
+        ));
+
+        let (mut caller, mut client) = tokio::io::duplex(4096);
+        let (mut upstream, server) = tokio::io::duplex(4096);
+        // The relay owns both halves, so the upstream closes when it ends, which ends `serve`.
+        let relay =
+            Box::pin(async move { relay_http_stream(&mut client, &mut upstream, context).await });
+        let serve = async move {
+            let mut server = tokio::io::BufReader::new(server);
+            let mut seen = Vec::new();
+            loop {
+                let mut line = String::new();
+                if server.read_line(&mut line).await.unwrap() == 0 {
+                    return seen;
+                }
+                seen.push(line.trim_end().to_string());
+                loop {
+                    let mut header = String::new();
+                    server.read_line(&mut header).await.unwrap();
+                    if header == "\r\n" || header.is_empty() {
+                        break;
+                    }
+                }
+                server
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        };
+        let send = async {
+            for path in ["/plain", target] {
+                let request = format!("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+                if caller.write_all(request.as_bytes()).await.is_err() {
+                    break;
+                }
+                let mut response = [0u8; 64];
+                match caller.read(&mut response).await {
+                    Ok(n) if n > 0 => {}
+                    _ => break,
+                }
+            }
+            caller.shutdown().await.ok();
+        };
+        let (result, (), seen) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(relay, send, serve)
+        })
+        .await
+        .expect("modeless relay should finish");
+        result.expect("modeless relay should end cleanly");
+        seen
+    }
+
+    #[tokio::test]
+    async fn modeless_relay_forwards_encoded_slash_when_endpoint_allows_it() {
+        let seen = relay_modeless_requests(Some(true), "/@scope%2Fname").await;
+        assert_eq!(
+            seen,
+            ["GET /plain HTTP/1.1", "GET /@scope%2Fname HTTP/1.1"],
+            "allow_encoded_slash: true should forward %2F on a modeless endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn modeless_relay_rejects_encoded_slash_when_allow_is_false() {
+        let seen = relay_modeless_requests(Some(false), "/@scope%2Fname").await;
+        assert_eq!(seen, ["GET /plain HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn modeless_relay_rejects_encoded_slash_when_allow_is_omitted() {
+        let seen = relay_modeless_requests(None, "/@scope%2Fname").await;
+        assert_eq!(seen, ["GET /plain HTTP/1.1"]);
+    }
+
     #[test]
     fn relay_without_route_pins_l4_decision_generation() {
         let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();

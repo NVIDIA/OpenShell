@@ -9880,6 +9880,199 @@ network_policies:
         }
     }
 
+    /// Forward `GET {path}` through `handle_forward_proxy` to a modeless
+    /// endpoint (no `protocol`) whose `allow_encoded_slash` is `Some(value)`
+    /// or omitted with `None`. Returns the proxy's status line and the request
+    /// line the upstream received, if the request reached it.
+    async fn forward_to_modeless_endpoint(
+        upstream_ip: Ipv4Addr,
+        identity_cache: &Arc<BinaryIdentityCache>,
+        allow_encoded_slash: Option<bool>,
+        path: &str,
+    ) -> (String, Option<String>) {
+        let upstream_listener = TcpListener::bind((upstream_ip, 0))
+            .await
+            .expect("bind modeless upstream listener");
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let executable = std::env::current_exe().expect("current executable");
+        let flag = allow_encoded_slash
+            .map(|value| format!("        allow_encoded_slash: {value}\n"))
+            .unwrap_or_default();
+        let data = format!(
+            r#"
+network_policies:
+  modeless:
+    name: modeless
+    endpoints:
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+{flag}    binaries:
+      - {{ path: "{executable}" }}
+"#,
+            executable = executable.display(),
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
+                .expect("load modeless policy"),
+        );
+
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0, "request closed before its headers completed");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let target = format!("http://{upstream_ip}:{upstream_port}{path}");
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nConnection: close\r\n\r\n"
+        );
+        let client = tokio::spawn(async move {
+            let mut socket = connect_tcp_nodelay_best_effort(proxy_address)
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (proxy_connection, _) = proxy_listener.accept().await.unwrap();
+        let socket_addrs = proxy_connection
+            .peer_addr()
+            .ok()
+            .zip(proxy_connection.local_addr().ok());
+        let mut proxy_connection: ProxyClient =
+            tokio::io::BufReader::new(Box::new(proxy_connection));
+
+        Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            Box::pin(handle_forward_proxy(
+                "GET",
+                &target,
+                request.as_bytes(),
+                request.len(),
+                &mut proxy_connection,
+                None,
+                socket_addrs,
+                engine,
+                Arc::clone(identity_cache),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                Arc::new(None),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )),
+        ))
+        .await
+        .expect("modeless forwarding should complete")
+        .expect("handle modeless request");
+        drop(proxy_connection);
+
+        let response = client.await.expect("join modeless client");
+        let status = String::from_utf8_lossy(&response)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        // A rejected request never reaches the upstream, so its accept never returns.
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(1), upstream)
+            .await
+            .ok()
+            .map(|joined| joined.expect("join modeless upstream"));
+        (status, forwarded)
+    }
+
+    /// Forward `/plain` (a setup check) and then `/@scope%2Fname` to a
+    /// modeless endpoint. Returns the outcome of the encoded-slash request.
+    async fn forward_encoded_slash_to_modeless_endpoint(
+        allow_encoded_slash: Option<bool>,
+    ) -> Option<(String, Option<String>)> {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return None;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return None;
+        };
+        let identity_cache = Arc::new(BinaryIdentityCache::new());
+        let plain = forward_to_modeless_endpoint(
+            upstream_ip,
+            &identity_cache,
+            allow_encoded_slash,
+            "/plain",
+        )
+        .await;
+        assert_eq!(
+            plain,
+            (
+                "HTTP/1.1 200 OK".to_string(),
+                Some("GET /plain HTTP/1.1".to_string())
+            ),
+            "the modeless endpoint should forward a plain path"
+        );
+        Some(
+            forward_to_modeless_endpoint(
+                upstream_ip,
+                &identity_cache,
+                allow_encoded_slash,
+                "/@scope%2Fname",
+            )
+            .await,
+        )
+    }
+
+    #[tokio::test]
+    async fn forward_modeless_endpoint_forwards_encoded_slash_when_allowed() {
+        let Some(outcome) = forward_encoded_slash_to_modeless_endpoint(Some(true)).await else {
+            return;
+        };
+        assert_eq!(
+            outcome,
+            (
+                "HTTP/1.1 200 OK".to_string(),
+                Some("GET /@scope%2Fname HTTP/1.1".to_string())
+            ),
+            "allow_encoded_slash: true should forward %2F on a modeless endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_modeless_endpoint_rejects_encoded_slash_when_allow_is_false() {
+        let Some(outcome) = forward_encoded_slash_to_modeless_endpoint(Some(false)).await else {
+            return;
+        };
+        assert_eq!(outcome, ("HTTP/1.1 400 Bad Request".to_string(), None));
+    }
+
+    #[tokio::test]
+    async fn forward_modeless_endpoint_rejects_encoded_slash_when_allow_is_omitted() {
+        let Some(outcome) = forward_encoded_slash_to_modeless_endpoint(None).await else {
+            return;
+        };
+        assert_eq!(outcome, ("HTTP/1.1 400 Bad Request".to_string(), None));
+    }
+
     #[tokio::test]
     async fn forward_mcp_websocket_upgrade_is_denied_before_connecting_upstream() {
         if !cfg!(target_os = "linux") {
