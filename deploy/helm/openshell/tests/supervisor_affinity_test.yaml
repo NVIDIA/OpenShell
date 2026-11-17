@@ -9,11 +9,11 @@ release:
   name: openshell
   namespace: gateway
 set:
-  scheduling:
-    workloadSupervisorAntiAffinity: off
   gatewayConfig:
     openshell.drivers.kubernetes:
       supervisor_topology: gateway
+      sandbox_runtime:
+        pod_anti_affinity: "off"
 tests:
   - it: renders supervisor.affinity unchanged on the supervisor Pod
     template: templates/supervisor.yaml

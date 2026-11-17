@@ -1065,13 +1065,12 @@ helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage
 ```
 
 Workload/supervisor node separation is preferred by default. Check
-`sandbox_runtime.pod_anti_affinity` in gateway configuration and
-`scheduling.workloadSupervisorAntiAffinity` in Helm values. Required mode needs
+`sandbox_runtime.pod_anti_affinity` in gateway configuration (under Helm's
+`gatewayConfig`); the chart derives shared-supervisor rules from it. Required mode needs
 separate eligible nodes; inspect both roles' `FailedScheduling` events. The
 reserved pod label `openshell.ai/runtime-role` has values `workload`,
 `supervisor`, and `gateway`; role anti-affinity selects across all namespaces
-unless `pod_anti_affinity_namespace_selector` / `scheduling.namespaceSelector`
-restricts scope. Node selectors/tolerations are opt-in: check gateway chart
+unless `sandbox_runtime.pod_anti_affinity_namespace_selector` restricts scope. Node selectors/tolerations are opt-in: check gateway chart
 fields, `supervisor.nodeSelector` / `supervisor.tolerations`, and
 `sandbox_runtime.workload_placement`. Existing unlabeled pods need recreation.
 The published gateway configuration reference documents the supported fields.

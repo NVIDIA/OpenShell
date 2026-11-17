@@ -279,8 +279,10 @@ task running while using those endpoints.
 Workloads, supervisors, and gateways use `openshell.ai/runtime-role` with values
 `workload`, `supervisor`, and `gateway`. Workload/supervisor anti-affinity defaults
 to preferred and matches across all namespaces. Set
-`scheduling.workloadSupervisorAntiAffinity=required` for hard separation or
-`off` to opt out; `scheduling.namespaceSelector` narrows the namespace scope.
+`gatewayConfig.openshell.drivers.kubernetes.sandbox_runtime.pod_anti_affinity`
+to `required` for hard separation or `off` to opt out. The driver's
+`pod_anti_affinity_namespace_selector` narrows namespace scope. The chart derives
+shared-supervisor rules from the same gateway configuration.
 Node selectors and tolerations remain opt-in. Gateways use the top-level chart
 fields; supervisors use `supervisor.nodeSelector` and `supervisor.tolerations`;
 workloads use gateway TOML `sandbox_runtime.workload_placement`.

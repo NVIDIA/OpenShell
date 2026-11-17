@@ -1488,18 +1488,18 @@ the participating namespaces and configure a native namespace label selector:
 "example.com/openshell-group" = "production"
 ```
 
-In Helm, `scheduling.workloadSupervisorAntiAffinity` sets the policy for both the
-driver and shared-supervisor Deployment. It inherits gateway TOML when unset,
-then defaults to `preferred`. `scheduling.namespaceSelector` similarly sets both
-sides' namespace selector. Contradictory chart and gateway settings are rejected.
-For example:
+In Helm, configure the driver through `gatewayConfig`. The chart derives the
+shared-supervisor Deployment's reciprocal policy and namespace scope from the
+same settings:
 
 ```yaml
-scheduling:
-  workloadSupervisorAntiAffinity: required
-  namespaceSelector:
-    matchLabels:
-      example.com/openshell-group: production
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    sandbox_runtime:
+      pod_anti_affinity: required
+      pod_anti_affinity_namespace_selector:
+        matchLabels:
+          example.com/openshell-group: production
 ```
 
 For independently deployed shared supervisors, apply the supervisor role label

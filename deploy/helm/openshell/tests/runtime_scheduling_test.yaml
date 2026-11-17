@@ -56,11 +56,13 @@ tests:
   - it: merges required role separation with custom affinity and namespace scope
     template: templates/supervisor.yaml
     set:
-      scheduling:
-        workloadSupervisorAntiAffinity: required
-        namespaceSelector:
-          matchLabels:
-            scheduling.example.com/group: a
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          sandbox_runtime:
+            pod_anti_affinity: required
+            pod_anti_affinity_namespace_selector:
+              matchLabels:
+                scheduling.example.com/group: a
       supervisor:
         nodeSelector:
           pool: supervisor
@@ -94,7 +96,10 @@ tests:
   - it: allows opting out while retaining role labels
     template: templates/supervisor.yaml
     set:
-      scheduling.workloadSupervisorAntiAffinity: "off"
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          sandbox_runtime:
+            pod_anti_affinity: "off"
     asserts:
       - notExists:
           path: spec.template.spec.affinity
@@ -111,17 +116,6 @@ tests:
     asserts:
       - exists:
           path: spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution
-  - it: rejects contradictory chart and gateway policies
-    template: templates/supervisor.yaml
-    set:
-      scheduling.workloadSupervisorAntiAffinity: required
-      gatewayConfig:
-        openshell.drivers.kubernetes:
-          sandbox_runtime:
-            pod_anti_affinity: preferred
-    asserts:
-      - failedTemplate:
-          errorMessage: scheduling.workloadSupervisorAntiAffinity conflicts with gatewayConfig sandbox_runtime.pod_anti_affinity
   - it: rejects gateway role overrides
     template: templates/supervisor.yaml
     set:

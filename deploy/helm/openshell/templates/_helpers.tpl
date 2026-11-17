@@ -655,27 +655,11 @@ absent fields so every chart consumer observes the same configuration.
 {{- if hasKey $gatewayConfig "openshell.drivers.kubernetes.sandbox_runtime" -}}
 {{- $runtimeConfig = deepCopy (get $gatewayConfig "openshell.drivers.kubernetes.sandbox_runtime") -}}
 {{- end -}}
-{{/* Resolve the chart convenience setting once for the gateway and supervisor. */}}
-{{- $scheduling := .Values.scheduling | default dict -}}
 {{- $mode := "preferred" -}}
 {{- if hasKey $runtimeConfig "pod_anti_affinity" -}}{{- $mode = get $runtimeConfig "pod_anti_affinity" -}}{{- end -}}
-{{- if and (hasKey $scheduling "workloadSupervisorAntiAffinity") (ne (get $scheduling "workloadSupervisorAntiAffinity") nil) -}}
-{{- $requested := get $scheduling "workloadSupervisorAntiAffinity" -}}
-{{- if and (hasKey $runtimeConfig "pod_anti_affinity") (ne $mode $requested) -}}
-{{- fail "scheduling.workloadSupervisorAntiAffinity conflicts with gatewayConfig sandbox_runtime.pod_anti_affinity" -}}
-{{- end -}}
-{{- $mode = $requested -}}
-{{- end -}}
 {{- if not (has $mode (list "off" "preferred" "required")) -}}{{- fail "pod anti-affinity must be off, preferred, or required" -}}{{- end -}}
 {{- $_ := set $runtimeConfig "pod_anti_affinity" $mode -}}
 {{- $namespaces := get $runtimeConfig "pod_anti_affinity_namespace_selector" | default dict -}}
-{{- if and (hasKey $scheduling "namespaceSelector") (ne (get $scheduling "namespaceSelector") nil) -}}
-{{- $requested := get $scheduling "namespaceSelector" -}}
-{{- if and (hasKey $runtimeConfig "pod_anti_affinity_namespace_selector") (ne (toJson $namespaces) (toJson $requested)) -}}
-{{- fail "scheduling.namespaceSelector conflicts with gatewayConfig pod_anti_affinity_namespace_selector" -}}
-{{- end -}}
-{{- $namespaces = $requested -}}
-{{- end -}}
 {{- if not (kindIs "map" $namespaces) -}}{{- fail "pod anti-affinity namespace selector must be a map" -}}{{- end -}}
 {{- $_ := set $runtimeConfig "pod_anti_affinity_namespace_selector" $namespaces -}}
 {{- $appDeployment := include "openshell.appListenerDeployment" . | fromYaml -}}

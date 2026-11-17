@@ -653,8 +653,6 @@ discovery endpoint or its TLS CA.
 | sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
 | sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
 | sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
-| scheduling.namespaceSelector | object | `nil` | Native namespace label selector for role anti-affinity. Null inherits gatewayConfig, then {} (all namespaces). |
-| scheduling.workloadSupervisorAntiAffinity | string | `nil` | Workload/supervisor anti-affinity: preferred (default), required, or off. Null inherits gatewayConfig, then preferred. Sets both driver and shared-supervisor policy. |
 | securityContext.allowPrivilegeEscalation | bool | `false` | Whether the gateway container can gain additional privileges. |
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
