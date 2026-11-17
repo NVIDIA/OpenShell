@@ -4,35 +4,41 @@
 //! Credential gating: which endpoints a provider credential may reach, and
 //! what the supervisor forwards upstream in REST bodies and WebSocket frames.
 //!
-//! Ported from the e2e tests added in NVIDIA/OpenShell#5264. The upstream
+//! Ported from the e2e tests added in NVIDIA/OpenShell#5264, the credential
+//! test in `proxy_egress_pipeline`, and `websocket_conformance`. The upstream
 //! servers run on the test host ([`host_server_support`]), so the suite
 //! requires sandboxes to reach the test host as `host.openshell.internal`.
 
 use std::time::Duration;
 
-use host_server_support::{HttpRecorder, Request, TEST_HOST, WebSocketRecorder};
+use host_server_support::{HttpRecorder, Request, TEXT_REPLY, WebSocketRecorder};
 use testkit::policy::{self, Access, Endpoint as _};
 use testkit::sdk::raw::proto;
 use testkit::{Context, Error, GrpcCode, PYTHON_BINARIES, Result, ResultExt as _, Sandbox};
+
+use crate::support::{self, TEST_HOST, python_binaries_yaml};
+
+const CREDENTIAL_REWRITE_CLIENT: &str = include_str!("scripts/credential_rewrite_client.py");
+const WEBSOCKET_TEXT_CLIENT: &str = include_str!("scripts/websocket_text_client.py");
 
 const TOKEN_ENV: &str = "E2E_GATING_TOKEN";
 const TEST_SECRET: &str = "e2e-gating-secret-value";
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 
-/// POSTs a body containing the provider's token to the host in `argv[1]` on
-/// the port in `argv[2]`, directly rather than through a proxy.
+/// POSTs a body containing the provider's token to `TEST_HOST` on the port
+/// in `argv[1]`, directly rather than through a proxy.
 const BODY_CLIENT: &str = r#"
 import os, sys, urllib.request
 body = ("prefix-" + os.environ["E2E_GATING_TOKEN"] + "-suffix").encode()
-request = urllib.request.Request(f"http://{sys.argv[1]}:{sys.argv[2]}/token", data=body, headers={"Content-Type": "text/plain"})
+request = urllib.request.Request(f"http://host.openshell.internal:{sys.argv[1]}/token", data=body, headers={"Content-Type": "text/plain"})
 urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=10).read()
 "#;
 
-/// Upgrades to WebSocket at the host in `argv[1]` on the port in `argv[2]`,
-/// sends one binary frame, and waits briefly for the connection to be closed.
+/// Upgrades to WebSocket at `TEST_HOST` on the port in `argv[1]`, sends one
+/// binary frame, and waits briefly for the connection to be closed.
 const WEBSOCKET_CLIENT: &str = r#"
 import base64, os, socket, sys
-host, port = sys.argv[1], int(sys.argv[2])
+host, port = "host.openshell.internal", int(sys.argv[1])
 with socket.create_connection((host, port), timeout=10) as sock:
     key = base64.b64encode(os.urandom(16)).decode()
     sock.sendall(f"GET /ws HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
@@ -216,6 +222,84 @@ async fn policy_binding_updates_provider_environment_live(cx: &mut Context) -> t
     wait_for_token(&sandbox, "TOKEN_ABSENT").await
 }
 
+/// A provider whose profile declares a REST endpoint with body rewriting
+/// gets its placeholder replaced with the secret in both the
+/// `Authorization` header and the body of every request, with no
+/// placeholder left upstream.
+#[testkit::test]
+async fn profile_rest_endpoint_rewrites_header_and_body(cx: &mut Context) -> testkit::Result {
+    let server = HttpRecorder::start("ok").await?;
+    let sandbox = profile_endpoint_sandbox(
+        cx,
+        "rewrite",
+        &format!(
+            "{{host: {TEST_HOST}, port: {}, path: /probe, protocol: rest, access: full, \
+             enforcement: enforce, request_body_credential_rewrite: true}}",
+            server.port
+        ),
+    )
+    .await?;
+    support::run_python(
+        &sandbox,
+        CREDENTIAL_REWRITE_CLIENT,
+        &[TEST_HOST, &server.port.to_string()],
+    )
+    .await?
+    .expect_stdout("REWRITE_OK\n")?;
+
+    let requests = server.wait_for_requests(2).await?;
+    let authorization = format!("Bearer {TEST_SECRET}");
+    for request in &requests {
+        testkit::ensure!(
+            request.header("authorization").as_deref() == Some(authorization.as_str())
+                && request.body.contains(TEST_SECRET)
+                && !request.head.contains(PLACEHOLDER_PREFIX)
+                && !request.body.contains(PLACEHOLDER_PREFIX),
+            "expected the secret in the header and body upstream; got {}",
+            redact(request)
+        );
+    }
+    Ok(())
+}
+
+/// A provider whose profile declares a WebSocket endpoint with
+/// `websocket_credential_rewrite` gets its placeholder replaced with the
+/// secret in a text frame.
+#[testkit::test]
+async fn profile_websocket_endpoint_rewrites_text_frames(cx: &mut Context) -> testkit::Result {
+    let server = WebSocketRecorder::start().await?;
+    let sandbox = profile_endpoint_sandbox(
+        cx,
+        "wstext",
+        &format!(
+            "{{host: {TEST_HOST}, port: {}, path: /ws, protocol: websocket, \
+             enforcement: enforce, access: read-write, websocket_credential_rewrite: true}}",
+            server.port
+        ),
+    )
+    .await?;
+    support::run_python(
+        &sandbox,
+        WEBSOCKET_TEXT_CLIENT,
+        &[TEST_HOST, &server.port.to_string()],
+    )
+    .await?
+    .expect_stdout(&format!("{TEXT_REPLY}\n"))?;
+
+    let texts = server.texts();
+    testkit::ensure!(
+        texts.len() == 1
+            && texts[0].contains(TEST_SECRET)
+            && !texts[0].contains(PLACEHOLDER_PREFIX),
+        "expected one text frame with the secret upstream; got {:?}",
+        texts
+            .iter()
+            .map(|text| text.replace(TEST_SECRET, "<secret>"))
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
 /// Run [`WEBSOCKET_CLIENT`] against `server` in a sandbox with `providers`,
 /// and return whether its binary frame reached `server`.
 async fn send_binary_frame(
@@ -250,21 +334,43 @@ fn allow(policy: &mut proto::SandboxPolicy, port: u16) -> &mut proto::NetworkEnd
 /// `endpoints`, its profile declares the REST and WebSocket ports as its
 /// endpoints; without, a policy must bind the provider explicitly.
 async fn install_gating_provider(cx: &Context, endpoints: Option<(u16, u16)>) -> Result<String> {
-    let name = cx.name("cg");
-    let endpoints = endpoints.map_or_else(String::new, |(rest, websocket)| {
-        format!(
-            "endpoints:
-  - host: {TEST_HOST}
-    port: {rest}
-    protocol: rest
-    access: full
-  - host: {TEST_HOST}
-    port: {websocket}
-    protocol: websocket
-    access: read-write
-"
-        )
+    let endpoints = endpoints.map_or_else(Vec::new, |(rest, websocket)| {
+        vec![
+            format!("{{host: {TEST_HOST}, port: {rest}, protocol: rest, access: full}}"),
+            format!(
+                "{{host: {TEST_HOST}, port: {websocket}, protocol: websocket, access: read-write}}"
+            ),
+        ]
     });
+    install_provider_with_endpoints(cx, &endpoints).await
+}
+
+/// A long-running sandbox with a provider from
+/// [`install_provider_with_endpoints`] whose profile declares `endpoint`, a
+/// YAML flow mapping, and a policy that allows the same endpoint.
+async fn profile_endpoint_sandbox(cx: &Context, suffix: &str, endpoint: &str) -> Result<Sandbox> {
+    let provider = install_provider_with_endpoints(cx, &[endpoint.to_string()]).await?;
+    let policy = policy::base_with(&format!(
+        "network_policies:
+  credential_gating:
+    name: credential_gating
+    endpoints: [{endpoint}]
+    binaries: {binaries}
+",
+        binaries = python_binaries_yaml(),
+    ))?;
+    create_sandbox(cx, suffix, policy, &[&provider]).await
+}
+
+/// Install a run-unique provider holding `TEST_SECRET` in `TOKEN_ENV`, whose
+/// profile declares `endpoints`, each a YAML flow mapping.
+async fn install_provider_with_endpoints(cx: &Context, endpoints: &[String]) -> Result<String> {
+    let name = cx.name("cg");
+    let endpoints = if endpoints.is_empty() {
+        String::new()
+    } else {
+        format!("endpoints: [{}]\n", endpoints.join(", "))
+    };
     let binaries: String = PYTHON_BINARIES
         .iter()
         .map(|path| format!("  - path: {path}\n"))
@@ -333,12 +439,11 @@ async fn expect_rejected(
     }
 }
 
-/// Run `script` with the image's Python, and [`TEST_HOST`] and `port` as its
-/// arguments.
+/// Run `script` with the image's Python and `port` as its argument.
 async fn run_python(sandbox: &Sandbox, script: &str, port: u16) -> Result {
     let port = port.to_string();
     sandbox
-        .exec(["python3", "-c", script, TEST_HOST, &port])
+        .exec(["python3", "-c", script, &port])
         .await?
         .success()
         .context("run the client in the sandbox")?;
@@ -390,4 +495,3 @@ async fn wait_for_token(sandbox: &Sandbox, expected: &str) -> Result {
         .await?;
     Ok(())
 }
-
