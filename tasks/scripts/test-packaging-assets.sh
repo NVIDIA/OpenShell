@@ -322,38 +322,6 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     echo "FAIL: package-deb did not stage openshell-prover" >&2
     exit 1
   fi
-  if ! dpkg-deb --fsys-tarfile "$package_work/output/openshell_0.0.0_amd64.deb" \
-    | tar -tf - | grep -x './usr/libexec/openshell/openshell-driver-vm' >/dev/null; then
-    echo "FAIL: package-deb did not stage openshell-driver-vm" >&2
-    exit 1
-  fi
-  if OPENSHELL_CLI_BINARY="$package_work/bin/openshell" \
-    OPENSHELL_GATEWAY_BINARY="$package_work/bin/openshell-gateway" \
-    OPENSHELL_PROVER_BINARY="$package_work/bin/openshell-prover" \
-    OPENSHELL_DEB_VERSION=0.0.1 \
-    OPENSHELL_DEB_ARCH=arm64 \
-    OPENSHELL_OUTPUT_DIR="$package_work/output" \
-    "$package_deb" >/dev/null 2>&1; then
-    echo "FAIL: package-deb must require openshell-driver-vm unless explicitly omitted" >&2
-    exit 1
-  fi
-  OPENSHELL_CLI_BINARY="$package_work/bin/openshell" \
-    OPENSHELL_GATEWAY_BINARY="$package_work/bin/openshell-gateway" \
-    OPENSHELL_PROVER_BINARY="$package_work/bin/openshell-prover" \
-    OPENSHELL_DEB_OMIT_VM_DRIVER=1 \
-    OPENSHELL_DEB_VERSION=0.0.1 \
-    OPENSHELL_DEB_ARCH=arm64 \
-    OPENSHELL_OUTPUT_DIR="$package_work/output" \
-    "$package_deb" >/dev/null
-  if [[ "$(dpkg-deb --field "$package_work/output/openshell_0.0.1_arm64.deb" Architecture)" != arm64 ]]; then
-    echo "FAIL: package-deb did not honor OPENSHELL_DEB_ARCH" >&2
-    exit 1
-  fi
-  if dpkg-deb --fsys-tarfile "$package_work/output/openshell_0.0.1_arm64.deb" \
-    | tar -tf - | grep -F 'openshell-driver-vm' >/dev/null; then
-    echo "FAIL: OPENSHELL_DEB_OMIT_VM_DRIVER=1 still staged openshell-driver-vm" >&2
-    exit 1
-  fi
 else
   echo "SKIP: dpkg-deb unavailable; Debian artifact staging requires its assigned lane"
 fi

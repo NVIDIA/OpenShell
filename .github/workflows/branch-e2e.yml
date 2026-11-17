@@ -335,7 +335,7 @@ jobs:
 
   build-deb:
     name: Build Debian packages
-    needs: [pr_metadata, version, build-binaries-linux]
+    needs: [pr_metadata, version, build-binaries-linux, build-vm-driver-linux]
     if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       contents: read
@@ -343,8 +343,6 @@ jobs:
     with:
       checkout-ref: ${{ github.sha }}
       deb-version: ${{ needs.version.outputs.deb_version }}
-      # tmachine deb rows use the Docker driver.
-      include-vm-driver: false
 
   build-rpm:
     name: Build RPM packages
