@@ -1091,6 +1091,11 @@ async fn run_from_args(
 
     if prepared.config.service_routing.enabled {
         info!("Gateway-based service routing enabled");
+        if prepared.config.service_routing.auth_enabled {
+            info!("Gateway-mediated service authentication enabled");
+        } else {
+            info!("Gateway-mediated service authentication disabled");
+        }
     }
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
