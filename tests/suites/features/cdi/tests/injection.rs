@@ -86,3 +86,13 @@ async fn device_node(cx: &mut Context) -> testkit::Result {
 async fn unix_socket(cx: &mut Context) -> testkit::Result {
     cdi::scenario(cx, "unix-socket").await
 }
+
+/// A device node that is mode 0660 with a group only the CDI spec's
+/// `additionalGids` grants. The workload must run as a non-root user, be a
+/// member of the node's group, and be denied the write the expectations record.
+/// This covers a group added at runtime, which the sandbox must accept from the
+/// Docker and Podman drivers alike.
+#[testkit::test]
+async fn device_node_with_gid(cx: &mut Context) -> testkit::Result {
+    cdi::scenario(cx, "device-node-with-gid").await
+}
