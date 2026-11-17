@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{Pod, Toleration};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
@@ -49,10 +50,36 @@ pub struct KubernetesWorkloadPlacement {
 // Remember only the operator's changes, so changing/removing operator placement
 // on restart restores caller settings and preserves unrelated admission rules.
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct AppliedPlacement {
     node_selector: BTreeMap<String, String>,
     original_selector: BTreeMap<String, String>,
-    added_tolerations: Vec<Value>,
+    added_tolerations: Vec<Toleration>,
+    anti_affinity: Option<AppliedAntiAffinity>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AppliedAntiAffinity {
+    key: String,
+    value: Value,
+}
+
+fn normalized_toleration(value: &Toleration) -> Toleration {
+    let mut value = value.clone();
+    if value.operator.as_ref().is_none_or(String::is_empty) {
+        value.operator = Some("Equal".into());
+    }
+    for field in [&mut value.key, &mut value.value, &mut value.effect] {
+        if field.as_ref().is_some_and(String::is_empty) {
+            *field = None;
+        }
+    }
+    value
+}
+
+fn toleration_matches(value: &Value, expected: &Toleration) -> bool {
+    serde_json::from_value::<Toleration>(value.clone())
+        .is_ok_and(|value| normalized_toleration(&value) == normalized_toleration(expected))
 }
 
 fn term(peer: &str, namespaces: &LabelSelector) -> Value {
@@ -63,28 +90,27 @@ fn term(peer: &str, namespaces: &LabelSelector) -> Value {
     })
 }
 
-fn owned_term(value: &Value, peer: &str) -> bool {
-    value["topologyKey"] == "kubernetes.io/hostname"
-        && value["labelSelector"] == json!({"matchLabels": {ROLE_LABEL: peer}})
-        && value.as_object().is_some_and(|map| {
-            map.keys().all(|key| {
-                matches!(
-                    key.as_str(),
-                    "topologyKey" | "labelSelector" | "namespaceSelector"
-                )
-            })
-        })
-}
-
-/// Reconcile only the reserved role rule. Other affinity is left intact.
+/// Add the role rule to a newly constructed supervisor spec.
 pub fn configure_affinity(
     spec: &mut Value,
     mode: KubernetesPodAntiAffinity,
     namespaces: &LabelSelector,
     peer: &str,
 ) {
+    reconcile_affinity(spec, mode, namespaces, peer, None);
+}
+
+// Stored ownership includes the strength and namespace scope. Similar rules
+// independently authored by operators must survive policy changes.
+fn reconcile_affinity(
+    spec: &mut Value,
+    mode: KubernetesPodAntiAffinity,
+    namespaces: &LabelSelector,
+    peer: &str,
+    previous: Option<&AppliedAntiAffinity>,
+) -> Option<AppliedAntiAffinity> {
     if spec["affinity"].is_null() && mode == KubernetesPodAntiAffinity::Off {
-        return;
+        return None;
     }
     if spec["affinity"].is_null() {
         spec["affinity"] = json!({});
@@ -96,12 +122,11 @@ pub fn configure_affinity(
     let anti = &mut affinity["podAntiAffinity"];
     let required = "requiredDuringSchedulingIgnoredDuringExecution";
     let preferred = "preferredDuringSchedulingIgnoredDuringExecution";
-    if let Some(terms) = anti.get_mut(required).and_then(Value::as_array_mut) {
-        terms.retain(|value| !owned_term(value, peer));
-    }
-    if let Some(terms) = anti.get_mut(preferred).and_then(Value::as_array_mut) {
-        terms
-            .retain(|value| value["weight"] != 100 || !owned_term(&value["podAffinityTerm"], peer));
+    if let Some(previous) = previous
+        && let Some(terms) = anti.get_mut(&previous.key).and_then(Value::as_array_mut)
+        && let Some(index) = terms.iter().position(|value| value == &previous.value)
+    {
+        terms.remove(index);
     }
     let generated = term(peer, namespaces);
     let (key, value) = match mode {
@@ -112,14 +137,19 @@ pub fn configure_affinity(
             Some(json!({"weight": 100, "podAffinityTerm": generated})),
         ),
     };
+    let mut applied = None;
     if let Some(value) = value {
         if anti[key].is_null() {
             anti[key] = json!([]);
         }
-        anti[key]
-            .as_array_mut()
-            .expect("affinity terms are arrays")
-            .push(value);
+        let terms = anti[key].as_array_mut().expect("affinity terms are arrays");
+        if !terms.contains(&value) {
+            terms.push(value.clone());
+            applied = Some(AppliedAntiAffinity {
+                key: key.into(),
+                value,
+            });
+        }
     }
     for key in [required, preferred] {
         if anti[key].as_array().is_some_and(Vec::is_empty) {
@@ -132,6 +162,7 @@ pub fn configure_affinity(
     if affinity.as_object().is_some_and(serde_json::Map::is_empty) {
         spec.as_object_mut().unwrap().remove("affinity");
     }
+    applied
 }
 
 pub fn configure_workload(
@@ -191,14 +222,20 @@ pub fn configure_workload(
     }
     let mut tolerations = spec["tolerations"].as_array().cloned().unwrap_or_default();
     for previous in previous.added_tolerations {
-        if let Some(index) = tolerations.iter().position(|value| *value == previous) {
+        if let Some(index) = tolerations
+            .iter()
+            .position(|value| toleration_matches(value, &previous))
+        {
             tolerations.remove(index);
         }
     }
     for toleration in &config.workload_placement.tolerations {
-        let value = json!(toleration);
-        if !tolerations.contains(&value) {
-            tolerations.push(value.clone());
+        if !tolerations
+            .iter()
+            .any(|value| toleration_matches(value, toleration))
+        {
+            let value = normalized_toleration(toleration);
+            tolerations.push(json!(&value));
             applied.added_tolerations.push(value);
         }
     }
@@ -207,11 +244,12 @@ pub fn configure_workload(
     } else {
         spec["tolerations"] = json!(tolerations);
     }
-    configure_affinity(
+    applied.anti_affinity = reconcile_affinity(
         spec,
         config.pod_anti_affinity,
         &config.pod_anti_affinity_namespace_selector,
         "supervisor",
+        previous.anti_affinity.as_ref(),
     );
     if template["metadata"].is_null() {
         template["metadata"] = json!({});
@@ -297,11 +335,11 @@ fn validate_role(
         }
     }
     for value in &config.workload_placement.tolerations {
-        if !spec
-            .tolerations
-            .as_ref()
-            .is_some_and(|values| values.contains(value))
-        {
+        if !spec.tolerations.as_ref().is_some_and(|values| {
+            values
+                .iter()
+                .any(|actual| normalized_toleration(actual) == normalized_toleration(value))
+        }) {
             return Err(fail("operator toleration removed"));
         }
     }
@@ -339,7 +377,8 @@ fn validate_role(
 
 /// Scheduling waits do not consume startup grace; once bound, startup gets a
 /// bounded grace from `PodScheduled`, including after a gateway outage.
-pub fn scheduling_wait(pod: &Pod, now_ms: i64, grace_ms: i64) -> bool {
+pub fn scheduling_wait(pod: &Pod, now_ms: i64, grace: Duration) -> bool {
+    let grace_ms = i64::try_from(grace.as_millis()).unwrap_or(i64::MAX);
     if pod.metadata.deletion_timestamp.is_some() {
         return false;
     }
@@ -490,6 +529,128 @@ mod tests {
     }
 
     #[test]
+    fn tolerations_accept_native_defaults_without_duplicates() {
+        for configured in [
+            json!({"key": "pool", "value": "sandbox", "effect": "NoSchedule"}),
+            json!({"key": "", "operator": "Exists", "value": "", "effect": ""}),
+        ] {
+            let config: Config = serde_json::from_value(json!({
+                "workload_placement": {"tolerations": [configured]}
+            }))
+            .unwrap();
+            config.validate().unwrap();
+            let mut pod = template();
+            configure_workload(&mut pod, &config).unwrap();
+            let mut admitted = serde_json::from_value::<Pod>(pod.clone()).unwrap();
+            for actual in admitted
+                .spec
+                .as_mut()
+                .unwrap()
+                .tolerations
+                .as_mut()
+                .unwrap()
+            {
+                *actual = normalized_toleration(actual);
+            }
+            validate_workload(&admitted, &config).unwrap();
+            pod["spec"]["tolerations"] = json!(admitted.spec.unwrap().tolerations.unwrap());
+            configure_workload(&mut pod, &config).unwrap();
+            assert_eq!(pod["spec"]["tolerations"].as_array().unwrap().len(), 1);
+            configure_workload(&mut pod, &Config::default()).unwrap();
+            assert!(pod["spec"].get("tolerations").is_none());
+        }
+
+        let configured = json!({"key": "pool", "value": "sandbox", "effect": "NoSchedule"});
+        let config: Config = serde_json::from_value(json!({
+            "workload_placement": {"tolerations": [configured]}
+        }))
+        .unwrap();
+        let mut pod = template();
+        let caller =
+            json!({"key": "pool", "operator": "Equal", "value": "sandbox", "effect": "NoSchedule"});
+        pod["spec"]["tolerations"] = json!([caller]);
+        configure_workload(&mut pod, &config).unwrap();
+        configure_workload(&mut pod, &Config::default()).unwrap();
+        assert_eq!(pod["spec"]["tolerations"], json!([caller]));
+    }
+
+    #[test]
+    fn restart_preserves_role_rules_with_independent_scope_and_strength() {
+        let mut pod = template();
+        let mut config = Config::default();
+        configure_workload(&mut pod, &config).unwrap();
+        let required = term(
+            "supervisor",
+            &serde_json::from_value(json!({"matchLabels": {"group": "critical"}})).unwrap(),
+        );
+        let preferred = json!({"weight": 100, "podAffinityTerm": term("supervisor", &serde_json::from_value(json!({"matchLabels": {"group": "other"}})).unwrap())});
+        let anti = &mut pod["spec"]["affinity"]["podAntiAffinity"];
+        anti["requiredDuringSchedulingIgnoredDuringExecution"] = json!([required]);
+        anti["preferredDuringSchedulingIgnoredDuringExecution"]
+            .as_array_mut()
+            .unwrap()
+            .push(preferred.clone());
+        for mode in [
+            KubernetesPodAntiAffinity::Required,
+            KubernetesPodAntiAffinity::Preferred,
+            KubernetesPodAntiAffinity::Off,
+        ] {
+            config.pod_anti_affinity = mode;
+            config.pod_anti_affinity_namespace_selector =
+                serde_json::from_value(json!({"matchLabels": {"group": "updated"}})).unwrap();
+            configure_workload(&mut pod, &config).unwrap();
+            let anti = &pod["spec"]["affinity"]["podAntiAffinity"];
+            assert!(
+                anti["requiredDuringSchedulingIgnoredDuringExecution"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&required)
+            );
+            assert!(
+                anti["preferredDuringSchedulingIgnoredDuringExecution"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&preferred)
+            );
+        }
+        let anti = &pod["spec"]["affinity"]["podAntiAffinity"];
+        assert_eq!(
+            anti["requiredDuringSchedulingIgnoredDuringExecution"],
+            json!([required])
+        );
+        assert_eq!(
+            anti["preferredDuringSchedulingIgnoredDuringExecution"],
+            json!([preferred])
+        );
+    }
+
+    #[test]
+    fn existing_identical_rule_is_not_claimed_by_driver() {
+        let mut pod = template();
+        let required = term("supervisor", &LabelSelector::default());
+        pod["spec"]["affinity"] = json!({"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [required]}});
+        // Missing ownership must not claim existing rules.
+        pod["metadata"] = json!({"annotations": {PLACEMENT_ANNOTATION: r#"{"node_selector":{},"original_selector":{},"added_tolerations":[]}"#}});
+        let config = Config {
+            pod_anti_affinity: KubernetesPodAntiAffinity::Required,
+            ..Config::default()
+        };
+        configure_workload(&mut pod, &config).unwrap();
+        configure_workload(
+            &mut pod,
+            &Config {
+                pod_anti_affinity: KubernetesPodAntiAffinity::Off,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            pod["spec"]["affinity"]["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"],
+            json!([required])
+        );
+    }
+
+    #[test]
     fn required_admission_rejects_scheduler_bypasses_and_changed_policy() {
         let config = Config {
             pod_anti_affinity: KubernetesPodAntiAffinity::Required,
@@ -552,20 +713,20 @@ mod tests {
             }]}
         }))
         .unwrap();
-        assert!(scheduling_wait(&pod, 10_000_000, 300_000));
+        assert!(scheduling_wait(&pod, 10_000_000, Duration::from_mins(5)));
         pod.spec.as_mut().unwrap().node_name = Some("new-node".into());
         pod.status.as_mut().unwrap().conditions = Some(serde_json::from_value(json!([{
             "type": "PodScheduled", "status": "True", "lastTransitionTime": "1970-01-01T02:46:40Z"
         }])).unwrap());
         assert!(
-            scheduling_wait(&pod, 10_100_000, 300_000),
+            scheduling_wait(&pod, 10_100_000, Duration::from_mins(5)),
             "ContainerCreating after a long capacity wait must survive"
         );
         assert!(
-            !scheduling_wait(&pod, 10_300_000, 300_000),
+            !scheduling_wait(&pod, 10_300_000, Duration::from_mins(5)),
             "startup failures must eventually be cleaned up"
         );
         pod.status.as_mut().unwrap().phase = Some("Failed".into());
-        assert!(!scheduling_wait(&pod, 10_100_000, 300_000));
+        assert!(!scheduling_wait(&pod, 10_100_000, Duration::from_mins(5)));
     }
 }

@@ -298,7 +298,9 @@ HELM_K3S_LB_HOST_PORT=18080 mise run helm:k3s:create
 
 `HELM_K3S_NODES` affects new clusters only; it does not resize an existing one.
 Use `mise run e2e:kubernetes:scheduling` for the shared-supervisor create/restart
-checks. Against the isolated cluster, set `OPENSHELL_E2E_KUBE_CONTEXT` and
+checks. This task enables the dedicated `e2e-kubernetes-scheduling` feature;
+the scheduling test is excluded from the general Kubernetes suite. Against the
+isolated cluster, set `OPENSHELL_E2E_KUBE_CONTEXT` and
 `OPENSHELL_E2E_KUBE_BUILD_IMAGES=1` to build matching branch images.
 Layer `ci/values-scheduling-required.yaml` through
 `OPENSHELL_E2E_KUBE_EXTRA_VALUES` and set `OPENSHELL_E2E_SCHEDULING_MODE=required`

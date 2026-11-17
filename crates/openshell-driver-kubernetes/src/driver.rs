@@ -5631,7 +5631,11 @@ impl KubernetesComputeDriver {
             return Ok(false);
         }
         Ok(generation_pods.iter().any(|pod| {
-            crate::scheduling::scheduling_wait(pod, openshell_core::time::now_ms(), 300_000)
+            crate::scheduling::scheduling_wait(
+                pod,
+                openshell_core::time::now_ms(),
+                Duration::from_secs(self.config.runtime_bootstrap_grace_seconds),
+            )
         }))
     }
 
@@ -13673,6 +13677,51 @@ mod tests {
         Arc<std::sync::Mutex<VecDeque<KubeTestStep>>>,
         Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     );
+
+    #[tokio::test]
+    async fn capacity_recovery_uses_configured_bootstrap_grace() {
+        let scheduled = k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            (SystemTime::now() - Duration::from_mins(1)).into(),
+        );
+        for grace in [30, 900] {
+            let config = KubernetesComputeConfig {
+                runtime_bootstrap_grace_seconds: grace,
+                ..KubernetesComputeConfig::default()
+            };
+            let pod = serde_json::json!({
+                "metadata": {"name": "demo", "uid": "current-uid"},
+                "spec": {"containers": [], "nodeName": "new-node"},
+                "status": {"phase": "Pending", "conditions": [{
+                    "type": "PodScheduled", "status": "True", "lastTransitionTime": scheduled
+                }]}
+            });
+            let (driver, remaining, _) = scripted_driver(
+                config,
+                vec![(
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell/pods/demo",
+                    kube_test_response(http::StatusCode::OK, pod),
+                )],
+            );
+            let object: DynamicObject = serde_json::from_value(serde_json::json!({
+                "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox",
+                "metadata": {"name": "demo", "namespace": "openshell", "annotations": {
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: "released",
+                    ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: "current-uid",
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: "1",
+                }}
+            }))
+            .unwrap();
+            assert_eq!(
+                driver
+                    .bootstrap_waiting_for_scheduling(&object)
+                    .await
+                    .unwrap(),
+                grace == 900
+            );
+            assert!(remaining.lock().unwrap().is_empty());
+        }
+    }
 
     /// Build a driver whose client answers `steps` in order and records each
     /// request body.

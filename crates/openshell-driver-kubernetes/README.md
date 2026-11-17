@@ -102,7 +102,9 @@ apply independently of caller driver-config opt-in. Conflicting caller selectors
 fail; tolerations append without duplicates. A reserved template annotation
 records operator additions so stop/start can replace them while preserving
 caller placement and unrelated admission rules. Restart reconciles only the
-reserved role anti-affinity term, using a merge patch that clears removed keys.
+exact anti-affinity term recorded as inserted by the driver, using a merge patch
+that clears removed keys. Independently authored role rules retain their scope
+and strength.
 Admission checks validate required workload placement before releasing the
 bootstrap scheduling gate. A verified unschedulable generation may wait for
 capacity; once bound, its scheduling transition starts a bounded startup grace.

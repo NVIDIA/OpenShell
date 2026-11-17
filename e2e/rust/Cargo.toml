@@ -33,6 +33,8 @@ e2e-config-push = ["e2e-docker"]
 e2e-gpu = ["e2e"]
 e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
+# The dedicated shared-supervisor scheduling fixture.
+e2e-kubernetes-scheduling = ["e2e-kubernetes"]
 e2e-kubernetes-ha = ["e2e-kubernetes"]
 e2e-kubernetes-credential-drivers = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
@@ -308,3 +310,8 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+[[test]]
+name = "kubernetes_scheduling"
+path = "tests/kubernetes_scheduling.rs"
+required-features = ["e2e-kubernetes-scheduling"]

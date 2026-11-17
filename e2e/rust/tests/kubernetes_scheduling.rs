@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(feature = "e2e-kubernetes")]
+#![cfg(feature = "e2e-kubernetes-scheduling")]
 
 //! Run via e2e:kubernetes:scheduling with a shared-supervisor fixture. The same
 //! test covers one eligible node, required separation, and three node pools.
@@ -60,7 +60,7 @@ async fn assert_placement(name: &str) -> Value {
         "-n",
         &namespace,
         "-l",
-        "openshell.ai/runtime-role",
+        "openshell.ai/runtime-role in (gateway,supervisor),app.kubernetes.io/instance=openshell",
         "-o",
         "json",
     ])
