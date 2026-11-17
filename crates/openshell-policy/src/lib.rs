@@ -1445,7 +1445,8 @@ pub fn validate_filesystem_paths(
 }
 
 /// Return whether `path` designates a filesystem root, such as `/`, `C:\`, `\`,
-/// `\\?\C:\` or `\\server\share`. The check is lexical rather than host-OS based
+/// `\\?\C:\`, `\\?\GLOBALROOT\Device\HarddiskVolume4\` or `\\server\share`.
+/// The check is lexical rather than host-OS based
 /// because the sandbox platform, not the gateway, decides what a path means.
 /// Windows spellings are matched in any mix of separators, because the MXC
 /// driver converts `/` to `\` before it uses a path.
@@ -1472,17 +1473,66 @@ fn is_filesystem_root(path: &str) -> bool {
         rest
     }
 
+    // `rest` follows a `\\?\`, `\\.\` or `\??\` prefix, which all name the
+    // `\??` object directory: drive letters, `UNC`, `Global` (a link to
+    // `\GLOBAL??`) and `GLOBALROOT` (a link to the object namespace root).
+    fn is_namespace_root(rest: &str, literal: bool) -> bool {
+        let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        if name.eq_ignore_ascii_case("Global") {
+            is_namespace_root(tail, literal)
+        } else if name.eq_ignore_ascii_case("GLOBALROOT") {
+            is_object_root(tail, literal)
+        } else if name.eq_ignore_ascii_case("UNC") {
+            only_root_components(skip_names(tail, 2), literal)
+        } else {
+            only_root_components(tail, literal)
+        }
+    }
+    // `rest` is an object path below `\`, such as `Device\HarddiskVolume4\`.
+    // A path outside `\Device` and the drive-letter directories is treated as
+    // a root, because a link there can name a whole volume.
+    fn is_object_root(rest: &str, literal: bool) -> bool {
+        let rest = rest.trim_start_matches('/');
+        let (dir, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        if ["??", "GLOBAL??", "DosDevices"]
+            .iter()
+            .any(|name| dir.eq_ignore_ascii_case(name))
+        {
+            return is_namespace_root(tail, literal);
+        }
+        if !dir.eq_ignore_ascii_case("Device") {
+            return true;
+        }
+        let (device, mut tail) = tail.split_once('/').unwrap_or((tail, ""));
+        // A disk is `Harddisk0\Partition2`; a network redirector is followed
+        // by optional `;`-prefixed connection names, a server and a share.
+        let names = if device
+            .get(..8)
+            .is_some_and(|name| name.eq_ignore_ascii_case("Harddisk"))
+            && device.len() > 8
+            && device[8..].bytes().all(|b| b.is_ascii_digit())
+        {
+            1
+        } else if ["Mup", "LanmanRedirector", "WebDavRedirector"]
+            .iter()
+            .any(|name| device.eq_ignore_ascii_case(name))
+        {
+            while let Some(after) = tail.strip_prefix(';') {
+                tail = after.split_once('/').map_or("", |(_, after)| after);
+            }
+            2
+        } else {
+            0
+        };
+        only_root_components(skip_names(tail, names), literal)
+    }
+
     let normalized = path.replace('\\', "/");
     let namespace = [("//?/", true), ("/??/", true), ("//./", false)]
         .into_iter()
         .find_map(|(prefix, literal)| normalized.strip_prefix(prefix).map(|tail| (tail, literal)));
     if let Some((tail, literal)) = namespace {
-        let (volume, tail) = tail.split_once('/').unwrap_or((tail, ""));
-        return if volume.eq_ignore_ascii_case("UNC") {
-            only_root_components(skip_names(tail, 2), literal)
-        } else {
-            only_root_components(tail, literal)
-        };
+        return is_namespace_root(tail, literal);
     }
     // Two leading separators start a UNC path when either is a backslash; a
     // leading `//` keeps its POSIX meaning.
@@ -3774,6 +3824,51 @@ network_policies:
                     .iter()
                     .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
                 "{root:?} should be overly broad, got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_object_namespace_roots_as_read_write_path() {
+        for root in [
+            r"\\?\GLOBALROOT\Device\HarddiskVolume4\",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume4\",
+            r"\??\GLOBALROOT\Device\HarddiskVolume4\",
+            "//?/globalroot/device/harddiskvolume4",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume4\. ",
+            r"\\?\GLOBALROOT\Device\Harddisk0\Partition2\",
+            r"\\?\GLOBALROOT\??\C:\",
+            r"\\?\GLOBALROOT\GLOBAL??\C:\",
+            r"\\?\GLOBALROOT\DosDevices\C:\",
+            r"\\?\Global\C:\",
+            r"\\?\GLOBALROOT\??\Global\C:\",
+            r"\\?\GLOBALROOT\Device\Mup\server\share\",
+            r"\\?\GLOBALROOT\Device\LanmanRedirector\;Z:0000000000012345\server\share",
+            r"\\?\GLOBALROOT\ArcName\multi(0)disk(0)rdisk(0)partition(3)\",
+            r"\\?\GLOBALROOT",
+        ] {
+            let violations = validate_filesystem_paths(&[], &[root.to_string()])
+                .expect_err("object namespace root read_write path must be rejected");
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+                "{root:?} should be overly broad, got {violations:?}"
+            );
+        }
+        for path in [
+            r"\\?\GLOBALROOT\Device\HarddiskVolume4\work",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume4\work",
+            r"\??\GLOBALROOT\Device\HarddiskVolume4\work",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume4\...",
+            r"\\?\GLOBALROOT\Device\Harddisk0\Partition2\work",
+            r"\\?\GLOBALROOT\??\C:\work",
+            r"\\?\Global\C:\work",
+            r"\\?\GLOBALROOT\Device\Mup\server\share\work",
+        ] {
+            assert!(
+                !is_filesystem_root(path),
+                "{path:?} is narrower than a volume"
             );
         }
     }
