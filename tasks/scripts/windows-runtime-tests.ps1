@@ -108,11 +108,22 @@ try {
         Set-Content -LiteralPath (Join-Path $build 'CMakeCache.txt') -Value 'CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022'
     }
     Set-Content -LiteralPath (Join-Path $newBuild 'CMakeCache.txt') -Value 'CMAKE_GENERATOR:INTERNAL=Ninja'
-    $installed = Join-Path (Split-Path $oldBuild) 'libz3.lib'
-    Set-Content -LiteralPath $installed -Value 'installed library'
+    $script:cleanCalls = @()
+    function cargo {
+        $script:cleanCalls += ,@($args)
+        $global:LASTEXITCODE = 0
+    }
     Reset-WindowsCMakeGeneratorCache 'aarch64-pc-windows-msvc'
-    if (Test-Path -LiteralPath $oldBuild) { throw 'Stale Visual Studio build files retained.' }
-    if (-not (Test-Path -LiteralPath $newBuild) -or -not (Test-Path -LiteralPath $otherTarget) -or -not (Test-Path -LiteralPath $installed)) { throw 'Unrelated build files removed.' }
+    $expected = @('clean', '-p', 'z3-sys', '--target', 'aarch64-pc-windows-msvc', '--profile', 'release', '--target-dir', $TargetDir)
+    if ($script:cleanCalls.Count -ne 1 -or ($script:cleanCalls[0] -join '|') -ne ($expected -join '|')) { throw 'Cargo was not asked to invalidate precisely the stale solver profile and target.' }
+    if (-not (Test-Path -LiteralPath $newBuild) -or -not (Test-Path -LiteralPath $otherTarget)) { throw 'Unrelated build files removed.' }
+    $count++
+    $archiveDir = Join-Path (Split-Path $oldBuild) 'lib'
+    New-Item -ItemType Directory -Path $archiveDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $archiveDir 'libz3.lib') -Value 'old cached archive'
+    Remove-Item -LiteralPath (Join-Path $oldBuild 'CMakeCache.txt')
+    Reset-WindowsCMakeGeneratorCache 'aarch64-pc-windows-msvc'
+    if ($script:cleanCalls.Count -ne 2) { throw 'Cached solver archive without build rules was reused.' }
     $count++
     $env:Z3_SRC_SOURCE_DIR = $null
     $env:Z3_LIBRARY_PATH_OVERRIDE = $sourceFixture

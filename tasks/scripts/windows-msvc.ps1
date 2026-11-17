@@ -444,13 +444,22 @@ function Reset-WindowsCMakeGeneratorCache([string] $RustTarget) {
     foreach ($profile in @('debug', 'release')) {
         $buildRoot = Join-Path $TargetDir "$RustTarget/$profile/build"
         if (-not (Test-Path -LiteralPath $buildRoot)) { continue }
-        foreach ($cache in Get-ChildItem -Path (Join-Path $buildRoot '*/out/build/CMakeCache.txt') -File) {
-            if (Select-String -LiteralPath $cache.FullName -Pattern '^CMAKE_GENERATOR:INTERNAL=(?!Ninja$)' -Quiet) {
-                # Only generated native build files are discarded. Keep the
-                # downloaded source and installed artifacts outside this folder.
-                Write-Host "==> Resetting native build files for Ninja: $($cache.DirectoryName)"
-                Remove-Item -LiteralPath $cache.DirectoryName -Recurse -Force
+        $stale = @(Get-ChildItem -LiteralPath $buildRoot -Filter 'z3-sys-*' -Directory | Where-Object {
+            $cache = Join-Path $_.FullName 'out/build/CMakeCache.txt'
+            if (Test-Path -LiteralPath $cache) {
+                Select-String -LiteralPath $cache -Pattern '^CMAKE_GENERATOR:INTERNAL=(?!Ninja$)' -Quiet
+            } else {
+                # A pruned cache can retain the archive without its build rules.
+                Test-Path -LiteralPath (Join-Path $_.FullName 'out/lib/libz3.lib')
             }
+        })
+        if ($stale.Count) {
+            # Cargo must invalidate its build-script fingerprint and the linked
+            # archive too; deleting only CMake files can reuse an old solver.
+            $cargoProfile = if ($profile -eq 'debug') { 'dev' } else { 'release' }
+            Write-Host "==> Rebuilding cached $cargoProfile Z3 with Ninja"
+            & cargo clean -p z3-sys --target $RustTarget --profile $cargoProfile --target-dir $TargetDir
+            if ($LASTEXITCODE -ne 0) { throw 'Could not invalidate the old Z3 build cache.' }
         }
     }
 }
