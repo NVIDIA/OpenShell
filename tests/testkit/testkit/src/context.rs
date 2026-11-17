@@ -745,7 +745,7 @@ impl Sandbox {
     pub async fn wait_absent(&self, timeout: Duration) -> Result {
         self.handles
             .client
-            .wait_deleted(&self.name, timeout, Some(&self.id))
+            .wait_deleted(&self.name, crate::budget::cap(timeout), Some(&self.id))
             .await
             .context(format!("wait for sandbox {} to be removed", self.name))?;
         self.expect_absent().await
@@ -760,7 +760,11 @@ impl Sandbox {
             .context(format!("delete sandbox {}", self.name))?;
         self.handles
             .client
-            .wait_deleted(&self.name, DELETE_TIMEOUT, Some(&self.id))
+            .wait_deleted(
+                &self.name,
+                crate::budget::cap(DELETE_TIMEOUT),
+                Some(&self.id),
+            )
             .await
             .context(format!("wait for sandbox {} to be deleted", self.name))?;
         self.handles

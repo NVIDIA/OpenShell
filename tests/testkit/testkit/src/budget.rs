@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 pub const TIMEOUT_ENV: &str = "OPENSHELL_TEST_TIMEOUT_SECS";
 
 /// How long before the limit a step gives up, so its error is reported and
-/// the test cleans up before the runner stops it.
+/// the test cleans up before the runner stops it. The clock starts at
+/// [`start`], not when the runner spawns the test, so the real margin is a
+/// little less.
 const MARGIN: Duration = Duration::from_secs(5);
 
 /// The least a step is given, so it still reports a timeout of its own.

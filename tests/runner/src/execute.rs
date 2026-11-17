@@ -376,7 +376,7 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
     // can be credentials, never appear in the command (or its errors).
     let log = format!("{guest}/{NEXTEST_LOG}");
     let script = format!(
-        r#"exec >"$0" 2>&1; date -u +%Y-%m-%dT%H:%M:%SZ >{RUN_STARTED_FILE} || true; {}; exec "$@""#,
+        r#"exec >"$0" 2>&1; rm -f {RUN_STARTED_FILE}; date -u +%Y-%m-%dT%H:%M:%SZ >{RUN_STARTED_FILE} || true; {}; exec "$@""#,
         test_env::export_script(test_env::ENV_DIR)
     );
     let mut command = vec!["sh", "-c", &script, &log];

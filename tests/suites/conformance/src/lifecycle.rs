@@ -34,8 +34,8 @@ async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
 
 /// Longer than the supervisor's 30s startup recovery deadline.
 const PAST_RECOVERY_DEADLINE: Duration = Duration::from_secs(31);
-/// The exec's own timeout is the runner's two-minute kill, so fail sooner,
-/// with a message that says which step hung.
+/// The exec's own timeout is longer than the runner's per-test limit, so fail
+/// sooner, with a message that says which step hung.
 const PAST_RECOVERY_EXEC_DEADLINE: Duration = Duration::from_mins(1);
 
 /// An exec admitted before the startup recovery deadline expires keeps

@@ -55,13 +55,12 @@ pub const PASSWORD_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_PASSWORD";
 // The wait runs inside the test, so it must leave room for the test body
 // within the runner's 2-minute per-test budget (`slow-timeout` in
 // tests/runner/src/bundle.rs). Otherwise a slow Keycloak gets the test killed
-// instead of failing with a readiness error. `poll_until` checks the deadline
-// only between attempts, so the wait can last this plus one request
-// (`CURL_MAX_TIME`) and one interval: 87 seconds, leaving 33 for the test.
+// instead of failing with a readiness error. `poll_until` bounds the attempt in
+// flight as well as the retry interval, so the wait lasts this and no more,
+// leaving 45 seconds for the test.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(75);
-/// How long one request to Keycloak may take, in seconds. `poll_until` checks
-/// its deadline only between attempts, so a request to a Keycloak that
-/// accepts connections but stalls must give up on its own.
+/// How long one request to Keycloak may take, in seconds, so a Keycloak that
+/// accepts connections but stalls does not hold one attempt for the whole wait.
 const CURL_MAX_TIME: &str = "10";
 
 /// How to reach the environment's Keycloak realm, and a user in it.
