@@ -17,6 +17,23 @@ import "datamodel.proto";
 // - Public sandbox resource types live in `openshell.proto`.
 // - Internal compute-driver sandbox observation types live in `compute_driver.proto`.
 
+// Immutable ingress envelope admitted from the compute driver's resolved inputs.
+// Presence with an unspecified scope is invalid; it never means legacy support.
+message SandboxIngressAdmission {
+  IngressScope scope = 1;
+  // Mutually exclusive with ports. False with an empty list admits no ports.
+  bool all_ports = 2;
+  repeated uint32 ports = 3;
+}
+
+enum IngressScope {
+  INGRESS_SCOPE_UNSPECIFIED = 0;
+  INGRESS_SCOPE_UNSUPPORTED = 1;
+  INGRESS_SCOPE_ISOLATED_LOOPBACK = 2;
+  // The driver has admitted its operator-controlled shared-host opt-in.
+  INGRESS_SCOPE_SHARED_HOST_LOOPBACK = 3;
+}
+
 // Sandbox security policy configuration.
 message SandboxPolicy {
   // Policy version.

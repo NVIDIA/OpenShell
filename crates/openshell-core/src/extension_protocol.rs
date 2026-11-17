@@ -28,6 +28,8 @@ pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
 /// Optional stopped-state workload configuration updates retaining the resource and storage.
 pub const COMPUTE_UPDATE_SANDBOX_CONFIGURATION: &str =
     "openshell.compute.update-sandbox-configuration";
+/// Immutable per-sandbox forwarding and service exposure admission.
+pub const COMPUTE_INGRESS_ADMISSION: &str = "openshell.compute.ingress-admission";
 
 /// Capability for supervisor middleware that implements HTTP hooks.
 ///
@@ -142,6 +144,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
             supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
             supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
             supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_CONFIGURATION.to_string());
+            supported_capabilities.push(COMPUTE_INGRESS_ADMISSION.to_string());
         }
         ExtensionFamily::SupervisorMiddleware => {
             supported_capabilities.push(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string());

@@ -212,3 +212,9 @@ These helpers use the raw client's authentication slot. They do not perform OIDC
 - Async-only. Tonic is async-native; callers needing a blocking call can wrap
   with their own runtime.
 - The curated surface will grow as more RPCs graduate from `raw`.
+
+## Next minor API migration
+
+Raw `SandboxStatus` adds optional `ingress_admission`, and raw `CreateSandboxRequest` adds `forward_ports`. Compute-driver `ValidateSandboxCreateResponse` also adds optional `ingress_admission`. Complete generated Rust literals must initialize optional descriptors to `None` and ports to an empty vector, or use `..Default::default()`.
+
+Upgrade gateway replicas together. If forwarding reports missing admission after an upgrade, recreate the sandbox with the required service ports.

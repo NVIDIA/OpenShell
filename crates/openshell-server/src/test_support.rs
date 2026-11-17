@@ -143,6 +143,7 @@ pub struct FakeComputeDriver {
 #[derive(Debug)]
 struct FakeComputeDriverState {
     capabilities: GetCapabilitiesResponse,
+    ingress_admission: Option<openshell_core::proto::SandboxIngressAdmission>,
     sandboxes: HashMap<String, DriverSandbox>,
     calls: Vec<FakeComputeDriverCall>,
     traceparents: Vec<String>,
@@ -166,9 +167,19 @@ impl FakeComputeDriver {
     }
 
     #[must_use]
+    pub fn with_ingress_admission(
+        self,
+        admission: Option<openshell_core::proto::SandboxIngressAdmission>,
+    ) -> Self {
+        self.with_state(|state| state.ingress_admission = admission);
+        self
+    }
+
+    #[must_use]
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(FakeComputeDriverState {
+                ingress_admission: None,
                 capabilities: GetCapabilitiesResponse {
                     resource_admission_policy:
                         openshell_core::resource_admission::DriverAdmissionConfig::default()
@@ -235,6 +246,24 @@ impl FakeComputeDriver {
                 .push(openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND.into());
         });
         self
+    }
+
+    pub fn set_ingress_capability(&self, supported: bool) {
+        self.with_state(|state| {
+            let capabilities = &mut state
+                .capabilities
+                .extension
+                .as_mut()
+                .unwrap()
+                .supported_capabilities;
+            capabilities.retain(|capability| {
+                capability != openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION
+            });
+            if supported {
+                capabilities
+                    .push(openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.into());
+            }
+        });
     }
 
     #[must_use]
@@ -440,7 +469,9 @@ impl ComputeDriver for FakeComputeDriver {
                     sandbox: request.sandbox,
                 });
         });
-        Ok(Response::new(ValidateSandboxCreateResponse {}))
+        Ok(Response::new(ValidateSandboxCreateResponse {
+            ingress_admission: self.with_state(|state| state.ingress_admission.clone()),
+        }))
     }
 
     async fn get_sandbox(

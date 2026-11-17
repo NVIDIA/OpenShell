@@ -744,7 +744,7 @@ impl PodmanComputeDriver {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/podman",
                 openshell_core::VERSION,
-                [],
+                [openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.to_string()],
             )),
         })
     }
