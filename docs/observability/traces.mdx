@@ -28,11 +28,11 @@ In the Helm chart, set the table under `gatewayConfig`. The gateway passes the e
 | Gateway requests | One server span for each inbound gRPC or HTTP request. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. |
 | Gateway background work | Reconciliation, driver watches, and credential refresh. These start their own traces because no request supplies a parent. Credential refresh creates a span only when a credential is due or needs cleanup. |
 | Compute drivers | Child spans for each compute-driver operation the gateway performs, from both the gateway's side and the driver's side. |
-| Sandbox supervisors | Supervisor startup, such as loading policy. |
+| Sandbox supervisors | Supervisor startup, such as loading policy, plus inspected HTTP requests and the stages they execute. |
 
 These are OpenShell's own spans. Spans that the agent produces travel separately, through the [agent trace relay](/observability/overview#agent-traces).
 
-Spans for routine or high-volume operations use DEBUG level, and the default INFO level does not export them. These include store operations, health checks, the RPCs that supervisors call on a timer (`GetSandboxConfig` and `ReportProviderReadiness`), and how supervisors handle egress connections. Set the gateway or sandbox log level to `debug` to include them.
+Store operations, health checks, periodic supervisor RPCs (`GetSandboxConfig` and `ReportProviderReadiness`), and connection-level egress diagnostics use DEBUG level. Set the gateway or sandbox log level to `debug` to include them. Inspected HTTP request spans and their executed stage children use INFO level, including allowed requests. Their volume is not limited by the legacy denial-span budgets. See [query and capacity migration](/observability/ocsf-json-export#update-existing-queries) before enabling supervisor trace export.
 
 ## Span Names
 
@@ -43,7 +43,7 @@ Each component names its spans after the operation it performs:
 | Gateway requests | The gRPC service and method, or the HTTP method for other requests | `openshell.v1.OpenShell/CreateSandbox`, `GET` |
 | Gateway background work | The task | `reconcile.sandboxes`, `refresh.provider_credentials` |
 | Compute drivers | The compute-driver RPC, with child spans prefixed by the driver name | `openshell.compute.v1.ComputeDriver/CreateSandbox`, `docker.provision` |
-| Sandbox supervisors | Prefixed with `supervisor.` | `supervisor.startup`, `supervisor.policy.load` |
+| Sandbox supervisors | Lifecycle spans use `supervisor.`; inspected HTTP uses request and stage operation names | `supervisor.startup`, `supervisor.policy.load`, `openshell.http.request`, `openshell.policy.evaluate` |
 
 The gateway's client span and the driver's server span for a compute-driver call share the same name, which also appears in `rpc.method`. Their service names and span kinds tell them apart. A driver watch stream records a terminal status when it observes one. If the gateway stops consuming the stream first, the span status stays unset.
 

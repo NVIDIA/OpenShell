@@ -389,6 +389,7 @@ struct RequestContext {
     origin: RequestOrigin,
     /// Set once a handler has emitted the request's authorization denial.
     denied: Arc<AtomicBool>,
+    mutation: Arc<Mutex<Mutation>>,
 }
 
 impl RequestContext {
@@ -397,8 +398,44 @@ impl RequestContext {
             path,
             origin,
             denied: Arc::default(),
+            mutation: Arc::default(),
         }
     }
+}
+
+/// What a state-changing request acted on and, when it succeeded without a
+/// plain change, how it ended.
+#[derive(Debug, Default)]
+struct Mutation {
+    resources: Vec<ResourceDetails>,
+    outcome: Option<&'static str>,
+}
+
+/// Record that the current request's change acts on `resource`.
+pub fn record_target(resource: ResourceDetails) {
+    let _ = REQUEST.try_with(|request| {
+        lock(&request.mutation).resources.push(resource);
+    });
+}
+
+/// Change the resources recorded for the current request.
+pub fn amend_targets(amend: impl FnOnce(&mut Vec<ResourceDetails>)) {
+    let _ = REQUEST.try_with(|request| amend(&mut lock(&request.mutation).resources));
+}
+
+/// Record how the current request's change ended when it succeeded without
+/// a plain change, such as `no_op:already_absent`.
+pub fn record_outcome(outcome: &'static str) {
+    let _ = REQUEST.try_with(|request| lock(&request.mutation).outcome = Some(outcome));
+}
+
+/// A resource of `type_label` named by the caller, bounded in length.
+pub fn requested(type_label: &str, name: &str) -> ResourceDetails {
+    ResourceDetails::named(type_label, bounded(name))
+}
+
+fn lock(mutation: &Mutex<Mutation>) -> std::sync::MutexGuard<'_, Mutation> {
+    mutation.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Run a request handler so the authorization denials it raises are
@@ -485,12 +522,7 @@ impl PendingMutation {
         if !std::mem::replace(&mut self.recorded, true)
             && !self.request.denied.load(Ordering::Relaxed)
         {
-            emit_mutation(
-                &self.request.path,
-                &self.request.origin,
-                &self.principal,
-                code,
-            );
+            emit_mutation(&self.request, &self.principal, code);
         }
     }
 }
@@ -685,11 +717,17 @@ fn principal_user(principal: &Principal) -> User {
     }
 }
 
-/// Emit an authorization denial raised by a handler for the current request.
+/// Emit an authorization denial raised by a handler for the current request,
+/// naming the targets the request recorded.
 pub fn emit_authorization_denial(principal: &Principal, denial: AuthzDenial<'_>) {
     let (path, origin) = current_request();
-    let _ = REQUEST.try_with(|request| request.denied.store(true, Ordering::Relaxed));
-    emit_authorization_denial_for(&path, &origin, principal, denial);
+    let targets = REQUEST
+        .try_with(|request| {
+            request.denied.store(true, Ordering::Relaxed);
+            lock(&request.mutation).resources.clone()
+        })
+        .unwrap_or_default();
+    emit_denial(&path, &origin, principal, denial, targets);
 }
 
 /// Emit an authorization denial raised by a handler for the current request,
@@ -707,6 +745,16 @@ pub fn emit_authorization_denial_for(
     principal: &Principal,
     denial: AuthzDenial<'_>,
 ) {
+    emit_denial(path, origin, principal, denial, Vec::new());
+}
+
+fn emit_denial(
+    path: &str,
+    origin: &RequestOrigin,
+    principal: &Principal,
+    denial: AuthzDenial<'_>,
+    mut resources: Vec<ResourceDetails>,
+) {
     let ctx = crate::gateway_ocsf::context("", "");
     let category = denial.category();
     let finding = denial.is_boundary_violation(principal);
@@ -723,7 +771,10 @@ pub fn emit_authorization_denial_for(
         .status(StatusId::Failure)
         .status_detail(category)
         .message(format!("authorization denied: {category}"));
-    if let Some(resource) = denial.resource() {
+    if let Some(resource) = denial.resource().filter(|r| !resources.contains(r)) {
+        resources.push(resource);
+    }
+    for resource in resources {
         builder = builder.resource(resource);
     }
     if let Some(uid) = &correlation_uid {
@@ -994,19 +1045,30 @@ fn api_activity<'a>(
 
 /// Emit the record of a mutation that ended with `code`, or that never
 /// finished when `code` is `None`.
-fn emit_mutation(path: &str, origin: &RequestOrigin, principal: &Principal, code: Option<Code>) {
+fn emit_mutation(request: &RequestContext, principal: &Principal, code: Option<Code>) {
+    let RequestContext { path, origin, .. } = request;
+    let mutation = std::mem::take(&mut *lock(&request.mutation));
     let ctx = crate::gateway_ocsf::context("", "");
-    let builder = api_activity(&ctx, path, origin, principal);
-    let mut builder = match code.map(failure) {
+    let mut builder = api_activity(&ctx, path, origin, principal);
+    for resource in mutation.resources {
+        builder = builder.resource(resource);
+    }
+    builder = match code.map(failure) {
         None => builder
             .severity(SeverityId::Medium)
             .status(StatusId::Unknown)
             .message("mutation did not finish")
             .status_detail("unknown:cancelled"),
-        Some(None) => builder
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .message("mutation succeeded"),
+        Some(None) => {
+            builder = builder
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .message("mutation succeeded");
+            match mutation.outcome {
+                Some(outcome) => builder.status_detail(outcome),
+                None => builder,
+            }
+        }
         Some(Some(failure)) => builder
             .severity(if failure.starts_with("rejected:") {
                 SeverityId::Low

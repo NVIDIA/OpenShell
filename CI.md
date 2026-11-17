@@ -201,6 +201,10 @@ The GitHub ruleset should require the `OpenShell / ...` statuses published by
 `Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
 push-triggered workflow jobs themselves.
 
+### E2E and dev release concurrency
+
+`Release Dev` serializes push and manual runs in the `release-dev` concurrency group. The active run finishes qualification and publication; new arrivals replace the pending run. It passes `cancel-in-progress: false` to E2E Suites; other callers retain the default `true`. Keep the complete dev workflow serialized so E2E families cannot replace pending candidates independently and dev publishers cannot overlap.
+
 ### K3s conformance version baseline
 
 The `ubuntu-k3s` conformance lanes pin Agent Sandbox v0.5.0 as the
