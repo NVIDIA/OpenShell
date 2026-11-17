@@ -292,10 +292,16 @@ struct CaptureHealth {
     /// Records rejected by the bounded callback queue. A non-zero value means
     /// the OCSF audit trail has a coverage gap.
     dropped_events: AtomicU64,
-    /// Events that reached the consumer but could not be attributed to any
-    /// sandbox before they aged out (or the holding buffer overflowed). A
-    /// non-zero value is an audit coverage gap just like `dropped_events`.
+    /// Audited events that reached the consumer and could not be attributed to any
+    /// sandbox before they aged out (or the holding buffer overflowed), while this
+    /// gateway had a live sandbox. The provider is system-wide, so some may belong
+    /// to another gateway: a non-zero value is possible audit loss, not a confirmed
+    /// gap like `dropped_events`.
     unattributed_events: AtomicU64,
+    /// Audited events that aged out while this gateway had no live sandbox. They
+    /// cannot belong to this gateway (another gateway or another consumer of the
+    /// system-wide provider emitted them), so they are counted but never warned about.
+    unowned_events: AtomicU64,
     /// Approximate owned bytes currently waiting in the callback queue.
     queued_bytes: AtomicUsize,
     /// Largest observed value of `queued_bytes`, retained for diagnostics.
@@ -346,9 +352,11 @@ impl OverloadReporter {
     }
 }
 
-/// Rate-limited warning for events that arrived but could not be attributed to a
-/// sandbox. Without it such events vanish at `debug` level and the audit trail is
-/// silently empty.
+/// Rate-limited warning for events that arrived while this gateway had a live
+/// sandbox but could not be attributed to one. The provider is system-wide, so
+/// these may be another gateway's or consumer's traffic: the warning reports
+/// possible loss, never a confirmed gap. Without it such events vanish at `debug`
+/// level and a genuinely empty audit trail would go unnoticed.
 #[derive(Default)]
 struct UnattributedReporter {
     last_reported: u64,
@@ -376,8 +384,9 @@ impl UnattributedReporter {
             target: "mxc_etw",
             unattributed_events = total,
             since_last_warning,
-            "MXC ETW audit events could not be attributed to any sandbox and were dropped; \
-             audit coverage has a gap"
+            "MXC ETW audit events arrived while this gateway had live sandboxes but could not \
+             be attributed to any of them; they may belong to another gateway or provider \
+             consumer, but if audit rows for this gateway's sandboxes are missing, this is why"
         );
         true
     }
@@ -427,9 +436,18 @@ impl EtwSession {
         self.health.dropped_events.load(Ordering::Relaxed)
     }
 
-    /// Events received from the provider that were never attributed to a sandbox.
+    /// Audited events that were never attributed to a sandbox although this
+    /// gateway had a live sandbox while they were waiting. They may belong to
+    /// another gateway or consumer of the system-wide provider, so this is an
+    /// upper bound on this gateway's audit loss, not a confirmed gap.
     pub fn unattributed_event_count(&self) -> u64 {
         self.health.unattributed_events.load(Ordering::Relaxed)
+    }
+
+    /// Audited events that aged out while this gateway had no live sandbox, which
+    /// therefore cannot be this gateway's own audit loss.
+    pub fn unowned_event_count(&self) -> u64 {
+        self.health.unowned_events.load(Ordering::Relaxed)
     }
 }
 
@@ -516,14 +534,15 @@ pub(crate) fn start_session(
                         unattributed_reporter.report_if_due(&consumer_health, false);
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // Replay and account for everything still waiting *before*
+                        // the forced warnings, so they report every loss.
+                        processor.finish();
                         overload_reporter.report_if_due(&consumer_health, true);
                         unattributed_reporter.report_if_due(&consumer_health, true);
                         break;
                     }
                 }
             }
-            // Final drain on shutdown so anything still resolvable is emitted.
-            processor.drain_and_emit();
         })
         .map_err(|e| {
             stop_session(handle, &session_name);
@@ -1241,6 +1260,11 @@ fn format_property_value(
 struct PendingEvent {
     at: Instant,
     ev: DecodedEtwEvent,
+    /// For `ProcessLaunched`: the launched process's parent as seen when the event
+    /// was first received. A replay must not look the PID up again, because by then
+    /// the launched process may have exited and its PID been reused by another
+    /// sandbox's child, which would hand this event to that sandbox.
+    launch_parent: Option<ParentIdentity>,
 }
 
 /// Max number of unattributed events buffered at once (memory bound). The
@@ -1320,6 +1344,7 @@ fn process_start_key_from_handle(handle: HANDLE, expected_pid: u32) -> Result<u6
 
 /// A process's parent as it is right now: the parent PID and, when the parent is
 /// still reachable, its kernel generation key.
+#[derive(Clone)]
 pub(crate) struct ParentIdentity {
     pub pid: u32,
     pub start_key: Option<u64>,
@@ -1409,6 +1434,11 @@ pub(crate) struct AttributionIndex {
     /// Events discarded without ever being attributed, not yet added to the
     /// session's health counter (see [`AttributionIndex::take_unattributed_drops`]).
     unattributed_dropped: u64,
+    /// Audited events discarded while this gateway had no live sandbox.
+    unowned_dropped: u64,
+    /// Last time a sandbox of this gateway was registered or retired, so an event
+    /// that waited while one was live is not classed as foreign traffic.
+    last_live: Option<Instant>,
     /// Overrides the real parent lookup (tests only).
     parent_lookup: Option<ParentLookup>,
 }
@@ -1430,6 +1460,7 @@ impl AttributionIndex {
         process_start_key: u64,
     ) {
         let now = Instant::now();
+        self.last_live = Some(now);
         self.purge_expired_retirements(now);
         let previous = self.by_pid.remove(&wxc_pid);
 
@@ -1483,6 +1514,7 @@ impl AttributionIndex {
         }
 
         let now = Instant::now();
+        self.last_live = Some(now);
         self.by_pid.remove(&wxc_pid);
         if !self
             .by_pid
@@ -1502,6 +1534,9 @@ impl AttributionIndex {
 
     /// Drop all keys for a finished sandbox to bound memory.
     pub fn forget(&mut self, sandbox_id: &str) {
+        // The driver can forget a sandbox without retiring it first. Record that one
+        // was live, so an event that waited alongside it is not classed as foreign.
+        self.last_live = Some(Instant::now());
         self.by_pid
             .retain(|_, registration| registration.sid != sandbox_id);
         self.by_identity.retain(|_, v| v != sandbox_id);
@@ -1556,7 +1591,20 @@ impl AttributionIndex {
     /// Strong per-sandbox correlators take precedence over PID. A PID match is
     /// accepted only when ETW's process start key equals the key queried from
     /// the live driver-owned child handle.
+    #[cfg(test)]
     fn resolve(&mut self, ev: &DecodedEtwEvent) -> Option<String> {
+        let launch_parent = self.launch_parent(ev);
+        self.resolve_with(ev, launch_parent.as_ref())
+    }
+
+    /// [`Self::resolve`] with the launched process's parent already captured (see
+    /// [`PendingEvent::launch_parent`]); a replay passes the snapshot taken when the
+    /// event first arrived instead of looking the PID up again.
+    fn resolve_with(
+        &mut self,
+        ev: &DecodedEtwEvent,
+        launch_parent: Option<&ParentIdentity>,
+    ) -> Option<String> {
         self.purge_expired_retirements(Instant::now());
         let identity = ev.identity();
         let cv = ev.cv_base();
@@ -1576,7 +1624,7 @@ impl AttributionIndex {
                     (ev.process_start_key == Some(r.process_start_key)).then(|| r.sid.clone())
                 })
             })
-            .or_else(|| self.resolve_by_launch_ancestry(ev))?;
+            .or_else(|| self.resolve_by_launch_ancestry(launch_parent))?;
 
         self.cross_link(&sid, identity, cv, activity);
         Some(sid)
@@ -1593,31 +1641,72 @@ impl AttributionIndex {
     /// recycled PID cannot hijack the attribution. Resolving this one event
     /// cross-links its activity id, and the rest of the burst follows through the
     /// identity/activity/CV correlators.
-    fn resolve_by_launch_ancestry(&self, ev: &DecodedEtwEvent) -> Option<String> {
-        if ev.event_name.as_deref() != Some("ProcessLaunched") {
-            return None;
-        }
-        let launched: u32 = ev.get("processId")?.trim().parse().ok()?;
-        let parent = self
-            .parent_lookup
-            .as_ref()
-            .map_or_else(|| live_parent_of(launched), |lookup| lookup(launched))?;
+    fn resolve_by_launch_ancestry(&self, parent: Option<&ParentIdentity>) -> Option<String> {
+        let parent = parent?;
         let registration = self.by_pid.get(&parent.pid)?;
         (parent.start_key == Some(registration.process_start_key)).then(|| registration.sid.clone())
     }
 
+    /// The parent of the process a `ProcessLaunched` event names, read now. This
+    /// must be called when the event is first received and the result kept with the
+    /// event: the launched process can exit before a queued event is replayed, and
+    /// its PID can then be reused by a child of another sandbox, so a later lookup
+    /// would attribute this event to that sandbox. `None` for any other event, or
+    /// when the launched process is already gone (nothing can then be proven).
+    fn launch_parent(&self, ev: &DecodedEtwEvent) -> Option<ParentIdentity> {
+        if ev.event_name.as_deref() != Some("ProcessLaunched") {
+            return None;
+        }
+        let launched: u32 = ev.get("processId")?.trim().parse().ok()?;
+        self.parent_lookup
+            .as_ref()
+            .map_or_else(|| live_parent_of(launched), |lookup| lookup(launched))
+    }
+
     /// Record that `ev` is being discarded without ever being attributed. Only
     /// events that would have been written to the audit trail count as a gap.
-    fn note_unattributed_drop(&mut self, ev: &DecodedEtwEvent, why: &str) {
+    ///
+    /// The provider is system-wide, so an unresolved event is not necessarily this
+    /// gateway's. It counts as possible loss only if this gateway had a live
+    /// sandbox at some point while the event waited (`since` is when it arrived);
+    /// otherwise it is foreign traffic and is counted separately.
+    fn note_unattributed_drop(&mut self, ev: &DecodedEtwEvent, since: Instant, why: &str) {
         if is_audited_event(ev.event_name.as_deref()) {
-            self.unattributed_dropped += 1;
+            if self.had_live_sandbox_since(since) {
+                self.unattributed_dropped += 1;
+            } else {
+                self.unowned_dropped += 1;
+            }
         }
         tracing::debug!(target: "mxc_etw", pid = ev.process_id, "dropping unattributed ({why}) {}", ev.summary());
     }
 
-    /// Events dropped without attribution since the last call.
+    /// Whether a sandbox of this gateway was live at any time since `since`.
+    ///
+    /// `last_live` is stamped on every register, retire and forget, so a sandbox that
+    /// came and went while the event waited still counts.
+    fn had_live_sandbox_since(&self, since: Instant) -> bool {
+        !self.by_pid.is_empty()
+            || !self.retired_sandboxes.is_empty()
+            || self.last_live.is_some_and(|at| at >= since)
+    }
+
+    /// Possible-loss events dropped without attribution since the last call.
     fn take_unattributed_drops(&mut self) -> u64 {
         std::mem::take(&mut self.unattributed_dropped)
+    }
+
+    /// Foreign-traffic events dropped without attribution since the last call.
+    fn take_unowned_drops(&mut self) -> u64 {
+        std::mem::take(&mut self.unowned_dropped)
+    }
+
+    /// Give up on everything still waiting (the session is ending): no later event
+    /// can attribute it, so account for it now instead of losing it silently.
+    fn expire_all_pending(&mut self) {
+        for p in std::mem::take(&mut self.pending) {
+            self.note_unattributed_drop(&p.ev, p.at, "session ended");
+        }
     }
 
     /// Cross-link the strong keys an event carries to its resolved `sandbox_id`
@@ -1642,13 +1731,13 @@ impl AttributionIndex {
 
     /// Hold an event that didn't resolve yet, evicting expired and (if needed)
     /// oldest entries first so the buffer stays bounded.
-    fn buffer_unresolved(&mut self, ev: DecodedEtwEvent) {
+    fn buffer_unresolved(&mut self, ev: DecodedEtwEvent, launch_parent: Option<ParentIdentity>) {
         let now = Instant::now();
         while let Some(front) = self.pending.front() {
             if now.duration_since(front.at) > PENDING_TTL {
                 let stale = self.pending.pop_front();
                 if let Some(p) = stale {
-                    self.note_unattributed_drop(&p.ev, "aged out");
+                    self.note_unattributed_drop(&p.ev, p.at, "aged out");
                 }
             } else {
                 break;
@@ -1657,9 +1746,13 @@ impl AttributionIndex {
         if self.pending.len() >= PENDING_MAX
             && let Some(p) = self.pending.pop_front()
         {
-            self.note_unattributed_drop(&p.ev, "buffer full");
+            self.note_unattributed_drop(&p.ev, p.at, "buffer full");
         }
-        self.pending.push_back(PendingEvent { at: now, ev });
+        self.pending.push_back(PendingEvent {
+            at: now,
+            ev,
+            launch_parent,
+        });
     }
 
     /// Re-resolve buffered events. Returns those that now attribute (removed
@@ -1681,10 +1774,10 @@ impl AttributionIndex {
             let mut keep = VecDeque::with_capacity(drained.len());
             for p in drained {
                 if now.duration_since(p.at) > PENDING_TTL {
-                    self.note_unattributed_drop(&p.ev, "aged out");
+                    self.note_unattributed_drop(&p.ev, p.at, "aged out");
                     continue;
                 }
-                match self.resolve(&p.ev) {
+                match self.resolve_with(&p.ev, p.launch_parent.as_ref()) {
                     Some(sid) => {
                         let name = self.name_of(&sid);
                         ready.push((sid, name, p.ev));
@@ -1758,6 +1851,12 @@ impl EtwEventProcessor {
                 .unattributed_events
                 .fetch_add(dropped, Ordering::Relaxed);
         }
+        let unowned = idx.take_unowned_drops();
+        if unowned > 0 {
+            self.health
+                .unowned_events
+                .fetch_add(unowned, Ordering::Relaxed);
+        }
     }
 
     /// Attribute one decoded event and emit an OCSF row for mapped classes.
@@ -1774,7 +1873,10 @@ impl EtwEventProcessor {
                 .index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(sid) = idx.resolve(&ev) {
+            // Read the launched process's parent once, now, and keep it with the event
+            // if it has to wait (see `PendingEvent::launch_parent`).
+            let launch_parent = idx.launch_parent(&ev);
+            if let Some(sid) = idx.resolve_with(&ev, launch_parent.as_ref()) {
                 let name = idx.name_of(&sid);
                 Some((sid, name, ev))
             } else {
@@ -1785,7 +1887,7 @@ impl EtwEventProcessor {
                 tracing::debug!(target: "mxc_etw", pid = ev.process_id,
                     process_start_key = ?ev.process_start_key,
                     "buffering uncorrelated MXC audit event");
-                idx.buffer_unresolved(ev);
+                idx.buffer_unresolved(ev, launch_parent);
                 self.publish_unattributed_drops(&mut idx);
                 None
             }
@@ -1807,6 +1909,25 @@ impl EtwEventProcessor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let ready = idx.drain_resolved();
+            self.publish_unattributed_drops(&mut idx);
+            ready
+        };
+        for (sandbox_id, sandbox_name, ev) in ready {
+            self.emit_resolved(&sandbox_id, &sandbox_name, &ev);
+        }
+    }
+
+    /// The session has ended. Replay what is waiting once more, then account for
+    /// whatever is still unresolved (no later event can attribute it) and publish
+    /// the count, so the final warning reflects every loss.
+    fn finish(&self) {
+        let ready = {
+            let mut idx = self
+                .index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ready = idx.drain_resolved();
+            idx.expire_all_pending();
             self.publish_unattributed_drops(&mut idx);
             ready
         };
@@ -2455,7 +2576,7 @@ mod tests {
 
         // Arrives before registration → unresolved → buffered, not dropped.
         assert!(idx.resolve(&ev).is_none());
-        idx.buffer_unresolved(ev);
+        idx.buffer_unresolved(ev, None);
         assert!(
             idx.drain_resolved().is_empty(),
             "nothing to drain pre-registration"
@@ -2481,7 +2602,7 @@ mod tests {
     fn pending_buffer_is_bounded() {
         let mut idx = AttributionIndex::new();
         for pid in 0..(PENDING_MAX as u32 + 50) {
-            idx.buffer_unresolved(mk_event(pid, "SandboxConfig"));
+            idx.buffer_unresolved(mk_event(pid, "SandboxConfig"), None);
         }
         assert!(
             idx.pending.len() <= PENDING_MAX,
@@ -2545,7 +2666,7 @@ mod tests {
             .props
             .push(("identity".into(), "new-generation".into()));
         assert!(idx.resolve(&queued_new).is_none());
-        idx.buffer_unresolved(queued_new.clone());
+        idx.buffer_unresolved(queued_new.clone(), None);
 
         idx.register_launch("sbx-new", "new", 1000, 200);
 
@@ -2683,7 +2804,7 @@ mod tests {
         event_b.props.push(("identity".into(), "identity-B".into()));
 
         assert!(idx.resolve(&event_b).is_none());
-        idx.buffer_unresolved(event_b);
+        idx.buffer_unresolved(event_b, None);
         idx.pending.back_mut().expect("buffered event").at = Instant::now()
             .checked_sub(Duration::from_secs(3))
             .expect("test duration is shorter than the monotonic clock epoch");
@@ -2918,7 +3039,7 @@ mod tests {
         let (anchor, rest) = burst.split_last().expect("burst");
         for ev in rest {
             assert!(idx.resolve(ev).is_none(), "{} resolved early", ev.summary());
-            idx.buffer_unresolved(ev.clone());
+            idx.buffer_unresolved(ev.clone(), None);
         }
         assert_eq!(idx.pending.len(), rest.len());
 
@@ -2969,7 +3090,7 @@ mod tests {
         let link_e = broker_event("E", 0x2, &[]);
         for ev in [&link_e, &link_c_late, &link_c, &link_b] {
             assert!(idx.resolve(ev).is_none());
-            idx.buffer_unresolved(ev.clone());
+            idx.buffer_unresolved(ev.clone(), None);
         }
         assert_eq!(idx.resolve(&anchor).as_deref(), Some("sbx-1"));
         let ready = idx.drain_resolved();
@@ -2984,9 +3105,10 @@ mod tests {
     #[test]
     fn unattributed_events_are_counted_when_they_age_out() {
         let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-live", "live", 100, 1000);
         let mut stale = mk_event(1, "SandboxConfig");
         stale.process_start_key = None;
-        idx.buffer_unresolved(stale);
+        idx.buffer_unresolved(stale, None);
         // Age the buffered event past the TTL.
         for p in &mut idx.pending {
             p.at = aged_out();
@@ -3007,7 +3129,7 @@ mod tests {
         let mut idx = AttributionIndex::new();
         let mut stray = mk_event(1, "BrokeredCreateProcessLaunchResult");
         stray.process_start_key = None;
-        idx.buffer_unresolved(stray);
+        idx.buffer_unresolved(stray, None);
         for p in &mut idx.pending {
             p.at = aged_out();
         }
@@ -3035,8 +3157,9 @@ mod tests {
     #[test]
     fn unattributed_events_are_counted_when_the_buffer_overflows() {
         let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-live", "live", 100, 1000);
         for pid in 0..(PENDING_MAX as u32 + 5) {
-            idx.buffer_unresolved(mk_event(pid, "SandboxConfig"));
+            idx.buffer_unresolved(mk_event(pid, "SandboxConfig"), None);
         }
         assert_eq!(idx.take_unattributed_drops(), 5);
     }
@@ -3049,9 +3172,10 @@ mod tests {
 
         {
             let mut idx = index.lock().unwrap();
+            idx.register_launch("sbx-live", "live", 100, 1000);
             let mut stale = mk_event(1, "SandboxConfig");
             stale.process_start_key = None;
-            idx.buffer_unresolved(stale);
+            idx.buffer_unresolved(stale, None);
             for p in &mut idx.pending {
                 p.at = aged_out();
             }
@@ -3059,6 +3183,173 @@ mod tests {
         processor.drain_and_emit();
 
         assert_eq!(health.unattributed_events.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_reused_child_pid_cannot_hand_a_queued_launch_to_another_sandbox() {
+        // Sandbox A's child (pid 777) launches while A is not registered yet, so the
+        // event waits. By replay time the child has exited and Windows gave pid 777 to
+        // a child of sandbox B (parent 200). Only the parent seen when the event first
+        // arrived may decide the owner.
+        let parents = Arc::new(Mutex::new((100_u32, 1000_u64)));
+        let mut idx = AttributionIndex::new();
+        let table = parents.clone();
+        idx.parent_lookup = Some(Box::new(move |_child| {
+            let (pid, key) = *table.lock().unwrap();
+            Some(ParentIdentity {
+                pid,
+                start_key: Some(key),
+            })
+        }));
+
+        let a_launch = launched(0xA1, 777);
+        let snapshot = idx.launch_parent(&a_launch);
+        assert!(idx.resolve_with(&a_launch, snapshot.as_ref()).is_none());
+        idx.buffer_unresolved(a_launch.clone(), snapshot);
+
+        // A is gone for good; pid 777 now belongs to B's child.
+        *parents.lock().unwrap() = (200, 2000);
+        idx.register_launch("sbx-B", "b", 200, 2000);
+
+        assert!(
+            idx.drain_resolved().is_empty(),
+            "the queued launch named A's child and must not be attributed to B"
+        );
+        assert!(
+            idx.resolve(&broker_event("SandboxConfig", 0xA1, &[]))
+                .is_none(),
+            "A's activity id must not have been linked to B"
+        );
+    }
+
+    #[test]
+    fn a_queued_launch_still_attributes_to_its_own_sandbox_once_registered() {
+        let mut idx = index_with_parents(&[(777, 100, Some(1000))]);
+        let launch = launched(0xA1, 777);
+        let snapshot = idx.launch_parent(&launch);
+        assert!(idx.resolve_with(&launch, snapshot.as_ref()).is_none());
+        idx.buffer_unresolved(launch, snapshot);
+
+        idx.register_launch("sbx-A", "a", 100, 1000);
+        let ready = idx.drain_resolved();
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, "sbx-A");
+    }
+
+    #[test]
+    fn a_launch_whose_child_is_already_gone_when_received_is_not_attributed() {
+        let mut idx = index_with_parents(&[]);
+        idx.register_launch("sbx-A", "a", 100, 1000);
+        let launch = launched(0xA1, 777);
+
+        assert!(idx.launch_parent(&launch).is_none());
+        assert!(idx.resolve(&launch).is_none());
+    }
+
+    #[test]
+    fn events_seen_while_the_gateway_has_no_sandbox_are_foreign_not_lost() {
+        // An idle gateway receiving another gateway's audited events.
+        let mut idx = AttributionIndex::new();
+        let mut other = mk_event(1, "SandboxConfig");
+        other.process_start_key = None;
+        idx.buffer_unresolved(other, None);
+        for p in &mut idx.pending {
+            p.at = aged_out();
+        }
+        assert!(idx.drain_resolved().is_empty());
+
+        assert_eq!(idx.take_unattributed_drops(), 0, "not this gateway's loss");
+        assert_eq!(idx.take_unowned_drops(), 1, "but still counted as foreign");
+    }
+
+    #[test]
+    fn an_event_that_waited_while_a_sandbox_registered_is_possible_loss() {
+        let mut idx = AttributionIndex::new();
+        let mut early = mk_event(1, "SandboxConfig");
+        early.process_start_key = None;
+        idx.buffer_unresolved(early, None);
+        // The sandbox registers and ends again while the event waits; by the time it
+        // ages out nothing is live, but the event did wait alongside a live sandbox.
+        idx.register_launch("sbx-1", "one", 100, 1000);
+        idx.retire_launch("sbx-1", 100);
+        idx.forget("sbx-1");
+        for p in &mut idx.pending {
+            p.at = aged_out();
+        }
+        assert!(idx.drain_resolved().is_empty());
+
+        assert_eq!(idx.take_unattributed_drops(), 1);
+        assert_eq!(idx.take_unowned_drops(), 0);
+    }
+
+    #[test]
+    fn an_event_that_waited_while_a_sandbox_was_forgotten_is_possible_loss() {
+        // The driver deletes a sandbox with `forget` and no prior `retire_launch`.
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "one", 100, 1000);
+        let mut early = mk_event(1, "SandboxConfig");
+        early.process_start_key = None;
+        idx.buffer_unresolved(early, None);
+        idx.forget("sbx-1");
+        for p in &mut idx.pending {
+            p.at = aged_out();
+        }
+        assert!(idx.drain_resolved().is_empty());
+
+        assert_eq!(idx.take_unattributed_drops(), 1);
+        assert_eq!(idx.take_unowned_drops(), 0);
+    }
+
+    #[test]
+    fn shutdown_accounts_for_a_fresh_unresolved_event_before_the_final_warning() {
+        let health = Arc::new(CaptureHealth::default());
+        let index = Arc::new(Mutex::new(AttributionIndex::new()));
+        let processor = EtwEventProcessor::new(index.clone(), health.clone(), "gw".to_string());
+        {
+            let mut idx = index.lock().unwrap();
+            idx.register_launch("sbx-live", "live", 100, 1000);
+        }
+        // A fresh audited event nothing can attribute: younger than PENDING_TTL, so a
+        // normal drain keeps it waiting.
+        let mut fresh = mk_event(1, "SandboxConfig");
+        fresh.process_start_key = None;
+        processor.process_event(fresh);
+        processor.drain_and_emit();
+        assert_eq!(health.unattributed_events.load(Ordering::Relaxed), 0);
+
+        processor.finish();
+
+        assert_eq!(
+            health.unattributed_events.load(Ordering::Relaxed),
+            1,
+            "the event still waiting at shutdown must be counted"
+        );
+        let mut reporter = UnattributedReporter::default();
+        assert!(
+            reporter.report_if_due(&health, true),
+            "the forced warning must see the count"
+        );
+        assert!(index.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn shutdown_still_emits_an_event_that_resolves_on_the_final_replay() {
+        let health = Arc::new(CaptureHealth::default());
+        let index = Arc::new(Mutex::new(AttributionIndex::new()));
+        let processor = EtwEventProcessor::new(index.clone(), health.clone(), "gw".to_string());
+        let mut early = mk_event(4242, "SandboxConfig");
+        early.process_start_key = Some(7);
+        processor.process_event(early);
+        index
+            .lock()
+            .unwrap()
+            .register_launch("sbx-1", "one", 4242, 7);
+
+        processor.finish();
+
+        assert_eq!(health.unattributed_events.load(Ordering::Relaxed), 0);
+        assert_eq!(health.unowned_events.load(Ordering::Relaxed), 0);
     }
 
     #[test]
