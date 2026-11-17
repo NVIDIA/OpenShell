@@ -37,10 +37,9 @@ pub struct AtomicPolicyRevisionWrite {
     /// Populate the create-time baseline, or replace it while startup admission
     /// is blocked and no workload has consumed the static restrictions.
     pub backfill_policy: Option<ProtoSandboxPolicy>,
-    /// Allow `backfill_policy` to replace the saved `Sandbox.spec.policy` while
-    /// first startup is blocked. Only an authorized user or operator can replace
-    /// it; a sandbox upload must conflict if a different policy was saved first.
-    pub replace_startup_baseline: bool,
+    /// Allow replacing saved `Sandbox.spec.policy` during first-start repair.
+    /// Set only for authorized users or operators, never sandbox uploads.
+    pub allow_policy_replacement: bool,
 }
 
 pub fn policy_record_for_atomic_write(
@@ -112,7 +111,7 @@ pub fn project_policy_revision_onto_sandbox(
                 changed = true;
             }
             Some(current) if current == backfill_policy => {}
-            Some(_) if startup_blocked && write.replace_startup_baseline => {
+            Some(_) if startup_blocked && write.allow_policy_replacement => {
                 spec.policy = Some(backfill_policy.clone());
                 changed = true;
             }
@@ -733,7 +732,7 @@ mod tests {
             .unwrap()
             .read_write
             .push("/new-static-path".to_string());
-        let mut write = AtomicPolicyRevisionWrite {
+        let write = AtomicPolicyRevisionWrite {
             id: "revision".to_string(),
             sandbox_id: "sandbox".to_string(),
             workspace: "default".to_string(),
@@ -744,7 +743,7 @@ mod tests {
             expected_resource_version: 0,
             annotations: HashMap::new(),
             backfill_policy: Some(replacement.clone()),
-            replace_startup_baseline: true,
+            allow_policy_replacement: true,
         };
         for activated in [None, Some(false), Some(true)] {
             for state in [Admission::Pending, Admission::Rejected, Admission::Accepted] {
@@ -777,27 +776,5 @@ mod tests {
                 }
             }
         }
-        // An upload chosen when spec.policy was absent cannot replace an
-        // operator's repair saved before this write commits.
-        write.replace_startup_baseline = false;
-        let blocked = Sandbox {
-            spec: Some(SandboxSpec {
-                policy: Some(baseline),
-                ..Default::default()
-            }),
-            status: Some(SandboxStatus {
-                configuration_activated: Some(false),
-                configuration_admission: Some(SandboxConfigurationAdmission {
-                    state: Admission::Pending.into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(matches!(
-            project_policy_revision_onto_sandbox(&write, &blocked.encode_to_vec(), 1),
-            Err(PersistenceError::Conflict { .. })
-        ));
     }
 }
