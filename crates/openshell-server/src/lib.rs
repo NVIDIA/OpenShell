@@ -703,7 +703,7 @@ fn derive_peer_endpoint(config: &Config) -> Option<String> {
     if let Ok(endpoint) = std::env::var("OPENSHELL_PEER_ENDPOINT")
         && !endpoint.trim().is_empty()
     {
-        return Some(endpoint.trim().to_string());
+        return Some(bracket_ipv6_host(endpoint.trim()));
     }
 
     let pod_name = std::env::var("OPENSHELL_POD_NAME").ok()?;
@@ -725,6 +725,22 @@ fn derive_peer_endpoint(config: &Config) -> Option<String> {
         namespace = namespace.trim(),
         port = config.bind_address.port()
     ))
+}
+
+/// The chart renders `$(OPENSHELL_POD_IP)` into the endpoint without brackets.
+fn bracket_ipv6_host(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_string();
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    match authority.rsplit_once(':') {
+        Some((host, port))
+            if host.parse::<std::net::Ipv6Addr>().is_ok() && port.parse::<u16>().is_ok() =>
+        {
+            format!("{scheme}://[{host}]:{port}{path}")
+        }
+        _ => endpoint.to_string(),
+    }
 }
 
 /// Reject a plaintext peer endpoint on a gateway that serves TLS.
@@ -2616,7 +2632,7 @@ mod tests {
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
         MetricsTlsHandshakeLogLimiter, MetricsTlsHandshakeLogLimiters, MultiplexService,
         ServerState, TlsAcceptor, allow_plaintext_service_http, bind_gateway_listener,
-        classify_initial_bytes, configured_compute_driver, extension_token_ttl,
+        bracket_ipv6_host, classify_initial_bytes, configured_compute_driver, extension_token_ttl,
         is_benign_tls_handshake_failure, log_metrics_tls_handshake_rejection,
         log_metrics_tls_handshake_timeout, metrics_tls_acceptor_or_disable,
         mint_gateway_extension_credential, serve_gateway_listener, serve_tls_metrics_listener,
@@ -2728,6 +2744,25 @@ mod tests {
         )
         .expect("failed to write test client key");
         (cert_path, key_path)
+    }
+
+    #[test]
+    fn peer_endpoint_brackets_only_unbracketed_ipv6_hosts() {
+        for (input, expected) in [
+            (
+                "http://fd00:10:244::16:8080",
+                "http://[fd00:10:244::16]:8080",
+            ),
+            ("https://[fd00::5]:8080", "https://[fd00::5]:8080"),
+            ("https://10.0.0.1:8080", "https://10.0.0.1:8080"),
+            (
+                "https://gw-1.peers.ns.svc:8080",
+                "https://gw-1.peers.ns.svc:8080",
+            ),
+        ] {
+            assert_eq!(bracket_ipv6_host(input), expected);
+            assert!(expected.parse::<http::Uri>().is_ok());
+        }
     }
 
     #[test]
