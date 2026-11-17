@@ -1540,8 +1540,9 @@ impl PodmanComputeDriver {
                             host_gateway_ip,
                             identity: &identity,
                             allow_extra_supplementary_groups:
-                                crate::isolation::userns_preserves_host_groups(
+                                crate::isolation::allow_extra_supplementary_groups(
                                     self.config.userns.as_deref(),
+                                    gpu_devices.is_some(),
                                 ),
                             child_env,
                             launch_authentication: &launch_authentication,
@@ -2160,8 +2161,9 @@ impl PodmanComputeDriver {
                         .map_err(ComputeDriverError::from)?,
                     identity: &restart_metadata.workload_identity,
                     allow_extra_supplementary_groups:
-                        crate::isolation::userns_preserves_host_groups(
+                        crate::isolation::allow_extra_supplementary_groups(
                             self.config.userns.as_deref(),
+                            restart_metadata.allow_extra_supplementary_groups,
                         ),
                     child_env: restart_metadata.child_env,
                     launch_authentication: launch_authentication.as_ref().expect("checked above"),
@@ -4474,6 +4476,7 @@ mod tests {
             generation: "generation-1".to_string(),
             workload_identity: identity,
             child_env: HashMap::new(),
+            allow_extra_supplementary_groups: false,
         })
         .unwrap();
         let mut header = tar::Header::new_gnu();
