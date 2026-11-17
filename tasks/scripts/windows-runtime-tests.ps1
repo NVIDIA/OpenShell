@@ -77,7 +77,7 @@ try {
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'windows-msvc.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-foreach ($name in @('Get-Sha256', 'Resolve-Z3Source', 'Configure-Z3')) {
+foreach ($name in @('Get-Sha256', 'Resolve-Z3Source', 'Configure-Z3', 'Reset-WindowsCMakeGeneratorCache')) {
     $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
     if ($null -eq $function) { throw "Missing build helper: $name" }
     Invoke-Expression $function.Extent.Text
@@ -100,6 +100,20 @@ try {
     $WindowsBuildJobs = 2
     $RepoRoot = $sourceFixture
     $TargetDir = Join-Path $sourceFixture 'target'
+    $oldBuild = Join-Path $TargetDir 'aarch64-pc-windows-msvc/release/build/z3-sys-old/out/build'
+    $newBuild = Join-Path $TargetDir 'aarch64-pc-windows-msvc/debug/build/z3-sys-new/out/build'
+    $otherTarget = Join-Path $TargetDir 'x86_64-pc-windows-msvc/release/build/z3-sys-old/out/build'
+    foreach ($build in @($oldBuild, $newBuild, $otherTarget)) {
+        New-Item -ItemType Directory -Path $build -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $build 'CMakeCache.txt') -Value 'CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022'
+    }
+    Set-Content -LiteralPath (Join-Path $newBuild 'CMakeCache.txt') -Value 'CMAKE_GENERATOR:INTERNAL=Ninja'
+    $installed = Join-Path (Split-Path $oldBuild) 'libz3.lib'
+    Set-Content -LiteralPath $installed -Value 'installed library'
+    Reset-WindowsCMakeGeneratorCache 'aarch64-pc-windows-msvc'
+    if (Test-Path -LiteralPath $oldBuild) { throw 'Stale Visual Studio build files retained.' }
+    if (-not (Test-Path -LiteralPath $newBuild) -or -not (Test-Path -LiteralPath $otherTarget) -or -not (Test-Path -LiteralPath $installed)) { throw 'Unrelated build files removed.' }
+    $count++
     $env:Z3_SRC_SOURCE_DIR = $null
     $env:Z3_LIBRARY_PATH_OVERRIDE = $sourceFixture
     Set-Content -LiteralPath (Join-Path $sourceFixture 'libz3.dll') -Value 'legacy shared runtime'

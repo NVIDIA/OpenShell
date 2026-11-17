@@ -440,6 +440,21 @@ function Configure-Z3 {
     }
 }
 
+function Reset-WindowsCMakeGeneratorCache([string] $RustTarget) {
+    foreach ($profile in @('debug', 'release')) {
+        $buildRoot = Join-Path $TargetDir "$RustTarget/$profile/build"
+        if (-not (Test-Path -LiteralPath $buildRoot)) { continue }
+        foreach ($cache in Get-ChildItem -Path (Join-Path $buildRoot '*/out/build/CMakeCache.txt') -File) {
+            if (Select-String -LiteralPath $cache.FullName -Pattern '^CMAKE_GENERATOR:INTERNAL=(?!Ninja$)' -Quiet) {
+                # Only generated native build files are discarded. Keep the
+                # downloaded source and installed artifacts outside this folder.
+                Write-Host "==> Resetting native build files for Ninja: $($cache.DirectoryName)"
+                Remove-Item -LiteralPath $cache.DirectoryName -Recurse -Force
+            }
+        }
+    }
+}
+
 function Invoke-VsCargo {
     param(
         [Parameter(Mandatory = $true)] [string] $RustTarget,
@@ -526,6 +541,7 @@ function Invoke-VsCargo {
             throw "Timed out waiting for another Windows Cargo task to finish."
         }
 
+        Reset-WindowsCMakeGeneratorCache $RustTarget
         $cmdWithLog = "$cmd > `"$logPath`" 2>&1"
         & cmd /v:on /d /c $cmdWithLog
         $exitCode = $LASTEXITCODE
