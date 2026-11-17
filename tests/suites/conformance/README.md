@@ -20,7 +20,12 @@ target (`harness = false`), so `openshell-conformance run`,
 | `policy-advisor` | `policy.local` accepts a proposed rule; a denied address or hostname yields one draft rule |
 | `file-transfer` | `sandbox upload` and `download`: round trips, file modes and symlinks outside the workspace, `.gitignore` filtering, workspace-escape and option-looking names, a large upload |
 | `create-upload` | `sandbox create --upload`: directory basename and nested files, multiple uploads, a single file |
-| `credential-gating` | Provider credentials: admission of credentialed endpoints, REST body placeholders and rewriting, WebSocket binary frames, live policy binding |
+| `credential-gating` | Provider credentials: admission of credentialed endpoints, REST header and body placeholders and rewriting, WebSocket text and binary frames, live policy binding, static credentials bound to their profile endpoints |
+| `network` | Direct connections that bypass the proxy are denied; reserved destinations fail with `EACCES`; localhost works without proxy settings; closed listeners release their ports |
+| `network-l7` | REST, GraphQL, JSON-RPC, and MCP rules allow and deny requests; REST upgrades are refused |
+| `network-egress` | Transparent egress: policy reloads close open connections, ambiguous updates are rejected, `tls: skip` relays raw bytes, middleware redacts or blocks traffic, pipelined requests are authorized one at a time |
+| `policy-update` | `policy set` and `policy update`: revisions and versions, repeated updates, scoped endpoint changes, the revision for a sparse initial policy |
+| `port-forward` | `forward start` reaches a server on the sandbox's loopback; `forward stop` closes the port |
 | `image` | A sandbox runs the default image or the one it is created from |
 | `labels` | Labels are stored and select sandboxes in `sandbox list` |
 | `templates` | A sandbox created from a template uses its workload; duplicate, deleted and missing templates return the right errors |
@@ -35,8 +40,9 @@ tmachine environment on CI. The other suites are ports of the old
 (credited in each file). `file-transfer` runs `git` on the machine that runs the
 tests, so a test environment needs it installed
 (`tests/tmachine/ansible/playbooks/test-tools.yaml` does that for the tmachine
-environments). `credential-gating`, ported from NVIDIA/OpenShell#5264, starts
-servers (`tests/support/host-server`) on the machine that runs the tests and
+environments). `credential-gating`, `network`, `network-l7`, and
+`network-egress` start servers (`tests/support/host-server`) on the machine
+that runs the tests and
 reaches them from sandboxes created from `testkit::python_image()` through
 `host.openshell.internal`. `ssh` runs `ssh` and `ssh-keygen` there and needs a named
 gateway, which `sandbox ssh-config` writes into its `ProxyCommand`.

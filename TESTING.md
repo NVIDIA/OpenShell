@@ -655,6 +655,14 @@ rootful and rootless, and the `k3s` and `k3s-ha` installers. The tests run on
 the K3s node, so the K3s installers set the chart's `server.hostGatewayIP` to
 the node's address.
 
+The `routable-host-ip` feature suite (`tests/suites/features/routable-host-ip`)
+checks that a policy endpoint whose host is an IP literal reaches that address,
+with or without `allowed_ips`. The sandbox uses the address
+`host.openshell.internal` resolves to, which must be one the supervisor lets an
+IP literal reach. Rootless Podman's is link-local and always blocked, so CI runs
+the suite on Docker rootful, Podman rootful, and the `k3s` and `k3s-ha`
+installers.
+
 The `connect-ssh-supervision` feature suite
 (`tests/suites/features/connect-ssh-supervision`) checks how `sandbox connect`
 supervises its `ssh` process: it reconnects after losing the SSH transport and
