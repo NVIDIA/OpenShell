@@ -24,8 +24,10 @@ Application/runtime settings remain in top-level `gatewayConfig`.
 `pkiInitJob`, `grpcRoute`, `certManager`, and `openshiftRoute` keep their top-level
 paths. There is no `gateway.server` map.
 
-Before chart `0.2.0`, old deployment paths and `server` runtime values remain
-deprecated aliases. Explicit canonical values take precedence, including false,
+Existing values files and `--set` overrides continue to work with this version
+of the chart; migration is not required to upgrade to it. Before chart `0.2.0`,
+old deployment paths and `server` runtime values remain deprecated aliases, so
+you can migrate incrementally. Explicit canonical values take precedence, including false,
 zero, empty strings, and empty lists/maps. Nullable component defaults inherit
 legacy user overrides or the existing render defaults. Starting with `0.2.0`,
 old paths fail with their replacements. Export overrides with `helm get values`,

@@ -11,6 +11,16 @@ and mounts) remain chart values.
 
 ## Upgrade compatibility
 
+Existing values files and `--set` overrides continue to work with this version
+of the chart without modification. You can upgrade first and migrate individual
+settings later. Install and upgrade notes identify deprecated paths; explicitly
+supplied component values override their legacy equivalents.
+
+Complete the migration before upgrading to chart `0.2.0`. Replace the release's
+stored legacy values with `--reset-values -f migrated-values.yaml` as shown below;
+adding new overrides with `--reuse-values` leaves the old keys stored in the
+release and does not complete the migration.
+
 The chart accepts the old deployment and application values as deprecated
 aliases before chart `0.2.0`. Starting with `0.2.0`, supplying an old path fails
 with its replacement instead of silently deploying defaults. When both forms set the same runtime field,

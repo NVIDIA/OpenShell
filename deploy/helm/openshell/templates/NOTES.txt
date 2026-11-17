@@ -2,6 +2,8 @@
 SPDX-License-Identifier: Apache-2.0 */}}
 {{- include "openshell.resolveValues" . -}}
 {{- if ._openshellValueWarnings }}
+Your existing values files and --set overrides work with this chart version.
+You can migrate incrementally; complete migration before upgrading to chart 0.2.0.
 Deprecated Helm values are accepted until chart 0.2.0:
 {{ range ._openshellValueWarnings }}
   - {{ . }}
