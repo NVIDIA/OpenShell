@@ -8,7 +8,7 @@
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
-use miette::Result;
+use miette::{Result, WrapErr};
 use openshell_cli::color::{self, ColorChoice, Colorize};
 use std::io::Write;
 use std::path::PathBuf;
@@ -4134,7 +4134,16 @@ async fn run_async() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
-            let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
+            let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "Could not connect to gateway '{}' at {}.\n\
+                         Check that the gateway service or tunnel is running and the endpoint is correct.\n\
+                         Inspect saved endpoints with: openshell gateway list",
+                        ctx.name, ctx.endpoint
+                    )
+                })?;
             let interceptor = openshell_core::auth::EdgeAuthInterceptor::new(
                 tls.oidc_token.as_deref(),
                 tls.edge_token.as_deref(),
