@@ -7,15 +7,30 @@ description: "Configure Kubernetes placement for OpenShell gateways, supervisors
 position: 8
 ---
 
-Workloads and supervisors prefer separate nodes by default. Node selectors and
-tolerations are opt-in: the default deployment needs no node-pool labels,
-taints, or dedicated nodes.
+Kubernetes places OpenShell pods using standard labels, node selectors,
+tolerations, and affinity rules. These concepts apply whether you use the
+OpenShell Helm chart, an operator, or deployment manifests you maintain.
+
+Placement configuration follows the owner of each pod:
+
+- The Kubernetes driver configures workload placement and workload/supervisor
+  anti-affinity through gateway configuration, including dedicated supervisors.
+- Configure gateways and shared supervisors in their deployment's Pod templates.
+  The OpenShell Helm chart renders these templates and derives shared-supervisor
+  anti-affinity from the gateway configuration. With another deployment method,
+  apply the equivalent labels and scheduling rules in your own templates.
+
+Examples identified as Helm values below are specific to the OpenShell chart.
+[Custom deployment manifests](#use-your-own-deployment-manifests) use native
+Kubernetes Pod fields.
 
 ## Choose the separation policy
 
-Set `pod_anti_affinity` in the gateway configuration to `preferred`, `required`,
-or `off`. Preferred mode permits colocation when capacity is limited, including
-a single-node cluster:
+The Kubernetes driver defaults to `preferred` workload/supervisor anti-affinity.
+Set `pod_anti_affinity` in the gateway configuration to `required` or `off` to
+change it. Preferred mode permits colocation when capacity is limited, including
+a single-node cluster. Node selectors and tolerations are opt-in; the default
+policy needs no node-pool labels, taints, or dedicated nodes:
 
 ```mermaid
 flowchart LR
@@ -26,7 +41,7 @@ flowchart LR
     end
 ```
 
-To require workload/supervisor separation, configure gateway TOML:
+To require workload/supervisor node separation, configure gateway TOML:
 
 ```toml
 [openshell.drivers.kubernetes.sandbox_runtime]
@@ -42,9 +57,9 @@ gatewayConfig:
       pod_anti_affinity: required
 ```
 
-The chart derives the shared-supervisor Deployment's reciprocal rule from this
-setting. The driver configures workloads and dedicated supervisors. Required
-mode leaves pods Pending when no separate eligible node exists; it does not
+When using the chart, it also derives the shared-supervisor Deployment's
+reciprocal rule from this setting. Required mode leaves pods Pending when no
+separate eligible node exists; it does not
 fall back to colocation. `off` omits generated anti-affinity rules while keeping
 operator-authored rules effective. Gateway placement is independent of this
 policy.
@@ -56,7 +71,8 @@ namespaces, including other OpenShell installations. This covers shared
 supervisors deployed in a separate namespace from their workloads.
 
 To scope separation to one installation, label the participating supervisor and
-workload namespaces with a common label, then select that label:
+workload namespaces with a common label, then select that label. For example,
+use these Helm values:
 
 ```yaml
 gatewayConfig:
@@ -67,16 +83,20 @@ gatewayConfig:
           example.com/openshell-group: production
 ```
 
-The chart applies the same namespace scope to shared-supervisor rules. An empty
-selector, `{}`, matches all namespaces. This selector identifies peer
-namespaces; it does not choose nodes.
+The chart applies the same namespace scope to shared-supervisor rules. In custom
+supervisor manifests, set the native anti-affinity term's `namespaceSelector` to
+the same selector. An empty selector, `{}`, matches all namespaces. This
+selector identifies peer namespaces; it does not choose nodes.
 
 ## Place pods in separate node pools
 
-Use node selectors to constrain eligible nodes. Gateways use Helm's
-`nodeSelector`; shared supervisors use `supervisor.nodeSelector`; workloads use
-the operator-owned `sandbox_runtime.workload_placement.node_selector` in gateway
-configuration. Caller driver-config opt-in is not required.
+Use node selectors to constrain eligible nodes. In your own gateway or
+shared-supervisor Pod templates, set `spec.nodeSelector`. The OpenShell chart
+exposes these fields as `nodeSelector` and `supervisor.nodeSelector` respectively.
+For driver-created workloads, use the operator-owned
+`sandbox_runtime.workload_placement.node_selector` in gateway configuration,
+regardless of how you deploy the gateway. Caller driver-config opt-in is not
+required.
 
 You might use, for example, `openshell.ai/node-pool` as a node label to organize
 where pods run within your cluster. This label is only an example; OpenShell
@@ -99,7 +119,7 @@ flowchart LR
 ```
 
 Label the nodes in those pools with `openshell.ai/node-pool=infrastructure` or
-`openshell.ai/node-pool=sandbox`, then configure:
+`openshell.ai/node-pool=sandbox`. With the OpenShell Helm chart, configure:
 
 ```yaml
 nodeSelector:
@@ -131,6 +151,8 @@ flowchart LR
     end
 ```
 
+For the OpenShell Helm chart, the values are:
+
 ```yaml
 nodeSelector:
   openshell.ai/node-pool: gateway
@@ -152,11 +174,12 @@ supervisors.
 
 ### Tolerate pool taints
 
-If a pool has a `NoSchedule` taint, give its pods the matching toleration.
-Gateways use Helm's `tolerations`, shared supervisors use
-`supervisor.tolerations`, and workloads use
-`sandbox_runtime.workload_placement.tolerations`. For a sandbox pool tainted
-`openshell.ai/node-pool=sandbox:NoSchedule`, add:
+If a pool has a `NoSchedule` taint, give its pods the matching toleration. Set
+`spec.tolerations` in custom gateway or shared-supervisor Pod templates. The
+OpenShell chart exposes these fields as `tolerations` and
+`supervisor.tolerations` respectively. For driver-created workloads, use
+`sandbox_runtime.workload_placement.tolerations`. These Helm values configure a
+workload toleration for `openshell.ai/node-pool=sandbox:NoSchedule`:
 
 ```yaml
 gatewayConfig:
@@ -172,9 +195,10 @@ gatewayConfig:
 
 Tolerations permit use of tainted nodes; they do not select a pool. Operator
 workload tolerations append without duplicates and retain caller tolerations.
-PKI hook Jobs inherit the gateway's node selectors and tolerations. Cluster
-services, including storage provisioners, need their own placement configuration
-when nodes are tainted.
+With the OpenShell chart, PKI hook Jobs inherit the gateway's node selectors and
+tolerations. Other deployment methods must configure their supporting Jobs as
+needed. Cluster services, including storage provisioners, need their own
+placement configuration when nodes are tainted.
 
 ## Use role labels in custom affinity rules
 
@@ -187,8 +211,9 @@ OpenShell uses the common label key `openshell.ai/runtime-role`:
 | Dedicated supervisor | `supervisor` | Kubernetes driver |
 | Gateway | `gateway` | Helm or its deployment owner |
 
-These pod labels preserve existing Service and controller selectors. For
-example, to prefer placing shared supervisors away from gateways, add:
+These pod labels preserve existing Service and controller selectors. Use them
+in native `spec.affinity` rules in your own Pod templates. For example, these
+OpenShell Helm values prefer placing shared supervisors away from gateways:
 
 ```yaml
 supervisor:
@@ -208,11 +233,15 @@ This example selects gateways across all namespaces. Set its namespace selector
 to narrow the scope. Custom `supervisor.affinity` rules coexist with generated
 workload/supervisor rules. Top-level Helm `affinity` configures gateway pods.
 
-## Configure independently deployed supervisors
+## Use your own deployment manifests
 
-The gateway configures workload pods; the supervisor deployment owner configures
-shared supervisors. Apply the supervisor role label and a reciprocal native
-anti-affinity rule in the supervisor Pod template. For required separation:
+Apply `openshell.ai/runtime-role: gateway` to your gateway pods and
+`openshell.ai/runtime-role: supervisor` to shared-supervisor pods. Configure
+their node selectors, tolerations, and affinity using native Pod fields.
+
+For example, this shared-supervisor Pod template requires separation from
+workloads. In a Deployment or StatefulSet manifest, place this fragment under
+`spec.template`:
 
 ```yaml
 metadata:
@@ -229,11 +258,13 @@ spec:
           topologyKey: kubernetes.io/hostname
 ```
 
-Use the same namespace scope and policy strength as the gateway. For soft
+Continue to configure driver-created pods through gateway TOML, as shown above.
+Give shared supervisors the same namespace scope and policy strength. For soft
 separation, put the term under
 `preferredDuringSchedulingIgnoredDuringExecution` as a `podAffinityTerm` with
 `weight: 100`. Changing the gateway setting does not change independently
-deployed supervisor pods.
+deployed supervisor pods. Your deployment tooling must maintain those labels
+and rules across rollouts, replacements, and scaling.
 
 ## Apply placement changes
 
