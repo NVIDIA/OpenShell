@@ -87,7 +87,7 @@ mod linux {
         tokio::time::sleep(ESTABLISHED).await;
         let proxy = wait_for_process(
             &format!("the ssh-proxy of sandbox {}", sandbox.name()),
-            || find_process(None, &["ssh-proxy", "--sandbox", sandbox.name()]),
+            || find_process(connect.pid(), &["ssh-proxy", "--sandbox", sandbox.name()]),
         )
         .await?;
         send(proxy, Signal::SIGTERM).context("terminate the ssh-proxy transport")?;
@@ -133,7 +133,7 @@ mod linux {
         let connect_pid = connect.pid();
 
         let ssh = wait_for_process(&format!("the ssh child of `{}`", connect.command()), || {
-            find_process(Some(connect_pid), &["-s", "sandbox", "openshell-main"])
+            find_process(connect_pid, &["-s", "sandbox", "openshell-main"])
         })
         .await?;
         send(connect_pid, Signal::SIGTERM).context("send SIGTERM to only the CLI")?;
@@ -194,23 +194,14 @@ mod linux {
         }
     }
 
-    /// A process whose arguments include all of `args`, and whose parent is
-    /// `parent` if given.
-    fn find_process(parent: Option<u32>, args: &[&str]) -> Option<u32> {
+    /// A descendant of `ancestor` whose arguments include all of `args`.
+    fn find_process(ancestor: u32, args: &[&str]) -> Option<u32> {
         for entry in std::fs::read_dir("/proc").ok()?.filter_map(Result::ok) {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
                 continue;
             };
-            if let Some(parent) = parent {
-                let status =
-                    std::fs::read_to_string(entry.path().join("status")).unwrap_or_default();
-                let ppid = status.lines().find_map(|line| {
-                    line.strip_prefix("PPid:")
-                        .and_then(|value| value.trim().parse::<u32>().ok())
-                });
-                if ppid != Some(parent) {
-                    continue;
-                }
+            if !descends_from(pid, ancestor) {
+                continue;
             }
             let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
             let argv: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
@@ -219,5 +210,26 @@ mod linux {
             }
         }
         None
+    }
+
+    fn descends_from(pid: u32, ancestor: u32) -> bool {
+        let mut current = pid;
+        while current > 1 {
+            let Some(parent) = parent_pid(current) else {
+                return false;
+            };
+            if parent == ancestor {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    fn parent_pid(pid: u32) -> Option<u32> {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:")?.trim().parse().ok())
     }
 }

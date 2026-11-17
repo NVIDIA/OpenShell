@@ -4,7 +4,7 @@
 #![cfg(feature = "e2e")]
 
 //! The other tests in this file moved to the testkit conformance and
-//! `features/cli-attach` suites. This one stays until #5507 is fixed.
+//! `features/connect-ssh-supervision` suites. This one stays until #5507 is fixed.
 
 use std::time::Duration;
 

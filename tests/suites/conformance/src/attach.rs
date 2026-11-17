@@ -6,7 +6,7 @@
 //! process's exit code.
 //!
 //! Ported from `e2e/rust/tests/sandbox_lifecycle.rs`. The CLI-side transport
-//! recovery and signal tests are in `tests/suites/features/cli-attach`.
+//! recovery and signal tests are in `tests/suites/features/connect-ssh-supervision`.
 
 use std::process::Stdio;
 use std::time::Duration;

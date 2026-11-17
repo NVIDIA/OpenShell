@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "cli-attach"
+name = "connect-ssh-supervision"
 description = "Features suite: `sandbox connect` recovers its SSH transport and forwards termination"
 version = "0.0.0"
 edition = "2024"
