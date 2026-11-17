@@ -203,9 +203,11 @@ push-triggered workflow jobs themselves.
 
 ### E2E and dev release concurrency
 
-Calling workflows own concurrency for complete runs. The reusable `e2e-suites.yml` and `integration-runner.yml` workflows do not cancel competing invocations. `Branch E2E Checks` cancels superseded runs on the same mirrored PR branch. Manual `Integration Tests` invocations can finish independently, including runs on the same branch and category.
+The reusable `e2e-suites.yml` and `integration-runner.yml` workflows retain cancellation within their existing caller, family or category, and Git ref groups. They disable active-run cancellation only when the caller is `Release Dev`, including manual dev releases. `Branch E2E Checks`, tagged release qualification, and manual `Integration Tests` retain their existing cancellation behavior.
 
 `Release Dev` uses one `release-dev` concurrency group for push and manual invocations, with `cancel-in-progress: false`. One active run continues through builds, qualification, publication, and downstream publishers. New arrivals replace the pending run, so intermediate candidates can be skipped while an active candidate finishes. Successful qualification can reach publication during sustained main updates. Failed qualification still blocks that candidate's publication.
+
+The complete dev workflow must stay serialized so separate candidates cannot compete for the reusable workflows' pending slots. Disabling cancellation within individual E2E families alone would still allow pending calls to replace each other independently.
 
 Serializing the complete dev workflow also prevents separate dev runs from interleaving updates to shared release outputs. The next candidate waits for the complete active workflow. This does not make publication transactional or enforce commit ordering for explicit reruns or manual dispatches.
 
