@@ -516,7 +516,8 @@ Useful log files:
 | `test-aarch64-pc-windows-msvc-mxc-real.log` | Native ARM64 real-MXC integration output. |
 
 The first check downloads a checksum-pinned Z3 5.1.0 source archive unless
-`Z3_SRC_SOURCE_DIR` supplies that version locally. The existing `vendored-z3`
+`Z3_SRC_SOURCE_DIR` supplies that version locally. Keep downloaded source under
+`.cache/windows-z3-source`, outside Cargo target-cache pruning. The existing `vendored-z3`
 feature builds a static library and selects the static MSVC runtime from the
 Windows targets' `crt-static` setting. Keep this source pin separate from the
 z3-src crate's bundled solver version. Cargo caches compiled Z3 per target;

@@ -366,9 +366,12 @@ function Resolve-Z3Source {
     if ($env:Z3_SRC_SOURCE_DIR) {
         $source = (Resolve-Path -LiteralPath $env:Z3_SRC_SOURCE_DIR).Path
     } else {
-        $source = Join-Path $TargetDir "windows-z3-source/z3-z3-$Z3Version"
+        # rust-cache prunes non-Cargo files under target, including VERSION.txt.
+        # Keep the complete source tree outside that cache's ownership.
+        $sourceRoot = Join-Path $RepoRoot '.cache/windows-z3-source'
+        $source = Join-Path $sourceRoot "z3-z3-$Z3Version"
         if (-not (Test-Path -LiteralPath $source -PathType Container)) {
-            $staging = Join-Path $TargetDir ("windows-z3-download-" + [guid]::NewGuid().ToString('N'))
+            $staging = Join-Path $sourceRoot ("download-" + [guid]::NewGuid().ToString('N'))
             New-Item -ItemType Directory -Path $staging -Force | Out-Null
             try {
                 $archive = Join-Path $staging 'source.zip'

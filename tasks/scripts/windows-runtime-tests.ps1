@@ -98,12 +98,15 @@ try {
     $Z3WorkspaceFeatures = '--features openshell-prover/vendored-z3'
     $Z3ServerFeatures = '--features openshell-server/vendored-z3,openshell-prover/vendored-z3'
     $WindowsBuildJobs = 2
+    $RepoRoot = $sourceFixture
     $TargetDir = Join-Path $sourceFixture 'target'
     $env:Z3_SRC_SOURCE_DIR = $null
     $env:Z3_LIBRARY_PATH_OVERRIDE = $sourceFixture
     Set-Content -LiteralPath (Join-Path $sourceFixture 'libz3.dll') -Value 'legacy shared runtime'
     $features = Configure-Z3
     if ($features.WorkspaceFeatures -notmatch 'vendored-z3' -or $env:Z3_LIBRARY_PATH_OVERRIDE) { throw 'Legacy shared override selected instead of static Z3.' }
+    $count++
+    if ($env:Z3_SRC_SOURCE_DIR.StartsWith($TargetDir, [StringComparison]::OrdinalIgnoreCase)) { throw 'Source cache is inside the pruned Cargo target directory.' }
     $count++
     if (-not (Test-Path -LiteralPath (Join-Path $env:Z3_SRC_SOURCE_DIR 'scripts/VERSION.txt'))) { throw 'Cold source extraction failed.' }
     $count++
@@ -112,7 +115,7 @@ try {
     # A verified cache can be reused without downloading another archive.
     if (-not (Resolve-Z3Source)) { throw 'Source cache reuse failed.' }
     $count++
-    $TargetDir = Join-Path $sourceFixture 'bad-checksum'
+    $RepoRoot = Join-Path $sourceFixture 'bad-checksum'
     $rejected = $false
     try { Resolve-Z3Source | Out-Null } catch {
         if ($_.Exception.Message -notmatch 'checksum') { throw }

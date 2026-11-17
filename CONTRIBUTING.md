@@ -210,7 +210,8 @@ For x86-64 and ARM64 Windows MSVC builds from the `windows` branch, the
 `windows:*` tasks compile checksum-pinned Z3 5.1.0 source into a static library.
 The Windows targets enable `crt-static` in `.cargo/config.toml`; the Z3 build
 uses the same static MSVC runtime. CMake and a C++ compiler are required on
-cold builds. Cargo caches the compiled library. `Z3_SRC_SOURCE_DIR` can point
+cold builds. Source lives under `.cache/windows-z3-source`; Cargo caches the
+compiled library separately. `Z3_SRC_SOURCE_DIR` can point
 to a local Z3 5.1.0 source tree instead of downloading it.
 
 To supply your own library, set `Z3_LIBRARY_PATH_OVERRIDE` to the directory
