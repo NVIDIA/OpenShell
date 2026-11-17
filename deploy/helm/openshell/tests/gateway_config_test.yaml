@@ -23,7 +23,9 @@ tests:
   - it: disables gateway service routing through canonical configuration
     template: templates/gateway-config.yaml
     set:
-      gatewayConfig.gateway.service_routing_enabled: false
+      gatewayConfig:
+        openshell.gateway:
+          service_routing_enabled: false
     asserts:
       - matchRegex:
           path: data["gateway.toml"]

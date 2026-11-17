@@ -620,8 +620,14 @@ gateway service URLs and reject gateway-mediated application HTTP requests and
 WebSocket upgrades with `404`. Control-plane APIs, service declarations, direct
 supervisor listeners, and discovery remain available. The setting also accepts
 `--service-routing-enabled=false` or `OPENSHELL_SERVICE_ROUTING_ENABLED=false`,
-with CLI > environment > TOML > default precedence. In Helm, use
-`gatewayConfig.gateway.service_routing_enabled: false`.
+with CLI > environment > TOML > default precedence. In Helm, configure the
+canonical gateway table:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    service_routing_enabled: false
+```
 
 With gateway routing disabled, `gateway_url` is empty and `gateway_service_urls`
 is empty. A configured application origin supplies the preferred URL; without
