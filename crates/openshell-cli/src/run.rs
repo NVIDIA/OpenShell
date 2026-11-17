@@ -7656,6 +7656,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_credential_expiry_preserves_fractional_millis_and_leap_seconds() {
+        for (value, expected) in [
+            ("2026-01-01T00:00:00.123999999Z", 1_767_225_600_123),
+            ("2016-12-31T23:59:60.250Z", 1_483_228_800_250),
+        ] {
+            assert_eq!(
+                parse_credential_expiry_cli_value(value).unwrap(),
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_credential_expiry_rejects_pre_epoch_values() {
+        for value in ["-1", "1969-12-31T23:59:59.999999999Z"] {
+            assert!(parse_credential_expiry_cli_value(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
     fn progress_step_metadata_values_map_to_cli_steps() {
         assert_eq!(
             progress_step_from_metadata(PROGRESS_STEP_REQUESTING_SANDBOX),
