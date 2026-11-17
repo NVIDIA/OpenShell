@@ -212,6 +212,28 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
+### Sandbox service routing
+
+Gateway-mediated sandbox service routing is disabled by default in this Kubernetes
+chart to avoid an unintended alternate application access path. Control-plane API
+access is unchanged. Configure the supervisor app listener and external ingress
+separately, or explicitly enable gateway forwarding:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    enable_gateway_service_routing: true
+```
+
+Existing Helm installations that rely on gateway service URLs must set this
+explicitly before upgrading. Missing saved values receive the disabled chart
+default; explicit choices are preserved. If neither routing mode is enabled,
+startup logs warn that sandbox service routing is disabled.
+
+The core runtime continues to default gateway routing to enabled, preserving
+Docker, Podman, and VM deployments outside this chart. Gateway service
+authentication remains independently opt-in.
+
 ### Additional destination CAs
 
 Create an operator-owned ConfigMap with a `ca.crt` key when sandboxes must reach
